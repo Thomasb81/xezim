@@ -1802,6 +1802,234 @@ impl Simulator {
         Ok(())
     }
 
+    /// Phase-3 event-island analysis: detect groups of edge blocks
+    /// that MUST be co-located on the same partition because splitting
+    /// them across cores would require an illegal or expensive
+    /// zero-time barrier mid-cycle. Returns Union-Find roots: per-block
+    /// representative id (canonical block_idx). Two blocks are in the
+    /// same island iff `roots[a] == roots[b]`.
+    ///
+    /// What's collapsed:
+    /// - **Async-reset cones**: any block whose sensitivity list has
+    ///   ≥2 distinct edge signals (e.g. `posedge clk or negedge rst`)
+    ///   merges with every other parallel-eligible block driven by
+    ///   the SAME secondary signal. This catches the classic FF-with-
+    ///   async-reset family — splitting them risks the reset edge
+    ///   firing on one core while the dependent FFs are mid-update on
+    ///   another.
+    /// - **Combinational SCCs**: builds a directed graph
+    ///   `A → B` when A NBA-writes a signal B reads. Tarjan SCCs of
+    ///   size ≥2 (mutual recursion through NBA) are collapsed.
+    /// - Clock-gating cones and latch cones are detected indirectly:
+    ///   a gated clock arrives via a comb assign which currently
+    ///   marks its driven block non-pure (already sequential), and
+    ///   latches are SystemVerilog `always @*` with conditional NBA
+    ///   that we similarly treat as non-pure. Phase 3 doesn't need
+    ///   to handle them explicitly — they don't enter the parallel
+    ///   set in the first place.
+    pub fn compute_phase3_islands(&self) -> Vec<usize> {
+        let n = self.edge_blocks.len();
+        // Union-Find over block_idx. Path compression + union-by-rank.
+        let mut parent: Vec<usize> = (0..n).collect();
+        let mut rank: Vec<u8> = vec![0; n];
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        fn union(parent: &mut [usize], rank: &mut [u8], a: usize, b: usize) {
+            let (ra, rb) = (find(parent, a), find(parent, b));
+            if ra == rb {
+                return;
+            }
+            if rank[ra] < rank[rb] {
+                parent[ra] = rb;
+            } else if rank[ra] > rank[rb] {
+                parent[rb] = ra;
+            } else {
+                parent[rb] = ra;
+                rank[ra] += 1;
+            }
+        }
+
+        // --- 3b: async-reset cones ---
+        // Build map sig_id → list of parallel block_idxs that have it
+        // in their sensitivity list. Then for any block with multiple
+        // sensitivities, union all blocks sharing each of those sigs.
+        let mut sens_to_blocks: ahash::AHashMap<usize, Vec<usize>> =
+            ahash::AHashMap::default();
+        for (bi, blk) in self.edge_blocks.iter().enumerate() {
+            if !self.edge_block_parallel.get(bi).copied().unwrap_or(false) {
+                continue;
+            }
+            for s in &blk.resolved_sensitivities {
+                sens_to_blocks.entry(s.signal_id).or_default().push(bi);
+            }
+        }
+        let mut cone_unions = 0usize;
+        for (bi, blk) in self.edge_blocks.iter().enumerate() {
+            if !self.edge_block_parallel.get(bi).copied().unwrap_or(false) {
+                continue;
+            }
+            // Distinct sensitivity signals (a clock or reset, etc).
+            let mut sids: Vec<usize> =
+                blk.resolved_sensitivities.iter().map(|s| s.signal_id).collect();
+            sids.sort();
+            sids.dedup();
+            if sids.len() < 2 {
+                continue; // single-signal sensitivity = clean clock domain
+            }
+            // For each sensitivity signal, merge bi with every other
+            // parallel block also driven by that signal — that's the
+            // "cone" for this trigger source.
+            for &sid in &sids {
+                if let Some(peers) = sens_to_blocks.get(&sid) {
+                    for &peer in peers {
+                        if peer != bi {
+                            union(&mut parent, &mut rank, bi, peer);
+                            cone_unions += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- 3a: combinational SCCs over the NBA dataflow graph ---
+        // Edge bi → bj when `bi` NBA-writes a signal `bj` reads.
+        // For parallel-eligible blocks only.
+        let mut writes_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut reads_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut writers_of_sig: ahash::AHashMap<usize, Vec<usize>> =
+            ahash::AHashMap::default();
+        let mut readers_of_sig: ahash::AHashMap<usize, Vec<usize>> =
+            ahash::AHashMap::default();
+        for bi in 0..n {
+            if !self.edge_block_parallel.get(bi).copied().unwrap_or(false) {
+                continue;
+            }
+            let cb = match self.compiled_edge_blocks.get(bi).and_then(|c| c.as_ref()) {
+                Some(c) => c,
+                None => continue,
+            };
+            for insn in cb.instructions.iter() {
+                match insn {
+                    super::bytecode::Insn::LoadSignal(_, sid)
+                    | super::bytecode::Insn::LoadSignalSigned(_, sid) => {
+                        if !reads_of[bi].contains(sid) {
+                            reads_of[bi].push(*sid);
+                            readers_of_sig.entry(*sid).or_default().push(bi);
+                        }
+                    }
+                    super::bytecode::Insn::NbaAssign(sid, _, _)
+                    | super::bytecode::Insn::NbaAssignRange(sid, _, _, _) => {
+                        if !writes_of[bi].contains(sid) {
+                            writes_of[bi].push(*sid);
+                            writers_of_sig.entry(*sid).or_default().push(bi);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Build adjacency `succ[bi]` = blocks that read something bi writes.
+        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for bi in 0..n {
+            for &sid in &writes_of[bi] {
+                if let Some(readers) = readers_of_sig.get(&sid) {
+                    for &r in readers {
+                        if r != bi && !succ[bi].contains(&r) {
+                            succ[bi].push(r);
+                        }
+                    }
+                }
+            }
+        }
+        // Tarjan iterative SCC. Skips non-parallel blocks (no out-edges).
+        let mut index = 0i64;
+        let mut stack: Vec<usize> = Vec::new();
+        let mut on_stack = vec![false; n];
+        let mut idx_of: Vec<i64> = vec![-1; n];
+        let mut low: Vec<i64> = vec![-1; n];
+        let mut scc_unions = 0usize;
+        // Recursion-as-stack: (node, child_iter_pos)
+        for start in 0..n {
+            if idx_of[start] != -1 {
+                continue;
+            }
+            if !self.edge_block_parallel.get(start).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut work: Vec<(usize, usize)> = Vec::new();
+            idx_of[start] = index;
+            low[start] = index;
+            index += 1;
+            stack.push(start);
+            on_stack[start] = true;
+            work.push((start, 0));
+            while let Some(&(v, ci)) = work.last() {
+                if ci < succ[v].len() {
+                    let w = succ[v][ci];
+                    work.last_mut().unwrap().1 += 1;
+                    if idx_of[w] == -1 {
+                        idx_of[w] = index;
+                        low[w] = index;
+                        index += 1;
+                        stack.push(w);
+                        on_stack[w] = true;
+                        work.push((w, 0));
+                    } else if on_stack[w] {
+                        if idx_of[w] < low[v] {
+                            low[v] = idx_of[w];
+                        }
+                    }
+                } else {
+                    // Done with v: maybe pop SCC.
+                    if low[v] == idx_of[v] {
+                        let mut comp: Vec<usize> = Vec::new();
+                        loop {
+                            let x = stack.pop().expect("stack underflow");
+                            on_stack[x] = false;
+                            comp.push(x);
+                            if x == v { break; }
+                        }
+                        if comp.len() > 1 {
+                            // Union all members.
+                            let head = comp[0];
+                            for &m in &comp[1..] {
+                                union(&mut parent, &mut rank, head, m);
+                                scc_unions += 1;
+                            }
+                        }
+                    }
+                    work.pop();
+                    if let Some(&(p, _)) = work.last() {
+                        if low[v] < low[p] {
+                            low[p] = low[v];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Path-compress so callers can read `parent[bi]` directly.
+        for i in 0..n {
+            let r = find(&mut parent, i);
+            parent[i] = r;
+        }
+        // Stats line — useful for confirming the analysis fired.
+        let mut roots: ahash::AHashSet<usize> = ahash::AHashSet::default();
+        for &p in &parent {
+            roots.insert(p);
+        }
+        eprintln!(
+            "[PART] phase-3 islands: {} blocks → {} super-vertices (cone_unions={}, scc_unions={})",
+            n, roots.len(), cone_unions, scc_unions
+        );
+        parent
+    }
+
     pub fn emit_edge_block_hypergraph(
         &self,
         path: &str,
@@ -1824,13 +2052,29 @@ impl Simulator {
         path: &str,
         profile: Option<&Phase2Profile>,
     ) -> Result<(usize, usize), String> {
+        self.emit_edge_block_hypergraph_full(path, profile, None)
+    }
+
+    /// Phase-3 hypergraph emit: when `islands` is `Some`, blocks
+    /// sharing an island root collapse into one super-vertex with
+    /// summed weights. The vmap then records the canonical block_idx
+    /// for each super-vertex; load_partition_file already inherits
+    /// partition assignments via the vmap so all members of a
+    /// super-vertex get the same partition automatically.
+    pub fn emit_edge_block_hypergraph_full(
+        &self,
+        path: &str,
+        profile: Option<&Phase2Profile>,
+        islands: Option<&[usize]>,
+    ) -> Result<(usize, usize), String> {
         use std::collections::HashMap;
         use std::io::Write;
 
-        // Step 1: collect the parallel-eligible block ids in a stable
-        // order. The hMETIS vertex id is `1 + position in this vec`
-        // (hMETIS uses 1-based indexing).
-        let mut blocks: Vec<usize> = Vec::new();
+        // Step 1: collect parallel-eligible block ids. With Phase 3
+        // islands, dedup by island root so each super-vertex (group
+        // of must-co-locate blocks) takes exactly one vid. Members
+        // of the same island map to the same vid.
+        let mut all_eligible: Vec<usize> = Vec::new();
         for (idx, &is_parallel) in self.edge_block_parallel.iter().enumerate() {
             if is_parallel {
                 if self
@@ -1839,28 +2083,55 @@ impl Simulator {
                     .and_then(|cb| cb.as_ref())
                     .is_some()
                 {
-                    blocks.push(idx);
+                    all_eligible.push(idx);
                 }
             }
         }
-        if blocks.is_empty() {
+        if all_eligible.is_empty() {
             return Err("no parallel-eligible edge blocks to partition".to_string());
+        }
+
+        // `blocks` = canonical representative per super-vertex.
+        // `island_of[bi]` = the canonical block_idx for bi's island.
+        // When `islands` is None each block is its own island.
+        let n = self.edge_blocks.len();
+        let island_of: Vec<usize> = match islands {
+            Some(roots) if roots.len() == n => roots.to_vec(),
+            _ => (0..n).collect(),
+        };
+        let mut blocks: Vec<usize> = Vec::new();
+        let mut seen_root: ahash::AHashSet<usize> = ahash::AHashSet::default();
+        for &bi in &all_eligible {
+            let r = island_of[bi];
+            if seen_root.insert(r) {
+                blocks.push(r);
+            }
         }
         let vid_of: HashMap<usize, usize> = blocks
             .iter()
             .enumerate()
-            .map(|(i, &bi)| (bi, i + 1))
+            .map(|(i, &root)| (root, i + 1))
             .collect();
+        // Map every eligible block to its super-vertex's vid via root.
+        let block_vid = |bi: usize| -> Option<usize> { vid_of.get(&island_of[bi]).copied() };
+        // Members per island (for vmap output and weight summing).
+        let mut members_of: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &bi in &all_eligible {
+            members_of.entry(island_of[bi]).or_default().push(bi);
+        }
 
-        // Step 2: walk each block's bytecode and collect the signal
-        // ids it reads (LoadSignal*) and writes (NbaAssign*). For
-        // a pure block, NBA writes are the only outgoing edge type.
-        // Map signal_id -> set of (vid) that touch it.
+        // Step 2: walk each ELIGIBLE block's bytecode (not just the
+        // representative) and collect signal ids. Map each (sid,
+        // super-vertex_vid) pair so the hyperedge captures the
+        // COMBINED read/write set of the island. Dedup so each vid
+        // appears at most once per signal.
         let mut sig_to_vids: HashMap<usize, Vec<usize>> = HashMap::new();
-        for &bi in &blocks {
+        for &bi in &all_eligible {
+            let vid = match block_vid(bi) {
+                Some(v) => v,
+                None => continue,
+            };
             let cb = self.compiled_edge_blocks[bi].as_ref().unwrap();
-            // Use a small stack-allocated dedup set per block to keep
-            // the inner loop tight; ~8 distinct sigs is typical.
             let mut seen: Vec<usize> = Vec::with_capacity(16);
             for insn in cb.instructions.iter() {
                 let sid = match insn {
@@ -1874,9 +2145,11 @@ impl Simulator {
                     seen.push(sid);
                 }
             }
-            let vid = vid_of[&bi];
             for sid in seen {
-                sig_to_vids.entry(sid).or_default().push(vid);
+                let vs = sig_to_vids.entry(sid).or_default();
+                if !vs.contains(&vid) {
+                    vs.push(vid);
+                }
             }
         }
 
@@ -1922,40 +2195,66 @@ impl Simulator {
             }
             writeln!(out).map_err(|e| e.to_string())?;
         }
-        for &bi in &blocks {
-            // Vertex weight: profile-guided uses real runtime
-            // (ns scaled to a reasonable u32 range), else insn count.
+        for &root in &blocks {
+            // Vertex weight: SUM over all members of this island
+            // (when phase-3 collapse is on, that's the joint cost
+            // of the must-co-locate group).
+            let empty: Vec<usize> = Vec::new();
+            let members = members_of.get(&root).unwrap_or(&empty);
             let w = if let Some(p) = profile {
-                let ns = p.edge_block_exec_ns.get(&bi).copied().unwrap_or(0);
-                // Scale ns to microseconds to keep numbers small + meaningful.
+                let ns: u64 = members
+                    .iter()
+                    .map(|&bi| p.edge_block_exec_ns.get(&bi).copied().unwrap_or(0))
+                    .sum();
                 let us = (ns / 1000).max(1);
                 us.min(u32::MAX as u64 - 1) as u32
             } else {
-                self.compiled_edge_blocks[bi]
-                    .as_ref()
-                    .map(|cb| cb.instructions.len() as u32)
-                    .unwrap_or(1)
-                    .max(1)
+                let total: u32 = members
+                    .iter()
+                    .map(|&bi| {
+                        self.compiled_edge_blocks[bi]
+                            .as_ref()
+                            .map(|cb| cb.instructions.len() as u32)
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                total.max(1)
             };
             writeln!(out, "{}", w).map_err(|e| e.to_string())?;
         }
         out.flush().map_err(|e| e.to_string())?;
         drop(out);
 
-        // Step 5: emit a sibling vmap file so consumers can invert
-        // the dense vid → original edge_block_idx mapping.
+        // Step 5: emit a sibling vmap file. With phase-3, each vid
+        // maps to MULTIPLE original block_idxs (the island's members).
+        // Format: `vid root_block_idx member1,member2,... total_insns`.
+        // load_partition_file parses the comma-list and propagates
+        // the partition assignment to every member.
         let vmap_path = format!("{}.vmap", path);
         let mut vmap = std::io::BufWriter::new(
             std::fs::File::create(&vmap_path)
                 .map_err(|e| format!("create {}: {}", vmap_path, e))?,
         );
-        writeln!(vmap, "# vid edge_block_idx insn_count").map_err(|e| e.to_string())?;
-        for (i, &bi) in blocks.iter().enumerate() {
-            let n_insns = self.compiled_edge_blocks[bi]
-                .as_ref()
-                .map(|cb| cb.instructions.len())
-                .unwrap_or(0);
-            writeln!(vmap, "{} {} {}", i + 1, bi, n_insns).map_err(|e| e.to_string())?;
+        writeln!(vmap, "# vid root_block_idx members(comma) total_insns").map_err(|e| e.to_string())?;
+        for (i, &root) in blocks.iter().enumerate() {
+            let empty: Vec<usize> = Vec::new();
+            let members = members_of.get(&root).unwrap_or(&empty);
+            let n_insns: usize = members
+                .iter()
+                .map(|&bi| {
+                    self.compiled_edge_blocks[bi]
+                        .as_ref()
+                        .map(|cb| cb.instructions.len())
+                        .unwrap_or(0)
+                })
+                .sum();
+            let mlist = members
+                .iter()
+                .map(|&bi| bi.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(vmap, "{} {} {} {}", i + 1, root, mlist, n_insns)
+                .map_err(|e| e.to_string())?;
         }
         vmap.flush().map_err(|e| e.to_string())?;
 
@@ -1998,7 +2297,9 @@ impl Simulator {
         let mut assigned = 0usize;
 
         if let Some(vmap) = vmap {
-            // vmap line format: "vid block_idx insn_count" (1-based vid).
+            // vmap formats supported:
+            //   Phase 1/2: "vid block_idx insn_count"      — 3 fields
+            //   Phase 3:   "vid root member,member,... ic" — 4 fields with members at idx 2
             for line in vmap.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
@@ -2009,15 +2310,39 @@ impl Simulator {
                     Some(v) => v,
                     None => continue,
                 };
-                let bi: usize = match it.next().and_then(|s| s.parse().ok()) {
+                let _root: usize = match it.next().and_then(|s| s.parse().ok()) {
                     Some(v) => v,
                     None => continue,
                 };
-                if vid == 0 || vid - 1 >= parts.len() || bi >= n_blocks {
+                if vid == 0 || vid - 1 >= parts.len() {
                     continue;
                 }
-                self.edge_block_partition[bi] = parts[vid - 1];
-                assigned += 1;
+                let part = parts[vid - 1];
+                // Third token is either insn_count (phase 1/2) or
+                // a comma-separated members list (phase 3). Tell them
+                // apart by presence of a comma.
+                let third = match it.next() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if third.contains(',') {
+                    for m in third.split(',') {
+                        if let Ok(bi) = m.parse::<usize>() {
+                            if bi < n_blocks {
+                                self.edge_block_partition[bi] = part;
+                                assigned += 1;
+                            }
+                        }
+                    }
+                } else {
+                    // Phase 1/2: third was insn_count → root_block_idx
+                    // is the only member. But we already consumed the
+                    // root field; re-route partition assignment there.
+                    if _root < n_blocks {
+                        self.edge_block_partition[_root] = part;
+                        assigned += 1;
+                    }
+                }
             }
         } else {
             // Fall back: i-th parallel block gets the i-th part id.

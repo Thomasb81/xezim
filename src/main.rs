@@ -359,6 +359,7 @@ fn main() {
     let mut load_partition: Option<String> = None;
     let mut write_profile: Option<String> = None;
     let mut profile_input: Option<String> = None;
+    let mut collapse_islands: bool = false;
 
     let mut include_dirs: Vec<String> = Vec::new();
     let mut defines: Vec<(String, Option<String>)> = Vec::new();
@@ -619,6 +620,9 @@ fn main() {
             }
             _ if arg.starts_with("--profile-input=") => {
                 profile_input = Some(arg["--profile-input=".len()..].to_string());
+            }
+            "--collapse-islands" => {
+                collapse_islands = true;
             }
             "--dpi-lib" => {
                 i += 1;
@@ -894,6 +898,7 @@ fn main() {
         load_partition.as_deref(),
         write_profile.as_deref(),
         profile_input.as_deref(),
+        collapse_islands,
     ) {
         Ok(sim) => {
             println!("------------------------------");

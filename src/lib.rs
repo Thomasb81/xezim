@@ -37,6 +37,7 @@ pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, Stri
         None,
         None,
         None,
+        false,
     )
 }
 
@@ -60,6 +61,7 @@ pub fn simulate_multi(
     load_partition: Option<&str>,
     write_profile: Option<&str>,
     profile_input: Option<&str>,
+    collapse_islands: bool,
 ) -> Result<compiler::Simulator, String> {
     let total_start = std::time::Instant::now();
     let compilation_start = std::time::Instant::now();
@@ -128,14 +130,29 @@ pub fn simulate_multi(
         } else {
             None
         };
-        let result = sim.emit_edge_block_hypergraph_with_profile(path, prof.as_ref());
+        // Phase-3 island analysis (optional). Computes which blocks
+        // MUST be co-located across cores (async-reset cones, comb
+        // SCCs) and collapses them into super-vertices in the emitted
+        // hypergraph. Without --collapse-islands, every block is its
+        // own vertex (Phase 1/2 behavior).
+        let islands = if collapse_islands {
+            Some(sim.compute_phase3_islands())
+        } else {
+            None
+        };
+        let result = sim.emit_edge_block_hypergraph_full(
+            path,
+            prof.as_ref(),
+            islands.as_deref(),
+        );
         match result {
             Ok((nv, ne)) => eprintln!(
-                "[PART] hypergraph written to {} ({} vertices, {} hyperedges, weights={}) in {:.1}ms",
+                "[PART] hypergraph written to {} ({} vertices, {} hyperedges, weights={}, islands={}) in {:.1}ms",
                 path,
                 nv,
                 ne,
                 if prof.is_some() { "profile" } else { "static" },
+                if islands.is_some() { "phase3" } else { "off" },
                 t.elapsed().as_secs_f64() * 1000.0
             ),
             Err(e) => eprintln!("[PART] failed to write hypergraph to {}: {}", path, e),
