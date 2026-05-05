@@ -982,6 +982,11 @@ pub struct Simulator {
     /// dispatch; sum tells you total dispatcher cycles.
     prof_par_dispatch_partition: u64,
     prof_par_dispatch_legacy: u64,
+    /// TBB-vs-std::thread::scope split: when XEZIM_DISPATCHER=tbb and
+    /// the feature is compiled in, parallel-block dispatch goes via
+    /// the TBB shim. Counted for the [PROF] line so users can confirm
+    /// which scheduler ran.
+    prof_par_dispatch_tbb: u64,
     prof_edge_waiters: u64,
     prof_edge_cg: u64,
     prof_waiter_iters: u64,
@@ -1758,6 +1763,7 @@ impl Simulator {
             prof_edge_exec: 0,
             prof_par_dispatch_partition: 0,
             prof_par_dispatch_legacy: 0,
+            prof_par_dispatch_tbb: 0,
             prof_edge_waiters: 0,
             prof_edge_cg: 0,
             prof_waiter_iters: 0,
@@ -7440,9 +7446,10 @@ impl Simulator {
             self.prof_fallback_insns);
         if self.prof_par_dispatch_partition + self.prof_par_dispatch_legacy > 0 {
             eprintln!(
-                "[PROF] par_dispatch partition={} legacy={} (partition k={})",
+                "[PROF] par_dispatch partition={} legacy={} tbb={} (partition k={})",
                 self.prof_par_dispatch_partition,
                 self.prof_par_dispatch_legacy,
+                self.prof_par_dispatch_tbb,
                 self.edge_block_partition_count
             );
         }
@@ -8748,41 +8755,82 @@ impl Simulator {
                         .collect();
                 }
 
+                // XEZIM_DISPATCHER=tbb selects the Intel TBB
+                // work-stealing scheduler (only when feature `tbb` is
+                // compiled in). Default = the existing std::thread::scope
+                // chunk-based dispatch.
+                let use_tbb = crate::tbb::is_available()
+                    && std::env::var("XEZIM_DISPATCHER").as_deref() == Ok("tbb");
+
                 let mut all_nba: Vec<Vec<NbaFast>> = Vec::new();
-                std::thread::scope(|s| {
-                    let mut handles = Vec::new();
-                    for chunk in chunks.iter() {
-                        let chunk = chunk.as_slice();
-                        let handle = s.spawn(move || {
-                            let mut thread_nba: Vec<NbaFast> = Vec::new();
-                            let max_regs =
-                                chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
-                            let mut vm_regs = vec![Value::zero(1); max_regs];
-                            for (_, bs) in chunk {
-                                if vm_regs.len() < bs.num_regs {
-                                    vm_regs.resize(bs.num_regs, Value::zero(1));
-                                }
-                                let insns = unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
-                                let mut nba = Self::exec_insns_isolated(
-                                    insns,
-                                    signal_table,
-                                    signal_signed,
-                                    signal_name_to_id,
-                                    array_first_id,
-                                    &mut vm_regs,
-                                );
-                                thread_nba.append(&mut nba);
+                if use_tbb {
+                    use std::sync::Mutex;
+                    let nba_collect: Mutex<Vec<Vec<NbaFast>>> =
+                        Mutex::new(Vec::with_capacity(chunks.len()));
+                    let chunks_ref = &chunks;
+                    crate::tbb::parallel_for_partitions(chunks.len(), 1, |p| {
+                        let chunk = chunks_ref[p].as_slice();
+                        let mut thread_nba: Vec<NbaFast> = Vec::new();
+                        let max_regs =
+                            chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
+                        let mut vm_regs = vec![Value::zero(1); max_regs];
+                        for (_, bs) in chunk {
+                            if vm_regs.len() < bs.num_regs {
+                                vm_regs.resize(bs.num_regs, Value::zero(1));
                             }
-                            thread_nba
-                        });
-                        handles.push(handle);
-                    }
-                    for h in handles {
-                        if let Ok(nba) = h.join() {
-                            all_nba.push(nba);
+                            let insns = unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
+                            let mut nba = Self::exec_insns_isolated(
+                                insns,
+                                signal_table,
+                                signal_signed,
+                                signal_name_to_id,
+                                array_first_id,
+                                &mut vm_regs,
+                            );
+                            thread_nba.append(&mut nba);
                         }
-                    }
-                });
+                        nba_collect.lock().unwrap().push(thread_nba);
+                    });
+                    all_nba = nba_collect.into_inner().unwrap();
+                    self.prof_par_dispatch_tbb += 1;
+                } else {
+                    std::thread::scope(|s| {
+                        let mut handles = Vec::new();
+                        for chunk in chunks.iter() {
+                            let chunk = chunk.as_slice();
+                            let handle = s.spawn(move || {
+                                let mut thread_nba: Vec<NbaFast> = Vec::new();
+                                let max_regs =
+                                    chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
+                                let mut vm_regs = vec![Value::zero(1); max_regs];
+                                for (_, bs) in chunk {
+                                    if vm_regs.len() < bs.num_regs {
+                                        vm_regs.resize(bs.num_regs, Value::zero(1));
+                                    }
+                                    let insns = unsafe {
+                                        std::slice::from_raw_parts(bs.ptr, bs.len)
+                                    };
+                                    let mut nba = Self::exec_insns_isolated(
+                                        insns,
+                                        signal_table,
+                                        signal_signed,
+                                        signal_name_to_id,
+                                        array_first_id,
+                                        &mut vm_regs,
+                                    );
+                                    thread_nba.append(&mut nba);
+                                }
+                                thread_nba
+                            });
+                            handles.push(handle);
+                        }
+                        for h in handles {
+                            if let Ok(nba) = h.join() {
+                                all_nba.push(nba);
+                            }
+                        }
+                    });
+                }
                 for nba_batch in all_nba {
                     // Sync nba_fast_index for each appended entry so the
                     // sequential-block path that may follow can still find
