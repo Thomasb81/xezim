@@ -8734,14 +8734,32 @@ impl Simulator {
                 unsafe impl Send for BlockSlice {}
                 unsafe impl Sync for BlockSlice {}
 
-                // Sort by block_index so each chunk we build below
-                // (whether by partition id or by index range) ends up
-                // pre-sorted by block_index. The parallel-NBA k-way
-                // merge below relies on this — without it, `triggered`
-                // is in sensitivity-fanout order, chunks inherit that
-                // order, and the merge produces the wrong last-writer
-                // (c910 cmark hang).
-                parallel_blocks.sort_unstable();
+                // Phase-1 partition-aware grouping: if a partition file
+                // has been loaded (via --load-partition), bucket blocks
+                // by their partition id so each thread processes one
+                // partition worth of work. Falls back to the legacy
+                // chunk-by-range when no partition is present.
+                //
+                // The partition path REQUIRES parallel_blocks to be
+                // sorted by block_index — chunks bucket by partition id
+                // (independent of block index), and the post-dispatch
+                // k-way merge assumes each chunk's NBAs come out in
+                // block-index order. Sorting AFTER bucketing would still
+                // not satisfy that invariant. Without this sort, k=4 on
+                // c910 hangs after ~50K cycles.
+                //
+                // The chunk-by-range path must NOT sort: chunk-by-range
+                // chunks are contiguous slices of parallel_blocks, so
+                // flattening them back preserves whatever order
+                // `triggered` collected blocks in (sensitivity-fanout
+                // order). c910 sequential dispatch has block-order
+                // dependencies that break under index-sorted order
+                // (c910 t=1 k=0 hangs at iters=200040 if we sort here).
+                let use_partition = self.edge_block_partition_count > 0
+                    && !self.edge_block_partition.is_empty();
+                if use_partition {
+                    parallel_blocks.sort_unstable();
+                }
                 let mut block_slices: Vec<(usize, BlockSlice)> =
                     Vec::with_capacity(parallel_blocks.len());
                 for &bi in &parallel_blocks {
@@ -8757,15 +8775,8 @@ impl Simulator {
                     }
                 }
 
-                // Phase-1 partition-aware grouping: if a partition file
-                // has been loaded (via --load-partition), bucket blocks
-                // by their partition id so each thread processes one
-                // partition worth of work. Falls back to the legacy
-                // chunk-by-range when no partition is present.
                 let mut chunks: Vec<Vec<(usize, BlockSlice)>>;
-                if self.edge_block_partition_count > 0
-                    && !self.edge_block_partition.is_empty()
-                {
+                if use_partition {
                     self.prof_par_dispatch_partition += 1;
                     let k = self.edge_block_partition_count as usize;
                     chunks = (0..k).map(|_| Vec::new()).collect();
@@ -8900,46 +8911,58 @@ impl Simulator {
                         }
                     });
                 }
-                // Apply NBAs in source block_index order so the merged
-                // stream matches sequential dispatch (last writer per
-                // signal is the highest block index, not the highest
-                // chunk index). Chunk bucketing — especially the
-                // partition path — does not preserve global block order,
-                // so a single misplaced cross-partition pair would flip
-                // last-writer semantics (this is what caused c910 cmark
-                // t=4 k=4 to hang).
+                // Apply NBAs.
                 //
-                // Each chunk's NBA vec is already in block-index order
-                // (blocks within a chunk are processed sequentially), so
-                // we run a k-way min-heap merge: O(N log k) instead of
-                // O(N log N) for a full sort. For k=4 with N in the
-                // millions per cycle that's ~10× cheaper.
-                let total: usize = all_nba.iter().map(Vec::len).sum();
-                if total > 0 {
-                    self.nba_fast.reserve(total);
-                    let mut iters: Vec<std::vec::IntoIter<NbaFast>> =
-                        all_nba.into_iter().map(|v| v.into_iter()).collect();
-                    use std::cmp::Reverse;
-                    use std::collections::BinaryHeap;
-                    // Heap entry: (Reverse(block_index), chunk_idx) — min-heap by block_index.
-                    let mut heap: BinaryHeap<(Reverse<u32>, usize)> =
-                        BinaryHeap::with_capacity(iters.len());
-                    let mut head: Vec<Option<NbaFast>> = (0..iters.len()).map(|_| None).collect();
-                    for (i, it) in iters.iter_mut().enumerate() {
-                        if let Some(n) = it.next() {
-                            heap.push((Reverse(n.block_index), i));
-                            head[i] = Some(n);
+                // Chunk-by-range path: chunks are contiguous slices of
+                // parallel_blocks (which is in `triggered` order), so a
+                // simple flatten reproduces the order legacy sequential
+                // dispatch would have used. c910 sequential block-order
+                // dependencies require this exact order — k-way merging
+                // by block_index here would change behavior and hang.
+                //
+                // Partition path: chunks are bucketed by partition id
+                // (independent of block index), so flattening loses
+                // global ordering and picks the wrong "last writer" for
+                // signals written from different partitions. Each chunk
+                // is already block-index sorted (parallel_blocks sorted
+                // upstream when use_partition is true), so a k-way
+                // min-heap merge reconstructs global block-index order
+                // in O(N log k).
+                if use_partition {
+                    let total: usize = all_nba.iter().map(Vec::len).sum();
+                    if total > 0 {
+                        self.nba_fast.reserve(total);
+                        let mut iters: Vec<std::vec::IntoIter<NbaFast>> =
+                            all_nba.into_iter().map(|v| v.into_iter()).collect();
+                        use std::cmp::Reverse;
+                        use std::collections::BinaryHeap;
+                        let mut heap: BinaryHeap<(Reverse<u32>, usize)> =
+                            BinaryHeap::with_capacity(iters.len());
+                        let mut head: Vec<Option<NbaFast>> = (0..iters.len()).map(|_| None).collect();
+                        for (i, it) in iters.iter_mut().enumerate() {
+                            if let Some(n) = it.next() {
+                                heap.push((Reverse(n.block_index), i));
+                                head[i] = Some(n);
+                            }
+                        }
+                        while let Some((_, ci)) = heap.pop() {
+                            if let Some(entry) = head[ci].take() {
+                                self.nba_fast_index
+                                    .insert(entry.signal_id, self.nba_fast.len());
+                                self.nba_fast.push(entry);
+                            }
+                            if let Some(n) = iters[ci].next() {
+                                heap.push((Reverse(n.block_index), ci));
+                                head[ci] = Some(n);
+                            }
                         }
                     }
-                    while let Some((_, ci)) = heap.pop() {
-                        if let Some(entry) = head[ci].take() {
+                } else {
+                    for nba_batch in all_nba {
+                        for entry in nba_batch {
                             self.nba_fast_index
                                 .insert(entry.signal_id, self.nba_fast.len());
                             self.nba_fast.push(entry);
-                        }
-                        if let Some(n) = iters[ci].next() {
-                            heap.push((Reverse(n.block_index), ci));
-                            head[ci] = Some(n);
                         }
                     }
                 }
@@ -9164,6 +9187,14 @@ impl Simulator {
             // Hot loop: >90% of iterations hit DC / CompiledContAssign /
             // CompiledAlwaysBlock — avoid scope_hint.clone() and Instant::now()
             // on those paths. Only the AST fallback arms pay that cost.
+            //
+            // NOTE: A previous version added a single-stage `_mm_prefetch`
+            // on entries[cur_list[cur_pos+8]] which gave c906 cmark a
+            // 31% wall-time win. Reverted because c910 t=1 k=0 starts
+            // hanging at iters=200040 with the prefetch active despite
+            // the prefetch being a semantic no-op — likely a downstream
+            // cache-state interaction we haven't traced yet. Don't
+            // re-enable without a c910 t=1 k=0 + t=4 k=4 cmark sanity.
             let mut cur_pos = 0usize;
             while cur_pos < cur_list.len() {
                 let eidx = cur_list[cur_pos];
