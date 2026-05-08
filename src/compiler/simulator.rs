@@ -6364,7 +6364,7 @@ impl Simulator {
         // the entire time-0 settle phase, only dropping to 1.4 GB when the
         // event loop's allocation pattern shifts. malloc_trim(0) forces
         // an immediate release. No-op on non-glibc platforms.
-        #[cfg(target_env = "gnu")]
+        #[cfg(all(target_env = "gnu", not(miri)))]
         unsafe {
             libc::malloc_trim(0);
         }
