@@ -3947,7 +3947,63 @@ impl Simulator {
         if self.xtrace_file.is_some() {
             self.xtrace_start_dump();
         }
+        self.auto_partition_by_clock();
         self.compiled = true;
+    }
+
+    /// XEZIM_PARTITION_BY_CLOCK=1 auto-bucket parallel-eligible edge blocks
+    /// by their primary posedge sensitivity. Each unique clock signal gets
+    /// its own partition (modulo XEZIM_PARTITION_BY_CLOCK_MAX_K, default 8).
+    /// Blocks within the same clock domain are tightly coupled and run in
+    /// the same thread; blocks across domains are mostly independent and
+    /// can run concurrently. Skipped if --load-partition was already used.
+    fn auto_partition_by_clock(&mut self) {
+        if std::env::var("XEZIM_PARTITION_BY_CLOCK").as_deref() != Ok("1") {
+            return;
+        }
+        if !self.edge_block_partition.is_empty() && self.edge_block_partition_count > 0 {
+            // External partition file was loaded — respect it.
+            return;
+        }
+        let max_k: u32 = std::env::var("XEZIM_PARTITION_BY_CLOCK_MAX_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let n_blocks = self.edge_blocks.len();
+        self.edge_block_partition = vec![0u32; n_blocks];
+        let mut clock_to_part: HashMap<usize, u32> = HashMap::new();
+        let mut next_part: u32 = 0;
+        let mut max_used: u32 = 0;
+        for (bi, block) in self.edge_blocks.iter().enumerate() {
+            // Primary clock = first Posedge sensitivity. Fall back to first
+            // any-edge / negedge if no posedge.
+            let primary = block
+                .resolved_sensitivities
+                .iter()
+                .find(|s| s.edge == EdgeKind::Posedge)
+                .or_else(|| block.resolved_sensitivities.first())
+                .map(|s| s.signal_id);
+            let part = if let Some(clk) = primary {
+                *clock_to_part.entry(clk).or_insert_with(|| {
+                    let p = next_part;
+                    next_part = (next_part + 1) % max_k;
+                    p
+                })
+            } else {
+                0
+            };
+            self.edge_block_partition[bi] = part;
+            if part > max_used {
+                max_used = part;
+            }
+        }
+        self.edge_block_partition_count = max_used + 1;
+        eprintln!(
+            "[OPT] auto-partition-by-clock: {} blocks, {} unique clock domains, k={}",
+            n_blocks,
+            clock_to_part.len(),
+            self.edge_block_partition_count
+        );
     }
 
     pub fn simulate(&mut self) {
