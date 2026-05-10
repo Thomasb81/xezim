@@ -4441,6 +4441,22 @@ impl Simulator {
             .map(|v| v != "0" && v != "")
             .unwrap_or(false);
         self.jit_fns = vec![None; self.compiled_edge_blocks.len()];
+        // Pre-compute which compiled blocks touch any signal with width
+        // > 64. JIT bridges (jit_load_signal / jit_load_array_elem) read
+        // signals as u64 and silently truncate wider values; refuse to
+        // JIT those blocks so the interpreter (which preserves full
+        // Value width) handles them.
+        let block_jit_safe: Vec<bool> = if enable_jit {
+            self.compiled_edge_blocks
+                .iter()
+                .map(|cb_opt| match cb_opt {
+                    Some(cb) => self.block_signals_fit_u64(cb),
+                    None => false,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if enable_jit {
             // Pick backend via XEZIM_JIT_BACKEND={cranelift,llvm}.
             // Default = cranelift (faster JIT-compile; matches prior
@@ -4461,6 +4477,9 @@ impl Simulator {
                     if let Some(jm) = llvm.as_mut() {
                         for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
                             if let Some(cb) = cb_opt {
+                                if !block_jit_safe[idx] {
+                                    continue;
+                                }
                                 if let Some(f) = jm.try_compile_with_xz(
                                     &cb.instructions,
                                     cb.num_regs as u32,
@@ -4490,6 +4509,9 @@ impl Simulator {
                     if let Some(jm) = self.jit_module.as_mut() {
                         for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
                             if let Some(cb) = cb_opt {
+                                if !block_jit_safe[idx] {
+                                    continue;
+                                }
                                 if let Some(f) = jm.try_compile_with_xz(
                                     &cb.instructions,
                                     cb.num_regs as u32,
@@ -13832,6 +13854,35 @@ impl Simulator {
         }
     }
 
+    /// Return true if every signal touched by `cb`'s instructions has
+    /// width ≤ 64. Used as a pre-JIT guard: blocks that read or write a
+    /// wider signal cannot use the u64-only JIT bridges without silent
+    /// truncation.
+    fn block_signals_fit_u64(&self, cb: &super::bytecode::CompiledBlock) -> bool {
+        use super::bytecode::Insn;
+        for insn in &cb.instructions {
+            let sig_id = match insn {
+                Insn::LoadSignal(_, id)
+                | Insn::LoadSignalSigned(_, id)
+                | Insn::NbaAssign(id, ..)
+                | Insn::NbaAssignRange(id, ..)
+                | Insn::NbaAssignRangeDyn(id, ..)
+                | Insn::NbaAssignBitDyn(id, ..)
+                | Insn::BlockingAssign(id, ..)
+                | Insn::BlockingAssignRange(id, ..)
+                | Insn::BlockingAssignRangeDyn(id, ..)
+                | Insn::BlockingAssignBitDyn(id, ..) => Some(*id),
+                _ => None,
+            };
+            if let Some(id) = sig_id {
+                if id < self.signal_widths.len() && self.signal_widths[id] > 64 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// JIT bridge: read `signal_table[id]` as a raw `u64` of val_bits.
     /// For 4-state (X/Z) values we still return a best-effort bit
     /// pattern (the val_bits directly) — the JIT'd block will compute
@@ -13839,11 +13890,20 @@ impl Simulator {
     /// afterwards if any X/Z is in play. (Phase-1 MVP: no XZ tracking
     /// in JIT code; we rely on post-execution fallback semantics which
     /// are fine for c910 post-reset where all signals are determinate.)
+    ///
+    /// **Width contract:** caller must ensure `signal_widths[id] <= 64`.
+    /// `block_signals_fit_u64` is the pre-JIT gate that guarantees this.
     #[inline]
     pub(crate) fn jit_load_signal(&self, id: usize) -> u64 {
         if id >= self.signal_table.len() {
             return 0;
         }
+        debug_assert!(
+            self.signal_widths[id] <= 64,
+            "jit_load_signal called on wide signal id={} width={}",
+            id,
+            self.signal_widths[id],
+        );
         self.signal_table[id].to_u64().unwrap_or(0)
     }
 
@@ -14008,9 +14068,24 @@ impl Simulator {
     }
 
     /// JIT bridge: load an array element as u64.
+    ///
+    /// **Width contract:** array element widths must be ≤ 64.
+    /// `block_signals_fit_u64` does not currently scan array element
+    /// widths (only direct signal references); if a JIT-compiled block
+    /// reads a wide unpacked-array element, the read truncates silently.
+    /// The current JIT lowering does not emit array-element loads for
+    /// any block that would hit a wide element width, so this is a
+    /// belt-and-suspenders assert.
     #[inline]
     pub(crate) fn jit_load_array_elem(&mut self, name: &str, idx: i64) -> u64 {
         if let Some(eid) = self.get_array_elem_id(name, idx) {
+            debug_assert!(
+                self.signal_widths[eid] <= 64,
+                "jit_load_array_elem called on wide elem array={} idx={} width={}",
+                name,
+                idx,
+                self.signal_widths[eid],
+            );
             self.signal_table[eid].to_u64().unwrap_or(0)
         } else {
             0
