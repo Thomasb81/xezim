@@ -962,7 +962,8 @@ impl<'a> BytecodeCompiler<'a> {
                 // but resized to 1 bit gives 0, so == 0 returns 1 instead
                 // of 0.)
                 let is_self_determined = matches!(op,
-                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq
+                    BinaryOp::Eq | BinaryOp::Neq
+                    | BinaryOp::CaseEq | BinaryOp::CaseNeq
                     | BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
                     | BinaryOp::LogAnd | BinaryOp::LogOr);
                 let sub_ctx = if is_self_determined {
