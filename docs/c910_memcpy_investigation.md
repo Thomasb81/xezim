@@ -72,6 +72,65 @@ sim 46665 (the obviously-wrong X-cascade) is reliably prevented.
 The late 1M watchdog failure remains, but it matches the original
 failure mode and may not be a new regression.
 
+## Round 29 (2026-05-10) — VCD COMPARISON: AXI handshake hang at sim 58335
+
+Direct comparison of `biu_pad_wvalid` transitions between xezim
+(with INIT_ZERO=1) and Questa golden VCD
+(`/home/bondan/agent/repo/memcpy_30k_70k.vcd`) over sim 30K-70K.
+
+**Result**: 123/123 events match EXACTLY through sim 58335
+(timestamps + edge directions identical). Then xezim's 124th event
+is missing.
+
+| Sim time (ns) | Questa | xezim |
+|---|---|---|
+| 58115 | 1 | 1 ✓ |
+| 58155 | 0 | 0 ✓ |
+| 58335 | 1 | 1 ✓ |
+| 58345 | 0 | (missing) |
+| 58425 | 1 | (missing) |
+| 58435 | 0 | (missing) |
+| 59675 | 1 | (missing) |
+| ... | ... | (missing) |
+| 69145 | 1 | (missing) |
+
+xezim asserts `biu_pad_wvalid=1` at sim 58335 but **never deasserts**.
+Questa drops it 10ns later at sim 58345 (normal 1-cycle pulse) and
+continues with more write transactions. All 122 prior wvalid pulses
+in xezim completed normally; this 123rd one stalls.
+
+**Root cause is in the AXI write channel handshake**: the
+`pad_biu_bvalid` (write-response valid from slave) or `pad_biu_wready`
+(write-data ready) signal in xezim's BIU/AXI subsystem fails to
+assert for this transaction, so the CPU's BIU write FSM hangs
+waiting for completion. Cascades downstream:
+- LSU pipe3 writeback never fires
+- RB entry stuck in WAIT_RDY
+- AIQ0 entry src0/src1 wb-bit never sets
+- Eventually no retires for 50K cycles → watchdog at sim 1M
+
+This matches the cascade chain documented in the round 22 "Verified
+at high precision" section earlier in this file. The original
+analysis was correct about the cascade; the new info is the
+**exact wvalid sim time (58335)** and the proof via VCD-vs-Questa
+diff that 100% of CPU behavior up to that point is bit-exact.
+
+**Next concrete step**: probe `pad_biu_bvalid` / `pad_biu_wready` /
+`biu_pad_bready` around sim 58335-58345 in both xezim and a fresh
+Questa run with those signals dumped. The mismatched signal
+pinpoints which AXI slave/BIU edge xezim mis-simulates. Likely
+candidate: the AXI slave `f_spsram_large.v` write-response timing
+or the BIU write-channel FSM transition into `cur_bresp_buf_bvalid`.
+
+**Files of interest**:
+- `xezim/rtlmeter/designs/XuanTie-C910/src/ct_biu_write_channel.v`
+  (lines 1-end, the BIU write-channel FSM)
+- `xezim/rtlmeter/designs/XuanTie-C910/src/f_spsram_large.v` (the
+  AXI slave model)
+- VCDs:
+  - xezim: `/tmp/fix_memcpy/memcpy/dump.vcd` (rerun with +vcd plusarg)
+  - Questa: `/home/bondan/agent/repo/memcpy_30k_70k.vcd`
+
 The 22+ rounds of IFU/IBUF investigation below were chasing two
 separate red herrings: the "PC 0x712 missing" retire-log artifact
 (round 22) and the precode/IBUF cone-of-influence work (rounds
