@@ -131,6 +131,55 @@ or the BIU write-channel FSM transition into `cur_bresp_buf_bvalid`.
   - xezim: `/tmp/fix_memcpy/memcpy/dump.vcd` (rerun with +vcd plusarg)
   - Questa: `/home/bondan/agent/repo/memcpy_30k_70k.vcd`
 
+### Detailed handshake timeline at the failure point (xezim VCD)
+
+Normal AXI write transaction (e.g. sim 58095-58165):
+```
+t=58095ns biu_pad_awvalid=1   (address phase start)
+t=58105ns biu_pad_awvalid=0
+t=58115ns biu_pad_wvalid=1    (data phase start)
+t=58155ns biu_pad_wvalid=0    (data phase ends)
+t=58155ns pad_biu_bvalid=1    (slave's write-response valid)
+t=58165ns pad_biu_bvalid=0
+```
+
+Broken transaction at sim 58315 (the 123rd write):
+```
+t=58315ns biu_pad_awvalid=1
+t=58325ns biu_pad_awvalid=0
+t=58335ns biu_pad_wvalid=1    (data phase start — never ends)
+t=58405ns biu_pad_awvalid=1   (CPU tries N+2 write — protocol violation)
+(nothing more — wvalid stuck high, bvalid never asserts)
+```
+
+Compared to Questa cpu_awaddr trace, the last addresses written are
+the memcpy destination 0xcd60-0xd000 (sequential, 122 writes). The
+write at sim 58335 corresponds to address 0xd000 (the final word of
+the buffer). The NEXT write in Questa is at sim 58425 to address
+0x1b40 — this is **post-loop code** writing to a different memory
+region. The transition from vector-burst memcpy writes to scalar
+post-loop writes is where xezim hangs.
+
+**Refined hypothesis**: xezim's BIU write-channel FSM (or the AXI
+slave model) mishandles the **first scalar write following the
+vector-burst memcpy phase**. The 122 vector-burst writes complete
+normally; the first non-burst write hangs.
+
+Possible specific causes:
+1. AXI slave (`f_spsram_large.v`) write-response FSM has stale state
+   from the burst that doesn't reset properly for the next
+   transaction.
+2. BIU's awburst/awlen tracking doesn't transition correctly between
+   burst and non-burst modes.
+3. xezim's combinational settle iteration limit (XEZIM_CASCADE_LIMIT
+   default 6) is too low for a specific event-island in the AXI
+   slave that fires only on the burst-to-scalar boundary.
+
+**Required next probe**: dump `biu_pad_awlen` / `biu_pad_awburst` /
+`biu_pad_awsize` (the AXI burst parameters) for both the 122nd
+working write and the 123rd hanging write. The diff identifies the
+specific transaction-shape change.
+
 The 22+ rounds of IFU/IBUF investigation below were chasing two
 separate red herrings: the "PC 0x712 missing" retire-log artifact
 (round 22) and the precode/IBUF cone-of-influence work (rounds
