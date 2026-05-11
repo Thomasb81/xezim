@@ -1,7 +1,33 @@
 # c910 memcpy investigation — full analysis
 
-17 rounds of root-cause narrowing on the c910 RISC-V memcpy hang in xezim.
-Bug remains unfixed at session end but is characterized to extreme depth.
+**TL;DR FIX (round 27, 2026-05-10): set `XEZIM_INIT_ZERO=1` when running
+c910 memcpy.** This is the same fix that's already documented for the
+c910 cmark canary. The X-cascade from uninitialized PRF/AIQ/ROB array
+elements leaks through `idu_iu_rf_pipex_src0/src1` → ALU → rbus → wb
+data, eventually producing `64'h2382348720` which trips tb.v's failure
+sentinel.
+
+Verified: with `XEZIM_INIT_ZERO=1`, c910 memcpy runs cleanly through
+sim 500000 (10× past the previous TEST FAILED at sim 46665). To
+actually reach TEST PASSED needs `--max-time 5000000+` (per the cmark
+canary memo).
+
+```bash
+XEZIM_INIT_ZERO=1 /home/bondan/agent/repo/xezim/target/release/xezim \
+  --max-time 5000000 -f /tmp/c910_files.list
+```
+
+The 22+ rounds of IFU/IBUF investigation below were chasing the wrong
+symptom. The five IFU/IBUF cone-of-influence synth tests committed
+during this session remain as regression guards but were investigating
+the wrong layer.
+
+---
+
+## Original investigation — root-cause narrowing on the c910 RISC-V memcpy hang
+
+22+ rounds of investigation before the fix was identified. Preserved
+below for reference.
 
 ## Symptom
 
