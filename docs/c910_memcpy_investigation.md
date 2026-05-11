@@ -1,26 +1,41 @@
 # c910 memcpy investigation — full analysis
 
-**TL;DR FIX (round 27, 2026-05-10): set `XEZIM_INIT_ZERO=1` when running
-c910 memcpy.** This is the same fix that's already documented for the
-c910 cmark canary. The X-cascade from uninitialized PRF/AIQ/ROB array
-elements leaks through `idu_iu_rf_pipex_src0/src1` → ALU → rbus → wb
-data, eventually producing `64'h2382348720` which trips tb.v's failure
-sentinel.
+**STATUS (round 27 update, 2026-05-10): partial fix only, full pass NOT
+achieved.**
 
-Verified: with `XEZIM_INIT_ZERO=1`, c910 memcpy runs cleanly through
-sim 500000 (10× past the previous TEST FAILED at sim 46665). To
-actually reach TEST PASSED needs `--max-time 5000000+` (per the cmark
-canary memo).
+`XEZIM_INIT_ZERO=1` fixes the early failure at sim 46665 (corrupt-value
+sentinel `0x2382348720` from uninitialized PRF/AIQ array elements
+leaking X via `idu_iu_rf_pipex_src0/src1`). But the test still fails
+with a different mode at sim 1,000,195 (watchdog: no retire for 50000
+cycles) — same termination as the original failure without the fix.
 
-```bash
-XEZIM_INIT_ZERO=1 /home/bondan/agent/repo/xezim/target/release/xezim \
-  --max-time 5000000 -f /tmp/c910_files.list
-```
+Run results:
 
-The 22+ rounds of IFU/IBUF investigation below were chasing the wrong
-symptom. The five IFU/IBUF cone-of-influence synth tests committed
-during this session remain as regression guards but were investigating
-the wrong layer.
+| Config | max-time | Result |
+|---|---|---|
+| (default) | 60K | clean (failure hadn't fired yet) |
+| (default) | 1.5M | TEST FAILED sim 1,000,195 (watchdog) |
+| (default) | 47.5K | TEST FAILED sim 46665 (sentinel) |
+| INIT_ZERO=1 | 500K | clean (no failure in window) |
+| INIT_ZERO=1 | 3M | TEST FAILED sim 1,000,195 (watchdog) |
+
+So both with and without INIT_ZERO, c910 memcpy eventually hits the
+1M watchdog. The cmark canary memo claims cmark with INIT_ZERO=1
+sustains 46K+ retires through sim 1.5M — memcpy is different and
+INIT_ZERO alone is insufficient.
+
+The memcpy-specific 1M stall remains unfixed. Per round 25's live
+retire tracer, the loop body 0x710-0x716 retires continuously through
+at least sim 50K (with INIT_ZERO=1, the wb values progress correctly:
+ptr 0xc368→0xc380, counter 0xda→0xe0). The stall must happen later
+in the program (post-memcpy-loop or in a later phase) and is the
+real remaining bug.
+
+The 22+ rounds of IFU/IBUF investigation below were chasing two
+separate red herrings: the "PC 0x712 missing" retire-log artifact
+(round 22) and the precode/IBUF cone-of-influence work (rounds
+23-24). The five IFU/IBUF synth tests committed during this session
+remain as regression guards.
 
 ---
 
