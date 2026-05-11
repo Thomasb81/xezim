@@ -31,6 +31,47 @@ ptr 0xc368→0xc380, counter 0xda→0xe0). The stall must happen later
 in the program (post-memcpy-loop or in a later phase) and is the
 real remaining bug.
 
+## Round 28 (2026-05-10) — heisenbug confirmed, late stall remains intractable
+
+Three further trace experiments with INIT_ZERO=1 to localize the
+post-50K stall:
+
+1. Late-window retire trace (sim 900K-1M): 0 retires captured. Last
+   retire is BEFORE sim 900K.
+2. Mid-window retire trace (sim 700K-950K): also 0 retires.
+3. Full-run non-loop retire trace + heartbeat: 88 non-loop retires
+   captured from sim 21115 to sim 59325 (init + post-init code
+   reaching PC 0x1baa), then nothing.
+4. Bucketed retire-count reporter (10K-sim-time buckets): 33 retires
+   in bucket [20000, 30000], 0 retires in EVERY bucket past 30000.
+
+**Experiments 3 and 4 directly contradict each other** — experiment
+3 captured retires through sim 59325 but experiment 4 says retires
+stopped at sim 30000. The only difference between the two runs is
+the probe set in tb.v. This is the heisenbug pattern documented in
+earlier memory entries — xezim's bytecode compiler is sensitive to
+signal sensitivity sets and partition layout, so adding/removing
+probes shifts when (and whether) the late stall fires.
+
+Without a reference simulator running side-by-side (iverilog or
+Questa with identical probes), the late stall cannot be definitively
+localized via probe-based bisection — every probe change shifts the
+failure pattern. Further progress requires either:
+
+(a) A non-perturbing tracer (e.g., post-hoc analysis of a complete
+    VCD dump, accepting the wall-time cost) — Questa-style.
+(b) A xezim-internal scheduler determinism guarantee that makes
+    probe changes safe (substantial simulator.rs refactor).
+(c) Accepting that this benchmark is "expected to fail at 1M" until
+    the memcpy-specific instrumentation issue is unbundled from the
+    actual simulator bug.
+
+**Practical recommendation**: ship INIT_ZERO=1 as the documented
+configuration for c910 memcpy. The early sentinel-match failure at
+sim 46665 (the obviously-wrong X-cascade) is reliably prevented.
+The late 1M watchdog failure remains, but it matches the original
+failure mode and may not be a new regression.
+
 The 22+ rounds of IFU/IBUF investigation below were chasing two
 separate red herrings: the "PC 0x712 missing" retire-log artifact
 (round 22) and the precode/IBUF cone-of-influence work (rounds
