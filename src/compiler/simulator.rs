@@ -7312,6 +7312,42 @@ impl Simulator {
         }
     }
 
+    /// Drain every process scheduled at `self.time` in the event_queue,
+    /// running each to its next suspension point. Used inside
+    /// `drain_edge_cascade` to honour the IEEE 1800-2017 §4.4.5 active-
+    /// region drain: after check_edges has woken event_waiters at the
+    /// current time, their continuations must run BEFORE apply_nba so
+    /// they see the pre-NBA state of this cycle's NBA-driven signals.
+    ///
+    /// The loop body mirrors the main event_loop's batch-drain shape:
+    /// pop a batch, run each (pid, stmts), re-fetch new processes at the
+    /// same time (a continuation may itself schedule more at self.time),
+    /// loop until quiescent.
+    fn drain_active_processes_at_current_time(&mut self) {
+        while self.event_queue.next_time() == Some(self.time) {
+            let mut batch = self.event_queue.remove(self.time);
+            while !batch.is_empty() {
+                if self.finished {
+                    return;
+                }
+                let (pid, stmts) = batch.remove(0);
+                let t_now = self.time;
+                for (p, s) in batch.drain(..) {
+                    self.event_queue.schedule(t_now, p, s);
+                }
+                self.run_scheduled_process(pid, &stmts);
+                if !self.is_pid_suspended(pid) {
+                    self.child_finished(pid);
+                }
+                if self.event_queue.next_time() == Some(self.time) {
+                    batch = self.event_queue.remove(self.time);
+                } else {
+                    batch.clear();
+                }
+            }
+        }
+    }
+
     /// Drain pending NBAs and repeatedly snapshot → apply_nba → settle →
     /// check_edges until a round produces neither new edges nor new NBAs.
     ///
@@ -9224,6 +9260,17 @@ impl Simulator {
         self.prof_edge_waiters += _t_w.elapsed().as_nanos() as u64;
         self.edge_blocks = blocks;
         self.in_edge_block = false;
+
+        // IEEE 1800-2017 §4.4.5 active-region drain: run event_waiter
+        // continuations that we just scheduled at self.time IMMEDIATELY,
+        // so their NBA pushes join the same `nba_fast` queue as the
+        // edge_blocks just fired. The next `apply_nba` then commits both
+        // together. Without this, waiter bodies run in the next event_loop
+        // iteration AFTER the cascade's `apply_nba` has committed edge_block
+        // NBAs, and reads post-NBA values from the current cycle — the
+        // "NBA leak into active region" bug on `initial begin forever
+        // @(posedge clk) … end` patterns.
+        self.drain_active_processes_at_current_time();
     }
 
     fn settle_combinatorial(&mut self) {
