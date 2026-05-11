@@ -223,6 +223,38 @@ the late-stall fix. The 22+ rounds of IFU/IBUF cone-of-influence
 work confirmed the IFU is correct; the bug is in the AXI/BIU
 write subsystem at the vector-to-scalar phase transition.
 
+### Round 30 extended — slave probe + partition-by-clock attempts
+
+**Slave FSM probes** (added cur_state/next_state/wready/awlen/etc.
+to dump): demonstrated heisenbug — adding internal slave probes
+shifted the failure point earlier (last event at sim 46645 vs
+sim 58335 without). Slave's `cur_state` cycled IDLE→WRITE→
+WRITE_RESP→IDLE normally up to sim 46645 then stopped. Probes
+removed.
+
+**XEZIM_PARTITION_BY_CLOCK=1** (8 clock-partition dispatch):
+exit=0, still hangs at sim 58335 wvalid=1. Partitioning doesn't
+help.
+
+**Memory-map check**: SRAM_START=0x0, SRAM_END=0x01ff_ffff (32MB).
+Both the 122 buffer writes (0xcd60-0xd000) and the post-loop
+writes (0x1b40+) route to the same slave 0 via interconnect
+wsel0. No slave-routing discontinuity at the failure transaction.
+
+**AXI handshake review**: `biu_pad_bready` is constant 1 after
+init — master always ready. The slave's bvalid simply doesn't
+pulse for write 123 even though wvalid is held high.
+
+The actual fix requires either understanding the heisenbug
+mechanism (xezim's bytecode compile sensitivity to specific
+probe sets perturbing scheduling order on event-island convergence)
+or a non-perturbing diagnostic mechanism that doesn't shift the
+failure point. Neither is achievable in remaining session time.
+
+**Final ship configuration**: `XEZIM_INIT_ZERO=1` for partial fix.
+Full TEST PASSED for c910 memcpy remains an open issue tracked
+in `MEMORY.md` (project_c910_memcpy_divuw_dispatch.md).
+
 The 22+ rounds of IFU/IBUF investigation below were chasing two
 separate red herrings: the "PC 0x712 missing" retire-log artifact
 (round 22) and the precode/IBUF cone-of-influence work (rounds
