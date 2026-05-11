@@ -301,6 +301,48 @@ The c910 memcpy bug remains unfixed. The shipping configuration is
 together get xezim through more of the test than vanilla but still
 hit the AXI handshake stall well before completion.
 
+## Round 33 (2026-05-10) — VCD diff (xezim vs iverilog) reveals pipeline stall
+
+Direct signal-by-signal diff between xezim (INIT_ZERO + NBA fix) and
+iverilog (TEST PASSED) on c910 memcpy.
+
+**rbus_pipe0_wb_data**: ALL 304 xezim retire-writeback events
+match iverilog **EXACTLY** through t=47215ns (the last xezim event).
+Including the memcpy destination pointer progressing through
+0xc3b8 → 0xc3bc → 0xc3c0 → 0xc3c4 → 0xc3c8.
+
+**AXI handshake (biu_pad_awvalid, biu_pad_wvalid)**: every pulse pair
+in both sims matches exactly through:
+- awvalid pulses: 46575, 46785, 46995, 47215, 47425, 47635 (xezim's last)
+- wvalid pulses:  46595, 46805, 47015, 47235, 47445, 47655 (xezim's last)
+- Final wvalid=0 deassertion at t=47695 (xezim's final event)
+
+**xezim's LAST event is at sim 47695ns** — a clean wvalid deassertion
+completing the previous transaction. After that: complete CPU
+silence. Simulation continues advancing wall time (reaches sim
+110000) but NO signal changes occur. The CPU pipeline is frozen.
+
+iverilog at sim 47855ns issues the NEXT awvalid (the 8th transaction
+of this batch). xezim never does.
+
+**Conclusion**: bug is NOT in the AXI slave or interconnect. The 7
+transactions before the freeze succeeded normally. The bug is in the
+CPU's pipeline: after the 7th write completes, xezim's CPU fails to
+issue the next instruction's AXI write. iverilog does.
+
+The pipeline stall is somewhere in the IFU→IDU→IU→LSU→BIU path.
+Some combinational dependency between AXI completion and next-cycle
+issue isn't being tracked correctly by xezim's bytecode-compiled
+event-island convergence.
+
+**This is the most-precise localization to date**: bug is in xezim's
+simulation of how AXI bvalid completion feeds back into the CPU's
+LSU/WMB drain → ROB retire → IFU next-PC-fetch chain. The chain is
+correct for 7 cycles, then breaks. May be a signal-sensitivity issue
+where a specific combinational path doesn't get re-evaluated after
+the 7th completion. Investigation handed off — not resolvable in
+remaining session time.
+
 The 22+ rounds of IFU/IBUF investigation below were chasing two
 separate red herrings: the "PC 0x712 missing" retire-log artifact
 (round 22) and the precode/IBUF cone-of-influence work (rounds
