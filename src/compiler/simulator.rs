@@ -10568,6 +10568,16 @@ impl Simulator {
                         _ => unreachable!(),
                     }
                 }
+                // Logical implication / equivalence (IEEE §11.4.7).
+                if matches!(op, BinaryOp::LogImplies | BinaryOp::LogEquiv) {
+                    let l = self.eval_expr_ctx(left, ctx_width);
+                    let r = self.eval_expr_ctx(right, ctx_width);
+                    return match op {
+                        BinaryOp::LogImplies => l.logic_impl(&r),
+                        BinaryOp::LogEquiv => l.logic_equiv(&r),
+                        _ => unreachable!(),
+                    };
+                }
                 // Unpacked array equality/inequality
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
                     if let (ExprKind::Ident(lhier), ExprKind::Ident(rhier)) =
@@ -10668,6 +10678,8 @@ impl Simulator {
                     BinaryOp::BitXnor => wl.bitwise_xor(&wr).bitwise_not(),
                     BinaryOp::LogAnd => wl.logic_and(&wr),
                     BinaryOp::LogOr => wl.logic_or(&wr),
+                    BinaryOp::LogImplies => wl.logic_impl(&wr),
+                    BinaryOp::LogEquiv => wl.logic_equiv(&wr),
                     BinaryOp::Eq => wl.is_equal(&wr),
                     BinaryOp::Neq => wl.is_not_equal(&wr),
                     BinaryOp::CaseEq => wl.case_eq(&wr),

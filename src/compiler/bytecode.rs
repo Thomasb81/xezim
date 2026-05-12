@@ -965,7 +965,8 @@ impl<'a> BytecodeCompiler<'a> {
                     BinaryOp::Eq | BinaryOp::Neq
                     | BinaryOp::CaseEq | BinaryOp::CaseNeq
                     | BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
-                    | BinaryOp::LogAnd | BinaryOp::LogOr);
+                    | BinaryOp::LogAnd | BinaryOp::LogOr
+                    | BinaryOp::LogImplies | BinaryOp::LogEquiv);
                 let sub_ctx = if is_self_determined {
                     let lw = self.expr_max_width(left);
                     let rw = self.expr_max_width(right);
@@ -996,6 +997,22 @@ impl<'a> BytecodeCompiler<'a> {
                     BinaryOp::BitXnor => self.emit(Insn::BitXnor(dest, l, r)),
                     BinaryOp::LogAnd => self.emit(Insn::LogAnd(dest, l, r)),
                     BinaryOp::LogOr => self.emit(Insn::LogOr(dest, l, r)),
+                    // a -> b  ==  !a || b   (IEEE 1800-2017 §11.4.7)
+                    BinaryOp::LogImplies => {
+                        self.emit(Insn::LogNot(dest, l));
+                        self.emit(Insn::LogOr(dest, dest, r));
+                    }
+                    // a <-> b  ==  (!a || b) && (!b || a)
+                    BinaryOp::LogEquiv => {
+                        let nl = self.alloc_reg();
+                        let nr = self.alloc_reg();
+                        let t1 = self.alloc_reg();
+                        self.emit(Insn::LogNot(nl, l));
+                        self.emit(Insn::LogNot(nr, r));
+                        self.emit(Insn::LogOr(t1, nl, r));
+                        self.emit(Insn::LogOr(dest, nr, l));
+                        self.emit(Insn::LogAnd(dest, t1, dest));
+                    }
                     BinaryOp::Eq => self.emit(Insn::Eq(dest, l, r)),
                     BinaryOp::Neq => self.emit(Insn::Neq(dest, l, r)),
                     BinaryOp::CaseEq => self.emit(Insn::CaseEq(dest, l, r)),
@@ -1824,7 +1841,8 @@ impl<'a> BytecodeCompiler<'a> {
                     BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq
                     | BinaryOp::CaseNeq
                     | BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
-                    | BinaryOp::LogAnd | BinaryOp::LogOr) {
+                    | BinaryOp::LogAnd | BinaryOp::LogOr
+                    | BinaryOp::LogImplies | BinaryOp::LogEquiv) {
                     1
                 } else {
                     self.expr_max_width(left).max(self.expr_max_width(right))
