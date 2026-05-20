@@ -16363,12 +16363,15 @@ impl Simulator {
             self.set_queue_size(obj_name, indices.len() as u64);
             return Some(Value::zero(32));
         }
-        if mname == "find"
+        if (mname == "find"
             || mname == "find_first"
             || mname == "find_last"
             || mname == "find_index"
             || mname == "find_first_index"
-            || mname == "find_last_index"
+            || mname == "find_last_index")
+            && (self.module.arrays.contains_key(obj_name)
+                || self.is_associative_array(obj_name)
+                || self.module.dynamic_arrays.contains(obj_name))
         {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let mut results = Vec::new();
@@ -18418,6 +18421,15 @@ impl Simulator {
                             continue;
                         }
                     };
+                    // A function may set its result via the implicit
+                    // return variable named after the function (`f = ...`)
+                    // instead of an explicit `return`.
+                    let fn_ret_name: Option<String> = match &method.kind {
+                        ClassMethodKind::Function(f) => {
+                            Some(f.name.name.name.clone())
+                        }
+                        _ => None,
+                    };
                     for (i, port) in ports.iter().enumerate() {
                         let val = if i < args.len() {
                             self.eval_expr(&args[i])
@@ -18425,6 +18437,9 @@ impl Simulator {
                             Value::zero(32)
                         };
                         locals.insert(port.name.name.clone(), val);
+                    }
+                    if let Some(rn) = &fn_ret_name {
+                        locals.entry(rn.clone()).or_insert_with(|| Value::zero(32));
                     }
                     self.this_stack.push(Some(handle));
                     self.local_stack.push(locals);
@@ -18437,7 +18452,14 @@ impl Simulator {
                     }
                     self.break_flag = false;
                     self.class_context_stack.pop();
-                    let ret = self.return_value.take().unwrap_or(Value::zero(32));
+                    let implicit = fn_ret_name.as_ref().and_then(|rn| {
+                        self.local_stack.last().and_then(|m| m.get(rn).cloned())
+                    });
+                    let ret = self
+                        .return_value
+                        .take()
+                        .or(implicit)
+                        .unwrap_or(Value::zero(32));
                     self.local_stack.pop();
                     self.this_stack.pop();
                     return ret;
