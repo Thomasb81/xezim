@@ -16686,6 +16686,42 @@ impl Simulator {
             {
                 return Value::zero(32);
             }
+            // UVM factory bridge: `factory.create_component_by_name(type, ...)`
+            // / `create_object_by_name`. The real factory's name->proxy map
+            // is empty because per-specialization registry registration
+            // (`uvm_component_registry#(T,name)::me`) needs parameterized-
+            // class specialization, which xezim does not yet model. As a
+            // bounded bridge, resolve the requested type name directly
+            // against the elaborated classes and construct it. Component
+            // ctor is `new(name, parent)`; object ctor is `new(name)`.
+            if real_uvm
+                && (mname == "create_component_by_name"
+                    || mname == "create_object_by_name")
+            {
+                let type_name = args
+                    .first()
+                    .map(|a| self.eval_expr(a).to_sv_string())
+                    .unwrap_or_default();
+                if let Some(cd) = self.module.classes.get(&type_name).cloned() {
+                    let ctor_args: Vec<Expression> =
+                        if mname == "create_component_by_name" {
+                            // (req_type, parent_inst_path, name, parent)
+                            let mut v = Vec::new();
+                            if let Some(n) = args.get(2) {
+                                v.push(n.clone());
+                            }
+                            if let Some(p) = args.get(3) {
+                                v.push(p.clone());
+                            }
+                            v
+                        } else {
+                            // (req_type, parent_inst_path, name)
+                            args.get(2).cloned().into_iter().collect()
+                        };
+                    return self.instantiate_class(&cd, &ctor_args);
+                }
+                return Value::zero(32);
+            }
             if mname == "write" && !real_uvm {
                 // Call write on scoreboard
                 let mut sb_handles = Vec::new();
