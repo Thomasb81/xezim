@@ -57,3 +57,55 @@ SUMMARY
   uvm_root + the full phase schedule + the uvm_test_top component.
 - NEXT: the phase-execution engine (m_run_phases, fork/join_none
   phase runner, wait(m_phase_all_done)).
+
+================================================================
+SECOND 5-ROUND PASS — phase-execution engine
+================================================================
+
+ROUND 1 — does m_run_phases / execute_phase run?  NO.
+- Traced exec_method_in_class_hierarchy for the phase-execution
+  methods. None of m_run_phases / execute_phase / build_phase / 
+  run_phase ever execute.
+
+ROUND 2 — wait() is non-blocking in nested calls
+- The StatementKind::Wait exec_statement arm only evaluates the
+  condition once: true -> run body, false -> fall through. It does
+  NOT suspend.
+- A proper blocking Wait exists, but only at process top-level
+  (run_process_stmts). `wait` reached through nested task/method
+  calls (as in uvm_root::run_test) uses the non-blocking arm.
+
+ROUND 3 — run_events_until never called
+- `#delay` mid-task drains the event queue via run_events_until,
+  which would run the forked m_run_phases. But the trace shows
+  run_events_until is never invoked during the UVM run.
+- The fork IS scheduled: "ParBlock JoinNone scheduled pids=[1] at t=0".
+
+ROUND 4 — execution does NOT stop at the fork
+- After the fork: break=false, finished=false, no return_value.
+- So run_test keeps going past the fork.
+
+ROUND 5 — run_test runs straight through, abandoning the phase runner
+- run_test executes all ~22 body statements in sequence and returns;
+  the forked m_run_phases (pid 1, queued at t=0) is never run.
+- Neither `#0` (no Delay/run_events_until trace) nor
+  `wait(m_phase_all_done==1)` yields control to the scheduler.
+
+ROOT CAUSE (architectural)
+- uvm_root::run_test relies on cooperative concurrency:
+    fork m_run_phases join_none;  #0;  wait(m_phase_all_done==1);
+  This needs process SUSPENSION from arbitrary nested-call depth —
+  a `wait`/`#0` deep inside task/method calls must suspend the whole
+  call stack and resume when the scheduler says so.
+- xezim suspends a process only at its top-level statement list
+  (run_process_stmts). Blocking constructs reached through nested
+  calls fall through. This is the simulation concurrency kernel —
+  a major change (coroutine/continuation model or a re-entrant
+  scheduler that can unwind+restore the interpreter call stack).
+
+OUTCOME
+- This pass was investigation only; no code change kept (the debug
+  traces were reverted). Tree/regression suites remain green
+  (49/49 sim, uvm_integration).
+- The previous pass's two fixes (implicit function-return variable,
+  array-.find() gating) stand and remain the last committed state.
