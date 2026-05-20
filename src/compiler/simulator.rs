@@ -13356,11 +13356,16 @@ impl Simulator {
                 declarators,
                 ..
             } => {
-                let w = super::elaborate::resolve_type_width(
+                let w0 = super::elaborate::resolve_type_width(
                     data_type,
                     Some(&self.module.parameters),
                     Some(&self.module.typedefs),
                 );
+                // A class-handle-typed variable holds a 32-bit handle, not
+                // the class's content layout (which `resolve_type_width`
+                // may report as 0 for a class with only methods/statics).
+                // A 0 width is never valid for a variable.
+                let w = if w0 == 0 { 32 } else { w0 };
                 let two_state = super::elaborate::is_type_two_state(data_type);
                 let default_v = if two_state {
                     Value::zero(w)
@@ -16443,6 +16448,22 @@ impl Simulator {
         }
     }
 
+    /// Does `class_name` or any ancestor declare a method `name`?
+    fn class_has_method(&self, class_name: &str, name: &str) -> bool {
+        let mut cur = Some(class_name.to_string());
+        while let Some(cname) = cur {
+            if let Some(cd) = self.module.classes.get(&cname) {
+                if cd.methods.contains_key(name) {
+                    return true;
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
     /// Is `name` a static method of `class_name` or any ancestor?
     fn is_static_method(&self, class_name: &str, name: &str) -> bool {
         let mut cur = Some(class_name.to_string());
@@ -16936,6 +16957,22 @@ impl Simulator {
             // DPI import call
             if let Some(v) = self.exec_dpi_import_call(name, args) {
                 return v;
+            }
+            // Unqualified call inside a class method — resolve to a method
+            // of the current class context. Dispatches virtually through
+            // `this` when in an instance method, or as a static method
+            // when there is no instance handle.
+            if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                if self.class_has_method(&ctx, name) {
+                    let this_handle =
+                        self.this_stack.last().copied().flatten().unwrap_or(0);
+                    if this_handle != 0 {
+                        return self.exec_method_call(this_handle, name, args);
+                    }
+                    if let Some(v) = self.exec_static_method(&ctx, name, args) {
+                        return v;
+                    }
+                }
             }
             // Module-level function call
             if let Some(fd) = self.module.functions.get(name).cloned() {
