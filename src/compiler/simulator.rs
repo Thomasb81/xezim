@@ -10526,59 +10526,66 @@ impl Simulator {
                 succ_entries[pos] = b;
                 succ_cursor[a as usize] += 1;
             }
-            // Kahn's: pick zero-indegree, remove. If cycle, pick lowest indegree.
+            // Kahn's topological sort with a degree-bucketed selector. Always
+            // emits the lowest-indegree unplaced node: indegree 0 = a normal
+            // ready node; indegree >0 only when the remaining graph is fully
+            // cyclic, where the min-indegree node is the cheapest cycle edge to
+            // break (fewest residual back-edges → fewest extra settle passes).
+            //
+            // The previous version scanned all n entries for the min on every
+            // stall (O(n) per cycle break → O(n²) on designs with many small
+            // combinational loops). Buckets give the same min-indegree choice
+            // in O(V+E): `buckets[d]` holds candidates believed to have indegree
+            // `d`; entries are lazily invalidated (a node placed, or whose
+            // indegree has since dropped, is skipped on pop). `min_d` tracks the
+            // lowest bucket that may hold a live node and only moves down when a
+            // decrement creates a lower-degree node.
             let mut new_order: Vec<usize> = Vec::with_capacity(n);
             let mut placed = vec![false; n];
-            let mut ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+            let max_d = indeg.iter().copied().max().unwrap_or(0);
+            let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); max_d + 1];
+            for i in 0..n {
+                buckets[indeg[i]].push(i as u32);
+            }
+            let mut min_d = 0usize;
             while new_order.len() < n {
-                if let Some(a) = ready.pop() {
-                    if placed[a] {
-                        continue;
-                    }
-                    placed[a] = true;
-                    new_order.push(a);
-                    let lo = succ_offsets[a] as usize;
-                    let hi = succ_offsets[a + 1] as usize;
-                    for &b_u32 in &succ_entries[lo..hi] {
-                        let b = b_u32 as usize;
-                        if placed[b] {
-                            continue;
-                        }
-                        if indeg[b] > 0 {
-                            indeg[b] -= 1;
-                        }
-                        if indeg[b] == 0 {
-                            ready.push(b);
+                // Advance to the lowest bucket holding a live (unplaced,
+                // current-indegree-matches) node, discarding stale entries.
+                let mut a = usize::MAX;
+                while min_d <= max_d {
+                    while let Some(&top) = buckets[min_d].last() {
+                        let t = top as usize;
+                        if placed[t] || indeg[t] != min_d {
+                            buckets[min_d].pop();
+                        } else {
+                            a = t;
+                            buckets[min_d].pop();
+                            break;
                         }
                     }
-                } else {
-                    // Cycle: pick any remaining node with min indegree.
-                    let mut best = usize::MAX;
-                    let mut best_d = usize::MAX;
-                    for i in 0..n {
-                        if !placed[i] && indeg[i] < best_d {
-                            best_d = indeg[i];
-                            best = i;
-                        }
-                    }
-                    if best == usize::MAX {
+                    if a != usize::MAX {
                         break;
                     }
-                    placed[best] = true;
-                    new_order.push(best);
-                    indeg[best] = 0;
-                    let lo = succ_offsets[best] as usize;
-                    let hi = succ_offsets[best + 1] as usize;
-                    for &b_u32 in &succ_entries[lo..hi] {
-                        let b = b_u32 as usize;
-                        if placed[b] {
-                            continue;
-                        }
-                        if indeg[b] > 0 {
-                            indeg[b] -= 1;
-                        }
-                        if indeg[b] == 0 {
-                            ready.push(b);
+                    min_d += 1;
+                }
+                if a == usize::MAX {
+                    break;
+                }
+                placed[a] = true;
+                new_order.push(a);
+                let lo = succ_offsets[a] as usize;
+                let hi = succ_offsets[a + 1] as usize;
+                for &b_u32 in &succ_entries[lo..hi] {
+                    let b = b_u32 as usize;
+                    if placed[b] {
+                        continue;
+                    }
+                    if indeg[b] > 0 {
+                        indeg[b] -= 1;
+                        let nb = indeg[b];
+                        buckets[nb].push(b as u32);
+                        if nb < min_d {
+                            min_d = nb;
                         }
                     }
                 }
