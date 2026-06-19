@@ -28,6 +28,7 @@ cranelift-native = { version = "0.109", optional = true }
 # (Ubuntu/Debian: `apt install llvm-18-dev`). Heavier compile-time
 # cost than cranelift but produces tighter machine code.
 inkwell = { version = "0.5", features = ["llvm18-0"], optional = true }
+fst-writer = "0.3"
 
 [build-dependencies]
 cc = "1"

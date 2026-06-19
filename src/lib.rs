@@ -29,9 +29,12 @@ pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, Stri
         None,
         None,
         &[],
-        false,
         &[],
         1,
+        None,
+        &[],
+        0,
+        u64::MAX,
         None,
         &[],
         None,
@@ -54,11 +57,14 @@ pub fn simulate_multi(
     sdf_file: Option<&str>,
     sdf_select: Option<xezim_core::sdf::DelaySelect>,
     defines: &[(String, Option<String>)],
-    aitrace: bool,
     plusargs: &[String],
     threads: usize,
     xtrace_file: Option<&str>,
     xtrace_scopes: &[String],
+    xtrace_from_ns: u64,
+    xtrace_to_ns: u64,
+    fst_file: Option<&str>,
+    fst_scopes: &[String],
     emit_hypergraph: Option<&str>,
     load_partition: Option<&str>,
     write_profile: Option<&str>,
@@ -88,9 +94,12 @@ pub fn simulate_multi(
         sim.settle_limit = limit;
     }
     sim.activity_mon = activity_mon;
-    sim.aitrace_mode = aitrace;
     sim.xtrace_file = xtrace_file.map(|s| s.to_string());
     sim.xtrace_scopes = xtrace_scopes.to_vec();
+    sim.xtrace_from_ns = xtrace_from_ns;
+    sim.xtrace_to_ns = xtrace_to_ns;
+    sim.fst_file = fst_file.map(|s| s.to_string());
+    sim.fst_scopes = fst_scopes.to_vec();
     sim.set_plusargs(plusargs);
     sim.set_threads(threads);
 

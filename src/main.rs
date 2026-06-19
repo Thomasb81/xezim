@@ -76,12 +76,16 @@ fn print_usage() {
     eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
-    eprintln!("                   n>=2 offloads VCD/AITRACE dumping and stdout");
-    eprintln!("                   writes to background threads.");
+    eprintln!("                   n>=2 offloads stdout writes to a background thread.");
     eprintln!("  --xtrace <file>  Emit XTrace v1.0 dump to <file>");
     eprintln!("                   (minimal profile: dictionary + signal deltas).");
     eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
     eprintln!("  --xtrace-scope <hier>  Restrict the XTrace dump to signals under <hier>");
+    eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
+    eprintln!("  --xtrace-from <ns>  Only dump XTrace changes at/after this time (ns).");
+    eprintln!("  --xtrace-to <ns>    Stop the XTrace dump after this time (ns).");
+    eprintln!("  --fst <file>     Emit an FST (GTKWave binary) waveform dump to <file>.");
+    eprintln!("  --fst-scope <hier>  Restrict the FST dump to signals under <hier>");
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
     eprintln!("  --sv2017         Parse as IEEE 1800-2017 (default is 1800-2023)");
     eprintln!("  --sv2023         Parse as IEEE 1800-2023 (default; kept for back-compat)");
@@ -410,9 +414,12 @@ fn main() {
     let mut activity_mon = false;
     let mut sdf_file: Option<String> = None;
     let mut sdf_select: Option<xezim::compiler::sdf::DelaySelect> = None;
-    let mut aitrace = false;
     let mut xtrace_file: Option<String> = None;
     let mut xtrace_scopes: Vec<String> = Vec::new();
+    let mut xtrace_from_ns: u64 = 0;
+    let mut xtrace_to_ns: u64 = u64::MAX;
+    let mut fst_file: Option<String> = None;
+    let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
@@ -640,9 +647,6 @@ fn main() {
             "--sdf-max" => {
                 sdf_select = Some(xezim::compiler::sdf::DelaySelect::Max);
             }
-            "--aitrace" => {
-                aitrace = true;
-            }
             "--xtrace" => {
                 i += 1;
                 if i < args.len() {
@@ -660,6 +664,42 @@ fn main() {
             }
             _ if arg.starts_with("--xtrace-scope=") => {
                 xtrace_scopes.push(arg["--xtrace-scope=".len()..].to_string());
+            }
+            "--xtrace-from" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_from_ns = args[i].parse().unwrap_or(0);
+                }
+            }
+            _ if arg.starts_with("--xtrace-from=") => {
+                xtrace_from_ns = arg["--xtrace-from=".len()..].parse().unwrap_or(0);
+            }
+            "--xtrace-to" => {
+                i += 1;
+                if i < args.len() {
+                    xtrace_to_ns = args[i].parse().unwrap_or(u64::MAX);
+                }
+            }
+            _ if arg.starts_with("--xtrace-to=") => {
+                xtrace_to_ns = arg["--xtrace-to=".len()..].parse().unwrap_or(u64::MAX);
+            }
+            "--fst" => {
+                i += 1;
+                if i < args.len() {
+                    fst_file = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--fst=") => {
+                fst_file = Some(arg["--fst=".len()..].to_string());
+            }
+            "--fst-scope" => {
+                i += 1;
+                if i < args.len() {
+                    fst_scopes.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--fst-scope=") => {
+                fst_scopes.push(arg["--fst-scope=".len()..].to_string());
             }
             "--sim_debug" => {
                 sim_debug = true;
@@ -795,9 +835,12 @@ fn main() {
                             sim.settle_limit = limit;
                         }
                         sim.activity_mon = activity_mon;
-                        sim.aitrace_mode = aitrace;
                         sim.xtrace_file = xtrace_file.clone();
                         sim.xtrace_scopes = xtrace_scopes.clone();
+                        sim.xtrace_from_ns = xtrace_from_ns;
+                        sim.xtrace_to_ns = xtrace_to_ns;
+                        sim.fst_file = fst_file.clone();
+                        sim.fst_scopes = fst_scopes.clone();
                         sim.set_plusargs(&plusargs);
                         sim.set_threads(threads);
                         let compilation_start = std::time::Instant::now();
@@ -1051,11 +1094,14 @@ fn main() {
         sdf_file.as_deref(),
         sdf_select,
         &defines,
-        aitrace,
         &plusargs,
         threads,
         xtrace_file.as_deref(),
         &xtrace_scopes,
+        xtrace_from_ns,
+        xtrace_to_ns,
+        fst_file.as_deref(),
+        &fst_scopes,
         emit_hypergraph.as_deref(),
         load_partition.as_deref(),
         write_profile.as_deref(),

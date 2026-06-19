@@ -17,6 +17,10 @@ use crate::ast::types::{DataType, IntegerAtomType, PortDirection};
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 use xezim_core::hasher::{HashMap, HashSet};
+use fst_writer::{
+    FstBodyWriter, FstHeaderWriter, FstScopeType, FstSignalId, FstSignalType, FstVarDirection,
+    FstVarType,
+};
 use libffi::middle::{Arg, Cif, CodePtr, Type};
 use libloading::Library;
 use rand::SeedableRng;
@@ -1742,8 +1746,9 @@ pub struct Simulator {
     /// Per-traced-signal table: (signal_table index, output id code). Built
     /// once at dump start; the per-cycle loop walks just this vector instead
     /// of iterating the full id_to_name (36M entries on c910) and hashing
-    /// every name. Shared by the VCD and AITRACE paths.
-    vcd_trace: Vec<(usize, String)>,
+    /// every name. The identifier code is an `Arc<str>` so the VCD per-change
+    /// clone is a refcount bump, not a heap allocation.
+    vcd_trace: Vec<(usize, Arc<str>)>,
     vcd_enabled: bool,
     vcd_last_time: u64,
     /// Previous emitted value per entry in `vcd_trace` (parallel vector).
@@ -1753,7 +1758,7 @@ pub struct Simulator {
     /// When non-empty, only signals whose hierarchical name starts with one of
     /// these strings (or matches exactly) are emitted to the VCD.
     vcd_filter_scopes: Vec<String>,
-    /// Worker-thread count. >=2 routes VCD/AITRACE dumps through a
+    /// Worker-thread count. >=2 routes VCD dumps through a
     /// background writer thread (see vcd_sink::VcdSink).
     threads: usize,
     /// Persistent workers for XEZIM_DISPATCHER=pdes parallel edge dispatch.
@@ -1787,9 +1792,7 @@ pub struct Simulator {
     /// Buffered stdout sink for $display/$write. Lazily initialized on first
     /// write so threaded mode can be enabled by `set_threads` beforehand.
     stdout_sink: Option<super::stdout_sink::StdoutSink>,
-    /// AITRACE mode: when true, $dumpfile/$dumpvars emit AITRACE-T instead of VCD
-    pub aitrace_mode: bool,
-    /// XTrace dump state. Independent from VCD/AITRACE — can run alongside.
+    /// XTrace dump state. Independent from VCD — can run alongside.
     /// Set `xtrace_file` to enable. Emits the XTrace v1.0 "minimal" profile:
     /// dictionary + per-cycle signal deltas (VCD-equivalent payload). When the
     /// filename ends in `.zst`/`.zstd` the byte stream is zstd-compressed.
@@ -1803,6 +1806,31 @@ pub struct Simulator {
     /// Previous emitted value per entry in `xtrace_trace` (parallel vector).
     xtrace_prev_signals: Vec<Value>,
     xtrace_last_time: u64,
+    /// Change-emitting steps since the last durable flush of the XTrace
+    /// writer. Bounds how much trailing trace a crash/SIGKILL can lose
+    /// (the binary builds with `panic = "abort"`, so `Drop` does not run on
+    /// panic, and the memory watchdog SIGKILLs outright).
+    xtrace_dirty_steps: u32,
+    /// XTrace time window (#8) in nanoseconds, from `--xtrace-from`/`--xtrace-to`.
+    /// `xtrace_to_ns == u64::MAX` means no upper bound. Set by the CLI.
+    pub xtrace_from_ns: u64,
+    pub xtrace_to_ns: u64,
+    /// The same window converted to simulation ticks (tick_s units), cached at
+    /// dump start. `xtrace_to_t == u64::MAX` means unbounded.
+    xtrace_from_t: u64,
+    xtrace_to_t: u64,
+    /// FST dump state (GTKWave binary format via the `fst-writer` crate).
+    /// Independent of VCD/XTrace — enabled by `--fst <file>`.
+    pub fst_file: Option<String>,
+    /// Optional hierarchical scope filters for FST (same semantics as
+    /// `--xtrace-scope`): keep signals whose name equals or sits under a scope.
+    pub fst_scopes: Vec<String>,
+    /// The FST body writer (post-header phase). `None` until `fst_start_dump`.
+    fst_writer: Option<FstBodyWriter<std::io::BufWriter<std::fs::File>>>,
+    /// Compact per-net trace table: (signal_table index, FST signal id).
+    fst_trace: Vec<(usize, FstSignalId)>,
+    /// Previous emitted value per `fst_trace` entry (parallel vector).
+    fst_prev_signals: Vec<Value>,
     /// Pre-computed combinatorial entries with sensitivity sets.
     comb_entries: Vec<CombEntry>,
     /// Precomputed indices of comb_entries with has_unresolved_reads=true.
@@ -2803,13 +2831,22 @@ impl Simulator {
             prof_perlp_total_ns: 0,
             perlp_after: 0,
             stdout_sink: None,
-            aitrace_mode: false,
             xtrace_file: None,
             xtrace_scopes: Vec::new(),
             xtrace_writer: None,
             xtrace_trace: Vec::new(),
             xtrace_prev_signals: Vec::new(),
             xtrace_last_time: 0,
+            xtrace_dirty_steps: 0,
+            xtrace_from_ns: 0,
+            xtrace_to_ns: u64::MAX,
+            xtrace_from_t: 0,
+            xtrace_to_t: u64::MAX,
+            fst_file: None,
+            fst_scopes: Vec::new(),
+            fst_writer: None,
+            fst_trace: Vec::new(),
+            fst_prev_signals: Vec::new(),
             comb_entries: Vec::new(),
             comb_unresolved_idx: Vec::new(),
             comb_time0_idx: Vec::new(),
@@ -2937,7 +2974,7 @@ impl Simulator {
     }
 
     /// Configure the worker-thread count. `n >= 2` enables the background
-    /// VCD/AITRACE writer thread; `n == 1` keeps the dump path inline.
+    /// VCD writer thread; `n == 1` keeps the dump path inline.
     pub fn set_threads(&mut self, n: usize) {
         self.threads = n.max(1);
         self.pdes_worker_pool = None;
@@ -5498,6 +5535,9 @@ impl Simulator {
         if self.xtrace_file.is_some() {
             self.xtrace_start_dump();
         }
+        if self.fst_file.is_some() {
+            self.fst_start_dump();
+        }
         self.auto_partition_by_clock();
         self.compiled = true;
     }
@@ -7671,12 +7711,9 @@ impl Simulator {
             }
             self.finished = was_finished;
         }
-        if self.aitrace_mode {
-            self.aitrace_finish();
-        } else {
-            self.vcd_finish();
-        }
+        self.vcd_finish();
         self.xtrace_finish();
+        self.fst_finish();
         if std::env::var("XEZIM_RS_STATS").is_ok() {
             xezim_core::value::Value::dump_range_select_stats();
         }
@@ -11928,13 +11965,12 @@ impl Simulator {
         self.drain_reactive_region();
         self.check_monitor();
         self.drain_pending_strobes();
-        if self.aitrace_mode {
-            self.aitrace_write_changes();
-        } else {
-            self.vcd_write_changes();
-        }
+        self.vcd_write_changes();
         if self.xtrace_writer.is_some() {
             self.xtrace_write_changes();
+        }
+        if self.fst_writer.is_some() {
+            self.fst_write_changes();
         }
         self.loop_iters += 1;
     }
@@ -21772,23 +21808,9 @@ impl Simulator {
             "$dumpfile" => {
                 if let Some(arg) = args.first() {
                     if let ExprKind::StringLiteral(s) = &arg.kind {
-                        if self.aitrace_mode {
-                            // Replace .vcd extension with .aitrace
-                            let name = if s.ends_with(".vcd") {
-                                format!("{}.aitrace", &s[..s.len() - 4])
-                            } else {
-                                format!("{}.aitrace", s)
-                            };
-                            self.vcd_file = Some(name);
-                        } else {
-                            self.vcd_file = Some(s.clone());
-                        }
+                        self.vcd_file = Some(s.clone());
                     } else {
-                        self.vcd_file = Some(if self.aitrace_mode {
-                            "dump.aitrace".to_string()
-                        } else {
-                            "dump.vcd".to_string()
-                        });
+                        self.vcd_file = Some("dump.vcd".to_string());
                     }
                 }
             }
@@ -21811,11 +21833,7 @@ impl Simulator {
                     }
                 }
                 self.vcd_filter_scopes = filter_scopes;
-                if self.aitrace_mode {
-                    self.aitrace_start_dump();
-                } else {
-                    self.vcd_start_dump();
-                }
+                self.vcd_start_dump();
             }
             "$dumpoff" => {
                 self.vcd_enabled = false;
@@ -23859,6 +23877,15 @@ impl Simulator {
         code
     }
 
+    /// Whether dump writers (VCD / XTrace) offload formatting and I/O
+    /// to a background thread. Decoupled from `--threads`: dump writing is pure
+    /// I/O and benefits even a single-threaded sim by moving ASCII formatting
+    /// and file writes off the simulation thread. Set `XEZIM_DUMP_INLINE=1` to
+    /// force inline writing (deterministic debugging, or to avoid the thread).
+    fn dump_writer_threaded(&self) -> bool {
+        std::env::var_os("XEZIM_DUMP_INLINE").is_none()
+    }
+
     /// Start VCD dumping: open file, write header, record initial values
     fn vcd_start_dump(&mut self) {
         self.sync_table_to_hashmap();
@@ -23873,7 +23900,14 @@ impl Simulator {
                 return;
             }
         };
-        let mut w = match super::vcd_sink::VcdSink::open_file(file, self.threads >= 2, None) {
+        // A '.zst'/'.zstd' filename suffix zstd-compresses the byte stream
+        // (same convention as the XTrace dump).
+        let zstd_level = if filename.ends_with(".zst") || filename.ends_with(".zstd") {
+            Some(3)
+        } else {
+            None
+        };
+        let mut w = match super::vcd_sink::VcdSink::open_file(file, self.dump_writer_threaded(), zstd_level) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Warning: cannot create VCD writer for '{}': {}", filename, e);
@@ -23888,14 +23922,18 @@ impl Simulator {
         let mut sig_names: Vec<String> = if self.vcd_filter_scopes.is_empty() {
             self.signals.keys().cloned().collect()
         } else {
-            let filters = self.vcd_filter_scopes.clone();
+            // Precompute each scope's "<scope>." prefix once (see XTrace note).
+            let filters: Vec<(&str, String)> = self
+                .vcd_filter_scopes
+                .iter()
+                .map(|f| (f.as_str(), format!("{}.", f)))
+                .collect();
             self.signals
                 .keys()
                 .filter(|name| {
-                    filters.iter().any(|f| {
-                        name.as_str() == f.as_str()
-                            || name.starts_with(&format!("{}.", f))
-                    })
+                    filters
+                        .iter()
+                        .any(|(f, fdot)| name.as_str() == *f || name.starts_with(fdot.as_str()))
                 })
                 .cloned()
                 .collect()
@@ -23904,16 +23942,23 @@ impl Simulator {
         eprintln!("[VCD] dumping {} signals (filter_scopes={})",
                   sig_names.len(), self.vcd_filter_scopes.len());
 
-        // Assign VCD identifier codes
-        let mut id_map = HashMap::default();
+        // Assign VCD identifier codes. Codes are Arc<str> so the per-change
+        // clone in vcd_write_changes is a refcount bump, not a heap alloc.
+        let mut id_map: HashMap<String, Arc<str>> = HashMap::default();
         for (idx, name) in sig_names.iter().enumerate() {
-            id_map.insert(name.clone(), Self::vcd_id_code(idx));
+            id_map.insert(name.clone(), Arc::from(Self::vcd_id_code(idx)));
         }
 
-        // Write VCD header
+        // Write VCD header. The timescale is derived from the sim's actual
+        // finest precision (tick_s), not hardcoded — a fixed "1ns" mislabels
+        // designs with finer precision (e.g. c910 runs at 100ps).
         let _ = writeln!(w, "$date\n  Simulation generated by xezim\n$end");
         let _ = writeln!(w, "$version\n  xezim 0.1\n$end");
-        let _ = writeln!(w, "$timescale\n  1ns\n$end");
+        let _ = writeln!(
+            w,
+            "$timescale\n  {}\n$end",
+            Self::xtrace_timescale_str(self.module.tick_s)
+        );
 
         // Build hierarchical signal tree from dotted names.
         // Signal "uut.cpu.reg_op1" → hierarchy ["uut", "cpu"], leaf "reg_op1"
@@ -23922,7 +23967,7 @@ impl Simulator {
         use std::collections::BTreeMap;
         struct ScopeNode {
             children: BTreeMap<String, ScopeNode>,
-            signals: Vec<(String, u32, String)>, // (leaf_name, width, vcd_id)
+            signals: Vec<(String, u32, Arc<str>)>, // (leaf_name, width, vcd_id)
         }
         impl ScopeNode {
             fn new() -> Self {
@@ -23987,7 +24032,7 @@ impl Simulator {
         // Build the compact per-cycle trace table: (signal_table index, code).
         // Initial values are written below and seeded into vcd_prev_signals so
         // the first vcd_write_changes only emits actual transitions.
-        let mut trace: Vec<(usize, String)> = Vec::with_capacity(sig_names.len());
+        let mut trace: Vec<(usize, Arc<str>)> = Vec::with_capacity(sig_names.len());
         let mut prev: Vec<Value> = Vec::with_capacity(sig_names.len());
 
         // Write initial values
@@ -24070,7 +24115,7 @@ impl Simulator {
         // Walk the compact trace table directly: no name hashing, and
         // vcd_prev_signals is a parallel Vec<Value> (index == position in
         // vcd_trace), so change detection is a single indexed compare.
-        let mut changes: Vec<(String, Value)> = Vec::new();
+        let mut changes: Vec<(Arc<str>, Value)> = Vec::new();
         for idx in 0..self.vcd_trace.len() {
             let id = self.vcd_trace[idx].0;
             let val = &self.signal_table[id];
@@ -24102,222 +24147,6 @@ impl Simulator {
             let _ = w.flush();
         }
         self.vcd_writer = None;
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    // AITRACE dump support (AITRACE-T text format, Level 0)
-    // ═══════════════════════════════════════════════════════════════
-
-    /// Format a Value as a hex string for AITRACE output.
-    /// Uses 0x prefix. X/Z bits produce masked hex like 0xXX0A.
-    fn aitrace_format_value(val: &Value) -> String {
-        if val.width == 1 {
-            return match val.bits_first() {
-                LogicBit::Zero => "0".to_string(),
-                LogicBit::One => "1".to_string(),
-                LogicBit::X => "X".to_string(),
-                LogicBit::Z => "Z".to_string(),
-            };
-        }
-        // Check if any X or Z bits
-        let mut has_xz = false;
-        for i in 0..val.width as usize {
-            match val.get_bit(i) {
-                LogicBit::X | LogicBit::Z => {
-                    has_xz = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        if has_xz {
-            // Emit nibble-by-nibble, replacing any nibble containing X/Z
-            let nibbles = (val.width as usize + 3) / 4;
-            let mut s = String::with_capacity(nibbles + 2);
-            s.push_str("0x");
-            let mut leading = true;
-            for nib in (0..nibbles).rev() {
-                let base = nib * 4;
-                let mut nibval = 0u8;
-                let mut nib_xz = false;
-                for b in 0..4 {
-                    let bit_idx = base + b;
-                    if bit_idx < val.width as usize {
-                        match val.get_bit(bit_idx) {
-                            LogicBit::One => {
-                                nibval |= 1 << b;
-                            }
-                            LogicBit::X | LogicBit::Z => {
-                                nib_xz = true;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                if nib_xz {
-                    leading = false;
-                    s.push('X');
-                } else if nibval != 0 || !leading || nib == 0 {
-                    leading = false;
-                    s.push(
-                        char::from_digit(nibval as u32, 16)
-                            .unwrap()
-                            .to_ascii_uppercase(),
-                    );
-                }
-            }
-            s
-        } else {
-            format!("0x{:X}", val.to_u64().unwrap_or(0))
-        }
-    }
-
-    /// Start AITRACE dump: open file, write header + dictionary + initial snapshot
-    fn aitrace_start_dump(&mut self) {
-        self.sync_table_to_hashmap();
-        let filename = self
-            .vcd_file
-            .clone()
-            .unwrap_or_else(|| "dump.aitrace".to_string());
-        let file = match std::fs::File::create(&filename) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Warning: cannot create AITRACE file '{}': {}", filename, e);
-                return;
-            }
-        };
-        let mut w = match super::vcd_sink::VcdSink::open_file(file, self.threads >= 2, None) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Warning: cannot create AITRACE writer for '{}': {}", filename, e);
-                return;
-            }
-        };
-
-        // Collect and sort signal names
-        let mut sig_names: Vec<String> = self.signals.keys().cloned().collect();
-        sig_names.sort();
-
-        // Build module hierarchy from dotted names
-        // e.g. "uut.cpu.pc" → module /testbench/uut/cpu, signal pc
-        let top_name = &self.module.name;
-        let mut modules: Vec<(String, String)> = Vec::new(); // (module_id, path)
-        let mut module_map: HashMap<String, String> = HashMap::default(); // path → module_id
-                                                                      // Always add top module
-        let top_path = format!("/{}", top_name);
-        modules.push(("m0".to_string(), top_path.clone()));
-        module_map.insert(top_path.clone(), "m0".to_string());
-
-        // Discover all module scopes from signal names
-        for name in &sig_names {
-            let parts: Vec<&str> = name.split('.').collect();
-            if parts.len() > 1 {
-                // Build scope path incrementally
-                let mut path = format!("/{}", top_name);
-                for part in &parts[..parts.len() - 1] {
-                    path = format!("{}/{}", path, part);
-                    if !module_map.contains_key(&path) {
-                        let mid = format!("m{}", modules.len());
-                        module_map.insert(path.clone(), mid.clone());
-                        modules.push((mid, path.clone()));
-                    }
-                }
-            }
-        }
-
-        // Assign signal IDs and build signal records
-        let mut id_map = HashMap::default();
-        let mut signal_records: Vec<String> = Vec::new();
-        for (idx, name) in sig_names.iter().enumerate() {
-            let sid = format!("s{}", idx);
-            id_map.insert(name.clone(), sid.clone());
-
-            // Determine owning module and leaf name
-            let parts: Vec<&str> = name.split('.').collect();
-            let (mod_id, leaf) = if parts.len() > 1 {
-                let mut path = format!("/{}", top_name);
-                for part in &parts[..parts.len() - 1] {
-                    path = format!("{}/{}", path, part);
-                }
-                (
-                    module_map
-                        .get(&path)
-                        .cloned()
-                        .unwrap_or_else(|| "m0".to_string()),
-                    parts[parts.len() - 1].to_string(),
-                )
-            } else {
-                ("m0".to_string(), name.clone())
-            };
-
-            let width = self.lookup_signal_width(name).unwrap_or(1);
-            let is_signed = self.lookup_signal_signed(name);
-            let type_str = if width == 1 {
-                "bit".to_string()
-            } else if is_signed {
-                format!("s{}", width)
-            } else {
-                format!("u{}", width)
-            };
-
-            signal_records.push(format!("S,{},{},{},{}", sid, mod_id, leaf, type_str));
-        }
-
-        // Write AITRACE header
-        let _ = writeln!(w, "@aitrace 1.0");
-        let _ = writeln!(w, "@format text");
-        let _ = writeln!(w, "@timescale 1ns");
-        let _ = writeln!(w, "@design {}", top_name);
-        let _ = writeln!(w, "@profile full_debug");
-        let _ = writeln!(w, "");
-
-        // Write dictionary section
-        let _ = writeln!(w, "@section dict");
-        for (mid, path) in &modules {
-            let _ = writeln!(w, "M,{},{}", mid, path);
-        }
-        for rec in &signal_records {
-            let _ = writeln!(w, "{}", rec);
-        }
-        let _ = writeln!(w, "");
-
-        // Write trace section header
-        let _ = writeln!(w, "@section trace");
-
-        // Write initial time and snapshot
-        let _ = writeln!(w, "T,+0");
-
-        // Build the compact per-cycle trace table and seed the initial
-        // snapshot from signal_table.
-        let mut trace: Vec<(usize, String)> = Vec::with_capacity(sig_names.len());
-        let mut prev: Vec<Value> = Vec::with_capacity(sig_names.len());
-        let mut snap_parts: Vec<String> = Vec::with_capacity(sig_names.len());
-        for name in &sig_names {
-            let id = match self.signal_name_to_id.get(name.as_str()) {
-                Some(&i) if i < self.signal_table.len() => i,
-                _ => continue,
-            };
-            let val = self.signal_table[id].clone();
-            let sid = id_map[name].clone();
-            snap_parts.push(format!("{}={}", sid, Self::aitrace_format_value(&val)));
-            prev.push(val);
-            trace.push((id, sid));
-        }
-        // Write snapshot in chunks to avoid excessively long lines
-        if snap_parts.len() <= 20 {
-            let _ = writeln!(w, "N,full,{}", snap_parts.join(","));
-        } else {
-            // Write as multiple packed delta records for initial state
-            for chunk in snap_parts.chunks(16) {
-                let _ = writeln!(w, "P,{}", chunk.join(","));
-            }
-        }
-
-        self.vcd_trace = trace;
-        self.vcd_prev_signals = prev;
-        self.vcd_writer = Some(w);
-        self.vcd_enabled = true;
-        self.vcd_last_time = self.time;
     }
 
     fn is_pid_suspended(&self, pid: usize) -> bool {
@@ -24360,72 +24189,38 @@ impl Simulator {
         }
     }
 
-    /// Write AITRACE signal deltas for the current timestep
-    fn aitrace_write_changes(&mut self) {
-        if !self.vcd_enabled || self.vcd_writer.is_none() {
-            return;
-        }
-
-        // (trace index, formatted value) for each signal that changed.
-        let mut changes: Vec<(usize, String)> = Vec::new();
-        for idx in 0..self.vcd_trace.len() {
-            let id = self.vcd_trace[idx].0;
-            let val = &self.signal_table[id];
-            if self.vcd_prev_signals[idx] != *val {
-                changes.push((idx, Self::aitrace_format_value(val)));
-                self.vcd_prev_signals[idx] = val.clone();
-            }
-        }
-
-        if changes.is_empty() {
-            return;
-        }
-
-        // Write time delta if needed
-        if self.time != self.vcd_last_time {
-            let delta = self.time - self.vcd_last_time;
-            self.vcd_last_time = self.time;
-            let w = self.vcd_writer.as_mut().unwrap();
-            let _ = writeln!(w, "T,+{}", delta);
-        }
-
-        let w = self.vcd_writer.as_mut().unwrap();
-        // Packed format (P) when multiple signals change, single delta (D) for one.
-        if changes.len() == 1 {
-            let (idx, val) = &changes[0];
-            let _ = writeln!(w, "D,{},{}", self.vcd_trace[*idx].1, val);
-        } else {
-            for chunk in changes.chunks(16) {
-                let _ = write!(w, "P");
-                for (idx, val) in chunk {
-                    let _ = write!(w, ",{}={}", self.vcd_trace[*idx].1, val);
-                }
-                let _ = writeln!(w);
-            }
-        }
-    }
-
-    /// Flush and close AITRACE file
-    fn aitrace_finish(&mut self) {
-        if let Some(ref mut w) = self.vcd_writer {
-            let _ = writeln!(w, "");
-            let _ = writeln!(w, "@section end");
-            let _ = w.flush();
-        }
-        self.vcd_writer = None;
-    }
-
     // ═══════════════════════════════════════════════════════════════
     // XTrace v1.0 dump support (XTrace_Specification_v1_0.txt)
     // ═══════════════════════════════════════════════════════════════
     //
     // Emits the "minimal" profile: dictionary + per-cycle signal deltas
-    // (the same VCD-equivalent payload the AITRACE path produces, under
-    // the @xtrace 1.0 header).
+    // (a VCD-equivalent payload, under the @xtrace 1.0 header).
 
     /// Format a Value per XTrace §13 / §A.6 4-state value semantics.
     /// Fully-known values use 0xHEX; values with X/Z fall back to the
     /// per-bit representation so unknowns aren't silently lost.
+    /// Render the dump timescale string (e.g. "1ns", "100ps") from `tick_s`,
+    /// the seconds-per-tick of the simulator's finest timescale precision.
+    /// `T,+delta` records count these ticks, so the header MUST match — a
+    /// hardcoded "1ns" mislabels any design with finer precision.
+    fn xtrace_timescale_str(tick_s: f64) -> String {
+        // `tick_s` is a power of ten (10^precision_exp seconds).
+        let exp = tick_s.log10().round() as i32;
+        // (base-10 exponent, unit). SystemVerilog units step by 1000×.
+        const UNITS: [(i32, &str); 6] = [
+            (0, "s"), (-3, "ms"), (-6, "us"), (-9, "ns"), (-12, "ps"), (-15, "fs"),
+        ];
+        for &(base, unit) in &UNITS {
+            if exp >= base {
+                // exp-base is 0/1/2 for 1/10/100 of the unit.
+                let value = 10i64.pow((exp - base) as u32);
+                return format!("{}{}", value, unit);
+            }
+        }
+        // Finer than 1fs (shouldn't happen): clamp to the smallest unit.
+        "1fs".to_string()
+    }
+
     fn xtrace_format_value(val: &Value) -> String {
         if val.has_xz() {
             // Per-bit binary representation preserves X/Z exactly.
@@ -24471,11 +24266,21 @@ impl Simulator {
     /// + initial state snapshot. Called once at the start of `run()` when
     /// `xtrace_file` is set.
     fn xtrace_start_dump(&mut self) {
+        // Signal count above which an unscoped (whole-design) dump is flagged.
+        const XTRACE_UNSCOPED_WARN: usize = 100_000;
         let filename = match self.xtrace_file.clone() {
             Some(f) => f,
             None => return,
         };
         self.sync_table_to_hashmap();
+        // Convert the ns time-window (#8) to ticks (same scale as max_time).
+        let scale = (1e-9_f64 / self.module.tick_s).round().max(1.0);
+        self.xtrace_from_t = (self.xtrace_from_ns as f64 * scale) as u64;
+        self.xtrace_to_t = if self.xtrace_to_ns == u64::MAX {
+            u64::MAX
+        } else {
+            (self.xtrace_to_ns as f64 * scale) as u64
+        };
         let file = match std::fs::File::create(&filename) {
             Ok(f) => f,
             Err(e) => {
@@ -24489,7 +24294,7 @@ impl Simulator {
         } else {
             None
         };
-        let mut w = match super::vcd_sink::VcdSink::open_file(file, self.threads >= 2, zstd_level) {
+        let mut w = match super::vcd_sink::VcdSink::open_file(file, self.dump_writer_threaded(), zstd_level) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Warning: cannot create XTrace writer for '{}': {}", filename, e);
@@ -24504,13 +24309,19 @@ impl Simulator {
         let mut sig_names: Vec<String> = if self.xtrace_scopes.is_empty() {
             self.signals.keys().cloned().collect()
         } else {
-            let filters = self.xtrace_scopes.clone();
+            // Precompute each scope's "<scope>." prefix ONCE rather than
+            // re-allocating it per (signal × filter) inside the hot filter loop.
+            let filters: Vec<(&str, String)> = self
+                .xtrace_scopes
+                .iter()
+                .map(|f| (f.as_str(), format!("{}.", f)))
+                .collect();
             self.signals
                 .keys()
                 .filter(|name| {
-                    filters.iter().any(|f| {
-                        name.as_str() == f.as_str() || name.starts_with(&format!("{}.", f))
-                    })
+                    filters
+                        .iter()
+                        .any(|(f, fdot)| name.as_str() == *f || name.starts_with(fdot.as_str()))
                 })
                 .cloned()
                 .collect()
@@ -24522,10 +24333,20 @@ impl Simulator {
                 sig_names.len(),
                 self.xtrace_scopes.len()
             );
+        } else if sig_names.len() > XTRACE_UNSCOPED_WARN {
+            // No scope filter on a large design: a full dump can run to many
+            // GB and minutes of I/O. Warn loudly rather than silently churn.
+            eprintln!(
+                "[XTrace] WARNING: dumping ALL {} signals (no --xtrace-scope given) — \
+                 this may produce a very large file and slow the run. \
+                 Pass --xtrace-scope <hier> to restrict the dump.",
+                sig_names.len()
+            );
         }
 
-        // Build module hierarchy (M records). Top module is m0, sub-scopes
-        // are discovered from dotted signal names.
+        // Module hierarchy (M records): top module is m0; sub-scopes are
+        // discovered from dotted signal names in the SAME pass that assigns
+        // signal IDs below — each signal's parent path is built exactly once.
         let top_name = &self.module.name;
         let mut modules: Vec<(String, String)> = Vec::new();
         let mut module_map: HashMap<String, String> = HashMap::default();
@@ -24533,41 +24354,54 @@ impl Simulator {
         modules.push(("m0".to_string(), top_path.clone()));
         module_map.insert(top_path.clone(), "m0".to_string());
 
-        for name in &sig_names {
-            let parts: Vec<&str> = name.split('.').collect();
-            if parts.len() > 1 {
-                let mut path = format!("/{}", top_name);
-                for part in &parts[..parts.len() - 1] {
-                    path = format!("{}/{}", path, part);
-                    if !module_map.contains_key(&path) {
-                        let mid = format!("m{}", modules.len());
-                        module_map.insert(path.clone(), mid.clone());
-                        modules.push((mid, path.clone()));
-                    }
-                }
-            }
-        }
-
-        // Assign signal IDs (s0, s1, ...) and build S records.
+        // Assign signal IDs and build S records. IDs are keyed by the backing
+        // `signal_table` index so that aliased nets (several hierarchical names
+        // resolving to the SAME signal) share ONE sid — VCD-style aliasing.
+        // Change records are then emitted once per net instead of once per
+        // name, shrinking the dump and the per-step change scan on alias-heavy
+        // designs. Every name still gets its own S record, so the full
+        // hierarchy stays navigable. `trace` (unique id → sid, in first-seen
+        // order) is the compact table reused at t=0 and every step.
+        let mut id_to_sid: HashMap<usize, String> = HashMap::default();
         let mut id_map: HashMap<String, String> = HashMap::default();
         let mut signal_records: Vec<String> = Vec::new();
-        for (idx, name) in sig_names.iter().enumerate() {
-            let sid = format!("s{}", idx);
+        let mut trace: Vec<(usize, String)> = Vec::new();
+        for name in sig_names.iter() {
+            let tbl_id = match self.signal_name_to_id.get(name.as_str()) {
+                Some(&i) if i < self.signal_table.len() => i,
+                // Unresolved name: no backing signal to trace. Skip it (the
+                // old t=0 snapshot loop dropped these too).
+                _ => continue,
+            };
+            let sid = if let Some(existing) = id_to_sid.get(&tbl_id) {
+                existing.clone()
+            } else {
+                let sid = format!("s{}", trace.len());
+                id_to_sid.insert(tbl_id, sid.clone());
+                trace.push((tbl_id, sid.clone()));
+                sid
+            };
             id_map.insert(name.clone(), sid.clone());
 
+            // Walk the parent path once, creating M records on demand; the
+            // deepest path component is this signal's module.
             let parts: Vec<&str> = name.split('.').collect();
             let (mod_id, leaf) = if parts.len() > 1 {
                 let mut path = format!("/{}", top_name);
+                let mut mid = "m0".to_string();
                 for part in &parts[..parts.len() - 1] {
-                    path = format!("{}/{}", path, part);
+                    path.push('/');
+                    path.push_str(part);
+                    mid = if let Some(existing) = module_map.get(&path) {
+                        existing.clone()
+                    } else {
+                        let m = format!("m{}", modules.len());
+                        module_map.insert(path.clone(), m.clone());
+                        modules.push((m.clone(), path.clone()));
+                        m
+                    };
                 }
-                (
-                    module_map
-                        .get(&path)
-                        .cloned()
-                        .unwrap_or_else(|| "m0".to_string()),
-                    parts[parts.len() - 1].to_string(),
-                )
+                (mid, parts[parts.len() - 1].to_string())
             } else {
                 ("m0".to_string(), name.clone())
             };
@@ -24590,7 +24424,7 @@ impl Simulator {
         let _ = writeln!(w, "@xtrace 1.0");
         let _ = writeln!(w, "@format text");
         let _ = writeln!(w, "@producer xezim {}", env!("CARGO_PKG_VERSION"));
-        let _ = writeln!(w, "@timescale 1ns");
+        let _ = writeln!(w, "@timescale {}", Self::xtrace_timescale_str(self.module.tick_s));
         let _ = writeln!(w, "@design {}", top_name);
         let _ = writeln!(w, "@profile minimal");
         let _ = writeln!(w);
@@ -24608,21 +24442,14 @@ impl Simulator {
         // Trace section opens with the t=0 full snapshot.
         let _ = writeln!(w, "@section trace");
         let _ = writeln!(w, "T,+0");
-        // Build the compact per-cycle trace table and seed the initial
-        // snapshot from signal_table (the backing store of truth).
-        let mut trace: Vec<(usize, String)> = Vec::with_capacity(sig_names.len());
-        let mut prev: Vec<Value> = Vec::with_capacity(sig_names.len());
-        let mut snap_parts: Vec<String> = Vec::with_capacity(sig_names.len());
-        for name in &sig_names {
-            let id = match self.signal_name_to_id.get(name.as_str()) {
-                Some(&i) if i < self.signal_table.len() => i,
-                _ => continue,
-            };
-            let val = self.signal_table[id].clone();
-            let sid = id_map[name].clone();
+        // Seed the t=0 snapshot from the deduped trace table (one entry per
+        // net) reading signal_table (the backing store of truth).
+        let mut prev: Vec<Value> = Vec::with_capacity(trace.len());
+        let mut snap_parts: Vec<String> = Vec::with_capacity(trace.len());
+        for (tbl_id, sid) in &trace {
+            let val = self.signal_table[*tbl_id].clone();
             snap_parts.push(format!("{}={}", sid, Self::xtrace_format_value(&val)));
             prev.push(val);
-            trace.push((id, sid));
         }
         // Long N,full lines are split into 16-signal chunks per the
         // emitter pattern in §A.13 to keep parser memory bounded.
@@ -24650,6 +24477,19 @@ impl Simulator {
     /// signal deltas as packed (P) or single (D) records.
     fn xtrace_write_changes(&mut self) {
         if self.xtrace_writer.is_none() {
+            return;
+        }
+
+        // Time-window gating (#8).
+        if self.time > self.xtrace_to_t {
+            // Past the window: finalize the dump now so no further trace I/O
+            // happens for the rest of the run.
+            self.xtrace_finish();
+            return;
+        }
+        if self.time < self.xtrace_from_t {
+            // Before the window: emit nothing and DON'T advance `prev`, so the
+            // first in-window write shows the true accumulated state at `from`.
             return;
         }
 
@@ -24690,6 +24530,18 @@ impl Simulator {
                 let _ = writeln!(w);
             }
         }
+
+        // Periodic durable flush so a crash/SIGKILL leaves a readable partial
+        // dump (Drop does not run under `panic = "abort"`). Bounds the loss to
+        // the last XTRACE_FLUSH_EVERY change-steps; the clean exit path still
+        // does a final flush in `xtrace_finish`.
+        const XTRACE_FLUSH_EVERY: u32 = 4096;
+        self.xtrace_dirty_steps += 1;
+        if self.xtrace_dirty_steps >= XTRACE_FLUSH_EVERY {
+            self.xtrace_dirty_steps = 0;
+            let w = self.xtrace_writer.as_mut().unwrap();
+            let _ = w.flush();
+        }
     }
 
     /// Close the trace section and flush. Called once from `run()` after
@@ -24701,6 +24553,221 @@ impl Simulator {
             let _ = w.flush();
         }
         self.xtrace_writer = None;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // FST dump support (GTKWave binary format via the `fst-writer` crate)
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Render a Value as the FST bit-string: full width, MSB first, using
+    /// '0'/'1'/'x'/'z'. Width-1 yields a single byte.
+    fn fst_format_value(val: &Value) -> Vec<u8> {
+        let w = val.width as usize;
+        if w == 0 {
+            return vec![b'0'];
+        }
+        let mut s = Vec::with_capacity(w);
+        for i in (0..w).rev() {
+            s.push(match val.get_bit(i) {
+                LogicBit::Zero => b'0',
+                LogicBit::One => b'1',
+                LogicBit::X => b'x',
+                LogicBit::Z => b'z',
+            });
+        }
+        s
+    }
+
+    /// Open the FST file, write the hierarchy (scopes + vars), transition to
+    /// the body writer, and emit the t=0 snapshot. Mirrors `vcd_start_dump`:
+    /// same scope-filter semantics, tick_s-derived timescale, and net dedup
+    /// (aliased signal_table ids share one FST id via the `alias` parameter).
+    fn fst_start_dump(&mut self) {
+        let filename = match self.fst_file.clone() {
+            Some(f) => f,
+            None => return,
+        };
+        self.sync_table_to_hashmap();
+
+        let mut sig_names: Vec<String> = if self.fst_scopes.is_empty() {
+            self.signals.keys().cloned().collect()
+        } else {
+            let filters: Vec<(&str, String)> = self
+                .fst_scopes
+                .iter()
+                .map(|f| (f.as_str(), format!("{}.", f)))
+                .collect();
+            self.signals
+                .keys()
+                .filter(|name| {
+                    filters
+                        .iter()
+                        .any(|(f, fdot)| name.as_str() == *f || name.starts_with(fdot.as_str()))
+                })
+                .cloned()
+                .collect()
+        };
+        sig_names.sort();
+        eprintln!(
+            "[FST] dumping {} signals (scopes={})",
+            sig_names.len(),
+            self.fst_scopes.len()
+        );
+
+        // Timescale exponent (e.g. -9 for 1ns, -12 for 1ps) from tick_s.
+        let ts_exp = self.module.tick_s.log10().round() as i8;
+        let info = fst_writer::FstInfo {
+            start_time: 0,
+            timescale_exponent: ts_exp,
+            version: format!("xezim {}", env!("CARGO_PKG_VERSION")),
+            date: String::new(),
+            file_type: fst_writer::FstFileType::Verilog,
+        };
+        let mut header = match fst_writer::open_fst(&filename, &info) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Warning: cannot create FST file '{}': {:?}", filename, e);
+                return;
+            }
+        };
+
+        // Nested scope tree from dotted names (same shape as VCD's ScopeNode),
+        // storing the backing signal_table index per leaf.
+        struct FstNode {
+            children: BTreeMap<String, FstNode>,
+            signals: Vec<(String, u32, usize)>, // (leaf, width, signal_table idx)
+        }
+        impl FstNode {
+            fn new() -> Self {
+                FstNode {
+                    children: BTreeMap::new(),
+                    signals: Vec::new(),
+                }
+            }
+        }
+        let mut root = FstNode::new();
+        for name in &sig_names {
+            let tbl_id = match self.signal_name_to_id.get(name.as_str()) {
+                Some(&i) if i < self.signal_table.len() => i,
+                _ => continue,
+            };
+            let width = self.lookup_signal_width(name).unwrap_or(1);
+            let parts: Vec<&str> = name.split('.').collect();
+            let (scope_parts, leaf) = if parts.len() > 1 {
+                (&parts[..parts.len() - 1], parts[parts.len() - 1])
+            } else {
+                (&[][..], parts[0])
+            };
+            let mut node = &mut root;
+            for part in scope_parts {
+                node = node
+                    .children
+                    .entry(part.to_string())
+                    .or_insert_with(FstNode::new);
+            }
+            node.signals.push((leaf.to_string(), width, tbl_id));
+        }
+
+        // DFS-emit scopes/vars, collecting (signal_table idx, FstSignalId).
+        let mut trace: Vec<(usize, FstSignalId)> = Vec::new();
+        let mut id_to_fst: HashMap<usize, FstSignalId> = HashMap::default();
+        fn emit<W: std::io::Write + std::io::Seek>(
+            header: &mut FstHeaderWriter<W>,
+            name: &str,
+            node: &FstNode,
+            trace: &mut Vec<(usize, FstSignalId)>,
+            id_to_fst: &mut HashMap<usize, FstSignalId>,
+        ) {
+            let _ = header.scope(name, "", FstScopeType::Module);
+            for (leaf, width, tbl_id) in &node.signals {
+                // Aliased nets (same signal_table id) reuse one FST id.
+                let alias = id_to_fst.get(tbl_id).copied();
+                let fid = match header.var(
+                    leaf,
+                    FstSignalType::bit_vec((*width).max(1)),
+                    FstVarType::Wire,
+                    FstVarDirection::Implicit,
+                    alias,
+                ) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                if alias.is_none() {
+                    id_to_fst.insert(*tbl_id, fid);
+                    trace.push((*tbl_id, fid));
+                }
+            }
+            for (child_name, child) in &node.children {
+                emit(header, child_name, child, trace, id_to_fst);
+            }
+            let _ = header.up_scope();
+        }
+        let top_name = self.module.name.clone();
+        emit(&mut header, &top_name, &root, &mut trace, &mut id_to_fst);
+
+        let mut body = match header.finish() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "Warning: cannot finish FST header for '{}': {:?}",
+                    filename, e
+                );
+                return;
+            }
+        };
+
+        // t=0 snapshot + seed prev.
+        let _ = body.time_change(self.time);
+        let mut prev: Vec<Value> = Vec::with_capacity(trace.len());
+        for (tbl_id, fid) in &trace {
+            let val = self.signal_table[*tbl_id].clone();
+            let _ = body.signal_change(*fid, &Self::fst_format_value(&val));
+            prev.push(val);
+        }
+
+        self.fst_trace = trace;
+        self.fst_prev_signals = prev;
+        self.fst_writer = Some(body);
+    }
+
+    /// Per-timestep FST emit: `time_change` once (if anything changed), then a
+    /// `signal_change` per changed net. Periodically flushes a value-change
+    /// block for crash safety (parity with the XTrace durable flush).
+    fn fst_write_changes(&mut self) {
+        if self.fst_writer.is_none() {
+            return;
+        }
+        let mut changes: Vec<(FstSignalId, Vec<u8>)> = Vec::new();
+        for idx in 0..self.fst_trace.len() {
+            let tbl_id = self.fst_trace[idx].0;
+            let val = &self.signal_table[tbl_id];
+            if self.fst_prev_signals[idx] != *val {
+                changes.push((self.fst_trace[idx].1, Self::fst_format_value(val)));
+                self.fst_prev_signals[idx] = val.clone();
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        let body = self.fst_writer.as_mut().unwrap();
+        let _ = body.time_change(self.time);
+        for (fid, bits) in &changes {
+            let _ = body.signal_change(*fid, bits);
+        }
+        // Crash-safe periodic flush once the in-memory block grows large
+        // (matches the fst-writer example's FLUSH_AT); leaves a readable
+        // partial FST on panic=abort / SIGKILL.
+        const FST_FLUSH_AT: usize = 64 * 1024 * 1024;
+        if body.size() >= FST_FLUSH_AT {
+            let _ = body.flush();
+        }
+    }
+
+    /// Finalize and close the FST file.
+    fn fst_finish(&mut self) {
+        if let Some(body) = self.fst_writer.take() {
+            let _ = body.finish();
+        }
     }
 
     fn is_associative_array(&self, name: &str) -> bool {
