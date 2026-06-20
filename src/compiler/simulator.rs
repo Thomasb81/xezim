@@ -1838,6 +1838,40 @@ pub struct Simulator {
     /// level write disjoint signals (no read-after-write), so they can be
     /// evaluated in parallel behind a per-level barrier. Empty = not built.
     comb_level: Vec<u32>,
+    /// Per comb entry: true if its compiled body contains NBA insns. The
+    /// isolated settle eval (`eval_comb_entry_isolated`) collects deferred NBAs
+    /// into a local and DROPS them, whereas canonical `exec_insns` schedules
+    /// them into the real NBA queue. So the BSP driver must route these through
+    /// the full `&mut self` path. Built alongside comb_level.
+    comb_has_nba: Vec<bool>,
+    /// Per comb entry: evaluable by the static isolated path (no `&mut self`,
+    /// disjoint writes) — not AST, no NBA, no unsupported insn. Only par_safe
+    /// entries run on worker threads in the parallel BSP level dispatch.
+    comb_par_safe: Vec<bool>,
+    /// Reusable per-level buckets for the BSP settle driver (one Vec per static
+    /// level). Taken out/restored each settle call so capacity is retained —
+    /// avoids re-allocating ~num_levels Vecs on every call. Inner Vecs are
+    /// cleared as each level is drained.
+    bsp_buckets: Vec<Vec<usize>>,
+    /// Reusable "re-trigger for next sweep" list for the BSP driver.
+    bsp_next_seed: Vec<usize>,
+    /// XEZIM_BSP_WIDTHS=1 diagnostic: histogram of per-level evaluated-entry
+    /// counts during time>0 (steady-state) settles, bucketed by width
+    /// [1, 2-15, 16-63, 64-255, 256-1023, 1024+]. Decides whether intra-level
+    /// parallelism has enough width to amortize dispatch in steady state.
+    bsp_width_buckets: [u64; 6],
+    bsp_widths_on: bool,
+    /// XEZIM_BSP_SETTLE=1: route combinational settle through the level-BSP
+    /// wavefront driver instead of the canonical chaotic-iteration worklist.
+    bsp_settle: bool,
+    /// XEZIM_BSP_PAR=1: evaluate each level's par_safe entries across worker
+    /// threads (intra-level parallelism). Requires bsp_settle.
+    bsp_par: bool,
+    /// Minimum par_safe entries in a level before the parallel dispatch fires
+    /// (smaller levels run serial — dispatch wouldn't amortize). XEZIM_BSP_PAR_THRESHOLD.
+    bsp_par_threshold: usize,
+    /// XEZIM_BSP_SHADOW=1: per-settle compare BSP vs canonical, abort on diff.
+    bsp_shadow: bool,
     /// Precomputed indices of comb_entries with has_unresolved_reads=true.
     /// Built once alongside comb_entries; scanning this short list every
     /// settle call is vastly cheaper than iterating all num_entries bits
@@ -2854,6 +2888,19 @@ impl Simulator {
             fst_prev_signals: Vec::new(),
             comb_entries: Vec::new(),
             comb_level: Vec::new(),
+            comb_has_nba: Vec::new(),
+            comb_par_safe: Vec::new(),
+            bsp_buckets: Vec::new(),
+            bsp_next_seed: Vec::new(),
+            bsp_width_buckets: [0; 6],
+            bsp_widths_on: std::env::var_os("XEZIM_BSP_WIDTHS").is_some(),
+            bsp_settle: std::env::var_os("XEZIM_BSP_SETTLE").is_some(),
+            bsp_par: std::env::var_os("XEZIM_BSP_PAR").is_some(),
+            bsp_par_threshold: std::env::var("XEZIM_BSP_PAR_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(256),
+            bsp_shadow: std::env::var_os("XEZIM_BSP_SHADOW").is_some(),
             comb_unresolved_idx: Vec::new(),
             comb_time0_idx: Vec::new(),
             comb_time0_fired: false,
@@ -5273,7 +5320,7 @@ impl Simulator {
             }
         }
         self.build_comb_entries();
-        if std::env::var_os("XEZIM_SETTLE_LEVELS").is_some() {
+        if std::env::var_os("XEZIM_SETTLE_LEVELS").is_some() || self.bsp_settle || self.bsp_shadow {
             self.report_comb_levels();
         }
         if self.activity_mon {
@@ -5670,8 +5717,65 @@ impl Simulator {
         let mut sig_prod_level: HashMap<usize, u32> = HashMap::default();
         let mut unresolved = 0usize;
         self.comb_level = vec![0u32; n];
+        self.comb_has_nba = vec![false; n];
+        self.comb_par_safe = vec![false; n];
+        // Writer-count pre-pass: a signal written by >1 comb entry is
+        // multi-driven; entries touching such a signal CANNOT run in the
+        // parallel level dispatch (two threads writing the same Value would
+        // race). Only single-writer entries are par_safe → disjoint writes
+        // within any level are then guaranteed.
+        let mut comb_writer_count: HashMap<usize, u32> = HashMap::default();
+        for e in &self.comb_entries {
+            for &w in &e.write_signal_ids {
+                *comb_writer_count.entry(w).or_insert(0) += 1;
+            }
+        }
         for i in 0..n {
             let e = &self.comb_entries[i];
+            let single_writer = e
+                .write_signal_ids
+                .iter()
+                .all(|w| comb_writer_count.get(w).copied().unwrap_or(0) <= 1);
+            use super::bytecode::Insn;
+            match &e.item {
+                // Simple isolated-safe items (no &mut self, no NBA).
+                CombItem::Noop
+                | CombItem::FastDirectCopy { .. }
+                | CombItem::DirectCopy { .. }
+                | CombItem::FusedGate { .. } => {
+                    self.comb_par_safe[i] = single_writer;
+                }
+                CombItem::CompiledContAssign { compiled, .. }
+                | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                    let mut has_nba = false;
+                    let mut unsupported = false;
+                    for ins in &compiled.instructions {
+                        match ins {
+                            Insn::NbaAssign(..)
+                            | Insn::NbaAssignRange(..)
+                            | Insn::NbaAssignRangeDyn(..)
+                            | Insn::NbaAssignBitDyn(..)
+                            | Insn::NbaAssignArray(..)
+                            | Insn::NbaAssignArrayRange(..) => has_nba = true,
+                            // Insns the isolated evaluator can't handle (see the
+                            // catch-all in exec_comb_block_isolated): array /
+                            // dynamic-range blocking writes and AST fallback.
+                            Insn::StmtFallback(..)
+                            | Insn::BlockingAssignArray(..)
+                            | Insn::BlockingAssignArrayRange(..)
+                            | Insn::BlockingAssignRangeDyn(..) => unsupported = true,
+                            _ => {}
+                        }
+                    }
+                    self.comb_has_nba[i] = has_nba;
+                    // par_safe only if the isolated path fully handles it, it
+                    // has no deferred NBA, and all its writes are single-driver
+                    // (disjoint-write safety for parallel level eval).
+                    self.comb_par_safe[i] = !has_nba && !unsupported && single_writer;
+                }
+                // AST entries always need &mut self.
+                CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {}
+            }
             if e.has_unresolved_reads {
                 unresolved += 1;
             }
@@ -5693,6 +5797,37 @@ impl Simulator {
         }
         if std::env::var_os("XEZIM_SETTLE_LEVELS").is_none() {
             return; // levels computed/stored; skip the diagnostic print
+        }
+        // Diagnostic: comb entries whose compiled body contains NBA insns.
+        // The isolated settle eval drops these (deferred) → BSP divergence
+        // candidate. If c910 has them and c906/static don't, that's the bug.
+        {
+            use super::bytecode::Insn;
+            let mut nba_blocks = 0usize;
+            for e in &self.comb_entries {
+                let cb = match &e.item {
+                    CombItem::CompiledContAssign { compiled, .. }
+                    | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled,
+                    _ => continue,
+                };
+                if cb.instructions.iter().any(|i| {
+                    matches!(
+                        i,
+                        Insn::NbaAssign(..)
+                            | Insn::NbaAssignRange(..)
+                            | Insn::NbaAssignRangeDyn(..)
+                            | Insn::NbaAssignBitDyn(..)
+                            | Insn::NbaAssignArray(..)
+                            | Insn::NbaAssignArrayRange(..)
+                    )
+                }) {
+                    nba_blocks += 1;
+                }
+            }
+            eprintln!(
+                "[SETTLE-LEVELS] comb entries with NBA insns (dropped by isolated eval): {}",
+                nba_blocks
+            );
         }
         let level = &self.comb_level;
         let max_level = level.iter().copied().max().unwrap_or(0);
@@ -6250,6 +6385,87 @@ impl Simulator {
             }
             // AST fallback (ContAssign / AlwaysBlock) — needs the full
             // Simulator (eval_expr / exec_statement). ast_ca=6 on c910.
+            CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => false,
+        }
+    }
+
+    /// Fully-static (no `&self`) isolated comb-entry evaluator for the parallel
+    /// BSP level dispatch — worker threads call this with shared refs to the
+    /// design arrays and a raw-aliased `view`, so it must not borrow the
+    /// (non-Sync) Simulator. Only ever called for `comb_par_safe` items, so the
+    /// AST / unsupported arms are unreachable (return false defensively).
+    /// Pushes changed signal ids into `dirtied`; bookkeeping/propagation is done
+    /// serially by the caller after the parallel join.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_comb_item_isolated(
+        item: &CombItem,
+        signal_widths: &[u32],
+        signal_signed: &[bool],
+        signal_name_to_id: &HashMap<Arc<str>, usize>,
+        array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
+        view: &mut [Value],
+        vm_regs: &mut Vec<Value>,
+        dirtied: &mut Vec<u32>,
+    ) -> bool {
+        match item {
+            CombItem::Noop => true,
+            CombItem::FastDirectCopy { dst_id, src_id } => {
+                let (sv, sx) = view[*src_id].raw_bits();
+                let (dv, dx) = view[*dst_id].raw_bits();
+                if (sv != dv || sx != dx) && view[*dst_id].set_inline_bits(sv, sx) {
+                    dirtied.push(*dst_id as u32);
+                }
+                true
+            }
+            CombItem::DirectCopy { dst_id, src_id, width } => {
+                let dst_w = signal_widths[*dst_id];
+                let mut handled = false;
+                if *width <= 64 && dst_w == *width {
+                    let (sv, sx) = view[*src_id].raw_bits();
+                    let (dv, dx) = view[*dst_id].raw_bits();
+                    if sv == dv && sx == dx {
+                        handled = true;
+                    } else if view[*dst_id].set_inline_bits(sv, sx) {
+                        dirtied.push(*dst_id as u32);
+                        handled = true;
+                    }
+                }
+                if !handled {
+                    let src_val = view[*src_id].clone();
+                    let resized = if src_val.width != *width {
+                        src_val.resize(*width)
+                    } else {
+                        src_val
+                    };
+                    if view[*dst_id] != resized {
+                        view[*dst_id] = resized;
+                        dirtied.push(*dst_id as u32);
+                    }
+                }
+                true
+            }
+            CombItem::CompiledContAssign { compiled, .. }
+            | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                if vm_regs.len() < compiled.num_regs as usize {
+                    vm_regs.resize(compiled.num_regs as usize, Value::zero(1));
+                }
+                let (_nba, unsupported) = Self::exec_comb_block_isolated(
+                    &compiled.instructions,
+                    view,
+                    signal_widths,
+                    signal_signed,
+                    signal_name_to_id,
+                    array_first_id,
+                    vm_regs,
+                    dirtied,
+                    0,
+                );
+                !unsupported
+            }
+            CombItem::FusedGate { op } => {
+                Self::exec_fused_gate_isolated(op, view, dirtied);
+                true
+            }
             CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => false,
         }
     }
@@ -12628,6 +12844,19 @@ impl Simulator {
             self.loop_iters,
             sim_elapsed.as_secs_f64() * 1e6 / self.loop_iters.max(1) as f64
         );
+        if self.bsp_widths_on {
+            let b = &self.bsp_width_buckets;
+            let tot: u64 = b.iter().sum();
+            let pct = |x: u64| 100.0 * x as f64 / tot.max(1) as f64;
+            eprintln!(
+                "[BSP-WIDTHS] steady-state entry-evals by level width: \
+                 w=1:{} ({:.0}%) 2-15:{} ({:.0}%) 16-63:{} ({:.0}%) 64-255:{} ({:.0}%) \
+                 256-1023:{} ({:.0}%) 1024+:{} ({:.0}%); parallelizable(>=64)={:.0}%",
+                b[0], pct(b[0]), b[1], pct(b[1]), b[2], pct(b[2]), b[3], pct(b[3]),
+                b[4], pct(b[4]), b[5], pct(b[5]),
+                pct(b[3] + b[4] + b[5])
+            );
+        }
         // Assertion + coverage summary (always when any data was recorded;
         // dump the JSON database iff XEZIM_COV_DB=<path> is set, else default
         // path xezim_cov.json when at least one stat exists).
@@ -15429,9 +15658,391 @@ impl Simulator {
             } else {
                 self.settle_combinatorial_perlp();
             }
+        } else if self.bsp_shadow {
+            self.settle_combinatorial_bsp_shadow();
+        } else if self.bsp_settle {
+            self.settle_combinatorial_bsp();
         } else {
             self.settle_combinatorial_inner();
         }
+    }
+
+    /// Level-BSP combinational settle (XEZIM_BSP_SETTLE=1). Reaches the SAME
+    /// fixpoint as `settle_combinatorial_inner`, but drains triggered entries
+    /// in a level-ordered wavefront: entries sharing a static level are
+    /// mutually independent (no intra-level read-after-write), which is the
+    /// structure a parallel intra-level eval (Stage 2) plugs into. Serial here.
+    /// Isolated entries (copy/bytecode/gate) eval via `eval_comb_entry_isolated`
+    /// against the signal table (taken into `view`); the rare AST entries via
+    /// `eval_ast_comb_entry` (restores the table around the call). Per-write
+    /// bookkeeping mirrors `write_sig!`. Falls back to canonical settle if
+    /// levels are missing.
+    fn settle_combinatorial_bsp(&mut self) {
+        if self.settling || !self.dirty_any {
+            return;
+        }
+        let num_entries = self.comb_entries.len();
+        if self.comb_level.len() != num_entries || num_entries == 0 {
+            self.settle_combinatorial_inner();
+            return;
+        }
+        self.settling = true;
+        self.settle_calls += 1;
+        if self.settle_triggered.len() < num_entries {
+            self.settle_triggered.resize(num_entries, false);
+        }
+        let limit = self.settle_limit as u64;
+
+        // --- seed (identical to settle_combinatorial_inner) ---
+        for &eidx in &self.settle_triggered_list {
+            self.settle_triggered[eidx] = false;
+        }
+        self.settle_triggered_list.clear();
+        let skip_deferred_at_t0 = self.time == 0 && !self.comb_time0_fired;
+        let seed_dirty_len = self.dirty_list.len();
+        for seed_idx in 0..seed_dirty_len {
+            let id = self.dirty_list[seed_idx];
+            if self.dirty_signals[id] {
+                self.dirty_signals[id] = false;
+                if id + 1 < self.comb_dep_offsets.len() {
+                    let lo = self.comb_dep_offsets[id] as usize;
+                    let hi = self.comb_dep_offsets[id + 1] as usize;
+                    for k in lo..hi {
+                        let eidx = self.comb_dep_entries[k] as usize;
+                        if skip_deferred_at_t0 && self.comb_entries[eidx].defer_at_time0 {
+                            continue;
+                        }
+                        if !self.settle_triggered[eidx] {
+                            self.settle_triggered[eidx] = true;
+                            self.settle_triggered_list.push(eidx);
+                        }
+                    }
+                }
+            }
+        }
+        self.dirty_list.clear();
+        self.dirty_any = false;
+        for ui in 0..self.comb_unresolved_idx.len() {
+            let eidx = self.comb_unresolved_idx[ui];
+            if eidx < num_entries && !self.settle_triggered[eidx] {
+                self.settle_triggered[eidx] = true;
+                self.settle_triggered_list.push(eidx);
+            }
+        }
+        if self.time == 0 && !self.comb_time0_fired {
+            for ti in 0..self.comb_time0_idx.len() {
+                let eidx = self.comb_time0_idx[ti];
+                if eidx < num_entries && !self.settle_triggered[eidx] {
+                    self.settle_triggered[eidx] = true;
+                    self.settle_triggered_list.push(eidx);
+                }
+            }
+            self.comb_time0_fired = true;
+        }
+        if self.settle_triggered_list.is_empty() {
+            self.settling = false;
+            return;
+        }
+
+        // --- wavefront drain ---
+        let num_levels = self.comb_level.iter().copied().max().unwrap_or(0) as usize + 1;
+        // Reuse persistent buckets (retain capacity across calls); grow once.
+        let mut buckets = std::mem::take(&mut self.bsp_buckets);
+        if buckets.len() < num_levels {
+            buckets.resize_with(num_levels, Vec::new);
+        }
+        for b in buckets.iter_mut() {
+            b.clear();
+        }
+        let mut seed_list = std::mem::take(&mut self.settle_triggered_list);
+        let mut next_seed = std::mem::take(&mut self.bsp_next_seed);
+        next_seed.clear();
+        let mut view = std::mem::take(&mut self.signal_table);
+        let mut vm_regs = std::mem::take(&mut self.vm_regs);
+        let mut dirtied: Vec<u32> = Vec::new();
+        let mut par_scratch: Vec<usize> = Vec::new();
+        let mut sweeps = 0u64;
+
+        loop {
+            sweeps += 1;
+            if sweeps > limit {
+                break;
+            }
+            for &e in &seed_list {
+                if self.settle_triggered[e] {
+                    buckets[self.comb_level[e] as usize].push(e);
+                }
+            }
+            seed_list.clear();
+            for l in 0..num_levels {
+                // Width diagnostic: count entries actually evaluated at this
+                // level this sweep (steady-state only) to gauge intra-level
+                // parallelism. Cheap pre-scan of still-triggered entries.
+                if self.bsp_widths_on && self.time > 0 && !buckets[l].is_empty() {
+                    let mut w = 0usize;
+                    for &e in &buckets[l] {
+                        if self.settle_triggered[e] {
+                            w += 1;
+                        }
+                    }
+                    if w > 0 {
+                        let b = if w == 1 {
+                            0
+                        } else if w < 16 {
+                            1
+                        } else if w < 64 {
+                            2
+                        } else if w < 256 {
+                            3
+                        } else if w < 1024 {
+                            4
+                        } else {
+                            5
+                        };
+                        self.bsp_width_buckets[b] += w as u64;
+                    }
+                }
+                // Parallel intra-level batch (Stage 2): when enabled and the
+                // level is wide, evaluate its par_safe entries across worker
+                // threads. Within a level every entry reads only lower,
+                // already-finalized levels, and par_safe guarantees single-writer
+                // outputs, so concurrent eval against the shared `view` is
+                // race-free (disjoint writes). Non-par entries fall through to
+                // the serial drain below.
+                if self.bsp_par && buckets[l].len() >= self.bsp_par_threshold {
+                    par_scratch.clear();
+                    for &eidx in &buckets[l] {
+                        if self.settle_triggered[eidx] && self.comb_par_safe[eidx] {
+                            self.settle_triggered[eidx] = false;
+                            par_scratch.push(eidx);
+                        }
+                    }
+                    if par_scratch.len() >= self.bsp_par_threshold {
+                        self.entry_evals += par_scratch.len() as u64;
+                        dirtied.clear();
+                        let nthreads = std::thread::available_parallelism()
+                            .map(|x| x.get().min(8))
+                            .unwrap_or(2)
+                            .min(par_scratch.len())
+                            .max(1);
+                        let chunk = (par_scratch.len() + nthreads - 1) / nthreads;
+                        let view_ptr = view.as_mut_ptr() as usize;
+                        let view_len = view.len();
+                        let widths: &[u32] = &self.signal_widths;
+                        let signed: &[bool] = &self.signal_signed;
+                        let n2id = &self.signal_name_to_id;
+                        let afi = &self.array_first_id;
+                        // comb_entries' AST variants hold Cell/OnceCell (not
+                        // Sync), so the slice can't cross threads by ref. Pass a
+                        // raw ptr: SAFE because threads only READ par_safe items
+                        // (Compiled/copy/gate — no Cell), and comb_entries is not
+                        // mutated during the scope.
+                        let entries_ptr = self.comb_entries.as_ptr() as usize;
+                        let entries_len = self.comb_entries.len();
+                        let scratch: &[usize] = &par_scratch;
+                        let results: Vec<Vec<u32>> = std::thread::scope(|s| {
+                            let mut handles = Vec::new();
+                            let mut start = 0usize;
+                            while start < scratch.len() {
+                                let end = (start + chunk).min(scratch.len());
+                                let part = &scratch[start..end];
+                                start = end;
+                                handles.push(s.spawn(move || {
+                                    // SAFETY: par_safe → single-writer, so the
+                                    // dst signals written by this thread's
+                                    // entries are disjoint from every other
+                                    // thread's. Reads hit lower, finalized
+                                    // levels. `view` outlives the scope.
+                                    let v = unsafe {
+                                        std::slice::from_raw_parts_mut(
+                                            view_ptr as *mut Value,
+                                            view_len,
+                                        )
+                                    };
+                                    let entries = unsafe {
+                                        std::slice::from_raw_parts(
+                                            entries_ptr as *const CombEntry,
+                                            entries_len,
+                                        )
+                                    };
+                                    let mut vm: Vec<Value> = Vec::new();
+                                    let mut d: Vec<u32> = Vec::new();
+                                    for &eidx in part {
+                                        Self::eval_comb_item_isolated(
+                                            &entries[eidx].item,
+                                            widths,
+                                            signed,
+                                            n2id,
+                                            afi,
+                                            v,
+                                            &mut vm,
+                                            &mut d,
+                                        );
+                                    }
+                                    d
+                                }));
+                            }
+                            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                        });
+                        for d in &results {
+                            dirtied.extend_from_slice(d);
+                        }
+                        // Bookkeeping for changed signals (isolated writes only
+                        // touched `view`).
+                        for &id_u in dirtied.iter() {
+                            let id = id_u as usize;
+                            let (vv, xx) = view[id].raw_bits();
+                            if id < self.signal_has_xz.len() {
+                                self.signal_has_xz[id] = if xx != 0 { 1 } else { 0 };
+                            }
+                            if id < self.signal_inline_bits.len() {
+                                self.signal_inline_bits[id] = [vv, xx];
+                            }
+                            if self.event_measure && id < self.sig_last_change.len() {
+                                self.sig_last_change[id] = self.event_phase;
+                            }
+                        }
+                        self.table_modified = true;
+                        // Propagate to dependents (serial, after the barrier).
+                        for &id_u in dirtied.iter() {
+                            let id = id_u as usize;
+                            if id + 1 < self.comb_dep_offsets.len() {
+                                let lo = self.comb_dep_offsets[id] as usize;
+                                let hi = self.comb_dep_offsets[id + 1] as usize;
+                                for k in lo..hi {
+                                    let dep = self.comb_dep_entries[k] as usize;
+                                    if !self.settle_triggered[dep] {
+                                        self.settle_triggered[dep] = true;
+                                        let dl = self.comb_level[dep] as usize;
+                                        if dl > l {
+                                            buckets[dl].push(dep);
+                                        } else {
+                                            next_seed.push(dep);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Too few par entries after filtering — re-arm so the
+                        // serial drain below handles them.
+                        for &eidx in &par_scratch {
+                            self.settle_triggered[eidx] = true;
+                        }
+                    }
+                }
+                let mut bi = 0;
+                while bi < buckets[l].len() {
+                    let eidx = buckets[l][bi];
+                    bi += 1;
+                    if !self.settle_triggered[eidx] {
+                        continue;
+                    }
+                    self.settle_triggered[eidx] = false;
+                    self.entry_evals += 1;
+                    dirtied.clear();
+                    let is_ast = matches!(
+                        self.comb_entries[eidx].item,
+                        CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. }
+                    );
+                    // Isolated eval for non-AST entries; if it reports the block
+                    // uses an insn it can't handle, discard the partial result
+                    // and fall through to the full &mut self path below.
+                    // NBA-bearing blocks MUST use the full path so their
+                    // deferred NBAs are scheduled (isolated eval drops them).
+                    let mut needs_full = is_ast || self.comb_has_nba[eidx];
+                    if !needs_full {
+                        let supported = self
+                            .eval_comb_entry_isolated(eidx, &mut view, &mut vm_regs, &mut dirtied);
+                        if supported {
+                            // Replicate write_sig! bookkeeping for changed
+                            // signals (eval_comb_entry_isolated only mutates view).
+                            for &id_u in dirtied.iter() {
+                                let id = id_u as usize;
+                                let (v, x) = view[id].raw_bits();
+                                if id < self.signal_has_xz.len() {
+                                    self.signal_has_xz[id] = if x != 0 { 1 } else { 0 };
+                                }
+                                if id < self.signal_inline_bits.len() {
+                                    self.signal_inline_bits[id] = [v, x];
+                                }
+                                if self.event_measure && id < self.sig_last_change.len() {
+                                    self.sig_last_change[id] = self.event_phase;
+                                }
+                            }
+                            self.table_modified = true;
+                        } else {
+                            dirtied.clear();
+                            needs_full = true;
+                        }
+                    }
+                    if needs_full {
+                        // Full path needs the table + vm_regs back on self.
+                        self.signal_table = std::mem::take(&mut view);
+                        self.vm_regs = std::mem::take(&mut vm_regs);
+                        // SAFETY: eval_comb_entry_full never mutates
+                        // self.comb_entries — the canonical settle runs the same
+                        // eval with comb_entries taken OUT (empty), proving the
+                        // eval path neither reads nor writes it. A raw shared
+                        // ref avoids cloning the whole CombEntry (compiled
+                        // bytecode / AST stmt) on every NBA/AST entry, which was
+                        // the dominant `process`-time cost on c910.
+                        let entry: &CombEntry =
+                            unsafe { &*(&self.comb_entries[eidx] as *const CombEntry) };
+                        self.eval_comb_entry_full(entry);
+                        view = std::mem::take(&mut self.signal_table);
+                        vm_regs = std::mem::take(&mut self.vm_regs);
+                        for i in 0..self.dirty_list.len() {
+                            let id = self.dirty_list[i];
+                            if self.dirty_signals[id] {
+                                self.dirty_signals[id] = false;
+                                dirtied.push(id as u32);
+                            }
+                        }
+                        self.dirty_list.clear();
+                        self.dirty_any = false;
+                    }
+                    // Propagate changed signals to their comb dependents.
+                    for &id_u in dirtied.iter() {
+                        let id = id_u as usize;
+                        if id + 1 < self.comb_dep_offsets.len() {
+                            let lo = self.comb_dep_offsets[id] as usize;
+                            let hi = self.comb_dep_offsets[id + 1] as usize;
+                            for k in lo..hi {
+                                let dep = self.comb_dep_entries[k] as usize;
+                                if !self.settle_triggered[dep] {
+                                    self.settle_triggered[dep] = true;
+                                    let dl = self.comb_level[dep] as usize;
+                                    if dl > l {
+                                        buckets[dl].push(dep);
+                                    } else {
+                                        next_seed.push(dep);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                buckets[l].clear();
+            }
+            if next_seed.is_empty() {
+                break;
+            }
+            std::mem::swap(&mut seed_list, &mut next_seed);
+            next_seed.clear();
+        }
+
+        self.signal_table = view;
+        self.vm_regs = vm_regs;
+        // Restore reusable buffers (retain capacity for the next call).
+        seed_list.clear();
+        self.settle_triggered_list = seed_list;
+        next_seed.clear();
+        self.bsp_next_seed = next_seed;
+        self.bsp_buckets = buckets;
+        self.dirty_list.clear();
+        self.dirty_any = false;
+        self.settling = false;
     }
 
     /// Debug: run the partitioned settle on a clone, the canonical settle as
@@ -15553,6 +16164,69 @@ impl Simulator {
         }
     }
 
+    /// BSP-settle shadow comparator (XEZIM_BSP_SHADOW=1). Per settle: snapshot
+    /// pre-state, run canonical (truth), restore pre-state, run BSP, diff, and
+    /// abort at the first divergent signal with its name. The sim evolves on the
+    /// CANONICAL result (always completes). Mirrors settle_combinatorial_shadow.
+    fn settle_combinatorial_bsp_shadow(&mut self) {
+        if self.settling || !self.dirty_any {
+            return;
+        }
+        if self.time == 0 {
+            // time-0 init settle is enormous; run BSP only, no compare.
+            self.settle_combinatorial_bsp();
+            return;
+        }
+        if self.dirty_list.len() > 256 {
+            self.settle_combinatorial_inner();
+            return;
+        }
+        let pre_dirty_list = self.dirty_list.clone();
+        let pre_dirty_any = self.dirty_any;
+        let pre_time0 = self.comb_time0_fired;
+        let pre_table = self.signal_table.clone();
+
+        self.settle_combinatorial_inner(); // canonical = truth
+
+        let canon = std::mem::replace(&mut self.signal_table, pre_table);
+        self.dirty_any = pre_dirty_any;
+        for &id in &pre_dirty_list {
+            self.dirty_signals[id] = true;
+        }
+        self.dirty_list = pre_dirty_list;
+        self.comb_time0_fired = pre_time0;
+        self.settle_combinatorial_bsp();
+
+        let n = canon.len().min(self.signal_table.len());
+        let mut diffs = 0u64;
+        let mut shown = 0;
+        for sid in 0..n {
+            let (cv, cx) = canon[sid].raw_bits();
+            let (pv, px) = self.signal_table[sid].raw_bits();
+            if cv == pv && cx == px {
+                continue;
+            }
+            diffs += 1;
+            if shown < 16 {
+                shown += 1;
+                eprintln!(
+                    "[BSP-SHADOW] time={} diff sid={} '{}' canon=(v{:#x},x{:#x}) bsp=(v{:#x},x{:#x})",
+                    self.time, sid, self.name_for_id(sid), cv, cx, pv, px,
+                );
+            }
+        }
+        self.signal_table = canon; // sim continues on canonical
+        if diffs > 0 {
+            eprintln!("[BSP-SHADOW] time={} FIRST divergence: {} signals differ — aborting", self.time, diffs);
+            self.finished = true;
+            return;
+        }
+        self.perlp_shadow_real_diffs += 1;
+        if self.perlp_shadow_real_diffs % 5000 == 0 {
+            eprintln!("[BSP-SHADOW] checked {} time>0 settles, no divergence (now time={})", self.perlp_shadow_real_diffs, self.time);
+        }
+    }
+
     /// AST comb-entry eval (`CombItem::ContAssign` / `AlwaysBlock`). These need
     /// the full `&mut self` interpreter (`eval_expr_ctx` / `exec_statement`), so
     /// they can't go through `eval_comb_entry_isolated`. Factored out of the
@@ -15652,6 +16326,54 @@ impl Simulator {
                 self.prof_settle_ab_count += 1;
             }
             _ => {}
+        }
+    }
+
+    /// Full `&mut self` eval of one comb entry against `signal_table` (used by
+    /// the BSP driver as the fallback for entries the isolated evaluator can't
+    /// handle — exotic compiled insns — and for AST entries). Mirrors the
+    /// canonical `settle_combinatorial_inner` per-entry arms; marks dirty via
+    /// the normal write path. `entry` borrows the caller's clone, not `self`.
+    fn eval_comb_entry_full(&mut self, entry: &CombEntry) {
+        match &entry.item {
+            CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
+                self.eval_ast_comb_entry(entry);
+            }
+            CombItem::CompiledContAssign { compiled, .. }
+            | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                if self.vm_regs.len() < compiled.num_regs as usize {
+                    self.vm_regs
+                        .resize(compiled.num_regs as usize, Value::zero(1));
+                }
+                let insns = unsafe {
+                    std::slice::from_raw_parts(
+                        compiled.instructions.as_ptr(),
+                        compiled.instructions.len(),
+                    )
+                };
+                self.exec_insns(insns);
+            }
+            CombItem::FusedGate { op } => {
+                let op = *op;
+                self.exec_fused_gate(op);
+            }
+            // Copies are always handled by the isolated path; reaching here for
+            // them would be a logic error, but eval them correctly regardless.
+            CombItem::FastDirectCopy { dst_id, src_id } => {
+                let v = self.signal_table[*src_id].clone();
+                if self.signal_table[*dst_id] != v {
+                    self.mark_dirty_id(*dst_id);
+                    write_sig!(self, *dst_id, v);
+                }
+            }
+            CombItem::DirectCopy { dst_id, src_id, width } => {
+                let v = self.signal_table[*src_id].clone().resize(*width);
+                if self.signal_table[*dst_id] != v {
+                    self.mark_dirty_id(*dst_id);
+                    write_sig!(self, *dst_id, v);
+                }
+            }
+            CombItem::Noop => {}
         }
     }
 
