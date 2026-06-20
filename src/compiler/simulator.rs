@@ -187,6 +187,18 @@ macro_rules! write_sig {
         if $self.event_measure && __wsig_id < $self.sig_last_change.len() {
             $self.sig_last_change[__wsig_id] = $self.event_phase;
         }
+        // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
+        // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
+        // the borrow stays a direct field access in macro-expanded contexts.
+        if ($self.dirty_edge || $self.dirty_edge_shadow)
+            && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+        {
+            let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+            if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
+                $self.edge_pos_seen[__ep as usize] = true;
+                $self.changed_edge_pos.push(__ep as usize);
+            }
+        }
     }};
 }
 
@@ -1912,6 +1924,22 @@ pub struct Simulator {
     /// per-iter edge_detect work from O(|edge_signal_ids|) ~10k to ~|clocks|.
     /// See `event_loop` for the dispatch.
     toggled_clock_positions: Vec<usize>,
+    /// XEZIM_EDGE_SCAN_STATS=1 diagnostic: edge-detect positions scanned vs
+    /// positions that actually changed (fired). Measures the dirty-driven
+    /// detect ceiling before building it.
+    edge_scan_scanned: u64,
+    edge_scan_changed: u64,
+    edge_scan_stats: bool,
+    /// Dirty-driven edge detect (XEZIM_DIRTY_EDGE=1). `sig_to_edge_pos[id]` =
+    /// position of signal `id` in `edge_signal_ids`, or -1 if not edge-sensitive.
+    /// Writes to edge-sensitive signals (via write_sig!/after_signal_write)
+    /// push their position into `changed_edge_pos` (deduped by `edge_pos_seen`),
+    /// so check_edges can scan only changed positions instead of all of them.
+    sig_to_edge_pos: Vec<i32>,
+    changed_edge_pos: Vec<usize>,
+    edge_pos_seen: Vec<bool>,
+    dirty_edge: bool,
+    dirty_edge_shadow: bool,
     /// Counter — number of iters whose check_edges ran over just the
     /// toggled clock subset instead of the full edge_signal_ids scan.
     prof_clocks_only_detect: u64,
@@ -2911,6 +2939,14 @@ impl Simulator {
             dirty_any: false,
             table_modified: false,
             toggled_clock_positions: Vec::new(),
+            edge_scan_scanned: 0,
+            edge_scan_changed: 0,
+            edge_scan_stats: std::env::var_os("XEZIM_EDGE_SCAN_STATS").is_some(),
+            sig_to_edge_pos: Vec::new(),
+            changed_edge_pos: Vec::new(),
+            edge_pos_seen: Vec::new(),
+            dirty_edge: std::env::var_os("XEZIM_DIRTY_EDGE").is_some(),
+            dirty_edge_shadow: std::env::var_os("XEZIM_DIRTY_EDGE_SHADOW").is_some(),
             prof_clocks_only_detect: 0,
             is_edge_signal_non_clock: Vec::new(),
             nba_touched_edge_non_clock: false,
@@ -5348,6 +5384,18 @@ impl Simulator {
         // Also collect from event waiters that are registered at time 0
         self.edge_signal_ids.sort_unstable();
         self.edge_signal_ids.dedup();
+        // Reverse map for dirty-driven edge detect: signal id -> its position
+        // in the (now sorted, stable) edge_signal_ids, or -1. Sized to the
+        // signal table so the per-write check is one bounds-checked load.
+        if self.dirty_edge || self.dirty_edge_shadow {
+            self.sig_to_edge_pos = vec![-1i32; self.signal_table.len()];
+            for (pos, &sid) in self.edge_signal_ids.iter().enumerate() {
+                if sid < self.sig_to_edge_pos.len() {
+                    self.sig_to_edge_pos[sid] = pos as i32;
+                }
+            }
+            self.edge_pos_seen = vec![false; self.edge_signal_ids.len()];
+        }
         // Cache each clock generator's position inside edge_signal_ids so
         // fire_clock_generators can populate toggled_clock_positions in O(1)
         // (binary search would be O(log N) per call — small N, but this path
@@ -12857,6 +12905,17 @@ impl Simulator {
                 pct(b[3] + b[4] + b[5])
             );
         }
+        if self.edge_scan_stats {
+            let s = self.edge_scan_scanned;
+            let c = self.edge_scan_changed;
+            eprintln!(
+                "[EDGE-SCAN] full-scan positions scanned={} changed(fired)={} ({:.1}%); \
+                 dirty-driven ceiling = skip {:.1}% of detect work",
+                s, c,
+                100.0 * c as f64 / s.max(1) as f64,
+                100.0 * (s - c) as f64 / s.max(1) as f64
+            );
+        }
         // Assertion + coverage summary (always when any data was recorded;
         // dump the JSON database iff XEZIM_COV_DB=<path> is set, else default
         // path xezim_cov.json when at least one stat exists).
@@ -14331,7 +14390,68 @@ impl Simulator {
     }
 
     fn check_edges(&mut self) {
-        self.check_edges_inner(None);
+        // Time-0 init detect is special (initial values set via non-hot paths
+        // vs uninitialized prev → everything "fires"). Run it as a full scan
+        // and reset the dirty accumulator so steady-state (time>0) starts clean.
+        if (self.dirty_edge || self.dirty_edge_shadow) && self.time == 0 {
+            self.check_edges_inner(None, false);
+            let positions = std::mem::take(&mut self.changed_edge_pos);
+            for &p in &positions {
+                if p < self.edge_pos_seen.len() {
+                    self.edge_pos_seen[p] = false;
+                }
+            }
+            let mut s = positions;
+            s.clear();
+            self.changed_edge_pos = s;
+            return;
+        }
+        if self.dirty_edge && !self.dirty_edge_shadow {
+            // Dirty-driven detect: scan only edge positions that changed since
+            // the last detect (written via write_sig!/after_signal_write hooks)
+            // plus the clocks that toggled this iter. Merge the toggled clocks
+            // into the changed set (deduped), scan that subset, then clear.
+            for &cp in &self.toggled_clock_positions {
+                if cp < self.edge_pos_seen.len() && !self.edge_pos_seen[cp] {
+                    self.edge_pos_seen[cp] = true;
+                    self.changed_edge_pos.push(cp);
+                }
+            }
+            let subset = std::mem::take(&mut self.changed_edge_pos);
+            self.check_edges_inner(Some(&subset), false);
+            for &p in &subset {
+                if p < self.edge_pos_seen.len() {
+                    self.edge_pos_seen[p] = false;
+                }
+            }
+            let mut s = subset;
+            s.clear();
+            self.changed_edge_pos = s;
+            return;
+        }
+        if self.dirty_edge_shadow {
+            // Shadow: full scan drives the sim (truth); mark the dirty set
+            // (clocks + accumulated writes) so check_edges_inner can assert
+            // every FIRING position was captured — validating hook coverage.
+            for &cp in &self.toggled_clock_positions {
+                if cp < self.edge_pos_seen.len() && !self.edge_pos_seen[cp] {
+                    self.edge_pos_seen[cp] = true;
+                    self.changed_edge_pos.push(cp);
+                }
+            }
+            self.check_edges_inner(None, true);
+            let positions = std::mem::take(&mut self.changed_edge_pos);
+            for &p in &positions {
+                if p < self.edge_pos_seen.len() {
+                    self.edge_pos_seen[p] = false;
+                }
+            }
+            let mut s = positions;
+            s.clear();
+            self.changed_edge_pos = s;
+            return;
+        }
+        self.check_edges_inner(None, false);
     }
 
     /// Fast-path edge-detect when the only signals that could have an edge
@@ -14344,7 +14464,7 @@ impl Simulator {
         // Clone the tiny scratch buffer so the borrow checker is happy when
         // we hand the slice into `check_edges_inner` (which needs &mut self).
         let positions = self.toggled_clock_positions.clone();
-        self.check_edges_inner(Some(&positions));
+        self.check_edges_inner(Some(&positions), false);
         self.prof_clocks_only_detect += 1;
     }
 
@@ -14352,7 +14472,7 @@ impl Simulator {
     /// only those positions in `edge_signal_ids` instead of the full range —
     /// see `check_edges_clocks_only`.  The dispatch / exec / cascade-prep
     /// path is identical either way.
-    fn check_edges_inner(&mut self, detect_subset: Option<&[usize]>) {
+    fn check_edges_inner(&mut self, detect_subset: Option<&[usize]>, validate_coverage: bool) {
         if self.event_measure {
             self.event_phase += 1; // flop SAMPLE phase
         }
@@ -14433,8 +14553,30 @@ impl Simulator {
             } else {
                 cur_v != prev_v || cur_x != prev_x
             };
+            if self.edge_scan_stats {
+                self.edge_scan_scanned += 1;
+            }
             if !fires_pos && !fires_neg && !fires_any {
                 continue;
+            }
+            if self.edge_scan_stats {
+                self.edge_scan_changed += 1;
+            }
+            // Shadow coverage check: a firing position MUST have been captured
+            // in the dirty set (clocks + write hooks). If not, a write path
+            // isn't hooked → dirty-driven detect would miss this edge. Abort
+            // loudly rather than risk silent wrong sim.
+            if validate_coverage
+                && pos < self.edge_pos_seen.len()
+                && !self.edge_pos_seen[pos]
+            {
+                eprintln!(
+                    "[DIRTY-EDGE-SHADOW] time={} MISSED edge at pos={} sid={} \
+                     (write path not hooked) — aborting",
+                    self.time, pos, sid
+                );
+                self.finished = true;
+                return;
             }
             // Phase-2 toggle counter: any edge means this signal
             // changed value this delta-cycle. Bumped only when
@@ -24112,7 +24254,27 @@ impl Simulator {
     /// `write_sig!` (full-Value writes) for backward-compatible JIT
     /// behavior.
     #[inline(always)]
+    /// Dirty-driven edge detect: record a write to signal `id` so check_edges
+    /// can later scan only changed edge-sensitive positions. No-op (one bool
+    /// load) unless XEZIM_DIRTY_EDGE / _SHADOW is active.
+    #[inline(always)]
+    fn note_edge_write(&mut self, id: usize) {
+        if !self.dirty_edge && !self.dirty_edge_shadow {
+            return;
+        }
+        if let Some(&p) = self.sig_to_edge_pos.get(id) {
+            if p >= 0 {
+                let p = p as usize;
+                if !self.edge_pos_seen[p] {
+                    self.edge_pos_seen[p] = true;
+                    self.changed_edge_pos.push(p);
+                }
+            }
+        }
+    }
+
     fn after_signal_write(&mut self, id: usize) {
+        self.note_edge_write(id);
         if id >= self.signal_table.len() {
             return;
         }
