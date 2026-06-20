@@ -1833,6 +1833,11 @@ pub struct Simulator {
     fst_prev_signals: Vec<Value>,
     /// Pre-computed combinatorial entries with sensitivity sets.
     comb_entries: Vec<CombEntry>,
+    /// Static topological level per comb entry (longest producer chain).
+    /// Populated when the level-BSP settle path is enabled; entries within one
+    /// level write disjoint signals (no read-after-write), so they can be
+    /// evaluated in parallel behind a per-level barrier. Empty = not built.
+    comb_level: Vec<u32>,
     /// Precomputed indices of comb_entries with has_unresolved_reads=true.
     /// Built once alongside comb_entries; scanning this short list every
     /// settle call is vastly cheaper than iterating all num_entries bits
@@ -2848,6 +2853,7 @@ impl Simulator {
             fst_trace: Vec::new(),
             fst_prev_signals: Vec::new(),
             comb_entries: Vec::new(),
+            comb_level: Vec::new(),
             comb_unresolved_idx: Vec::new(),
             comb_time0_idx: Vec::new(),
             comb_time0_fired: false,
@@ -5267,6 +5273,9 @@ impl Simulator {
             }
         }
         self.build_comb_entries();
+        if std::env::var_os("XEZIM_SETTLE_LEVELS").is_some() {
+            self.report_comb_levels();
+        }
         if self.activity_mon {
             self.activity_counts = vec![0u64; self.comb_entries.len()];
         }
@@ -5641,6 +5650,72 @@ impl Simulator {
         eprintln!(
             "[OPT] auto-partition-by-scope: k={} buckets, block counts {:?}",
             self.edge_block_partition_count, counts
+        );
+    }
+
+    /// Feasibility probe for levelized / bulk-synchronous parallel settle
+    /// (XEZIM_SETTLE_LEVELS=1). Assigns each comb entry a static level =
+    /// longest producer chain (entries in stored topo order; cyclic back-edges
+    /// ignored), then reports the per-level width distribution. WIDE levels =
+    /// many mutually-independent entries that could evaluate in parallel behind
+    /// a barrier; NARROW levels (long dependency chains) mean little exploitable
+    /// parallelism. Static (all entries) — an upper bound on the dynamic
+    /// per-pass parallelism (settle only fires triggered entries).
+    fn report_comb_levels(&mut self) {
+        let n = self.comb_entries.len();
+        if n == 0 {
+            return;
+        }
+        // signal_id -> highest producer level seen so far (topo order).
+        let mut sig_prod_level: HashMap<usize, u32> = HashMap::default();
+        let mut unresolved = 0usize;
+        self.comb_level = vec![0u32; n];
+        for i in 0..n {
+            let e = &self.comb_entries[i];
+            if e.has_unresolved_reads {
+                unresolved += 1;
+            }
+            let mut lvl = 0u32;
+            for &rs in &e.read_signal_ids {
+                if let Some(&pl) = sig_prod_level.get(&rs) {
+                    if pl + 1 > lvl {
+                        lvl = pl + 1;
+                    }
+                }
+            }
+            for &ws in &e.write_signal_ids {
+                let cur = sig_prod_level.entry(ws).or_insert(0);
+                if lvl > *cur {
+                    *cur = lvl;
+                }
+            }
+            self.comb_level[i] = lvl;
+        }
+        if std::env::var_os("XEZIM_SETTLE_LEVELS").is_none() {
+            return; // levels computed/stored; skip the diagnostic print
+        }
+        let level = &self.comb_level;
+        let max_level = level.iter().copied().max().unwrap_or(0);
+        let num_levels = max_level as usize + 1;
+        let mut width = vec![0usize; num_levels];
+        for &l in level.iter() {
+            width[l as usize] += 1;
+        }
+        let max_width = width.iter().copied().max().unwrap_or(0);
+        let avg_width = n as f64 / num_levels as f64;
+        // Parallelizable mass: entries in levels wide enough to amortize a
+        // per-level barrier.
+        let mass_ge = |t: usize| -> usize { width.iter().filter(|&&w| w >= t).sum() };
+        eprintln!(
+            "[SETTLE-LEVELS] {} entries, {} levels, max_width={}, avg_width={:.1}, unresolved(always-fire)={} ({:.0}%)",
+            n, num_levels, max_width, avg_width, unresolved,
+            100.0 * unresolved as f64 / n as f64
+        );
+        eprintln!(
+            "[SETTLE-LEVELS] entries in levels of width >=16: {} ({:.0}%), >=64: {} ({:.0}%), >=256: {} ({:.0}%)",
+            mass_ge(16), 100.0 * mass_ge(16) as f64 / n as f64,
+            mass_ge(64), 100.0 * mass_ge(64) as f64 / n as f64,
+            mass_ge(256), 100.0 * mass_ge(256) as f64 / n as f64,
         );
     }
 
