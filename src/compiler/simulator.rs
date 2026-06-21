@@ -1930,6 +1930,11 @@ pub struct Simulator {
     edge_scan_scanned: u64,
     edge_scan_changed: u64,
     edge_scan_stats: bool,
+    /// XEZIM_ARRAY_SOA_SHADOW=1 (with XEZIM_INLINE_BITS=1): redirect array-cell
+    /// READS to the compact signal_inline_bits store and assert they match the
+    /// canonical signal_table — Stage-0 validation toward dropping the 32-byte
+    /// Value array cells. signal_table stays canonical (safe).
+    soa_shadow: bool,
     /// Dirty-driven edge detect (XEZIM_DIRTY_EDGE=1). `sig_to_edge_pos[id]` =
     /// position of signal `id` in `edge_signal_ids`, or -1 if not edge-sensitive.
     /// Writes to edge-sensitive signals (via write_sig!/after_signal_write)
@@ -2942,6 +2947,7 @@ impl Simulator {
             edge_scan_scanned: 0,
             edge_scan_changed: 0,
             edge_scan_stats: std::env::var_os("XEZIM_EDGE_SCAN_STATS").is_some(),
+            soa_shadow: std::env::var_os("XEZIM_ARRAY_SOA_SHADOW").is_some(),
             sig_to_edge_pos: Vec::new(),
             changed_edge_pos: Vec::new(),
             edge_pos_seen: Vec::new(),
@@ -10455,7 +10461,28 @@ impl Simulator {
                     // miss; subsequent calls are a Vec index away.
                     let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
                     if let Some(eid) = self.get_array_elem_id(array_name, idx) {
-                        self.vm_regs[*dest as usize].copy_from(&self.signal_table[eid]);
+                        // Stage-0 SoA read-redirect (shadow-validated): reconstruct
+                        // the cell from the compact signal_inline_bits store and
+                        // assert it matches canonical signal_table.
+                        if self.soa_shadow
+                            && eid < self.signal_inline_bits.len()
+                            && self.signal_widths[eid] <= 64
+                        {
+                            let [v, x] = self.signal_inline_bits[eid];
+                            let (cv, cx) = self.signal_table[eid].raw_bits();
+                            if v != cv || x != cx {
+                                eprintln!(
+                                    "[SOA-SHADOW] LoadArrayElem mismatch eid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
+                                    eid, v, x, cv, cx
+                                );
+                                self.finished = true;
+                            }
+                            let mut val = Value::from_inline(v, x, self.signal_widths[eid]);
+                            val.is_signed = self.signal_signed[eid];
+                            self.vm_regs[*dest as usize] = val;
+                        } else {
+                            self.vm_regs[*dest as usize].copy_from(&self.signal_table[eid]);
+                        }
                     } else {
                         self.vm_regs[*dest as usize] = Value::new(1);
                     }
