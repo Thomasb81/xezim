@@ -12892,6 +12892,30 @@ impl Simulator {
             self.loop_iters,
             sim_elapsed.as_secs_f64() * 1e6 / self.loop_iters.max(1) as f64
         );
+        if std::env::var_os("XEZIM_XZ_STATS").is_some() {
+            // Sparse-X/Z opportunity: how many signals carry X/Z at sim end
+            // (steady-state proxy). If X/Z is rare, a sparse X/Z store + 2-state
+            // fast value path would shrink the dominant 4-state storage traffic.
+            let n = self.signal_table.len();
+            let mut xz = 0usize;
+            let mut xz_scalar = 0usize;
+            let named = self.id_to_name.len();
+            for i in 0..n {
+                if self.signal_table[i].has_xz() {
+                    xz += 1;
+                    if i < named {
+                        xz_scalar += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[XZ-STATS] signals with X/Z at end: {}/{} ({:.3}%); of {} named: {} ({:.3}%); \
+                 → {:.1}% are 2-state (sparse-X/Z candidates)",
+                xz, n, 100.0 * xz as f64 / n.max(1) as f64,
+                named, xz_scalar, 100.0 * xz_scalar as f64 / named.max(1) as f64,
+                100.0 * (n - xz) as f64 / n.max(1) as f64
+            );
+        }
         if self.bsp_widths_on {
             let b = &self.bsp_width_buckets;
             let tot: u64 = b.iter().sum();
