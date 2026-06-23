@@ -14113,6 +14113,16 @@ impl Simulator {
             StatementKind::For { body, .. } | StatementKind::While { body, .. } => {
                 self.stmt_is_blocking(body)
             }
+            // `fork...join` / `join_any` suspends the calling process until its
+            // children finish, so a task containing one must be inlined (run via
+            // the suspend-aware run_process_stmts) — otherwise the synchronous
+            // path mishandles the join and drops the post-join continuation
+            // (this is what stalls uvm_sequence_base::start, which forks the
+            // sequence body). `join_none` returns immediately, so it doesn't
+            // make the enclosing task blocking on its own.
+            StatementKind::ParBlock { join_type, .. } => {
+                !matches!(join_type, JoinType::JoinNone)
+            }
             _ => false,
         }
     }
