@@ -14157,6 +14157,28 @@ impl Simulator {
                     }
                 }
             }
+            // A non-TimingControl body statement that blocks (a `wait(...)`,
+            // `repeat(N) @event`, `if/while` with an inner wait, or a blocking
+            // method call) the top-level scan above can't suspend on. Route the
+            // remainder of this iteration + a Forever continuation through
+            // run_process_stmts so its waits suspend instead of spinning
+            // synchronously. (Top-level `#delay`/`@event` — e.g. `always #5 clk`
+            // clock generators — are handled above and never reach here.)
+            if !matches!(&s.kind, StatementKind::TimingControl { .. })
+                && self.stmt_is_blocking(s)
+            {
+                let mut cont: Vec<Statement> = vec![s.clone()];
+                cont.extend_from_slice(&body_stmts[i + 1..]);
+                cont.push(Statement::new(
+                    StatementKind::Forever {
+                        body: Box::new(body.clone()),
+                    },
+                    body.span,
+                ));
+                cont.extend_from_slice(after);
+                self.run_process_stmts(pid, &cont);
+                return;
+            }
             self.exec_statement(s);
         }
         // No delay/event in forever body — safety limit

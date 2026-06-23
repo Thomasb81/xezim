@@ -1,0 +1,28 @@
+********* Init Program *********
+********* Wipe memory to 0 *********
+********* Read program *********
+********* Load program to memory *********
+
+CoreMark has been run 1 times, one times cost 167124 cycles !
+
+CoreMark 1.0 : 5.983581 (iterations/sec)/MHz
+2K performance run parameters for coremark.
+CoreMark Size    : 666
+Total ticks      : -1
+Total time (secs): 42
+Iterations/Sec   : 0
+Iterations       : 1
+Compiler version : GCC10.2.0
+Compiler flags   : -O
+Memory location  : STACK
+seedcrc          : 0xe9f5
+[0]crclist       : 0xe714
+[0]crcmatrix     : 0x1fd7
+[0]crcstate     :  0x8e3a
+[0]crcfinal      : 0xe714
+Correct operation validated. See readme.txt for run and reporting rules.
+**********************************************
+*    simulation finished successfully        *
+**********************************************
+TEST PASSED
+/home/bondan/repo/rtlmeter/designs/XuanTie-C910/src/tb.v:267: $finish called at 20073650 (100ps)

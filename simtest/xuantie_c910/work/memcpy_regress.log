@@ -1,0 +1,136 @@
+=== xezim ===
+Max time: 80000000
+------------------------------
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.wid_for_axi4.create_en' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_bmbif.x_ct_ciu_bmbif_ctcq.x_ct_bmbif_xx_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_bmbif.x_ct_ciu_bmbif_ctcq.x_ct_bmbif_xx_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_bmbif.x_ct_ciu_bmbif_ncq.x_ct_bmbif_xx_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_bmbif.x_ct_ciu_bmbif_ncq.x_ct_bmbif_xx_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_bmbif.x_ct_ciu_bmbif_snb0.x_ct_bmbif_xx_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_bmbif.x_ct_ciu_bmbif_snb0.x_ct_bmbif_xx_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_bmbif.x_ct_ciu_bmbif_snb1.x_ct_bmbif_xx_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_bmbif.x_ct_ciu_bmbif_snb1.x_ct_bmbif_xx_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_ctcq.x_ct_dvm_op_rid_rfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_ctcq.x_ct_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_ebiuif.x_ct_ciu_snb_ebiuif_ar_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_ncq.x_ct_aw_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_ncq.x_ct_ciu_ncq_raq.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_ncq.x_ct_ciu_ncq_rdq.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_ncq.x_ct_ciu_ncq_waq.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_ncq.x_ct_ciu_ncq_wbq.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_ncq.x_ct_ciu_ncq_wdq.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_ncq.x_ct_ciu_ncq_woq.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_ncq.x_ct_ncq_ar_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_0.x_ct_ciu_snb_arb.x_ct_ciu_ebiu_sel_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_0.x_ct_ciu_snb_arb.x_ct_ciu_l2c_sel_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_0.x_ct_ciu_snb_arb.x_ct_ciu_sab_ar_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_0.x_ct_ciu_snb_arb.x_ct_ciu_sab_aw_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_0.x_ct_ciu_snb_arb.x_ct_ciu_sab_cd_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_0.x_ct_ciu_snb_arb.x_ct_ciu_wd_sel_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_1.x_ct_ciu_snb_arb.x_ct_ciu_ebiu_sel_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_1.x_ct_ciu_snb_arb.x_ct_ciu_l2c_sel_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_1.x_ct_ciu_snb_arb.x_ct_ciu_sab_ar_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_1.x_ct_ciu_snb_arb.x_ct_ciu_sab_aw_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_1.x_ct_ciu_snb_arb.x_ct_ciu_sab_cd_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_snb_1.x_ct_ciu_snb_arb.x_ct_ciu_wd_sel_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ciu_vb.x_ct_ciu_vb_aw_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ebiu_top.x_ct_ebiu_read_channel.x_ct_ebiu_rfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_ebiu_top.x_ct_ebiu_write_channel.x_ct_ebiu_bfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_ac_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_ac_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_ar_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_b_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_b_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_back_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_cd_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_cd_sid_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_cr_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_r_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_r_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_rack_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_rspq.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_wd_sid_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_wd_wns_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu0_top.x_ct_piu_wd_ws_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_ac_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_ac_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_ar_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_b_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_b_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_back_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_cd_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_cd_sid_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_cr_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_r_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_r_prio.prio' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_rack_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_rspq.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_wd_sid_fifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_wd_wns_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_ciu_top.x_ct_piu1_top.x_ct_piu_wd_ws_dfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_l2c_top.x_ct_l2c_sub_bank_0.x_ct_l2c_wb.x_ct_l2c_resp_rfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_l2c_top.x_ct_l2c_sub_bank_1.x_ct_l2c_wb.x_ct_l2c_resp_rfifo.fifo_entry_cont' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_top_0.x_ct_core' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_top_0.x_ct_had_private_top.x_ct_had_private_ir.x_ct_had_private_sync_dr.x_sync_level2level.sync_ff' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_top_0.x_ct_had_private_top.x_ct_had_private_ir.x_ct_had_private_sync_ir.x_sync_level2level.sync_ff' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_top_1.x_ct_core' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_top_1.x_ct_had_private_top.x_ct_had_private_ir.x_ct_had_private_sync_dr.x_sync_level2level.sync_ff' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_ct_top_1.x_ct_had_private_top.x_ct_had_private_ir.x_ct_had_private_sync_ir.x_sync_level2level.sync_ff' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_plic_top.x_plic_hreg_busif.hart_mclaim_flop' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_plic_top.x_plic_hreg_busif.hart_sclaim_flop' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[xezim][warning] implicit 1-bit net created for undeclared identifier 'x_soc.x_cpu_sub_system_axi.x_rv_integration_platform.x_cpu_top.x_plic_top.x_plic_kid_busif.x_plic_int_sync.sync_ff' (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.
+[PHASE] simulator construction: 4339.5ms (materialize 291.8, names 495.1, static 456.3, arrays_1d 2554.1, arrays_other 0.0, prev 6.4, drop 287.3; signals 35955017, named 2400585)
+[PHASE] time-0 settle: 184.0ms (446456 entry_evals, 4 settle_iters, 438580 comb_entries, 35955017 signals)
+[PHASE] time-0 settle breakdown: DC 0.0ms/437824 (0.0µs), CA 0.1ms/6 (16.2µs), AB 0.0ms/8626 (0.0µs)
+[PHASE] compilation: 30908.4ms
+********* Init Program *********
+********* Wipe memory to 0 *********
+********* Read program *********
+********* Load program to memory *********
+Memory copy for 1024 bytes cost 402 CPU cycles!
+**********************************************
+*    simulation finished successfully        *
+**********************************************
+TEST PASSED
+[PROF] settle=82253.3ms edges=113868.8ms nba=316.4ms process=1181.2ms snap=7610.1ms sched=12.2ms
+[PROF] edge_waiters=5.1ms edge_cg=3.1ms waiter_iters=0
+[PROF] clocks_only_detect=0 nba_elided=192087722 (iters with clocks-only scan / NBAs dropped at eval because value matched signal_table)
+[PROF] edge_detect=27643.4ms edge_exec=85918.5ms edges_fired=204360382 insns=1896856266 ns_per_insn=45.3 fallbacks=54
+[PROF] par_dispatch partition=0 legacy=10189 tbb=0 pdes=0 (partition k=0)
+[PROF] fallback_reason                  TimingControl: count=       1 total=     2.5ms avg= 2472.1µs
+[PROF] fallback_reason                     Expr_write: count=      48 total=     1.0ms avg=   20.2µs
+[PROF] fallback_reason                   Expr_display: count=       4 total=     0.3ms avg=   64.9µs
+[PROF] fallback_reason                    Expr_finish: count=       1 total=     0.0ms avg=    0.1µs
+[PROF] settle_dc=0.0ms(359314691) settle_ca=1189.3ms(1092120) settle_ab=0.0ms(6151862)
+[PROF] settle_calls=182020 settle_iters=374578 max_iters=6 entry_evals=366558673 unresolved_entries=6/438580
+[PROF] simulation_loop=205312.8ms iters=20392 avg=10068.30µs/iter
+[PHASE] simulation: 205321.1ms
+[PHASE] total: 236229.5ms
+------------------------------
+Simulation finished at time 101965
+------------------------------
+Simulation finished at time 101965
+($finish called)
+	Command being timed: "/home/bondan/repo/sv2023/xezim-pdes/target/release/xezim --simulate --max-time 80000000 -s tb -I /home/bondan/repo/sv2023/xezim-pdes/simtest/xuantie_c910/work -I /home/bondan/repo/rtlmeter/designs/XuanTie-C910/src -f c910.fl"
+	User time (seconds): 213.26
+	System time (seconds): 11.51
+	Percent of CPU this job got: 98%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 3:48.08
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9099340
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 2440260
+	Voluntary context switches: 33995
+	Involuntary context switches: 8419
+	Swaps: 0
+	File system inputs: 41704
+	File system outputs: 64
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
