@@ -1539,6 +1539,13 @@ pub struct Simulator {
     /// Class-typed procedural locals — variable name -> class type name.
     /// Lets a later `name = new();` know which class to construct.
     var_class_types: HashMap<String, String>,
+    /// §15.3/§15.4: built-in container local variable → "mailbox"/"semaphore".
+    /// Populated at VarDecl exec time when the declared base type is a
+    /// (possibly parameterized) mailbox/semaphore, so a later separate
+    /// `name = new(bound)` allocates the right container. get_expr_type_name
+    /// can't serve this: for a class property it returns the enclosing class
+    /// name, and for an untracked local it returns None.
+    var_container_types: HashMap<String, String>,
     /// LRM §6.19.6: typedef-typed local variable → typedef name. So
     /// `<local>.next()/.first()/.last()/.num()/.prev()` resolves the
     /// enum-member list via `module.enum_members[typedef]`. Mirrors
@@ -2814,6 +2821,7 @@ impl Simulator {
             dist_picked_once: HashSet::default(),
             class_statics: HashMap::default(),
             var_class_types: HashMap::default(),
+            var_container_types: HashMap::default(),
             var_typedef_types: HashMap::default(),
             string_signals: HashSet::default(),
             queue_frame_saves: Vec::new(),
@@ -21408,6 +21416,38 @@ impl Simulator {
                     if let ExprKind::Ident(hier) = &func.kind {
                         let method_name = hier.path.last().unwrap().name.name.as_str();
                         if method_name == "new" {
+                            // `mailbox`/`semaphore` allocation (§15.3/§15.4):
+                            // `m = new(bound)`. This must be detected BEFORE the
+                            // copy-constructor heuristic below — `new(size)` with
+                            // an int variable `size` would otherwise be mistaken
+                            // for `new <handle>` (its value collides with a live
+                            // heap index) and shallow-copy the wrong object. The
+                            // declared container type is found via the class
+                            // property / local-decl maps, which get_expr_type_name
+                            // misreports (it returns the enclosing class name for
+                            // a property, or None for an untracked local).
+                            if let Some(kind) = self.lvalue_container_kind(lvalue) {
+                                let handle = self.heap.len();
+                                self.heap.push(Some(ClassInstance {
+                                    class_name: kind.to_string(),
+                                    properties: HashMap::default(),
+                                }));
+                                if kind == "semaphore" {
+                                    let n = args
+                                        .first()
+                                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
+                                        .unwrap_or(0);
+                                    self.semaphores.insert(handle, n);
+                                } else {
+                                    self.mailboxes
+                                        .insert(handle, std::collections::VecDeque::new());
+                                }
+                                self.assign_value(lvalue, &Value::from_u64(handle as u64, 32).resize(w));
+                                if !self.in_edge_block {
+                                    self.settle_combinatorial();
+                                }
+                                return;
+                            }
                             // Copy constructor `new <obj>` (SV 8.13): a single
                             // argument that resolves to a live object handle is
                             // shallow-copied into a fresh instance. riscv-dv's
@@ -22938,6 +22978,20 @@ impl Simulator {
                             if self.module.classes.contains_key(cn) {
                                 self.var_class_types
                                     .insert(d.name.name.clone(), cn.clone());
+                            }
+                        }
+                        // §15.3/§15.4: record a mailbox/semaphore-typed local so
+                        // a later separate `name = new(bound)` allocates the right
+                        // container. Clear any stale same-named entry from another
+                        // frame (var_container_types is a flat map like
+                        // var_class_types) when this decl isn't a container.
+                        match class_name.as_deref().and_then(Self::container_base) {
+                            Some(k) => {
+                                self.var_container_types
+                                    .insert(d.name.name.clone(), k.to_string());
+                            }
+                            None => {
+                                self.var_container_types.remove(&d.name.name);
                             }
                         }
                         // LRM §6.19.6: track typedef-typed locals so
@@ -27501,13 +27555,18 @@ impl Simulator {
                 }
             }
         }
-        // If obj_name is a mailbox/semaphore handle variable, don't treat it as an array.
+        // If obj_name is a mailbox/semaphore handle variable, don't treat it as
+        // an array — bail (None) so the call falls through to the handle-based
+        // container dispatch. The handle lives in a signal for a module/local
+        // var, but in the instance's property map for a class member (e.g.
+        // uvm_tlm_fifo's `local mailbox m`), so check both: a signal-only check
+        // mis-routes a class-property mailbox's `num()`/`get()` to the array
+        // path and reads 0.
         if matches!(
             mname,
             "num" | "put" | "get" | "peek" | "try_put" | "try_get" | "try_peek"
         ) {
-            if let Some(handle_val) = self.get_signal_value_by_name(obj_name) {
-                let handle = handle_val.to_u64().unwrap_or(0) as usize;
+            if let Some(handle) = self.resolve_container_handle(obj_name) {
                 if self.mailboxes.contains_key(&handle) || self.semaphores.contains_key(&handle) {
                     return None;
                 }
@@ -33168,6 +33227,84 @@ impl Simulator {
     /// handles). Used to give `field.name()` the correct enum type — e.g. an
     /// instruction's `rd` (riscv_reg_t) must reflect against the register enum,
     /// not the largest enum in the design (riscv_instr_name_t).
+    /// Resolve a receiver name to its container (mailbox/semaphore) handle.
+    /// Checks the signal/local table first, then — for a bare class-member
+    /// name accessed inside a method — the current `this` instance's property
+    /// map. Returns the raw handle value (caller checks mailboxes/semaphores).
+    fn resolve_container_handle(&self, obj_name: &str) -> Option<usize> {
+        if let Some(v) = self.get_signal_value_by_name(obj_name) {
+            return Some(v.to_u64().unwrap_or(0) as usize);
+        }
+        let prop = obj_name.strip_prefix("this.").unwrap_or(obj_name);
+        if !prop.contains('.') {
+            if let Some(Some(th)) = self.this_stack.last().copied() {
+                if let Some(Some(inst)) = self.heap.get(th) {
+                    if let Some(v) = inst.properties.get(prop) {
+                        return Some(v.to_u64().unwrap_or(0) as usize);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Strip parameterization/whitespace from a declared type string and
+    /// return "mailbox"/"semaphore" if that is the base type, else None.
+    /// `"mailbox #(REQ)"`, `"mailbox#(T)"`, `"mailbox"` -> Some("mailbox").
+    fn container_base(t: &str) -> Option<&'static str> {
+        let base = t
+            .split(|c| c == '#' || c == ' ' || c == '(')
+            .next()
+            .unwrap_or("")
+            .trim();
+        match base {
+            "mailbox" => Some("mailbox"),
+            "semaphore" => Some("semaphore"),
+            _ => None,
+        }
+    }
+
+    /// §15.3/§15.4: if `lvalue`'s declared type is a (possibly parameterized)
+    /// mailbox/semaphore, return "mailbox"/"semaphore". Consults the local
+    /// container-decl map and the class-property type via the current class
+    /// context FIRST (both reliable), falling back to get_expr_type_name
+    /// (which only serves module-scope container signals correctly).
+    fn lvalue_container_kind(&self, lvalue: &Expression) -> Option<&'static str> {
+        let prop: Option<String> = match &lvalue.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => Some(h.path[0].name.name.clone()),
+            ExprKind::MemberAccess { expr, member }
+                if matches!(expr.kind, ExprKind::This) =>
+            {
+                Some(member.name.clone())
+            }
+            _ => None,
+        };
+        if let Some(pn) = &prop {
+            // 1. tracked local (procedural `mailbox m;`).
+            if let Some(k) = self.var_container_types.get(pn) {
+                return Self::container_base(k);
+            }
+            // 2. class property of the current class (walk the hierarchy).
+            if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                let mut cur = Some(ctx);
+                while let Some(cn) = cur {
+                    if let Some(cd) = self.module.classes.get(&cn) {
+                        if let Some(sig) = cd.properties.get(pn) {
+                            return sig.type_name.as_deref().and_then(Self::container_base);
+                        }
+                        cur = cd.extends.clone();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        // 3. module-scope signal (get_expr_type_name returns "mailbox" here).
+        self.get_expr_type_name(lvalue)
+            .as_deref()
+            .and_then(Self::container_base)
+    }
+
     fn class_prop_type_named(&self, class_name: &str, prop: &str) -> Option<String> {
         let mut cur = Some(class_name.to_string());
         while let Some(cname) = cur {
