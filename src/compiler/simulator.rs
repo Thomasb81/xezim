@@ -1524,6 +1524,15 @@ pub struct Simulator {
     /// bus_if.master vif`) so the rewrite path can also emit a direction
     /// warning when writing to a modport-input member.
     virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
+    /// UVM uvm_config_db scope-aware store (in addition to the flat
+    /// `__uvm_cfgdb__` signal keys, kept as a fallback). Each set records the
+    /// fully-resolved scope pattern `<cntxt.get_full_name()>.<inst_name>`, the
+    /// field, the value, and (for a virtual-interface value) the bound
+    /// interface instance name. A get computes its own scope
+    /// `<cntxt.get_full_name()>.<inst_name>` and takes the LAST-set entry whose
+    /// field matches and whose scope pattern glob-matches — so two sets to
+    /// different scopes with the same field no longer collide on a bare key.
+    cfgdb_scoped: Vec<(String, String, Value, Option<String>)>,
     /// LRM §25.9: stack of per-call virtual-interface formal-arg
     /// aliases. When a task or function takes `virtual <iface> <name>`,
     /// the call hooks add a frame mapping `<name>` to the caller's
@@ -2844,6 +2853,7 @@ impl Simulator {
             dpi_unresolved: HashSet::default(),
             heap: vec![None], // index 0 is null
             virtual_iface_bindings: HashMap::default(),
+            cfgdb_scoped: Vec::new(),
             local_iface_aliases: Vec::new(),
             dist_picked_once: HashSet::default(),
             class_statics: HashMap::default(),
@@ -20836,8 +20846,22 @@ impl Simulator {
                 // bound interface signal directly. (UVM driver `vif.rst_n`.)
                 if let ExprKind::Ident(vh) = &expr.kind {
                     if vh.path.len() == 1 {
+                        let seg0 = &vh.path[0].name.name;
+                        // (a) virtual-interface formal arg aliased into this call
+                        // frame (LRM §25.9: `task f(virtual if av); ...av.sig`).
+                        if let Some(bound) = self
+                            .local_iface_aliases
+                            .last()
+                            .and_then(|f| f.get(seg0))
+                            .cloned()
+                        {
+                            let resolved = format!("{}.{}", bound, member.name);
+                            if let Some(v) = self.lookup_signal_value(&resolved) {
+                                return v;
+                            }
+                        }
+                        // (b) `this.vif` class property binding.
                         if let Some(Some(this_h)) = self.this_stack.last().copied() {
-                            let seg0 = &vh.path[0].name.name;
                             let is_vif = self
                                 .heap
                                 .get(this_h)
@@ -26954,9 +26978,78 @@ impl Simulator {
         )
     }
 
+    /// UVM glob match for config_db inst_name patterns (`*` = any run, `?` =
+    /// any single char). Patterns/scopes are short, so the simple recursion is
+    /// fine.
+    fn cfg_glob_match(pat: &str, text: &str) -> bool {
+        fn m(p: &[u8], t: &[u8]) -> bool {
+            if p.is_empty() {
+                return t.is_empty();
+            }
+            if p[0] == b'*' {
+                for i in 0..=t.len() {
+                    if m(&p[1..], &t[i..]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if t.is_empty() {
+                return false;
+            }
+            if p[0] == b'?' || p[0] == t[0] {
+                return m(&p[1..], &t[1..]);
+            }
+            false
+        }
+        m(pat.as_bytes(), text.as_bytes())
+    }
+
+    /// Match a config_db set scope `pattern` against a getter scope. Tries the
+    /// full pattern first; then, because xezim's `get_full_name` yields a
+    /// component's LEAF name (not the full hierarchical path), also matches the
+    /// pattern's last dotted segment against the getter — so `*.d1` / `*.agent.*`
+    /// still select by the requesting component's name.
+    fn cfg_scope_matches(pattern: &str, getter: &str) -> bool {
+        if Self::cfg_glob_match(pattern, getter) {
+            return true;
+        }
+        let last = pattern.rsplit('.').next().unwrap_or(pattern);
+        last != pattern && Self::cfg_glob_match(last, getter)
+    }
+
+    /// Resolve a config_db scope `<cntxt.get_full_name()>.<inst_name>` (UVM's
+    /// effective lookup/registration scope). `uvm_root::get()` / null cntxt
+    /// contributes an empty prefix (so the scope is just inst_name).
+    fn cfg_scope(&mut self, cntxt: Option<&Expression>, inst: &str) -> String {
+        let full = cntxt
+            .and_then(|e| {
+                let h = self.eval_expr(e).to_u64().unwrap_or(0) as usize;
+                if h == 0 || h >= self.heap.len() {
+                    return None;
+                }
+                let s = self
+                    .exec_method_call(h, "get_full_name", &[])
+                    .to_sv_string();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            })
+            .unwrap_or_default();
+        match (full.is_empty(), inst.is_empty()) {
+            (true, _) => inst.to_string(),
+            (false, true) => full,
+            (false, false) => format!("{}.{}", full, inst),
+        }
+    }
+
     /// `uvm_config_db#(T)::set/get/exists(cntxt, inst_name, field_name, value)`.
-    /// Stores/retrieves by `field_name` in a flat map (`self.signals` under a
-    /// reserved prefix). Sufficient for riscv-dv's single-scope cfg hand-off.
+    /// Scope-aware: each set records `<cntxt.get_full_name()>.<inst_name>` and a
+    /// get matches its own scope against those patterns (UVM glob), so sets to
+    /// distinct scopes with the same field don't collide. A flat
+    /// `__uvm_cfgdb__` signal-key store is kept as a fallback.
     fn exec_config_db(&mut self, mname: &str, args: &[Expression]) -> Value {
         // Pull args by name when named-form is used (`.field_name(...)`),
         // falling back to positional otherwise: (cntxt, inst_name, field_name, value).
@@ -26975,21 +27068,26 @@ impl Simulator {
         let inst = inst_expr
             .map(|a| self.eval_expr(a).to_sv_string())
             .unwrap_or_default();
+        let cntxt_expr = find_named("cntxt").or_else(|| args.get(0));
+        let scope = self.cfg_scope(cntxt_expr, &inst);
         let key = format!("__uvm_cfgdb__{}|{}", inst, field);
         match mname {
             "set" => {
                 if let Some(v) = value_expr {
                     let val = self.eval_expr(v);
+                    // Virtual-interface value: remember the bound interface
+                    // instance name (a direct iface ident, or another vif's
+                    // current target) for the get-side binding.
+                    let vif_iname = self.resolve_vif_rhs_name(v).filter(|_| {
+                        matches!(&v.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. })
+                    });
+                    // Scope-aware store (primary).
+                    self.cfgdb_scoped
+                        .push((scope.clone(), field.clone(), val.clone(), vif_iname.clone()));
+                    // Flat fallback keys (back-compat for the loose lookup).
                     self.signals.insert(key.clone(), val.clone());
-                    // Also publish under bare-field key for plain inst_name=""
-                    // gets that just lookup the field. Latest set wins.
                     self.signals.insert(format!("__uvm_cfgdb__{}", field), val);
-                    // P6: for a virtual-interface value (set with an interface
-                    // instance identifier, e.g. `::set(.., "in_intf", ivif)`),
-                    // remember the instance NAME so a later get can bind it for
-                    // `vif.member` resolution + `@(posedge vif.clk)` sensitivity.
-                    if let ExprKind::Ident(h) = &v.kind {
-                        let iname = self.resolve_hier_name(h);
+                    if let Some(iname) = vif_iname {
                         let nv = Value::from_string(&iname);
                         self.signals
                             .insert(format!("__uvm_cfgvif__{}|{}", inst, field), nv.clone());
@@ -27008,40 +27106,57 @@ impl Simulator {
             // a few key forms so wildcard sets (`"*"`, `"*foo"`) reach plain
             // gets with inst_name "" or specific child names.
             _ => {
-                let bare = format!("__uvm_cfgdb__{}", field);
-                let candidates = [
-                    key.clone(),
-                    format!("__uvm_cfgdb__*|{}", field),
-                    format!("__uvm_cfgdb__*{}|{}", inst, field),
-                    bare.clone(),
-                ];
-                let mut hit: Option<Value> = None;
-                for k in candidates.iter() {
-                    if let Some(v) = self.signals.get(k).cloned() {
-                        hit = Some(v);
-                        break;
+                // Scope-aware match first: the LAST-set entry whose field
+                // matches and whose set scope pattern glob-matches this getter's
+                // scope. Falls back to the flat keys when no scoped entry hits.
+                let scoped = self
+                    .cfgdb_scoped
+                    .iter()
+                    .rev()
+                    .find(|(s, f, _, _)| f == &field && Self::cfg_scope_matches(s, &scope))
+                    .map(|(_, _, v, vif)| (v.clone(), vif.clone()));
+                let (hit, scoped_vif): (Option<Value>, Option<String>) = match scoped {
+                    Some((v, vif)) => (Some(v), vif),
+                    None => {
+                        let bare = format!("__uvm_cfgdb__{}", field);
+                        let candidates = [
+                            key.clone(),
+                            format!("__uvm_cfgdb__*|{}", field),
+                            format!("__uvm_cfgdb__*{}|{}", inst, field),
+                            bare,
+                        ];
+                        let mut h: Option<Value> = None;
+                        for k in candidates.iter() {
+                            if let Some(v) = self.signals.get(k).cloned() {
+                                h = Some(v);
+                                break;
+                            }
+                        }
+                        let vif = if h.is_some() {
+                            let vif_cands = [
+                                format!("__uvm_cfgvif__{}|{}", inst, field),
+                                format!("__uvm_cfgvif__*|{}", field),
+                                format!("__uvm_cfgvif__*{}|{}", inst, field),
+                                format!("__uvm_cfgvif__{}", field),
+                            ];
+                            vif_cands
+                                .iter()
+                                .find_map(|k| self.signals.get(k).map(|v| v.to_sv_string()))
+                                .filter(|s| !s.is_empty())
+                        } else {
+                            None
+                        };
+                        (h, vif)
                     }
-                }
-                let _ = (inst.as_str(),); // suffix-walk fallback removed: iterating
-                // the full signal table on every get is O(N) and dominated by RTL nets.
+                };
                 if let Some(val) = hit {
                     if let Some(dst) = value_expr {
                         self.assign_value(dst, &val);
-                        // P6: if this field carried a virtual-interface instance
+                        // If this field carried a virtual-interface instance
                         // name, bind it to the destination vif property so
                         // `vif.member` resolves and `@(posedge vif.clk)` events
                         // sensitize on the real interface signal.
-                        let vif_cands = [
-                            format!("__uvm_cfgvif__{}|{}", inst, field),
-                            format!("__uvm_cfgvif__*|{}", field),
-                            format!("__uvm_cfgvif__*{}|{}", inst, field),
-                            format!("__uvm_cfgvif__{}", field),
-                        ];
-                        let iface_name = vif_cands
-                            .iter()
-                            .find_map(|k| self.signals.get(k).map(|v| v.to_sv_string()))
-                            .filter(|s| !s.is_empty());
-                        if let Some(iname) = iface_name {
+                        if let Some(iname) = scoped_vif {
                             let hp: Option<(usize, String)> = match &dst.kind {
                                 ExprKind::Ident(h) if h.path.len() == 1 => self
                                     .this_stack
@@ -28606,6 +28721,12 @@ impl Simulator {
         // index as `"vif_arr[<idx>]"` so existing single-key storage
         // can stash per-index bindings (LRM §25.10).
         let (handle, prop) = match &lvalue.kind {
+            // Bare `v = ...` inside a method — `v` is `this.<v>` (a class vif
+            // property). The prop_info check below filters non-vif locals.
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let handle = self.this_stack.last().copied().flatten().unwrap_or(0);
+                (handle, h.path[0].name.name.clone())
+            }
             ExprKind::Ident(h) if h.path.len() == 2 => {
                 let obj = h.path[0].name.name.as_str();
                 let prop = h.path[1].name.name.clone();
@@ -28728,6 +28849,35 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// LRM §25.9: build the `local_iface_aliases` entry (formal_name ->
+    /// bound_interface_instance) for a virtual-interface formal arg. Accepts a
+    /// formal whose type is `DataType::Interface` (the `virtual <iface>` form)
+    /// or a `TypeReference` naming a known interface; resolves the ACTUAL via
+    /// the vif binding so `<formal>.member` inside the callee dispatches to the
+    /// real interface (was: passing a vif arg yielded a 0/X member read).
+    /// Must be called while `this_stack` is the CALLER's context (where the
+    /// actual vif is bound).
+    fn vif_formal_alias(
+        &self,
+        dt: &crate::ast::types::DataType,
+        formal: &str,
+        arg: &Expression,
+    ) -> Option<(String, String)> {
+        use crate::ast::types::DataType;
+        let is_iface_formal = match dt {
+            DataType::Interface { .. } => true,
+            DataType::TypeReference { name, .. } => {
+                self.module.interfaces.contains(&name.name.name)
+            }
+            _ => false,
+        };
+        if !is_iface_formal {
+            return None;
+        }
+        self.resolve_vif_rhs_name(arg)
+            .map(|bound| (formal.to_string(), bound))
     }
 
     /// Resolve a `(handle, prop)` virtual-interface binding to its bound
@@ -30632,17 +30782,11 @@ impl Simulator {
         // `<bound>.member` for the duration of this call.
         let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
         for (i, port) in td.ports.iter().enumerate() {
-            if let crate::ast::types::DataType::TypeReference { name, .. } =
-                &port.data_type
-            {
-                if self.module.interfaces.contains(&name.name.name)
-                    && i < args.len()
+            if i < args.len() {
+                if let Some((f, b)) =
+                    self.vif_formal_alias(&port.data_type, &port.name.name, &args[i])
                 {
-                    if let ExprKind::Ident(h) = &args[i].kind {
-                        let actual = self.resolve_hier_name(h);
-                        iface_alias_frame
-                            .insert(port.name.name.clone(), actual);
-                    }
+                    iface_alias_frame.insert(f, b);
                 }
             }
         }
@@ -33624,29 +33768,26 @@ impl Simulator {
                     self.break_flag = false;
                     self.continue_flag = false;
                     self.return_flag = false;
-                    self.this_stack.push(Some(handle));
-                    self.local_stack.push(locals);
-                    self.class_context_stack.push(Some(cname.clone()));
                     // LRM §25.9 virtual-interface formal-arg aliasing
-                    // (class-method dispatch). Mirrors exec_task_call.
+                    // (class-method dispatch). Resolve the actuals' vif bindings
+                    // NOW, while `this_stack` is still the CALLER's context
+                    // (the bound vif lives there), before pushing the callee's.
                     let mut iface_alias_frame: HashMap<String, String> =
                         HashMap::default();
                     for (i, port) in ports.iter().enumerate() {
-                        if let crate::ast::types::DataType::TypeReference {
-                            name, ..
-                        } = &port.data_type
-                        {
-                            if self.module.interfaces.contains(&name.name.name)
-                                && i < args.len()
-                            {
-                                if let ExprKind::Ident(h) = &args[i].kind {
-                                    let actual = self.resolve_hier_name(h);
-                                    iface_alias_frame
-                                        .insert(port.name.name.clone(), actual);
-                                }
+                        if i < args.len() {
+                            if let Some((f, b)) = self.vif_formal_alias(
+                                &port.data_type,
+                                &port.name.name,
+                                &args[i],
+                            ) {
+                                iface_alias_frame.insert(f, b);
                             }
                         }
                     }
+                    self.this_stack.push(Some(handle));
+                    self.local_stack.push(locals);
+                    self.class_context_stack.push(Some(cname.clone()));
                     self.local_iface_aliases.push(iface_alias_frame);
                     for stmt in body {
                         self.exec_statement(stmt);
