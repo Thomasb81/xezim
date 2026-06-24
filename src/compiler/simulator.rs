@@ -691,6 +691,11 @@ struct MailboxGetWaiter {
     pid: usize,
     lvalue: Expression,
     cont: Vec<Statement>,
+    /// `peek` (not `get`): the waiter reads the front WITHOUT removing it, so
+    /// a `put` that wakes it must also leave the item in the mailbox for the
+    /// subsequent `get`/`try_get`. UVM's sequencer does this: get_next_item
+    /// peeks m_req_fifo, then item_done try_gets it.
+    is_peek: bool,
 }
 
 /// A process waiting for a signal edge event.
@@ -13911,19 +13916,29 @@ impl Simulator {
                         }
                         _ => (None, String::new()),
                     };
-                    if method == "get" && !args.is_empty() {
+                    if (method == "get" || method == "peek") && !args.is_empty() {
                         if let Some(recv) = recv_expr_opt {
                             let recv_val = self.eval_expr(&recv);
                             let handle = recv_val.to_u64().unwrap_or(0) as usize;
                             if let Some(q) = self.mailboxes.get(&handle) {
                                 if q.is_empty() {
+                                    // Blocking get/peek on an empty mailbox: park
+                                    // until a put hands over a value. peek leaves
+                                    // the item in the box (m_req_fifo.peek in
+                                    // uvm_sequencer::get_next_item, then item_done
+                                    // try_gets it).
                                     let lvalue = args[0].clone();
                                     let cont: Vec<Statement> =
                                         stmts[i + 1..].to_vec();
                                     self.mailbox_get_waiters
                                         .entry(handle)
                                         .or_insert_with(std::collections::VecDeque::new)
-                                        .push_back(MailboxGetWaiter { pid, lvalue, cont });
+                                        .push_back(MailboxGetWaiter {
+                                            pid,
+                                            lvalue,
+                                            cont,
+                                            is_peek: method == "peek",
+                                        });
                                     return;
                                 }
                             }
@@ -31138,9 +31153,14 @@ impl Simulator {
                             .get_mut(&handle)
                             .and_then(|q| q.pop_front());
                         if let Some(w) = waiter {
-                            let MailboxGetWaiter { pid, lvalue, cont } = w;
+                            let MailboxGetWaiter { pid, lvalue, cont, is_peek } = w;
                             let width = self.infer_lhs_width(&lvalue);
                             self.assign_value(&lvalue, &v.resize(width));
+                            if is_peek {
+                                // peek doesn't consume — leave the item for the
+                                // subsequent get/try_get (sequencer item_done).
+                                self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                            }
                             if !cont.is_empty() {
                                 self.event_queue.schedule(self.time, pid, cont);
                             } else {
@@ -31172,9 +31192,12 @@ impl Simulator {
                             .get_mut(&handle)
                             .and_then(|q| q.pop_front());
                         if let Some(w) = waiter {
-                            let MailboxGetWaiter { pid, lvalue, cont } = w;
+                            let MailboxGetWaiter { pid, lvalue, cont, is_peek } = w;
                             let width = self.infer_lhs_width(&lvalue);
                             self.assign_value(&lvalue, &v.resize(width));
+                            if is_peek {
+                                self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                            }
                             if !cont.is_empty() {
                                 self.event_queue.schedule(self.time, pid, cont);
                             } else {
