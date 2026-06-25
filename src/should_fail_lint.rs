@@ -39,6 +39,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
                 }
+                check_proc_net_assign(&m.items, &mut errs);
             }
             SourceDefinition::Interface(m) => {
                 for it in &m.items {
@@ -74,6 +75,94 @@ fn check_module_item(item: &ModuleItem, elab: &ElaboratedModule, errs: &mut Vec<
                 for_each_expr(l, &mut |e| check_zero_slice(e, elab, errs));
                 for_each_expr(r, &mut |e| check_zero_slice(e, elab, errs));
             }
+        }
+        _ => {}
+    }
+}
+
+/// §6.5: a net (an explicit `wire`/`tri`/... declaration) may not be the target
+/// of a procedural assignment (`=`/`<=` inside always/initial) — only a
+/// continuous assignment or `force`. Catches `wire w; initial w = ...;`.
+/// Conservative: only explicit NetDeclarations are treated as nets (output
+/// ports, where net-vs-var is ambiguous, are NOT flagged), and only `=`/`<=`
+/// targets are checked (force/release/assign are separate statement kinds).
+fn check_proc_net_assign(items: &[ModuleItem], errs: &mut Vec<String>) {
+    use std::collections::HashSet;
+    let mut nets: HashSet<String> = HashSet::new();
+    for it in items {
+        if let ModuleItem::NetDeclaration(nd) = it {
+            for d in &nd.declarators {
+                nets.insert(d.name.name.clone());
+            }
+        }
+    }
+    if nets.is_empty() {
+        return;
+    }
+    let mut flagged: HashSet<String> = HashSet::new();
+    for it in items {
+        let stmt = match it {
+            ModuleItem::AlwaysConstruct(a) => &a.stmt,
+            ModuleItem::InitialConstruct(i) => &i.stmt,
+            ModuleItem::FinalConstruct(_) => continue,
+            _ => continue,
+        };
+        for_each_proc_assign_lhs(stmt, &mut |lv| {
+            if let Some(b) = base_ident(lv) {
+                if nets.contains(&b) && flagged.insert(b.clone()) {
+                    errs.push(format!(
+                        "net '{}' is the target of a procedural assignment (LRM 1800-2017 \
+                         §6.5 — nets need a continuous assignment)",
+                        b
+                    ));
+                }
+            }
+        });
+    }
+}
+
+/// Root identifier of an lvalue, peeling index/part-select/member access.
+fn base_ident(e: &Expression) -> Option<String> {
+    match &e.kind {
+        ExprKind::Ident(h) if h.path.len() == 1 => Some(h.path[0].name.name.clone()),
+        ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::MemberAccess { expr, .. }
+        | ExprKind::Paren(expr) => base_ident(expr),
+        _ => None,
+    }
+}
+
+/// Call `f` on the lvalue of each procedural assignment (`=`/`<=`) in a
+/// statement tree.
+fn for_each_proc_assign_lhs(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
+    match &stmt.kind {
+        StatementKind::BlockingAssign { lvalue, .. }
+        | StatementKind::NonblockingAssign { lvalue, .. } => f(lvalue),
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            for_each_proc_assign_lhs(then_stmt, f);
+            if let Some(e) = else_stmt {
+                for_each_proc_assign_lhs(e, f);
+            }
+        }
+        StatementKind::Case { items, .. } => {
+            items.iter().for_each(|it| for_each_proc_assign_lhs(&it.stmt, f))
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body } => for_each_proc_assign_lhs(body, f),
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            stmts.iter().for_each(|s| for_each_proc_assign_lhs(s, f))
+        }
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            for_each_proc_assign_lhs(stmt, f)
         }
         _ => {}
     }
