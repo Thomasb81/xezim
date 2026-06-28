@@ -394,6 +394,11 @@ fn main() {
 
     let mut source_files: Vec<String> = Vec::new();
     let mut top_module: Option<String> = None;
+    // All `-s <top>` modules, in order. UVM testbenches commonly declare two
+    // unconnected roots (e.g. `hdl_top` + `hvl_top`); when more than one is
+    // given we synthesize a wrapper module that instantiates them all and
+    // elaborate that instead (a single root reaching every requested top).
+    let mut top_modules: Vec<String> = Vec::new();
     let mut max_time: u64 = 100_000;
     let mut dump_tokens = false;
     let mut dump_ast = false;
@@ -484,10 +489,12 @@ fn main() {
                 i += 1;
                 if i < args.len() {
                     top_module = Some(args[i].clone());
+                    top_modules.push(args[i].clone());
                 }
             }
             _ if arg.starts_with("-s") && arg.len() > 2 => {
                 top_module = Some(arg[2..].to_string());
+                top_modules.push(arg[2..].to_string());
             }
             "-c" | "-f" => {
                 i += 1;
@@ -897,6 +904,23 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    // Multi-top: synthesize a single wrapper root that instantiates every
+    // requested `-s` top, so all of them elaborate (UVM hdl_top + hvl_top etc.).
+    // Appended after the real sources so the instantiated modules are already
+    // declared; the wrapper has no macros/includes, so preprocessing is a no-op.
+    if top_modules.len() > 1 {
+        let wrap_name = "__xz_multitop__";
+        let mut body = format!("module {wrap_name};\n");
+        for (i, t) in top_modules.iter().enumerate() {
+            body.push_str(&format!("  {} __xz_top_inst_{}();\n", t, i));
+        }
+        body.push_str("endmodule\n");
+        sources.push(body);
+        source_files.push("<xz_multitop>".to_string());
+        file_labels.push("<xz_multitop>".to_string());
+        top_module = Some(wrap_name.to_string());
     }
 
     let preprocessed_sources =
