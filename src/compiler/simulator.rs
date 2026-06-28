@@ -1548,6 +1548,11 @@ pub struct Simulator {
     uvm_components: Vec<usize>,
     /// Set once the post-run phases have executed so they run exactly once.
     uvm_post_run_done: bool,
+    /// UVM report-server tallies for the `--- UVM Report Summary ---` block
+    /// emitted at end_run_phase: counts by severity [INFO, WARNING, ERROR,
+    /// FATAL] and by message id (sorted). Populated at the report choke point.
+    uvm_sev_counts: [u64; 4],
+    uvm_id_counts: std::collections::BTreeMap<String, u64>,
     /// UVM TLM connection graph: port/export handle -> connected target
     /// handles, in connect() order. Recorded by intercepting `connect()`
     /// (the UVM source keys its m_provided_by by get_full_name(), which xezim
@@ -2884,6 +2889,8 @@ impl Simulator {
             uvm_pending_end: None,
             uvm_components: Vec::new(),
             uvm_post_run_done: false,
+            uvm_sev_counts: [0; 4],
+            uvm_id_counts: std::collections::BTreeMap::new(),
             tlm_connections: HashMap::default(),
             local_iface_aliases: Vec::new(),
             dist_picked_once: HashSet::default(),
@@ -30373,6 +30380,7 @@ impl Simulator {
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| "reporter".to_string());
                     let severity = name.replace("uvm_report_", "").to_uppercase();
+                    self.tally_uvm_report(&severity, &id);
                     let line = format!(
                         "UVM_{} @ {}: {} [{}] {}",
                         severity, self.time, ctx, id, msg
@@ -31928,6 +31936,7 @@ impl Simulator {
             return;
         };
 
+        self.tally_uvm_report("INFO", "RNTST");
         let line = format!(
             "UVM_INFO @ 0: reporter [RNTST] Running test {}...",
             test_name
@@ -32087,6 +32096,49 @@ impl Simulator {
     }
 
     /// Run the post-run UVM function phases on every component, then finish.
+    /// Tally a UVM report for the end-of-run `--- UVM Report Summary ---` block.
+    /// `severity` is INFO/WARNING/ERROR/FATAL; `id` is the message id (the first
+    /// arg to `uvm_info`/etc.). Called at every UVM report emission site.
+    fn tally_uvm_report(&mut self, severity: &str, id: &str) {
+        let sidx = match severity {
+            "INFO" => 0,
+            "WARNING" => 1,
+            "ERROR" => 2,
+            "FATAL" => 3,
+            _ => return,
+        };
+        self.uvm_sev_counts[sidx] += 1;
+        *self.uvm_id_counts.entry(id.to_string()).or_insert(0) += 1;
+    }
+
+    /// Emit the `--- UVM Report Summary ---` block (uvm_report_server::
+    /// report_summarize), matching UVM's format: counts by severity then by id.
+    /// Counts reflect the reports xezim actually issued this run.
+    fn emit_uvm_report_summary(&mut self) {
+        let mut out = String::new();
+        out.push_str("--- UVM Report Summary ---\n\n");
+        out.push_str("** Report counts by severity\n");
+        out.push_str(&format!("UVM_INFO :  {:3}\n", self.uvm_sev_counts[0]));
+        out.push_str(&format!("UVM_WARNING :  {:3}\n", self.uvm_sev_counts[1]));
+        out.push_str(&format!("UVM_ERROR :  {:3}\n", self.uvm_sev_counts[2]));
+        out.push_str(&format!("UVM_FATAL :  {:3}\n", self.uvm_sev_counts[3]));
+        out.push_str("** Report counts by id\n");
+        let ids: Vec<(String, u64)> = self
+            .uvm_id_counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        for (id, n) in ids {
+            out.push_str(&format!("[{}]  {:3}\n", id, n));
+        }
+        // Trailing newline trimmed by writeln.
+        for line in out.lines() {
+            let l = line.to_string();
+            self.record_output(l.clone());
+            self.stdout_writeln(&l);
+        }
+    }
+
     /// Triggered when the run-phase objection count returns to 0 (after a
     /// raise) and the drain has elapsed.
     fn end_run_phase(&mut self) {
@@ -32112,6 +32164,9 @@ impl Simulator {
                 }
             }
         }
+        // uvm_root::run_test calls report_server.report_summarize() after the
+        // report phase — emit the summary block before $finish.
+        self.emit_uvm_report_summary();
         self.finished = true;
     }
 
