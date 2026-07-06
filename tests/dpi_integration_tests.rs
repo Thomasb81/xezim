@@ -17,9 +17,16 @@ fn unique_so_path(stem: &str) -> PathBuf {
 fn compile_dpi_lib(c_file: &str, stem: &str) -> PathBuf {
     let c_path = manifest_path(c_file);
     let so_path = unique_so_path(stem);
+    // Include the xezim/include dir for vpi_user.h, svdpi.h,
+    // sv_vpi_user.h, veriuser.h. The headers live in their own
+    // subdirectory so users don't accidentally pick up unrelated
+    // xezim source files via the include search path.
+    let include_dir = manifest_path("include");
     let status = Command::new("cc")
         .arg("-shared")
         .arg("-fPIC")
+        .arg("-I")
+        .arg(&include_dir)
         .arg(&c_path)
         .arg("-o")
         .arg(&so_path)
@@ -30,7 +37,7 @@ fn compile_dpi_lib(c_file: &str, stem: &str) -> PathBuf {
 }
 
 fn run_xezim_with_dpi(so_path: &Path, sv_file: &str) -> String {
-    let bin = std::env::var("CARGO_BIN_EXE_xezim").unwrap_or_else(|_| "xezim".to_string());
+    let bin = env!("CARGO_BIN_EXE_xezim");
     let sv_path = manifest_path(sv_file);
     let out = Command::new(bin)
         .arg("--dpi-lib")
@@ -104,5 +111,28 @@ fn dpi_open_array_test() {
         "tests/dpi/open_array_dpi.c",
         "open_array_dpi",
         "tests/dpi/open_array_dpi_test.sv",
+    );
+}
+
+#[test]
+fn dpi_vpi_backdoor_compliance_test() {
+    let so = compile_dpi_lib("tests/dpi/vpi_backdoor_compliance.c", "vpi_backdoor_compliance");
+    let log = run_xezim_with_dpi(&so, "tests/dpi/vpi_backdoor_compliance.sv");
+    // The vpi_backdoor_compliance test outputs "RESULT: PASSED" not "TEST_PASS"
+    assert!(
+        log.contains("RESULT: PASSED"),
+        "missing RESULT: PASSED for vpi_backdoor_compliance:\n{}",
+        log
+    );
+}
+
+#[test]
+fn dpi_uvm_test() {
+    let so = compile_dpi_lib("tests/dpi/uvm_dpi_test.c", "uvm_dpi_test");
+    let log = run_xezim_with_dpi(&so, "tests/dpi/uvm_dpi_test.sv");
+    assert!(
+        log.contains("RESULT: PASSED"),
+        "uvm_dpi_test missing RESULT: PASSED:\n{}",
+        log
     );
 }
