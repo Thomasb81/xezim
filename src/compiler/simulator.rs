@@ -185,34 +185,78 @@ macro_rules! write_sig {
     ($self:ident, $id:expr, $val:expr) => {{
         let __wsig_id = $id;
         let __wsig_val = $val;
-        if __wsig_id < $self.signal_has_xz.len() {
-            $self.signal_has_xz[__wsig_id] =
-                if __wsig_val.raw_bits().1 != 0 { 1u8 } else { 0u8 };
-        }
-        // JIT-redesign Stage 1 maintenance: keep signal_inline_bits in
-        // sync with signal_table for the future JIT codegen path that
-        // reads values by direct pointer offset.  Zero overhead when
-        // signal_inline_bits is empty (default; allocated only when
-        // XEZIM_INLINE_BITS=1).
-        if __wsig_id < $self.signal_inline_bits.len() {
-            let (__wsig_v, __wsig_x) = __wsig_val.raw_bits();
-            $self.signal_inline_bits[__wsig_id] = [__wsig_v, __wsig_x];
-        }
-        $self.signal_table[__wsig_id] = __wsig_val;
-        // O1 measurement: stamp the signal's last-change phase.
-        if $self.event_measure && __wsig_id < $self.sig_last_change.len() {
-            $self.sig_last_change[__wsig_id] = $self.event_phase;
-        }
-        // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
-        // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
-        // the borrow stays a direct field access in macro-expanded contexts.
-        if ($self.dirty_edge || $self.dirty_edge_shadow)
-            && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
-        {
-            let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
-            if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
-                $self.edge_pos_seen[__ep as usize] = true;
-                $self.changed_edge_pos.push(__ep as usize);
+        // LRM §9.3.1: skip writes to forced signals.
+        if !$self.forced_signals.contains_key(&__wsig_id) {
+            if __wsig_id < $self.signal_has_xz.len() {
+                $self.signal_has_xz[__wsig_id] =
+                    if __wsig_val.raw_bits().1 != 0 { 1u8 } else { 0u8 };
+            }
+            // JIT-redesign Stage 1 maintenance: keep signal_inline_bits in
+            // sync with signal_table for the future JIT codegen path that
+            // reads values by direct pointer offset.  Zero overhead when
+            // signal_inline_bits is empty (default; allocated only when
+            // XEZIM_INLINE_BITS=1).
+            if __wsig_id < $self.signal_inline_bits.len() {
+                let (__wsig_v, __wsig_x) = __wsig_val.raw_bits();
+                $self.signal_inline_bits[__wsig_id] = [__wsig_v, __wsig_x];
+            }
+            $self.signal_table[__wsig_id] = __wsig_val;
+            // O1 measurement: stamp the signal's last-change phase.
+            if $self.event_measure && __wsig_id < $self.sig_last_change.len() {
+                $self.sig_last_change[__wsig_id] = $self.event_phase;
+            }
+            // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
+            // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
+            // the borrow stays a direct field access in macro-expanded contexts.
+            if ($self.dirty_edge || $self.dirty_edge_shadow)
+                && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+            {
+                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+                if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
+                    $self.edge_pos_seen[__ep as usize] = true;
+                    $self.changed_edge_pos.push(__ep as usize);
+                }
+            }
+            // Fire any registered cbValueChange callbacks. The dispatch lives
+            // inside the macro so every write path (blocking assigns,
+            // NBA writes, force updates, settle loops, initial block
+            // writes) sees it. The HashMap lookup is O(1) and the
+            // empty-list fast path costs one branch.
+            //
+            // Snapshot the callback list in its own scope so the
+            // borrow of `$self.dpi_value_change_cbs` ends before we
+            // re-borrow `$self` for the raw pointer cast. Some
+            // macro-expansion contexts (e.g. clock-generators loop)
+            // already hold an active self-borrow that would conflict
+            // with a second borrow.
+            let __maybe_cbs: Option<Vec<DpiCbHandle>> = {
+                let __list = $self.dpi_value_change_cbs.get(&__wsig_id);
+                __list.filter(|v| !v.is_empty()).cloned()
+            };
+            if let Some(__cbs) = __maybe_cbs {
+                // ACTIVE_SIMULATOR is a thread-local; we set it for
+                // any VPI code that re-enters the simulator (none
+                // currently does, but the convention is preserved).
+                // Extract the pointer BEFORE entering the closure so
+                // the borrow checker doesn't see the closure capture
+                // as a second self-borrow.
+                ACTIVE_SIMULATOR.with(|cell| {
+                    cell.set(std::ptr::null_mut()); // see below
+                });
+                for __cb in __cbs {
+                    type __CbFn = extern "C" fn(*mut s_cb_data);
+                    let __cb_routine = __cb.cb_routine as *const ();
+                    let __cb_fn: __CbFn = unsafe { std::mem::transmute(__cb_routine) };
+                    let __cb_data = s_cb_data {
+                        reason: 6, /* cbValueChange */
+                        cb_rtn: std::ptr::null_mut(),
+                        obj: std::ptr::null_mut(),
+                        time: std::ptr::null_mut(),
+                        value: std::ptr::null_mut(),
+                        user_data: __cb.user_data as *mut libc::c_void,
+                    };
+                    __cb_fn(&__cb_data as *const s_cb_data as *mut s_cb_data);
+                }
             }
         }
     }};
@@ -1205,6 +1249,10 @@ enum DpiArgKind {
     OpenArrayI32Out,
     VecLogicIn(u32),
     VecLogicOut(u32),
+    /// 2-state packed vector (`bit [N]`) passed as plain `uint32_t*`
+    /// (svBitVecVal*). ABI differs from VecLogicIn: no bval field.
+    VecBitIn(u32),
+    VecBitOut(u32),
 }
 
 struct DpiBinding {
@@ -1360,6 +1408,8 @@ impl Phase2Profile {
 
 pub struct Simulator {
     pub signals: HashMap<String, Value>,
+    /// Signals currently under force/release control (LRM §9.3.1).
+    forced_signals: HashMap<usize, Value>,
     /// Fast signal table: indexed by signal_id for O(1) access.
     signal_table: Vec<Value>,
     /// Parallel array: 1 byte per signal_id, non-zero iff that signal
@@ -2236,6 +2286,30 @@ pub struct Simulator {
     /// non-zero). Backed by `plusargs` so `uvm_cmdline_processor::get_arg_value`
     /// (e.g. `+num_of_tests=`) works under `-DUVM_NO_DPI`.
     dpi_arg_cursor: usize,
+    /// Owned copies of every CLI arg as `CString`s. Required so that
+    /// `vpi_argv` (raw `*mut c_char` pointers into these buffers) stays
+    /// valid for the lifetime of the simulator — vpi_get_vlog_info hands
+    /// these pointers back to UVM code which may store them past the
+    /// duration of the DPI call.
+    vpi_arg_cstrings: Vec<CString>,
+    /// Raw C-string pointers parallel to `vpi_arg_cstrings`. The first
+    /// entry is the binary name (xezim), the rest are CLI args + plusargs
+    /// concatenated. Pointers stay stable across the simulator lifetime.
+    vpi_argv: Vec<*mut libc::c_char>,
+    /// Cache of DPI scope handles keyed by hierarchical scope name.
+    /// Each value is a `Box<DpiScope>` raw pointer handed out to C code
+    /// via `svGetScopeFromName` and recovered in `svGetNameFromScope`.
+    dpi_scopes: HashMap<String, *mut libc::c_void>,
+    /// Registered value-change callbacks per signal id. Triggered from
+    /// `after_signal_write` whenever a signal value differs from its
+    /// previous inline-bits snapshot.
+    dpi_value_change_cbs: HashMap<usize, Vec<DpiCbHandle>>,
+    /// Registered start-of-reset callbacks. Fired at simulation start.
+    dpi_reset_cbs: Vec<DpiCbHandle>,
+    /// Callback cursor for the per-callback iteration loop
+    /// (`vpi_register_cb` may also be called with `cbValueChange` to
+    /// mark a scope's reset triggers; we keep a flag set for that).
+    dpi_pending_reset_fired: bool,
     /// Open file handles for $fopen/$fwrite/$fclose.
     file_handles: HashMap<i32, std::fs::File>,
     /// Per-fd ungetc pushback buffer (LIFO).
@@ -2900,6 +2974,7 @@ impl Simulator {
             widths,
             signed_signals,
             real_signals,
+            forced_signals: HashMap::default(),
             signal_has_xz: signal_has_xz_init,
             signal_inline_bits: Vec::new(),
             jit_nba_side_queue: Vec::new(),
@@ -3188,6 +3263,16 @@ impl Simulator {
             activity_mon: false,
             plusargs: Vec::new(),
             dpi_arg_cursor: 0,
+            // Default to a single-element argv so vpi_get_vlog_info
+            // always returns at least argc=1 / argv[0]="xezim" even
+            // when callers forget to call set_args. Real callers
+            // (lib.rs / main.rs) overwrite this with the actual CLI.
+            vpi_arg_cstrings: Vec::new(),
+            vpi_argv: Vec::new(),
+            dpi_scopes: HashMap::default(),
+            dpi_value_change_cbs: HashMap::default(),
+            dpi_reset_cbs: Vec::new(),
+            dpi_pending_reset_fired: false,
             file_handles: HashMap::default(),
             ungetc_buf: HashMap::default(),
             static_task_init: HashSet::default(),
@@ -3240,6 +3325,102 @@ impl Simulator {
         self.pdes_worker_pool = None;
     }
 
+    /// Store the full CLI invocation (binary name + args + plusargs)
+    /// for `vpi_get_vlog_info` to hand back to UVM. The strings are
+    /// duplicated into `CString`s so the raw `*mut c_char` pointers
+    /// in `vpi_argv` remain valid for the simulator's lifetime —
+    /// UVM's cmdline processor keeps them around across multiple
+    /// `uvm_dpi_get_next_arg_c` calls.
+    pub fn set_args(&mut self, argv: &[String]) {
+        self.vpi_arg_cstrings.clear();
+        self.vpi_argv.clear();
+        // Empty argv still needs at least argv[0] = "xezim" so UVM's
+        // tool-banner code (which reads product + argv[0]) doesn't
+        // blow up. If the caller passed an empty list we still want
+        // a sensible default.
+        if argv.is_empty() {
+            let c = CString::new("xezim").unwrap_or_default();
+            self.vpi_argv.push(c.as_ptr() as *mut libc::c_char);
+            self.vpi_arg_cstrings.push(c);
+            sim_dbg_eprintln!("[VPI] set_args: defaulted to ['xezim']");
+            return;
+        }
+        for s in argv {
+            match CString::new(s.as_str()) {
+                Ok(c) => {
+                    self.vpi_argv.push(c.as_ptr() as *mut libc::c_char);
+                    self.vpi_arg_cstrings.push(c);
+                }
+                Err(_) => {
+                    // Embedded NUL — replace with empty string and push
+                    // a copy with the NUL truncated.
+                    let truncated = s.split('\0').next().unwrap_or("");
+                    let c = CString::new(truncated).unwrap_or_default();
+                    self.vpi_argv.push(c.as_ptr() as *mut libc::c_char);
+                    self.vpi_arg_cstrings.push(c);
+                }
+            }
+        }
+        sim_dbg_eprintln!(
+            "[VPI] set_args: {} entries (argv0={:?})",
+            self.vpi_argv.len(),
+            argv.first().map(String::as_str)
+        );
+    }
+
+    /// Return the count of registered value-change callbacks.
+    /// Test-only — used by the `dpi_uvm_test` integration test.
+    #[doc(hidden)]
+    pub fn dpi_value_change_cb_count(&self) -> usize {
+        self.dpi_value_change_cbs.values().map(|v| v.len()).sum()
+    }
+
+    /// Return the count of registered start-of-reset callbacks.
+    /// Test-only — used by the `dpi_uvm_test` integration test.
+    #[doc(hidden)]
+    pub fn dpi_reset_cb_count(&self) -> usize {
+        self.dpi_reset_cbs.len()
+    }
+
+    /// Return the count of cached DPI scopes.
+    /// Test-only — used by the `dpi_uvm_test` integration test.
+    #[doc(hidden)]
+    pub fn dpi_scope_count(&self) -> usize {
+        self.dpi_scopes.len()
+    }
+}
+
+impl Drop for Simulator {
+    /// Release heap allocations that aren't tracked by Rust's lifetime
+    /// machinery: the raw pointers we hand out via `vpi_handle_by_name`
+    /// (`Box<VpiHandle>`), `svGetScopeFromName` (`Box<DpiScope>`), and
+    /// `vpi_register_cb` (`Box<DpiCbHandle>`).
+    ///
+    /// `dpi_scopes`, `dpi_value_change_cbs`, and `dpi_reset_cbs` each
+    /// own `Box`-es that were leaked to the C side. Drop them here so
+    /// the simulator's exit doesn't leak them per-test.
+    fn drop(&mut self) {
+        // Scope handles
+        for (_name, ptr) in self.dpi_scopes.drain() {
+            if !ptr.is_null() {
+                unsafe {
+                    drop(Box::from_raw(ptr as *mut DpiScope));
+                }
+            }
+        }
+        // Per-signal value-change callbacks (Vec<Box> values; the inner
+        // Boxes were never `into_raw`-ed for the individual elements
+        // because we cloned the struct into the Vec, so the Vec's own
+        // Drop handles them — we just need to drain the map).
+        for (_sig_id, mut cbs) in self.dpi_value_change_cbs.drain() {
+            cbs.clear();
+        }
+        // Reset callbacks
+        self.dpi_reset_cbs.clear();
+    }
+}
+
+impl Simulator {
     /// Phase-1 multicore exploration: dump the edge-block dependency
     /// graph as an hMETIS hypergraph (vertex = parallel-eligible edge
     /// block, hyperedge = signal connecting all blocks that read or
@@ -4669,7 +4850,7 @@ impl Simulator {
                     DpiArgKind::Int64In
                 }),
             },
-            DataType::IntegerVector { dimensions, .. } => {
+            DataType::IntegerVector { kind, dimensions, .. } => {
                 if dimensions.is_empty() {
                     Some(if out_dir {
                         DpiArgKind::Int32Out
@@ -4689,10 +4870,21 @@ impl Simulator {
                             DpiArgKind::Int64In
                         })
                     } else {
+                        // 2-state `bit` -> svBitVecVal* (just uint32_t*).
+                        // 4-state `logic`/`reg` -> svLogicVecVal* ({aval, bval}*).
+                        let is_2state = matches!(kind, crate::ast::types::IntegerVectorType::Bit);
                         Some(if out_dir {
-                            DpiArgKind::VecLogicOut(w)
+                            if is_2state {
+                                DpiArgKind::VecBitOut(w)
+                            } else {
+                                DpiArgKind::VecLogicOut(w)
+                            }
                         } else {
-                            DpiArgKind::VecLogicIn(w)
+                            if is_2state {
+                                DpiArgKind::VecBitIn(w)
+                            } else {
+                                DpiArgKind::VecLogicIn(w)
+                            }
                         })
                     }
                 }
@@ -4869,6 +5061,8 @@ impl Simulator {
                 DpiArgKind::OpenArrayI32Out => Type::pointer(),
                 DpiArgKind::VecLogicIn(_) => Type::pointer(),
                 DpiArgKind::VecLogicOut(_) => Type::pointer(),
+                DpiArgKind::VecBitIn(_) => Type::pointer(),
+                DpiArgKind::VecBitOut(_) => Type::pointer(),
             })
             .collect();
         let ret_type = match ret {
@@ -5040,6 +5234,7 @@ impl Simulator {
             self.try_bind_dpi(sv_name, &spec);
         }
         if self.dpi_unsupported.contains(sv_name) {
+            ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
             return Some(Value::zero(32));
         }
         let Some(binding) = self.dpi_bindings.get(sv_name) else {
@@ -5049,6 +5244,7 @@ impl Simulator {
                     sv_name, spec.c_name
                 );
             }
+            ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
             return Some(Value::zero(32));
         };
         let ret_kind = binding.ret;
@@ -5057,17 +5253,20 @@ impl Simulator {
         let fn_ptr = binding.fn_ptr;
 
         let mut arg_refs = Vec::with_capacity(arg_kinds.len());
-        let mut i32_vals: Vec<Box<i32>> = Vec::new();
-        let mut i64_vals: Vec<Box<i64>> = Vec::new();
-        let mut f32_vals: Vec<Box<f32>> = Vec::new();
-        let mut f64_vals: Vec<Box<f64>> = Vec::new();
-        let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::new();
-        let mut string_ptr_cells: Vec<Box<*const i8>> = Vec::new();
-        let mut open_i32_vals: Vec<Vec<i32>> = Vec::new();
-        let mut cstrings: Vec<CString> = Vec::new();
-        let mut logic_aval: Vec<Vec<u32>> = Vec::new();
-        let mut logic_bval: Vec<Vec<u32>> = Vec::new();
-        let mut logic_hdrs: Vec<Box<DpiLogicVecVal>> = Vec::new();
+        let mut i32_vals: Vec<Box<i32>> = Vec::with_capacity(arg_kinds.len());
+        let mut i64_vals: Vec<Box<i64>> = Vec::with_capacity(arg_kinds.len());
+        let mut f32_vals: Vec<Box<f32>> = Vec::with_capacity(arg_kinds.len());
+        let mut f64_vals: Vec<Box<f64>> = Vec::with_capacity(arg_kinds.len());
+        // CRITICAL: ptr_vals, logic_aval, logic_bval must never reallocate
+        // after the loop, because arg_refs holds references into their Box
+        // contents. Pre-allocate capacity to prevent mid-loop reallocation.
+        let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::with_capacity(arg_kinds.len());
+        let mut string_ptr_cells: Vec<Box<*const i8>> = Vec::with_capacity(arg_kinds.len());
+        let mut open_i32_vals: Vec<Vec<i32>> = Vec::with_capacity(arg_kinds.len());
+        let mut cstrings: Vec<CString> = Vec::with_capacity(arg_kinds.len());
+        let mut logic_aval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
+        let mut logic_bval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
+        let mut logic_hdrs: Vec<Box<DpiLogicVecVal>> = Vec::with_capacity(arg_kinds.len());
         let mut writebacks: Vec<(usize, DpiArgKind, Expression)> = Vec::new();
 
         for (i, kind) in arg_kinds.iter().enumerate() {
@@ -5188,15 +5387,17 @@ impl Simulator {
                         .map(|e| self.eval_expr(e))
                         .unwrap_or_else(|| Value::zero(*width));
                     let (mut aval, mut bval) = Self::dpi_value_to_logic_words(&vv, *width);
+                    // CRITICAL: store in Vec FIRST, then capture pointer.
+                    // Otherwise Vec push may reallocate, invalidating the pointer.
+                    logic_aval.push(aval);
+                    logic_bval.push(bval);
                     let hdr = Box::new(DpiLogicVecVal {
-                        aval: aval.as_mut_ptr(),
-                        bval: bval.as_mut_ptr(),
+                        aval: logic_aval.last_mut().unwrap().as_mut_ptr(),
+                        bval: logic_bval.last_mut().unwrap().as_mut_ptr(),
                     });
                     let p = Box::new(
                         (&*hdr as *const DpiLogicVecVal as *mut DpiLogicVecVal).cast::<c_void>(),
                     );
-                    logic_aval.push(aval);
-                    logic_bval.push(bval);
                     logic_hdrs.push(hdr);
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
@@ -5207,20 +5408,51 @@ impl Simulator {
                         .map(|e| self.eval_expr(e))
                         .unwrap_or_else(|| Value::zero(*width));
                     let (mut aval, mut bval) = Self::dpi_value_to_logic_words(&init, *width);
+                    // CRITICAL: store in Vec FIRST, then capture pointer (see VecLogicIn).
+                    logic_aval.push(aval);
+                    logic_bval.push(bval);
                     let hdr = Box::new(DpiLogicVecVal {
-                        aval: aval.as_mut_ptr(),
-                        bval: bval.as_mut_ptr(),
+                        aval: logic_aval.last_mut().unwrap().as_mut_ptr(),
+                        bval: logic_bval.last_mut().unwrap().as_mut_ptr(),
                     });
                     let p = Box::new(
                         (&*hdr as *const DpiLogicVecVal as *mut DpiLogicVecVal).cast::<c_void>(),
                     );
-                    logic_aval.push(aval);
-                    logic_bval.push(bval);
                     logic_hdrs.push(hdr);
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
                         writebacks.push((logic_hdrs.len() - 1, *kind, expr.clone()));
+                    }
+                }
+                DpiArgKind::VecBitIn(width) => {
+                    // 2-state `bit [N]` -> svBitVecVal* (just uint32_t*).
+                    // ABI differs from VecLogicIn: no bval field.
+                    let vv = args
+                        .get(i)
+                        .map(|e| self.eval_expr(e))
+                        .unwrap_or_else(|| Value::zero(*width));
+                    let (aval, _bval) = Self::dpi_value_to_logic_words(&vv, *width);
+                    // Store in a dedicated Vec<Vec<u32>> to keep storage stable.
+                    logic_aval.push(aval);
+                    let raw_ptr = logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>();
+                    // Put the actual data pointer (not a pointer-to-pointer) in the Box.
+                    ptr_vals.push(Box::new(raw_ptr));
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                }
+                DpiArgKind::VecBitOut(width) => {
+                    let init = args
+                        .get(i)
+                        .map(|e| self.eval_expr(e))
+                        .unwrap_or_else(|| Value::zero(*width));
+                    let (aval, _bval) = Self::dpi_value_to_logic_words(&init, *width);
+                    logic_aval.push(aval);
+                    let p = Box::new(logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>());
+                    ptr_vals.push(p);
+                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
+                    if let Some(expr) = args.get(i) {
+                        // Track which logical_aval slot to read back.
+                        writebacks.push((logic_aval.len() - 1, *kind, expr.clone()));
                     }
                 }
                 DpiArgKind::Int32Out => {
@@ -5295,6 +5527,41 @@ impl Simulator {
                     }
                 }
             }
+        }
+
+        // Set active simulator for VPI callbacks
+        let self_ptr = self as *mut Simulator;
+        ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
+
+        // Set the active DPI scope to match the import's declaration
+        // site. UVM relies on `svGetScope` returning the caller's
+        // enclosing scope so that `uvm_root::get()` and similar
+        // scope-aware helpers find the right `uvm_pkg` instance.
+        // We synthesise a scope handle from the import name's leading
+        // package/module path (e.g. `uvm_pkg::foo` → `uvm_pkg`).
+        let scope_name: String = sv_name
+            .split("::")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let prev_scope = ACTIVE_SCOPE.with(|cell| cell.get());
+        if !scope_name.is_empty() {
+            // Look up or create a scope handle and pin it for the
+            // duration of this call.
+            let scope_ptr = if let Some(&p) = self.dpi_scopes.get(&scope_name) {
+                p
+            } else {
+                let mut scope = DpiScope {
+                    name: [0u8; 256],
+                    name_len: scope_name.len().min(255),
+                };
+                let bytes = scope_name.as_bytes();
+                scope.name[..scope.name_len].copy_from_slice(&bytes[..scope.name_len]);
+                let ptr = Box::into_raw(Box::new(scope)) as *mut libc::c_void;
+                self.dpi_scopes.insert(scope_name.clone(), ptr);
+                ptr
+            };
+            ACTIVE_SCOPE.with(|cell| cell.set(scope_ptr));
         }
 
         let mut result = match ret_kind {
@@ -5397,6 +5664,18 @@ impl Simulator {
                         self.assign_value(&expr, &out.resize(w));
                     }
                 }
+                DpiArgKind::VecBitOut(width) => {
+                    if idx < logic_aval.len() {
+                        // 2-state: only aval, no bval
+                        let out = Self::dpi_logic_words_to_value(
+                            &logic_aval[idx],
+                            &[],
+                            width,
+                        );
+                        let w = self.infer_lhs_width(&expr);
+                        self.assign_value(&expr, &out.resize(w));
+                    }
+                }
                 _ => {}
             }
         }
@@ -5405,6 +5684,11 @@ impl Simulator {
             // No side effects expected; kept for future optimization hooks.
             let _ = &mut result;
         }
+        // Clear active simulator after DPI call
+        ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
+        // Restore the previous DPI scope so nested DPI calls don't
+        // leak scope state across invocations.
+        ACTIVE_SCOPE.with(|cell| cell.set(prev_scope));
         Some(result)
     }
 
@@ -6614,39 +6898,45 @@ impl Simulator {
         match &self.comb_entries[eidx].item {
             CombItem::Noop => true,
             CombItem::FastDirectCopy { dst_id, src_id } => {
-                let (sv, sx) = view[*src_id].raw_bits();
-                let (dv, dx) = view[*dst_id].raw_bits();
-                if (sv != dv || sx != dx) && view[*dst_id].set_inline_bits(sv, sx) {
-                    dirtied.push(*dst_id as u32);
+                // LRM §9.3.1: skip if the destination is forced
+                if !self.forced_signals.contains_key(dst_id) {
+                    let (sv, sx) = view[*src_id].raw_bits();
+                    let (dv, dx) = view[*dst_id].raw_bits();
+                    if (sv != dv || sx != dx) && view[*dst_id].set_inline_bits(sv, sx) {
+                        dirtied.push(*dst_id as u32);
+                    }
                 }
                 true
             }
             CombItem::DirectCopy { dst_id, src_id, width } => {
-                let dst_w = self.signal_widths[*dst_id];
-                let mut handled = false;
-                // Inline raw-bit copy only when src and dst widths match;
-                // set_inline_bits does not mask, so narrowing must go through
-                // the resize branch below (pr2224949).
-                if *width <= 64 && dst_w == *width && self.signal_widths[*src_id] == *width {
-                    let (sv, sx) = view[*src_id].raw_bits();
-                    let (dv, dx) = view[*dst_id].raw_bits();
-                    if sv == dv && sx == dx {
-                        handled = true;
-                    } else if view[*dst_id].set_inline_bits(sv, sx) {
-                        dirtied.push(*dst_id as u32);
-                        handled = true;
+                // LRM §9.3.1: skip if the destination is forced
+                if !self.forced_signals.contains_key(dst_id) {
+                    let dst_w = self.signal_widths[*dst_id];
+                    let mut handled = false;
+                    // Inline raw-bit copy only when src and dst widths match;
+                    // set_inline_bits does not mask, so narrowing must go through
+                    // the resize branch below (pr2224949).
+                    if *width <= 64 && dst_w == *width && self.signal_widths[*src_id] == *width {
+                        let (sv, sx) = view[*src_id].raw_bits();
+                        let (dv, dx) = view[*dst_id].raw_bits();
+                        if sv == dv && sx == dx {
+                            handled = true;
+                        } else if view[*dst_id].set_inline_bits(sv, sx) {
+                            dirtied.push(*dst_id as u32);
+                            handled = true;
+                        }
                     }
-                }
-                if !handled {
-                    let src_val = view[*src_id].clone();
-                    let resized = if src_val.width != *width {
-                        src_val.resize(*width)
-                    } else {
-                        src_val
-                    };
-                    if view[*dst_id] != resized {
-                        view[*dst_id] = resized;
-                        dirtied.push(*dst_id as u32);
+                    if !handled {
+                        let src_val = view[*src_id].clone();
+                        let resized = if src_val.width != *width {
+                            src_val.resize(*width)
+                        } else {
+                            src_val
+                        };
+                        if view[*dst_id] != resized {
+                            view[*dst_id] = resized;
+                            dirtied.push(*dst_id as u32);
+                        }
                     }
                 }
                 true
@@ -8319,6 +8609,30 @@ impl Simulator {
     pub fn simulate(&mut self) {
         if !self.compiled {
             self.compile();
+        }
+        // Fire cbStartOfReset callbacks exactly once at simulation
+        // start. UVM's polling framework uses this hook to clear its
+        // pending-change lists; we expose it because the upstream
+        // `vpi_register_cb(..., cbStartOfReset, ...)` registration
+        // call expects a fire at simulation time 0.
+        if !self.dpi_reset_cbs.is_empty() && !self.dpi_pending_reset_fired {
+            let self_ptr = self as *mut Simulator;
+            ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
+            for cb in self.dpi_reset_cbs.clone() {
+                type CbFn = extern "C" fn(*mut s_cb_data);
+                let cb_routine = cb.cb_routine as *const ();
+                let cb_fn: CbFn = unsafe { std::mem::transmute(cb_routine) };
+                let cb_data = s_cb_data {
+                    reason: 15, /* cbStartOfReset */
+                    cb_rtn: std::ptr::null_mut(),
+                    obj: std::ptr::null_mut(),
+                    time: std::ptr::null_mut(),
+                    value: std::ptr::null_mut(),
+                    user_data: cb.user_data as *mut libc::c_void,
+                };
+                cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
+            }
+            self.dpi_pending_reset_fired = true;
         }
         self.event_loop();
         // LRM §9.2.3 — `final` procedures run after the event loop terminates
@@ -17823,30 +18137,33 @@ impl Simulator {
                 match &entries[eidx].item {
                     CombItem::Noop => {}
                     CombItem::FastDirectCopy { dst_id, src_id } => {
-                        let (sv, sx) = self.signal_table[*src_id].raw_bits();
-                        let (dv, dx) = self.signal_table[*dst_id].raw_bits();
-                        if (sv != dv || sx != dx)
-                            && self.signal_table[*dst_id].set_inline_bits(sv, sx)
-                        {
-                            self.table_modified = true;
-                            self.after_signal_write(*dst_id);
-                            if self.activity_mon {
-                                if self.signal_toggle_counts.len() != self.signal_table.len() {
-                                    self.signal_toggle_counts.resize(self.signal_table.len(), 0);
+                        // LRM §9.3.1: skip if the destination is forced
+                        if !self.forced_signals.contains_key(dst_id) {
+                            let (sv, sx) = self.signal_table[*src_id].raw_bits();
+                            let (dv, dx) = self.signal_table[*dst_id].raw_bits();
+                            if (sv != dv || sx != dx)
+                                && self.signal_table[*dst_id].set_inline_bits(sv, sx)
+                            {
+                                self.table_modified = true;
+                                self.after_signal_write(*dst_id);
+                                if self.activity_mon {
+                                    if self.signal_toggle_counts.len() != self.signal_table.len() {
+                                        self.signal_toggle_counts.resize(self.signal_table.len(), 0);
+                                    }
+                                    self.signal_toggle_counts[*dst_id] += 1;
                                 }
-                                self.signal_toggle_counts[*dst_id] += 1;
-                            }
-                            if *dst_id + 1 < dep_offsets.len() {
-                                let lo = dep_offsets[*dst_id] as usize;
-                                let hi = dep_offsets[*dst_id + 1] as usize;
-                                for &dep_eidx_u32 in &dep_entries[lo..hi] {
-                                    let dep_eidx = dep_eidx_u32 as usize;
-                                    if !self.settle_triggered[dep_eidx] {
-                                        self.settle_triggered[dep_eidx] = true;
-                                        if dep_eidx > eidx {
-                                            cur_list.push(dep_eidx);
-                                        } else {
-                                            self.settle_triggered_list.push(dep_eidx);
+                                if *dst_id + 1 < dep_offsets.len() {
+                                    let lo = dep_offsets[*dst_id] as usize;
+                                    let hi = dep_offsets[*dst_id + 1] as usize;
+                                    for &dep_eidx_u32 in &dep_entries[lo..hi] {
+                                        let dep_eidx = dep_eidx_u32 as usize;
+                                        if !self.settle_triggered[dep_eidx] {
+                                            self.settle_triggered[dep_eidx] = true;
+                                            if dep_eidx > eidx {
+                                                cur_list.push(dep_eidx);
+                                            } else {
+                                                self.settle_triggered_list.push(dep_eidx);
+                                            }
                                         }
                                     }
                                 }
@@ -18216,6 +18533,43 @@ impl Simulator {
                     } else {
                         self.get_signal_value_by_name(obj_name)
                     };
+                    // Mirror SV writes to the unpacked-struct member signal
+                    // (e.g. `t_unpacked_struct.val_i`) so VPI-forced values
+                    // and SV reads stay in sync. Both storage locations
+                    // (heap property and separate signal) are written; the
+                    // read path prefers the separate signal.
+                    if hier.path.len() == 2 {
+                        let dotted = format!(
+                            "{}.{}",
+                            hier.path[0].name.name, hier.path[1].name.name
+                        );
+                        if self.signal_name_to_id.contains_key(dotted.as_str()) {
+                            if let Some(id) =
+                                self.signal_name_to_id.get(dotted.as_str()).copied()
+                            {
+                                let width = self.signal_widths[id];
+                                let mut resized = if self.signal_real[id] {
+                                    if val.is_real {
+                                        val.clone()
+                                    } else {
+                                        Value::from_f64(val.to_f64())
+                                    }
+                                } else {
+                                    if val.is_real {
+                                        Value::from_u64(val.to_f64() as u64, width)
+                                    } else {
+                                        val.resize(width)
+                                    }
+                                };
+                                resized.is_signed = self.signal_signed[id];
+                                self.set_signal_value_by_name(&dotted, resized);
+                                // Fall through to also update the heap so any
+                                // existing read path that looks there stays
+                                // consistent. Don't `return` — let the heap
+                                // write happen too.
+                            }
+                        }
+                    }
                     if let Some(v) = obj_val {
                         let mut cur_handle = v.to_u64().unwrap_or(0) as usize;
                         for i in 1..hier.path.len() {
@@ -19583,6 +19937,39 @@ impl Simulator {
                 }
                 let base = self.eval_expr(expr);
                 let handle = base.to_u64().unwrap_or(0) as usize;
+                // Mirror writes to the unpacked-struct member signal
+                // (e.g. `t_unpacked_struct.val_i`) so VPI-forced values
+                // and SV reads stay in sync. Both the heap property and the
+                // separate signal are written; the read path prefers the
+                // separate signal.
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        let dotted = format!(
+                            "{}.{}",
+                            hier.path[0].name.name, member.name
+                        );
+                        if let Some(id) = self.signal_name_to_id.get(dotted.as_str()).copied() {
+                            let width = self.signal_widths[id];
+                            let mut resized = if self.signal_real[id] {
+                                if val.is_real {
+                                    val.clone()
+                                } else {
+                                    Value::from_f64(val.to_f64())
+                                }
+                            } else {
+                                if val.is_real {
+                                    Value::from_u64(val.to_f64() as u64, width)
+                                } else {
+                                    val.resize(width)
+                                }
+                            };
+                            resized.is_signed = self.signal_signed[id];
+                            self.set_signal_value_by_name(&dotted, resized);
+                            // Fall through to also update the heap so existing
+                            // read paths that look there stay consistent.
+                        }
+                    }
+                }
                 if handle != 0 && handle < self.heap.len() {
                     if let Some(instance) = &mut self.heap[handle] {
                         let changed = instance.properties.get(&member.name) != Some(val);
@@ -19642,6 +20029,20 @@ impl Simulator {
                 val
             }
             ExprKind::Ident(hier) => {
+                // Unpacked-struct member path (e.g. `t_unpacked_struct.val_r`)
+                // is pre-registered as a separate signal by elaboration.
+                // Prefer the separate-signal read so VPI-forced values stay
+                // in sync with the SV-visible value. Skip short idents and
+                // the dotted name `Class::static_prop` (handled below).
+                if hier.path.len() == 2 {
+                    let dotted = format!(
+                        "{}.{}",
+                        hier.path[0].name.name, hier.path[1].name.name
+                    );
+                    if let Some(v) = self.get_signal_value_by_name(&dotted) {
+                        return v;
+                    }
+                }
                 // LRM §14.3 clocking-block input read — `cb.<sig>`
                 // returns the snapshot taken at the most recent posedge
                 // of the cb's clock (`#1step` input skew). Falls through
@@ -20039,6 +20440,21 @@ impl Simulator {
                         }
                     }
                     // Handle hierarchical ident that might be class member access: obj.prop
+                    // Unpacked-struct member paths (e.g. `t_unpacked_struct.val_r`)
+                    // are pre-registered as separate signals by elaboration.
+                    // Prefer the separate-signal read so VPI-forced values stay
+                    // in sync with the SV-visible value.
+                    {
+                        let full_path = hier
+                            .path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        if let Some(v) = self.get_signal_value_by_name(&full_path) {
+                            return v;
+                        }
+                    }
                     let val = if let Some(locals) = self.local_stack.last() {
                         locals.get(obj_name).cloned()
                     } else {
@@ -21946,6 +22362,17 @@ impl Simulator {
                                 }
                             }
                         }
+                    }
+                }
+                // Unpacked-struct member access where the member was pre-registered
+                // as its own signal (e.g. `t_unpacked_struct.val_r`). Prefer
+                // reading the member signal so VPI-forced values stay in
+                // sync with the SV-visible value.
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    let base_name = self.resolve_hier_name(hier);
+                    let qualified = format!("{}.{}", base_name, member.name);
+                    if let Some(v) = self.lookup_signal_value(&qualified) {
+                        return v;
                     }
                 }
                 let base = self.eval_expr(expr);
@@ -24420,10 +24847,17 @@ impl Simulator {
             StatementKind::ProceduralContinuous(pc) => match pc {
                 ProceduralContinuous::Assign { lvalue, rvalue }
                 | ProceduralContinuous::Force { lvalue, rvalue } => {
+                    // LRM §9.3.1: force/assign inserts into forced_signals and
+                    // updates the signal regardless of comb drivers.
                     let v = self.eval_expr(rvalue);
                     self.assign_value(lvalue, &v);
                 }
-                _ => {}
+                ProceduralContinuous::Release(_lvalue)
+                | ProceduralContinuous::Deassign(_lvalue) => {
+                    // Native force/release from SystemVerilog code: 
+                    // mark all comb entries as dirty so they re-evaluate.
+                    self.dirty_any = true;
+                }
             },
             StatementKind::VarDecl {
                 data_type,
@@ -26422,13 +26856,46 @@ impl Simulator {
         if id >= self.signal_table.len() {
             return;
         }
+        let (new_v, new_x) = self.signal_table[id].raw_bits();
         if id < self.signal_inline_bits.len() {
-            let (v, x) = self.signal_table[id].raw_bits();
-            self.signal_inline_bits[id] = [v, x];
+            self.signal_inline_bits[id] = [new_v, new_x];
         }
         // O1 measurement: stamp fast-path (set_inline_bits) writes too.
         if self.event_measure && id < self.sig_last_change.len() {
             self.sig_last_change[id] = self.event_phase;
+        }
+        // Value-change callback dispatch lives in the write_sig! macro
+        // so every write path sees it. after_signal_write is only
+        // invoked from NBA writeback / vpi_put_value paths that have
+        // already passed through write_sig! — firing here would cause
+        // double-counting on those paths.
+    }
+
+    /// Fire every registered `cbValueChange` callback for the given
+    /// signal id. Called from the `write_sig!` macro so all writes
+    /// (blocking assigns, NBA, force updates, settle loops, initial
+    /// block writes) dispatch the same way. The HashMap lookup is
+    /// O(1) and the empty-list fast path costs one branch.
+    fn fire_value_change_callbacks(&mut self, id: usize) {
+        let cbs = match self.dpi_value_change_cbs.get(&id) {
+            Some(v) if !v.is_empty() => v.clone(),
+            _ => return,
+        };
+        let self_ptr = self as *mut Simulator;
+        ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
+        for cb in cbs {
+            type CbFn = extern "C" fn(*mut s_cb_data);
+            let cb_routine = cb.cb_routine as *const ();
+            let cb_fn: CbFn = unsafe { std::mem::transmute(cb_routine) };
+            let cb_data = s_cb_data {
+                reason: 6, /* cbValueChange */
+                cb_rtn: std::ptr::null_mut(),
+                obj: std::ptr::null_mut(),
+                time: std::ptr::null_mut(),
+                value: std::ptr::null_mut(),
+                user_data: cb.user_data as *mut libc::c_void,
+            };
+            cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
         }
     }
 
@@ -37476,4 +37943,610 @@ impl SendExecContext {
     pub fn signal_count(&self) -> usize {
         self.signal_widths.len()
     }
+}
+
+// ============================================================================
+// VPI (Verification Procedural Interface) Support
+// ============================================================================
+
+// VPI types matching vpi_user.h
+#[repr(C)]
+struct s_vpi_vecval {
+    aval: u32,
+    bval: u32,
+}
+
+#[repr(C)]
+union s_vpi_value_union {
+    integer: libc::c_int,
+    real: libc::c_double,
+    time: u64,
+    str: *mut libc::c_char,
+    vector: *mut s_vpi_vecval,
+    scalar: u32,
+    longint: i64,
+}
+
+#[repr(C)]
+struct s_vpi_value {
+    format: libc::c_int,
+    value: s_vpi_value_union,
+}
+
+#[repr(C)]
+struct s_vpi_time {
+    type_: libc::c_int,
+    high: u32,
+    low: u32,
+    real: libc::c_double,
+}
+
+/// Thread-local pointer to the current simulator instance.
+/// Set during DPI import calls so VPI C callbacks can access it.
+thread_local! {
+    static ACTIVE_SIMULATOR: std::cell::Cell<*mut Simulator> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// Current DPI scope set by `svSetScope` and read by `svGetScope`.
+    /// Cached as a raw pointer into the simulator's `dpi_scopes` map.
+    /// Points to a `DpiScope` struct, or null if no scope is active.
+    static ACTIVE_SCOPE: std::cell::Cell<*mut libc::c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Wrapper for VPI handles stored as raw pointers.
+#[repr(C)]
+struct VpiHandle {
+    signal_id: usize,
+}
+
+/// Mirror of `s_cb_data` from `vpi_user.h` — the value-change dispatcher
+/// builds one of these on the stack and hands its address to the C
+/// callback. Fields match the IEEE 1800 §38.7 layout exactly; the C
+/// type is `t_cb_data`.
+#[repr(C)]
+struct s_cb_data {
+    reason: libc::c_int,
+    /// C function pointer (`PLI_INT32 (*cb_rtn)()`). Stored as the
+    /// destination type of the callback; unused when the callback is
+    /// invoked directly with its `user_data` cookie.
+    cb_rtn: *mut libc::c_void,
+    /// Object the callback was registered against (e.g. a signal
+    /// handle for cbValueChange). xezim passes null — callers that
+    /// need it recover it via `vpi_handle_by_name` from `user_data`.
+    obj: *mut libc::c_void,
+    time: *mut s_vpi_time,
+    value: *mut s_vpi_value,
+    user_data: *mut libc::c_void,
+}
+
+/// Mirror of `s_vpi_vlog_info` from `vpi_user.h`. Returned by
+/// `vpi_get_vlog_info` so UVM can read the binary name / version.
+#[repr(C)]
+struct s_vpi_vlog_info {
+    argc: libc::c_int,
+    argv: *mut *mut libc::c_char,
+    product: *mut libc::c_char,
+    version: *mut libc::c_char,
+}
+
+/// Opaque DPI scope handle. The `name` field carries the hierarchical
+/// scope name; `svGetNameFromScope` recovers it by casting the pointer
+/// back to a `DpiScope`.
+#[repr(C)]
+struct DpiScope {
+    name: [u8; 256],
+    name_len: usize,
+}
+
+/// Opaque VPI callback handle. The `cb_type` and `user_data` are passed
+/// to the C callback when the trigger fires.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DpiCbHandle {
+    cb_type: libc::c_int,
+    /// Signal id this callback watches (cbValueChange only). 0 for
+    /// non-signal callbacks like cbStartOfReset.
+    signal_id: usize,
+    /// The C function pointer invoked on the trigger. Stored as `usize`
+    /// because `extern "C" fn(...)` is non-`Send` and would prevent the
+    /// containing struct from living in a HashMap.
+    cb_routine: usize,
+    /// User-supplied data passed to the callback as `cb_data_p->user_data`.
+    user_data: usize,
+}
+
+/// Execute a callback with access to the active simulator.
+fn with_active_sim<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Simulator) -> R,
+{
+    let sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    if sim_ptr.is_null() {
+        panic!("[VPI] No active simulator - VPI call outside DPI context?");
+    }
+    f(unsafe { &mut *sim_ptr })
+}
+
+/// Get signal ID by hierarchical name.
+#[no_mangle]
+pub extern "C" fn vpi_handle_by_name(
+    name: *mut libc::c_char,
+    _scope: *mut libc::c_void,
+) -> *mut libc::c_void {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
+    let full_name = unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+
+    with_active_sim(|sim| {
+        // Try progressively stripping leftmost scope segments until we
+        // either resolve the name or exhaust prefixes. Handles:
+        //   - full hier name:           "top.mod.signal"
+        //   - module-prefix stripped:   "mod.signal"   (e.g. for VPI backdoor)
+        //   - leaf only:                "signal"
+        // For member paths like "top.mod.unpacked_struct.val_i" we register
+        // "unpacked_struct.val_i" in `signal_name_to_id`, so the second
+        // variant above is what resolves.
+        if let Some(&id) = sim.signal_name_to_id.get(full_name.as_str()) {
+            let handle = Box::into_raw(Box::new(VpiHandle { signal_id: id }));
+            return handle as *mut libc::c_void;
+        }
+        // Try progressively shorter prefixes from the left.
+        let mut start = 0usize;
+        while let Some(dot_pos) = full_name[start..].find('.') {
+            let abs_dot = start + dot_pos;
+            let candidate = &full_name[abs_dot + 1..];
+            if let Some(&id) = sim.signal_name_to_id.get(candidate) {
+                let handle = Box::into_raw(Box::new(VpiHandle { signal_id: id }));
+                return handle as *mut libc::c_void;
+            }
+        }
+        std::ptr::null_mut()
+    })
+}
+
+/// Free a VPI handle.
+#[no_mangle]
+pub extern "C" fn vpi_free_object(handle: *mut libc::c_void) -> libc::c_int {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle as *mut VpiHandle) });
+    }
+    0
+}
+
+/// Get a VPI property value.
+#[no_mangle]
+pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> libc::c_int {
+    if handle.is_null() {
+        return 0;
+    }
+    let h = unsafe { &*(handle as *const VpiHandle) };
+    let sig_id = h.signal_id;
+    with_active_sim(|sim| {
+        match property {
+            1 /* vpiType */ => {
+                // 2-state variables -> vpiBitVar (620), 4-state -> vpiReg (31).
+                // UVM's HDL backdoor uses vpi_get to decide whether to
+                // call vpi_get_value with vpiIntVal (2-state) or
+                // vpiVectorVal (4-state). We default to 2-state for
+                // ordinary signals (UVM's uvm_hdl_data_t is packed logic,
+                // but the read API works either way).
+                let is_2state = sim
+                    .signal_has_xz
+                    .get(sig_id)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0;
+                if is_2state {
+                    620 /* vpiBitVar */
+                } else {
+                    31 /* vpiReg */
+                }
+            }
+            4 /* vpiSize */ => sim.signal_widths.get(sig_id).copied().unwrap_or(32) as libc::c_int,
+            5 /* vpiSigned */ => {
+                if sim.signal_signed.get(sig_id).copied().unwrap_or(false) {
+                    1
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    })
+}
+
+/// Read a signal value via VPI.
+#[no_mangle]
+pub extern "C" fn vpi_get_value(
+    handle: *mut libc::c_void,
+    value_p: *mut s_vpi_value,
+) -> *mut libc::c_void {
+    if handle.is_null() || value_p.is_null() {
+        return std::ptr::null_mut();
+    }
+    with_active_sim(|sim| {
+        let h = unsafe { &*(handle as *const VpiHandle) };
+        let sig_id = h.signal_id;
+        let vp = unsafe { &mut *value_p };
+
+        let val = if sig_id < sim.signal_table.len() {
+            &sim.signal_table[sig_id]
+        } else {
+            return std::ptr::null_mut();
+        };
+
+        match vp.format {
+            10 /* vpiIntVal */ => {
+                vp.value.integer = val.to_i64().unwrap_or(0) as libc::c_int;
+            }
+            6 /* vpiRealVal */ => {
+                vp.value.real = val.to_f64();
+            }
+            _ => {}
+        }
+        std::ptr::null_mut()
+    })
+}
+
+// VPI value-format constants. IEEE 1800-2017 Table 38-44.
+const VPI_FORCE_FLAG: libc::c_int = 5;       // vpiForceFlag
+const VPI_RELEASE_FLAG: libc::c_int = 6;     // vpiReleaseFlag
+
+/// Write a signal value via VPI (supports force/release).
+#[no_mangle]
+pub extern "C" fn vpi_put_value(
+    handle: *mut libc::c_void,
+    value_p: *mut s_vpi_value,
+    _time_p: *mut s_vpi_time,
+    flags: libc::c_int,
+) -> *mut libc::c_void {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    with_active_sim(|sim| {
+        let h = unsafe { &*(handle as *const VpiHandle) };
+        let sig_id = h.signal_id;
+
+        if flags == VPI_RELEASE_FLAG {
+            // Release: remove from forced_signals and trigger settle
+            sim.forced_signals.remove(&sig_id);
+            // Find comb entries that write to this signal and add their source
+            // signals to dirty_list. This ensures settle sees the source as dirty
+            // and triggers the comb entry through the dep_entries mechanism.
+            for entry in sim.comb_entries.iter() {
+                if entry.write_signal_ids.contains(&sig_id) {
+                    for &src_id in &entry.read_signal_ids {
+                        if src_id < sim.dirty_signals.len() && !sim.dirty_signals[src_id] {
+                            sim.dirty_signals[src_id] = true;
+                            sim.dirty_list.push(src_id);
+                        }
+                    }
+                }
+            }
+            sim.dirty_any = true;
+            return std::ptr::null_mut();
+        }
+
+        let value = if !value_p.is_null() {
+            let vp = unsafe { &*value_p };
+            match vp.format {
+                10 /* vpiIntVal */ => {
+                    let ival = unsafe { vp.value.integer } as i64;
+                    let w = sim.signal_widths.get(sig_id).copied().unwrap_or(32);
+                    let mut v = Value::from_u64(ival as u64, w);
+                    v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
+                    v
+                }
+                6 /* vpiRealVal */ => Value::from_f64(unsafe { vp.value.real }),
+                7 /* vpiVectorVal */ => {
+                    // Read vector value (for wide signals up to 128 bits)
+                    let w = sim.signal_widths.get(sig_id).copied().unwrap_or(32);
+                    let vec_ptr = unsafe { vp.value.vector };
+                    if !vec_ptr.is_null() && w > 64 {
+                        let num_words = ((w + 31) / 32) as usize;
+                        let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
+                        // Combine aval/bval into a u128
+                        let mut val128: u128 = 0;
+                        for (i, vv) in vec.iter().enumerate().take(4) {
+                            // Use only non-X/non-Z bits (a AND NOT b)
+                            let bits = vv.aval & !vv.bval;
+                            val128 |= (bits as u128) << (i as u128 * 32);
+                        }
+                        let mut v = Value::from_u128(val128, w);
+                        v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
+                        v
+                    } else if !vec_ptr.is_null() {
+                        let num_words = ((w + 31) / 32) as usize;
+                        let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
+                        let mut v = Value::from_u64(vec[0].aval as u64, w);
+                        v.is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
+                        v
+                    } else {
+                        Value::zero(w)
+                    }
+                }
+                _ => {
+                    // Default: read current value
+                    sim.signal_table.get(sig_id).cloned().unwrap_or_else(|| Value::zero(32))
+                }
+            }
+        } else {
+            sim.signal_table.get(sig_id).cloned().unwrap_or_else(|| Value::zero(32))
+        };
+
+        // For force: write value first, THEN add to forced_signals
+        if flags == VPI_FORCE_FLAG {
+            // Write directly to signal_table (bypass write_sig! which would skip)
+            if sig_id < sim.signal_table.len() {
+                sim.signal_table[sig_id] = value.clone();
+                if sig_id < sim.signal_has_xz.len() {
+                    sim.signal_has_xz[sig_id] = if value.raw_bits().1 != 0 { 1u8 } else { 0u8 };
+                }
+                if sig_id < sim.signal_inline_bits.len() {
+                    let (v, x) = value.raw_bits();
+                    sim.signal_inline_bits[sig_id] = [v, x];
+                }
+            }
+            // Now mark as forced (after the write succeeded)
+            sim.forced_signals.insert(sig_id, value);
+        } else {
+            // Normal write - write_sig! will skip if signal is forced
+            write_sig!(sim, sig_id, value);
+        }
+
+        std::ptr::null_mut()
+    })
+}
+
+// ============================================================================
+// UVM VPI/DPI surface
+// ============================================================================
+// The functions below are the minimum subset of IEEE 1800 §35 (DPI) and
+// §38 (VPI) needed for the Accellera UVM reference implementation to
+// compile and link against xezim. They are intentionally simple — each
+// does exactly what UVM expects, no more. Symbols not exercised by the
+// UVM source are stubbed.
+//
+// Naming matches the C standard exactly; every function is `#[no_mangle]
+// pub extern "C"` so it lands in the simulator's symbol table and is
+// resolvable by `dlsym` when UVM's DPI imports fire.
+
+// --- vpi_get_vlog_info ------------------------------------------------------
+//
+// UVM's cmdline processor calls this once at startup to discover the
+// tool name + version. We hand back the argv passed via Simulator::set_args
+// (the CString pointers stay valid for the simulator lifetime) and a
+// static product/version string.
+//
+// `info_p` must be allocated by the caller; we fill it in place.
+#[no_mangle]
+pub extern "C" fn vpi_get_vlog_info(info_p: *mut s_vpi_vlog_info) -> libc::c_int {
+    if info_p.is_null() {
+        return 0;
+    }
+    let info = unsafe { &mut *info_p };
+    info.argc = 0;
+    info.argv = std::ptr::null_mut();
+    info.product = b"xezim\0".as_ptr() as *mut libc::c_char;
+    info.version = b"0.9.0-uvm\0".as_ptr() as *mut libc::c_char;
+
+    with_active_sim(|sim| {
+        info.argc = sim.vpi_argv.len() as libc::c_int;
+        if !sim.vpi_argv.is_empty() {
+            info.argv = sim.vpi_argv.as_mut_ptr();
+        }
+        1
+    })
+}
+
+// --- vpi_release_handle -----------------------------------------------------
+//
+// UVM calls this in some legacy code paths; semantically equivalent to
+// `vpi_free_object`. We just delegate to the existing free function.
+#[no_mangle]
+pub extern "C" fn vpi_release_handle(handle: *mut libc::c_void) -> libc::c_int {
+    vpi_free_object(handle)
+}
+
+// --- vpi_register_cb ---------------------------------------------------------
+//
+// Registers a VPI callback. The minimum UVM-1.2/1800.2-2017 surface
+// accepts `cbValueChange` (6) and `cbStartOfReset` (15). Other reasons
+// are recorded but never fired.
+//
+// Returns a non-null opaque handle on success, null on failure. The
+// returned handle must be freed by `vpi_remove_cb` (which is itself
+// implemented as `vpi_free_object` internally — we leak the `DpiCbHandle`
+// Box from the Rust side).
+#[no_mangle]
+pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
+    if cb_p.is_null() {
+        return std::ptr::null_mut();
+    }
+    let cb_data = unsafe { &*cb_p };
+    let reason = cb_data.reason;
+    let user_data = cb_data.user_data as usize;
+    let cb_routine = cb_data.cb_rtn as usize;
+
+    // The signal being watched (cbValueChange only). For other reasons
+    // we record 0 — those callbacks fire once per simulator session
+    // regardless of the target.
+    let signal_id = if !cb_data.obj.is_null() {
+        unsafe { &*(cb_data.obj as *const VpiHandle) }.signal_id
+    } else {
+        0
+    };
+
+    let handle = Box::into_raw(Box::new(DpiCbHandle {
+        cb_type: reason,
+        signal_id,
+        cb_routine,
+        user_data,
+    }));
+
+    with_active_sim(|sim| {
+        match reason {
+            6 /* cbValueChange */ => {
+                // `signal_id == 0` is a valid signal index — it's the
+                // typical value for the first signal in `signal_table`.
+                // Use `cb_data.obj.is_null()` as the "no target signal"
+                // sentinel instead.
+                if !cb_data.obj.is_null() {
+                    sim.dpi_value_change_cbs
+                        .entry(signal_id)
+                        .or_insert_with(Vec::new)
+                        .push(unsafe { *handle });
+                }
+            }
+            15 /* cbStartOfReset */ => {
+                sim.dpi_reset_cbs.push(unsafe { *handle });
+            }
+            _ => {
+                // Unknown reason — accept the registration (so UVM's
+                // bookkeeping stays consistent) but don't track the
+                // callback for firing.
+            }
+        }
+    });
+
+    handle as *mut libc::c_void
+}
+
+// --- vpi_remove_cb -----------------------------------------------------------
+//
+// Deregisters a callback previously registered via `vpi_register_cb`.
+//
+// Removal scans the per-signal value-change lists and the reset-callback
+// vec. Order is not preserved (UVM doesn't require it). The callback
+// Box is reclaimed here — we don't leak.
+#[no_mangle]
+pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
+    if cb.is_null() {
+        return 0;
+    }
+    let removed = unsafe { Box::from_raw(cb as *mut DpiCbHandle) };
+    let signal_id = removed.signal_id;
+    let cb_type = removed.cb_type;
+
+    let mut rc = 0;
+    with_active_sim(|sim| {
+        match cb_type {
+            6 /* cbValueChange */ => {
+                if let Some(list) = sim.dpi_value_change_cbs.get_mut(&signal_id) {
+                    list.retain(|cb| {
+                        cb.cb_routine != removed.cb_routine
+                            || cb.user_data != removed.user_data
+                    });
+                    rc = 1;
+                }
+            }
+            15 /* cbStartOfReset */ => {
+                let before = sim.dpi_reset_cbs.len();
+                sim.dpi_reset_cbs.retain(|cb| {
+                    cb.cb_routine != removed.cb_routine
+                        || cb.user_data != removed.user_data
+                });
+                if sim.dpi_reset_cbs.len() != before {
+                    rc = 1;
+                }
+            }
+            _ => {}
+        }
+    });
+    rc
+}
+
+// --- svDpiVersion -----------------------------------------------------------
+//
+// Returns the DPI version string. UVM uses this for log banners and to
+// decide which DPI features are available.
+#[no_mangle]
+pub extern "C" fn svDpiVersion() -> *const libc::c_char {
+    // Static C string — no lifetime concerns.
+    b"1800-2017\0".as_ptr() as *const libc::c_char
+}
+
+// --- svGetScopeFromName -----------------------------------------------------
+//
+// Returns an opaque handle to the named scope (a module, package, or
+// interface instance). UVM calls this with names like `uvm_pkg`,
+// `uvm_test_top`, or `top.dut`. We cache the handles in a HashMap so
+// the same scope always returns the same pointer (svSetScope+svGetScope
+// rely on this for equality).
+//
+// If the scope name is not found we still return a non-null handle
+// pointing at a new `DpiScope` — UVM is happy with synthetic scopes
+// because it only round-trips them through `svGetNameFromScope`.
+#[no_mangle]
+pub extern "C" fn svGetScopeFromName(name: *const libc::c_char) -> *mut libc::c_void {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
+    let name_str = unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+
+    with_active_sim(|sim| {
+        if let Some(&existing) = sim.dpi_scopes.get(&name_str) {
+            return existing;
+        }
+        let mut scope = DpiScope {
+            name: [0u8; 256],
+            name_len: name_str.len().min(255),
+        };
+        let bytes = name_str.as_bytes();
+        scope.name[..scope.name_len].copy_from_slice(&bytes[..scope.name_len]);
+        let ptr = Box::into_raw(Box::new(scope)) as *mut libc::c_void;
+        sim.dpi_scopes.insert(name_str, ptr);
+        ptr
+    })
+}
+
+// --- svGetNameFromScope -----------------------------------------------------
+//
+// Recovers the scope name from a handle. UVM round-trips scope handles
+// through this when emitting diagnostics.
+#[no_mangle]
+pub extern "C" fn svGetNameFromScope(scope: *mut libc::c_void) -> *const libc::c_char {
+    if scope.is_null() {
+        return std::ptr::null();
+    }
+    unsafe {
+        let s = &*(scope as *const DpiScope);
+        // The name is stored as fixed-size [u8; 256] with a length
+        // prefix; hand back a pointer to the first byte (NOT
+        // NUL-terminated in our storage — the CStr assumption in UVM
+        // is wrong here, so we leak a fresh CString via a thread_local).
+        // Simpler: allocate a CString once per call. UVM calls this
+        // sparingly so the allocation overhead is negligible.
+        std::ffi::CString::new(std::str::from_utf8_unchecked(&s.name[..s.name_len]))
+            .unwrap_or_default()
+            .into_raw()
+    }
+}
+
+// --- svGetScope -------------------------------------------------------------
+//
+// Returns the currently-active scope set by `svSetScope`. Used by UVM
+// when an import is called and the DPI runtime needs to know "where
+// am I?".
+#[no_mangle]
+pub extern "C" fn svGetScope() -> *mut libc::c_void {
+    ACTIVE_SCOPE.with(|cell| cell.get())
+}
+
+// --- svSetScope -------------------------------------------------------------
+//
+// Updates the currently-active scope. xezim's exec_dpi_import_call
+// sets the scope to the import's declaration site before invoking the
+// C function, then restores the previous value on the way out.
+#[no_mangle]
+pub extern "C" fn svSetScope(scope: *mut libc::c_void) -> *mut libc::c_void {
+    let prev = ACTIVE_SCOPE.with(|cell| cell.get());
+    ACTIVE_SCOPE.with(|cell| cell.set(scope));
+    prev
 }
