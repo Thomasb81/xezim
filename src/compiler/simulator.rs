@@ -24620,6 +24620,26 @@ impl Simulator {
                         self.module.queue_max_sizes.remove(nm);
                         self.signals.remove(&format!("{}.size", nm));
                     }
+                    // Register a *packed*-struct local's field layout so member
+                    // access (`p.field`) aliases into the whole variable, as
+                    // module-level packed-struct signals already do. Without
+                    // this a local `pkt_t p;` keeps `p` and `p.field` in
+                    // separate storage (a whole write doesn't reach members and
+                    // vice-versa). Unpacked structs are intentionally excluded.
+                    if d.dimensions.is_empty() {
+                        if let Some(fields) = super::elaborate::packed_struct_field_layout(
+                            data_type,
+                            &self.module.parameters,
+                            &self.module.typedefs,
+                            &self.module.typedef_types,
+                        ) {
+                            if !fields.is_empty() {
+                                self.module
+                                    .packed_struct_fields
+                                    .insert(d.name.name.clone(), fields);
+                            }
+                        }
+                    }
                     let dims = &d.dimensions;
                     let mut range: Option<(i64, i64)> = None;
                     let mut descending = false;
