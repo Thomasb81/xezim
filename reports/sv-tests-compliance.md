@@ -1,56 +1,66 @@
 # sv-tests compliance run (runner = xezim)
 
-- **Date:** 2026-07-07
+- **Date:** 2026-07-08
 - **Simulator:** xezim 0.8.1 (release build)
 - **Suite:** [chipsalliance/sv-tests](https://github.com/chipsalliance/sv-tests) @ `4d3772a6`
 - **Command:** `make report RUNNERS=Xezim -j5` (with `XEZIM_BIN` pointing at the
   release binary)
-- **Full HTML report:** `sv-tests/out/report/index.html` (+ `report.csv`)
+- **Full HTML report:** `svtests_index.html` (+ `svtests_report.csv`)
 
 ## Headline
 
 | Category | Pass / Total | Rate |
 |---|---|---|
-| **Native sv-tests (LRM chapters + UVM)** | 1621 / 1647 | **98.4 %** |
-| Imported third-party suites | 860 / 3121 | 27.6 % |
-| **All tests** | **2481 / 4768** | **52.0 %** |
+| **All tests** | **4354 / 4768** | **91.3 %** |
+| UVM (1800.2-2017) | 484 / 487 | 99.4 % |
+| non-`ivtest` | 2153 / 2237 | 96.2 % |
+| Icarus `ivtest` suite | 2201 / 2531 | 87.0 % |
 
-xezim passes **98.4 %** of the native SystemVerilog LRM compliance and UVM
-tests. The overall 52 % is pulled down by the imported third-party suites —
-above all the Icarus Verilog `ivtest` regression set, which is ~53 % of all
-tests and targets simulator-specific Verilog behaviors rather than SV-LRM
-conformance.
+## History: the 52 % → 91 % jump
 
-## Imported-suite detail
+The first run of this suite scored only **52 %**. Investigation showed that was
+not a capability gap but a library-scan artifact:
 
-| Suite (tag) | Pass / Total | Rate | Notes |
-|---|---|---|---|
-| `ivtest`   | 352 / 2531 | 13.9 % | Icarus Verilog regression suite (simulation behaviors, delays, PLI) |
-| `basejump` | 335 / 360  | 93.1 % | BaseJump STL cores |
-| `yosys`    | 169 / 216  | 78.2 % | Yosys front-end tests |
+- sv-tests runs each `ivtest` case as a single file but adds its directory,
+  `third_party/tools/icarus/ivtest/ivltests/` (~1000 unrelated single-file
+  tests), as an `-I` include dir.
+- xezim honors IEEE §23.3.2 library-directory semantics — an `-I` dir supplies
+  `module`/`interface`/`program` definitions to satisfy unresolved
+  instantiations — but `resolve_library_modules` was adopting **every**
+  definition found in the directory. Typedefs/enums from unrelated sibling
+  files (e.g. `typedef word word_darray[];` in `unp_array_typedef.v`) leaked
+  into the primary design's scope and failed a spurious §6.18 "base type not
+  declared" check in tests that never mention them. ~2100 `ivtest` cases failed
+  this way.
 
-## Selected native-tag rates (all ≈100 %)
+Reproduction (before the fix):
 
-`uvm-req` 294/294, `uvm` 107/110, `uvm-classes` 36/36, keyword-library
-(`5.6.2`) 248/248, data-types (`5.7.1`) 63/64, `11.4.*` operators 100 %,
-`22.5.1` 29/29.
+```sh
+IV=third_party/tools/icarus/ivtest
+xezim --simulate --sv2017 $IV/ivltests/casesynth7.v            # PASSED
+xezim --simulate --sv2017 -I $IV/ivltests $IV/ivltests/casesynth7.v
+# → Simulation error: typedef 'word_darray': base type 'word' is not declared
+#   (word_darray appears nowhere in casesynth7.v — a trivial mux)
+```
+
+**Fix** (`xezim-core/src/lib.rs::resolve_library_modules`): index the library
+directory's module/interface/program definitions without adopting them, then
+pull in only those reachable from the explicitly-compiled design's
+instantiations, transitively. Classes, packages and forward typedefs are never
+imported from a library dir; a non-forward library typedef is adopted only to
+fill a forward typedef the primary design actually declared.
+
+Result: `ivtest` 13.9 % → 87.0 %, overall 52.0 % → 91.3 %, with the native
+LRM/UVM tests unchanged (no regressions).
 
 ## How it was run
 
-There was no manual wiring needed — sv-tests already ships a `Xezim.py`
-runner (registers as `xezim`, resolves the binary from `$XEZIM_BIN` first,
-then `xezim` on `PATH`). Modes map to `--preprocess` / `--parse` /
+sv-tests already ships a `Xezim.py` runner (registers as `xezim`, resolves the
+binary from `$XEZIM_BIN` first). Modes map to `--preprocess` / `--parse` /
 `--compile` / `--simulate`; all invocations pass `--sv2017`.
 
 ```sh
 export XEZIM_BIN=/home/bondan/repo/fix/jul7/xezim/target/release/xezim
 cd sv-tests
-make report RUNNERS=Xezim -j5
-# → out/report/index.html
+make report RUNNERS=Xezim -j5   # → out/report/index.html
 ```
-
-Per-test timeouts are honored by the runner (from each test's metadata), so
-a pathological case can't stall the batch. A handful of `WARNING | Error when
-opening file third_party/...` messages come from tests referencing
-third-party submodules that aren't checked out; they don't affect the xezim
-results above.
