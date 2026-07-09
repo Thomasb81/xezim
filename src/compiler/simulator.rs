@@ -18789,6 +18789,25 @@ impl Simulator {
                 // A 0 width here means the flat `widths` map was polluted
                 // by a same-named variable from another scope — never a
                 // valid lvalue width, so fall back to the value's width.
+                // A member of a nested packed struct / untagged union aliases the
+                // container's storage (§7.3): splice into it rather than create an
+                // independent leaf that would stop aliasing its siblings. Its dotted
+                // name parses as one hierarchical ident, so the root-keyed field
+                // lookups above never matched it.
+                if let Some((base, off, w)) = self.packed_leaf_of_hier(&name) {
+                    if let Some(cur) = self.get_signal_value_by_name(&base) {
+                        let mut next = cur.clone();
+                        let piece = val.resize(w);
+                        for i in 0..w {
+                            next.set_bit((off + i) as usize, piece.get_bit(i as usize));
+                        }
+                        let changed = next != cur;
+                        if changed {
+                            self.set_signal_value_by_name(&base, next);
+                        }
+                        return changed;
+                    }
+                }
                 let width = self
                     .widths
                     .get(&name)
@@ -26475,6 +26494,13 @@ impl Simulator {
             .map(|s| s.name.name.as_str())
             .collect::<Vec<_>>()
             .join(".");
+        // `a.b.c` where `a.b` carries a bit layout (a nested packed struct, or
+        // an untagged union whose members share one storage): the dotted name
+        // IS the leaf. Without this the suffix-scan fallback below collapses it
+        // to the last segment (`c`) and writes a stray module-scope signal.
+        if hier.path.len() >= 2 && self.packed_leaf_of_hier(&raw).is_some() {
+            return raw;
+        }
         // LRM §25.9: if the leading segment names a virtual-interface
         // formal-arg alias in the current task call frame, rewrite the
         // path to use the bound interface instance name. Has to fire
@@ -28917,6 +28943,18 @@ impl Simulator {
         }
     }
 
+    /// `a.b.c` where `a.b` is a signal carrying a bit layout (a nested packed
+    /// struct, or an untagged union whose members all sit at bit 0): the leaf's
+    /// `(container, offset, width)`. Such a dotted name parses as ONE
+    /// hierarchical identifier, so the field lookups that key off the ROOT
+    /// (`a`) never see it.
+    fn packed_leaf_of_hier(&self, full: &str) -> Option<(String, u32, u32)> {
+        let (base, field) = full.rsplit_once('.')?;
+        let fields = self.module.packed_struct_fields.get(base)?;
+        let (_, off, w) = fields.iter().find(|(m, _, _)| m == field)?;
+        Some((base.to_string(), *off, *w))
+    }
+
     fn get_signal_value_by_name(&self, name: &str) -> Option<Value> {
         if !name.contains('.') {
             if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
@@ -28946,6 +28984,13 @@ impl Simulator {
                 v.is_signed = true;
             }
             return Some(v);
+        }
+        // A member of a nested packed struct / untagged union: slice it out of
+        // the container rather than reading a stale lazily-created leaf.
+        if let Some((base, off, w)) = self.packed_leaf_of_hier(name) {
+            if let Some(cur) = self.get_signal_value_by_name(&base) {
+                return Some(cur.range_select((off + w - 1) as usize, off as usize));
+            }
         }
         self.signals.get(name).cloned()
     }
@@ -28982,6 +29027,22 @@ impl Simulator {
                 self.table_modified = true;
             }
             return;
+        }
+        // A member of a nested packed struct / untagged union shares the
+        // container's storage (§7.3) — splice into it instead of creating an
+        // independent leaf that would silently stop aliasing its siblings.
+        if let Some((base, off, w)) = self.packed_leaf_of_hier(name) {
+            if let Some(cur) = self.get_signal_value_by_name(&base) {
+                let mut next = cur.clone();
+                let piece = val.resize(w);
+                for i in 0..w {
+                    next.set_bit((off + i) as usize, piece.get_bit(i as usize));
+                }
+                if next != cur {
+                    self.set_signal_value_by_name(&base, next);
+                }
+                return;
+            }
         }
         self.signals.insert(name.to_string(), val);
     }
@@ -30049,6 +30110,16 @@ impl Simulator {
         self.set_signal_value_by_name(flat, val);
     }
 
+    /// Whether an aggregate keeps each member in its OWN signal, so an
+    /// assignment pattern must be spread across them. A packed struct is one
+    /// signal; so is an untagged union — one storage shared by every member
+    /// (§7.3) — and both take the packed-value path instead.
+    fn spreads_member_wise(su: &crate::ast::types::StructUnionType) -> bool {
+        let untagged_union =
+            matches!(su.kind, crate::ast::types::StructUnionKind::Union) && !su.tagged;
+        !su.packed && !untagged_union
+    }
+
     /// Assign `e` to the flattened target `target` of declared type `dt`. When
     /// `e` is itself an assignment pattern and `dt` an unpacked struct, recurse
     /// member-wise; otherwise evaluate and write the leaf.
@@ -30056,7 +30127,7 @@ impl Simulator {
         if let ExprKind::AssignmentPattern(sub) = &e.kind {
             if !sub.is_empty() {
                 if let DataType::Struct(su) = self.resolve_dt(dt) {
-                    if !su.packed {
+                    if Self::spreads_member_wise(&su) {
                         self.assign_pattern_into_struct(target, &su, sub);
                         return;
                     }
@@ -30166,8 +30237,8 @@ impl Simulator {
             return wrote;
         }
 
-        let elem_is_unpacked_struct =
-            matches!(self.resolve_dt(&dt), DataType::Struct(ref su) if !su.packed);
+        let elem_is_unpacked_struct = matches!(
+            self.resolve_dt(&dt), DataType::Struct(ref su) if Self::spreads_member_wise(su));
 
         // Fixed unpacked array of unpacked structs: `'{'{...}, '{...}}`.
         // Queues and dynamic arrays keep the existing (size-tracking) path.
@@ -30191,7 +30262,7 @@ impl Simulator {
         }
 
         if let DataType::Struct(su) = self.resolve_dt(&dt) {
-            if !su.packed {
+            if Self::spreads_member_wise(&su) {
                 self.assign_pattern_into_struct(base, &su, items);
                 return true;
             }
@@ -30214,7 +30285,7 @@ impl Simulator {
         let bname = self.resolve_hier_name(bh);
         let Some(dt) = self.module.var_decl_types.get(&bname).cloned() else { return false };
         let DataType::Struct(su) = self.resolve_dt(&dt) else { return false };
-        if su.packed {
+        if !Self::spreads_member_wise(&su) {
             return false;
         }
         let iv = self.eval_expr(index);
@@ -30236,11 +30307,9 @@ impl Simulator {
             return false;
         }
         let Some((dt, arr)) = self.flat_path_type(flat) else { return false };
-        let DataType::Struct(su) = self.resolve_dt(&dt) else { return false };
-        if su.packed {
-            return false;
-        }
-        // Unindexed array member: one pattern item per element.
+        // Unindexed unpacked array member: one pattern item per element. The
+        // element type need not be a struct — `real m[3] = '{1.1, 2.2, 3.3}`
+        // spreads exactly the same way.
         if let Some(idxs) = arr {
             if !items.iter().all(|i| matches!(i, AssignmentPatternItem::Ordered(_))) {
                 return false;
@@ -30250,6 +30319,10 @@ impl Simulator {
                 self.assign_pattern_or_leaf(&format!("{}[{}]", flat, idx), &dt, item.expr());
             }
             return true;
+        }
+        let DataType::Struct(su) = self.resolve_dt(&dt) else { return false };
+        if !Self::spreads_member_wise(&su) {
+            return false;
         }
         self.assign_pattern_into_struct(flat, &su, items);
         true
@@ -30438,6 +30511,9 @@ impl Simulator {
                 for b in 0..w {
                     sub.set_bit(b as usize, v.get_bit((offs[i] + b) as usize));
                 }
+                // A slice loses the member's signedness: an `int` member holding
+                // 32'hDEADBEEF prints -559038737, not 3735928559.
+                sub.is_signed = super::elaborate::is_type_signed(&mdt);
                 format!("{}:{}", n, self.render_p_value_typed(&sub, &mdt))
             })
             .collect();
@@ -30470,8 +30546,11 @@ impl Simulator {
                     return format!("'{{{}:{}}}", tag, v.to_dec_string());
                 }
                 // A PACKED struct has no per-member signals — its members are
-                // bit-slices of the container's own value.
-                if su.packed {
+                // bit-slices of the container's own value. So does an untagged
+                // UNION, packed or not: one storage, every member at bit 0 (§7.3).
+                let is_untagged_union =
+                    matches!(su.kind, crate::ast::types::StructUnionKind::Union) && !su.tagged;
+                if su.packed || is_untagged_union {
                     let v = self
                         .get_signal_value_by_name(name)
                         .unwrap_or_else(|| Value::zero(1));
