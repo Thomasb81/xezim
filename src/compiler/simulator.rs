@@ -24663,6 +24663,17 @@ impl Simulator {
                                     .insert(d.name.name.clone(), fields);
                             }
                         }
+                        // Declaration-order member names for `%p` (§21.2.1.7).
+                        if let Some(names) = super::elaborate::struct_member_names(
+                            data_type,
+                            &self.module.typedef_types,
+                        ) {
+                            if !names.is_empty() {
+                                self.module
+                                    .struct_members
+                                    .insert(d.name.name.clone(), names);
+                            }
+                        }
                     }
                     let dims = &d.dimensions;
                     let mut range: Option<(i64, i64)> = None;
@@ -25467,10 +25478,67 @@ impl Simulator {
                                         continue;
                                     }
                                 }
+                                // §21.2.1.7: a class object prints its properties
+                                // named, in declaration order (base first); a
+                                // null handle prints `null`. Only a genuinely
+                                // class-typed variable takes this path, so a
+                                // plain int is never read as a handle.
+                                if let ExprKind::Ident(h) = &arg.kind {
+                                    if h.path.len() == 1
+                                        && self.class_of_var(&h.path[0].name.name).is_some()
+                                    {
+                                        let handle = self.eval_expr(arg).to_u64().unwrap_or(0);
+                                        if handle == 0 {
+                                            result.push_str("null");
+                                            continue;
+                                        }
+                                        if let Some(members) =
+                                            self.class_object_members(handle as usize)
+                                        {
+                                            let parts: Vec<String> = members
+                                                .iter()
+                                                .map(|(n, v, is_str)| {
+                                                    format!(
+                                                        "{}:{}",
+                                                        n,
+                                                        Self::render_p_value(v, *is_str)
+                                                    )
+                                                })
+                                                .collect();
+                                            result
+                                                .push_str(&format!("'{{{}}}", parts.join(", ")));
+                                            continue;
+                                        }
+                                    }
+                                }
                                 // §21.2.1.7: a struct prints in assignment-pattern
-                                // form `'{member, member, ...}`. Needed for
-                                // unpacked structs (no flat value ⇒ plain eval is
-                                // X) and nicer than a flattened decimal for packed.
+                                // form with NAMED members, in declaration order:
+                                //   '{data:10, addr:20, vld:1}
+                                if let Some(members) = self.struct_members_ordered(arg) {
+                                    let mut parts = Vec::with_capacity(members.len());
+                                    for (mname, fexpr) in &members {
+                                        // A `string` member is tracked by its
+                                        // dotted signal name.
+                                        let is_str = match &fexpr.kind {
+                                            ExprKind::Ident(fh) => {
+                                                let n = self.resolve_hier_name(fh);
+                                                self.string_signals.contains(&n)
+                                            }
+                                            _ => false,
+                                        };
+                                        let v = self.eval_expr(fexpr);
+                                        parts.push(format!(
+                                            "{}:{}",
+                                            mname,
+                                            Self::render_p_value(&v, is_str)
+                                        ));
+                                    }
+                                    result.push_str(&format!("'{{{}}}", parts.join(", ")));
+                                    continue;
+                                }
+                                // Fallback: member order unknown (struct declared
+                                // somewhere we don't record) — emit unnamed values
+                                // rather than a flattened decimal / X.
                                 if let Some(fields) = self.expand_struct_target(arg) {
                                     let mut parts = Vec::with_capacity(fields.len());
                                     for (_n, fexpr) in &fields {
@@ -29605,6 +29673,107 @@ impl Simulator {
         } else {
             Some(candidates[self.rng.gen::<usize>() % candidates.len()].clone())
         }
+    }
+
+    /// Class type of a variable, if it is a class-handle variable. Guards `%p`
+    /// against treating a plain integer as an object handle.
+    fn class_of_var(&self, vname: &str) -> Option<String> {
+        // Procedural locals record their class at VarDecl exec time.
+        if let Some(c) = self.var_class_types.get(vname) {
+            if self.module.classes.contains_key(c) {
+                return Some(c.clone());
+            }
+        }
+        if let Some(sig) = self.module.signals.get(vname) {
+            if let Some(tn) = &sig.type_name {
+                if self.module.classes.contains_key(tn) {
+                    return Some(tn.clone());
+                }
+            }
+        }
+        // Module-level class handles are only in the compact signal table.
+        if let Some(&id) = self.signal_name_to_id.get(vname) {
+            if let Some(tn) = self.signal_type_names.get(&id) {
+                if self.module.classes.contains_key(tn) {
+                    return Some(tn.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Render one `%p` member value: strings as quoted text, reals as reals,
+    /// everything else in decimal (LRM §21.2.1.7 assignment-pattern form).
+    fn render_p_value(v: &Value, is_string: bool) -> String {
+        if is_string {
+            format!("\"{}\"", v.to_sv_string())
+        } else if v.is_real {
+            format!("{}", v.to_f64())
+        } else {
+            v.to_dec_string()
+        }
+    }
+
+    /// `(property, value, is_string)` of a class object, in DECLARATION order
+    /// with base classes first — what `%p` prints for a class handle (§21.2.1.7).
+    fn class_object_members(&self, handle: usize) -> Option<Vec<(String, Value, bool)>> {
+        let inst = self.heap.get(handle)?.as_ref()?;
+        // Walk the inheritance chain, then emit base-first.
+        let mut chain: Vec<String> = Vec::new();
+        let mut cur = Some(inst.class_name.clone());
+        while let Some(c) = cur {
+            if chain.contains(&c) {
+                break; // defensive: cyclic extends
+            }
+            cur = self.module.classes.get(&c).and_then(|k| k.extends.clone());
+            chain.push(c);
+        }
+        chain.reverse();
+        let mut out = Vec::new();
+        let mut seen: HashSet<String> = HashSet::default();
+        for c in &chain {
+            if let Some(k) = self.module.classes.get(c) {
+                for p in &k.property_order {
+                    if seen.insert(p.clone()) {
+                        if let Some(v) = inst.properties.get(p) {
+                            let is_str = k.string_properties.contains(p);
+                            out.push((p.clone(), v.clone(), is_str));
+                        }
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// `(member_name, member_lvalue)` for a struct variable, in DECLARATION
+    /// order — what `%p` must print (LRM §21.2.1.7). `None` for a non-struct
+    /// target or one whose member order wasn't recorded.
+    fn struct_members_ordered(&self, a: &Expression) -> Option<Vec<(String, Expression)>> {
+        let ExprKind::Ident(h) = &a.kind else { return None };
+        if h.path.len() != 1 {
+            return None;
+        }
+        let vname = &h.path[0].name.name;
+        let names = self.module.struct_members.get(vname)?;
+        if names.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(names.len());
+        for fname in names {
+            let mut fh = h.clone();
+            fh.path.push(crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier { name: fname.clone(), span: h.span },
+                selects: Vec::new(),
+            });
+            fh.cached_signal_id = std::cell::Cell::new(None);
+            fh.cached_resolved_name = std::cell::OnceCell::new();
+            out.push((
+                fname.clone(),
+                Expression { kind: ExprKind::Ident(fh), span: a.span },
+            ));
+        }
+        Some(out)
     }
 
     /// Expand a scope-randomize target that names a struct variable into its

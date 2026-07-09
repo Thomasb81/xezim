@@ -833,7 +833,7 @@ fn main() {
             if head.len() == 8 && &head[..] == xezim::XEZIM_BYTECODE_MAGIC {
                 match xezim::read_compiled(sf) {
                     Ok(Some(elab)) => {
-                        println!("=== xezim ===");
+                        println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
                         println!("Loaded compiled: {}", sf);
                         println!("Max time: {}", max_time);
                         println!("------------------------------");
@@ -1092,7 +1092,7 @@ fn main() {
         return;
     }
 
-    println!("=== xezim ===");
+    println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
     println!("Max time: {}", max_time);
     println!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
