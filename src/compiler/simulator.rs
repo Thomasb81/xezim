@@ -19717,6 +19717,45 @@ impl Simulator {
                         }
                     }
                 }
+                // `arr[i].member = …` where `arr`'s element is an UNPACKED
+                // struct: each member lives in its own signal `arr[i].member`
+                // (there is no contiguous bit layout to slice — a `real` member
+                // has no meaningful bit offset). Write that signal directly,
+                // honouring its declared width / signedness / real-ness. Packed
+                // element types keep the bit-slice path below.
+                if let ExprKind::Index { expr: base, index } = &expr.kind {
+                    if let ExprKind::Ident(bh) = &base.kind {
+                        if bh.path.len() == 1
+                            && !self
+                                .module
+                                .packed_struct_fields
+                                .contains_key(&bh.path[0].name.name)
+                        {
+                            let idx = self.eval_expr(index).to_i64().unwrap_or(0);
+                            let target =
+                                format!("{}[{}].{}", bh.path[0].name.name, idx, member.name);
+                            if let Some(&id) = self.signal_name_to_id.get(target.as_str()) {
+                                let width = self.signal_widths[id];
+                                let mut resized = if self.signal_real[id] {
+                                    if val.is_real {
+                                        val.clone()
+                                    } else {
+                                        Value::from_f64(val.to_f64())
+                                    }
+                                } else if val.is_real {
+                                    Value::from_u64(val.to_f64() as u64, width)
+                                } else {
+                                    val.resize(width)
+                                };
+                                resized.is_signed = self.signal_signed[id];
+                                let prev = self.get_signal_value_by_name(&target);
+                                let changed = prev.as_ref() != Some(&resized);
+                                self.set_signal_value_by_name(&target, resized);
+                                return changed;
+                            }
+                        }
+                    }
+                }
                 // LRM §25.10 — `vif_arr[i].member = ...` (indexed
                 // virtual-iface property write). Index{ Ident(vif_arr), idx }
                 // base shape; look up `(this_h, "vif_arr[idx]")` binding.
@@ -21915,6 +21954,29 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // `arr[i].member` where `arr`'s element is an UNPACKED struct:
+                // the member lives in its own signal `arr[i].member` (there is
+                // no contiguous bit layout to slice). Mirror of the write path
+                // in `assign_value`; packed element types keep bit-slicing.
+                if let ExprKind::Index { expr: base, index } = &expr.kind {
+                    if let ExprKind::Ident(bh) = &base.kind {
+                        if bh.path.len() == 1
+                            && !self
+                                .module
+                                .packed_struct_fields
+                                .contains_key(&bh.path[0].name.name)
+                        {
+                            let idx = self.eval_expr(index).to_i64().unwrap_or(0);
+                            let target =
+                                format!("{}[{}].{}", bh.path[0].name.name, idx, member.name);
+                            if self.signal_name_to_id.contains_key(target.as_str()) {
+                                if let Some(v) = self.get_signal_value_by_name(&target) {
+                                    return v;
+                                }
+                            }
+                        }
+                    }
+                }
                 // LRM §15.5.3: `<event>.triggered` — returns 1 iff the
                 // named event was triggered in the same simulation time
                 // slot as this query. `EventTrigger` stamps
