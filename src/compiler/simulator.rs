@@ -22345,6 +22345,121 @@ impl Simulator {
         }
     }
 
+    /// Active tag of a tagged-union subject (§7.3.2), if it is one.
+    fn subject_union_tag(&self, subject: &Expression) -> Option<String> {
+        if let ExprKind::Ident(h) = &subject.kind {
+            let n = self.resolve_hier_name(h);
+            return self.active_union_tag.get(&n).cloned();
+        }
+        None
+    }
+
+    /// Test a §12.6 pattern against `subject`, collecting `.v` bindings.
+    fn match_pattern(
+        &mut self,
+        subject: &Expression,
+        pat: &Pattern,
+        binds: &mut Vec<(String, Value)>,
+    ) -> bool {
+        match pat {
+            Pattern::Wildcard => true,
+            Pattern::Binding(id) => {
+                let v = self.eval_expr(subject);
+                binds.push((id.name.clone(), v));
+                true
+            }
+            Pattern::Tagged { tag, inner } => {
+                // Subject must be a tagged union currently holding this member.
+                match self.subject_union_tag(subject) {
+                    Some(cur) if cur == tag.name => match inner {
+                        // The union's stored value IS the member payload.
+                        Some(ip) => self.match_pattern(subject, ip, binds),
+                        None => true,
+                    },
+                    _ => false,
+                }
+            }
+            Pattern::Expr(e) => {
+                let a = self.eval_expr(subject);
+                let b = self.eval_expr(e);
+                a.case_eq(&b).is_true()
+            }
+            // Structure patterns (`'{…}`) are not modelled yet.
+            Pattern::Struct(_) => false,
+        }
+    }
+
+    /// Make pattern bindings visible as locals; returns state to undo them.
+    fn push_pattern_bindings(
+        &mut self,
+        binds: &[(String, Value)],
+    ) -> (bool, Vec<(String, Option<Value>)>) {
+        let pushed = if self.local_stack.is_empty() {
+            self.local_stack.push(HashMap::default());
+            true
+        } else {
+            false
+        };
+        let mut saved = Vec::with_capacity(binds.len());
+        if let Some(f) = self.local_stack.last_mut() {
+            for (n, v) in binds {
+                saved.push((n.clone(), f.insert(n.clone(), v.clone())));
+            }
+        }
+        (pushed, saved)
+    }
+
+    fn pop_pattern_bindings(&mut self, st: (bool, Vec<(String, Option<Value>)>)) {
+        let (pushed, saved) = st;
+        if let Some(f) = self.local_stack.last_mut() {
+            for (n, prev) in saved {
+                match prev {
+                    Some(v) => {
+                        f.insert(n, v);
+                    }
+                    None => {
+                        f.remove(&n);
+                    }
+                }
+            }
+        }
+        if pushed {
+            self.local_stack.pop();
+        }
+    }
+
+    /// §12.6.1: run the first item whose pattern matches (and whose `&&&`
+    /// guard holds), with its `.v` bindings in scope; else the `default` item.
+    fn exec_case_matches(&mut self, subject: &Expression, items: &[CaseItem]) {
+        let mut default_idx: Option<usize> = None;
+        for (i, item) in items.iter().enumerate() {
+            if item.is_default {
+                default_idx = Some(i);
+                continue;
+            }
+            let Some(pat) = &item.pattern else { continue };
+            let mut binds: Vec<(String, Value)> = Vec::new();
+            if !self.match_pattern(subject, pat, &mut binds) {
+                continue;
+            }
+            // Bindings are visible to both the guard and the body.
+            let st = self.push_pattern_bindings(&binds);
+            let pass = match &item.guard {
+                Some(g) => self.eval_expr(g).is_true(),
+                None => true,
+            };
+            if pass {
+                self.exec_statement(&item.stmt);
+                self.pop_pattern_bindings(st);
+                return;
+            }
+            self.pop_pattern_bindings(st);
+        }
+        if let Some(i) = default_idx {
+            self.exec_statement(&items[i].stmt);
+        }
+    }
+
     pub fn exec_statement(&mut self, stmt: &Statement) {
         if self.finished || self.time > self.max_time || self.break_flag || self.continue_flag
             || self.return_flag
@@ -23788,6 +23903,13 @@ impl Simulator {
                 expr,
                 items,
             } => {
+                // IEEE 1800-2017 §12.6.1 pattern case:
+                //   case (expr) matches <pattern> [&&& guard] : stmt ... endcase
+                // Distinguished by items carrying a `pattern`.
+                if items.iter().any(|i| i.pattern.is_some()) {
+                    self.exec_case_matches(expr, items);
+                    return;
+                }
                 let val = self.eval_expr(expr);
                 // SV-2023: under unique/unique0/priority, pre-pass the items
                 // and emit a violation message if multiple match or (for
