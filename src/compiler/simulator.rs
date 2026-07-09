@@ -30474,6 +30474,14 @@ impl Simulator {
             }
         }
         let v = self.eval_expr(e);
+        // A `real` leaf keeps its real value even when the element signal was
+        // never flagged real (array elements are synthesized without the flag);
+        // otherwise `real m[3] = '{1.5, ...}` truncates to integers.
+        if matches!(self.resolve_dt(dt), DataType::Real { .. }) {
+            let rv = if v.is_real { v } else { Value::from_f64(v.to_f64()) };
+            self.set_signal_value_by_name(target, rv);
+            return;
+        }
         self.write_leaf_by_name(target, v);
     }
 
@@ -30508,6 +30516,15 @@ impl Simulator {
                 }
                 AssignmentPatternItem::Default(e) => default = Some(e),
                 AssignmentPatternItem::Ordered(e) => ordered.push(e),
+                // §10.9.2 `type:value` — binds every member of that type. A
+                // `name:` key still wins over it, and `default:` fills the rest.
+                AssignmentPatternItem::Typed(key_dt, e) => {
+                    for (i, (_, mdt, _)) in members.iter().enumerate() {
+                        if by_name[i].is_none() && self.pattern_type_matches(mdt, key_dt) {
+                            by_name[i] = Some(e);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -30747,6 +30764,140 @@ impl Simulator {
         self.set_signal_value_by_name(elem, val);
     }
 
+    /// Whether a struct member's declared type matches a `type:value` key of an
+    /// assignment pattern (§10.9.2), after resolving typedefs on both sides.
+    fn pattern_type_matches(&self, member_dt: &DataType, key_dt: &DataType) -> bool {
+        use crate::ast::types::DataType as D;
+        match (self.resolve_dt(member_dt), self.resolve_dt(key_dt)) {
+            (D::IntegerAtom { kind: a, .. }, D::IntegerAtom { kind: b, .. }) => a == b,
+            (D::IntegerVector { kind: a, .. }, D::IntegerVector { kind: b, .. }) => a == b,
+            (D::Real { kind: a, .. }, D::Real { kind: b, .. }) => a == b,
+            (D::Simple { kind: a, .. }, D::Simple { kind: b, .. }) => a == b,
+            (D::TypeReference { name: a, .. }, D::TypeReference { name: b, .. }) => {
+                a.name.name == b.name.name
+            }
+            _ => false,
+        }
+    }
+
+    /// Element expressions of ONE array dimension, in the order of `indices`.
+    /// Resolves the §10.9.1 forms: positional items, `N{expr}` replication,
+    /// `index:expr` keys, and `default:expr` for whatever is left over.
+    fn pattern_elems<'a>(
+        &mut self,
+        items: &'a [AssignmentPatternItem],
+        indices: &[i64],
+    ) -> Vec<Option<&'a Expression>> {
+        let n = indices.len();
+        let mut out: Vec<Option<&Expression>> = vec![None; n];
+        let mut default: Option<&Expression> = None;
+        let mut pos = 0usize;
+        for item in items {
+            match item {
+                AssignmentPatternItem::Default(e) => default = Some(e),
+                AssignmentPatternItem::Keyed(k, v) => {
+                    let ki = self.eval_expr(k).to_i64().unwrap_or(0);
+                    if let Some(p) = indices.iter().position(|&i| i == ki) {
+                        out[p] = Some(v);
+                    }
+                }
+                AssignmentPatternItem::Ordered(e) => {
+                    if let ExprKind::Replication { count, exprs } = &e.kind {
+                        let c = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
+                        for _ in 0..c {
+                            for sub in exprs {
+                                if pos < n {
+                                    out[pos] = Some(sub);
+                                    pos += 1;
+                                }
+                            }
+                        }
+                    } else if pos < n {
+                        out[pos] = Some(e);
+                        pos += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for slot in out.iter_mut() {
+            if slot.is_none() {
+                *slot = default;
+            }
+        }
+        out
+    }
+
+    /// Assign `e` to every leaf of the sub-array `base` spanning `dims`
+    /// (`m = '{default:0}` on a multi-dimensional array).
+    fn fill_dims(&mut self, base: &str, dims: &[(i64, i64)], dt: &DataType, e: &Expression) {
+        if dims.is_empty() {
+            self.assign_pattern_or_leaf(base, dt, e);
+            return;
+        }
+        let (lo, hi) = dims[0];
+        for i in lo..=hi {
+            let target = format!("{}[{}]", base, i);
+            self.fill_dims(&target, &dims[1..], dt, e);
+        }
+    }
+
+    /// Spread an assignment pattern across a FIXED unpacked array of any rank
+    /// (§10.9.1). A nested pattern descends one dimension; anything else fills
+    /// the whole sub-array.
+    fn assign_pattern_array(
+        &mut self,
+        base: &str,
+        dims: &[(i64, i64)],
+        dt: &DataType,
+        items: &[AssignmentPatternItem],
+        descending: bool,
+    ) {
+        let (lo, hi) = dims[0];
+        let indices: Vec<i64> = if descending && dims.len() == 1 {
+            (lo..=hi).rev().collect()
+        } else {
+            (lo..=hi).collect()
+        };
+        let elems = self.pattern_elems(items, &indices);
+        for (k, e) in elems.into_iter().enumerate() {
+            let Some(e) = e else { continue };
+            let target = format!("{}[{}]", base, indices[k]);
+            if dims.len() > 1 {
+                match &e.kind {
+                    ExprKind::AssignmentPattern(sub) if !sub.is_empty() => {
+                        self.assign_pattern_array(&target, &dims[1..], dt, sub, descending);
+                    }
+                    _ => self.fill_dims(&target, &dims[1..], dt, e),
+                }
+            } else {
+                self.assign_pattern_or_leaf(&target, dt, e);
+            }
+        }
+    }
+
+    /// Positional element expressions after expanding `N{expr}` replication —
+    /// what a queue / dynamic array pattern (`q = '{3{5}}`) yields.
+    fn pattern_ordered<'a>(
+        &mut self,
+        items: &'a [AssignmentPatternItem],
+    ) -> Vec<&'a Expression> {
+        let mut out: Vec<&Expression> = Vec::new();
+        for item in items {
+            if let AssignmentPatternItem::Ordered(e) = item {
+                if let ExprKind::Replication { count, exprs } = &e.kind {
+                    let c = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
+                    for _ in 0..c {
+                        out.extend(exprs.iter());
+                    }
+                } else {
+                    out.push(e);
+                }
+            }
+        }
+        out
+    }
+
     /// IEEE 1800-2017 §10.9.2 / §10.10: an assignment pattern assigned to an
     /// aggregate whose leaves each live in their OWN signal — an unpacked
     /// struct, an unpacked array of unpacked structs, or an associative array —
@@ -30778,27 +30929,30 @@ impl Simulator {
             return wrote;
         }
 
-        let elem_is_unpacked_struct = matches!(
-            self.resolve_dt(&dt), DataType::Struct(ref su) if Self::spreads_member_wise(su));
+        // Queue / dynamic array: the pattern's positional items ARE the
+        // elements, and they set its size. `'{3{5}}` replication expands here.
+        if self.module.dynamic_arrays.contains(base) {
+            let exprs = self.pattern_ordered(items);
+            if exprs.is_empty() {
+                return false;
+            }
+            for (i, e) in exprs.iter().enumerate() {
+                self.assign_pattern_or_leaf(&format!("{}[{}]", base, i), &dt, e);
+            }
+            self.set_queue_size(base, exprs.len() as u64);
+            return true;
+        }
 
-        // Fixed unpacked array of unpacked structs: `'{'{...}, '{...}}`.
-        // Queues and dynamic arrays keep the existing (size-tracking) path.
-        if let Some(&(lo, hi, _)) = self.module.arrays.get(base) {
-            if !elem_is_unpacked_struct
-                || hi < lo
-                || self.module.dynamic_arrays.contains(base)
-                || !items.iter().all(|i| matches!(i, AssignmentPatternItem::Ordered(_)))
-            {
+        // Fixed unpacked array of any rank (§10.9.1): positional items,
+        // `N{expr}` replication, `index:expr` keys and `default:expr`, with
+        // nested patterns descending one dimension at a time.
+        if let Some(dims) = self.foreach_dims(base) {
+            let cells: i64 = dims.iter().map(|&(lo, hi)| (hi - lo + 1).max(0)).product();
+            if cells <= 0 || cells > (1 << 20) {
                 return false;
             }
             let descending = self.module.descending_arrays.contains(base);
-            for (i, item) in items.iter().enumerate() {
-                let idx = if descending { hi - i as i64 } else { lo + i as i64 };
-                if idx < lo || idx > hi {
-                    break;
-                }
-                self.assign_pattern_or_leaf(&format!("{}[{}]", base, idx), &dt, item.expr());
-            }
+            self.assign_pattern_array(base, &dims, &dt, items, descending);
             return true;
         }
 
