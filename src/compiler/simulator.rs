@@ -22740,29 +22740,74 @@ impl Simulator {
                 // ELEMENT is the dynamic array. Only a bare-identifier lvalue ever
                 // got its size shadow written, so `d[i].size()` reported the
                 // backing buffer instead of `n`.
-                // `d[i] = new[n]` on an array of dynamic arrays (§7.5.1): the
-                // ELEMENT is the dynamic array. Only a bare-identifier lvalue ever
-                // got its size shadow written, so `d[i].size()` reported the
-                // 64-slot backing buffer instead of `n`.
-                if let ExprKind::Call { func, args: nargs } = &rvalue.kind {
-                    let is_new = matches!(&func.kind,
-                        ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new");
-                    if is_new && !nargs.is_empty() {
-                        if let Some(name) = self.flat_member_name(lvalue) {
-                            if name.ends_with(']') && self.module.dynamic_arrays.contains(&name) {
-                                let n = self.eval_expr(&nargs[0]).to_u64().unwrap_or(0);
-                                self.set_queue_size(&name, n);
-                                for i in 0..n {
-                                    self.set_signal_value_by_name(
-                                        &format!("{}[{}]", name, i),
-                                        Value::zero(32),
-                                    );
-                                }
-                                if !self.in_edge_block {
-                                    self.settle_combinatorial();
-                                }
-                                return;
+                // §7.5.1 dynamic-array `new[n]` / `new[n](src)`.
+                //   - `new[n](src)` copies min(n, src.size()) elements from `src`
+                //     and default-initialises the rest. It was ignored entirely:
+                //     the size came out as 1 and the data was lost.
+                //   - `d[i] = new[n]` on an array of dynamic arrays sizes the
+                //     ELEMENT; only a bare-identifier lvalue ever got a size.
+                // §7.5.1 dynamic-array `new[n]` and `new[n](src)`.
+                //   `new[n]`      parses as Call{Ident(new), [n]}
+                //   `new[n](src)` parses as Call{Call{Ident(new), [n]}, [src]}
+                // The second form was never recognised: the size came out as 1
+                // and the source data was lost. `new[n](src)` copies
+                // min(n, src.size()) elements and default-initialises the rest.
+                // A `d[i] = new[n]` lvalue sizes the ELEMENT of an array of
+                // dynamic arrays.
+                {
+                    let is_new = |e: &Expression| {
+                        matches!(&e.kind,
+                            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new")
+                    };
+                    let sized_new: Option<(&Expression, Option<&Expression>)> = match &rvalue.kind {
+                        ExprKind::Call { func, args } if is_new(func) && !args.is_empty() => {
+                            Some((&args[0], None))
+                        }
+                        ExprKind::Call { func, args } => match &func.kind {
+                            ExprKind::Call { func: inner, args: iargs }
+                                if is_new(inner) && !iargs.is_empty() =>
+                            {
+                                Some((&iargs[0], args.first()))
                             }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((n_expr, src_expr)) = sized_new {
+                        let target = match &lvalue.kind {
+                            ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
+                            _ => self.flat_member_name(lvalue),
+                        };
+                        if let Some(name) = target.filter(|n| self.module.dynamic_arrays.contains(n))
+                        {
+                            let n = self.eval_expr(n_expr).to_u64().unwrap_or(0);
+                            // The source may be any array or queue. A self-copy
+                            // (`d = new[n](d)`) is index-preserving, so no
+                            // snapshot is needed.
+                            let src = src_expr.and_then(|e| match &e.kind {
+                                ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                                _ => None,
+                            });
+                            let keep = match &src {
+                                Some(sn) => self.get_queue_size(sn).min(n),
+                                None => 0,
+                            };
+                            if let Some(sn) = src {
+                                for i in 0..keep {
+                                    self.queue_copy_elem(&sn, i, &name, i);
+                                }
+                            }
+                            for i in keep..n {
+                                self.set_signal_value_by_name(
+                                    &format!("{}[{}]", name, i),
+                                    Value::zero(32),
+                                );
+                            }
+                            self.set_queue_size(&name, n);
+                            if !self.in_edge_block {
+                                self.settle_combinatorial();
+                            }
+                            return;
                         }
                     }
                 }
@@ -23296,6 +23341,23 @@ impl Simulator {
                     return;
                 }
                 // Handle array locator methods with `with` clause: qs = arr.find with (filter)
+                // §7.12.1 array locator methods (`find`, `min`, `max`, `unique`,
+                // and the `_index` forms), with or without a `with (...)`
+                // clause. They RETURN a queue and never modify the source.
+                // `q.min()` parses as a Call, which the old match missed, so the
+                // result was a packed scalar written to a queue container signal
+                // that nothing reads — the destination came back as X.
+                if let Some((arr_name, mname, filter)) = self.locator_call(rvalue) {
+                    if let ExprKind::Ident(lhier) = &lvalue.kind {
+                        let lname = self.resolve_hier_name(lhier);
+                        let idxs = self.locator_indices(&arr_name, &mname, filter.as_ref());
+                        self.materialize_locator(&lname, &arr_name, &mname, &idxs);
+                        if !self.in_edge_block {
+                            self.settle_combinatorial();
+                        }
+                        return;
+                    }
+                }
                 if let ExprKind::WithClause {
                     expr: wexpr,
                     filter,
@@ -23447,101 +23509,7 @@ impl Simulator {
                 }
                 // Handle queue = array.locator_method (no with clause)
                 // Detect via MemberAccess or hierarchical ident (e.g. s.unique_index)
-                let locator_info: Option<(String, &str)> = if let ExprKind::MemberAccess {
-                    expr: arr_expr,
-                    member,
-                } = &rvalue.kind
-                {
-                    let mname = member.name.as_str();
-                    if matches!(mname, "min" | "max" | "unique" | "unique_index") {
-                        if let ExprKind::Ident(ahier) = &arr_expr.kind {
-                            Some((self.resolve_hier_name(ahier), mname))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else if let ExprKind::Ident(rhier) = &rvalue.kind {
-                    if rhier.path.len() == 2 {
-                        let arr_name = &rhier.path[0].name.name;
-                        let mname = rhier.path[1].name.name.as_str();
-                        if matches!(mname, "min" | "max" | "unique" | "unique_index")
-                            && self.module.arrays.contains_key(arr_name)
-                        {
-                            Some((arr_name.clone(), mname))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some((arr_name, mname)) = locator_info {
-                    if let ExprKind::Ident(lhier) = &lvalue.kind {
-                        let lname = self.resolve_hier_name(lhier);
-                        if self.module.arrays.contains_key(&arr_name) {
-                            let cur_size = self.get_queue_size(&arr_name) as usize;
-                            let mut results: Vec<Value> = Vec::new();
-                            if mname == "unique" || mname == "unique_index" {
-                                let mut seen = std::collections::HashSet::new();
-                                for i in 0..cur_size {
-                                    if let Some(v) = self
-                                        .get_signal_value_by_name(&format!("{}[{}]", arr_name, i))
-                                    {
-                                        let key = v.to_u64().unwrap_or(0);
-                                        if seen.insert(key) {
-                                            if mname == "unique_index" {
-                                                results.push(Value::from_u64(i as u64, 32));
-                                            } else {
-                                                results.push(v);
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if mname == "min" || mname == "max" {
-                                let mut best: Option<Value> = None;
-                                for i in 0..cur_size {
-                                    if let Some(v) = self
-                                        .get_signal_value_by_name(&format!("{}[{}]", arr_name, i))
-                                    {
-                                        let keep = match &best {
-                                            None => true,
-                                            Some(b) => {
-                                                if mname == "min" {
-                                                    v.to_u64().unwrap_or(u64::MAX)
-                                                        < b.to_u64().unwrap_or(u64::MAX)
-                                                } else {
-                                                    v.to_u64().unwrap_or(0)
-                                                        > b.to_u64().unwrap_or(0)
-                                                }
-                                            }
-                                        };
-                                        if keep {
-                                            best = Some(v);
-                                        }
-                                    }
-                                }
-                                if let Some(b) = best {
-                                    results.push(b);
-                                }
-                            }
-                            for (i, v) in results.iter().enumerate() {
-                                self.set_signal_value_by_name(
-                                    &format!("{}[{}]", lname, i),
-                                    v.clone(),
-                                );
-                            }
-                            self.set_queue_size(&lname, results.len() as u64);
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
-                            return;
-                        }
-                    }
-                }
+
                 // An untracked lvalue (e.g. a module-scope class handle like
                 // `uvm_component c;`) infers width 0; assigning then truncates
                 // the RHS to 0 bits — wrong for a handle. Default unknown width
@@ -31385,6 +31353,151 @@ impl Simulator {
     /// LRM §7.12.2: in-place sort/rsort/unique on `arr` with the
     /// per-element key expression `filter` (binds `item` to each
     /// element). Mirrors `reduce_with`'s `item` plumbing.
+    /// IEEE 1800-2017 §7.12.1 array LOCATOR methods. They select elements and
+    /// RETURN a queue — none of them modifies the source array.
+    fn is_locator_method(m: &str) -> bool {
+        matches!(
+            m,
+            "find" | "find_index" | "find_first" | "find_first_index"
+                | "find_last" | "find_last_index" | "min" | "max"
+                | "unique" | "unique_index"
+        )
+    }
+
+    /// `(array, method, filter)` when `e` is a locator call on an array/queue,
+    /// with or without a `with (...)` clause. `q.min()` parses as a Call, while
+    /// `q.min` (no parens) parses as a 2-segment identifier.
+    fn locator_call(&mut self, e: &Expression) -> Option<(String, String, Option<Expression>)> {
+        let (inner, filter) = match &e.kind {
+            ExprKind::WithClause { expr, filter } => (expr.as_ref(), Some((**filter).clone())),
+            _ => (e, None),
+        };
+        let target = match &inner.kind {
+            ExprKind::Call { func, .. } => func.as_ref(),
+            _ => inner,
+        };
+        let (arr, mname) = match &target.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                let ExprKind::Ident(h) = &expr.kind else { return None };
+                (self.resolve_hier_name(h), member.name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 => (
+                h.path[0].name.name.clone(),
+                h.path[1].name.name.clone(),
+            ),
+            _ => return None,
+        };
+        if !Self::is_locator_method(&mname) {
+            return None;
+        }
+        if self.module.arrays.contains_key(&arr) || self.module.dynamic_arrays.contains(&arr) {
+            Some((arr, mname, filter))
+        } else {
+            None
+        }
+    }
+
+    /// Indices of the elements a locator method selects. `item` binds to each
+    /// element — by value for scalars and class handles, by NAME for unpacked
+    /// structs (see `item_alias`). Without a `with` clause the element's own
+    /// value is the key.
+    fn locator_indices(
+        &mut self,
+        arr: &str,
+        method: &str,
+        filter: Option<&Expression>,
+    ) -> Vec<usize> {
+        let size = self.get_queue_size(arr) as usize;
+        if size == 0 {
+            return Vec::new();
+        }
+        let elem_su = self.queue_elem_struct(arr);
+        let pushed_frame = if self.local_stack.is_empty() {
+            self.local_stack.push(HashMap::default());
+            true
+        } else {
+            false
+        };
+        let saved_item = self.local_stack.last().and_then(|f| f.get("item").cloned());
+        let saved_alias = self.item_alias.take();
+
+        let mut keys: Vec<i64> = Vec::with_capacity(size);
+        let mut truth: Vec<bool> = Vec::with_capacity(size);
+        for i in 0..size {
+            let elem = format!("{}[{}]", arr, i);
+            if elem_su.is_some() {
+                self.item_alias = Some(elem.clone());
+            }
+            let v = self
+                .get_signal_value_by_name(&elem)
+                .unwrap_or_else(|| Value::zero(32));
+            if let Some(f) = self.local_stack.last_mut() {
+                f.insert("item".to_string(), v.clone());
+            }
+            match filter {
+                Some(f) => {
+                    let fv = self.eval_expr(f);
+                    truth.push(fv.is_true());
+                    keys.push(fv.to_i64().unwrap_or(0));
+                }
+                None => {
+                    truth.push(true);
+                    keys.push(v.to_i64().unwrap_or(0));
+                }
+            }
+        }
+
+        self.item_alias = saved_alias;
+        if let Some(f) = self.local_stack.last_mut() {
+            match saved_item {
+                Some(v) => {
+                    f.insert("item".to_string(), v);
+                }
+                None => {
+                    f.remove("item");
+                }
+            }
+        }
+        if pushed_frame {
+            self.local_stack.pop();
+        }
+
+        match method {
+            "find" | "find_index" => (0..size).filter(|&i| truth[i]).collect(),
+            "find_first" | "find_first_index" => {
+                (0..size).find(|&i| truth[i]).into_iter().collect()
+            }
+            "find_last" | "find_last_index" => {
+                (0..size).rev().find(|&i| truth[i]).into_iter().collect()
+            }
+            "min" => (0..size).min_by_key(|&i| keys[i]).into_iter().collect(),
+            "max" => (0..size).max_by_key(|&i| keys[i]).into_iter().collect(),
+            "unique" | "unique_index" => {
+                let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+                (0..size).filter(|&i| seen.insert(keys[i])).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Write a locator result into the destination queue `dst`. The `_index`
+    /// forms yield the indices themselves; the rest copy the elements
+    /// (member-wise for unpacked structs).
+    fn materialize_locator(&mut self, dst: &str, arr: &str, method: &str, idxs: &[usize]) {
+        let index_form = method.ends_with("_index");
+        for (i, &src_i) in idxs.iter().enumerate() {
+            if index_form {
+                self.set_signal_value_by_name(
+                    &format!("{}[{}]", dst, i),
+                    Value::from_u64(src_i as u64, 32),
+                );
+            } else {
+                self.queue_copy_elem(arr, src_i as u64, dst, i as u64);
+            }
+        }
+        self.set_queue_size(dst, idxs.len() as u64);
+    }
+
     /// LRM §7.12.2: `q.sort()/.rsort()/.unique() with (item.field)`.
     ///
     /// Computes each element's key, then permutes the queue by INDEX rather
@@ -31445,10 +31558,8 @@ impl Simulator {
             // `sort_by_key` is stable, so equal keys keep their order.
             "sort" => order.sort_by_key(|&i| keys[i]),
             "rsort" => order.sort_by_key(|&i| std::cmp::Reverse(keys[i])),
-            "unique" => {
-                let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-                order.retain(|&i| seen.insert(keys[i]));
-            }
+            // `unique` is a LOCATOR (§7.12.1): it returns a queue and must not
+            // reorder or shrink the source. Handled by the locator path.
             _ => return,
         }
 
@@ -32082,21 +32193,9 @@ impl Simulator {
             return Some(max_val.unwrap_or(Value::zero(32)));
         }
         if mname == "unique" {
-            let cur_size = self.get_queue_size(obj_name) as usize;
-            let mut seen = std::collections::HashSet::new();
-            let mut result = Vec::new();
-            for i in 0..cur_size {
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
-                    let key = v.to_u64().unwrap_or(0);
-                    if seen.insert(key) {
-                        result.push(v);
-                    }
-                }
-            }
-            for (i, v) in result.iter().enumerate() {
-                self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v.clone());
-            }
-            self.set_queue_size(obj_name, result.len() as u64);
+            // §7.12.1: a locator method RETURNS a queue; it must not modify the
+            // source. `r = q.unique()` is handled by the locator path in
+            // BlockingAssign; a bare `q.unique();` is simply a no-op.
             return Some(Value::zero(32));
         }
         if mname == "unique_index" {

@@ -14,9 +14,9 @@ module tb;
   typedef struct { int k; }                      inner_t;
   typedef struct { int a; string s; inner_t in; } p_t;
 
-  p_t q [$], u [$];
+  p_t q [$], u [$], uniq [$];
   int iq [$];
-  int uniq_size;
+  int uniq_size, src_size;
 
   class C;
     int v;
@@ -38,13 +38,14 @@ module tb;
     q.sort() with (item.in.k);
     $display("NESTED=%p", q);
 
-    // unique() dedups by key and shrinks the queue.
+    // §7.12.1: unique() RETURNS a queue and leaves the source alone.
     u.push_back('{5, "a", '{0}});
     u.push_back('{5, "b", '{0}});
     u.push_back('{6, "c", '{0}});
-    u.unique() with (item.a);
-    uniq_size = u.size();
-    $display("UNIQ=%p", u);
+    uniq = u.unique() with (item.a);
+    uniq_size = uniq.size();
+    src_size  = u.size();
+    $display("UNIQ=%p", uniq);
 
     // Scalar elements: `item` still binds by value.
     iq.push_back(3); iq.push_back(1); iq.push_back(2);
@@ -112,10 +113,12 @@ fn a_nested_member_can_be_the_sort_key() {
     );
 }
 
+/// §7.12.1: a locator method returns a queue; it must NOT modify the source.
 #[test]
-fn unique_dedups_by_key_and_shrinks_the_queue() {
+fn unique_returns_a_deduped_queue_and_leaves_the_source_alone() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(u(&sim, "uniq_size"), 2);
+    assert_eq!(u(&sim, "src_size"), 3, "unique() must not shrink its source");
     // First occurrence of each key survives.
     assert_eq!(
         line(&sim, "UNIQ="),
