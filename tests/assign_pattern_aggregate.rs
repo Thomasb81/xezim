@@ -130,6 +130,33 @@ fn packed_struct_and_scalar_array_keep_the_packed_path() {
     assert_eq!(line(&sim, "FIXED="), "FIXED='{1, 2, 3}");
 }
 
+/// An unpacked array member of SCALAR element type (`real m[3]`) is spread the
+/// same way — it is not a struct, so it must not be rejected for lacking one.
+const REALARR: &str = r#"
+module tb;
+  typedef struct { int idx; real mm[3]; } rec_t;
+  rec_t a[2];
+  real  top[3];
+  initial begin
+    a[0].idx = 0; a[0].mm = '{1.5, 2.5, 3.5};
+    a[1].idx = 1; a[1].mm = '{4.0, 5.0, 6.0};
+    top = '{9.5, 8.25, 7.125};
+    $display("A=%p", a);
+    $display("TOP=%p", top);
+  end
+endmodule
+"#;
+
+#[test]
+fn pattern_assign_spreads_into_real_array_members() {
+    let sim = simulate(REALARR, 100).expect("simulate failed");
+    assert_eq!(
+        line(&sim, "A="),
+        "A='{'{idx:0, mm:'{1.5, 2.5, 3.5}}, '{idx:1, mm:'{4, 5, 6}}}"
+    );
+    assert_eq!(line(&sim, "TOP="), "TOP='{9.5, 8.25, 7.125}");
+}
+
 /// A pattern written to a nested sub-path, and `%p` read back from one. A
 /// sub-path has no declaration of its own, so both directions must derive the
 /// type by walking the base variable's declared type.
