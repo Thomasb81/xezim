@@ -23785,6 +23785,20 @@ impl Simulator {
                 {
                     let lname = self.resolve_hier_name(lhier);
                     let rname = self.resolve_hier_name(rhier);
+                    // `r = q` between queues / dynamic arrays (§7.6): copy every
+                    // element and the size. Nothing did this — the RHS was read as
+                    // a scalar container signal that queues do not have, so the
+                    // destination stayed empty whatever its element type.
+                    if lname != rname
+                        && self.module.dynamic_arrays.contains(&lname)
+                        && self.module.dynamic_arrays.contains(&rname)
+                    {
+                        self.copy_whole_queue(&lname, &rname);
+                        if !self.in_edge_block {
+                            self.settle_combinatorial();
+                        }
+                        return;
+                    }
                     if self.is_associative_array(&lname) && self.is_associative_array(&rname) {
                         let prefix = format!("{}[", rname);
                         let entries: Vec<(String, Value)> = self
@@ -30196,8 +30210,13 @@ impl Simulator {
                     buckets.push((v, w * scaler));
                 }
                 ConstraintRange::Range { lo, hi } => {
-                    let l = self.eval_expr(lo).to_i64().unwrap_or(0);
-                    let h = self.eval_expr(hi).to_i64().unwrap_or(l);
+                    let lov = self.eval_expr(lo);
+                    let hiv = self.eval_expr(hi);
+                    // A bucket must be as wide as its bounds: `[64'h1_0000_0000 :
+                    // 64'h1_0000_00FF]` truncated to 32 bits and produced 0.
+                    let bw = lov.width.max(hiv.width).max(32);
+                    let l = lov.to_i64().unwrap_or(0);
+                    let h = hiv.to_i64().unwrap_or(l);
                     if h < l { continue; }
                     let span = (h - l + 1).min(MAX_BUCKETS) as u64;
                     if span == 0 { continue; }
@@ -30216,7 +30235,7 @@ impl Simulator {
                     let mut v = l;
                     let mut emitted = 0u64;
                     while v <= h && emitted < span {
-                        buckets.push((Value::from_u64(v as u64, 32), per_value_weight.max(1)));
+                        buckets.push((Value::from_u64(v as u64, bw), per_value_weight.max(1)));
                         v = v.saturating_add(stride as i64);
                         emitted += 1;
                     }
@@ -30529,19 +30548,97 @@ impl Simulator {
         }
     }
 
-    /// Move queue element `from` to `to`, member-wise when the element is an
-    /// unpacked struct (a single packed copy would lose every member).
-    fn queue_move_elem(&mut self, obj_name: &str, from: u64, to: u64) {
+    /// Copy element `si` of queue `src_obj` onto element `di` of `dst_obj`,
+    /// member-wise when the element is an unpacked struct (a single packed copy
+    /// would lose every member — the struct has no container signal).
+    fn queue_copy_elem(&mut self, src_obj: &str, si: u64, dst_obj: &str, di: u64) {
         let (src, dst) = (
-            format!("{}[{}]", obj_name, from),
-            format!("{}[{}]", obj_name, to),
+            format!("{}[{}]", src_obj, si),
+            format!("{}[{}]", dst_obj, di),
         );
-        if let Some(su) = self.queue_elem_struct(obj_name) {
+        if let Some(su) = self.queue_elem_struct(src_obj) {
             self.copy_unpacked_struct(&dst, &src, &su);
             return;
         }
         if let Some(v) = self.get_signal_value_by_name(&src) {
             self.set_signal_value_by_name(&dst, v);
+        }
+    }
+
+    /// Move queue element `from` to `to` within one queue.
+    fn queue_move_elem(&mut self, obj_name: &str, from: u64, to: u64) {
+        self.queue_copy_elem(obj_name, from, obj_name, to);
+    }
+
+    /// Copy every element of `src` onto `dst` and set its size (`r = q`).
+    fn copy_whole_queue(&mut self, dst: &str, src: &str) {
+        let n = self.get_queue_size(src);
+        for i in 0..n {
+            self.queue_copy_elem(src, i, dst, i);
+        }
+        self.set_queue_size(dst, n);
+    }
+
+    /// Relative leaf paths of an unpacked struct (`a`, `inner.b`, `arr[0]`).
+    fn struct_leaf_suffixes(&self, su: &crate::ast::types::StructUnionType) -> Vec<String> {
+        let mut out = Vec::new();
+        for m in &su.members {
+            for md in &m.declarators {
+                let base = md.name.name.clone();
+                if md.dimensions.is_empty() {
+                    if let DataType::Struct(inner) = self.resolve_dt(&m.data_type) {
+                        if Self::spreads_member_wise(&inner) {
+                            for sfx in self.struct_leaf_suffixes(&inner) {
+                                out.push(format!("{}.{}", base, sfx));
+                            }
+                            continue;
+                        }
+                    }
+                    out.push(base);
+                } else if let Some(idxs) = self.member_dim_indices(&md.dimensions) {
+                    for i in idxs {
+                        out.push(format!("{}[{}]", base, i));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Rearrange a queue so that position `i` holds what used to be at
+    /// `order[i]`. Snapshots first: an in-place shuffle would overwrite an
+    /// element it still has to read. Struct elements move leaf by leaf.
+    fn queue_permute(&mut self, obj_name: &str, order: &[usize]) {
+        if let Some(su) = self.queue_elem_struct(obj_name) {
+            let sfxs = self.struct_leaf_suffixes(&su);
+            let mut snap: Vec<Vec<Option<Value>>> = Vec::with_capacity(order.len());
+            for &old in order {
+                let mut row = Vec::with_capacity(sfxs.len());
+                for sfx in &sfxs {
+                    row.push(self.get_signal_value_by_name(&format!(
+                        "{}[{}].{}",
+                        obj_name, old, sfx
+                    )));
+                }
+                snap.push(row);
+            }
+            for (newi, row) in snap.into_iter().enumerate() {
+                for (sfx, v) in sfxs.iter().zip(row) {
+                    if let Some(v) = v {
+                        self.write_leaf_by_name(&format!("{}[{}].{}", obj_name, newi, sfx), v);
+                    }
+                }
+            }
+            return;
+        }
+        let mut snap: Vec<Option<Value>> = Vec::with_capacity(order.len());
+        for &old in order {
+            snap.push(self.get_signal_value_by_name(&format!("{}[{}]", obj_name, old)));
+        }
+        for (newi, v) in snap.into_iter().enumerate() {
+            if let Some(v) = v {
+                self.set_signal_value_by_name(&format!("{}[{}]", obj_name, newi), v);
+            }
         }
     }
 
@@ -31822,17 +31919,8 @@ impl Simulator {
         if mname == "reverse" {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
-                let mut elements = Vec::new();
-                for i in 0..cur_size {
-                    if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
-                    {
-                        elements.push(v);
-                    }
-                }
-                elements.reverse();
-                for (i, v) in elements.into_iter().enumerate() {
-                    self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);
-                }
+                let order: Vec<usize> = (0..cur_size).rev().collect();
+                self.queue_permute(obj_name, &order);
             }
             return Some(Value::zero(32));
         }
@@ -31842,32 +31930,27 @@ impl Simulator {
             use rand::Rng;
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 1 {
-                let mut elements: Vec<Value> = (0..cur_size)
-                    .filter_map(|i| self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)))
-                    .collect();
-                // Fisher-Yates
-                for i in (1..elements.len()).rev() {
+                let mut order: Vec<usize> = (0..cur_size).collect();
+                // Fisher-Yates over the index order, then move the elements.
+                for i in (1..cur_size).rev() {
                     let j = self.rng.gen_range(0..=i);
-                    elements.swap(i, j);
+                    order.swap(i, j);
                 }
-                for (i, v) in elements.into_iter().enumerate() {
-                    self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);
-                }
+                self.queue_permute(obj_name, &order);
             }
             return Some(Value::zero(32));
         }
         if mname == "insert" {
             if args.len() >= 2 {
                 let idx = self.eval_expr(&args[0]).to_u64().unwrap_or(0);
-                let val = self.eval_expr(&args[1]);
                 let cur_size = self.get_queue_size(obj_name);
+                // Move elements member-wise: an unpacked-struct element has no
+                // container signal, so a packed copy shifts nothing at all.
                 for i in (idx..cur_size).rev() {
-                    if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
-                    {
-                        self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i + 1), v);
-                    }
+                    self.queue_move_elem(obj_name, i, i + 1);
                 }
-                self.set_signal_value_by_name(&format!("{}[{}]", obj_name, idx), val);
+                let slot = format!("{}[{}]", obj_name, idx);
+                self.queue_store_elem(obj_name, &slot, &args[1]);
                 self.set_queue_size(obj_name, cur_size + 1);
             }
             return Some(Value::zero(32));
@@ -32092,14 +32175,9 @@ impl Simulator {
                     let idx = self.eval_expr(arg).to_u64().unwrap_or(0) as usize;
                     let cur_size = self.get_queue_size(obj_name) as usize;
                     if idx < cur_size {
+                        // Member-wise, for the same reason as `insert`.
                         for i in idx..cur_size - 1 {
-                            let next_val = self
-                                .get_signal_value_by_name(&format!("{}[{}]", obj_name, i + 1))
-                                .unwrap_or(Value::zero(32));
-                            self.set_signal_value_by_name(
-                                &format!("{}[{}]", obj_name, i),
-                                next_val,
-                            );
+                            self.queue_move_elem(obj_name, (i + 1) as u64, i as u64);
                         }
                         self.set_queue_size(obj_name, (cur_size - 1) as u64);
                     }
