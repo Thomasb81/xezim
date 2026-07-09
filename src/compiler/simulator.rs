@@ -21413,14 +21413,19 @@ impl Simulator {
                                     if let Some(ev) = self
                                         .get_signal_value_by_name(&format!("{}[{}]", nm, i))
                                     {
-                                        if val == ev {
+                                        if val.wildcard_eq(&ev).is_true() {
                                             return Value::from_u64(1, 1);
                                         }
                                     }
                                 }
                                 continue;
                             }
-                            if val == self.eval_expr(r) {
+                            // §11.4.13: a set element is compared with the
+                            // tested expression using WILDCARD equality, so x/z
+                            // bits in the element are don't-cares — exactly what
+                            // `==?` does. Plain `==` missed `v inside {4'b10xx}`.
+                            let ev = self.eval_expr(r);
+                            if val.wildcard_eq(&ev).is_true() {
                                 return Value::from_u64(1, 1);
                             }
                         }
