@@ -25734,9 +25734,38 @@ impl Simulator {
                                         }
                                     }
                                 }
-                                // §21.2.1.7: a struct prints in assignment-pattern
-                                // form with NAMED members, in declaration order:
-                                //   '{data:10, addr:20, vld:1}
+                                // §21.2.1.7: type-directed recursive render —
+                                // nested structs, unpacked arrays, enum labels,
+                                // strings and reals, in declaration order.
+                                if let Some(flat) = self.flat_member_name(arg) {
+                                    let rendered = if self.module.var_decl_types.contains_key(&flat) {
+                                        self.render_p_var(&flat)
+                                    } else if self.signal_name_to_id.contains_key(flat.as_str()) {
+                                        // A sub-path (`cmb[10].str`): render the leaf.
+                                        let is_str = self.string_signals.contains(&flat);
+                                        self.get_signal_value_by_name(&flat)
+                                            .map(|v| Self::render_p_value(&v, is_str))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(mut s) = rendered {
+                                        // §21.2.1.7: an implementation may cap the
+                                        // string (at least 1024 chars); on truncation
+                                        // it must warn.
+                                        const P_MAX_LEN: usize = 8192;
+                                        if s.len() > P_MAX_LEN {
+                                            s.truncate(P_MAX_LEN);
+                                            s.push_str("...");
+                                            self.stdout_writeln(
+                                                "[xezim][warning] %p output truncated at 8192 characters (IEEE 1800-2017 §21.2.1.7)",
+                                            );
+                                        }
+                                        result.push_str(&s);
+                                        continue;
+                                    }
+                                }
+                                // Fallback: one-level named members (declared
+                                // somewhere we don't record a full type for).
                                 if let Some(members) = self.struct_members_ordered(arg) {
                                     let mut parts = Vec::with_capacity(members.len());
                                     for (mname, fexpr) in &members {
@@ -29923,6 +29952,197 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// Follow a typedef chain to the underlying type.
+    fn resolve_dt(&self, dt: &DataType) -> DataType {
+        let mut cur = dt.clone();
+        for _ in 0..16 {
+            if let DataType::TypeReference { name, .. } = &cur {
+                if let Some(next) = self.module.typedef_types.get(&name.name.name) {
+                    cur = next.clone();
+                    continue;
+                }
+            }
+            break;
+        }
+        cur
+    }
+
+    /// Constant indices of a member's (single) unpacked dimension.
+    fn member_dim_indices(
+        &self,
+        dims: &[crate::ast::types::UnpackedDimension],
+    ) -> Option<Vec<i64>> {
+        use crate::ast::types::UnpackedDimension as UD;
+        let p = Some(&self.module.parameters);
+        match dims.first()? {
+            UD::Expression { expr, .. } => {
+                match super::elaborate::const_eval_i64_with_params(expr, p) {
+                    Some(n) if n > 0 && n <= 4096 => Some((0..n).collect()),
+                    _ => None,
+                }
+            }
+            UD::Range { left, right, .. } => {
+                let l = super::elaborate::const_eval_i64_with_params(left, p)?;
+                let r = super::elaborate::const_eval_i64_with_params(right, p)?;
+                let (lo, hi) = if l <= r { (l, r) } else { (r, l) };
+                if hi - lo < 4096 { Some((lo..=hi).collect()) } else { None }
+            }
+            _ => None,
+        }
+    }
+
+    /// LRM §21.2.1.7 `%p` on the variable `name`: recursively render nested
+    /// structs, unpacked arrays, enums, strings and reals in assignment-pattern
+    /// form. `None` if the variable has no recorded declared type.
+    fn render_p_var(&mut self, name: &str) -> Option<String> {
+        let dt = self.module.var_decl_types.get(name).cloned()?;
+        // Fixed unpacked array -> element list.
+        if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
+            if hi >= lo && (hi - lo) < 4096 {
+                let parts: Vec<String> = (lo..=hi)
+                    .map(|i| self.render_p_typed(&format!("{}[{}]", name, i), &dt))
+                    .collect();
+                return Some(format!("'{{{}}}", parts.join(", ")));
+            }
+            return None;
+        }
+        Some(self.render_p_typed(name, &dt))
+    }
+
+    /// Render an already-extracted `Value` interpreted as `dt` (used for the
+    /// bit-slices of a packed struct, which have no signal of their own).
+    fn render_p_value_typed(&mut self, v: &Value, dt: &DataType) -> String {
+        if let DataType::TypeReference { name: tn, .. } = dt {
+            if let Some(members) = self.module.enum_members.get(&tn.name.name).cloned() {
+                if let Some(x) = v.to_u64() {
+                    if let Some((label, _)) = members.iter().find(|(_, mv)| *mv == x) {
+                        return label.clone();
+                    }
+                }
+                return v.to_dec_string();
+            }
+        }
+        match self.resolve_dt(dt) {
+            DataType::Struct(su) if su.packed => self.render_p_packed(v, &su),
+            DataType::Real { .. } => format!("{}", v.to_f64()),
+            _ => {
+                if v.is_real { format!("{}", v.to_f64()) } else { v.to_dec_string() }
+            }
+        }
+    }
+
+    /// Render a packed struct's members by slicing `v`. The FIRST declared
+    /// member occupies the most-significant bits (LRM §7.2.1), so offsets are
+    /// assigned from the last member up.
+    fn render_p_packed(&mut self, v: &Value, su: &crate::ast::types::StructUnionType) -> String {
+        let mut items: Vec<(String, u32, DataType)> = Vec::new();
+        for m in &su.members {
+            let w = super::elaborate::resolve_type_width(
+                &m.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
+            for md in &m.declarators {
+                items.push((md.name.name.clone(), w, m.data_type.clone()));
+            }
+        }
+        let is_union = matches!(su.kind, crate::ast::types::StructUnionKind::Union);
+        let mut offs = vec![0u32; items.len()];
+        if !is_union {
+            let mut off = 0u32;
+            for i in (0..items.len()).rev() {
+                offs[i] = off;
+                off += items[i].1;
+            }
+        }
+        let parts: Vec<String> = (0..items.len())
+            .map(|i| {
+                let (n, w, mdt) = items[i].clone();
+                let mut sub = Value::zero(w.max(1));
+                for b in 0..w {
+                    sub.set_bit(b as usize, v.get_bit((offs[i] + b) as usize));
+                }
+                format!("{}:{}", n, self.render_p_value_typed(&sub, &mdt))
+            })
+            .collect();
+        format!("'{{{}}}", parts.join(", "))
+    }
+
+    /// Render the value stored at flat signal `name`, interpreted as `dt`.
+    fn render_p_typed(&mut self, name: &str, dt: &DataType) -> String {
+        use crate::ast::types::SimpleType;
+        // Enum member -> its label (LRM prints the name, not the encoding).
+        if let DataType::TypeReference { name: tn, .. } = dt {
+            if let Some(members) = self.module.enum_members.get(&tn.name.name).cloned() {
+                if let Some(v) = self.get_signal_value_by_name(name) {
+                    if let Some(x) = v.to_u64() {
+                        if let Some((label, _)) = members.iter().find(|(_, mv)| *mv == x) {
+                            return label.clone();
+                        }
+                    }
+                    return v.to_dec_string();
+                }
+            }
+        }
+        match self.resolve_dt(dt) {
+            DataType::Struct(su) => {
+                // A tagged union prints only its active member.
+                if let Some(tag) = self.active_union_tag.get(name).cloned() {
+                    let v = self
+                        .get_signal_value_by_name(name)
+                        .unwrap_or_else(|| Value::zero(1));
+                    return format!("'{{{}:{}}}", tag, v.to_dec_string());
+                }
+                // A PACKED struct has no per-member signals — its members are
+                // bit-slices of the container's own value.
+                if su.packed {
+                    let v = self
+                        .get_signal_value_by_name(name)
+                        .unwrap_or_else(|| Value::zero(1));
+                    return self.render_p_packed(&v, &su);
+                }
+                let mut parts = Vec::new();
+                for m in &su.members {
+                    for md in &m.declarators {
+                        let mbase = format!("{}.{}", name, md.name.name);
+                        let rendered = if md.dimensions.is_empty() {
+                            self.render_p_typed(&mbase, &m.data_type)
+                        } else if let Some(idxs) = self.member_dim_indices(&md.dimensions) {
+                            let elems: Vec<String> = idxs
+                                .into_iter()
+                                .map(|i| {
+                                    self.render_p_typed(
+                                        &format!("{}[{}]", mbase, i),
+                                        &m.data_type,
+                                    )
+                                })
+                                .collect();
+                            format!("'{{{}}}", elems.join(", "))
+                        } else {
+                            // Dynamic / queue / associative member: size unknown here.
+                            "'{}".to_string()
+                        };
+                        parts.push(format!("{}:{}", md.name.name, rendered));
+                    }
+                }
+                format!("'{{{}}}", parts.join(", "))
+            }
+            DataType::Real { .. } => self
+                .get_signal_value_by_name(name)
+                .map(|v| format!("{}", v.to_f64()))
+                .unwrap_or_else(|| "0".into()),
+            DataType::Simple { kind: SimpleType::String, .. } => self
+                .get_signal_value_by_name(name)
+                .map(|v| format!("\"{}\"", v.to_sv_string()))
+                .unwrap_or_else(|| "\"\"".into()),
+            _ => self
+                .get_signal_value_by_name(name)
+                .map(|v| if v.is_real { format!("{}", v.to_f64()) } else { v.to_dec_string() })
+                .unwrap_or_else(|| "x".into()),
+        }
     }
 
     /// Render one `%p` member value: strings as quoted text, reals as reals,
