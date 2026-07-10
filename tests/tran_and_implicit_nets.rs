@@ -151,3 +151,31 @@ fn bidirectional_switches_follow_the_resolution_table() {
         .unwrap_or(99);
     assert_eq!(fails, 0, "{} of the 9 IEEE 1800-2017 §28.8 checks failed", fails);
 }
+
+/// §6.6.1: a net with several continuous drivers resolves ALL of them, rather
+/// than taking whichever assign ran last.
+const MULTI_DRIVER: &str = r#"
+module tb;
+  wire [1:0] w;
+  logic en_a, en_b;
+  assign w = en_a ? 2'b01 : 2'bzz;
+  assign w = en_b ? 2'b10 : 2'bzz;
+
+  logic none_z, only_a, only_b, contention_x;
+  initial begin
+    en_a = 0; en_b = 0; #1 none_z      = (w === 2'bzz);
+    en_a = 1; en_b = 0; #1 only_a      = (w === 2'b01);
+    en_a = 0; en_b = 1; #1 only_b      = (w === 2'b10);
+    en_a = 1; en_b = 1; #1 contention_x = (w === 2'bxx);
+  end
+endmodule
+"#;
+
+#[test]
+fn a_net_resolves_all_of_its_continuous_drivers() {
+    let sim = simulate(MULTI_DRIVER, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "none_z"), 1, "both drivers z -> z");
+    assert_eq!(u(&sim, "only_a"), 1, "one driver, one z -> the driven value");
+    assert_eq!(u(&sim, "only_b"), 1);
+    assert_eq!(u(&sim, "contention_x"), 1, "two conflicting drivers must give x");
+}
