@@ -21507,6 +21507,12 @@ impl Simulator {
                 };
                 result
             }
+            // §12.6 `e matches p` used as a plain boolean.
+            ExprKind::Matches { expr, pattern } => {
+                let mut binds: Vec<(String, Value)> = Vec::new();
+                let ok = self.match_pattern(expr, pattern, &mut binds);
+                return if ok { Value::ones(1) } else { Value::zero(1) };
+            }
             ExprKind::Inside { expr, ranges } => {
                 let val = self.eval_expr(expr);
                 for r in ranges {
@@ -22774,8 +22780,27 @@ impl Simulator {
                 let b = self.eval_expr(e);
                 a.case_eq(&b).is_true()
             }
-            // Structure patterns (`'{…}`) are not modelled yet.
-            Pattern::Struct(_) => false,
+            // §12.6 structure pattern `'{a: .x, b: 3}`: members bind by name
+            // when named, positionally otherwise.
+            Pattern::Struct(members) => {
+                let Some(ordered) = self.struct_members_ordered(subject) else {
+                    return false;
+                };
+                for (i, (name, sub)) in members.iter().enumerate() {
+                    let target = match name {
+                        Some(id) => ordered
+                            .iter()
+                            .find(|(n, _)| *n == id.name)
+                            .map(|(_, e)| e.clone()),
+                        None => ordered.get(i).map(|(_, e)| e.clone()),
+                    };
+                    let Some(t) = target else { return false };
+                    if !self.match_pattern(&t, sub, binds) {
+                        return false;
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -24373,6 +24398,20 @@ impl Simulator {
                 else_stmt,
                 ..
             } => {
+                // §12.6: `if (e matches p) ...` — the pattern's `.name` bindings
+                // are visible in the then-branch. The parser used to discard the
+                // pattern and yield a literal 0, so the branch never ran.
+                if let ExprKind::Matches { expr, pattern } = &condition.kind {
+                    let mut binds: Vec<(String, Value)> = Vec::new();
+                    if self.match_pattern(expr, pattern, &mut binds) {
+                        let st = self.push_pattern_bindings(&binds);
+                        self.exec_statement(then_stmt);
+                        self.pop_pattern_bindings(st);
+                    } else if let Some(el) = else_stmt {
+                        self.exec_statement(el);
+                    }
+                    return;
+                }
                 if self.eval_expr(condition).is_true() {
                     self.exec_statement(then_stmt);
                 } else if let Some(el) = else_stmt {
