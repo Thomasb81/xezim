@@ -21719,6 +21719,67 @@ impl Simulator {
                         Value::zero(32)
                     }
                 }
+                // §28.8 internal helpers emitted by `resolve_bidirectional_switches`.
+                //
+                // `$__wres(a, b)` — wired-net resolution, bit by bit: a `z`
+                // yields to a driven value, equal values pass through, and
+                // anything else (a 0/1 conflict, or an `x`) gives `x`.
+                "$__wres" => {
+                    if args.len() < 2 {
+                        return Value::new(1);
+                    }
+                    let a = self.eval_expr(&args[0]);
+                    let b = self.eval_expr(&args[1]);
+                    let w = a.width.max(b.width).max(1);
+                    let mut out = Value::zero(w);
+                    for i in 0..w as usize {
+                        out.set_bit(i, Self::wire_resolve_bit(a.get_bit(i), b.get_bit(i)));
+                    }
+                    return out;
+                }
+                // `$__tranif(own_self, own_other, ctl, active)` — the value of
+                // THIS terminal of a bidirectional switch.
+                "$__tranif" => {
+                    if args.len() < 4 {
+                        return Value::new(1);
+                    }
+                    let me = self.eval_expr(&args[0]);
+                    let other = self.eval_expr(&args[1]);
+                    let ctl = self.eval_expr(&args[2]);
+                    let active_high = self.eval_expr(&args[3]).get_bit(0) == LogicBit::One;
+                    let w = me.width.max(other.width).max(1);
+                    // The switch conducts when the control matches its polarity.
+                    let cb = ctl.get_bit(0);
+                    let conducting = match (cb, active_high) {
+                        (LogicBit::One, true) | (LogicBit::Zero, false) => Some(true),
+                        (LogicBit::Zero, true) | (LogicBit::One, false) => Some(false),
+                        _ => None, // x/z control
+                    };
+                    let mut out = Value::zero(w);
+                    for i in 0..w as usize {
+                        let (m, o) = (me.get_bit(i), other.get_bit(i));
+                        let bit = match conducting {
+                            Some(true) => Self::wire_resolve_bit(m, o),
+                            Some(false) => m,
+                            // An unknown control isolates or connects: a bit
+                            // that agrees either way passes, one that differs
+                            // is unknown.
+                            None => {
+                                if m == o {
+                                    m
+                                } else if m == LogicBit::Z {
+                                    // z here means "whatever the other side is,
+                                    // if connected" -> unknown.
+                                    LogicBit::X
+                                } else {
+                                    LogicBit::X
+                                }
+                            }
+                        };
+                        out.set_bit(i, bit);
+                    }
+                    return out;
+                }
                 "$signed" => {
                     let mut v = args
                         .first()
@@ -29632,6 +29693,18 @@ impl Simulator {
                  value — the access is ignored (IEEE 1800-2017 §7.8.2)",
                 name
             );
+        }
+    }
+
+    /// IEEE 1800-2017 Table 28-1 wired-net resolution for one bit: `z` yields
+    /// to a driven value, equal values pass, everything else is `x`.
+    fn wire_resolve_bit(a: LogicBit, b: LogicBit) -> LogicBit {
+        match (a, b) {
+            (LogicBit::Z, x) => x,
+            (x, LogicBit::Z) => x,
+            (LogicBit::X, _) | (_, LogicBit::X) => LogicBit::X,
+            (x, y) if x == y => x,
+            _ => LogicBit::X,
         }
     }
 
