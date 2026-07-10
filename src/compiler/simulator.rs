@@ -15183,8 +15183,11 @@ impl Simulator {
                 ..
             } = &stmt.kind
             {
+                // Fork-block declarations run in THIS process first (§9.3.2), so
+                // the children snapshot them instead of racing over them.
+                let (spawnable, saved_auto_len) = self.exec_fork_block_decls(sub_stmts);
                 let mut child_pids = HashSet::default();
-                for s in sub_stmts {
+                for s in spawnable {
                     let pid_child = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid_child, pid);
@@ -15194,6 +15197,7 @@ impl Simulator {
                         .schedule(self.time, pid_child, vec![s.clone()]);
                     child_pids.insert(pid_child);
                 }
+                self.auto_loop_vars.truncate(saved_auto_len);
 
                 if *join_type == JoinType::JoinNone {
                     // Continue immediately
@@ -18733,9 +18737,16 @@ impl Simulator {
                     }
                     // Check 'this' properties
                     if let Some(Some(handle)) = self.this_stack.last() {
-                        if let Some(Some(instance)) = self.heap.get_mut(*handle) {
-                            if instance.properties.contains_key(name) {
-                                instance.properties.insert(name.clone(), val.clone());
+                        let handle = *handle;
+                        let holds = self
+                            .heap
+                            .get(handle)
+                            .and_then(|o| o.as_ref())
+                            .is_some_and(|i| i.properties.contains_key(name));
+                        if holds {
+                            let fitted = self.fit_class_prop(handle, name, val);
+                            if let Some(Some(instance)) = self.heap.get_mut(handle) {
+                                instance.properties.insert(name.clone(), fitted);
                                 return true;
                             }
                         }
@@ -18843,9 +18854,15 @@ impl Simulator {
                             }
                             let member_name = &hier.path[i].name.name;
                             if i == hier.path.len() - 1 {
-                                if let Some(Some(inst)) = self.heap.get_mut(cur_handle) {
-                                    if inst.properties.contains_key(member_name) {
-                                        inst.properties.insert(member_name.clone(), val.clone());
+                                let holds = self
+                                    .heap
+                                    .get(cur_handle)
+                                    .and_then(|o| o.as_ref())
+                                    .is_some_and(|inst| inst.properties.contains_key(member_name));
+                                if holds {
+                                    let fitted = self.fit_class_prop(cur_handle, member_name, val);
+                                    if let Some(Some(inst)) = self.heap.get_mut(cur_handle) {
+                                        inst.properties.insert(member_name.clone(), fitted);
                                         return true;
                                     }
                                 }
@@ -22951,6 +22968,46 @@ impl Simulator {
         }
     }
 
+    /// IEEE 1800-2017 §9.3.2. A declaration at the head of a `fork` belongs to
+    /// the fork BLOCK, not to a spawned process. Execute those in the forking
+    /// process, then return only the statements that are actually processes.
+    ///
+    /// Every top-level item between `fork` and `join*` used to be spawned,
+    /// declarations included. So `fork automatic int j = i; begin ... j ... end
+    /// join_none` spawned two siblings with independently cloned frames: the
+    /// declaration landed in one frame and the body read `j` from the other,
+    /// as X. It appeared to work outside a loop only because a process with no
+    /// captured loop variable gets no local frame at all, and the declaration
+    /// then fell through to the global signal map, which the sibling shared.
+    ///
+    /// Running them here, BEFORE `inherit_fork_child_context` snapshots the
+    /// context, gives each child its own copy at fork time — the per-spawn
+    /// capture the construct exists for.
+    /// Returns the statements to spawn. The declared names are appended to
+    /// `auto_loop_vars` for the caller's spawn loop, which is what makes
+    /// `inherit_fork_child_context` copy them into each child's frame by value.
+    /// The caller must truncate `auto_loop_vars` back afterwards.
+    ///
+    /// Without that, a declaration executed in a process that has no local
+    /// frame lands in the shared `signals` map, so every child reads whatever
+    /// the LAST fork iteration wrote — the exact capture bug the construct
+    /// exists to avoid (all five children saw `local_i == 4`).
+    fn exec_fork_block_decls<'a>(&mut self, stmts: &'a [Statement]) -> (Vec<&'a Statement>, usize) {
+        let saved_auto_len = self.auto_loop_vars.len();
+        let mut processes = Vec::with_capacity(stmts.len());
+        for s in stmts {
+            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                self.exec_statement(s);
+                for d in declarators {
+                    self.auto_loop_vars.push(d.name.name.clone());
+                }
+            } else {
+                processes.push(s);
+            }
+        }
+        (processes, saved_auto_len)
+    }
+
     pub fn exec_statement(&mut self, stmt: &Statement) {
         if self.finished || self.time > self.max_time || self.break_flag || self.continue_flag
             || self.return_flag
@@ -23179,6 +23236,35 @@ impl Simulator {
                                     ExprKind::Call { args, .. } => args,
                                     _ => &[],
                                 };
+                                // `arr[i] = new src` is the §8.12 SHALLOW COPY
+                                // constructor, not construction. This block used
+                                // to match any `new` and hand the source to
+                                // `instantiate_class` as a constructor argument,
+                                // where it was ignored: the element became a
+                                // freshly default-constructed object, with newly
+                                // allocated nested handles instead of the
+                                // source's. The same guards as the plain-handle
+                                // path (`h = new src`): exactly one argument,
+                                // and it must be a handle expression naming a
+                                // live object — never `new(size)`.
+                                let arg_could_be_handle = ctor_args
+                                    .first()
+                                    .map(|a| matches!(
+                                        &a.kind,
+                                        ExprKind::Ident(_)
+                                            | ExprKind::MemberAccess { .. }
+                                            | ExprKind::Index { .. }
+                                    ))
+                                    .unwrap_or(false);
+                                if ctor_args.len() == 1 && arg_could_be_handle {
+                                    let src_h =
+                                        self.eval_expr(&ctor_args[0]).to_u64().unwrap_or(0) as usize;
+                                    if src_h != 0 && matches!(self.heap.get(src_h), Some(Some(_))) {
+                                        let h = self.copy_construct(src_h);
+                                        self.assign_value(lvalue, &h);
+                                        return;
+                                    }
+                                }
                                 if let Some(cd) = self.module.classes.get(&cn).cloned() {
                                     let v = self.instantiate_class(&cd, ctor_args);
                                     self.assign_value(lvalue, &v);
@@ -25069,8 +25155,11 @@ impl Simulator {
                 // canonical `for (int i…) fork … join_none` idiom captures the
                 // per-iteration `i` instead of the parent's post-loop value
                 // (LRM §9.3.2 automatic-variable semantics).
+                // As in run_process_stmts: fork-block declarations are not
+                // processes; run them here so each child snapshots them.
+                let (spawnable, saved_auto_len) = self.exec_fork_block_decls(stmts);
                 let mut child_set = HashSet::default();
-                for s in stmts {
+                for s in spawnable {
                     let pid = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid, self.current_pid);
@@ -25078,6 +25167,7 @@ impl Simulator {
                     self.event_queue.schedule(self.time, pid, vec![s.clone()]);
                     child_set.insert(pid);
                 }
+                self.auto_loop_vars.truncate(saved_auto_len);
                 match join_type {
                     // `join` waits for all, `join_any` for the first; both suspend
                     // the forking process via a JoinWaiter. `join_none` continues.
@@ -28450,6 +28540,15 @@ impl Simulator {
                     h.cached_signal_id.set(Some(id));
                     return self.signal_widths[id];
                 }
+                // A class property lives on the heap, not in the flat signal
+                // maps, so without this it fell through to the 32-bit default
+                // and `std::randomize(prop)` drew a full 32-bit value into a
+                // 2-bit property.
+                if let Some(&Some(handle)) = self.this_stack.last() {
+                    if let Some(w) = self.heap_prop_width(handle, leaf) {
+                        return w;
+                    }
+                }
                 self.widths
                     .get(leaf)
                     .copied()
@@ -30956,6 +31055,46 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// Declared width of property `prop` on `class_name` or any ancestor.
+    ///
+    /// A class property is stored as a bare `Value` in `ClassInstance`, which
+    /// carries no declared width of its own. Every write therefore has to
+    /// consult the class definition, or a wide value lands in a narrow
+    /// property intact: `u2_t v; v = 32'hDEADBEEF;` kept all 32 bits.
+    /// `None` for reals, class handles and strings, which must not be resized.
+    fn class_prop_width(&self, class_name: &str, prop: &str) -> Option<u32> {
+        let mut cur = Some(class_name.to_string());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(sig) = cd.properties.get(prop) {
+                if sig.is_real || sig.type_name.as_ref().is_some_and(|t| self.module.classes.contains_key(t)) {
+                    return None;
+                }
+                if cd.string_properties.contains(prop) {
+                    return None;
+                }
+                return Some(sig.width).filter(|w| *w > 0);
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// Declared width of `prop` on the object `handle` points at.
+    fn heap_prop_width(&self, handle: usize, prop: &str) -> Option<u32> {
+        let inst = self.heap.get(handle)?.as_ref()?;
+        self.class_prop_width(&inst.class_name, prop)
+    }
+
+    /// Clamp `val` to a class property's declared width. Values that already
+    /// fit are returned unchanged, so nothing is disturbed for the common case.
+    fn fit_class_prop(&self, handle: usize, prop: &str, val: &Value) -> Value {
+        match self.heap_prop_width(handle, prop) {
+            Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
+            _ => val.clone(),
+        }
     }
 
     fn class_of_var(&self, vname: &str) -> Option<String> {
