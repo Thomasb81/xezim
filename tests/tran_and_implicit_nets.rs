@@ -179,3 +179,55 @@ fn a_net_resolves_all_of_its_continuous_drivers() {
     assert_eq!(u(&sim, "only_b"), 1);
     assert_eq!(u(&sim, "contention_x"), 1, "two conflicting drivers must give x");
 }
+
+/// A `tran` declared in a SUB-MODULE, bridging two nets referenced through the
+/// top module. Gates in an inlined module are lowered before the switch pass
+/// ran, so the switch was dropped; and a hierarchical lvalue had its root
+/// prefixed with the instance path, so the assign wrote a name that resolved to
+/// nothing.
+const SUBMODULE_TRAN: &str = r#"
+module leaf ();
+  wire [3:0] p;
+  logic en;
+  logic [3:0] d;
+  assign p = en ? d : 4'bzzzz;
+endmodule
+
+module bridge ();
+  tran t (top.l0.p, top.l1.p);
+endmodule
+
+module wr_lhs ();
+  assign top.probe = top.l0.p;   // cross-module lvalue in a sub-module
+endmodule
+
+module top;
+  wire [3:0] probe;
+  leaf l0(); leaf l1();
+  bridge b(); wr_lhs w();
+
+  logic [3:0] seen_l1, seen_probe, seen_back;
+  initial begin
+    l0.en = 1; l0.d = 4'hA;
+    l1.en = 0; l1.d = 4'h0;
+    #1 seen_l1 = l1.p;        // driven across the bridge
+       seen_probe = probe;    // cross-module lvalue
+    l0.en = 0;
+    l1.en = 1; l1.d = 4'h5;
+    #1 seen_back = l0.p;      // and back the other way
+  end
+endmodule
+"#;
+
+#[test]
+fn a_tran_in_a_submodule_bridges_hierarchical_terminals() {
+    let sim = simulate(SUBMODULE_TRAN, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "seen_l1"), 0xA, "a tran inside a sub-module was dropped");
+    assert_eq!(u(&sim, "seen_back"), 0x5, "the bridge must work in both directions");
+}
+
+#[test]
+fn a_continuous_assign_to_a_cross_module_lvalue_reaches_the_net() {
+    let sim = simulate(SUBMODULE_TRAN, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "seen_probe"), 0xA, "the cross-module lvalue wrote a stray signal");
+}
