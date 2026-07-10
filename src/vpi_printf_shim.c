@@ -34,3 +34,22 @@ int vpi_mcd_printf(unsigned int mcd, char *format, ...) {
     fflush(stdout);
     return n;
 }
+
+/* vpi_control — IEEE 1800-2017 section 38.14. Variadic, so it lives here too;
+ * the operation's optional argument (the $finish/$stop diagnostic level) is
+ * unpacked and forwarded to the Rust backend. */
+extern int xezim_vpi_control(int operation, int arg);
+
+#define XEZIM_vpiStop   66
+#define XEZIM_vpiFinish 67
+
+int vpi_control(int operation, ...) {
+    int arg = 0;
+    if (operation == XEZIM_vpiStop || operation == XEZIM_vpiFinish) {
+        va_list ap;
+        va_start(ap, operation);
+        arg = va_arg(ap, int);
+        va_end(ap);
+    }
+    return xezim_vpi_control(operation, arg);
+}

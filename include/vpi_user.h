@@ -13,9 +13,9 @@
  * Functions the standard defines but xezim does not implement are NOT
  * declared here: a call to one is a compile error, which is the loud
  * failure we want, rather than a link-time surprise or a stub that
- * silently returns nothing. Notably absent: vpi_control, vpi_chk_error,
- * vpi_put_userdata, vpi_get_userdata, and the vpiSysTfCall / vpiArgument
- * relations (so a registered $systf cannot read its own arguments yet).
+ * silently returns nothing. Still absent: vpi_put_userdata /
+ * vpi_get_userdata, vpi_get_systf_info, vpi_handle_multi, the strength
+ * value format, and the delay/timing relations.
  *
  * A VPI module is loaded with `--vpi-lib <so>` (or `-m`), after which its
  * `vlog_startup_routines` run once, before simulation. VPI is also callable
@@ -55,10 +55,20 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiRegBit             49
 #define vpiTimeVar            63
 
+#define vpiConstant            7   /* a literal / computed argument value */
+#define vpiSysFuncCall        56
+#define vpiSysTaskCall        57
+
 /* Traversal relations. */
 #define vpiScope              84   /* containing scope */
+#define vpiSysTfCall          85   /* the $systf call now executing */
+#define vpiArgument           89   /* argument of a $systf call */
 #define vpiInternalScope      92   /* internal scopes of a module */
 #define vpiVariables         100   /* variables declared in a module */
+
+/* vpi_get(vpiFuncType, sysTfCallHandle) -> the sysfunctype it was registered with. */
+#define vpiFuncType           44
+#define vpiSysFuncType        vpiFuncType
 /* SystemVerilog object types (IEEE 1800-2017 sv_vpi_user.h). */
 #define vpiLongIntVar        610
 #define vpiShortIntVar       611
@@ -119,6 +129,21 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiScaledRealTime      1
 #define vpiSimTime             2
 #define vpiSuppressTime        3
+
+/* --- vpi_control operations ------------------------------------------- */
+#define vpiStop               66   /* ends the run, like $stop */
+#define vpiFinish             67   /* ends the run, like $finish */
+#define vpiReset              68   /* NOT supported: xezim cannot rewind */
+
+/* --- vpi_chk_error severity levels and states ------------------------- */
+#define vpiNotice              1
+#define vpiWarning             2
+#define vpiError               3
+#define vpiSystem              4
+#define vpiInternal            5
+#define vpiCompile             1
+#define vpiPLI                 2
+#define vpiRun                 3
 
 /* --- callback reasons (Table 38-49) ----------------------------------- */
 #define cbValueChange          1
@@ -225,10 +250,15 @@ int vpi_printf(PLI_BYTE8 *format, ...);
 int vpi_vprintf(PLI_BYTE8 *format, va_list ap);
 int vpi_mcd_printf(PLI_UINT32 mcd, PLI_BYTE8 *format, ...);
 
-/* Register a system task or function. `tfname` must begin with '$'.
- * `compiletf` runs immediately before `calltf` on each call — xezim has no
- * separate compile phase for it. `sizetf` is accepted and ignored: system
- * FUNCTIONS registered this way are not yet dispatched, only tasks. */
+/* Register a system task or function. `tfname` must begin with '$', and
+ * `type` must be vpiSysTask or vpiSysFunc. `compiletf` runs immediately
+ * before `calltf` on each call — xezim has no separate compile phase for it.
+ *
+ * A vpiSysFunc is dispatched when its `$name` appears in an expression. It
+ * returns whatever it deposits with vpi_put_value on its own call handle
+ * (vpi_handle(vpiSysTfCall, NULL)); a function that deposits nothing returns
+ * 0. `sizetf` is called once per invocation for vpiSizedFunc/vpiSizedSignedFunc
+ * to learn the return width; the other sysfunctypes size themselves. */
 typedef struct t_vpi_systf_data {
     PLI_INT32   type;         /* vpiSysTask or vpiSysFunc */
     PLI_INT32   sysfunctype;  /* vpi[Int,Real,Time,Sized,SizedSigned]Func */
@@ -248,6 +278,30 @@ typedef struct t_vpi_systf_data {
 #define vpiSizedSignedFunc     5
 
 vpiHandle vpi_register_systf(p_vpi_systf_data systf_data_p);
+
+/* s_vpi_error_info — filled by vpi_chk_error. `message` and `product` point at
+ * simulator-owned storage valid until the next vpi_chk_error call. */
+typedef struct t_vpi_error_info {
+    PLI_INT32  state;    /* vpiCompile / vpiPLI / vpiRun */
+    PLI_INT32  level;    /* vpiNotice / vpiWarning / vpiError / ... */
+    PLI_BYTE8 *message;
+    PLI_BYTE8 *product;
+    PLI_BYTE8 *code;
+    PLI_BYTE8 *file;
+    PLI_INT32  line;
+} s_vpi_error_info, *p_vpi_error_info;
+
+/* Reports the last VPI diagnostic and CLEARS it, returning its severity level,
+ * or 0 when nothing has failed since the previous call. `error_info_p` may be
+ * NULL if you only want the level. This is the way to notice that a
+ * vpi_get_value / vpi_put_value / vpi_register_* call did not do what you
+ * asked — most of them cannot report failure any other way. */
+PLI_INT32 vpi_chk_error(p_vpi_error_info error_info_p);
+
+/* vpiStop and vpiFinish end the run, like $stop / $finish; both accept the
+ * usual diagnostic-level argument, which xezim ignores. vpiReset is rejected.
+ * Returns 1 on success, 0 on failure (see vpi_chk_error). */
+PLI_INT32 vpi_control(PLI_INT32 operation, ...);
 
 /* The entry point xezim calls for every `--vpi-lib` module: a NULL-terminated
  * array of registration routines (IEEE 1800-2017 section 38.2). Define it in

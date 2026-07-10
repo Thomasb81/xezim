@@ -278,3 +278,34 @@ fn vpi_object_model_test() {
         log
     );
 }
+
+/// The rest of IEEE 1800-2017 clause 38: a registered `$systf` reading its own
+/// arguments (`vpiSysTfCall` / `vpiArgument`), writing an output argument,
+/// system FUNCTIONS returning a value (including `vpiSizedFunc` sizing itself
+/// through `sizetf`), `vpi_chk_error`, and `vpi_control`.
+///
+/// Also pins that a system function inside an expression is invoked exactly
+/// once: `infer_width` learned a width by EVALUATING, so every `$systf` in a
+/// binary operator ran its calltf twice.
+#[test]
+fn vpi_systf_test() {
+    let so = compile_dpi_lib("tests/dpi/vpi_systf.c", "vpi_systf");
+    let log = run_xezim_with_vpi_timeout(&so, "tests/dpi/vpi_systf.sv", 60);
+    assert!(
+        log.contains("SYSTF_ERRORS: 0"),
+        "vpi_systf reported C-side failures:\n{}",
+        log
+    );
+    assert!(
+        log.contains("RESULT: PASSED"),
+        "vpi_systf missing RESULT: PASSED:\n{}",
+        log
+    );
+    // vpi_control(vpiFinish) must actually end the run.
+    assert!(log.contains("BEFORE_FINISH"), "$st_finish never ran:\n{}", log);
+    assert!(
+        !log.contains("vpi_control(vpiFinish) did not end the run"),
+        "vpi_control(vpiFinish) did not end the run:\n{}",
+        log
+    );
+}

@@ -15047,22 +15047,38 @@ impl Simulator {
                 ..
             } = &stmt.kind
             {
-                let chosen: Option<&Statement> = if self.eval_expr(condition).is_true() {
-                    Some(then_stmt.as_ref())
-                } else {
-                    else_stmt.as_ref().map(|b| b.as_ref())
-                };
-                if let Some(branch) = chosen {
-                    if self.stmt_is_blocking(branch) {
-                        let branch_stmts: Vec<Statement> = match &branch.kind {
-                            StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
-                            _ => vec![branch.clone()],
-                        };
-                        let mut cont = branch_stmts;
-                        cont.extend_from_slice(&stmts[i + 1..]);
-                        self.run_process_stmts(pid, &cont);
-                        return;
+                // `if (e matches p)` binds pattern variables, which only
+                // `exec_statement` does; evaluating it here would produce the
+                // match result without the bindings. Leave it alone.
+                if !matches!(condition.kind, ExprKind::Matches { .. }) {
+                    // The condition is evaluated EXACTLY ONCE. Deciding whether
+                    // the chosen branch blocks used to evaluate it here and then
+                    // fall through to `exec_statement`, which evaluated it again
+                    // — so any side effect in an `if` condition (`$random()`,
+                    // `$urandom()`, a VPI `$systf`, `i++`) happened twice.
+                    let chosen: Option<&Statement> = if self.eval_expr(condition).is_true() {
+                        Some(then_stmt.as_ref())
+                    } else {
+                        else_stmt.as_ref().map(|b| b.as_ref())
+                    };
+                    match chosen {
+                        Some(branch) if self.stmt_is_blocking(branch) => {
+                            let branch_stmts: Vec<Statement> = match &branch.kind {
+                                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                                _ => vec![branch.clone()],
+                            };
+                            let mut cont = branch_stmts;
+                            cont.extend_from_slice(&stmts[i + 1..]);
+                            self.run_process_stmts(pid, &cont);
+                            return;
+                        }
+                        // Run the branch we already selected, rather than
+                        // re-entering the whole `if`.
+                        Some(branch) => self.exec_statement(branch),
+                        None => {}
                     }
+                    i += 1;
+                    continue;
                 }
             }
 
@@ -22342,6 +22358,12 @@ impl Simulator {
                     }
                     Value::zero(32)
                 }
+                // A `$name` a VPI module registered as a system FUNCTION.
+                // Checked last so a builtin always wins.
+                _ if vpi_systf_is_func(name) => {
+                    let self_ptr = self as *mut Simulator;
+                    vpi_call_systf(self_ptr, name, args).unwrap_or_else(|| Value::zero(32))
+                }
                 _ => Value::zero(32),
             },
             ExprKind::This => {
@@ -26475,7 +26497,7 @@ impl Simulator {
             // Checked last so a builtin always wins.
             _ if vpi_systf_registered(name) => {
                 let self_ptr = self as *mut Simulator;
-                vpi_call_systf(self_ptr, name);
+                vpi_call_systf(self_ptr, name, args);
             }
             _ => {}
         }
@@ -28503,9 +28525,51 @@ impl Simulator {
                 else_expr,
                 ..
             } => self.infer_width(then_expr).max(self.infer_width(else_expr)),
+            // A VPI system function has a declared return width. The fallback
+            // below infers a width by EVALUATING, which for a `$systf` means
+            // running its calltf — twice, once here and once for the value.
+            ExprKind::SystemCall { name, .. } if vpi_systf_is_func(name) => {
+                vpi_sysfunc_ret_width(name)
+            }
+            // Same for a user function: its width comes from its declared
+            // return type, never from calling it. `f() + 1` used to call `f`
+            // once for the width and once for the value, so any function with
+            // a side effect ran twice.
+            ExprKind::Call { func, .. } => {
+                if let Some(w) = self.call_return_width(func) {
+                    w
+                } else {
+                    self.eval_expr(expr).width
+                }
+            }
             _ => self.eval_expr(expr).width,
         }
     }
+    /// Declared return width of the function `func` names, without calling it.
+    /// `None` when the callee is not a plain module-scope function (a method,
+    /// a class constructor, an array builtin), where the caller falls back to
+    /// evaluation.
+    fn call_return_width(&mut self, func: &Expression) -> Option<u32> {
+        let ExprKind::Ident(h) = &func.kind else { return None };
+        if h.path.len() != 1 {
+            return None;
+        }
+        let name = &h.path[0].name.name;
+        let fd = self.module.functions.get(name)?;
+        if matches!(fd.return_type, DataType::Void { .. }) {
+            return None;
+        }
+        if matches!(fd.return_type, DataType::Real { .. }) {
+            return Some(64);
+        }
+        let w = super::elaborate::resolve_type_width(
+            &fd.return_type,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        (w > 0).then_some(w)
+    }
+
     fn infer_lhs_width(&mut self, expr: &Expression) -> u32 {
         match &expr.kind {
             ExprKind::Concatenation(p) => {
@@ -31055,6 +31119,25 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// Build the VPI object for one `$systf` argument.
+    ///
+    /// A signal-backed argument gets a real signal handle, so a systf can
+    /// `vpi_put_value` into it — that is how an `output` argument works.
+    /// Anything else (a literal, a concatenation, a computed expression) is
+    /// evaluated once and handed over as a read-only `vpiConstant`.
+    fn vpi_arg_handle(&mut self, e: &Expression) -> VpiHandle {
+        if let ExprKind::Ident(h) = &e.kind {
+            let name = self.resolve_hier_name(h);
+            if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                let ty = vpi_type_of(self, &name, id);
+                let leaf = name.rsplit('.').next().unwrap_or(&name).to_string();
+                let full = vpi_full_name(self, &name);
+                return VpiHandle::signal(id, ty, &leaf, &full);
+            }
+        }
+        VpiHandle::constant(self.eval_expr(e))
     }
 
     /// Declared width of property `prop` on `class_name` or any ancestor.
@@ -40906,8 +40989,32 @@ mod vpi {
     pub const VECTOR: c_int = 18;
     pub const SIGNED: c_int = 65;
 
+    // vpi_control operations.
+    pub const STOP: c_int = 66;
+    pub const FINISH: c_int = 67;
+    pub const RESET: c_int = 68;
+
+    // vpi_chk_error levels and states.
+    pub const NOTICE: c_int = 1;
+    pub const WARNING: c_int = 2;
+    pub const ERROR: c_int = 3;
+    pub const RUN_STATE: c_int = 3;
+
+    // System-function return kinds (`s_vpi_systf_data.sysfunctype`).
+    pub const INT_FUNC: c_int = 1;
+    pub const REAL_FUNC: c_int = 2;
+    pub const TIME_FUNC: c_int = 3;
+    pub const SIZED_FUNC: c_int = 4;
+    pub const SIZED_SIGNED_FUNC: c_int = 5;
+
     // Object types returned by vpi_get(vpiType), and traversal relations.
+    pub const CONSTANT: c_int = 7;
     pub const ITERATOR: c_int = 27;
+    pub const FUNC_TYPE: c_int = 44;
+    pub const SYS_FUNC_CALL: c_int = 56;
+    pub const SYS_TASK_CALL: c_int = 57;
+    pub const SYS_TF_CALL: c_int = 85;
+    pub const ARGUMENT: c_int = 89;
     pub const MEMORY: c_int = 29;
     pub const MODULE: c_int = 32;
     pub const PARAMETER: c_int = 41;
@@ -40934,6 +41041,10 @@ mod vpi {
 
     // Time types.
     pub const SIM_TIME: c_int = 2;
+
+    // s_vpi_systf_data.type
+    pub const SYS_TASK: c_int = 1;
+    pub const SYS_FUNC: c_int = 2;
 
     // Callback reasons (Table 38-49).
     pub const CB_VALUE_CHANGE: c_int = 1;
@@ -41127,6 +41238,13 @@ enum VpiKind {
     Memory,
     /// The result of `vpi_iterate`, consumed by `vpi_scan`.
     Iterator,
+    /// A read-only value: a `$systf` argument that is not signal-backed
+    /// (a literal, or any computed expression).
+    Constant,
+    /// The `$systf` call currently executing. `vpi_iterate(vpiArgument, ..)`
+    /// walks its arguments; `vpi_put_value` on it sets a system function's
+    /// return value.
+    SysTfCall,
 }
 
 /// Wrapper for VPI handles stored as raw pointers.
@@ -41153,6 +41271,11 @@ struct VpiHandle {
     /// Iterator only: the objects still to be handed out by `vpi_scan`.
     items: Vec<VpiHandle>,
     pos: usize,
+    /// Constant only: the argument's value, captured at call time.
+    value: Option<Value>,
+    /// SysTfCall only: depth of the frame in `VPI_SYSTF_STACK`, so a handle
+    /// held across a nested `$systf` call still names its own frame.
+    frame: usize,
 }
 
 impl VpiHandle {
@@ -41169,11 +41292,51 @@ impl VpiHandle {
             def_name: String::new(),
             items: Vec::new(),
             pos: 0,
+            value: None,
+            frame: 0,
         }
     }
 
     fn into_raw(self) -> *mut libc::c_void {
         Box::into_raw(Box::new(self)) as *mut libc::c_void
+    }
+
+    /// A read-only `$systf` argument that is not signal-backed.
+    fn constant(v: Value) -> Self {
+        VpiHandle {
+            kind: VpiKind::Constant,
+            signal_id: 0,
+            type_code: vpi::CONSTANT,
+            lsb: 0,
+            width: v.width,
+            inst_idx: -1,
+            name: String::new(),
+            full_name: String::new(),
+            def_name: String::new(),
+            items: Vec::new(),
+            pos: 0,
+            value: Some(v),
+            frame: 0,
+        }
+    }
+
+    /// The `$systf` call at `frame` (an index into `VPI_SYSTF_STACK`).
+    fn systf_call(frame: usize, name: &str, is_func: bool, ret_width: u32) -> Self {
+        VpiHandle {
+            kind: VpiKind::SysTfCall,
+            signal_id: 0,
+            type_code: if is_func { vpi::SYS_FUNC_CALL } else { vpi::SYS_TASK_CALL },
+            lsb: 0,
+            width: ret_width,
+            inst_idx: -1,
+            name: name.to_string(),
+            full_name: name.to_string(),
+            def_name: String::new(),
+            items: Vec::new(),
+            pos: 0,
+            value: None,
+            frame,
+        }
     }
 }
 
@@ -41190,6 +41353,44 @@ unsafe fn vpi_deref<'a>(handle: *mut libc::c_void) -> Option<&'a VpiHandle> {
     }
 }
 
+/// The `$systf` invocation currently on the stack. `vpi_handle(vpiSysTfCall,
+/// NULL)` names the innermost one; `vpi_iterate(vpiArgument, ..)` walks its
+/// arguments; `vpi_put_value` on it sets a system function's return value.
+struct VpiSystfFrame {
+    /// The `$name`, as `vpi_get_str(vpiName, ..)` reports it.
+    name: String,
+    /// Argument objects, resolved once at call time. A signal-backed argument
+    /// is writable (an `output` argument); the rest are `Constant`.
+    args: Vec<VpiHandle>,
+    /// Return value deposited by `vpi_put_value` on the call handle.
+    ret: Option<Value>,
+    /// Width the return value is resized to.
+    ret_width: u32,
+    /// vpiSysTask or vpiSysFunc.
+    tf_type: libc::c_int,
+    /// `sysfunctype`, for a function.
+    func_type: libc::c_int,
+}
+
+// Innermost frame last: a `$systf` may invoke another.
+thread_local! {
+    static VPI_SYSTF_STACK: std::cell::RefCell<Vec<VpiSystfFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The last diagnostic, for `vpi_chk_error`. Cleared once reported.
+    static VPI_LAST_ERROR: std::cell::RefCell<Option<(libc::c_int, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record a diagnostic so `vpi_chk_error` can report it, and echo it to stderr.
+///
+/// Every VPI failure path routes through here. Without it `vpi_chk_error`
+/// would always answer "no error", and a caller that checks it — which is the
+/// only reason to call it — would sail straight past a failed call.
+fn vpi_error(level: libc::c_int, msg: String) {
+    eprintln!("[VPI] {}", msg);
+    VPI_LAST_ERROR.with(|c| *c.borrow_mut() = Some((level, msg)));
+}
+
 /// A `$systf` registered from a VPI module via `vpi_register_systf`.
 #[derive(Clone, Copy)]
 struct VpiSystf {
@@ -41197,9 +41398,14 @@ struct VpiSystf {
     /// struct stays `Copy` and can live in a thread-local map.
     calltf: usize,
     compiletf: usize,
+    /// Called once per invocation of a `vpiSizedFunc` to learn its return width.
+    sizetf: usize,
     user_data: usize,
     /// vpiSysTask (1) or vpiSysFunc (2).
     tf_type: libc::c_int,
+    /// `sysfunctype`: vpiIntFunc / vpiRealFunc / vpiTimeFunc / vpiSizedFunc /
+    /// vpiSizedSignedFunc. Meaningless for a task.
+    func_type: libc::c_int,
 }
 
 // System tasks and functions registered by a VPI module's
@@ -41425,6 +41631,8 @@ fn vpi_module_handle(sim: &Simulator, inst_idx: isize) -> *mut libc::c_void {
         def_name: def,
         items: Vec::new(),
         pos: 0,
+        value: None,
+        frame: 0,
     }
     .into_raw()
 }
@@ -41463,6 +41671,8 @@ fn vpi_slice_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
         def_name: String::new(),
         items: Vec::new(),
         pos: 0,
+        value: None,
+        frame: 0,
     })
 }
 
@@ -41563,6 +41773,8 @@ fn vpi_memory_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
         def_name: String::new(),
         items: Vec::new(),
         pos: 0,
+        value: None,
+        frame: 0,
     })
 }
 
@@ -41600,6 +41812,29 @@ pub extern "C" fn vpi_handle_by_index(
 /// purity of returning NULL.
 #[no_mangle]
 pub extern "C" fn vpi_handle(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
+    // The currently executing $systf. A `NULL` reference is the idiomatic
+    // spelling; the standard also allows passing the call handle itself.
+    if type_ == vpi::SYS_TF_CALL {
+        return VPI_SYSTF_STACK.with(|st| {
+            let st = st.borrow();
+            match st.last() {
+                Some(f) => VpiHandle::systf_call(
+                    st.len() - 1,
+                    &f.name,
+                    f.tf_type == vpi::SYS_FUNC,
+                    f.ret_width,
+                )
+                .into_raw(),
+                None => {
+                    vpi_error(
+                        vpi::ERROR,
+                        "vpi_handle(vpiSysTfCall): no $systf is executing".to_string(),
+                    );
+                    std::ptr::null_mut()
+                }
+            }
+        });
+    }
     try_active_sim("vpi_handle", |sim| {
         if type_ != vpi::SCOPE {
             return std::ptr::null_mut();
@@ -41682,6 +41917,18 @@ fn vpi_scope_members(sim: &Simulator, scope: &str) -> Vec<(String, usize)> {
 /// yields nothing, as the standard requires (callers test for it).
 #[no_mangle]
 pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
+    // The arguments of a $systf call. Handled before the design traversal
+    // below because it needs no simulator, only the call frame.
+    if type_ == vpi::ARGUMENT {
+        let Some(h) = (unsafe { vpi_deref(refh) }) else { return std::ptr::null_mut() };
+        if h.kind != VpiKind::SysTfCall {
+            return std::ptr::null_mut();
+        }
+        let items = VPI_SYSTF_STACK.with(|st| {
+            st.borrow().get(h.frame).map(|f| f.args.clone()).unwrap_or_default()
+        });
+        return vpi_make_iterator(items);
+    }
     try_active_sim("vpi_iterate", |sim| {
         let scope_h = unsafe { vpi_deref(refh) };
 
@@ -41763,6 +42010,8 @@ fn vpi_make_iterator(items: Vec<VpiHandle>) -> *mut libc::c_void {
         def_name: String::new(),
         items,
         pos: 0,
+        value: None,
+        frame: 0,
     }
     .into_raw()
 }
@@ -41797,7 +42046,10 @@ pub extern "C" fn vpi_get_str(property: libc::c_int, handle: *mut libc::c_void) 
         vpi::NAME => h.name.clone(),
         vpi::FULL_NAME => h.full_name.clone(),
         vpi::DEF_NAME if h.kind == VpiKind::Module => h.def_name.clone(),
-        _ => return std::ptr::null_mut(),
+        _ => {
+            vpi_error(vpi::WARNING, format!("vpi_get_str: property {} not modelled", property));
+            return std::ptr::null_mut();
+        }
     };
     VPI_STR2_SCRATCH.with(|cell| {
         let mut pool = cell.borrow_mut();
@@ -41819,7 +42071,7 @@ pub extern "C" fn vpi_register_systf(data: *mut s_vpi_systf_data) -> *mut libc::
     }
     let d = unsafe { &*data };
     if d.tfname.is_null() || d.calltf.is_null() {
-        eprintln!("[VPI] vpi_register_systf: tfname and calltf are required");
+        vpi_error(vpi::ERROR, "vpi_register_systf: tfname and calltf are required".into());
         return std::ptr::null_mut();
     }
     let name = unsafe { std::ffi::CStr::from_ptr(d.tfname) }
@@ -41827,14 +42079,20 @@ pub extern "C" fn vpi_register_systf(data: *mut s_vpi_systf_data) -> *mut libc::
         .trim()
         .to_string();
     if !name.starts_with('$') {
-        eprintln!("[VPI] vpi_register_systf: tfname '{}' must start with '$'", name);
+        vpi_error(vpi::ERROR, format!("vpi_register_systf: tfname '{}' must start with '$'", name));
+        return std::ptr::null_mut();
+    }
+    if d.type_ != vpi::SYS_TASK && d.type_ != vpi::SYS_FUNC {
+        vpi_error(vpi::ERROR, format!("vpi_register_systf: '{}' has type {}, expected vpiSysTask or vpiSysFunc", name, d.type_));
         return std::ptr::null_mut();
     }
     let entry = VpiSystf {
         calltf: d.calltf as usize,
         compiletf: d.compiletf as usize,
+        sizetf: d.sizetf as usize,
         user_data: d.user_data as usize,
         tf_type: d.type_,
+        func_type: d.sysfunctype,
     };
     VPI_SYSTFS.with(|m| m.borrow_mut().insert(name, entry));
     // The returned handle is only compared against NULL in practice.
@@ -41843,10 +42101,52 @@ pub extern "C" fn vpi_register_systf(data: *mut s_vpi_systf_data) -> *mut libc::
 
 /// Call a registered `$systf`. Returns false when `name` is not registered,
 /// so the caller can fall through to its own diagnostic.
-fn vpi_call_systf(sim: *mut Simulator, name: &str) -> bool {
-    let Some(entry) = VPI_SYSTFS.with(|m| m.borrow().get(name).copied()) else {
-        return false;
+/// Width of a system function's return value, per its `sysfunctype`.
+/// `vpiSizedFunc` asks the module via `sizetf`.
+fn vpi_sysfunc_width(entry: &VpiSystf) -> u32 {
+    type TfFn = extern "C" fn(*mut libc::c_char) -> libc::c_int;
+    match entry.func_type {
+        vpi::REAL_FUNC => 64,
+        vpi::TIME_FUNC => 64,
+        vpi::SIZED_FUNC | vpi::SIZED_SIGNED_FUNC if entry.sizetf != 0 => {
+            let f: TfFn = unsafe { std::mem::transmute(entry.sizetf as *const ()) };
+            let w = f(entry.user_data as *mut libc::c_char);
+            if w > 0 { w as u32 } else { 32 }
+        }
+        _ => 32,
+    }
+}
+
+/// Invoke a registered `$systf` with a frame carrying its arguments, so the
+/// C side can reach them through `vpi_handle(vpiSysTfCall, NULL)` and
+/// `vpi_iterate(vpiArgument, ..)`, and deposit a return value.
+///
+/// Returns the function's return value; `None` for a task, or when `name` is
+/// not registered (so the caller can fall through to its own diagnostic).
+fn vpi_call_systf(sim: *mut Simulator, name: &str, args: &[Expression]) -> Option<Value> {
+    let entry = VPI_SYSTFS.with(|m| m.borrow().get(name).copied())?;
+
+    let is_func = entry.tf_type == vpi::SYS_FUNC;
+    let ret_width = if is_func { vpi_sysfunc_width(&entry) } else { 0 };
+
+    // Resolve the arguments BEFORE the frame is pushed: building a handle
+    // evaluates expressions, which can itself invoke a nested $systf.
+    let arg_handles: Vec<VpiHandle> = unsafe {
+        let s = &mut *sim;
+        args.iter().map(|a| s.vpi_arg_handle(a)).collect()
     };
+
+    VPI_SYSTF_STACK.with(|st| {
+        st.borrow_mut().push(VpiSystfFrame {
+            name: name.to_string(),
+            args: arg_handles,
+            ret: None,
+            ret_width,
+            tf_type: entry.tf_type,
+            func_type: entry.func_type,
+        })
+    });
+
     ACTIVE_SIMULATOR.with(|cell| cell.set(sim));
     type TfFn = extern "C" fn(*mut libc::c_char) -> libc::c_int;
     if entry.compiletf != 0 {
@@ -41855,13 +42155,112 @@ fn vpi_call_systf(sim: *mut Simulator, name: &str) -> bool {
     }
     let f: TfFn = unsafe { std::mem::transmute(entry.calltf as *const ()) };
     f(entry.user_data as *mut libc::c_char);
-    true
+
+    let frame = VPI_SYSTF_STACK.with(|st| st.borrow_mut().pop());
+    if !is_func {
+        return None;
+    }
+    // A function that never deposited a value returns 0, as the LRM's own
+    // system functions do.
+    let mut v = frame
+        .and_then(|f| f.ret)
+        .unwrap_or_else(|| Value::zero(ret_width.max(1)));
+    if entry.func_type == vpi::REAL_FUNC {
+        v.is_real = true;
+    } else if entry.func_type == vpi::SIZED_SIGNED_FUNC {
+        v.is_signed = true;
+    }
+    Some(v)
 }
 
 /// True when a VPI module registered `name`. Lets the caller distinguish a
 /// user-defined `$task` from a genuinely unknown one.
 pub fn vpi_systf_registered(name: &str) -> bool {
     VPI_SYSTFS.with(|m| m.borrow().contains_key(name))
+}
+
+/// Return width of a registered system function, without invoking it.
+pub fn vpi_sysfunc_ret_width(name: &str) -> u32 {
+    VPI_SYSTFS
+        .with(|m| m.borrow().get(name).map(|e| vpi_sysfunc_width(&e)))
+        .unwrap_or(32)
+}
+
+/// True when `name` was registered as a system FUNCTION (`vpiSysFunc`).
+pub fn vpi_systf_is_func(name: &str) -> bool {
+    VPI_SYSTFS.with(|m| m.borrow().get(name).is_some_and(|e| e.tf_type == vpi::SYS_FUNC))
+}
+
+/// Mirror of `s_vpi_error_info` (IEEE 1800-2017 §38.4).
+#[repr(C)]
+struct s_vpi_error_info {
+    state: libc::c_int,
+    level: libc::c_int,
+    message: *mut libc::c_char,
+    product: *mut libc::c_char,
+    code: *mut libc::c_char,
+    file: *mut libc::c_char,
+    line: libc::c_int,
+}
+
+/// Report the last VPI diagnostic, and clear it. Returns the severity level,
+/// or 0 when nothing has gone wrong since the previous call.
+///
+/// `error_info_p` may be NULL — callers often use `vpi_chk_error(NULL)` purely
+/// as a "did anything fail?" probe.
+#[no_mangle]
+pub extern "C" fn vpi_chk_error(error_info_p: *mut s_vpi_error_info) -> libc::c_int {
+    let taken = VPI_LAST_ERROR.with(|c| c.borrow_mut().take());
+    let Some((level, msg)) = taken else { return 0 };
+    if !error_info_p.is_null() {
+        let info = unsafe { &mut *error_info_p };
+        info.state = vpi::RUN_STATE;
+        info.level = level;
+        info.message = vpi_err_scratch(&msg);
+        info.product = b"xezim\0".as_ptr() as *mut libc::c_char;
+        info.code = b"\0".as_ptr() as *mut libc::c_char;
+        info.file = std::ptr::null_mut();
+        info.line = 0;
+    }
+    level
+}
+
+fn vpi_err_scratch(s: &str) -> *mut libc::c_char {
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUF.with(|cell| {
+        let mut b = cell.borrow_mut();
+        b.clear();
+        b.extend_from_slice(s.as_bytes());
+        b.push(0);
+        b.as_mut_ptr() as *mut libc::c_char
+    })
+}
+
+/// Backend for `vpi_control`, which is C-variadic and therefore lives in
+/// `src/vpi_printf_shim.c`. `arg` is the `$finish`/`$stop` diagnostic level.
+///
+/// Only vpiStop and vpiFinish do anything: both end the run, exactly as the
+/// corresponding system tasks do. vpiReset is rejected rather than silently
+/// ignored — xezim cannot rewind a simulation.
+#[no_mangle]
+pub extern "C" fn xezim_vpi_control(operation: libc::c_int, _arg: libc::c_int) -> libc::c_int {
+    match operation {
+        vpi::STOP | vpi::FINISH => try_active_sim("vpi_control", |sim| {
+            sim.finished = true;
+            1
+        })
+        .unwrap_or(0),
+        vpi::RESET => {
+            vpi_error(vpi::ERROR, "vpi_control(vpiReset): xezim cannot reset a running simulation".into());
+            0
+        }
+        other => {
+            vpi_error(vpi::ERROR, format!("vpi_control: operation {} not supported", other));
+            0
+        }
+    }
 }
 
 /// Load each `--vpi-lib` and run its `vlog_startup_routines`, the standard
@@ -41927,6 +42326,26 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
     if property == vpi::TYPE {
         return h.type_code;
     }
+    // vpiFuncType of a system function call is its `sysfunctype`.
+    if h.kind == VpiKind::SysTfCall {
+        return match property {
+            vpi::SIZE => h.width as libc::c_int,
+            vpi::FUNC_TYPE => VPI_SYSTF_STACK
+                .with(|st| st.borrow().get(h.frame).map(|f| f.func_type))
+                .unwrap_or(vpi::UNDEFINED),
+            _ => vpi::UNDEFINED,
+        };
+    }
+    if h.kind == VpiKind::Constant {
+        let w = h.width as libc::c_int;
+        return match property {
+            vpi::SIZE => w,
+            vpi::SIGNED => i32::from(h.value.as_ref().is_some_and(|v| v.is_signed)),
+            vpi::SCALAR => i32::from(w == 1),
+            vpi::VECTOR => i32::from(w > 1),
+            _ => vpi::UNDEFINED,
+        };
+    }
     // A module or an iterator has no width, sign or scalar-ness.
     match h.kind {
         VpiKind::Module | VpiKind::Iterator => return vpi::UNDEFINED,
@@ -41979,11 +42398,28 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
     }
     let vp = unsafe { &mut *value_p };
     let Some(h) = (unsafe { vpi_deref(handle) }) else {
+        vpi_error(vpi::ERROR, "vpi_get_value: null handle".into());
         vp.format = vpi::SUPPRESS_VAL;
         return;
     };
-    // Modules, memories and iterators have no value.
-    if matches!(h.kind, VpiKind::Module | VpiKind::Iterator | VpiKind::Memory) {
+    // A constant argument carries its own value and needs no simulator.
+    if h.kind == VpiKind::Constant {
+        let ok = match &h.value {
+            Some(v) => fill_vpi_value(v, 0, vp),
+            None => false,
+        };
+        if !ok {
+            vpi_error(vpi::ERROR, format!("vpi_get_value: cannot supply format {} for a constant", vp.format));
+            vp.format = vpi::SUPPRESS_VAL;
+        }
+        return;
+    }
+    // Modules, memories, iterators and call handles have no readable value.
+    if matches!(
+        h.kind,
+        VpiKind::Module | VpiKind::Iterator | VpiKind::Memory | VpiKind::SysTfCall
+    ) {
+        vpi_error(vpi::ERROR, "vpi_get_value: this object has no readable value".into());
         vp.format = vpi::SUPPRESS_VAL;
         return;
     }
@@ -42007,6 +42443,12 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
     .unwrap_or(false);
 
     if !ok {
+        // vpiSuppressVal is the only failure channel this function has, and a
+        // caller that never checks `format` needs vpi_chk_error to notice.
+        vpi_error(
+            vpi::ERROR,
+            format!("vpi_get_value: cannot supply format {}", vp.format),
+        );
         vp.format = vpi::SUPPRESS_VAL;
     }
 }
@@ -42147,10 +42589,60 @@ pub extern "C" fn vpi_put_value(
         return std::ptr::null_mut();
     }
 
+    // Depositing into the call handle sets a system function's return value
+    // (IEEE 1800-2017 §38.33). Handled before the simulator lookup because it
+    // touches only the call frame.
+    {
+        let Some(h) = (unsafe { vpi_deref(handle) }) else { return std::ptr::null_mut() };
+        if h.kind == VpiKind::SysTfCall {
+            if value_p.is_null() {
+                vpi_error(vpi::ERROR, "vpi_put_value: null value on a $systf call".into());
+                return std::ptr::null_mut();
+            }
+            let w = h.width.max(1);
+            let vp = unsafe { &*value_p };
+            let v = match vp.format {
+                vpi::INT_VAL => Value::from_u64(unsafe { vp.value.integer } as i64 as u64, w),
+                vpi::REAL_VAL => Value::from_f64(unsafe { vp.value.real }),
+                vpi::VECTOR_VAL => {
+                    let ptr = unsafe { vp.value.vector };
+                    if ptr.is_null() {
+                        vpi_error(vpi::ERROR, "vpi_put_value: null vector on a $systf call".into());
+                        return std::ptr::null_mut();
+                    }
+                    let words = (w as usize).div_ceil(32);
+                    vecval_to_value(unsafe { std::slice::from_raw_parts(ptr, words) }, w, false)
+                }
+                other => {
+                    vpi_error(
+                        vpi::ERROR,
+                        format!("vpi_put_value: format {} unsupported on a $systf call", other),
+                    );
+                    return std::ptr::null_mut();
+                }
+            };
+            let frame = h.frame;
+            VPI_SYSTF_STACK.with(|st| {
+                if let Some(f) = st.borrow_mut().get_mut(frame) {
+                    if f.tf_type == vpi::SYS_FUNC {
+                        f.ret = Some(v);
+                    } else {
+                        vpi_error(vpi::ERROR, "vpi_put_value: a $systf TASK has no return value".into());
+                    }
+                }
+            });
+            return std::ptr::null_mut();
+        }
+        if h.kind == VpiKind::Constant {
+            vpi_error(vpi::ERROR, "vpi_put_value: a vpiConstant argument is read-only".into());
+            return std::ptr::null_mut();
+        }
+    }
+
     try_active_sim("vpi_put_value", |sim| {
         let h = unsafe { &*(handle as *const VpiHandle) };
         if matches!(h.kind, VpiKind::Module | VpiKind::Iterator | VpiKind::Memory) {
-            eprintln!("[VPI] vpi_put_value: this object has no value; ignored");
+            vpi_error(vpi::ERROR, "vpi_put_value: this object has no value; ignored".into());
             return std::ptr::null_mut();
         }
         let sig_id = h.signal_id;
@@ -42176,7 +42668,7 @@ pub extern "C" fn vpi_put_value(
         }
 
         if value_p.is_null() {
-            eprintln!("[VPI] vpi_put_value: null value_p with a write flag; ignored");
+            vpi_error(vpi::ERROR, "vpi_put_value: null value_p with a write flag; ignored".into());
             return std::ptr::null_mut();
         }
 
@@ -42210,7 +42702,7 @@ pub extern "C" fn vpi_put_value(
                     vpi::SCALAR_X => 2,
                     vpi::SCALAR_Z => 3,
                     other => {
-                        eprintln!("[VPI] vpi_put_value: unsupported vpiScalarVal code {}", other);
+                        vpi_error(vpi::ERROR, format!("vpi_put_value: unsupported vpiScalarVal code {}", other));
                         return std::ptr::null_mut();
                     }
                 };
@@ -42227,7 +42719,7 @@ pub extern "C" fn vpi_put_value(
                 // path at four words (128 bits).
                 let vec_ptr = unsafe { vp.value.vector };
                 if vec_ptr.is_null() {
-                    eprintln!("[VPI] vpi_put_value: vpiVectorVal with a null vector; ignored");
+                    vpi_error(vpi::ERROR, "vpi_put_value: vpiVectorVal with a null vector; ignored".into());
                     return std::ptr::null_mut();
                 }
                 let num_words = (w as usize).div_ceil(32);
@@ -42235,10 +42727,7 @@ pub extern "C" fn vpi_put_value(
                 vecval_to_value(vec, w, is_signed)
             }
             other => {
-                eprintln!(
-                    "[VPI] vpi_put_value: unsupported format {} (nothing written)",
-                    other
-                );
+                vpi_error(vpi::ERROR, format!("vpi_put_value: unsupported format {} (nothing written)", other));
                 return std::ptr::null_mut();
             }
         };
@@ -42357,7 +42846,7 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
     let signal_id = match unsafe { vpi_deref(cb_data.obj) } {
         Some(h) if h.kind == VpiKind::Signal => h.signal_id,
         Some(_) => {
-            eprintln!("[VPI] vpi_register_cb: obj is not a signal (not registered)");
+            vpi_error(vpi::ERROR, "vpi_register_cb: obj is not a signal (not registered)".into());
             return std::ptr::null_mut();
         }
         None => 0,
@@ -42373,11 +42862,11 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
     // Reject a reason we will never dispatch rather than handing back a
     // handle that quietly never fires.
     if reason != vpi::CB_VALUE_CHANGE && reason != vpi::CB_START_OF_RESET {
-        eprintln!("[VPI] vpi_register_cb: unsupported reason {} (not registered)", reason);
+        vpi_error(vpi::ERROR, format!("vpi_register_cb: unsupported reason {} (not registered)", reason));
         return std::ptr::null_mut();
     }
     if reason == vpi::CB_VALUE_CHANGE && cb_data.obj.is_null() {
-        eprintln!("[VPI] vpi_register_cb: cbValueChange with a null obj (not registered)");
+        vpi_error(vpi::ERROR, "vpi_register_cb: cbValueChange with a null obj (not registered)".into());
         return std::ptr::null_mut();
     }
 
