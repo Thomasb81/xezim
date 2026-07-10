@@ -1945,6 +1945,11 @@ pub struct Simulator {
     /// Label of a process-level named block (`initial begin : worker`) -> its
     /// pid, so `disable worker` from another process can terminate it.
     disable_labels: HashMap<String, usize>,
+    /// A named `fork : blk ... join*` maps to the processes it spawned, so
+    /// `disable blk` can terminate them (§9.6.2). Without this, disabling a
+    /// join_none fork block — which has already returned — unwound the
+    /// DISABLING process instead, dropping its continuation.
+    fork_block_children: HashMap<String, HashSet<usize>>,
     /// Associative arrays already warned about an x/z index.
     warned_assoc_index: HashSet<String>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
@@ -3196,6 +3201,7 @@ impl Simulator {
             rs_return_flag: false,
             disable_target: None,
             disable_labels: HashMap::default(),
+            fork_block_children: HashMap::default(),
             warned_assoc_index: HashSet::default(),
             killed_pids: HashSet::default(),
             auto_loop_vars: Vec::new(),
@@ -15196,6 +15202,7 @@ impl Simulator {
             if let StatementKind::ParBlock {
                 stmts: sub_stmts,
                 join_type,
+                name: block_name,
                 ..
             } = &stmt.kind
             {
@@ -15214,8 +15221,17 @@ impl Simulator {
                     child_pids.insert(pid_child);
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
+                if let Some(nm) = block_name {
+                    self.fork_block_children.insert(nm.name.clone(), child_pids.clone());
+                }
 
-                if *join_type == JoinType::JoinNone {
+                // An empty fork (or one whose only items were declarations)
+                // has nothing to wait for and completes at once, whatever the
+                // join type. A JoinWaiter is re-checked only when a child
+                // finishes, so a waiter with no children would never fire —
+                // `fork join` with an empty body used to drop the entire
+                // continuation.
+                if *join_type == JoinType::JoinNone || child_pids.is_empty() {
                     // Continue immediately
                     i += 1;
                     continue;
@@ -25168,7 +25184,7 @@ impl Simulator {
                 }
             }
             StatementKind::ParBlock {
-                stmts, join_type, ..
+                stmts, join_type, name: block_name, ..
             } => {
                 // Mirror the suspend-aware path (run_process_stmts): children are
                 // parented to the CURRENT pid (not 0) and inherit a *snapshot* of
@@ -25190,10 +25206,15 @@ impl Simulator {
                     child_set.insert(pid);
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
+                if let Some(nm) = block_name {
+                    self.fork_block_children.insert(nm.name.clone(), child_set.clone());
+                }
                 match join_type {
                     // `join` waits for all, `join_any` for the first; both suspend
                     // the forking process via a JoinWaiter. `join_none` continues.
-                    JoinType::Join | JoinType::JoinAny => {
+                    // An empty fork has no children to wait for, so it must NOT
+                    // suspend — a childless waiter is never re-checked.
+                    JoinType::Join | JoinType::JoinAny if !child_set.is_empty() => {
                         self.join_waiters.push(JoinWaiter {
                             parent_pid: self.current_pid,
                             child_pids: child_set,
@@ -25204,7 +25225,7 @@ impl Simulator {
                         });
                         self.break_flag = true; // Suspend current execution
                     }
-                    JoinType::JoinNone => {}
+                    _ => {}
                 }
             }
             StatementKind::TimingControl { control, stmt } => {
@@ -25294,6 +25315,34 @@ impl Simulator {
                 // named block, truncated the disabling process, and leaked into
                 // unrelated processes.
                 //
+                // A named `fork : blk ... join*` block: terminate the processes
+                // it spawned (and their descendants), and CONTINUE. A join_none
+                // fork block has already returned, so trying to unwind to it
+                // below would run off the end of the disabling process and drop
+                // its continuation — which is exactly what used to happen.
+                if let Some(children) = self.fork_block_children.get(&name.name).cloned() {
+                    let mut to_kill: HashSet<usize> = HashSet::default();
+                    for &c in &children {
+                        to_kill.insert(c);
+                        to_kill.extend(self.collect_fork_descendants(c));
+                    }
+                    // If the disabling process is itself one of them (disabling
+                    // the block it is currently inside), fall through to the
+                    // unwind path rather than killing itself here.
+                    if !to_kill.contains(&self.current_pid) {
+                        for &pid in &to_kill {
+                            self.killed_pids.insert(pid);
+                            self.process_parents.remove(&pid);
+                            self.process_contexts.remove(&pid);
+                        }
+                        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        for q in self.mailbox_get_waiters.values_mut() {
+                            q.retain(|w| !to_kill.contains(&w.pid));
+                        }
+                        self.release_killed_from_join_waiters(&to_kill);
+                        return;
+                    }
+                }
                 // A label naming ANOTHER process's top-level block terminates
                 // that process; the disabling process carries on.
                 if let Some(&pid) = self.disable_labels.get(&name.name) {
