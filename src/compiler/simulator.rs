@@ -14541,8 +14541,51 @@ impl Simulator {
         } else {
             self.process_contexts.remove(&pid);
         }
+        // IEEE 1800-2023 §9.3.2: automatic variables declared in the parent
+        // scope are SHARED with fork children — a child's write must be
+        // visible to the parent (and to siblings after the parent resumes).
+        // xezim gives each fork child a COPY of the parent's locals (see
+        // inherit_fork_child_context), so propagate the child's local frames
+        // back into the parent's saved context. Without this, UVM 2020's
+        // m_safe_select_item idiom (`fork … select_process = process::self();
+        // … join_none; wait(select_process != null)`) deadlocks: the parent
+        // never sees the child's assignment and the `wait` parks forever.
+        // 2017's sequencer has no such fork-and-wait idiom, which is why it
+        // completes. We merge every frame the child shares with the parent
+        // (child may have pushed extra frames via nested calls — those are
+        // skipped), exactly mirroring shared-automatic semantics.
+        self.propagate_fork_locals_to_parent(pid);
         self.restore_process_context(saved);
         *self.name_resolve_hint.borrow_mut() = saved_hint;
+    }
+
+    /// Merge a (just-run) fork child's local frames into its parent process's
+    /// saved context so the parent observes the child's writes to shared
+    /// automatic variables (IEEE 1800-2023 §9.3.2). See the call site in
+    /// `run_scheduled_process` for the full rationale. Only frames that exist
+    /// in BOTH the child and parent stacks are merged (the child may hold
+    //  extra frames from nested subroutine calls; the parent may hold extra
+    //  frames pushed after the fork).
+    fn propagate_fork_locals_to_parent(&mut self, child_pid: usize) {
+        let parent_pid = match self.process_parents.get(&child_pid).copied() {
+            Some(p) => p,
+            None => return,
+        };
+        // `self.local_stack` currently holds the CHILD's frames (captured
+        // before we restore the event-loop caller's context below).
+        let child_frames: Vec<HashMap<String, Value>> = self.local_stack.clone();
+        if child_frames.is_empty() {
+            return;
+        }
+        let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) else {
+            return;
+        };
+        let n = parent_ctx.local_stack.len().min(child_frames.len());
+        for i in 0..n {
+            for (k, v) in &child_frames[i] {
+                parent_ctx.local_stack[i].insert(k.clone(), v.clone());
+            }
+        }
     }
 
     /// Evaluate a `#delay` expression to an integer number of simulator ticks.
@@ -15538,6 +15581,7 @@ impl Simulator {
                     | "m_wait_for_available_sequence"
                     | "m_wait_for_arbitration_completed"
                     | "m_wait_arb_not_equal"
+                    | "m_safe_select_item"
                     | "uvm_wait_for_nba_region"
                     | "execute_item"
                     | "send_request"
@@ -35660,6 +35704,25 @@ impl Simulator {
                         return Value::zero(32);
                     }
                 }
+                // IEEE 1800-2023 §9.7: `process::self()` returns a handle to
+                // the CURRENT process — never null. xezim doesn't model the
+                // built-in `process` class as a real heap object, so a static
+                // call `process::self()` fell through to generic dispatch and
+                // returned 0 (null). UVM 2020.3.1's `uvm_sequencer_param_base::
+                // m_safe_select_item` does `select_process = process::self();
+                // ... wait(select_process != null);` — with a null handle that
+                // `wait` blocks forever, so `get_next_item` never returns, the
+                // sequence body never completes, the run-phase objection never
+                // drops, and the sim runs to max_time. Return an opaque non-null
+                // token (offset into a high range so it never collides with a
+                // real heap index; the `.status` workaround in the MemberAccess
+                // handler then yields RUNNING for it). 2017's sequencer has no
+                // `m_safe_select_item` wrapper, which is why 2017 completes.
+                if name == "process" && mname == "self" {
+                    const PROCESS_HANDLE_BASE: u64 = 0x7000_0000;
+                    let h = PROCESS_HANDLE_BASE.wrapping_add(self.current_pid as u64);
+                    return Value::from_u64(h, 64);
+                }
                 // Static method call: `ClassName::method(args)`. The LHS
                 // names a class and is not a variable holding a handle.
                 if hier.path.len() == 1
@@ -35764,6 +35827,26 @@ impl Simulator {
                     if let (Some(v), Some(arg)) = (val, args.first()) {
                         let w = self.infer_lhs_width(arg);
                         self.assign_value(arg, &v.resize(w));
+                        return Value::from_u64(1, 32);
+                    }
+                    return Value::zero(32);
+                }
+                // §15.4.3: `semaphore.try_get(int key = 1)` — non-blocking
+                // attempt to procure `key` keys. Returns 1 on success (count
+                // decremented), 0 if not enough keys. UVM 2020.3.1's
+                // uvm_sequence_base::start gates re-entry with
+                // `m_sequence_state_mutex.try_get(1)`; without this the call
+                // fell through to generic dispatch and returned 0, falsely
+                // reporting `SEQ_NOT_DONE ... already started` (sequence never
+                // started at all) at time 0.
+                if self.semaphores.contains_key(&handle) {
+                    let n = args
+                        .first()
+                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
+                        .unwrap_or(1) as i64;
+                    let count = self.semaphores.get_mut(&handle).unwrap();
+                    if *count >= n && n >= 0 {
+                        *count -= n;
                         return Value::from_u64(1, 32);
                     }
                     return Value::zero(32);
@@ -36039,6 +36122,19 @@ impl Simulator {
         if let ExprKind::Ident(hier) = &func.kind {
             let path = &hier.path;
             let len = path.len();
+
+            // IEEE 1800-2023 §9.7: `process::self()` (2-segment scoped-Ident
+            // parse shape for the `::` call) — see the MemberAccess-form
+            // handler for the full rationale. Returns a non-null opaque
+            // process handle.
+            if len == 2
+                && path[0].name.name == "process"
+                && path[1].name.name == "self"
+            {
+                const PROCESS_HANDLE_BASE: u64 = 0x7000_0000;
+                let h = PROCESS_HANDLE_BASE.wrapping_add(self.current_pid as u64);
+                return Value::from_u64(h, 64);
+            }
 
             // `std::randomize(vars)` where the scope qualifier flattened into
             // the ident path (`Call{ Ident([std, randomize]) }`) — the
