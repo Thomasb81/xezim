@@ -235,7 +235,9 @@ Common options:
 | `--simulate` | Run the simulation (vs `--parse` / `--compile` / `--preprocess`) |
 | `-s <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); xezim elaborates them all under a synthetic wrapper |
 | `--dpi-lib <path>` | Load a DPI-C shared library (`.so`/`.dylib`/`.dll`). Repeatable. See [docs/dpi-guide.md](docs/dpi-guide.md). |
-| `--max-time <N>` | Stop simulation at time `N` |
+| `--vpi-lib <path>` (`-m`) | Load a VPI module and run its `vlog_startup_routines` (system-task registration, design walk). Repeatable. |
+| `--module-timescale [mods=]<unit>/<prec>` | Assign a timescale to modules with no explicit source-level one. See [below](#module-timescale-extension). Repeatable. |
+| `--max-time <N>` | Stop simulation at time `N` (counted in the design's finest time precision) |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
 | `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate standard delays |
@@ -259,6 +261,47 @@ Example — run the picorv32 testbench against a gate-level netlist:
 ./target/release/xezim testbench.v synth.v \
     +firmware=firmware/firmware.hex --max-time 50000000
 ```
+
+## Module-timescale extension
+
+`--module-timescale` is an xezim-specific command-line extension. It assigns a
+time unit and precision to module *definitions* that have **no explicit
+source-level timescale**, without changing the semantics of the source. It is
+handy for retrofitting a timescale onto legacy RTL that omits one, or onto a
+mix of files where only some carry `` `timescale ``.
+
+```bash
+# Every module without an explicit timescale gets 1ns/1ps:
+xezim --module-timescale 1ns/1ps design.sv
+
+# Only the listed definitions (comma-separated), 10ns/1ns:
+xezim --module-timescale cpu,cache=10ns/1ns design.sv
+
+# Repeatable; the named form wins over the global one:
+xezim --module-timescale 1ns/1ps --module-timescale dram=1ps/1fs design.sv
+```
+
+**A module has an explicit source-level timescale** — which the option never
+overrides — when it has a `timeunit`/`timeprecision` declaration, **or** a
+`` `timescale `` directive is active where it is declared (`` `resetall ``
+clears that). Effective precedence, highest first:
+
+1. module-local `timeunit` / `timeprecision`
+2. an active `` `timescale `` directive
+3. a named `--module-timescale mods=<unit>/<prec>`
+4. a global `--module-timescale <unit>/<prec>`
+5. the 1ns / 1ns default
+
+The precision must be equal to or finer than the unit (`1ns/1ps` is legal,
+`1ps/1ns` is an error). Two *different* named assignments for the same module
+are an error; an unmatched name, or one that lands on a module that already has
+an explicit timescale, is a warning (the assignment is ignored). Assignments
+apply to a definition, so every instance of it shares the timescale.
+
+Sub-nanosecond precision is honoured — the simulation tick is the finest
+precision declared anywhere in the design, down to `fs`. (`--max-time` is
+counted in that tick, so a `1ps`-precision design covers proportionally less
+wall-clock time for the same `--max-time`.)
 
 ---
 
