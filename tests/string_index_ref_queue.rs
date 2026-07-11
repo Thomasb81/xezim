@@ -104,6 +104,28 @@ end endmodule
     assert!(o.contains("C=0 '{}"), "q = {{}} did not clear the queue: {}", o);
 }
 
+#[test]
+fn percent_p_on_a_local_string_valued_assoc_quotes_the_values() {
+    // §21.2.1.7 — a LOCAL `string m[...]` (string-VALUED associative array) must
+    // render its values quoted, not as their character codes. Covers both an
+    // int-keyed and a string-keyed map. (Module-scope arrays already worked via
+    // `var_decl_types`; a local has no such entry, so the name must be marked.)
+    let o = out(r#"
+module m; initial begin
+  string ai[int]; string sk[string];
+  ai[0] = "x"; ai[1] = "y";
+  sk["a"] = "apple";
+  $display("AI=%p", ai);
+  $display("SK=%p", sk);
+  // reads must be unaffected by the string marking
+  $display("R=%s L=%0d", ai[1], ai[1].len());
+end endmodule
+"#);
+    assert!(o.contains(r#"AI='{0:"x", 1:"y"}"#), "int-keyed string assoc %p: {}", o);
+    assert!(o.contains(r#"SK='{"a":"apple"}"#), "string-keyed string assoc %p: {}", o);
+    assert!(o.contains("R=y L=1"), "string-valued assoc read broke: {}", o);
+}
+
 /// The whole helper end to end: split on '.' then on ':', with a clear between.
 #[test]
 fn the_hierarchical_split_helper_works_end_to_end() {

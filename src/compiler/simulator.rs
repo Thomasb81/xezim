@@ -25596,9 +25596,11 @@ impl Simulator {
                             }
                         } else if self.string_signals.contains(&name) {
                             // foreach over a string iterates its characters
-                            // [0..len). Bit-by-bit width would visit 8× too many
-                            // indices and an unreliable local width can under-run.
-                            let len = (self.eval_expr(array).width as usize / 8) as u64;
+                            // [0..len). Use the CONTENT length: a string is held
+                            // in a fixed-width container (e.g. 1024 bits), so
+                            // `width/8` is the container size (128), not the
+                            // string length — the loop ran 128 times over "hi".
+                            let len = self.eval_expr(array).to_sv_string().len() as u64;
                             for i in 0..len {
                                 if self.finished {
                                     break;
@@ -26400,6 +26402,22 @@ impl Simulator {
                                     .associative_arrays
                                     .insert(name.clone(), is_string_key);
                                 self.widths.insert(name.clone(), w);
+                                // A `string m[...]` (string-VALUED assoc): mark the
+                                // name so its elements render as quoted strings under
+                                // `%p` (the element-string check keys off the array
+                                // name being in `string_signals`). This mirrors the
+                                // string-queue marking above.
+                                if matches!(
+                                    data_type,
+                                    crate::ast::types::DataType::Simple {
+                                        kind: crate::ast::types::SimpleType::String,
+                                        ..
+                                    }
+                                ) {
+                                    self.string_signals.insert(name.clone());
+                                } else {
+                                    self.string_signals.remove(&name);
+                                }
                                 // If the element type is a known class, record it
                                 // so `assoc[k] = new()` constructs the right class
                                 // (ranged arrays get this at elaborate time; assoc
@@ -32754,10 +32772,18 @@ impl Simulator {
                         || self.string_signals.contains(&format!("{}[0]", name));
                     (0..sz)
                         .map(|i| {
-                            let ev = self
-                                .get_signal_value_by_name(&format!("{}[{}]", name, i))
-                                .unwrap_or_else(|| Value::zero(32));
-                            Self::render_p_value(&ev, is_str)
+                            let elem = format!("{}[{}]", name, i);
+                            // An element may itself be a collection (`int
+                            // q[$][$]`): recurse so it renders as a nested list
+                            // rather than a packed value.
+                            if let Some(nested) = self.render_p_var(&elem) {
+                                nested
+                            } else {
+                                let ev = self
+                                    .get_signal_value_by_name(&elem)
+                                    .unwrap_or_else(|| Value::zero(32));
+                                Self::render_p_value(&ev, is_str)
+                            }
                         })
                         .collect()
                 }
@@ -32777,12 +32803,78 @@ impl Simulator {
             let dt = self.p_elem_type(name)?;
             return Some(self.render_p_dims(name, &dims, &dt));
         }
+        // Associative array — handled before the type gate so a LOCAL assoc
+        // (no `var_decl_types` entry) still renders instead of bailing to `x`.
+        // Element type comes from the declared type when known, else each
+        // element renders from its raw value.
+        if self.module.associative_arrays.contains_key(name) {
+            let dt = self
+                .module
+                .var_decl_types
+                .get(name)
+                .cloned()
+                .or_else(|| self.flat_path_type(name).map(|(d, _)| d));
+            let prefix = format!("{}[", name);
+            let mut keys: Vec<String> = self
+                .signals
+                .keys()
+                .map(|k| k.as_str())
+                .chain(self.signal_name_to_id.keys().map(|k| &**k))
+                .filter_map(|k| k.strip_prefix(prefix.as_str()))
+                .filter_map(|rest| rest.split(']').next())
+                .map(|s| s.to_string())
+                .collect();
+            keys.sort();
+            keys.dedup();
+            if keys.iter().all(|k| k.parse::<i64>().is_ok()) {
+                keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
+            }
+            let string_keyed = self.is_string_keyed_array(name);
+            let val_is_str = self.string_signals.contains(name);
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    let elem = format!("{}[{}]", name, k);
+                    let v = match &dt {
+                        Some(d) => self.render_p_typed(&elem, d),
+                        None => {
+                            let ev = self
+                                .get_signal_value_by_name(&elem)
+                                .unwrap_or_else(|| Value::zero(32));
+                            Self::render_p_value(&ev, val_is_str)
+                        }
+                    };
+                    if string_keyed {
+                        format!("\"{}\":{}", k, v)
+                    } else {
+                        format!("{}:{}", k, v)
+                    }
+                })
+                .collect();
+            return Some(format!("'{{{}}}", parts.join(", ")));
+        }
         let Some(dt) = self.module.var_decl_types.get(name).cloned() else {
             let (dt, arr) = self.flat_path_type(name)?;
             if let Some(idxs) = arr {
                 let parts: Vec<String> = idxs
                     .iter()
-                    .map(|i| self.render_p_typed(&format!("{}[{}]", name, i), &dt))
+                    .map(|i| {
+                        // An element may itself be a collection (`int aq[2][$]`:
+                        // each `aq[i]` is a queue). A LOCAL such array has no
+                        // `var_decl_types` entry, so recurse through `render_p_var`
+                        // when the element is a registered collection; otherwise
+                        // it renders as the scalar element type.
+                        let elem = format!("{}[{}]", name, i);
+                        if self.module.dynamic_arrays.contains(&elem)
+                            || self.module.associative_arrays.contains_key(&elem)
+                            || self.module.arrays.contains_key(&elem)
+                        {
+                            if let Some(nested) = self.render_p_var(&elem) {
+                                return nested;
+                            }
+                        }
+                        self.render_p_typed(&elem, &dt)
+                    })
                     .collect();
                 return Some(format!("'{{{}}}", parts.join(", ")));
             }
