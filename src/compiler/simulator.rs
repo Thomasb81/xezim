@@ -19457,17 +19457,17 @@ impl Simulator {
                     // i-th character (byte). `s[0]` is the leftmost char, which
                     // sits in the most-significant byte of the packed value.
                     if self.string_signals.contains(&name) {
-                        let cur = self.eval_expr(expr);
-                        let len = (cur.width as usize) / 8;
+                        // Replace the i-th character of the string CONTENT (not
+                        // a byte of the fixed-width container, which would write
+                        // the wrong position and grow the string). Mirrors putc.
+                        let content = self.eval_expr(expr).to_sv_string();
                         let i = idx_val.to_u64().unwrap_or(0) as usize;
-                        if i < len {
-                            let byte_pos = len - 1 - i;
-                            let cbyte = val.resize(8);
-                            let mut newv = cur.clone();
-                            for b in 0..8 {
-                                newv.set_bit(byte_pos * 8 + b, cbyte.get_bit(b));
-                            }
-                            return self.assign_value(expr, &newv);
+                        let cbyte = (val.resize(8).to_u64().unwrap_or(0) & 0xFF) as u8;
+                        let mut b = content.into_bytes();
+                        if i < b.len() && cbyte != 0 {
+                            b[i] = cbyte;
+                            let out = String::from_utf8_lossy(&b).into_owned();
+                            return self.assign_value(expr, &Value::from_string(&out));
                         }
                         return false;
                     }
@@ -21666,18 +21666,18 @@ impl Simulator {
                     }
                 }
                 // String character read: `s[i]` returns the i-th character
-                // (byte), `s[0]` being the leftmost (most-significant) byte.
+                // (byte), `s[0]` being the leftmost. Index the actual string
+                // CONTENT, not `width/8`: a string variable is stored in a
+                // fixed-width container (e.g. 1024 bits), so `width/8` is the
+                // container size, not the string length — indexing that read
+                // the empty leading bytes and always returned 0.
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let nm = self.resolve_hier_name(hier);
                     if self.string_signals.contains(&nm) {
-                        let base_v = self.eval_expr(expr);
-                        let len = (base_v.width as usize) / 8;
+                        let content = self.eval_expr(expr).to_sv_string();
                         let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
-                        if i < len {
-                            let byte_pos = len - 1 - i;
-                            return base_v.range_select(byte_pos * 8 + 7, byte_pos * 8);
-                        }
-                        return Value::zero(8);
+                        let byte = content.as_bytes().get(i).copied().unwrap_or(0);
+                        return Value::from_u64(byte as u64, 8);
                     }
                 }
                 // Packed multi-D signal element select (LRM §7.4.1): for
@@ -23835,9 +23835,15 @@ impl Simulator {
                     // method isn't always registered in `string_signals`, so
                     // `lk = {a, "__M_UVM__", b}` (config_db's resource key) would
                     // otherwise fall to numeric bit-concat and read as "".
-                    if self.string_signals.contains(&lname)
-                        || self.string_signals.contains(&lh.path.last().map(|s| s.name.name.clone()).unwrap_or_default())
-                        || self.expr_is_string_valued(rvalue)
+                    // A string QUEUE is in `string_signals` too (so its
+                    // elements render as strings), but `q = {...}` on it is a
+                    // QUEUE assignment — `q = {}` clears it — not a byte concat.
+                    let lhs_is_queue = self.module.dynamic_arrays.contains(&lname)
+                        || self.module.arrays.contains_key(&lname);
+                    if !lhs_is_queue
+                        && (self.string_signals.contains(&lname)
+                            || self.string_signals.contains(&lh.path.last().map(|s| s.name.name.clone()).unwrap_or_default())
+                            || self.expr_is_string_valued(rvalue))
                     {
                         let mut s = String::new();
                         for p in parts {
@@ -26313,6 +26319,19 @@ impl Simulator {
                                 self.module.dynamic_arrays.insert(name.clone());
                                 self.widths.insert(name.clone(), w);
                                 self.set_queue_size(&name, 0);
+                                // A `string q[$]` queue: mark the name so its
+                                // elements are treated as strings (`%p`, `%s`,
+                                // concat) — the element-string check keys off
+                                // the queue name being in `string_signals`.
+                                if matches!(
+                                    data_type,
+                                    crate::ast::types::DataType::Simple {
+                                        kind: crate::ast::types::SimpleType::String,
+                                        ..
+                                    }
+                                ) {
+                                    self.string_signals.insert(name.clone());
+                                }
                                 // LRM §7.10 / §7.12.1 — if an initializer
                                 // is provided (e.g. `int idx[$] =
                                 // q.find_first_index with (…);`),
@@ -32722,11 +32741,27 @@ impl Simulator {
         // fixed 64-slot buffer it is backed by. Its ELEMENTS (`q[i]` of an
         // array of queues) have no declared type of their own.
         if self.module.dynamic_arrays.contains(name) {
-            let dt = self.p_elem_type(name)?;
             let sz = self.get_queue_size(name);
-            let parts: Vec<String> = (0..sz)
-                .map(|i| self.render_p_typed(&format!("{}[{}]", name, i), &dt))
-                .collect();
+            // A LOCAL queue has no entry in `var_decl_types`, so `p_elem_type`
+            // returns None; fall back to rendering each element from its stored
+            // value (string elements quoted) instead of bailing to `x`.
+            let parts: Vec<String> = match self.p_elem_type(name) {
+                Some(dt) => (0..sz)
+                    .map(|i| self.render_p_typed(&format!("{}[{}]", name, i), &dt))
+                    .collect(),
+                None => {
+                    let is_str = self.string_signals.contains(name)
+                        || self.string_signals.contains(&format!("{}[0]", name));
+                    (0..sz)
+                        .map(|i| {
+                            let ev = self
+                                .get_signal_value_by_name(&format!("{}[{}]", name, i))
+                                .unwrap_or_else(|| Value::zero(32));
+                            Self::render_p_value(&ev, is_str)
+                        })
+                        .collect()
+                }
+            };
             return Some(format!("'{{{}}}", parts.join(", ")));
         }
         // A MULTI-dimensional unpacked array is a nested element list; only the
@@ -33483,19 +33518,25 @@ impl Simulator {
     /// parameter storage uses the bare parameter name, so deep recursion through
     /// the same queue parameter is not isolated — acceptable for the generator's
     /// non-recursive `gen_section`-style helpers.)
+    /// Bind a queue-typed argument into the call frame. Returns `Some(caller)`
+    /// on success — the caller's queue name, or an empty string for a literal
+    /// actual (nothing to write back to). `None` when `arg` is not a queue.
+    /// The caller writes the param's queue back to `caller` for a `ref`/
+    /// `output`/`inout` formal; without that, a `ref` queue's `push_back` was
+    /// lost on return (§13.5.2).
     fn bind_queue_param(
         &mut self,
         pname: &str,
         dims: &[crate::ast::types::UnpackedDimension],
         arg: &Expression,
         queue_data_type: &crate::ast::types::DataType,
-    ) -> bool {
+    ) -> Option<String> {
         use crate::ast::types::{DataType, UnpackedDimension};
         if !matches!(
             dims.first(),
             Some(UnpackedDimension::Queue { .. }) | Some(UnpackedDimension::Unsized(_))
         ) {
-            return false;
+            return None;
         }
         // A queue literal / assignment pattern (`{"a", "b"}` or `'{...}`) passed
         // directly as the actual: bind each top-level element as one queue
@@ -33555,7 +33596,7 @@ impl Simulator {
                 self.set_signal_value_by_name(&format!("{}[{}]", pname, j), v);
             }
             self.set_queue_size(pname, parts.len() as u64);
-            return true;
+            return Some(String::new());
         }
         let cname = if let ExprKind::Ident(h) = &arg.kind {
             let mut n = self.resolve_hier_name(h);
@@ -33564,10 +33605,10 @@ impl Simulator {
             }
             n
         } else {
-            return false;
+            return None;
         };
         if !self.module.arrays.contains_key(&cname) && !self.module.dynamic_arrays.contains(&cname) {
-            return false;
+            return None;
         }
         let size = self.get_queue_size(&cname);
         let w = self.module.arrays.get(&cname).map(|t| t.2).unwrap_or(32);
@@ -33583,7 +33624,39 @@ impl Simulator {
             self.set_signal_value_by_name(&format!("{}[{}]", pname, j), v);
         }
         self.set_queue_size(pname, size);
-        true
+        Some(cname)
+    }
+
+    /// Copy a queue param's contents back to the caller's queue on return
+    /// (ref/output/inout). The caller's queue may have grown or shrunk, so its
+    /// stale element signals are cleared first.
+    fn writeback_queue_param(&mut self, param: &str, caller: &str) {
+        if caller.is_empty() || param == caller {
+            return;
+        }
+        let size = self.get_queue_size(param);
+        let w = self.module.arrays.get(param).map(|t| t.2).unwrap_or(32);
+        let vals: Vec<Value> = (0..size)
+            .map(|j| {
+                self.get_signal_value_by_name(&format!("{}[{}]", param, j))
+                    .unwrap_or_else(|| Value::zero(w))
+            })
+            .collect();
+        let stale: Vec<String> = self
+            .signals
+            .keys()
+            .filter(|k| k.starts_with(&format!("{}[", caller)))
+            .cloned()
+            .collect();
+        for k in stale {
+            self.signals.remove(&k);
+        }
+        self.module.arrays.insert(caller.to_string(), (0, -1, w));
+        self.module.dynamic_arrays.insert(caller.to_string());
+        for (j, v) in vals.into_iter().enumerate() {
+            self.set_signal_value_by_name(&format!("{}[{}]", caller, j), v);
+        }
+        self.set_queue_size(caller, size);
     }
 
     /// LRM §8.4: evaluate a value argument destined for a queue/array
@@ -37228,6 +37301,7 @@ impl Simulator {
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
+        let mut queue_writebacks: Vec<(String, String)> = Vec::new();
         for (i, port) in fd.ports.iter().enumerate() {
             let is_out = matches!(
                 port.direction,
@@ -37241,8 +37315,15 @@ impl Simulator {
                     continue;
                 }
             }
-            if i < args.len() && self.bind_queue_param(&port.name.name, &port.dimensions, &args[i], &port.data_type) {
-                continue;
+            if i < args.len() {
+                if let Some(caller) =
+                    self.bind_queue_param(&port.name.name, &port.dimensions, &args[i], &port.data_type)
+                {
+                    if is_out && !caller.is_empty() {
+                        queue_writebacks.push((port.name.name.clone(), caller));
+                    }
+                    continue;
+                }
             }
             // Unpacked ARRAY formal: functions never bound one, so the body read
             // X and a `ref` write never reached the caller (§13.5.2).
@@ -37308,6 +37389,9 @@ impl Simulator {
                 self.writeback_assoc_param(&param, &caller);
             }
             self.purge_assoc_param(&param);
+        }
+        for (param, caller) in &queue_writebacks {
+            self.writeback_queue_param(param, caller);
         }
         self.writeback_array_args(&array_writebacks);
         for (param, ..) in &array_writebacks {
@@ -40963,6 +41047,7 @@ impl Simulator {
                     // actual on return (e.g. `randomize_instr(output riscv_instr
                     // instr, …)` writing the picked instruction to `instr_list[i]`).
                     let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+                    let mut queue_writebacks: Vec<(String, String)> = Vec::new();
                     for (i, port) in ports.iter().enumerate() {
                         if matches!(
                             port.direction,
@@ -40971,10 +41056,22 @@ impl Simulator {
                         {
                             output_bindings.push((port.name.name.clone(), args[i].clone()));
                         }
-                        if i < args.len()
-                            && self.bind_queue_param(&port.name.name, &port.dimensions, &args[i], &port.data_type)
-                        {
-                            continue;
+                        if i < args.len() {
+                            if let Some(caller) = self.bind_queue_param(
+                                &port.name.name,
+                                &port.dimensions,
+                                &args[i],
+                                &port.data_type,
+                            ) {
+                                let is_out = matches!(
+                                    port.direction,
+                                    PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                                );
+                                if is_out && !caller.is_empty() {
+                                    queue_writebacks.push((port.name.name.clone(), caller));
+                                }
+                                continue;
+                            }
                         }
                         let mut val = if i < args.len() {
                             self.eval_expr(&args[i])
@@ -41173,6 +41270,9 @@ impl Simulator {
                     self.local_stack.pop();
                     self.this_stack.pop();
                     self.pop_and_restore_queue_frame();
+                    for (param, caller) in &queue_writebacks {
+                        self.writeback_queue_param(param, caller);
+                    }
                     for (v, caller) in writebacks {
                         self.assign_value(&caller, &v);
                     }
