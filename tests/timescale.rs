@@ -104,3 +104,47 @@ endmodule
 "#);
     assert!(o.contains("is 1us / 10ns"), "got: {}", o);
 }
+
+// §3.14.1: sub-nanosecond precision is honoured — the simulation tick is the
+// finest precision declared anywhere, not a fixed 1 ns. (Fixed as a side
+// effect of the per-module timescale rework; there is no longer a 1 ns floor.)
+
+#[test]
+fn one_picosecond_precision_is_honoured() {
+    let o = out(r#"
+`timescale 1ns/1ps
+module m; initial begin
+  #0.5;  $display("A=%0f", $realtime);   // 0.5 ns = 500 ps
+  #0.001; $display("B=%0f", $realtime);  // + 1 ps
+end endmodule
+"#);
+    assert!(o.contains("A=0.500000"), "0.5ns must be exact under 1ps precision: {}", o);
+    assert!(o.contains("B=0.501000"), "a 1ps step must advance time: {}", o);
+}
+
+#[test]
+fn a_picosecond_timescale_counts_in_picoseconds() {
+    let o = out(r#"
+`timescale 1ps/1ps
+module m; initial begin #500; $display("T=%0d", $time); end endmodule
+"#);
+    assert!(o.contains("T=500"), "#500 under 1ps must read 500, not 0: {}", o);
+}
+
+#[test]
+fn femtosecond_precision_works() {
+    let o = out(r#"
+`timescale 1ps/1fs
+module m; initial begin #1; $display("T=%0d R=%0f", $time, $realtime); end endmodule
+"#);
+    assert!(o.contains("T=1"), "1ps unit, fs precision: {}", o);
+}
+
+#[test]
+fn sub_ns_precision_emits_no_warning() {
+    // The old "sim ticks are 1ns" warning was stale and is gone.
+    let sim = simulate("`timescale 1ns/1ps\nmodule m; initial #1.5 $display(\"x\"); endmodule", 100)
+        .expect("simulate failed");
+    let joined = sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n");
+    assert!(!joined.contains("ticks are 1ns"), "stale sub-ns warning leaked: {}", joined);
+}
