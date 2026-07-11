@@ -76,6 +76,7 @@ fn print_usage() {
     eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
+    eprintln!("  --module-timescale [mods=]<unit>/<prec>  Timescale for modules with no explicit one");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
     eprintln!("  --xtrace <file>  Emit XTrace v1.0 dump to <file>");
@@ -104,6 +105,80 @@ fn print_usage() {
 
 fn print_version() {
     println!("xezim version {}", env!("CARGO_PKG_VERSION"));
+}
+
+/// Parse a SystemVerilog time literal (`1ns`, `10ns`, `100ps`) to a power-of-
+/// ten seconds exponent. Rejects an illegal mantissa or unit.
+fn parse_time_literal(s: &str) -> Result<i32, String> {
+    let s = s.trim();
+    let split = s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len());
+    let (digits, unit) = s.split_at(split);
+    let mantissa_exp = match digits.trim() {
+        "1" => 0,
+        "10" => 1,
+        "100" => 2,
+        other => return Err(format!("invalid time mantissa '{}' (must be 1, 10, or 100)", other)),
+    };
+    let unit_exp = match unit.trim() {
+        "s" => 0,
+        "ms" => -3,
+        "us" => -6,
+        "ns" => -9,
+        "ps" => -12,
+        "fs" => -15,
+        other => return Err(format!("invalid time unit '{}'", other)),
+    };
+    Ok(mantissa_exp + unit_exp)
+}
+
+/// Parse a `<unit>/<precision>` timescale value, checking precision <= unit.
+fn parse_timescale_value(d: &str) -> Result<(i32, i32), String> {
+    let (u, p) = d.split_once('/').ok_or_else(|| {
+        format!("invalid --module-timescale value '{}' (expected <unit>/<precision>)", d)
+    })?;
+    let ue = parse_time_literal(u)?;
+    let pe = parse_time_literal(p)?;
+    // A larger precision exponent means coarser precision; precision must be
+    // equal to or finer (<=) the unit.
+    if pe > ue {
+        return Err(format!(
+            "invalid --module-timescale '{}': precision {} is larger than unit {}",
+            d,
+            p.trim(),
+            u.trim()
+        ));
+    }
+    Ok((ue, pe))
+}
+
+/// Build the `--module-timescale` configuration from raw option strings,
+/// validating units and detecting conflicting named assignments.
+fn build_module_timescale_cli(raw: &[String]) -> Result<xezim::ModuleTimescaleCli, String> {
+    let mut cli = xezim::ModuleTimescaleCli::default();
+    for spec in raw {
+        let (modules, value) = match spec.split_once('=') {
+            Some((m, v)) => (Some(m), v),
+            None => (None, spec.as_str()),
+        };
+        let ts = parse_timescale_value(value)?;
+        match modules {
+            None => cli.global = Some(ts),
+            Some(list) => {
+                for m in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    if let Some(&existing) = cli.named.get(m) {
+                        if existing != ts {
+                            return Err(format!(
+                                "conflicting --module-timescale assignments for module '{}'",
+                                m
+                            ));
+                        }
+                    }
+                    cli.named.insert(m.to_string(), ts);
+                }
+            }
+        }
+    }
+    Ok(cli)
 }
 
 fn push_define_token(tok: &str, defines: &mut Vec<(String, Option<String>)>) {
@@ -432,6 +507,7 @@ fn main() {
     let mut sim_debug = false;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut vpi_libs: Vec<String> = Vec::new();
+    let mut module_timescale_args: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
     let mut threads: usize = 1;
     let mut emit_hypergraph: Option<String> = None;
@@ -809,6 +885,14 @@ fn main() {
                     vpi_libs.push(args[i].clone());
                 }
             }
+            // Implementation-defined extension: assign a time unit/precision to
+            // module definitions that have no explicit source-level timescale.
+            "--module-timescale" => {
+                i += 1;
+                if i < args.len() {
+                    module_timescale_args.push(args[i].clone());
+                }
+            }
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
             }
@@ -823,6 +907,17 @@ fn main() {
         eprintln!("Error: no source files specified");
         print_usage();
         std::process::exit(1);
+    }
+
+    // Install the --module-timescale configuration before any elaboration.
+    if !module_timescale_args.is_empty() {
+        match build_module_timescale_cli(&module_timescale_args) {
+            Ok(cli) => xezim::set_module_timescale_cli(cli),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     if let Some(ref path) = log_file {
