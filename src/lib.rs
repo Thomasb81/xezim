@@ -13,8 +13,9 @@ pub mod should_fail_lint;
 // Re-export xezim-core surface so existing `xezim::...` paths keep working.
 pub use xezim_core::{
     ast, diagnostics, lexer, log_eprintln, log_println, parse, parse_and_elaborate_multi,
-    parse_str, preprocessor, read_compiled, set_log_file, sv_parser, tokenize_file, write_compiled,
-    ParseResult, SourceDefinition, XEZIM_BYTECODE_MAGIC,
+    parse_str, preprocessor, read_compiled, set_log_file, set_module_timescale_cli, sv_parser,
+    tokenize_file, write_compiled, ModuleTimescaleCli, ParseResult, SourceDefinition,
+    XEZIM_BYTECODE_MAGIC,
 };
 
 /// Simulate a single source string.
