@@ -76,7 +76,10 @@ fn print_usage() {
     eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
-    eprintln!("  --module-timescale [mods=]<unit>/<prec>  Timescale for modules with no explicit one");
+    eprintln!("  --module-timescale <unit>/<prec>            Timescale for every module with no");
+    eprintln!("                     [mod1,mod2=]<unit>/<prec>   explicit source-level timescale (the");
+    eprintln!("                     named form limits it to the listed modules). Repeatable. Never");
+    eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
     eprintln!("  --xtrace <file>  Emit XTrace v1.0 dump to <file>");
