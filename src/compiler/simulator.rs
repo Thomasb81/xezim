@@ -1615,6 +1615,10 @@ pub struct Simulator {
     pub max_time: u64,
     /// Seconds per simulation tick (finest timescale precision; 1e-9 default).
     pub tick_s: f64,
+    /// $timeformat state (§21.3.5): (units_exp, fraction_digits, suffix,
+    /// min_field_width). `None` until `$timeformat` is called; %t then uses
+    /// the design's finest precision, 0 fraction digits, no suffix.
+    time_format: Option<(i32, usize, String, usize)>,
     /// Maximum iterations for combinatorial settling per cycle.
     pub settle_limit: u32,
     /// Maximum snapshot→apply_nba→settle→check_edges rounds per event-loop
@@ -3105,6 +3109,7 @@ impl Simulator {
             active_union_tag: HashMap::default(),
             max_time,
             tick_s,
+            time_format: None,
             settle_limit: 100,
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
                 .ok()
@@ -22105,9 +22110,9 @@ impl Simulator {
                     v.is_signed = false;
                     v
                 }
-                "$time" => Value::from_u64((self.time as f64 * self.tick_s * 1e9).round() as u64, 64),
-                "$realtime" => Value::from_f64(self.time as f64 * self.tick_s * 1e9),
-                "$stime" => Value::from_u64(((self.time as f64 * self.tick_s * 1e9).round() as u64) & 0xFFFF_FFFF, 32),
+                "$time" => Value::from_u64(self.time_in_current_unit().round() as u64, 64),
+                "$realtime" => Value::from_f64(self.time_in_current_unit()),
+                "$stime" => Value::from_u64((self.time_in_current_unit().round() as u64) & 0xFFFF_FFFF, 32),
                 "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
                     Value::from_u64(0, 1)
                 }
@@ -26894,6 +26899,46 @@ impl Simulator {
 
     fn exec_system_task(&mut self, name: &str, args: &[Expression]) {
         match name {
+            // §21.3.5 $timeformat(units, precision, suffix, min_width). All
+            // arguments are optional in xezim's callers; missing ones keep the
+            // prior/default value.
+            "$timeformat" => {
+                let cur = self.time_format.clone();
+                let units = args
+                    .first()
+                    .map(|a| self.eval_expr(a).to_i64().unwrap_or(-9) as i32)
+                    .unwrap_or_else(|| cur.as_ref().map(|c| c.0).unwrap_or_else(|| Self::secs_to_exp(self.tick_s)));
+                let prec = args
+                    .get(1)
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as usize)
+                    .unwrap_or_else(|| cur.as_ref().map(|c| c.1).unwrap_or(0));
+                let suffix = args
+                    .get(2)
+                    .map(|a| self.eval_expr(a).to_sv_string())
+                    .unwrap_or_else(|| cur.as_ref().map(|c| c.2.clone()).unwrap_or_default());
+                let width = args
+                    .get(3)
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as usize)
+                    .unwrap_or_else(|| cur.as_ref().map(|c| c.3).unwrap_or(0));
+                self.time_format = Some((units, prec, suffix, width));
+            }
+            // §21.2.1.4 $printtimescale [(hier)]. Reports the calling scope's
+            // time unit and precision.
+            "$printtimescale" => {
+                let (unit_exp, prec_exp) = self.current_timescale_exp();
+                let scope = match self.process_scope_hint.get(&self.current_pid) {
+                    Some(s) if !s.is_empty() => format!("{}.{}", self.module.name, s),
+                    _ => self.module.name.clone(),
+                };
+                let m = format!(
+                    "Time scale of ({}) is {} / {}",
+                    scope,
+                    Self::time_exp_to_str(unit_exp),
+                    Self::time_exp_to_str(prec_exp)
+                );
+                self.record_output(m.clone());
+                self.stdout_writeln(&m);
+            }
             "$cast" => {
                 // `$cast(dest, src)` as a statement: evaluate src and assign
                 // to dest. Dynamic-cast type checking is not enforced — a
@@ -27195,15 +27240,20 @@ impl Simulator {
                         '%' => result.push('%'),
                         't' | 'T' => {
                             if ai < args.len() {
-                                if let ExprKind::SystemCall { name, .. } = &args[ai].kind {
-                                    if name == "$time" {
-                                        let s = format!("{}", self.time);
-                                        result.push_str(&pad_string(&s, pad_width, zero_pad));
-                                        ai += 1;
-                                        continue;
+                                // The argument carries a time in the scope's
+                                // unit. $time/$realtime compute it directly; any
+                                // other expression is read as scope-unit too.
+                                let value = match &args[ai].kind {
+                                    ExprKind::SystemCall { name, .. }
+                                        if matches!(name.as_str(), "$time" | "$realtime" | "$stime") =>
+                                    {
+                                        self.time_in_current_unit()
                                     }
-                                }
-                                let s = self.eval_expr(&args[ai]).to_dec_string();
+                                    _ => self.eval_expr(&args[ai]).to_f64(),
+                                };
+                                let s = self.format_time_field(value);
+                                // $timeformat's own min-width governs %t; only
+                                // apply an explicit `%NNt` field width on top.
                                 result.push_str(&pad_string(&s, pad_width, zero_pad));
                                 ai += 1;
                             }
@@ -31776,6 +31826,83 @@ impl Simulator {
     /// consult the class definition, or a wide value lands in a narrow
     /// property intact: `u2_t v; v = 32'hDEADBEEF;` kept all 32 bits.
     /// `None` for reals, class handles and strings, which must not be resized.
+    /// Module definition the current process belongs to, resolved from its
+    /// instance-scope hint. The top module's own definition when there is no
+    /// hint (the process runs in the top scope).
+    fn current_module_def(&self) -> &str {
+        match self.process_scope_hint.get(&self.current_pid) {
+            Some(s) if !s.is_empty() => {
+                let rel = s.strip_prefix(&format!("{}.", self.module.name)).unwrap_or(s);
+                self.module
+                    .instances
+                    .iter()
+                    .find(|i| i.path == rel || i.path == *s)
+                    .map(|i| i.def_name.as_str())
+                    .unwrap_or(self.module.name.as_str())
+            }
+            _ => self.module.name.as_str(),
+        }
+    }
+
+    /// Timeunit / time-precision exponents (powers of 10 in seconds) of the
+    /// current process's module (§20.3). Falls back to the design defaults.
+    fn current_timescale_exp(&self) -> (i32, i32) {
+        let def = self.current_module_def();
+        self.module
+            .module_timescale_exp
+            .get(def)
+            .copied()
+            .unwrap_or((self.module.timeunit_exp, self.module.timeprecision_exp))
+    }
+
+    /// Current simulation time in the current module's time unit, as
+    /// `$time`/`$realtime` require (§20.3). For a default 1 ns design this is
+    /// just the tick count.
+    fn time_in_current_unit(&self) -> f64 {
+        let (unit_exp, _) = self.current_timescale_exp();
+        self.time as f64 * self.tick_s / 10f64.powi(unit_exp)
+    }
+
+    fn secs_to_exp(s: f64) -> i32 {
+        if s <= 0.0 { -9 } else { s.log10().round() as i32 }
+    }
+
+    /// A power-of-ten seconds exponent as a time literal string:
+    /// -6 -> "1us", -8 -> "10ns", -7 -> "100ns".
+    fn time_exp_to_str(exp: i32) -> String {
+        let unit_exp = (exp as f64 / 3.0).floor() as i32 * 3;
+        let mant = 10i64.pow((exp - unit_exp).max(0) as u32);
+        let unit = match unit_exp {
+            0 => "s",
+            -3 => "ms",
+            -6 => "us",
+            -9 => "ns",
+            -12 => "ps",
+            -15 => "fs",
+            _ => "s",
+        };
+        format!("{}{}", mant, unit)
+    }
+
+    /// Format a %t field (§21.2.1.5). `value` is the time argument in the
+    /// current scope's time unit ($time/$realtime already are); it is scaled to
+    /// the $timeformat unit, printed with the configured fraction digits and
+    /// suffix, and right-justified in the minimum field width.
+    fn format_time_field(&self, value: f64) -> String {
+        let (scope_unit_exp, _) = self.current_timescale_exp();
+        let (tf_units, tf_prec, tf_suffix, tf_width) = self
+            .time_format
+            .clone()
+            .unwrap_or_else(|| (Self::secs_to_exp(self.tick_s), 0, String::new(), 0));
+        let display = value * 10f64.powi(scope_unit_exp - tf_units);
+        let body = format!("{:.*}{}", tf_prec, display, tf_suffix);
+        if body.len() < tf_width {
+            format!("{}{}", " ".repeat(tf_width - body.len()), body)
+        } else {
+            body
+        }
+    }
+
     fn class_prop_width(&self, class_name: &str, prop: &str) -> Option<u32> {
         let mut cur = Some(class_name.to_string());
         while let Some(cn) = cur {
@@ -36360,9 +36487,9 @@ impl Simulator {
                 let name = &path[0].name.name;
                 if name.starts_with('$') {
                     return match name.as_str() {
-                        "$time" => Value::from_u64((self.time as f64 * self.tick_s * 1e9).round() as u64, 64),
-                        "$realtime" => Value::from_f64(self.time as f64 * self.tick_s * 1e9),
-                        "$stime" => Value::from_u64(((self.time as f64 * self.tick_s * 1e9).round() as u64) & 0xFFFF_FFFF, 32),
+                        "$time" => Value::from_u64(self.time_in_current_unit().round() as u64, 64),
+                        "$realtime" => Value::from_f64(self.time_in_current_unit()),
+                        "$stime" => Value::from_u64((self.time_in_current_unit().round() as u64) & 0xFFFF_FFFF, 32),
                         "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
                             Value::from_u64(0, 1)
                         }
