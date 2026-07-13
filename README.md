@@ -73,7 +73,7 @@ Current capabilities include:
 
 ---
 
-# What's new since 0.8.5
+# What's new in 0.9
 
 * **UVM 1800.2-2020.3.1 runs green** — the reference testbench passes against the
   2020.3.1 library (`UVM_ERROR : 0` / `UVM_FATAL : 0`, in/out monitors agree).
