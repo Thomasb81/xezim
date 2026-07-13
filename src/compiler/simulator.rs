@@ -26183,7 +26183,11 @@ impl Simulator {
                         }
                         _ => false,
                     };
-                let default_v = if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle
+                // §6.4: `real`/`shortreal` variables default to 0.0.
+                let is_real_type = super::elaborate::is_type_real(data_type);
+                let default_v = if is_real_type {
+                    Value::from_f64(0.0)
+                } else if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle
                 {
                     Value::zero(w)
                 } else {
@@ -26639,6 +26643,15 @@ impl Simulator {
                         } else {
                             self.signed_signals.remove(&d.name.name);
                         }
+                        // Track `real` locals so assignments coerce to real —
+                        // without this a block-local `real r; r = 3.14159;`
+                        // rounded through real_to_int and read back 3.0
+                        // (issue #23). A non-real decl clears a stale flag.
+                        if is_real_type {
+                            self.real_signals.insert(d.name.name.clone());
+                        } else {
+                            self.real_signals.remove(&d.name.name);
+                        }
                         // Track `string`-typed locals so `{a, b}` concatenations
                         // involving them are evaluated as string concat. A
                         // non-string decl clears a stale same-named flag from
@@ -26817,6 +26830,26 @@ impl Simulator {
                 self.assign_value(recv, &v);
             }
             return Some(Value::zero(1));
+        }
+        // §6.16.6 compare/icompare — strcmp-style lexicographic difference:
+        // 0 when equal, negative/positive otherwise. Neither was implemented,
+        // so both returned 0 and `compare()` looked case-insensitive.
+        if matches!(mname, "compare" | "icompare") && args.len() == 1 {
+            let a = self.eval_expr(recv).to_sv_string();
+            let b = self.eval_expr(&args[0]).to_sv_string();
+            let (a, b) = if mname == "icompare" {
+                (a.to_lowercase(), b.to_lowercase())
+            } else {
+                (a, b)
+            };
+            let d: i64 = match a.cmp(&b) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            let mut v = Value::from_u64(d as u64, 32);
+            v.is_signed = true;
+            return Some(v);
         }
         if matches!(mname, "itoa" | "hextoa" | "octtoa" | "bintoa" | "realtoa")
             && args.len() == 1
@@ -36903,6 +36936,7 @@ impl Simulator {
                 && matches!(
                     path[len - 1].name.name.as_str(),
                     "putc" | "itoa" | "hextoa" | "octtoa" | "bintoa" | "realtoa" | "atoreal"
+                        | "compare" | "icompare"
                 )
             {
                 let m = path[len - 1].name.name.clone();
