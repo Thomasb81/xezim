@@ -15440,15 +15440,14 @@ impl Simulator {
                 }
             }
 
-            // PURE_SV_LRM: bridge `objn.wait_for(UVM_ALL_DROPPED, obj)` to a
-            // condition-wait on the objection total (see synth_objection_wait).
-            // Must run BEFORE Stage 1b would inline wait_for's real body (whose
+            // PURE_SV_LRM: bridge a genuine-UVM objection sync call
+            // `objn.wait_for(evt, obj)` to a condition-wait on the objection
+            // total (see bridge_objection_wait_for). Must run BEFORE Stage 1b
+            // would inline wait_for's real body (whose
             // `@(m_events[obj].all_dropped)` member-event wait can't block).
             if self.pure_sv_lrm {
-                if let Some((recv, obj, all_dropped)) = Self::match_objection_wait_for(stmt) {
-                    let wait_stmt =
-                        Self::synth_objection_wait(&recv, obj.as_ref(), all_dropped, stmt.span);
-                    let mut cont = vec![wait_stmt];
+                if let Some(wait_stmts) = self.bridge_objection_wait_for(stmt) {
+                    let mut cont = wait_stmts;
                     cont.extend_from_slice(&stmts[i + 1..]);
                     self.run_process_stmts(pid, &cont);
                     return;
@@ -16428,20 +16427,105 @@ impl Simulator {
         )
     }
 
-    /// PURE_SV_LRM bridge: rewrite `objn.wait_for(UVM_ALL_DROPPED|UVM_RAISED, obj)`
-    /// into `wait(objn.get_objection_total(obj) <op> 0)`. The real
-    /// `uvm_objection::wait_for` blocks on `@(m_events[obj].all_dropped)` — a
-    /// plain SV `event` MEMBER of an assoc-array-indexed object — which xezim
-    /// can't key (only simple-Identifier named events resolve to a signal), so
-    /// the `@` returns immediately and the phase-end loop spins at t0. Bridging
-    /// to a condition-wait on the (working) objection total lets the calling
-    /// process PARK (so time advances to the drop) and wake when it hits 0.
-    fn synth_objection_wait(
+    /// PURE_SV_LRM bridge: rewrite a genuine-UVM objection sync call
+    /// `objn.wait_for(evt, obj)` into condition-wait(s) on the objection total.
+    ///
+    /// The real `uvm_objection::wait_for` blocks on
+    /// `@(m_events[obj].all_dropped)` — a plain SV `event` MEMBER of an
+    /// assoc-array-indexed object — which xezim can't key (only
+    /// simple-Identifier named events resolve to a signal), so the `@`
+    /// returns immediately and the phase-end loop spins at t0. Bridging to a
+    /// condition-wait on the (working) objection total lets the calling process
+    /// PARK (so time advances to the drop) and wake when the total moves.
+    ///
+    /// `evt` may be a *literal* (`UVM_ALL_DROPPED`) or a *runtime enum
+    /// variable*. The literal form appears in `execute_phase`
+    /// (`phase_done.wait_for(UVM_ALL_DROPPED, top)`); the variable form appears
+    /// after `uvm_phase_hopper::wait_for_objection(objt_event, obj)` is inlined
+    /// and routes its parameter through to the inner `objection.wait_for(...)`
+    /// — which is the call that ends `run_phases`. The variable case is why a
+    /// literal-only matcher missed it and `run_phases` fell through to the
+    /// empty-sensitivity `@()` and ended the schedule at t0.
+    ///
+    /// Semantics:
+    ///   - UVM_ALL_DROPPED (4): `wait(total > 0); wait(total == 0)`. The
+    ///     two-step idiom is required because `run_phases` reaches this wait
+    ///     BEFORE the run phase has raised (total is 0 at entry); a bare
+    ///     `wait(total == 0)` would return immediately and finish at t0.
+    ///     `execute_phase`'s call is already gated on `total > 0` in the SV, so
+    ///     the first wait passes through there.
+    ///   - UVM_RAISED (1): `wait(total > 0)`.
+    ///
+    /// Returns the synthesized wait statement(s), or None if `stmt` is not an
+    /// objection `wait_for` call (so other `wait_for`-named methods —
+    /// uvm_event/barrier — are never hijacked).
+    fn bridge_objection_wait_for(
+        &mut self,
+        stmt: &Statement,
+    ) -> Option<Vec<Statement>> {
+        let (recv, obj, evt_expr) = Self::match_objection_wait_call(stmt)?;
+        // Resolve the event: literal enum ident first, else evaluate the
+        // (inlined-parameter) variable to its enum integer.
+        let evt_int: Option<u64> = match &evt_expr.kind {
+            ExprKind::Ident(h) => match h.path.last().map(|s| s.name.name.as_str()).as_deref() {
+                Some("UVM_ALL_DROPPED") => Some(4),
+                Some("UVM_DROPPED") => Some(2),
+                Some("UVM_RAISED") => Some(1),
+                _ => None,
+            },
+            _ => None,
+        };
+        let evt_int = match evt_int {
+            Some(v) => v,
+            None => self.eval_expr(&evt_expr).to_u64()?,
+        };
+        let span = stmt.span;
+        let total = Self::objection_total_call_expr(&recv, obj.as_ref(), span);
+        let zero = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: NumberBase::Decimal,
+                value: "0".to_string(),
+                cached_val: Cell::new(None),
+            }),
+            span,
+        );
+        let mk_wait = |op, span: crate::ast::Span| {
+            let cond = Expression::new(
+                ExprKind::Binary {
+                    op,
+                    left: Box::new(total.clone()),
+                    right: Box::new(zero.clone()),
+                },
+                span,
+            );
+            Statement::new(
+                StatementKind::Wait {
+                    condition: cond,
+                    stmt: Box::new(Statement::new(StatementKind::Null, span)),
+                },
+                span,
+            )
+        };
+        if evt_int == 4 {
+            // wait(total > 0); wait(total == 0);
+            Some(vec![
+                mk_wait(BinaryOp::Gt, span),
+                mk_wait(BinaryOp::Eq, span),
+            ])
+        } else {
+            // UVM_RAISED / UVM_DROPPED: wait(total > 0)
+            Some(vec![mk_wait(BinaryOp::Gt, span)])
+        }
+    }
+
+    /// Build `<recv>.get_objection_total(<obj>)` as an expression.
+    fn objection_total_call_expr(
         recv: &Expression,
         obj: Option<&Expression>,
-        all_dropped: bool,
         span: crate::ast::Span,
-    ) -> Statement {
+    ) -> Expression {
         let func = Expression::new(
             ExprKind::MemberAccess {
                 expr: Box::new(recv.clone()),
@@ -16453,38 +16537,19 @@ impl Simulator {
             span,
         );
         let args: Vec<Expression> = obj.cloned().into_iter().collect();
-        let call = Expression::new(ExprKind::Call { func: Box::new(func), args }, span);
-        let zero = Expression::new(
-            ExprKind::Number(NumberLiteral::Integer {
-                size: None,
-                signed: false,
-                base: NumberBase::Decimal,
-                value: "0".to_string(),
-                cached_val: Cell::new(None),
-            }),
-            span,
-        );
-        let op = if all_dropped { BinaryOp::Eq } else { BinaryOp::Gt };
-        let cond = Expression::new(
-            ExprKind::Binary { op, left: Box::new(call), right: Box::new(zero) },
-            span,
-        );
-        Statement::new(
-            StatementKind::Wait {
-                condition: cond,
-                stmt: Box::new(Statement::new(StatementKind::Null, span)),
-            },
-            span,
-        )
+        Expression::new(ExprKind::Call { func: Box::new(func), args }, span)
     }
 
-    /// Recognise an objection `wait_for(UVM_ALL_DROPPED|UVM_RAISED, obj)` call
-    /// statement and return `(receiver, obj_arg, all_dropped)`. Gated on the
-    /// first arg being one of the objection-event idents so it never hijacks
-    /// other `wait_for`-named methods (uvm_event/barrier).
-    fn match_objection_wait_for(
+    /// Recognise an objection `objn.wait_for(evt, obj)` call statement and
+    /// return `(receiver, obj_arg, evt_expr)`. The event argument is returned
+    /// UNRESOLVED — `bridge_objection_wait_for` resolves it (literal ident OR
+    /// a runtime enum variable, after the genuine library routes
+    /// `wait_for_objection`'s parameter through). Only `wait_for`-named methods
+    /// on a receiver match; other `wait_for` methods (uvm_event/barrier) have no
+    /// receiver-shaped `objn` and are handled by their own machinery.
+    fn match_objection_wait_call(
         stmt: &Statement,
-    ) -> Option<(Expression, Option<Expression>, bool)> {
+    ) -> Option<(Expression, Option<Expression>, Expression)> {
         let expr = match &stmt.kind {
             StatementKind::Expr(e) => e,
             _ => return None,
@@ -16496,15 +16561,6 @@ impl Simulator {
         if args.is_empty() {
             return None;
         }
-        let evt = match &args[0].kind {
-            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()).unwrap_or(""),
-            _ => "",
-        };
-        let all_dropped = match evt {
-            "UVM_ALL_DROPPED" => true,
-            "UVM_RAISED" => false,
-            _ => return None,
-        };
         let (recv, method) = match &func.kind {
             ExprKind::MemberAccess { expr: r, member } => ((**r).clone(), member.name.clone()),
             ExprKind::Ident(h) if h.path.len() >= 2 => {
@@ -16517,7 +16573,7 @@ impl Simulator {
         if method != "wait_for" {
             return None;
         }
-        Some((recv, args.get(1).cloned(), all_dropped))
+        Some((recv, args.get(1).cloned(), args[0].clone()))
     }
 
     /// Is `s` a (potentially blocking) mailbox `get`/`peek` call — `mb.get(v)`
