@@ -317,6 +317,7 @@ fn check_delta(signals: &[String], aliases: &[(String, String)], sid: &str, val:
         || val == "Z"
         || val.starts_with("0x")
         || val.starts_with("0b")
+        || val.starts_with('"') // §15.4 quoted string
         || val.parse::<f64>().is_ok();
     assert!(ok, "§15: malformed value {:?} — {}", val, line);
 }
@@ -615,21 +616,24 @@ fn real_values_are_decimal() {
 /// XTrace defines none, so a partially collapsed vector is unparseable.
 #[test]
 fn unknown_values_use_the_compact_forms() {
+    // The t=0 `N,full` snapshot carries POST-SETTLE values (§19.7), so a
+    // signal's first emitted value is what its initial block left it at — there
+    // is no spurious pre-initialization `X` transient ahead of it.
     let xt = dump("xz", KITCHEN);
     assert_eq!(
         values_of(&xt, "allx"),
         vec!["X", "0x0"],
-        "§15.3: an all-x vector is `X`"
+        "§15.3: an all-x vector is `X` (initial leaves it 8'hxx, then 8'h00)"
     );
     assert_eq!(
         values_of(&xt, "allz"),
-        vec!["X", "Z", "0x0"],
-        "§15.3: an all-z vector is `Z` (it starts life all-x)"
+        vec!["Z", "0x0"],
+        "§15.3: an all-z vector is `Z` (initial leaves it 8'hzz, then 8'h00)"
     );
     assert_eq!(
         values_of(&xt, "xz"),
-        vec!["X", "0b01XZ"],
-        "§15.3: a MIXED x/z vector keeps every bit"
+        vec!["0b01XZ"],
+        "§15.3: a MIXED x/z vector keeps every bit (and never changes again)"
     );
     assert!(
         !xt.contains("0bXXXXXXXX") && !xt.contains("0bZZZZZZZZ"),
@@ -711,6 +715,79 @@ fn trace_closes_at_the_final_simulation_time() {
     assert_eq!(last, "T,+10", "§10.1: the trace must end at t=40, not t=30");
 }
 
+// ─────────────────────── strings & snapshot ───────────────────────
+
+const STR_DESIGN: &str = r#"
+module top;
+    string s;
+    logic [7:0] settled;
+    initial begin
+        settled = 8'h42;
+        s = "hi \"there\"\ttab";
+        #5 s = "plain";
+        #5 $finish;
+    end
+endmodule
+"#;
+
+/// §9.3 `str` type + §15.4: a `string` signal is declared with the `str` type
+/// and its value is a quoted, §8.5-escaped literal — not a 1024-bit hex blob.
+#[test]
+fn string_signals_use_str_type_and_quoted_values() {
+    let xt = dump("str", STR_DESIGN);
+    let s = sig_line(&xt, "s");
+    assert!(
+        s.contains(",str,"),
+        "§9.3: a string signal must be typed `str`, got: {}",
+        s
+    );
+    assert!(
+        !s.contains(",u1024,"),
+        "§9.3: a string must NOT be typed as a 1024-bit vector, got: {}",
+        s
+    );
+    let vals = values_of(&xt, "s");
+    assert_eq!(
+        vals,
+        vec![r#""hi \"there\"\ttab""#, r#""plain""#],
+        "§15.4/§8.5: string values must be quoted and escaped, got {:?}",
+        vals
+    );
+}
+
+/// §19.7: the t=0 `N,full` checkpoint carries POST-SETTLE values, so a signal
+/// initialized in an initial block appears at its real value directly — not an
+/// all-X image that a redundant same-time record then corrects.
+#[test]
+fn snapshot_carries_settled_values() {
+    let xt = dump("snap", STR_DESIGN);
+    // `settled` is 8'h42 from t=0; it must appear that way in N,full, and there
+    // must be no separate correction record for it at the same time.
+    let vals = values_of(&xt, "settled");
+    assert_eq!(
+        vals,
+        vec!["0x42"],
+        "§19.7: an initialized signal appears settled in N,full, once, got {:?}",
+        vals
+    );
+    // The very first value line of the trace is the N,full checkpoint.
+    let trace: Vec<&str> = xt
+        .lines()
+        .skip_while(|l| *l != "@section trace")
+        .filter(|l| l.starts_with("N,full") || l.starts_with('P') || l.starts_with('D'))
+        .collect();
+    assert!(
+        trace.first().map(|l| l.starts_with("N,full")).unwrap_or(false),
+        "the first delta record must be the N,full snapshot, got {:?}",
+        trace.first()
+    );
+    assert!(
+        trace[0].contains("=0x42"),
+        "N,full must carry the settled 0x42, got {}",
+        trace[0]
+    );
+}
+
 // ───────────────────────── selection & memories ─────────────────────────
 
 /// §9.1/§9.2: an unpacked array (`logic [7:0] mem [0:3]`) contributes one
@@ -723,8 +800,11 @@ fn memory_elements_are_dumped() {
         let s = sig_line(&xt, &format!("mem[{}]", i));
         assert!(s.contains(",u8,enc=delta,width=8"), "§9.2: {}", s);
     }
-    assert_eq!(values_of(&xt, "mem[1]"), vec!["X", "0x0", "0xbe"]);
-    assert_eq!(values_of(&xt, "mem[3]"), vec!["X", "0x0"]);
+    // Post-settle snapshot (§19.7): mem[1]/mem[3] first appear at their
+    // initialized 0x0, not a pre-init X, since the initial block ran before the
+    // N,full checkpoint was captured.
+    assert_eq!(values_of(&xt, "mem[1]"), vec!["0x0", "0xbe"]);
+    assert_eq!(values_of(&xt, "mem[3]"), vec!["0x0"]);
 }
 
 /// `--xtrace-scope`: only the signals under the scope reach the dictionary, and
