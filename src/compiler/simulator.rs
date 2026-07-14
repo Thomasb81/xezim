@@ -2212,6 +2212,18 @@ pub struct Simulator {
     /// statements. `put` drains a waiter, assigns the value into its lvalue,
     /// and re-schedules the continuation at the current time.
     mailbox_get_waiters: HashMap<usize, std::collections::VecDeque<MailboxGetWaiter>>,
+    /// IEEE 1800-2023 §9.3.2: a fork child's WRITES to the parent's automatic
+    /// variables must be visible to the parent after the child finishes. xezim
+    /// gives each child a COPY of the parent's locals (see
+    /// `inherit_fork_child_context`), then `propagate_fork_locals_to_parent`
+    /// merges the child's frames back. To avoid clobbering a parent variable
+    /// that the child only INHERITED (never wrote) — which the parent may have
+    /// since modified (e.g. a mailbox `get` delivery writing `phase` while a
+    /// `fork ... join_none` child is still running, as in UVM's
+    /// `m_run_phases`) — each child's local frames are snapshotted here at
+    /// fork time as a baseline; propagate merges only the keys whose value the
+    /// child CHANGED relative to this baseline.
+    fork_baselines: HashMap<usize, Vec<HashMap<String, Value>>>,
     /// Processes blocked in `semaphore.get()` on an under-full semaphore.
     semaphore_get_waiters: HashMap<usize, std::collections::VecDeque<SemGetWaiter>>,
     /// IEEE 1800-2017 §9.4.5 intra-assignment delay (`lhs = #d rhs`): RHS
@@ -3661,6 +3673,7 @@ impl Simulator {
             cond_progress: 0,
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
+            fork_baselines: HashMap::default(),
             semaphore_get_waiters: HashMap::default(),
             intra_saved: HashMap::default(),
             intra_saved_next: 0,
@@ -15078,6 +15091,12 @@ impl Simulator {
         if trivial {
             self.process_contexts.remove(&pid);
         } else {
+            // §9.3.2 baseline: snapshot the child's local frames as forked so
+            // `propagate_fork_locals_to_parent` can merge only the keys the
+            // child later WRITES (value changes), not keys it merely inherited
+            // (which the parent may have modified in the meantime — e.g. a
+            // mailbox-get delivery into `phase` while this child runs).
+            self.fork_baselines.insert(pid, ctx.local_stack.clone());
             self.process_contexts.insert(pid, ctx);
         }
     }
@@ -15274,6 +15293,16 @@ impl Simulator {
             Some(p) => p,
             None => return,
         };
+        // §9.3.2 baseline: only the keys the child WROTE (its value now differs
+        // from the fork-time snapshot) are propagated — a key it merely
+        // inherited unchanged must NOT clobber a value the parent modified
+        // after the fork (e.g. a mailbox-get delivery into `phase` while this
+        // child ran, as in UVM `m_run_phases`). If no baseline survived (child
+        // that never had saved context, or an older run), fall back to the
+        // legacy whole-frame merge so the §9.3.2 write-visibility guarantee
+        // (e.g. m_safe_select_item's `select_process = process::self()`)
+        // still holds.
+        let baseline = self.fork_baselines.get(&child_pid).cloned();
         // `self.local_stack` currently holds the CHILD's frames (captured
         // before we restore the event-loop caller's context below).
         let child_frames: Vec<HashMap<String, Value>> = self.local_stack.clone();
@@ -15286,8 +15315,29 @@ impl Simulator {
         let n = parent_ctx.local_stack.len().min(child_frames.len());
         for i in 0..n {
             for (k, v) in &child_frames[i] {
+                // Only propagate keys that exist in the parent's frame (a key
+                // the child declared itself, like a loop-local `succ`, is
+                // child-private and of no interest to the parent).
+                if !parent_ctx.local_stack[i].contains_key(k) {
+                    continue;
+                }
+                let inherited_unchanged = baseline
+                    .as_ref()
+                    .and_then(|b| b.get(i))
+                    .and_then(|f| f.get(k))
+                    .is_some_and(|old| old == v);
+                if inherited_unchanged {
+                    continue;
+                }
                 parent_ctx.local_stack[i].insert(k.clone(), v.clone());
             }
+        }
+        // Drop the baseline once the child is done (no longer suspended) so the
+        // map doesn't grow unboundedly across a forever-fork loop (UVM
+        // `m_run_phases`). A child that merely parked (e.g. on a `#5`) keeps
+        // its baseline for the next propagate.
+        if !self.is_pid_suspended(child_pid) {
+            self.fork_baselines.remove(&child_pid);
         }
     }
 
@@ -40409,20 +40459,37 @@ impl Simulator {
             if mname == "put" {
                 let base = self.eval_expr(expr);
                 let handle = base.to_u64().unwrap_or(0) as usize;
-                let val = args.first().map(|a| self.eval_expr(a));
-                let mut changed = false;
-                if let Some(v) = val {
-                    if let Some(q) = self.mailboxes.get_mut(&handle) {
-                        q.push_back(v);
-                        changed = true;
+                if let Some(arg) = args.first() {
+                    let v = self.eval_expr(arg);
+                    // LRM §15.4.3/§15.4.5: a `put` stores in FIFO order and
+                    // unblocks any process waiting in a `get`/`peek` on this
+                    // mailbox. Hand the value directly to the FIFO-ordered
+                    // waiter (skipping the queue) and reschedule its parked
+                    // continuation — exactly as `exec_method_call`'s `put`
+                    // does. This handler is reached when a `put` is evaluated
+                    // in EXPRESSION context (e.g. a forked producer like the
+                    // genuine-UVM `m_run_phases` successor scheduler); without
+                    // the delivery the parked consumer never resumed and the
+                    // schedule deadlocked at the successor hop.
+                    if self.mailboxes.contains_key(&handle) {
+                        let waiter = self
+                            .mailbox_get_waiters
+                            .get_mut(&handle)
+                            .and_then(|q| q.pop_front());
+                        if let Some(MailboxGetWaiter { pid, lvalue, cont, is_peek }) = waiter {
+                            if is_peek {
+                                // peek does not consume — leave the item for the
+                                // subsequent get/try_get.
+                                self.mailboxes.get_mut(&handle).unwrap().push_back(v.clone());
+                            }
+                            self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont);
+                        } else if let Some(q) = self.mailboxes.get_mut(&handle) {
+                            q.push_back(v);
+                        }
                     } else if let Some(count) = self.semaphores.get_mut(&handle) {
                         *count += v.to_u64().unwrap_or(1) as i64;
-                        changed = true;
+                        self.wake_semaphore_waiters(handle);
                     }
-                }
-                if changed {
-                    // Waking up might be needed, but simplified: waking up is usually via events.
-                    // For mailboxes/semaphores, we'd need dedicated waiter queues.
                 }
                 return Value::zero(32);
             }
