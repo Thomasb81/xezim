@@ -26,7 +26,7 @@ use libffi::middle::{Arg, Cif, CodePtr, Type};
 use libloading::Library;
 use rand::SeedableRng;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -1721,6 +1721,8 @@ pub struct Simulator {
     pub finished: bool,
     compiled: bool,
     pub monitor: Option<(String, Vec<Expression>)>,
+    /// `$monitoroff` pauses (not destroys) the monitor; `$monitoron` resumes.
+    pub monitor_paused: bool,
     /// `$strobe` queue: formatted+printed at the end of the current
     /// event-loop iteration, after `apply_nba` has committed scheduled
     /// non-blocking writes. Each entry is `(task_name, args)` and is
@@ -2282,6 +2284,7 @@ pub struct Simulator {
     vcd_trace: Vec<(usize, Arc<str>)>,
     vcd_enabled: bool,
     vcd_last_time: u64,
+    /// Optional size limit for the VCD dump ($dumplimit, §21.7.1.5).
     /// Previous emitted value per entry in `vcd_trace` (parallel vector).
     /// A plain Vec<Value> — no duplicated name strings, no hashing.
     vcd_prev_signals: Vec<Value>,
@@ -2704,6 +2707,10 @@ pub struct Simulator {
     file_handles: HashMap<i32, std::fs::File>,
     /// Per-fd ungetc pushback buffer (LIFO).
     ungetc_buf: HashMap<i32, Vec<u8>>,
+    /// §20.15 stochastic-analysis queues, keyed by q_id. Created by
+    /// `$q_initialize`, mutated by `$q_add`/`$q_remove`, queried by
+    /// `$q_full`/`$q_exam`.
+    queues: HashMap<i64, StochasticQueue>,
     static_task_init: HashSet<String>,
     current_static_task: Option<String>,
     next_file_handle: i32,
@@ -2714,6 +2721,55 @@ pub struct Simulator {
 /// Empty static used as fallback name for unnamed array-element ids
 /// (large 1-D arrays have per-element entries skipped to save memory).
 static EMPTY_NAME: &str = "";
+
+/// §20.15 stochastic-analysis queue state for `$q_initialize`/`$q_add`/
+/// `$q_remove`/`$q_full`/`$q_exam`.
+///
+/// `q_type`: 1 = FIFO (§20.15.1 Table 20-9), 2 = LIFO. Each entry records the
+/// user `job_id`, `inform_id`, and the sim-time tick at which it was added so
+/// `$q_exam` can compute the wait-time statistics of Table 20-10. Statistics
+/// accumulate across the queue's lifetime: `max_len_seen` is the high-water
+/// mark (code 3); inter-arrival samples feed code 2; per-job waits feed codes
+/// 4/5/6. `i64::MIN`/sentinels encode "no sample yet" (the LRM leaves these
+/// stats implementation-defined; many tools report -1 in that case).
+#[derive(Clone, Debug, Default)]
+struct StochasticQueue {
+    q_type: i64,
+    max_length: i64,
+    entries: VecDeque<(i64, i64, i64)>, // (job_id, inform_id, arrival_tick)
+    // lifetime statistics
+    arrivals: u64,
+    last_arrival_tick: Option<i64>,
+    sum_interarrival: i128,
+    max_len_seen: usize,
+    shortest_wait_ever: Option<i64>,
+    longest_wait_queued: Option<i64>,
+    sum_wait_removed: i128,
+    count_wait_removed: u64,
+}
+
+/// Evaluate the single real argument of a §20.8.2 one-operand real math
+/// function (`$sin`, `$sqrt`, …). Defaults to 0.0 when absent.
+#[inline]
+fn real1<F>(args: &[Expression], eval: &mut F) -> f64
+where
+    F: FnMut(&Expression) -> Value,
+{
+    args.first().map(|a| eval(a).to_f64()).unwrap_or(0.0)
+}
+
+/// Evaluate the two real arguments of a §20.8.2 two-operand real math function
+/// (`$atan2(y,x)`, `$hypot(x,y)`), defaulting missing operands to 0.0.
+#[inline]
+fn real2<F>(args: &[Expression], eval: &mut F) -> (f64, f64)
+where
+    F: FnMut(&Expression) -> Value,
+{
+    (
+        args.get(0).map(|a| eval(a).to_f64()).unwrap_or(0.0),
+        args.get(1).map(|a| eval(a).to_f64()).unwrap_or(0.0),
+    )
+}
 
 impl Simulator {
     /// Safe accessor for `id_to_name`. Large-array element ids may sit
@@ -3592,6 +3648,7 @@ impl Simulator {
             finished: false,
             compiled: false,
             monitor: None,
+            monitor_paused: false,
             monitor_prev: HashMap::default(),
             monitor_arg_prev: None,
             pending_strobes: Vec::new(),
@@ -3921,6 +3978,7 @@ impl Simulator {
             dpi_pending_reset_fired: false,
             file_handles: HashMap::default(),
             ungetc_buf: HashMap::default(),
+            queues: HashMap::default(),
             static_task_init: HashSet::default(),
             current_static_task: None,
             next_file_handle: 3,
@@ -5344,12 +5402,21 @@ impl Simulator {
     }
 
     fn write_file_handle(&mut self, args: &[Expression], newline: bool) -> Value {
+        self.write_file_handle_named(args, newline, "$write")
+    }
+
+    fn write_file_handle_named(
+        &mut self,
+        args: &[Expression],
+        newline: bool,
+        tn: &str,
+    ) -> Value {
         if args.is_empty() {
             return Value::zero(32);
         }
         let fd = self.eval_file_handle_arg(&args[0]);
         let mut payload = if args.len() > 1 {
-            self.format_args(&args[1..], "$write")
+            self.format_args(&args[1..], tn)
         } else {
             String::new()
         };
@@ -5533,6 +5600,63 @@ impl Simulator {
             mem_name,
             path
         );
+        Value::zero(32)
+    }
+
+    /// §21.5 `$writememb/h/d`: dump a memory array to a file in the specified
+    /// radix. Each line is `@<addr_hex> <value_in_radix>`, matching the
+    /// `$readmem*` format so the file is round-trippable.
+    fn write_memory_file(&mut self, args: &[Expression], tn: &str) -> Value {
+        if args.len() < 2 {
+            return Value::zero(32);
+        }
+        let path = self.system_string_arg(&args[0]);
+        if path.is_empty() {
+            return Value::zero(32);
+        }
+        let Some(mem_name) = self.resolve_array_name_from_expr(&args[1]) else {
+            return Value::zero(32);
+        };
+        let Some((lo, hi, width)) = self.module.arrays.get(&mem_name).copied() else {
+            return Value::zero(32);
+        };
+        let start = if args.len() >= 3 {
+            self.eval_expr(&args[2]).to_i64().unwrap_or(lo)
+        } else {
+            lo
+        };
+        let end = if args.len() >= 4 {
+            self.eval_expr(&args[3]).to_i64().unwrap_or(hi)
+        } else {
+            hi
+        };
+        let radix: u32 = if tn.ends_with('b') { 2 } else if tn.ends_with('h') { 16 } else { 10 };
+        let step: i64 = if start <= end { 1 } else { -1 };
+        let min_idx = lo.min(hi);
+        let max_idx = lo.max(hi);
+        let dense_array = self.array_first_id.get(mem_name.as_str()).copied();
+        let mut out = String::new();
+        let mut addr = start;
+        while (step > 0 && addr <= end) || (step < 0 && addr >= end) {
+            if addr >= min_idx && addr <= max_idx {
+                let val = if let Some((first_id, arr_lo, _)) = dense_array {
+                    let id = first_id + (addr - arr_lo) as usize;
+                    self.signal_table.get(id).cloned().unwrap_or_else(|| Value::zero(width))
+                } else {
+                    Value::zero(width)
+                };
+                out.push_str(&format!("@{:x} ", addr));
+                let s = match radix {
+                    2 => val.to_bin_string(),
+                    16 => val.to_hex_string(),
+                    _ => val.to_dec_string(),
+                };
+                out.push_str(&s);
+                out.push('\n');
+            }
+            addr += step;
+        }
+        let _ = std::fs::write(&path, out);
         Value::zero(32)
     }
 
@@ -23504,8 +23628,14 @@ impl Simulator {
                 "$value$plusargs" => self.eval_value_plusargs(args),
                 "$fopen" => self.open_file_handle(args),
                 "$fclose" => self.close_file_handle(args),
-                "$fwrite" => self.write_file_handle(args, false),
-                "$fdisplay" => self.write_file_handle(args, true),
+                "$fwrite" => self.write_file_handle_named(args, false, "$write"),
+                "$fwriteb" => self.write_file_handle_named(args, false, "$writeb"),
+                "$fwriteh" | "$fwritex" => self.write_file_handle_named(args, false, "$writeh"),
+                "$fwriteo" => self.write_file_handle_named(args, false, "$writeo"),
+                "$fdisplay" => self.write_file_handle_named(args, true, "$display"),
+                "$fdisplayb" => self.write_file_handle_named(args, true, "$displayb"),
+                "$fdisplayh" | "$fdisplayx" => self.write_file_handle_named(args, true, "$displayh"),
+                "$fdisplayo" => self.write_file_handle_named(args, true, "$displayo"),
                 "$ftell" => {
                     use std::io::Seek;
                     let fd = args
@@ -23648,8 +23778,72 @@ impl Simulator {
                     }
                     Value::from_u64(u32::MAX as u64, 32)
                 }
+                // §21.3.4.2 `$fgets(str, fd)`: read a line into the string
+                // variable; returns the count of chars read, or 0 on EOF/error.
+                "$fgets" => {
+                    use std::io::Read;
+                    let dest = args.first();
+                    let fd = args.get(1).map(|a| self.eval_file_handle_arg(a)).unwrap_or(0);
+                    let mut line = Vec::new();
+                    let mut got_eof = true;
+                    if let Some(f) = self.file_handles.get_mut(&fd) {
+                        let mut b = [0u8; 1];
+                        loop {
+                            // Check ungetc buffer first
+                            if let Some(buf) = self.ungetc_buf.get_mut(&fd) {
+                                if let Some(c) = buf.pop() {
+                                    got_eof = false;
+                                    if c == b'\n' { line.push(c); break; }
+                                    line.push(c);
+                                    continue;
+                                }
+                            }
+                            match f.read(&mut b) {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    got_eof = false;
+                                    if b[0] == b'\n' { line.push(b[0]); break; }
+                                    line.push(b[0]);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    let s = String::from_utf8_lossy(&line).to_string();
+                    if let Some(d) = dest {
+                        self.assign_value(d, &Value::from_string(&s));
+                    }
+                    if got_eof && s.is_empty() {
+                        Value::zero(32)
+                    } else {
+                        Value::from_u64(s.len() as u64, 32)
+                    }
+                }
+                // §21.3.8 `$feof(fd)`: returns nonzero if the file is at EOF.
+                "$feof" => {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let fd = args.first().map(|a| self.eval_file_handle_arg(a)).unwrap_or(0);
+                    let at_eof = if let Some(f) = self.file_handles.get_mut(&fd) {
+                        let pos = f.stream_position().unwrap_or(0);
+                        let end = f.seek(SeekFrom::End(0)).unwrap_or(0);
+                        let _ = f.seek(SeekFrom::Start(pos));
+                        pos >= end
+                    } else {
+                        false
+                    };
+                    Value::from_u64(if at_eof { 1 } else { 0 }, 32)
+                }
+                // §21.3.7 `$ferror(fd, str)`: returns 0 if no error, writes a
+                // description string to the 2nd argument.
+                "$ferror" => {
+                    if let Some(out) = args.get(1) {
+                        self.assign_value(out, &Value::from_string("No error"));
+                    }
+                    Value::zero(32)
+                }
                 "$readmemh" => self.read_memory_file(args, 16),
                 "$readmemb" => self.read_memory_file(args, 2),
+                "$readmemd" => self.read_memory_file(args, 10),
                 // PRNG system functions.
                 //  - no-seed `$urandom`/`$urandom_range` draw from the OS-entropy
                 //    RNG, so each run differs (riscv-dv's source of variation).
@@ -23850,11 +24044,12 @@ impl Simulator {
                     Value::from_f64(v.to_f64().floor())
                 }
                 "$sqrt" => {
+                    // §20.8.2: real result, matches C sqrt().
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    Value::from_u64(v.to_f64().sqrt() as u64, 32)
+                    Value::from_f64(v.to_f64().sqrt())
                 }
                 "$pow" => {
                     let a = args
@@ -23868,11 +24063,12 @@ impl Simulator {
                     Value::from_f64(a.to_f64().powf(b.to_f64()))
                 }
                 "$log10" => {
+                    // §20.8.2: real result, matches C log10().
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    Value::from_u64(v.to_f64().log10() as u64, 32)
+                    Value::from_f64(v.to_f64().log10())
                 }
                 "$exp" => {
                     let v = args
@@ -23894,6 +24090,67 @@ impl Simulator {
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
                     Value::from_f64(v.to_f64().log2())
+                }
+                // §20.8.2 real trigonometric and hyperbolic functions. Per
+                // Table 20-4 each matches the equivalent C <math.h> function.
+                // All take a real argument (two for $atan2/$hypot) and return a
+                // real result. f64 methods below are direct C-library mirrors.
+                "$sin" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.sin())
+                }
+                "$cos" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.cos())
+                }
+                "$tan" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.tan())
+                }
+                "$asin" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.asin())
+                }
+                "$acos" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.acos())
+                }
+                "$atan" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.atan())
+                }
+                // $atan2(y, x): first arg is y, second is x (Table 20-4).
+                "$atan2" => {
+                    let (a, b) = real2(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(a.atan2(b))
+                }
+                "$hypot" => {
+                    let (a, b) = real2(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(a.hypot(b))
+                }
+                "$sinh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.sinh())
+                }
+                "$cosh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.cosh())
+                }
+                "$tanh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.tanh())
+                }
+                "$asinh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.asinh())
+                }
+                "$acosh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.acosh())
+                }
+                "$atanh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.atanh())
                 }
                 "$clog2" => {
                     let v = args
@@ -24303,6 +24560,23 @@ impl Simulator {
                         return Value::from_u64(n as u64, 32);
                     }
                     Value::zero(32)
+                }
+                // §20.15 `$q_full(q_id, status)`: system FUNCTION returning 0/1
+                // and writing the status code to its second argument.
+                "$q_full" => {
+                    let (full, status) = self.q_full_impl(args);
+                    self.assign_q_status(args, 1, status);
+                    Value::from_u64(full as u64, 32)
+                }
+                // §20.17.1 `$system` as a FUNCTION: returns the host shell
+                // exit status (int). With no argument calls system(NULL).
+                "$system" => {
+                    Value::from_u64(self.system_impl(args) as u64, 32)
+                }
+                // §20.17.2 `$stacktrace` as a FUNCTION: returns the call-stack
+                // text as a string. Content is implementation-defined (20.17.2).
+                "$stacktrace" => {
+                    Value::from_string(&self.stacktrace_text())
                 }
                 // A `$name` a VPI module registered as a system FUNCTION.
                 // Checked last so a builtin always wins.
@@ -29350,6 +29624,32 @@ impl Simulator {
                     self.assign_value(&args[0], &v);
                 }
             }
+            // §20.10 severity system tasks. Each emits a tool-specific
+            // message (severity tag + user `$display`-style text + a context
+            // line with time/scope) and — except for `$fatal` — allows
+            // execution to CONTINUE (LRM 20.10: only `$fatal` terminates,
+            // via an implicit `$finish`). The user message uses the same
+            // format-string rules as `$display`.
+            "$info" => {
+                self.emit_severity("Info", args);
+            }
+            "$warning" => {
+                self.emit_severity("Warning", args);
+            }
+            "$error" => {
+                self.emit_severity("Error", args);
+            }
+            "$fatal" => {
+                // `$fatal [ ( finish_number [, list_of_arguments] ) ]`. The
+                // first argument, when it is an integer literal 0/1/2, is the
+                // finish_number (LRM 20.10 / 20.2 diagnostics level); the
+                // remaining arguments are the `$display`-style message. A bare
+                // `$fatal("msg")` (no valid finish_number) defaults to 1 and
+                // treats every argument as the message.
+                let (msg_args, _finish) = self.fatal_msg_args(args);
+                self.emit_severity("Fatal", msg_args);
+                self.finished = true; // implicit $finish
+            }
             "$display" | "$displayb" | "$displayh" | "$displayo" => {
                 let m = self.format_args(args, name);
                 self.record_output(m.clone());
@@ -29403,7 +29703,15 @@ impl Simulator {
                 self.check_monitor();
             }
             "$monitoroff" => {
-                self.monitor = None;
+                self.monitor_paused = true;
+            }
+            "$monitoron" => {
+                // Re-enable a previously paused monitor. Per LRM §21.2.3,
+                // $monitoron always prints once immediately (even if values
+                // are unchanged since the last $monitoroff).
+                self.monitor_paused = false;
+                self.monitor_arg_prev = None; // force immediate print
+                self.check_monitor();
             }
             "$finish" | "$stop" => {
                 if std::env::var("XEZIM_TRACE_FINISH").is_ok() {
@@ -29417,10 +29725,41 @@ impl Simulator {
                 let _ = self.close_file_handle(args);
             }
             "$fwrite" => {
-                let _ = self.write_file_handle(args, false);
+                let _ = self.write_file_handle_named(args, false, "$write");
+            }
+            "$fwriteb" => {
+                let _ = self.write_file_handle_named(args, false, "$writeb");
+            }
+            "$fwriteh" | "$fwritex" => {
+                let _ = self.write_file_handle_named(args, false, "$writeh");
+            }
+            "$fwriteo" => {
+                let _ = self.write_file_handle_named(args, false, "$writeo");
             }
             "$fdisplay" => {
-                let _ = self.write_file_handle(args, true);
+                let _ = self.write_file_handle_named(args, true, "$display");
+            }
+            "$fdisplayb" => {
+                let _ = self.write_file_handle_named(args, true, "$displayb");
+            }
+            "$fdisplayh" | "$fdisplayx" => {
+                let _ = self.write_file_handle_named(args, true, "$displayh");
+            }
+            "$fdisplayo" => {
+                let _ = self.write_file_handle_named(args, true, "$displayo");
+            }
+            "$fflush" => {
+                let fd = args.first()
+                    .map(|a| self.eval_file_handle_arg(a))
+                    .unwrap_or(0);
+                if fd == 0 {
+                    // Flush ALL open file handles
+                    for f in self.file_handles.values_mut() {
+                        let _ = f.flush();
+                    }
+                } else if let Some(f) = self.file_handles.get_mut(&fd) {
+                    let _ = f.flush();
+                }
             }
             "$fseek" => {
                 use std::io::{Seek, SeekFrom};
@@ -29466,11 +29805,54 @@ impl Simulator {
                     .unwrap_or(0);
                 self.ungetc_buf.entry(fd).or_default().push(ch);
             }
+            "$fgets" => {
+                // task form: discard return value, just write to the string arg
+                use std::io::Read;
+                let dest = args.first();
+                let fd = args.get(1).map(|a| self.eval_file_handle_arg(a)).unwrap_or(0);
+                let mut line = Vec::new();
+                if let Some(f) = self.file_handles.get_mut(&fd) {
+                    let mut b = [0u8; 1];
+                    loop {
+                        if let Some(buf) = self.ungetc_buf.get_mut(&fd) {
+                            if let Some(c) = buf.pop() {
+                                if c == b'\n' { line.push(c); break; }
+                                line.push(c); continue;
+                            }
+                        }
+                        match f.read(&mut b) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                if b[0] == b'\n' { line.push(b[0]); break; }
+                                line.push(b[0]);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let s = String::from_utf8_lossy(&line).to_string();
+                if let Some(d) = dest {
+                    self.assign_value(d, &Value::from_string(&s));
+                }
+            }
+            "$feof" => { /* function-only; task form is a no-op */ }
+            "$ferror" => {
+                // task form: just write the message string
+                if let Some(out) = args.get(1) {
+                    self.assign_value(out, &Value::from_string("No error"));
+                }
+            }
             "$readmemh" => {
                 let _ = self.read_memory_file(args, 16);
             }
             "$readmemb" => {
                 let _ = self.read_memory_file(args, 2);
+            }
+            "$readmemd" => {
+                let _ = self.read_memory_file(args, 10);
+            }
+            "$writememb" | "$writememh" | "$writememd" => {
+                let _ = self.write_memory_file(args, name);
             }
             "$dumpfile" => {
                 if let Some(arg) = args.first() {
@@ -29539,6 +29921,36 @@ impl Simulator {
                     let _ = self.sv_sscanf(&src_str, &fmt, &args[2..]);
                 }
             }
+            // §20.15 stochastic-analysis tasks. All four write an output status
+            // code (Table 20-11) to their last argument; `$q_remove`/
+            // `$q_exam` additionally write their job/stat outputs.
+            "$q_initialize" => {
+                let status = self.q_initialize_impl(args);
+                self.assign_q_status(args, 3, status);
+            }
+            "$q_add" => {
+                let status = self.q_add_impl(args);
+                self.assign_q_status(args, 3, status);
+            }
+            "$q_remove" => {
+                let status = self.q_remove_impl(args);
+                self.assign_q_status(args, 3, status);
+            }
+            "$q_exam" => {
+                let status = self.q_exam_impl(args);
+                self.assign_q_status(args, 3, status);
+            }
+            // §20.17.1 `$system` as a TASK (return value discarded). Invokes
+            // the host shell; with no argument calls system(NULL).
+            "$system" => {
+                let _ = self.system_impl(args);
+            }
+            // §20.17.2 `$stacktrace` as a TASK: displays the call-stack text.
+            "$stacktrace" => {
+                let trace = self.stacktrace_text();
+                self.record_output(trace.clone());
+                self.stdout_writeln(&trace);
+            }
             // A `$name` a VPI module registered with `vpi_register_systf`.
             // Checked last so a builtin always wins.
             _ if vpi_systf_registered(name) => {
@@ -29549,6 +29961,240 @@ impl Simulator {
         }
     }
 
+    /// Hierarchical scope name of the currently running process, for the
+    /// context line of §20.10 severity messages and §20.17.2 `$stacktrace`.
+    /// Mirrors the resolution used by `$printtimescale`.
+    fn severity_scope(&self) -> String {
+        match self.process_scope_hint.get(&self.current_pid) {
+            Some(s) if !s.is_empty() => format!("{}.{}", self.module.name, s),
+            _ => self.module.name.clone(),
+        }
+    }
+
+    /// Split `$fatal` arguments into `(message_args, finish_number)` per LRM
+    /// 20.10: if the first argument is an integer literal whose value is 0, 1,
+    /// or 2, it is the finish_number (diagnostics level, §20.2) and the
+    /// remaining arguments form the `$display`-style message; otherwise every
+    /// argument is the message and finish_number defaults to 1.
+    fn fatal_msg_args<'a>(&mut self, args: &'a [Expression]) -> (&'a [Expression], i32) {
+        if let Some(first) = args.first() {
+            if let ExprKind::Number(NumberLiteral::Integer { value, base: NumberBase::Decimal, .. }) =
+                &first.kind
+            {
+                if let Ok(n) = value.parse::<i64>() {
+                    if (0..=2).contains(&n) {
+                        return (&args[1..], n as i32);
+                    }
+                }
+            }
+        }
+        (args, 1)
+    }
+
+    /// Emit a §20.10 severity-system-task message. Formats the user
+    /// `$display`-style arguments and prefixes a `** <Severity>:` tag plus a
+    /// context line (sim time + hierarchical scope). Routed to both the
+    /// captured output log and stdout, exactly like `$display`.
+    fn emit_severity(&mut self, severity: &str, args: &[Expression]) {
+        let body = if args.is_empty() {
+            String::new()
+        } else {
+            self.format_args(args, "$display")
+        };
+        let scope = self.severity_scope();
+        let time_s = self.format_time_parts(self.time_in_current_unit()).0;
+        let line = if body.is_empty() {
+            format!("** {}", severity)
+        } else {
+            format!("** {}: {}", severity, body)
+        };
+        let ctx = format!("   Time: {}  Scope: {}", time_s.trim(), scope);
+        self.record_output(line.clone());
+        self.record_output(ctx.clone());
+        self.stdout_writeln(&line);
+        self.stdout_writeln(&ctx);
+    }
+
+    /// Write a §20.15 status code to output argument `idx` (if present). The
+    /// status is an `int`; stored as a 32-bit unsigned (sign bit preserved
+    /// via two's complement for the -1 sentinel some stats use).
+    fn assign_q_status(&mut self, args: &[Expression], idx: usize, status: i64) {
+        if let Some(out) = args.get(idx) {
+            self.assign_value(out, &Value::from_u64(status as u32 as u64, 32));
+        }
+    }
+
+    /// §20.15.1 `$q_initialize(q_id, q_type, max_length, status)`. Creates a
+    /// new queue. Status codes: 0 OK, 4 unsupported type, 5 length<=0,
+    /// 6 duplicate q_id (Table 20-11).
+    fn q_initialize_impl(&mut self, args: &[Expression]) -> i64 {
+        let qid = args.get(0).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let qtype = args.get(1).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let maxlen = args.get(2).map(|a| self.eval_expr(a).to_i64().unwrap_or(0)).unwrap_or(0);
+        if qtype != 1 && qtype != 2 {
+            return 4; // unsupported queue type
+        }
+        if maxlen <= 0 {
+            return 5; // specified length <= 0
+        }
+        if self.queues.contains_key(&qid) {
+            return 6; // duplicate q_id
+        }
+        self.queues.insert(qid, StochasticQueue { q_type: qtype, max_length: maxlen, ..Default::default() });
+        0
+    }
+
+    /// §20.15.2 `$q_add(q_id, job_id, inform_id, status)`. Enqueues an entry
+    /// tagged with the current sim time (for wait statistics). Status codes:
+    /// 0 OK, 1 queue full, 2 undefined q_id.
+    fn q_add_impl(&mut self, args: &[Expression]) -> i64 {
+        let qid = args.get(0).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let job = args.get(1).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let inform = args.get(2).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        // §20.15: queue timing statistics are in the same time basis as $time
+        // (the current scope's time unit), not raw simulator ticks. A `#10` in a
+        // 1ns design therefore contributes a wait of 10, not 10000 (ps ticks).
+        let now = self.time_in_current_unit() as i64;
+        let Some(q) = self.queues.get_mut(&qid) else { return 2; };
+        if q.entries.len() >= q.max_length as usize {
+            return 1; // queue full
+        }
+        // inter-arrival statistics (§20.15.5 code 2)
+        q.arrivals += 1;
+        if let Some(last) = q.last_arrival_tick {
+            q.sum_interarrival += now.saturating_sub(last) as i128;
+        }
+        q.last_arrival_tick = Some(now);
+        q.entries.push_back((job, inform, now));
+        if q.entries.len() > q.max_len_seen {
+            q.max_len_seen = q.entries.len();
+        }
+        0
+    }
+
+    /// §20.15.3 `$q_remove(q_id, job_id, inform_id, status)`. Dequeues per the
+    /// queue type (1=FIFO front, 2=LIFO back), writing the entry's job_id and
+    /// inform_id to the output arguments, and accumulating wait statistics.
+    /// Status codes: 0 OK, 2 undefined q_id, 3 queue empty.
+    fn q_remove_impl(&mut self, args: &[Expression]) -> i64 {
+        let qid = args.get(0).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let now = self.time_in_current_unit() as i64;
+        // Dequeue + update statistics while holding the mutable queue borrow,
+        // then drop it before assigning the output arguments (which borrow
+        // `self` again via assign_value).
+        let (job, inform, status) = match self.queues.get_mut(&qid) {
+            None => (0i64, 0i64, 2i64), // undefined q_id
+            Some(q) => {
+                let popped = if q.q_type == 2 { q.entries.pop_back() } else { q.entries.pop_front() };
+                match popped {
+                    None => (0, 0, 3), // queue empty
+                    Some((job, inform, arrival)) => {
+                        let wait = now as i64 - arrival as i64;
+                        // shortest wait over removed jobs (code 4)
+                        q.shortest_wait_ever = Some(match q.shortest_wait_ever {
+                            Some(w) => w.min(wait),
+                            None => wait,
+                        });
+                        q.sum_wait_removed += wait as i128;
+                        q.count_wait_removed += 1;
+                        // longest wait over jobs STILL queued (code 5)
+                        q.longest_wait_queued = q
+                            .entries
+                            .iter()
+                            .map(|(_, _, t)| now as i64 - *t as i64)
+                            .max();
+                        (job, inform, 0)
+                    }
+                }
+            }
+        };
+        if status == 0 {
+            if let Some(out) = args.get(1) {
+                self.assign_value(out, &Value::from_u64(job as u32 as u64, 32));
+            }
+            if let Some(out) = args.get(2) {
+                self.assign_value(out, &Value::from_u64(inform as u32 as u64, 32));
+            }
+        }
+        status
+    }
+
+    /// §20.15.5 `$q_exam(q_id, q_stat_code, q_stat_value, status)`. Writes the
+    /// requested statistic (Table 20-10) to `q_stat_value`. The
+    /// time-influenced codes (2/4/5/6) return -1 when insufficient samples
+    /// exist; the LRM leaves their exact computation implementation-defined.
+    fn q_exam_impl(&mut self, args: &[Expression]) -> i64 {
+        let qid = args.get(0).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let code = args.get(1).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let now = self.time_in_current_unit() as i64;
+        // Compute the statistic while borrowing the queue, then drop the
+        // borrow before assigning the output (which re-borrows `self`).
+        let (val, status) = match self.queues.get(&qid) {
+            None => (0i64, 2i64), // undefined q_id
+            Some(q) => {
+                let v: i64 = match code {
+                    1 => q.entries.len() as i64,                       // current length
+                    2 => if q.arrivals >= 2 {                          // mean interarrival
+                        (q.sum_interarrival / (q.arrivals - 1) as i128) as i64
+                    } else { -1 },
+                    3 => q.max_len_seen as i64,                        // maximum length
+                    4 => q.shortest_wait_ever.unwrap_or(-1),           // shortest wait ever
+                    5 => q.longest_wait_queued.unwrap_or_else(|| {     // longest wait, jobs still queued
+                        q.entries.iter().map(|(_, _, t)| now as i64 - *t as i64).max().unwrap_or(-1)
+                    }),
+                    6 => if q.count_wait_removed >= 1 {                // average wait time
+                        (q.sum_wait_removed / q.count_wait_removed as i128) as i64
+                    } else { -1 },
+                    _ => 0,
+                };
+                (v, 0)
+            }
+        };
+        if let Some(out) = args.get(2) {
+            self.assign_value(out, &Value::from_u64(val as u32 as u64, 32));
+        }
+        status
+    }
+
+    /// §20.15.4 `$q_full(q_id, status)` — system FUNCTION. Returns 1 if the
+    /// queue is full, 0 otherwise; also writes the status code. Status codes:
+    /// 0 OK, 2 undefined q_id.
+    fn q_full_impl(&mut self, args: &[Expression]) -> (i64, i64) {
+        let qid = args.get(0).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let Some(q) = self.queues.get(&qid) else { return (0, 2); };
+        let full = if q.entries.len() >= q.max_length as usize { 1 } else { 0 };
+        (full, 0)
+    }
+
+    /// §20.17.1 `$system`. Invokes the host POSIX shell on the command string
+    /// (via `sh -c <cmd>`, mirroring C `system()`); with no argument calls
+    /// `system(NULL)` (returns nonzero when a shell is available). Returns the
+    /// command's exit status as an `int`.
+    fn system_impl(&mut self, args: &[Expression]) -> i32 {
+        match args.first() {
+            None => 1, // system(NULL): a shell is available
+            Some(a) => {
+                let cmd = self.system_string_arg(a);
+                match std::process::Command::new("sh").arg("-c").arg(&cmd).status() {
+                    Ok(s) => s.code().unwrap_or(-1),
+                    Err(_) => -1,
+                }
+            }
+        }
+    }
+
+    /// §20.17.2 `$stacktrace` text. Content is implementation-defined; xezim
+    /// reports the current hierarchical scope (the deepest frame it models at
+    /// runtime) in a `Call Stack:`/`A total of N stack frames` envelope. The
+    /// task form prints this; the function form returns it as a string.
+    fn stacktrace_text(&self) -> String {
+        let scope = self.severity_scope();
+        format!(
+            "Call Stack:\nModule {}\n\nA total of 1 stack frames are displayed.\n",
+            scope
+        )
+    }
+
     fn format_args(&mut self, args: &[Expression], tn: &str) -> String {
         if args.is_empty() {
             return String::new();
@@ -29557,6 +30203,8 @@ impl Simulator {
             'b'
         } else if tn.ends_with('h') {
             'h'
+        } else if tn.ends_with('o') {
+            'o'
         } else {
             'd'
         };
@@ -29598,6 +30246,7 @@ impl Simulator {
                 result.push_str(&match r {
                     'b' => v.to_bin_string(),
                     'h' => v.to_hex_string(),
+                    'o' => Self::bin_to_oct_string(&v.to_bin_string()),
                     _ => v.to_dec_string(),
                 });
             }
@@ -29901,9 +30550,11 @@ impl Simulator {
                                 ai += 1;
                                 match spec {
                                     'd' | 'D' => {
-                                        // §21.2.1.3: default field width is the
-                                        // widest decimal the operand's type can
-                                        // take (sign included), space-padded.
+                                        // §21.2.1.2: default field width is
+                                        // the widest decimal the operand's
+                                        // type can take (sign included).
+                                        // %0d = minimum width; %0Nd zero-pads;
+                                        // %Nd space-pads; %-Nd left-justifies.
                                         let mut core = v.to_dec_string();
                                         if plus_sign && !core.starts_with('-') {
                                             core.insert(0, '+');
@@ -29916,32 +30567,32 @@ impl Simulator {
                                     }
                                     'b' | 'B' => {
                                         let full = v.to_bin_string();
-                                        let core = if zero_pad {
-                                            Self::trim_radix_zeros(&full)
+                                        if has_width {
+                                            let core = Self::trim_radix_zeros(&full);
+                                            Self::push_radix(&mut result, &core, pad_width, left_align);
                                         } else {
-                                            full
-                                        };
-                                        result.push_str(&field(core, 0));
+                                            result.push_str(&full);
+                                        }
                                     }
                                     'h' | 'H' | 'x' | 'X' => {
                                         let full = v.to_hex_string();
-                                        let core = if zero_pad {
-                                            Self::trim_radix_zeros(&full)
+                                        if has_width {
+                                            let core = Self::trim_radix_zeros(&full);
+                                            Self::push_radix(&mut result, &core, pad_width, left_align);
                                         } else {
-                                            full
-                                        };
-                                        result.push_str(&field(core, 0));
+                                            result.push_str(&full);
+                                        }
                                     }
                                     'o' | 'O' => {
                                         // Full width is ceil(bits/3) digits
-                                        // (§21.2.1.3) — "075" for an 8-bit 8'o75.
+                                        // (§21.2.1.3).
                                         let full = Self::bin_to_oct_string(&v.to_bin_string());
-                                        let core = if zero_pad {
-                                            Self::trim_radix_zeros(&full)
+                                        if has_width {
+                                            let core = Self::trim_radix_zeros(&full);
+                                            Self::push_radix(&mut result, &core, pad_width, left_align);
                                         } else {
-                                            full
-                                        };
-                                        result.push_str(&field(core, 0));
+                                            result.push_str(&full);
+                                        }
                                     }
                                     'f' | 'F' => {
                                         let mut core = format!(
@@ -29955,7 +30606,11 @@ impl Simulator {
                                         result.push_str(&field(core, 0));
                                     }
                                     'g' | 'G' => {
-                                        let s = format!("{:?}", v.to_f64());
+                                        let s = Self::format_g(
+                                            v.to_f64(),
+                                            precision.unwrap_or(6),
+                                            spec == 'G',
+                                        );
                                         result.push_str(&field(s, 0));
                                     }
                                     'e' | 'E' => {
@@ -30528,6 +31183,9 @@ impl Simulator {
     }
 
     fn check_monitor(&mut self) {
+        if self.monitor_paused {
+            return;
+        }
         if let Some((tn, args)) = self.monitor.clone() {
             self.sync_table_to_hashmap();
             // LRM §21.2.3: $monitor prints once when armed, then again only
@@ -32910,6 +33568,37 @@ impl Simulator {
             let _ = w.flush();
         }
         self.vcd_writer = None;
+    }
+
+    /// §21.7.1.4 `$dumpall`: emit a checkpoint of ALL current signal values,
+    /// regardless of whether they changed.
+    fn vcd_dump_checkpoint(&mut self) {
+        if !self.vcd_enabled || self.vcd_writer.is_none() {
+            return;
+        }
+        let mut changes: Vec<(Arc<str>, Value)> = Vec::new();
+        for idx in 0..self.vcd_trace.len() {
+            let id = self.vcd_trace[idx].0;
+            let val = self.signal_table[id].clone();
+            changes.push((self.vcd_trace[idx].1.clone(), val.clone()));
+            self.vcd_prev_signals[idx] = val;
+        }
+        let time_marker = if self.time != self.vcd_last_time {
+            self.vcd_last_time = self.time;
+            Some(self.time)
+        } else {
+            None
+        };
+        if let Some(sink) = self.vcd_writer.as_mut() {
+            sink.post_vcd_changes(time_marker, changes);
+        }
+    }
+
+    /// §21.7.1.6 `$dumpflush`: flush the VCD writer buffer to disk.
+    fn vcd_flush(&mut self) {
+        if let Some(ref mut w) = self.vcd_writer {
+            let _ = w.flush();
+        }
     }
 
     /// Hand a put/try_put value to a parked mailbox get/peek waiter. The assign
@@ -36401,6 +37090,54 @@ impl Simulator {
             sign,
             digits
         )
+    }
+
+    /// §21.2.1.2 hex/binary/octal: when an explicit width is given, the
+    /// value is stripped to its minimum representation and then padded to
+    /// the field width. Normally zero-padded on the left; a `-` flag
+    /// left-justifies with spaces on the right instead.
+    fn push_radix(result: &mut String, core: &str, width: usize, left_align: bool) {
+        if core.len() >= width {
+            result.push_str(core);
+        } else if left_align {
+            result.push_str(core);
+            result.push_str(&" ".repeat(width - core.len()));
+        } else {
+            result.push_str(&"0".repeat(width - core.len()));
+            result.push_str(core);
+        }
+    }
+
+    /// §21.2.1.1 `%g`/`%G`: use `%e` if exponent < -4 or >= precision,
+    /// otherwise `%f`; strip trailing zeros. Precision = significant digits
+    /// (default 6).
+    fn format_g(x: f64, prec: usize, upper: bool) -> String {
+        if x == 0.0 {
+            return "0".to_string();
+        }
+        let p = prec.max(1);
+        let exp = x.abs().log10().floor() as i32;
+        let mut raw = if exp < -4 || exp >= p as i32 {
+            Self::c_style_exp(x, p.saturating_sub(1), upper)
+        } else {
+            let decimals = (p as i32 - 1 - exp).max(0) as usize;
+            format!("{:.*}", decimals, x)
+        };
+        // Remove trailing zeros from the mantissa (C %g behavior).
+        // Works for both plain and exponential forms.
+        if let Some(ei) = raw.find(['e', 'E']) {
+            let (mant, exp) = raw.split_at(ei);
+            let mant = if mant.contains('.') {
+                mant.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                mant
+            };
+            format!("{}{}", mant, exp)
+        } else if raw.contains('.') {
+            raw.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            raw
+        }
     }
 
     /// §21.2.1.4 `%u`: the 2-state data (x/z read as 0) as raw little-endian
@@ -41768,8 +42505,8 @@ impl Simulator {
                         "$value$plusargs" => self.eval_value_plusargs(args),
                         "$fopen" => self.open_file_handle(args),
                         "$fclose" => self.close_file_handle(args),
-                        "$fwrite" => self.write_file_handle(args, false),
-                        "$fdisplay" => self.write_file_handle(args, true),
+                        "$fwrite" => self.write_file_handle_named(args, false, "$write"),
+                        "$fdisplay" => self.write_file_handle_named(args, true, "$display"),
                         "$readmemh" => self.read_memory_file(args, 16),
                         "$readmemb" => self.read_memory_file(args, 2),
                         "$display" | "$displayb" | "$displayh" | "$displayo" | "$write"
