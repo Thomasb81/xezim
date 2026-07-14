@@ -39824,7 +39824,24 @@ impl Simulator {
             if name.name.name.contains("registry") {
                 if let Some(first) = type_args.first() {
                     if let ExprKind::Ident(hier) = &first.kind {
-                        return Some(hier.path.last().unwrap().name.name.clone());
+                        let leaf = hier.path.last().unwrap().name.name.clone();
+                        // The registered type is often a class-local typedef
+                        // alias, not the class itself — e.g. UVM's
+                        // `uvm_sequencer` declares
+                        //   typedef uvm_sequencer#(REQ,RSP) this_type;
+                        //   `uvm_component_param_utils(this_type)`
+                        // so type_id's first arg is `this_type`. Resolve one
+                        // level through the class's own typedef table to the
+                        // underlying class name (else `this_type` is not a
+                        // class and the factory create returns null → the
+                        // sequencer's `seq_item_export` is never built →
+                        // "Cannot connect to null port handle" build error).
+                        if let Some(DataType::TypeReference { name: real, .. }) =
+                            cd.typedef_targets.get(&leaf)
+                        {
+                            return Some(real.name.name.clone());
+                        }
+                        return Some(leaf);
                     }
                 }
             }
