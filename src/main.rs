@@ -1184,6 +1184,10 @@ fn main() {
                     std::process::exit(1);
                 }
                 println!("Elaboration successful");
+                // §6.21: keep compiled artifacts consistent with the simulate
+                // path — re-issue static initializers that call simulation-time
+                // system functions as time-0 assignments (issue #26).
+                xezim::defer_static_syscall_inits(&_defs, &mut elab);
                 if let Some(ref out) = _output_file {
                     // The serialized artifact format flattens always_blocks /
                     // initial_blocks / continuous_assigns; pending_* are

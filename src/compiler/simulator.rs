@@ -1829,6 +1829,10 @@ pub struct Simulator {
     /// per-pid hint so $time/%t scale to the BLOCK's module timescale, not
     /// the last scheduled process's.
     timescale_scope_override: Option<String>,
+    /// Collection name a `return <collection>` recorded (§13.4: functions may
+    /// return arrays/queues). The caller's assign-from-call consumes it with
+    /// a whole-collection copy; a plain value return leaves it None.
+    pending_ret_collection: Option<String>,
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,
@@ -3196,7 +3200,9 @@ impl Simulator {
             uvm_obj_raised: false,
             uvm_phase_drain: 0,
             uvm_pending_end: None,
-            pure_sv_lrm: std::env::var("PURE_SV_LRM").map(|v| v == "1").unwrap_or(false),
+            // Pure-LRM semantics are the DEFAULT; PURE_SV_LRM=0 opts back
+            // into the legacy UVM-hack mode.
+            pure_sv_lrm: std::env::var("PURE_SV_LRM").map(|v| v != "0").unwrap_or(true),
             tb_cache: std::cell::RefCell::new(HashMap::default()),
             uvm_components: Vec::new(),
             uvm_post_run_done: false,
@@ -3230,6 +3236,7 @@ impl Simulator {
             process_contexts: HashMap::default(),
             process_scope_hint: HashMap::default(),
             timescale_scope_override: None,
+            pending_ret_collection: None,
             current_scope: String::new(),
             return_value: None,
             rng: rand::rngs::StdRng::from_entropy(),
@@ -6306,12 +6313,20 @@ impl Simulator {
         // populated before user code reads them. Schedule them first so they
         // receive the lowest pids (the time-0 queue runs lower pids first).
         for ib in std::mem::take(&mut self.module.static_init_blocks) {
+            let span = ib.stmt.span;
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, ib.stmt.span)],
+                other => vec![Statement::new(other, span)],
             };
             let pid = self.next_pid;
             self.next_pid += 1;
+            // §6.21: an instance-scoped static initializer (deferred by
+            // `defer_static_syscall_inits`) needs the same name-resolution
+            // hint initial blocks get, so bare names, module-level function
+            // calls and `%m` resolve in the DECLARING instance's scope.
+            if !ib.scope.is_empty() {
+                self.process_scope_hint.insert(pid, ib.scope);
+            }
             self.event_queue.schedule(0, pid, stmts);
         }
         if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
@@ -14762,11 +14777,28 @@ impl Simulator {
     /// astronomically far out so it never fired and the process was lost).
     fn eval_delay_ticks(&mut self, d: &Expression) -> u64 {
         let v = self.eval_expr(d);
-        if v.is_real {
+        let raw = if v.is_real {
             let f = v.to_f64();
-            if f.is_finite() && f > 0.0 { f.round() as u64 } else { 0 }
+            if f.is_finite() && f > 0.0 { f } else { 0.0 }
         } else {
-            v.to_u64().unwrap_or(0)
+            v.to_u64().unwrap_or(0) as f64
+        };
+        // §3.14.3: a delay rounds to the CURRENT MODULE's time precision, not
+        // the (finer) global tick — `#1.55` in a 1ns/100ps module is 1.6ns,
+        // and `#0.04` collapses to 0. `raw` is already tick-denominated (the
+        // elaborator pre-scales by the module unit), so quantize to the
+        // module-precision-per-tick grid. The grid ratio comes from EXPONENT
+        // arithmetic (10^n is exact in f64 for small n; dividing seconds
+        // values is not), and a 1-ulp relative nudge keeps a half-grid delay
+        // that arrived as x.49999999999996 from rounding the wrong way.
+        let (_, prec_exp) = self.current_timescale_exp();
+        let diff = prec_exp - Self::secs_to_exp(self.tick_s);
+        if diff > 0 {
+            let q = 10f64.powi(diff);
+            let x = (raw / q) * (1.0 + 1e-12);
+            (x.round() * q).round() as u64
+        } else {
+            raw.round() as u64
         }
     }
 
@@ -22949,6 +22981,33 @@ impl Simulator {
                 "$typename" => {
                     if let Some(arg) = args.first() {
                         if let ExprKind::Ident(hier) = &arg.kind {
+                            // IEEE 1800-2017 §20.6.1: $typename of a built-in
+                            // type returns that type's name — $typename(int)
+                            // is "int". A bare type keyword in a call argument
+                            // parses as a single-segment Ident (see the
+                            // §20.6.2 branch in parse_call_args).
+                            if hier.path.len() == 1 {
+                                let kw = hier.path[0].name.name.as_str();
+                                if matches!(
+                                    kw,
+                                    "bit" | "logic"
+                                        | "reg"
+                                        | "byte"
+                                        | "shortint"
+                                        | "int"
+                                        | "longint"
+                                        | "integer"
+                                        | "time"
+                                        | "real"
+                                        | "shortreal"
+                                        | "realtime"
+                                        | "string"
+                                        | "chandle"
+                                        | "event"
+                                ) {
+                                    return Value::from_string(kw);
+                                }
+                            }
                             let name = self.resolve_hier_name(hier);
                             if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
                                 let w = self.signal_widths[id];
@@ -24851,16 +24910,13 @@ impl Simulator {
                 };
                 if bare_new {
                     let type_name = self.get_expr_type_name(lvalue);
-                    // PURE_SV_LRM type-parameter construction: if the declared
+                    // §6.20.3 type-parameter construction: if the declared
                     // type is a class type parameter (e.g. `T obj = new;`),
-                    // resolve it through the current instance's bindings to the
-                    // concrete class. Plain class names pass through unchanged.
-                    let type_name = if self.pure_sv_lrm {
-                        type_name
-                            .map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn))
-                    } else {
-                        type_name
-                    };
+                    // resolve it through the current instance's bindings to
+                    // the concrete class. A non-parameter name resolves to
+                    // None and passes through unchanged.
+                    let type_name = type_name
+                        .map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn));
                     if let Some(tname) = type_name {
                         if let Some(class_def) = self.module.classes.get(&tname).cloned() {
                             let lname_opt = if let ExprKind::Ident(lh) = &lvalue.kind {
@@ -25066,17 +25122,13 @@ impl Simulator {
                                 }
                             }
                             let type_name = self.get_expr_type_name(lvalue);
-                            // PURE_SV_LRM type-parameter construction: resolve a
+                            // §6.20.3 type-parameter construction: resolve a
                             // declared type that is a class type parameter (e.g.
                             // `T obj; obj = new(n);`) through the current
                             // instance's bindings to the concrete class so its
                             // real `new` runs. Plain class names are unchanged.
-                            let type_name = if self.pure_sv_lrm {
-                                type_name
-                                    .map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn))
-                            } else {
-                                type_name
-                            };
+                            let type_name = type_name
+                                .map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn));
                             if let Some(tname) = type_name {
                                 if tname == "semaphore" {
                                     let handle = self.heap.len();
@@ -25213,18 +25265,62 @@ impl Simulator {
                 } else {
                     self.eval_expr_ctx(rvalue, w)
                 };
-                if let (ExprKind::Ident(lhier), ExprKind::Ident(rhier)) =
-                    (&lvalue.kind, &rvalue.kind)
+                // A collection RETURNED by the call in `rvalue` (recorded at
+                // its `return` statement): copy it into a collection lvalue.
+                if matches!(&rvalue.kind, ExprKind::Call { .. }) {
+                    if let Some(src) = self.pending_ret_collection.take() {
+                        let dst: Option<String> = {
+                            let byname = if let ExprKind::Ident(h) = &lvalue.kind {
+                                let n = self.resolve_hier_name(h);
+                                self.module.dynamic_arrays.contains(&n).then_some(n)
+                            } else {
+                                None
+                            };
+                            byname.or_else(|| {
+                                self.expr_assoc_name(lvalue)
+                                    .filter(|an| !self.is_associative_array(an))
+                            })
+                        };
+                        if let Some(dst) = dst {
+                            if dst != src {
+                                self.copy_whole_queue(&dst, &src);
+                            }
+                            if !self.in_edge_block {
+                                self.settle_combinatorial();
+                            }
+                            return;
+                        }
+                    }
+                }
+                let resolve_coll = |sim: &Self, e: &Expression| -> Option<(String, bool)> {
+                    if let ExprKind::Ident(h) = &e.kind {
+                        let n = Self::resolve_hier_name_static(h, &sim.module);
+                        if sim.module.dynamic_arrays.contains(&n) {
+                            return Some((n, false));
+                        }
+                    }
+                    // An object's collection PROPERTY (`d.data`, `this.data`)
+                    // lives under "<handle>#member" — resolve it like element
+                    // accesses already do, else a whole-array copy involving
+                    // a property is silently dropped.
+                    sim.expr_assoc_name(e)
+                        .filter(|an| !sim.is_associative_array(an))
+                        .map(|an| (an, true))
+                };
+                if std::env::var("XZ_CP_DBG").is_ok() {
+                    eprintln!("[CPDBG] l={:?} r={:?}",
+                        resolve_coll(self, lvalue), resolve_coll(self, rvalue));
+                }
+                if let (Some((lname, l_is_prop)), Some((rname, r_is_prop))) =
+                    (resolve_coll(self, lvalue), resolve_coll(self, rvalue))
                 {
-                    let lname = self.resolve_hier_name(lhier);
-                    let rname = self.resolve_hier_name(rhier);
                     // `r = q` between queues / dynamic arrays (§7.6): copy every
                     // element and the size. Nothing did this — the RHS was read as
                     // a scalar container signal that queues do not have, so the
                     // destination stayed empty whatever its element type.
                     if lname != rname
-                        && self.module.dynamic_arrays.contains(&lname)
-                        && self.module.dynamic_arrays.contains(&rname)
+                        && (l_is_prop || self.module.dynamic_arrays.contains(&lname))
+                        && (r_is_prop || self.module.dynamic_arrays.contains(&rname))
                     {
                         self.copy_whole_queue(&lname, &rname);
                         if !self.in_edge_block {
@@ -25232,6 +25328,16 @@ impl Simulator {
                         }
                         return;
                     }
+                }
+                // Assoc-to-assoc and fixed-array-to-fixed-array copies key on
+                // the PLAIN resolved names (they predate the collection
+                // resolver above and must not be gated behind it — `s = a`
+                // between fixed arrays broke when they were).
+                if let (ExprKind::Ident(lhier), ExprKind::Ident(rhier)) =
+                    (&lvalue.kind, &rvalue.kind)
+                {
+                    let lname = self.resolve_hier_name(lhier);
+                    let rname = self.resolve_hier_name(rhier);
                     if self.is_associative_array(&lname) && self.is_associative_array(&rname) {
                         let prefix = format!("{}[", rname);
                         let entries: Vec<(String, Value)> = self
@@ -26451,6 +26557,23 @@ impl Simulator {
             }
             StatementKind::Return(expr) => {
                 if let Some(e) = expr {
+                    // §13.4: `return <collection>` — record the collection's
+                    // storage name so the caller's assign can copy elements
+                    // (a packed Value cannot carry them).
+                    self.pending_ret_collection = None;
+                    if let ExprKind::Ident(h) = &e.kind {
+                        let n = self.resolve_hier_name(h);
+                        if self.module.dynamic_arrays.contains(&n) {
+                            self.pending_ret_collection = Some(n);
+                        }
+                    }
+                    if self.pending_ret_collection.is_none() {
+                        if let Some(an) = self.expr_assoc_name(e) {
+                            if !self.is_associative_array(&an) {
+                                self.pending_ret_collection = Some(an);
+                            }
+                        }
+                    }
                     self.return_value = Some(self.eval_expr(e));
                 }
                 self.break_flag = true;
@@ -26970,7 +27093,35 @@ impl Simulator {
                             }
                         }
                     }
-                    let dims = &d.dimensions;
+                    // §6.18/§6.20.3: a typedef'd (or type-param-bound) local
+                    // carries its unpacked dims on the TYPE — `my_array_t a;`
+                    // declared inside a task elaborated as a scalar.
+                    let typedef_dims: Vec<crate::ast::types::UnpackedDimension> =
+                        if d.dimensions.is_empty() {
+                            if let crate::ast::types::DataType::TypeReference { name, .. } =
+                                data_type
+                            {
+                                let tn = &name.name.name;
+                                let concrete = self
+                                    .resolve_type_param_binding(tn)
+                                    .unwrap_or_else(|| tn.clone());
+                                self.module
+                                    .typedef_unpacked_dims
+                                    .get(&concrete)
+                                    .cloned()
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                    let dims: &Vec<crate::ast::types::UnpackedDimension> =
+                        if typedef_dims.is_empty() {
+                            &d.dimensions
+                        } else {
+                            &typedef_dims
+                        };
                     // A local MULTI-dimensional array was registered from its
                     // first dimension only, so `int n[2][2]` became a 1-D array
                     // of double-width elements: `n[1][0]` read 0 and the
@@ -27827,10 +27978,73 @@ impl Simulator {
             // §21.2.1.4 $printtimescale [(hier)]. Reports the calling scope's
             // time unit and precision.
             "$printtimescale" => {
-                let (unit_exp, prec_exp) = self.current_timescale_exp();
-                let scope = match self.process_scope_hint.get(&self.current_pid) {
-                    Some(s) if !s.is_empty() => format!("{}.{}", self.module.name, s),
-                    _ => self.module.name.clone(),
+                // §20.11: an instance argument selects THAT instance's
+                // module timescale; no argument means the calling scope.
+                let arg_inst: Option<String> = args.first().and_then(|a| {
+                    if let ExprKind::Ident(h) = &a.kind {
+                        Some(self.resolve_hier_name(h))
+                    } else {
+                        None
+                    }
+                });
+                let (unit_exp, prec_exp, scope) = if let Some(inst) = arg_inst {
+                    let rel = inst
+                        .strip_prefix(&format!("{}.", self.module.name))
+                        .unwrap_or(&inst);
+                    // Prefix the caller's own instance scope for a relative
+                    // path ($printtimescale(m1) inside tb_top.sub).
+                    let hint = self
+                        .process_scope_hint
+                        .get(&self.current_pid)
+                        .cloned()
+                        .unwrap_or_default();
+                    let candidates = if hint.is_empty() {
+                        vec![rel.to_string()]
+                    } else {
+                        vec![format!("{}.{}", hint, rel), rel.to_string()]
+                    };
+                    let mut found: Option<(i32, i32, String)> = None;
+                    for cand in candidates {
+                        if let Some(def) = self
+                            .module
+                            .instances
+                            .iter()
+                            .find(|i| i.path == cand)
+                            .map(|i| i.def_name.clone())
+                        {
+                            let ts = self
+                                .module
+                                .module_timescale_exp
+                                .get(&def)
+                                .copied()
+                                .unwrap_or((
+                                    self.module.timeunit_exp,
+                                    self.module.timeprecision_exp,
+                                ));
+                            found = Some((
+                                ts.0,
+                                ts.1,
+                                format!("{}.{}", self.module.name, cand),
+                            ));
+                            break;
+                        }
+                    }
+                    match found {
+                        Some(f) => f,
+                        None => {
+                            let (u, p) = self.current_timescale_exp();
+                            (u, p, format!("{}.{}", self.module.name, rel))
+                        }
+                    }
+                } else {
+                    let (u, p) = self.current_timescale_exp();
+                    let scope = match self.process_scope_hint.get(&self.current_pid) {
+                        Some(s) if !s.is_empty() => {
+                            format!("{}.{}", self.module.name, s)
+                        }
+                        _ => self.module.name.clone(),
+                    };
+                    (u, p, scope)
                 };
                 let m = format!(
                     "Time scale of ({}) is {} / {}",
@@ -29350,6 +29564,94 @@ impl Simulator {
                     let parent = parent_of(k).to_string();
                     *self.name_resolve_hint.borrow_mut() = Some(parent);
                     return k.to_string();
+                }
+            }
+        }
+
+        // IEEE 1800-2023 §23.8 (upward name referencing) / §23.10.1 (a module
+        // inserted with `bind` resolves names in the scope of the bind
+        // TARGET, i.e. through the target instance's own scope chain): a
+        // hierarchical name whose first segment did not resolve as a downward
+        // path is searched UPWARD through the enclosing instance scopes.
+        // Starting at the executing scope (for a bound monitor: the bound
+        // instance, whose parent is the bind target) and walking one segment
+        // up at a time, at each ancestor scope P the first segment can match
+        //   a) an instance declared in P — the reference resolves under
+        //      `P.first`, or
+        //   b) the MODULE DEFINITION name of P's own instance (§23.8: the
+        //      first name may be "the name of a module", meaning the nearest
+        //      enclosing instance of that module) — the reference resolves
+        //      under P itself. With P = "" this also covers naming the
+        //      top-level module.
+        // xezim inlines a bound module as a regular child of the target
+        // (§23.11), so this walk is exactly what lets the bound module read
+        // the target's — and any enclosing scope's — signals by naming those
+        // scopes (e.g. `dut_top.top_secret` from a monitor bound under
+        // `dut_top.sub.core`).
+        if hier.path.len() > 1 && !self.module.instances.is_empty() {
+            let (first, rest) = raw.split_once('.').unwrap();
+            let exists = |name: &str, this: &Self| -> bool {
+                this.signal_name_to_id.contains_key(name) || check_known_or_signal(name, this)
+            };
+            // Does scope path `p` ("" = top) instantiate a module named `d`?
+            let def_matches = |p: &str, d: &str, this: &Self| -> bool {
+                if p.is_empty() {
+                    return this.module.name == d;
+                }
+                this.module
+                    .instances
+                    .iter()
+                    .any(|i| i.path == p && i.def_name == d)
+            };
+            let hint_owned = self.name_resolve_hint.borrow().clone();
+            // Walk from the stable executing scope first; the transient
+            // resolve hint is a fallback for call sites that only set it.
+            let mut starts: Vec<&str> = Vec::new();
+            if !self.current_scope.is_empty() {
+                starts.push(self.current_scope.as_str());
+            }
+            if let Some(h) = hint_owned.as_deref() {
+                if !h.is_empty() && starts.first() != Some(&h) {
+                    starts.push(h);
+                }
+            }
+            if starts.is_empty() {
+                starts.push("");
+            }
+            for &start in &starts {
+                let mut p: &str = start;
+                loop {
+                    // b) `first` names the module DEFINITION of scope `p`.
+                    if def_matches(p, first, self) {
+                        let full = if p.is_empty() {
+                            rest.to_string()
+                        } else {
+                            format!("{}.{}", p, rest)
+                        };
+                        if exists(&full, self) {
+                            let parent = parent_of(&full).to_string();
+                            *self.name_resolve_hint.borrow_mut() = Some(parent);
+                            return full;
+                        }
+                    }
+                    // a) `first` names an instance declared in scope `p`.
+                    let inst = if p.is_empty() {
+                        first.to_string()
+                    } else {
+                        format!("{}.{}", p, first)
+                    };
+                    if self.module.instances.iter().any(|i| i.path == inst) {
+                        let full = format!("{}.{}", inst, rest);
+                        if exists(&full, self) {
+                            let parent = parent_of(&full).to_string();
+                            *self.name_resolve_hint.borrow_mut() = Some(parent);
+                            return full;
+                        }
+                    }
+                    if p.is_empty() {
+                        break;
+                    }
+                    p = parent_of(p);
                 }
             }
         }
@@ -32989,8 +33291,17 @@ impl Simulator {
     /// `$time`/`$realtime` require (§20.3). For a default 1 ns design this is
     /// just the tick count.
     fn time_in_current_unit(&self) -> f64 {
+        // Exponent-difference division keeps the result exact where it can
+        // be: 1600 ticks(1ps) in a 1ns unit is 1600.0 / 1000.0 == literal
+        // 1.6, so testbench `$realtime != 1.6` compares hold. Multiplying by
+        // tick seconds first (1e-12 is inexact) drifted by an ulp.
         let (unit_exp, _) = self.current_timescale_exp();
-        self.time as f64 * self.tick_s / 10f64.powi(unit_exp)
+        let diff = unit_exp - Self::secs_to_exp(self.tick_s);
+        if diff >= 0 {
+            self.time as f64 / 10f64.powi(diff)
+        } else {
+            self.time as f64 * 10f64.powi(-diff)
+        }
     }
 
     fn secs_to_exp(s: f64) -> i32 {
@@ -36227,6 +36538,46 @@ impl Simulator {
 
     /// Does `class_name` or an ancestor declare `member` as an associative
     /// array or queue/dynamic-array (both stored per-instance as `<h>#<m>`)?
+    /// Is `member` of the object at `handle` a collection BY TYPE BINDING —
+    /// a property declared with a type parameter that this instance binds to
+    /// a typedef carrying a dynamic/queue unpacked dimension (§6.20.3)?
+    fn prop_bound_collection(&self, handle: usize, class_name: &str, member: &str) -> bool {
+        let mut cur = Some(class_name.to_string());
+        let raw_ty: Option<String> = loop {
+            let Some(cn) = cur else { break None };
+            match self.module.classes.get(&cn) {
+                Some(cd) => {
+                    if let Some(sig) = cd.properties.get(member) {
+                        break sig.type_name.clone();
+                    }
+                    cur = cd.extends.clone();
+                }
+                None => break None,
+            }
+        };
+        let Some(raw) = raw_ty else { return false };
+        // A type-param binding resolves first; otherwise the raw name may
+        // itself be an array/queue typedef (`my_array_t data;` — the class
+        // property elaboration is dim-blind for typedef'd types).
+        let concrete = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| i.type_bindings.get(&raw).cloned())
+            .unwrap_or(raw);
+        self.module
+            .typedef_unpacked_dims
+            .get(&concrete)
+            .and_then(|dims| dims.first())
+            .map_or(false, |d| {
+                matches!(
+                    d,
+                    crate::ast::types::UnpackedDimension::Unsized(_)
+                        | crate::ast::types::UnpackedDimension::Queue { .. }
+                )
+            })
+    }
+
     fn class_assoc_member(&self, class_name: &str, member: &str) -> bool {
         let mut cur = Some(class_name.to_string());
         while let Some(cn) = cur {
@@ -36273,11 +36624,25 @@ impl Simulator {
                 .map(|i| i.class_name.clone())?;
             if sim.class_assoc_member(&cn, member) {
                 Some(format!("{}#{}", handle, member))
+            } else if sim.prop_bound_collection(handle, &cn, member) {
+                // §6.20.3: `T data;` where THIS instance binds T to an
+                // array/queue typedef — a per-spec collection property.
+                Some(format!("{}#{}", handle, member))
             } else {
                 None
             }
         };
         match &expr.kind {
+            // Explicit `this.member` / `obj.member` MemberAccess forms — the
+            // flattened-Ident arms below never see them, so a
+            // `this.data = val` whole-collection write went unresolved.
+            ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+                ExprKind::This => obj_member(self, "this", &member.name),
+                ExprKind::Ident(bh) if bh.path.len() == 1 => {
+                    obj_member(self, &bh.path[0].name.name, &member.name)
+                }
+                _ => None,
+            },
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 self.instance_assoc_member(&h.path[0].name.name)
             }
@@ -38857,8 +39222,31 @@ impl Simulator {
                 }
             }
             if i < args.len() {
+                // §6.18/§6.20.3: a typedef'd (or type-param-bound) formal
+                // carries its unpacked dims on the TYPE, not the port —
+                // `function void set(my_array_t val)` bound as a scalar.
+                let eff_dims: Vec<crate::ast::types::UnpackedDimension> =
+                    if port.dimensions.is_empty() {
+                        if let crate::ast::types::DataType::TypeReference { name, .. } =
+                            &port.data_type
+                        {
+                            let tn = &name.name.name;
+                            let concrete = self
+                                .resolve_type_param_binding(tn)
+                                .unwrap_or_else(|| tn.clone());
+                            self.module
+                                .typedef_unpacked_dims
+                                .get(&concrete)
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        port.dimensions.clone()
+                    };
                 if let Some(caller) =
-                    self.bind_queue_param(&port.name.name, &port.dimensions, &args[i], &port.data_type)
+                    self.bind_queue_param(&port.name.name, &eff_dims, &args[i], &port.data_type)
                 {
                     if is_out && !caller.is_empty() {
                         queue_writebacks.push((port.name.name.clone(), caller));
@@ -42737,9 +43125,48 @@ impl Simulator {
                             output_bindings.push((port.name.name.clone(), args[i].clone()));
                         }
                         if i < args.len() {
+                            // §6.18/§6.20.3: typedef'd / type-param-bound
+                            // formal — dims live on the type (see the same
+                            // resolution in exec_function_call).
+                            if std::env::var("XZ_BD_DBG").is_ok() {
+                                if let crate::ast::types::DataType::TypeReference { name, .. } = &port.data_type {
+                                    eprintln!("[BDDBG] port={} tn={} in_tud={} tud_keys={:?}",
+                                        port.name.name, name.name.name,
+                                        self.module.typedef_unpacked_dims.contains_key(&name.name.name),
+                                        self.module.typedef_unpacked_dims.keys().collect::<Vec<_>>());
+                                }
+                            }
+                            let eff_dims: Vec<crate::ast::types::UnpackedDimension> =
+                                if port.dimensions.is_empty() {
+                                    if let crate::ast::types::DataType::TypeReference {
+                                        name, ..
+                                    } = &port.data_type
+                                    {
+                                        let tn = &name.name.name;
+                                        // Resolve against the CALLEE's own
+                                        // type bindings — `this` isn't pushed
+                                        // yet while formals bind.
+                                        let concrete = self
+                                            .heap
+                                            .get(handle)
+                                            .and_then(|o| o.as_ref())
+                                            .and_then(|i| i.type_bindings.get(tn).cloned())
+                                            .or_else(|| self.resolve_type_param_binding(tn))
+                                            .unwrap_or_else(|| tn.clone());
+                                        self.module
+                                            .typedef_unpacked_dims
+                                            .get(&concrete)
+                                            .cloned()
+                                            .unwrap_or_default()
+                                    } else {
+                                        Vec::new()
+                                    }
+                                } else {
+                                    port.dimensions.clone()
+                                };
                             if let Some(caller) = self.bind_queue_param(
                                 &port.name.name,
-                                &port.dimensions,
+                                &eff_dims,
                                 &args[i],
                                 &port.data_type,
                             ) {
@@ -43086,6 +43513,10 @@ impl Simulator {
                     if let Some(t) = &sig.type_name {
                         if self.module.classes.contains_key(t)
                             || self.module.enum_members.contains_key(t)
+                            // §6.20.3: a TYPE-parameter name passes through —
+                            // the caller resolves it to the bound concrete
+                            // type via the instance's type_bindings.
+                            || cd.type_param_names.iter().any(|p| p == t)
                         {
                             return Some(t.clone());
                         }
@@ -43227,6 +43658,17 @@ impl Simulator {
             // `ClassName::static_prop` or `obj.field` — resolve the
             // member's declared class type.
             ExprKind::MemberAccess { expr: base, member } => {
+                // `this.field` — the current instance's class (its dynamic
+                // type, so an inherited property resolves too).
+                if matches!(base.kind, ExprKind::This) {
+                    if let Some(Some(h)) = self.this_stack.last().copied() {
+                        if let Some(Some(inst)) = self.heap.get(h) {
+                            let cn = inst.class_name.clone();
+                            return self.class_prop_type_named(&cn, &member.name);
+                        }
+                    }
+                    return None;
+                }
                 if let ExprKind::Ident(bh) = &base.kind {
                     if bh.path.len() == 1 {
                         let bname = &bh.path[0].name.name;

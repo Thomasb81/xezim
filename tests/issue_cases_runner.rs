@@ -83,3 +83,17 @@ fn orphan_force_release_compliance_ratchet() {
         msgs.iter().filter(|m| m.starts_with("FAIL")).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn issue_21_timescale_handling() {
+    // §3.14.3 precision quantization + per-module directive scales.
+    let msgs = outputs(include_str!("issue_cases/timescale.handling.sv"), 1_000_000);
+    assert!(msgs.iter().any(|m| m.contains("TEST PASSED")), "{:?}", msgs);
+}
+
+#[test]
+fn issue_18_type_parameters() {
+    // §6.20.3 type params: structs, arrays, class handles.
+    let msgs = outputs(include_str!("issue_cases/type-parameter-compliance.sv"), 100_000);
+    assert!(msgs.iter().any(|m| m.contains("TEST PASSED")), "{:?}", msgs);
+}
