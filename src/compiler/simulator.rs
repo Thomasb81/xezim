@@ -2437,6 +2437,12 @@ pub struct Simulator {
     /// non-null but `vif.member`/edge-waits don't resolve). Entries are
     /// (scope_glob, field, iface_name); get matches scope via UVM glob rules.
     vif_config_db: Vec<(String, String, String)>,
+    /// Reverse map from the sentinel hash value stored in a local virtual-
+    /// interface variable (by `pure_vif_config_db` GET) back to the bound
+    /// interface-instance name.  This lets `resolve_vif_rhs_name` propagate
+    /// the binding when the local var is later assigned to a class property
+    /// (`wr.vif = v`), without needing a class handle for the key.
+    vif_hash_to_iface: HashMap<u64, String>,
     /// UVM uvm_config_db scope-aware store (in addition to the flat
     /// `__uvm_cfgdb__` signal keys, kept as a fallback). Each set records the
     /// fully-resolved scope pattern `<cntxt.get_full_name()>.<inst_name>`, the
@@ -4791,6 +4797,7 @@ impl Simulator {
             heap: vec![None], // index 0 is null
             virtual_iface_bindings: HashMap::default(),
             vif_config_db: Vec::new(),
+            vif_hash_to_iface: HashMap::default(),
             cfgdb_scoped: Vec::new(),
             uvm_obj_count: 0,
             uvm_obj_raised: false,
@@ -45102,13 +45109,27 @@ impl Simulator {
                         // `vif.member` resolves and `@(posedge vif.clk)` events
                         // sensitize on the real interface signal.
                         if let Some(iname) = scoped_vif {
+                            // Determine (handle, prop) for the destination so we can
+                            // record a virtual_iface_bindings entry — the same logic
+                            // used by the pure_vif_config_db path.
                             let hp: Option<(usize, String)> = match &dst.kind {
-                                ExprKind::Ident(h) if h.path.len() == 1 => self
-                                    .this_stack
-                                    .last()
-                                    .copied()
-                                    .flatten()
-                                    .map(|hh| (hh, h.path[0].name.name.clone())),
+                                ExprKind::Ident(h) if h.path.len() == 1 => {
+                                    // Single-segment: could be `this.prop` (when inside a
+                                    // class method) or a plain local/module variable.
+                                    let prop = h.path[0].name.name.clone();
+                                    let th = self.this_stack.last().copied().flatten();
+                                    if let Some(hh) = th {
+                                        Some((hh, prop))
+                                    } else {
+                                        // No class context — record by variable name so that
+                                        // a later `obj.vif = local_var` can propagate.
+                                        self.signals.insert(
+                                            format!("__vif_local__{}", prop),
+                                            Value::from_string(&iname),
+                                        );
+                                        None
+                                    }
+                                }
                                 ExprKind::Ident(h) if h.path.len() == 2 => self
                                     .eval_ident_handle(&h.path[0].name.name)
                                     .map(|hh| (hh, h.path[1].name.name.clone())),
@@ -51833,7 +51854,12 @@ impl Simulator {
                 h ^= b as u64;
                 h = h.wrapping_mul(0x100000001b3);
             }
-            self.assign_value(&args[3], &Value::from_u64((h & 0x7FFF_FFFF) | 1, 32));
+            let sentinel: u64 = (h & 0x7FFF_FFFF) | 1;
+            // Record hash→iface so resolve_vif_rhs_name can propagate the
+            // binding when a local var holding this sentinel is later assigned
+            // to a class property (`wr.vif = v`).
+            self.vif_hash_to_iface.insert(sentinel, iface.clone());
+            self.assign_value(&args[3], &Value::from_u64(sentinel, 32));
             Some(Value::from_u64(1, 32))
         }
     }
@@ -51847,6 +51873,17 @@ impl Simulator {
                 if let Some(th) = self.this_stack.last().copied().flatten() {
                     if let Some((b, _)) = self.virtual_iface_bindings.get(&(th, raw.clone())) {
                         return Some(b.clone());
+                    }
+                }
+                // Check for a recorded local/module-level vif binding: when
+                // config_db GET lands into a variable with no class context, we
+                // record the interface name in signals["__vif_local__<var>"] so a
+                // later `obj.vif_prop = local_var` can propagate the binding.
+                let local_key = format!("__vif_local__{}", raw);
+                if let Some(iface_val) = self.signals.get(&local_key) {
+                    let s = iface_val.to_sv_string();
+                    if !s.is_empty() {
+                        return Some(s);
                     }
                 }
                 if let Some(b) = self.iface_alias_for(&raw) {
