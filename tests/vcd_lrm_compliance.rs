@@ -61,6 +61,27 @@ fn id_of(vcd: &str, name: &str) -> String {
         .to_string()
 }
 
+/// Every `$var` line whose reference is `name`, across ALL scopes — the same
+/// leaf name appears once per instance that declares it (`clk` in `top`, in
+/// `u_mid` and in `u_leaf`).
+fn var_lines_all(vcd: &str, name: &str) -> Vec<String> {
+    let v: Vec<String> = vcd
+        .lines()
+        .filter(|l| l.starts_with("$var") && l.split_whitespace().nth(4) == Some(name))
+        .map(|l| l.to_string())
+        .collect();
+    assert!(!v.is_empty(), "no $var for `{}` in:\n{}", name, vcd);
+    v
+}
+
+/// The identifier codes of every `$var` named `name`, in file order.
+fn ids_of_all(vcd: &str, name: &str) -> Vec<String> {
+    var_lines_all(vcd, name)
+        .iter()
+        .map(|l| l.split_whitespace().nth(3).unwrap().to_string())
+        .collect()
+}
+
 /// Every value-change record emitted for `name`, in file order, without its id.
 fn records(vcd: &str, name: &str) -> Vec<String> {
     let id = id_of(vcd, name);
@@ -147,7 +168,9 @@ endmodule
 "#,
     );
     assert_eq!(var_line(&vcd, "a"), format!("$var reg 4 {} a [3:0] $end", id_of(&vcd, "a")));
-    assert_eq!(records(&vcd, "a"), vec!["bxxxx", "b1", "b10"]);
+    // `bx` — an all-x vector left-extends back to full width (§21.7.2.1), and is
+    // what Icarus writes. See `leading_run_suppression_matches_icarus_...`.
+    assert_eq!(records(&vcd, "a"), vec!["bx", "b1", "b10"]);
 }
 
 /// §21.7.1.4: the depth argument. `1` = only the named scope's own level;
@@ -485,6 +508,289 @@ endmodule
     // §21.7.2: the file is closed at the final simulation time, so the last
     // value spans to the end of the run instead of stopping at #23.
     assert!(body.trim_end().ends_with("#27"), "no closing time marker:\n{}", body);
+}
+
+/// A net threaded down three levels of hierarchy through whole-net port
+/// connections, plus a same-named (`clk`) and a differently-named (`src` →
+/// `mdin` → `din`) binding.
+const PORT_HIER: &str = r#"
+`timescale 1ns/1ps
+module leaf(input logic clk, input logic [7:0] din, output logic [7:0] dout);
+  always @(posedge clk) dout <= din + 8'd1;
+endmodule
+module mid(input logic clk, input logic [7:0] mdin, output logic [7:0] mdout);
+  leaf u_leaf(.clk(clk), .din(mdin), .dout(mdout));
+endmodule
+module top;
+  logic clk = 0;
+  logic [7:0] src, snk;
+  mid u_mid(.clk(clk), .mdin(src), .mdout(snk));
+  always #5 clk = ~clk;
+  initial begin
+    $dumpfile("{VCD}");
+    $dumpvars(0, top);
+    src = 8'h10;
+    #20 src = 8'h20;
+    #20 $finish;
+  end
+endmodule
+"#;
+
+/// §21.7.2.1: "several variables can be mapped to the same identifier code if
+/// the variables would always have identical values" — which is exactly a net
+/// connected through an instance port. Verilator and Icarus both give
+/// `src_bus`/`u_sub.din` ONE code and emit ONE value-change record per change;
+/// xezim gave them separate codes and wrote every change TWICE (three times at
+/// three levels), roughly doubling the file on any hierarchical design and
+/// presenting one physical net as two independent signals.
+///
+/// The alias must resolve through a CHAIN (a port bound to a port bound to a
+/// port) to the outermost net, and each name still gets its own `$var` in its
+/// own `$scope` — that is what both reference tools emit.
+#[test]
+fn port_connected_nets_share_one_identifier_code() {
+    let vcd = dump("portalias", PORT_HIER);
+
+    // Every scope still declares its own object: the hierarchy is intact.
+    assert!(vcd.contains("$scope module u_mid $end"), "{}", vcd);
+    assert!(vcd.contains("$scope module u_leaf $end"), "{}", vcd);
+    assert_eq!(var_lines_all(&vcd, "clk").len(), 3, "{}", vcd);
+
+    // …but the three `clk` declarations name ONE net, three levels deep.
+    let clk = ids_of_all(&vcd, "clk");
+    assert!(
+        clk.iter().all(|c| *c == clk[0]),
+        "port-connected `clk` must share one id code, got {:?}\n{}",
+        clk,
+        vcd
+    );
+    // Differently-named formals alias just the same: src → mdin → din.
+    assert_eq!(id_of(&vcd, "src"), id_of(&vcd, "mdin"), "{}", vcd);
+    assert_eq!(id_of(&vcd, "src"), id_of(&vcd, "din"), "{}", vcd);
+    // …and so does an output port bound up the chain: dout → mdout → snk.
+    assert_eq!(id_of(&vcd, "snk"), id_of(&vcd, "mdout"), "{}", vcd);
+    assert_eq!(id_of(&vcd, "snk"), id_of(&vcd, "dout"), "{}", vcd);
+
+    // ONE record per change, not one per hierarchical name: the checkpoint x,
+    // then each of the two `src` writes exactly once.
+    assert_eq!(records(&vcd, "src"), vec!["bx", "b10000", "b100000"], "{}", vcd);
+    // The clock's 8 edges over 40ns, once each.
+    assert_eq!(records(&vcd, "clk").len(), 1 + 8, "{}", vcd);
+}
+
+/// §21.7.2.1: only a WHOLE-net actual is the same object as the formal. A
+/// bit-select, a concatenation or an expression actual is a distinct object —
+/// Verilator and Icarus both give those their own identifier code — so the
+/// aliasing must not over-reach and collapse them.
+#[test]
+fn a_port_bound_to_a_bit_select_concat_or_expression_is_not_aliased() {
+    let vcd = dump(
+        "portnoalias",
+        r#"
+`timescale 1ns/1ps
+module sub(input logic [3:0] p_bit, input logic [3:0] p_cat, input logic [3:0] p_expr,
+           input logic [3:0] p_whole, output logic [3:0] o);
+  assign o = p_whole ^ p_bit;
+endmodule
+module top;
+  logic [7:0] bus;
+  logic [3:0] nib, w;
+  logic [1:0] lo, hi2;
+  sub u_sub(.p_bit(bus[3:0]), .p_cat({lo,hi2}), .p_expr(w + 4'd1), .p_whole(w), .o(nib));
+  initial begin
+    $dumpfile("{VCD}");
+    $dumpvars(0, top);
+    bus = 8'hA5; lo = 2'b01; hi2 = 2'b10; w = 4'd9;
+    #10 w = 4'd3;
+    #10 $finish;
+  end
+endmodule
+"#,
+    );
+    // A part of a net, a concat of two nets and a function of a net are all
+    // separate objects — each keeps its own code.
+    assert_ne!(id_of(&vcd, "p_bit"), id_of(&vcd, "bus"), "{}", vcd);
+    let distinct = [
+        id_of(&vcd, "p_bit"),
+        id_of(&vcd, "p_cat"),
+        id_of(&vcd, "p_expr"),
+        id_of(&vcd, "bus"),
+        id_of(&vcd, "lo"),
+        id_of(&vcd, "hi2"),
+    ];
+    for (i, a) in distinct.iter().enumerate() {
+        for b in &distinct[i + 1..] {
+            assert_ne!(a, b, "non-whole-net port actuals must not alias:\n{}", vcd);
+        }
+    }
+    // The whole-net actuals in the SAME instance still do alias — both
+    // directions (an input's actual and an output's actual).
+    assert_eq!(id_of(&vcd, "p_whole"), id_of(&vcd, "w"), "{}", vcd);
+    assert_eq!(id_of(&vcd, "o"), id_of(&vcd, "nib"), "{}", vcd);
+}
+
+/// §21.7.1.4: aliasing is a property of the dump, not of the design, so it may
+/// not leak past the scope/depth filter. `$dumpvars(1, top)` must still stop at
+/// the top level, and a dump rooted INSIDE the hierarchy — where the parent net
+/// of an aliased port is not dumped at all — must fall back to giving the formal
+/// its own code and its own records.
+#[test]
+fn aliasing_does_not_break_dumpvars_depth_or_scope_filtering() {
+    let one = dump("aliasdepth1", &PORT_HIER.replace("$dumpvars(0, top)", "$dumpvars(1, top)"));
+    // Depth 1: only the top level's own objects.
+    var_line(&one, "clk");
+    assert_eq!(var_lines_all(&one, "clk").len(), 1, "{}", one);
+    assert!(!one.contains("$scope module u_mid"), "depth 1 must not descend:\n{}", one);
+    assert_eq!(records(&one, "clk").len(), 1 + 8, "{}", one);
+
+    // A scope argument below the top: `src` is outside the dump, so `mdin` is
+    // the outermost dumped name of the net and carries the records itself.
+    let sub = dump(
+        "aliasscope",
+        &PORT_HIER.replace("$dumpvars(0, top)", "$dumpvars(0, top.u_mid)"),
+    );
+    assert!(!sub.contains(" src $end"), "u_mid subtree must not carry `src`:\n{}", sub);
+    assert_eq!(id_of(&sub, "mdin"), id_of(&sub, "din"), "{}", sub);
+    assert_eq!(records(&sub, "mdin"), vec!["bx", "b10000", "b100000"], "{}", sub);
+}
+
+/// §21.7.2.1: an unpacked-array ELEMENT carries the bit range of the element,
+/// exactly as Verilator emits it (`$var wire 8 ) mem[0] [7:0] $end`). Without it
+/// a viewer has no bit numbering for any array element.
+#[test]
+fn unpacked_array_elements_carry_their_bit_range() {
+    let vcd = dump(
+        "arrayrange",
+        r#"
+module tb;
+  reg [7:0]   mem [0:2];
+  logic [15:8] hi  [0:1];   // non-zero-based element range
+  logic        bits[0:1];   // 1-bit elements have no range
+  initial begin
+    $dumpfile("{VCD}");
+    $dumpvars(0, tb);
+    mem[0] = 8'hDE; mem[1] = 8'hAD; mem[2] = 8'hBE;
+    hi[0] = 8'h3C; hi[1] = 8'h5A;
+    bits[0] = 1'b1; bits[1] = 1'b0;
+    #1 $finish;
+  end
+endmodule
+"#,
+    );
+    for i in 0..3 {
+        let l = var_line(&vcd, &format!("mem[{}]", i));
+        assert!(l.ends_with(&format!(" mem[{}] [7:0] $end", i)), "{}", l);
+    }
+    assert!(var_line(&vcd, "hi[0]").ends_with(" hi[0] [15:8] $end"), "{}", vcd);
+    // A scalar element has no range to declare.
+    assert!(var_line(&vcd, "bits[0]").ends_with(" bits[0] $end"), "{}", vcd);
+}
+
+/// §21.7.2.1 value-change records: a reader LEFT-EXTENDS a value shorter than
+/// the `$var` width with its leftmost character — `x` extends with x, `z` with
+/// z, anything else with 0. Icarus therefore collapses a leading run of x (or of
+/// z) to a single character, just as it collapses a leading run of zeros; xezim
+/// spelled x/z runs out in full. The one case that may NOT collapse is a leading
+/// run of ZEROS in front of an x/z: `8'b000000x1` → `b0x1`, never `bx1` (which
+/// reads back as `8'bxxxxxxx1`).
+#[test]
+fn leading_run_suppression_matches_icarus_for_every_vector_shape() {
+    let vcd = dump(
+        "leadrun",
+        r#"
+module tb;
+  logic [7:0] v0, v1, v2, v3, v4, v5, v6, v7, v8;
+  initial begin
+    $dumpfile("{VCD}");
+    $dumpvars(0, tb);
+    v0 = 8'b000000x1;   // 0-run in front of an x → keep one 0
+    v1 = 8'bzzzz0011;   // leading z-run → one z
+    v2 = 8'bxxxx0011;   // leading x-run → one x
+    v3 = 8'b00001111;   // leading 0-run in front of a 1 → dropped
+    v4 = 8'hFF;         // leading 1 → nothing may be dropped
+    v5 = 8'bxxxxxxxx;   // all x
+    v6 = 8'bzzzzzzzz;   // all z
+    v7 = 8'b00000000;   // all 0
+    v8 = 8'b1010zz11;   // no leading run at all
+    #1 $finish;
+  end
+endmodule
+"#,
+    );
+    // Each pair is exactly what `iverilog`/`vvp` writes for the same assignment.
+    let expected = [
+        ("v0", "b0x1"),
+        ("v1", "bz0011"),
+        ("v2", "bx0011"),
+        ("v3", "b1111"),
+        ("v4", "b11111111"),
+        ("v5", "bx"),
+        ("v6", "bz"),
+        ("v7", "b0"),
+        ("v8", "b1010zz11"),
+    ];
+    for (name, want) in expected {
+        assert_eq!(
+            records(&vcd, name).last().map(|s| s.as_str()),
+            Some(want),
+            "`{}` must dump as `{}`:\n{}",
+            name,
+            want,
+            vcd
+        );
+    }
+}
+
+/// §21.7.2.1 `var_type` / §6.5: a variable cannot mix continuous and procedural
+/// drivers, so an object driven ONLY by a continuous assign — or by an instance
+/// output port, which inlining lowers to one — has no procedural driver and is a
+/// net. Icarus types exactly those `wire`; xezim typed every `logic` `reg`, so
+/// GTKWave coloured driven nets as registers.
+#[test]
+fn a_variable_with_only_a_continuous_driver_is_typed_wire_like_icarus() {
+    let vcd = dump(
+        "wirekind",
+        r#"
+module sub(input logic [3:0] din, output logic [3:0] dout);
+  always @(din) dout = din + 4'd1;   // procedural driver in the child
+endmodule
+module top;
+  logic [3:0] src;      // procedural driver → reg
+  logic [3:0] snk;      // driven only by u_sub's output port → wire
+  logic [3:0] cpy;      // driven only by a continuous assign → wire
+  assign cpy = src;
+  sub u_sub(.din(src), .dout(snk));
+  initial begin
+    $dumpfile("{VCD}");
+    $dumpvars(0, top);
+    src = 4'd7;
+    #1 $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(var_line(&vcd, "src").starts_with("$var reg 4 "), "{}", var_line(&vcd, "src"));
+    assert!(var_line(&vcd, "snk").starts_with("$var wire 4 "), "{}", var_line(&vcd, "snk"));
+    assert!(var_line(&vcd, "cpy").starts_with("$var wire 4 "), "{}", var_line(&vcd, "cpy"));
+    // The child's own port formals: an input port is fed by the port connect
+    // (continuous → wire); `dout` is written by an always block (→ reg).
+    let child: Vec<&str> = vcd
+        .split("$scope module u_sub $end")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .take_while(|l| !l.starts_with("$upscope"))
+        .collect();
+    assert!(
+        child.iter().any(|l| l.starts_with("$var wire 4 ") && l.ends_with(" din [3:0] $end")),
+        "{:?}",
+        child
+    );
+    assert!(
+        child.iter().any(|l| l.starts_with("$var reg 4 ") && l.ends_with(" dout [3:0] $end")),
+        "{:?}",
+        child
+    );
 }
 
 /// §21.7 header: a real `$date`, and the timescale derived from the design's

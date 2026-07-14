@@ -1666,6 +1666,15 @@ pub struct Simulator {
     /// Set of signal IDs that are signed.
     signal_signed: Vec<bool>,
     signal_real: Vec<bool>,
+    /// Signal ids that carry a CONTINUOUS driver — the whole-name LHS of an
+    /// `assign` (including the continuous-assigns that inlining synthesizes for
+    /// instance port connections). §6.5 forbids mixing continuous and procedural
+    /// drivers on a variable, so this is exactly "has no procedural driver", and
+    /// §21.7.2.1's `var_type` for such an object is `wire` — what Icarus emits
+    /// and what makes a viewer colour it as a net. `module.continuous_assigns` is
+    /// drained into bytecode at compile time, so the fact is recorded here while
+    /// it is still known.
+    cont_driven: HashSet<usize>,
     /// Sparse: signal_id → declared user type name (e.g. class/struct
     /// type for `MyClass h;`). Only populated for signals where the
     /// elaborator recorded a non-None `type_name` on the source
@@ -3575,6 +3584,7 @@ impl Simulator {
             signal_widths: signal_widths_vec,
             signal_signed: signal_signed_vec,
             signal_real: signal_real_vec,
+            cont_driven: HashSet::default(),
             signal_type_names,
             time: 0,
             output: Vec::new(),
@@ -12164,6 +12174,19 @@ impl Simulator {
             .chain(pending_ca.into_iter().map(|p| p.materialize()))
         {
             let explicit_delay = ca.delay;
+            // §21.7.2.1 `var_type`: an object whose only driver is continuous is
+            // a `wire` in a dump (see `cont_driven`). Recorded here — this is the
+            // last point at which the continuous assigns still exist as ASTs.
+            // Only a WHOLE-name LHS counts: `assign a[3] = …` leaves the rest of
+            // `a` to other drivers, so the object is not purely continuous.
+            if let ExprKind::Ident(lhs_hier) = &ca.lhs.kind {
+                if lhs_hier.path.iter().all(|s| s.selects.is_empty()) {
+                    let n = Self::resolve_hier_name_static(lhs_hier, &self.module);
+                    if let Some(&id) = self.signal_name_to_id.get(n.as_str()) {
+                        self.cont_driven.insert(id);
+                    }
+                }
+            }
             reads.clear();
             writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
@@ -32195,6 +32218,73 @@ impl Simulator {
         out
     }
 
+    /// The signal-table entry that BACKS each dumped name.
+    ///
+    /// An instance port whose actual is a whole net (`.din(src_bus)`) is not a
+    /// second object: inlining gives the formal its own table entry kept in step
+    /// by a port continuous-assign, but `src_bus` and `u_sub.din` are ONE net.
+    /// Verilator collapses them (same `$var` identifier code, one value-change
+    /// record per change); so does Icarus. Dumping them independently doubled the
+    /// records of every hierarchical design and showed one net as two signals.
+    ///
+    /// Resolves alias CHAINS (a port bound to a port bound to a port) up to the
+    /// outermost net that is itself in the dump. A chain stops early at a name
+    /// the current `$dumpvars` scope/depth filter did not select (so
+    /// `$dumpvars(0, top.u_sub)` still dumps `u_sub.din` under its own code), at
+    /// a width change, and at a `real`/`event` boundary — a shared code may only
+    /// carry one width and one record shape.
+    fn dump_backing_ids(&self, names: &[String]) -> HashMap<String, usize> {
+        let selected: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+        let tbl_id = |n: &str| -> Option<usize> {
+            match self.signal_name_to_id.get(n) {
+                Some(&i) if i < self.signal_table.len() => Some(i),
+                _ => None,
+            }
+        };
+        let mut out: HashMap<String, usize> = HashMap::default();
+        for name in names {
+            let own = match tbl_id(name.as_str()) {
+                Some(i) => i,
+                None => continue,
+            };
+            let mut rep_name: &str = name.as_str();
+            let mut rep = own;
+            // Bounded walk: a malformed alias cycle must not hang the dump.
+            for _ in 0..64 {
+                let parent = match self.module.port_aliases.get(rep_name) {
+                    Some(p) => p.as_str(),
+                    None => break,
+                };
+                if !selected.contains(parent) {
+                    break;
+                }
+                let pid = match tbl_id(parent) {
+                    Some(i) => i,
+                    None => break,
+                };
+                if self.signal_widths[pid] != self.signal_widths[rep]
+                    || self.lookup_signal_width(parent) != self.lookup_signal_width(rep_name)
+                {
+                    break;
+                }
+                if self.signal_real.get(pid).copied().unwrap_or(false)
+                    != self.signal_real.get(rep).copied().unwrap_or(false)
+                {
+                    break;
+                }
+                // An `event` emits a pulse, not a level — never fold one into a
+                // level signal (or into another event's pulse dedup).
+                if self.module.events.contains(parent) || self.module.events.contains(rep_name) {
+                    break;
+                }
+                rep = pid;
+                rep_name = parent;
+            }
+            out.insert(name.clone(), rep);
+        }
+        out
+    }
+
     /// §21.7.2.1 `var_type` of a dumped object. Every `$var` used to be
     /// hardcoded `wire`.
     fn dump_var_kind(&self, name: &str, id: usize) -> VcdVarKind {
@@ -32228,6 +32318,15 @@ impl Simulator {
         if self.module.nets.contains(base) {
             return VcdVarKind::Wire;
         }
+        // §21.7.2.1: a variable with no PROCEDURAL driver — driven only by a
+        // continuous assign, or by an instance output port (which inlining
+        // lowers to one) — is a net to a viewer, and Icarus types it `wire`.
+        // §6.5 makes continuous and procedural drivers mutually exclusive on a
+        // variable, so a continuous driver is proof there is no procedural one.
+        // Typing these `reg` made GTKWave colour a driven net as a register.
+        if self.cont_driven.contains(&id) {
+            return VcdVarKind::Wire;
+        }
         if self.module.parameters.contains_key(base)
             && self
                 .module
@@ -32243,10 +32342,15 @@ impl Simulator {
     /// §21.7.2.1 optional bit range on a `$var` reference
     /// (`$var wire 8 ( hi [15:8] $end`). Without it a `logic [15:8]` shows as
     /// `[7:0]` in a viewer, and an ascending `logic [0:7]` loses its bit order.
+    ///
+    /// An unpacked-array ELEMENT carries the range too — the index in its
+    /// reference name selects the element, and the range then gives that
+    /// element's own packed bit numbering, exactly as Verilator emits it:
+    ///   `$var wire 8 ) mem[0] [7:0] $end`
+    /// Suppressing it (the old behaviour) left every `mem[i]` un-ranged.
     fn dump_var_range(&self, name: &str, width: u32) -> Option<(i64, i64)> {
-        // Scalars have no range; an array element's index is already part of its
-        // reference name, and a second `[msb:lsb]` there would be ambiguous.
-        if width <= 1 || name.ends_with(']') {
+        // A scalar has no range.
+        if width <= 1 {
             return None;
         }
         let base = match name.find('[') {
@@ -32372,9 +32476,31 @@ impl Simulator {
 
         // Assign VCD identifier codes. Codes are Arc<str> so the per-change
         // clone in vcd_write_changes is a refcount bump, not a heap alloc.
+        //
+        // §21.7.2.1: "several variables can be mapped to the same identifier
+        // code if the variables would always have identical values" — which is
+        // exactly a net threaded through instance ports. Names that share a
+        // backing signal (see `dump_backing_ids`) therefore share ONE code: each
+        // still gets its own `$var` line in its own `$scope`, but the net emits a
+        // single value-change record instead of one per hierarchical name.
+        let backing = self.dump_backing_ids(&sig_names);
         let mut id_map: HashMap<String, Arc<str>> = HashMap::default();
-        for (idx, name) in sig_names.iter().enumerate() {
-            id_map.insert(name.clone(), Arc::from(Self::vcd_id_code(idx)));
+        let mut code_of_backing: HashMap<usize, Arc<str>> = HashMap::default();
+        for name in sig_names.iter() {
+            let rep = match backing.get(name.as_str()) {
+                Some(&r) => r,
+                // No backing signal — never declared, never dumped.
+                None => continue,
+            };
+            let code = match code_of_backing.get(&rep) {
+                Some(c) => c.clone(),
+                None => {
+                    let c: Arc<str> = Arc::from(Self::vcd_id_code(code_of_backing.len()));
+                    code_of_backing.insert(rep, c.clone());
+                    c
+                }
+            };
+            id_map.insert(name.clone(), code);
         }
 
         // Write VCD header. The timescale is derived from the sim's actual
@@ -32525,11 +32651,18 @@ impl Simulator {
         // placed at t=0 by every viewer.
         let _ = writeln!(hdr, "#{}", self.time);
         let _ = writeln!(hdr, "$dumpvars");
+        // One trace entry — and one checkpoint record — per BACKING signal, not
+        // per name: the aliased names of a port-connected net share a code, so a
+        // per-name loop would emit the same record two or three times over.
+        let mut traced: HashSet<usize> = HashSet::default();
         for name in &sig_names {
-            let sid = match self.signal_name_to_id.get(name.as_str()) {
-                Some(&i) if i < self.signal_table.len() => i,
+            let sid = match backing.get(name.as_str()) {
+                Some(&i) => i,
                 _ => continue,
             };
+            if !traced.insert(sid) {
+                continue;
+            }
             let kind = self.dump_var_kind(name, sid);
             let code = id_map[name].clone();
             // An `event` has no level, so it contributes no checkpoint record —
@@ -33155,9 +33288,13 @@ impl Simulator {
         let mut id_map: HashMap<String, String> = HashMap::default();
         let mut signal_records: Vec<String> = Vec::new();
         let mut trace: Vec<(usize, String)> = Vec::new();
+        // Port-connected nets resolve to ONE backing signal (see
+        // `dump_backing_ids`), so `.din(src_bus)` shares `src_bus`'s sid instead
+        // of tracing a second copy of the same net.
+        let xt_backing = self.dump_backing_ids(&sig_names);
         for name in sig_names.iter() {
-            let tbl_id = match self.signal_name_to_id.get(name.as_str()) {
-                Some(&i) if i < self.signal_table.len() => i,
+            let tbl_id = match xt_backing.get(name.as_str()) {
+                Some(&i) => i,
                 // Unresolved name: no backing signal to trace. Skip it (the
                 // old t=0 snapshot loop dropped these too).
                 _ => continue,
@@ -33420,9 +33557,13 @@ impl Simulator {
             }
         }
         let mut root = FstNode::new();
+        // A port bound to a whole net is the SAME net (see `dump_backing_ids`) —
+        // it reuses the parent's signal id, so `header.var` declares it as an FST
+        // alias of the parent instead of a second signal with its own changes.
+        let fst_backing = self.dump_backing_ids(&sig_names);
         for name in &sig_names {
-            let tbl_id = match self.signal_name_to_id.get(name.as_str()) {
-                Some(&i) if i < self.signal_table.len() => i,
+            let tbl_id = match fst_backing.get(name.as_str()) {
+                Some(&i) => i,
                 _ => continue,
             };
             let width = self.lookup_signal_width(name).unwrap_or(1);
