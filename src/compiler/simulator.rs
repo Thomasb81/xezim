@@ -27022,6 +27022,50 @@ impl Simulator {
                         }
                     }
                 }
+                // LRM §25.8 — `vif.member[i] = ...` (bit-select write
+                // through a virtual-interface property). The lvalue parses as
+                // Index { expr: MemberAccess { Ident(vif_prop), signal_member },
+                //          index }.  The scalar-write path (ExprKind::MemberAccess
+                // arm below) handles `vif.member = ...` but misses the indexed
+                // form, causing all bit-select writes to vif-bound signals to be
+                // silently lost.  Detect and redirect here before the generic
+                // flat-name path, which has no knowledge of vif bindings.
+                if let ExprKind::MemberAccess { expr: ma_base, member: ma_member } = &expr.kind {
+                    if let ExprKind::Ident(ma_hier) = &ma_base.kind {
+                        if ma_hier.path.len() == 1 {
+                            let vif_prop = ma_hier.path[0].name.name.as_str();
+                            let sig_member = ma_member.name.as_str();
+                            // Resolve virtual-interface binding (same lookup as
+                            // the scalar MemberAccess arm below ~line 20401).
+                            let binding = self.this_stack.last().copied().flatten().and_then(|this_h| {
+                                let cls_name = self.heap.get(this_h)
+                                    .and_then(|o| o.as_ref())
+                                    .map(|i| i.class_name.clone())?;
+                                self.module.classes.get(&cls_name)
+                                    .and_then(|cd| cd.virtual_iface_properties.get(vif_prop).map(|_| ()))
+                                    .and(self.virtual_iface_bindings.get(&(this_h, vif_prop.to_string())).cloned())
+                            });
+                            if let Some((bound_name, _modport)) = binding {
+                                let target = format!("{}.{}", bound_name, sig_member);
+                                let idx = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
+                                if let Some(prev) = self.get_signal_value_by_name(&target) {
+                                    let w = prev.width as usize;
+                                    if idx < w {
+                                        let nb = val.get_bit(0);
+                                        let old = prev.get_bit(idx);
+                                        let changed = old != nb;
+                                        if changed {
+                                            let mut nv = prev.clone();
+                                            nv.set_bit(idx, nb);
+                                            self.set_signal_value_by_name(&target, nv);
+                                        }
+                                        return changed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // The array base may be a flat/hier Ident (`mem[i]`,
                 // rewritten submodule refs) OR a MemberAccess chain
                 // (`u_h.mem[q]` from a parent scope) — the latter never
