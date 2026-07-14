@@ -2393,6 +2393,14 @@ pub struct Simulator {
     /// Whether entry `i` of `xtrace_trace` is a `real` (parallel vector): its
     /// value token is a decimal number, not a hex bit pattern (§15.1).
     xtrace_real: Vec<bool>,
+    /// Whether entry `i` of `xtrace_trace` is a `string` (parallel vector): its
+    /// value token is a §15.4 quoted, escaped string rather than a bit pattern.
+    xtrace_string: Vec<bool>,
+    /// The t=0 `N,full` snapshot is emitted lazily, on the first in-window
+    /// `xtrace_write_changes` call — by then the time-0 initial blocks have run
+    /// and settled, so the checkpoint carries real values (matching the
+    /// reference producer) instead of the pre-init all-X image.
+    xtrace_snapshot_pending: bool,
     /// SV `event` objects (signal_table index, XTrace signal id). An event has
     /// no level, so it is NOT in `xtrace_trace`: it emits an §10.4 `X` record
     /// per trigger instead of a value delta.
@@ -3878,6 +3886,8 @@ impl Simulator {
             xtrace_trace: Vec::new(),
             xtrace_prev_signals: Vec::new(),
             xtrace_real: Vec::new(),
+            xtrace_string: Vec::new(),
+            xtrace_snapshot_pending: false,
             xtrace_events: Vec::new(),
             xtrace_event_last: Vec::new(),
             xtrace_last_time: 0,
@@ -33945,7 +33955,25 @@ impl Simulator {
     ///   shorter than its `$var` width. XTrace defines no such rule anywhere,
     ///   so a partially collapsed vector would be unparseable (nothing tells a
     ///   consumer how many bits were dropped, or what to refill them with).
-    fn xtrace_format_value(val: &Value, is_real: bool) -> String {
+    fn xtrace_format_value(val: &Value, is_real: bool, is_string: bool) -> String {
+        if is_string {
+            // §9.3 `str` type + §15.4: a string signal is emitted as a quoted,
+            // escaped literal, not a 1024-bit hex blob. §8.5 escapes only.
+            let mut s = String::with_capacity(val.width as usize / 8 + 2);
+            s.push('"');
+            for b in val.sv_string_bytes() {
+                match b {
+                    b'\\' => s.push_str("\\\\"),
+                    b'"' => s.push_str("\\\""),
+                    b'\n' => s.push_str("\\n"),
+                    b'\t' => s.push_str("\\t"),
+                    0x20..=0x7e => s.push(b as char),
+                    other => s.push_str(&format!("\\x{:02x}", other)),
+                }
+            }
+            s.push('"');
+            return s;
+        }
         if is_real || val.is_real {
             return super::vcd_sink::vcd_real_string(val.to_f64());
         }
@@ -34141,6 +34169,7 @@ impl Simulator {
         // The compact per-NET tables reused at t=0 and every step.
         let mut trace: Vec<(usize, String)> = Vec::new();
         let mut reals: Vec<bool> = Vec::new();
+        let mut strings: Vec<bool> = Vec::new();
         let mut events: Vec<(usize, String)> = Vec::new();
         for (name, tbl_id, sid) in &entries {
             // Walk the parent path once, creating M records on demand; the
@@ -34176,6 +34205,14 @@ impl Simulator {
             let kind = self.dump_var_kind(name, own_id);
             let is_event = kind == VcdVarKind::Event;
             let is_real = kind == VcdVarKind::Real;
+            // A `string` signal is stored as a wide bit vector, so `dump_var_kind`
+            // sees a plain vector; recognise it from the string set (keyed by
+            // both the dotted name and its leaf, since the set may hold either).
+            let leaf_name = name.rsplit('.').next().unwrap_or(name);
+            let is_string = !is_event
+                && !is_real
+                && (self.string_signals.contains(*name)
+                    || self.string_signals.contains(leaf_name));
             let width = if is_real {
                 64
             } else {
@@ -34186,11 +34223,13 @@ impl Simulator {
             // value (§15.1), an event carries no value at all and shows up only
             // as an §10.4 `X` record. Per §8.7/§19.10 a consumer that knows
             // neither still parses the record and simply sees a signal that
-            // never changes.
+            // never changes. `str` (§9.3) carries a §15.4 quoted literal.
             let type_str = if is_event {
                 "event".to_string()
             } else if is_real {
                 "real".to_string()
+            } else if is_string {
+                "str".to_string()
             } else if width == 1 {
                 "bit".to_string()
             } else if self.lookup_signal_signed(name) {
@@ -34218,7 +34257,7 @@ impl Simulator {
             // carry it: a consumer that knows it renumbers correctly, one that
             // does not is no worse off than before. Emitted only when it says
             // something a plain `width=` does not (i.e. lsb != 0).
-            if !is_real && !is_event {
+            if !is_real && !is_event && !is_string {
                 if let Some((l, r)) = self.dump_var_range(name, width) {
                     if r != 0 {
                         attrs.push(format!("range={}:{}", l, r));
@@ -34233,6 +34272,7 @@ impl Simulator {
             } else {
                 trace.push((*tbl_id, sid.clone()));
                 reals.push(is_real);
+                strings.push(is_string);
             }
 
             signal_records.push(format!(
@@ -34298,25 +34338,56 @@ impl Simulator {
         }
         let _ = writeln!(w);
 
-        // Trace section opens with the t=0 full snapshot.
+        // Trace section. The opening `T,+0` and `N,full` snapshot are emitted
+        // LAZILY, on the first in-window `xtrace_write_changes` call — by then
+        // the time-0 initial blocks have run and settled, so the checkpoint
+        // carries real values (matching the 0.1.2 reference producer) instead
+        // of the pre-init all-X image that a redundant same-time P then had to
+        // correct. See `xtrace_emit_pending_snapshot`.
         let _ = writeln!(w, "@section trace");
-        let _ = writeln!(w, "T,+0");
-        // Seed the t=0 snapshot from the deduped trace table (one entry per
-        // net) reading signal_table (the backing store of truth). Events are
-        // absent by construction: they have no level to snapshot.
-        let mut prev: Vec<Value> = Vec::with_capacity(trace.len());
-        let mut snap_parts: Vec<String> = Vec::with_capacity(trace.len());
-        for (idx, (tbl_id, sid)) in trace.iter().enumerate() {
+
+        self.xtrace_event_last = vec![u64::MAX; events.len()];
+        self.xtrace_events = events;
+        self.xtrace_real = reals;
+        self.xtrace_string = strings;
+        // prev only needs the right LENGTH here; the pending snapshot re-reads
+        // signal_table and reseeds it from settled values.
+        self.xtrace_prev_signals = trace
+            .iter()
+            .map(|(id, _)| self.signal_table[*id].clone())
+            .collect();
+        self.xtrace_trace = trace;
+        self.xtrace_writer = Some(w);
+        self.xtrace_last_time = self.time;
+        self.xtrace_snapshot_pending = true;
+    }
+
+    /// Emit the deferred t=0 (or window-start) `N,full` checkpoint from the
+    /// SETTLED signal values, chunked per §A.13, and reseed `xtrace_prev_signals`
+    /// so subsequent writes are pure deltas. Called once, from the first
+    /// in-window `xtrace_write_changes`.
+    fn xtrace_emit_pending_snapshot(&mut self) {
+        self.xtrace_snapshot_pending = false;
+        let delta = self.time - self.xtrace_last_time;
+        self.xtrace_last_time = self.time;
+
+        let mut snap_parts: Vec<String> = Vec::with_capacity(self.xtrace_trace.len());
+        for idx in 0..self.xtrace_trace.len() {
+            let (tbl_id, sid) = &self.xtrace_trace[idx];
             let val = self.signal_table[*tbl_id].clone();
             snap_parts.push(format!(
                 "{}={}",
                 sid,
-                Self::xtrace_format_value(&val, reals[idx])
+                Self::xtrace_format_value(&val, self.xtrace_real[idx], self.xtrace_string[idx])
             ));
-            prev.push(val);
+            self.xtrace_prev_signals[idx] = val;
         }
-        // Long N,full lines are split into 16-signal chunks per the
-        // emitter pattern in §A.13 to keep parser memory bounded.
+
+        let w = self.xtrace_writer.as_mut().unwrap();
+        let _ = writeln!(w, "T,+{}", delta);
+        // Long N,full lines are split into 16-signal chunks per the emitter
+        // pattern in §A.13 to keep parser memory bounded; continuation chunks
+        // reuse the P record form.
         if snap_parts.len() <= 16 {
             let _ = writeln!(w, "N,full,{}", snap_parts.join(","));
         } else {
@@ -34330,14 +34401,6 @@ impl Simulator {
                 }
             }
         }
-
-        self.xtrace_event_last = vec![u64::MAX; events.len()];
-        self.xtrace_events = events;
-        self.xtrace_trace = trace;
-        self.xtrace_real = reals;
-        self.xtrace_prev_signals = prev;
-        self.xtrace_writer = Some(w);
-        self.xtrace_last_time = self.time;
     }
 
     /// Per-cycle XTrace emit. Writes a T record (if time advanced), the signal
@@ -34361,6 +34424,14 @@ impl Simulator {
             return;
         }
 
+        // First in-window write: emit the deferred N,full checkpoint from the
+        // now-settled values, then fall through so any same-slot events still
+        // record. The snapshot reseeds prev, so the change loop below finds
+        // nothing to re-emit.
+        if self.xtrace_snapshot_pending {
+            self.xtrace_emit_pending_snapshot();
+        }
+
         // Walk the compact trace table directly; xtrace_prev_signals is a
         // parallel Vec<Value>, so change detection is a single indexed
         // compare with no name hashing.
@@ -34369,7 +34440,14 @@ impl Simulator {
             let id = self.xtrace_trace[idx].0;
             let val = &self.signal_table[id];
             if self.xtrace_prev_signals[idx] != *val {
-                changes.push((idx, Self::xtrace_format_value(val, self.xtrace_real[idx])));
+                changes.push((
+                    idx,
+                    Self::xtrace_format_value(
+                        val,
+                        self.xtrace_real[idx],
+                        self.xtrace_string[idx],
+                    ),
+                ));
                 self.xtrace_prev_signals[idx] = val.clone();
             }
         }
