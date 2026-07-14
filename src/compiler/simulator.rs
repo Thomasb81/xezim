@@ -23329,6 +23329,115 @@ impl Simulator {
                 }
                 // `$random` (no seed) keeps its legacy deterministic value; with a
                 // seed it produces a reproducible stream (updating the seed).
+                // §20.15.2 probabilistic distribution functions. Each takes an
+                // inout `seed` it advances in place, so the same seed replays
+                // the same stream.
+                "$dist_uniform" | "$dist_normal" | "$dist_exponential"
+                | "$dist_poisson" | "$dist_chi_square" | "$dist_t"
+                | "$dist_erlang" => {
+                    let Some(seed_arg) = args.first() else {
+                        return Value::zero(32);
+                    };
+                    let mut seed = self.eval_expr(seed_arg).to_u64().unwrap_or(0) as u32;
+                    // Advance the caller's seed exactly once per call.
+                    let mut next_u32 = |sd: &mut u32| -> u32 {
+                        *sd = Self::prng_next(*sd);
+                        *sd
+                    };
+                    let mut unit = |sd: &mut u32| -> f64 {
+                        // (0,1) — never exactly 0, so ln() stays finite.
+                        (next_u32(sd) as f64 + 1.0) / (u32::MAX as f64 + 2.0)
+                    };
+                    let arg_i = |sim: &mut Self, i: usize| -> i64 {
+                        args.get(i)
+                            .map(|a| sim.eval_expr(a).to_i64().unwrap_or(0))
+                            .unwrap_or(0)
+                    };
+                    let out: i64 = match name.as_str() {
+                        "$dist_uniform" => {
+                            let lo = arg_i(self, 1);
+                            let hi = arg_i(self, 2);
+                            if hi <= lo {
+                                lo
+                            } else {
+                                let span = (hi - lo + 1) as u64;
+                                lo + (next_u32(&mut seed) as u64 % span) as i64
+                            }
+                        }
+                        "$dist_normal" => {
+                            let mean = arg_i(self, 1) as f64;
+                            let sd = arg_i(self, 2) as f64;
+                            // Box-Muller.
+                            let u1 = unit(&mut seed);
+                            let u2 = unit(&mut seed);
+                            let z = (-2.0 * u1.ln()).sqrt()
+                                * (2.0 * std::f64::consts::PI * u2).cos();
+                            (mean + sd * z).round() as i64
+                        }
+                        "$dist_exponential" => {
+                            let mean = arg_i(self, 1).max(1) as f64;
+                            (-mean * unit(&mut seed).ln()).round() as i64
+                        }
+                        "$dist_poisson" => {
+                            let mean = arg_i(self, 1).max(0) as f64;
+                            // Knuth.
+                            let l = (-mean).exp();
+                            let mut k = 0i64;
+                            let mut p = 1.0f64;
+                            loop {
+                                p *= unit(&mut seed);
+                                if p <= l || k > 10_000 {
+                                    break;
+                                }
+                                k += 1;
+                            }
+                            k
+                        }
+                        "$dist_chi_square" => {
+                            // Sum of `df` squared standard normals.
+                            let df = arg_i(self, 1).max(1);
+                            let mut acc = 0.0f64;
+                            for _ in 0..df.min(1000) {
+                                let u1 = unit(&mut seed);
+                                let u2 = unit(&mut seed);
+                                let z = (-2.0 * u1.ln()).sqrt()
+                                    * (2.0 * std::f64::consts::PI * u2).cos();
+                                acc += z * z;
+                            }
+                            acc.round() as i64
+                        }
+                        "$dist_t" => {
+                            let df = arg_i(self, 1).max(1);
+                            let u1 = unit(&mut seed);
+                            let u2 = unit(&mut seed);
+                            let z = (-2.0 * u1.ln()).sqrt()
+                                * (2.0 * std::f64::consts::PI * u2).cos();
+                            let mut chi = 0.0f64;
+                            for _ in 0..df.min(1000) {
+                                let a = unit(&mut seed);
+                                let b = unit(&mut seed);
+                                let zz = (-2.0 * a.ln()).sqrt()
+                                    * (2.0 * std::f64::consts::PI * b).cos();
+                                chi += zz * zz;
+                            }
+                            (z / (chi / df as f64).sqrt()).round() as i64
+                        }
+                        _ => {
+                            // $dist_erlang(seed, k, mean)
+                            let k = arg_i(self, 1).max(1);
+                            let mean = arg_i(self, 2).max(1) as f64;
+                            let mut acc = 0.0f64;
+                            for _ in 0..k.min(1000) {
+                                acc += -unit(&mut seed).ln();
+                            }
+                            (acc * mean / k as f64).round() as i64
+                        }
+                    };
+                    self.assign_value(seed_arg, &Value::from_u64(seed as u64, 32));
+                    let mut v = Value::from_u64(out as u64, 32);
+                    v.is_signed = true;
+                    v
+                }
                 "$random" => {
                     if let Some(seed_arg) = args.first() {
                         let s = self.eval_expr(seed_arg).to_u64().unwrap_or(0) as u32;
@@ -47718,9 +47827,22 @@ impl Simulator {
                             return false;
                         }
                         let width = cur.width.max(1);
+                        // §18.5.4/§5.7.1: a dist item's value comes from an
+                        // unsized decimal literal, which is SIGNED. Narrowed to
+                        // the target's width that flipped an MSB-set value
+                        // negative (`5` in a 3-bit `bit` field read as -3), the
+                        // membership check then rejected it and the trial
+                        // retried until a low value was drawn — so a `dist`
+                        // never produced its upper values. The pick takes the
+                        // TARGET's signedness, not the literal's.
+                        let signed = cur.is_signed;
                         let picked = self
                             .pick_dist_value(Some(key.clone()), range, dist_weights)
-                            .map(|p| p.resize(width));
+                            .map(|p| {
+                                let mut p = p.resize(width);
+                                p.is_signed = signed;
+                                p
+                            });
                         if let Some(p) = picked {
                             self.dist_picked_once.insert(key);
                             return self.set_prop_if_changed(handle, &v, p);
