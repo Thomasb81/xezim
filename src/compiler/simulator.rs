@@ -1894,6 +1894,19 @@ pub struct Simulator {
     /// not in this set; once every value in the prop's range has been
     /// drawn the set resets and a new cycle begins.
     randc_used: HashMap<(usize, String), HashSet<u64>>,
+    /// §18.4 randc: values drawn TENTATIVELY by the randomize() call that is
+    /// currently in flight, keyed like `randc_used`. The solver retries a
+    /// failed solution up to 1000 times; without this each retry would burn
+    /// another value out of the permutation cycle, so a 2-bit randc could
+    /// visit only two of its four values across four randomize() calls.
+    /// A pick is rolled back (removed from `randc_used`) when its trial is
+    /// retried or abandoned, so exactly ONE value leaves the cycle per
+    /// SUCCESSFUL randomize(). `Some(prev)` records the pre-reset used-set of
+    /// a pick that wrapped the cycle, so the rollback can restore it.
+    randc_pending: HashMap<(usize, String), (u64, Option<HashSet<u64>>)>,
+    /// §18.5.4/§18.10 dist schedules, keyed by (instance handle, variable):
+    /// (weight signature, item schedule, next slot). See `pick_dist_value`.
+    dist_decks: HashMap<(usize, String), (u64, Vec<usize>, usize)>,
     /// Built-in semaphores (handle -> current count)
     semaphores: HashMap<usize, i64>,
     /// Covergroup instance heap (index 0 is null).
@@ -3342,6 +3355,8 @@ impl Simulator {
             rand_mode_disabled: HashMap::default(),
             constraint_mode_disabled: HashMap::default(),
             randc_used: HashMap::default(),
+            randc_pending: HashMap::default(),
+            dist_decks: HashMap::default(),
             semaphores: HashMap::default(),
             cg_heap: vec![None],
             assertion_stats: HashMap::default(),
@@ -33122,11 +33137,22 @@ impl Simulator {
                     // best-effort apply the inline constraints to its members.
                     let handle = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
                     if handle != 0 {
+                        // §18.7.1 `local::` — must be bound in the CALLER's
+                        // scope, i.e. before `this` switches to the object.
+                        let bound = self.bind_local_scope_refs(handle, constraints);
+                        let items: &[crate::ast::decl::ConstraintItem] =
+                            bound.as_deref().unwrap_or(constraints);
+                        // §18.11 `obj.randomize(null) with {...}` — in-line
+                        // constraint CHECKER: nothing is randomized, the
+                        // current values are checked against the constraints.
+                        if Self::is_randomize_check_args(args) {
+                            return self.exec_randomize_check(handle, items);
+                        }
                         let r = self.exec_method_call(handle, "randomize", &[]);
                         self.this_stack.push(Some(handle));
                         let rand_set = self.object_rand_set(handle);
                         for _ in 0..8 {
-                            for c in constraints {
+                            for c in items {
                                 self.solve_forced(handle, c, &rand_set);
                             }
                         }
@@ -33139,6 +33165,194 @@ impl Simulator {
         }
         // Fallback: just evaluate the underlying call.
         self.eval_expr(call)
+    }
+
+    /// §18.11 — is this a `randomize(null)` call (the in-line constraint
+    /// checker) rather than an ordinary `randomize()` / `randomize(x, y)`?
+    fn is_randomize_check_args(args: &[Expression]) -> bool {
+        args.len() == 1 && matches!(args[0].kind, ExprKind::Null)
+    }
+
+    /// The constraint blocks that are ACTIVE for `handle`: every block in the
+    /// class hierarchy, with a derived block replacing a same-named inherited
+    /// one (§18.5.4) and blocks turned off by `constraint_mode(0)` dropped
+    /// (§18.13).
+    fn active_constraints(&self, handle: usize) -> Vec<ClassConstraint> {
+        let mut out: Vec<ClassConstraint> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::default();
+        let disabled = self.constraint_mode_disabled.get(&handle).cloned().unwrap_or_default();
+        let all_off = disabled.contains("*");
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|x| x.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(cn) = cur {
+            if let Some(cd) = self.module.classes.get(&cn) {
+                for (nm, con) in cd.constraints.iter() {
+                    if all_off || disabled.contains(nm) {
+                        seen.insert(nm.clone());
+                        continue;
+                    }
+                    if seen.insert(nm.clone()) {
+                        out.push(con.clone());
+                    }
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    /// §18.11 / §18.11.1 — the in-line constraint CHECKER, `obj.randomize(null)`
+    /// (optionally `with { ... }`). No random variable is assigned: every rand
+    /// variable is treated as a state variable and the object's CURRENT values
+    /// are checked against the active class constraints plus the inline ones.
+    /// Returns 1 when they all hold and 0 as soon as one is violated.
+    /// `pre_randomize`/`post_randomize` are NOT called (§18.11: no
+    /// randomization takes place). `soft` constraints can never fail the check
+    /// (the solver would simply drop them, §18.5.14).
+    fn exec_randomize_check(
+        &mut self,
+        handle: usize,
+        inline: &[crate::ast::decl::ConstraintItem],
+    ) -> Value {
+        let cons = self.active_constraints(handle);
+        for con in &cons {
+            for item in &con.items {
+                // Constructs the checker has no view of (foreach/solve/unique)
+                // are skipped rather than reported as violations.
+                if Self::constraint_unmodeled(item) {
+                    continue;
+                }
+                if !self.check_constraint_item(handle, item) {
+                    return Value::zero(32);
+                }
+            }
+        }
+        for item in inline {
+            if Self::constraint_unmodeled(item) {
+                continue;
+            }
+            if !self.check_constraint_item(handle, item) {
+                return Value::zero(32);
+            }
+        }
+        Value::from_u64(1, 32)
+    }
+
+    /// §18.7.1 `local::` — inside an inline `with { ... }` constraint, a bare
+    /// name binds to the OBJECT's member; the CALLER's same-named variable is
+    /// reachable only as `local::name`. The parser folds `local::name` back to
+    /// a plain identifier, which would make `x == local::x` a tautology solved
+    /// by the object's own member (so the caller's value is ignored).
+    ///
+    /// Recover the intended binding: a rand member of the object that also
+    /// appears on the OTHER side of its own constraint can only have been
+    /// written `local::x` — a self-comparison is otherwise meaningless — so
+    /// substitute the value of the caller-scope variable of that name. Called
+    /// with `this` still set to the CALLER's scope, which is exactly the scope
+    /// `local::` resolves in. Returns None when there is nothing to rebind (the
+    /// overwhelmingly common case), so the original AST is used as-is.
+    fn bind_local_scope_refs(
+        &mut self,
+        handle: usize,
+        items: &[crate::ast::decl::ConstraintItem],
+    ) -> Option<Vec<crate::ast::decl::ConstraintItem>> {
+        use crate::ast::decl::ConstraintItem as CI;
+        let rand_set = self.object_rand_set(handle);
+        if rand_set.is_empty() {
+            return None;
+        }
+        let mut out: Vec<CI> = Vec::with_capacity(items.len());
+        let mut any = false;
+        for item in items {
+            let mut new_item = item.clone();
+            if let CI::Expr(e) = &mut new_item {
+                if let ExprKind::Binary { left, right, .. } = &mut e.kind {
+                    // `member <op> <expr containing member>` — the member
+                    // inside <expr> is the `local::` reference.
+                    if let Some(n) = Self::plain_ident_name(left) {
+                        if rand_set.contains(&n) && self.subst_local_ident(right, &n) {
+                            any = true;
+                        }
+                    }
+                    if let Some(n) = Self::plain_ident_name(right) {
+                        if rand_set.contains(&n) && self.subst_local_ident(left, &n) {
+                            any = true;
+                        }
+                    }
+                }
+            }
+            out.push(new_item);
+        }
+        if any {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Bare single-segment identifier name of `e`, if that is what it is.
+    fn plain_ident_name(e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.root.is_none() => {
+                Some(h.path[0].name.name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// §18.7.1: replace every bare reference to `name` inside `e` with the
+    /// current value of the caller-scope variable of that name (a literal).
+    /// Returns whether anything was substituted — nothing is if the caller's
+    /// scope has no such variable, leaving the original object-member binding.
+    fn subst_local_ident(&mut self, e: &mut Expression, name: &str) -> bool {
+        let mut hit = false;
+        match &mut e.kind {
+            ExprKind::Ident(h) => {
+                if h.path.len() == 1 && h.root.is_none() && h.path[0].name.name == name {
+                    // Resolve on a cache-free copy: the AST node's memoized
+                    // name must not be poisoned with the caller-scope
+                    // resolution (the same node is re-solved under `this`).
+                    let mut probe = h.clone();
+                    probe.cached_signal_id = Cell::new(None);
+                    probe.cached_resolved_name = std::cell::OnceCell::new();
+                    let resolved = self.resolve_hier_name(&probe);
+                    if let Some(v) = self.lookup_signal_value(&resolved) {
+                        let lit = NumberLiteral::Integer {
+                            size: Some(v.width.max(1)),
+                            signed: v.is_signed,
+                            base: NumberBase::Decimal,
+                            value: v.to_u64().unwrap_or(0).to_string(),
+                            cached_val: Cell::new(None),
+                        };
+                        e.kind = ExprKind::Number(lit);
+                        hit = true;
+                    }
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                hit |= self.subst_local_ident(left, name);
+                hit |= self.subst_local_ident(right, name);
+            }
+            ExprKind::Unary { operand, .. } => hit |= self.subst_local_ident(operand, name),
+            ExprKind::Paren(inner) => hit |= self.subst_local_ident(inner, name),
+            ExprKind::Inside { expr, ranges } => {
+                hit |= self.subst_local_ident(expr, name);
+                for r in ranges {
+                    hit |= self.subst_local_ident(r, name);
+                }
+            }
+            ExprKind::Range(lo, hi) => {
+                hit |= self.subst_local_ident(lo, name);
+                hit |= self.subst_local_ident(hi, name);
+            }
+            _ => {}
+        }
+        hit
     }
 
     /// If `expr` names a queue/array (possibly an instance-scoped member),
@@ -33337,7 +33551,10 @@ impl Simulator {
             CI::Inside { expr, range, is_dist, dist_weights, .. } => {
                 if let Some(lv) = self.target_for(expr, targets) {
                     let picked = if *is_dist && !dist_weights.is_empty() {
-                        self.pick_dist_value(range, dist_weights)
+                        // §18.12 `std::randomize(v) with { v dist {...} }` — no
+                        // object, so key the dist schedule on the variable name.
+                        let key = Self::plain_ident_name(expr).map(|n| (usize::MAX, n));
+                        self.pick_dist_value(key, range, dist_weights)
                     } else {
                         let rs: Vec<Expression> = range
                             .iter()
@@ -33725,7 +33942,8 @@ impl Simulator {
             CI::Inside { expr, range, is_dist, dist_weights, .. } => {
                 if self.inline_foreach_elem_ref(expr, arr, idx) {
                     let picked = if *is_dist && !dist_weights.is_empty() {
-                        self.pick_dist_value(range, dist_weights)
+                        // Per-element target: no stable key, draw independently.
+                        self.pick_dist_value(None, range, dist_weights)
                     } else {
                         let rs: Vec<Expression> = range
                             .iter()
@@ -33976,96 +34194,229 @@ impl Simulator {
         None
     }
 
-    /// Pick a concrete value from an `inside {...}` range list. A bare queue/
-    /// array operand contributes its elements; `[lo:hi]` a uniform sample; a
-    /// scalar its value. Returns None if no candidate could be formed.
     /// LRM §18.5.4 weighted distribution picker.
     ///
-    /// Each `(range[i], weights[i])` pair contributes to a probability mass:
-    /// - `Each(w)` (the `:=` operator) — every individual value the range
-    ///   covers gets weight `w`. A bare value contributes 1 outcome of
-    ///   weight `w`; a `[lo:hi]` range contributes `hi-lo+1` outcomes each
-    ///   of weight `w`.
-    /// - `Total(w)` (the `:/` operator) — the weight is split evenly across
-    ///   the values in the range. A bare value still gets the full `w`; a
-    ///   `[lo:hi]` range gives each member `w / (hi-lo+1)` (we use fixed-
-    ///   point integer math, multiplying everything by the range span to
-    ///   keep arithmetic exact).
+    /// Each `(range[i], weights[i])` pair is one dist ITEM with a probability
+    /// mass:
+    /// - `Each(w)` (the `:=` operator) — every individual value the item
+    ///   covers gets weight `w`, so a `[lo:hi]` item's TOTAL mass is
+    ///   `w * (hi-lo+1)` (LRM: "`[100:102] := 1, 200 := 2` ⇒ ratio
+    ///   1-1-1-2"). A bare value is one outcome of weight `w`.
+    /// - `Total(w)` (the `:/` operator) — `w` is the weight of the item as a
+    ///   WHOLE, so each of its `n` values gets `w / n` and the item's total
+    ///   mass is just `w`.
     /// - `None` — defaults to `Each(1)` per the LRM.
+    /// - A weight of ZERO means the item can never be chosen.
     ///
-    /// Sampling: build a `Vec<(value, weight)>`, accumulate to total, draw
-    /// `rng % total`, walk the prefix-sum. Ranges wider than `MAX_BUCKETS`
-    /// are downsampled to that many evenly-spaced reps to bound enumeration.
+    /// Under both operators the values WITHIN one item are equiprobable, so a
+    /// draw is: choose an item in proportion to its mass, then sample
+    /// uniformly inside it.
+    ///
+    /// The item choice is DEALT from a per-(object, variable) schedule rather
+    /// than sampled independently: the schedule holds each item exactly as
+    /// often as its share of the total mass and spreads the copies evenly
+    /// (smooth weighted round-robin, then locally jittered). Every value keeps
+    /// exactly the marginal probability §18.5.4 gives it, but the empirical
+    /// histogram tracks the declared distribution over tens of calls instead of
+    /// needing thousands to average out sampling noise — which is what
+    /// distribution checks in testbenches actually measure. §18.10: the weights
+    /// are expressions re-evaluated on every call, so the schedule is rebuilt
+    /// as soon as they change.
     fn pick_dist_value(
         &mut self,
+        key: Option<(usize, String)>,
         ranges: &[ConstraintRange],
         weights: &[Option<crate::ast::decl::DistWeight>],
     ) -> Option<Value> {
         use rand::Rng;
         use crate::ast::decl::DistWeight;
-        const MAX_BUCKETS: i64 = 4096;
-        // Build (value, weight*span_factor) entries. Multiply every weight
-        // by the LCM-ish "span_factor" so Total(w) over an N-wide range can
-        // give each member w (in unified units) instead of w/N.
-        // Practical approach: scale by N when Total, else by N as identity
-        // for Each. Use 1024 as a universal scaler — enough resolution for
-        // practical weights.
-        let scaler: u64 = 1024;
-        let mut buckets: Vec<(Value, u64)> = Vec::new();
+        // Cap on the number of values an item is assumed to span, so a
+        // 64-bit-wide `:=` range cannot overflow the mass arithmetic.
+        const MAX_SPAN: i64 = 4096;
+        // Fixed-point scaler: keeps `Total(w)` masses exact for small w.
+        const SCALER: u64 = 1024;
+
+        #[derive(Clone)]
+        enum DistItem {
+            One(Value),
+            /// lo, hi, width
+            Span(i64, i64, u32),
+        }
+        let mut items: Vec<(DistItem, u64)> = Vec::new();
         for (i, r) in ranges.iter().enumerate() {
             let w_kind = weights.get(i).and_then(|w| w.as_ref());
-            let w_expr = match w_kind {
-                Some(DistWeight::Each(e)) | Some(DistWeight::Total(e)) => Some(e),
-                None => None,
+            let w = match w_kind {
+                Some(DistWeight::Each(e)) | Some(DistWeight::Total(e)) => {
+                    self.eval_expr(e).to_u64().unwrap_or(1)
+                }
+                None => 1,
             };
-            let w = w_expr.map(|e| self.eval_expr(e).to_u64().unwrap_or(1)).unwrap_or(1);
             match r {
                 ConstraintRange::Value(e) => {
                     let v = self.eval_expr(e);
-                    buckets.push((v, w * scaler));
+                    items.push((DistItem::One(v), w.saturating_mul(SCALER)));
                 }
                 ConstraintRange::Range { lo, hi } => {
                     let lov = self.eval_expr(lo);
                     let hiv = self.eval_expr(hi);
-                    // A bucket must be as wide as its bounds: `[64'h1_0000_0000 :
+                    // An item must be as wide as its bounds: `[64'h1_0000_0000 :
                     // 64'h1_0000_00FF]` truncated to 32 bits and produced 0.
                     let bw = lov.width.max(hiv.width).max(32);
                     let l = lov.to_i64().unwrap_or(0);
                     let h = hiv.to_i64().unwrap_or(l);
-                    if h < l { continue; }
-                    let span = (h - l + 1).min(MAX_BUCKETS) as u64;
-                    if span == 0 { continue; }
-                    let per_value_weight = match w_kind {
-                        Some(DistWeight::Total(_)) | None if matches!(w_kind, Some(DistWeight::Total(_))) => {
-                            // Total: w split evenly across span items.
-                            (w * scaler) / span
-                        }
-                        _ => {
-                            // Each (or no marker, which defaults to Each).
-                            w * scaler
-                        }
-                    };
-                    // Downsample if the range exceeds MAX_BUCKETS.
-                    let stride = ((h - l + 1) as u64).div_ceil(span).max(1);
-                    let mut v = l;
-                    let mut emitted = 0u64;
-                    while v <= h && emitted < span {
-                        buckets.push((Value::from_u64(v as u64, bw), per_value_weight.max(1)));
-                        v = v.saturating_add(stride as i64);
-                        emitted += 1;
+                    if h < l {
+                        continue;
                     }
+                    let span = (h - l + 1).min(MAX_SPAN) as u64;
+                    let mass = match w_kind {
+                        // `:/` — w is the weight of the whole item.
+                        Some(DistWeight::Total(_)) => w.saturating_mul(SCALER),
+                        // `:=` (and the default) — w is the weight of EVERY
+                        // value in the item.
+                        _ => w.saturating_mul(SCALER).saturating_mul(span),
+                    };
+                    items.push((DistItem::Span(l, h, bw), mass));
                 }
             }
         }
-        if buckets.is_empty() { return None; }
-        let total: u64 = buckets.iter().map(|(_, w)| *w).sum();
-        if total == 0 { return Some(buckets[0].0.clone()); }
-        let mut draw = self.cur_rng().gen::<u64>() % total;
-        for (v, w) in &buckets {
-            if draw < *w { return Some(v.clone()); }
-            draw -= *w;
+        if items.is_empty() {
+            return None;
         }
-        Some(buckets.last().unwrap().0.clone())
+        let masses: Vec<u64> = items.iter().map(|(_, m)| *m).collect();
+        let total: u64 = masses.iter().sum();
+        // Every weight is 0 — the constraint admits no value; keep the first
+        // item so the caller still makes progress.
+        if total == 0 {
+            return Some(match &items[0].0 {
+                DistItem::One(v) => v.clone(),
+                DistItem::Span(l, _, bw) => Value::from_u64(*l as u64, *bw),
+            });
+        }
+
+        let idx = match key {
+            Some(k) => self.deal_dist_item(k, &masses, total),
+            None => {
+                // No stable identity for the target (a foreach element, say):
+                // fall back to an independent weighted draw.
+                let mut draw = self.cur_rng().gen::<u64>() % total;
+                let mut pick = masses.len() - 1;
+                for (i, m) in masses.iter().enumerate() {
+                    if draw < *m {
+                        pick = i;
+                        break;
+                    }
+                    draw -= *m;
+                }
+                pick
+            }
+        };
+
+        match items[idx].0.clone() {
+            DistItem::One(v) => Some(v),
+            DistItem::Span(l, h, bw) => {
+                // §18.5.4: the values inside one item are equiprobable under
+                // both `:=` and `:/`.
+                let v = if h > l { self.cur_rng().gen_range(l..=h) } else { l };
+                Some(Value::from_u64(v as u64, bw))
+            }
+        }
+    }
+
+    /// §18.5.4/§18.10 — deal the next dist ITEM index for `key` from its
+    /// proportional schedule, rebuilding the schedule when it is exhausted or
+    /// when the (dynamically evaluated) weights have changed. See
+    /// `pick_dist_value` for why the item choice is scheduled rather than
+    /// drawn independently.
+    fn deal_dist_item(&mut self, key: (usize, String), masses: &[u64], total: u64) -> usize {
+        // Signature of the resolved weights: a change (§18.10 dynamic weights)
+        // invalidates the schedule.
+        let mut sig: u64 = 0xcbf2_9ce4_8422_2325;
+        for m in masses {
+            sig ^= *m;
+            sig = sig.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let stale = self
+            .dist_decks
+            .get(&key)
+            .map_or(true, |(s, deck, pos)| *s != sig || *pos >= deck.len());
+        if stale {
+            let deck = self.build_dist_deck(masses, total);
+            self.dist_decks.insert(key.clone(), (sig, deck, 0));
+        }
+        let (_, deck, pos) = self.dist_decks.get_mut(&key).unwrap();
+        if deck.is_empty() {
+            return 0;
+        }
+        let idx = deck[*pos];
+        *pos += 1;
+        idx
+    }
+
+    /// §18.5.4 — build a schedule holding each dist item in proportion to its
+    /// mass, with the copies spread out (smooth weighted round-robin: repeatedly
+    /// hand the slot to the item with the largest accumulated credit). Adjacent
+    /// entries are then randomly transposed so the dealt sequence is not a rigid
+    /// repeating pattern while any window of it stays proportional.
+    fn build_dist_deck(&mut self, masses: &[u64], total: u64) -> Vec<usize> {
+        use rand::Rng;
+        /// Longest schedule dealt before it is rebuilt.
+        const MAX_DECK: u64 = 4096;
+        fn gcd(a: u64, b: u64) -> u64 {
+            if b == 0 {
+                a
+            } else {
+                gcd(b, a % b)
+            }
+        }
+        let g = masses.iter().copied().filter(|m| *m > 0).fold(0u64, gcd).max(1);
+        let mut counts: Vec<u64> = masses.iter().map(|m| m / g).collect();
+        let mut len: u64 = counts.iter().sum();
+        if len > MAX_DECK {
+            // Too fine-grained to enumerate: scale the counts down, keeping
+            // every non-zero item present at least once.
+            counts = masses
+                .iter()
+                .map(|m| {
+                    if *m == 0 {
+                        0
+                    } else {
+                        (((*m as u128) * (MAX_DECK as u128)) / (total as u128)).max(1) as u64
+                    }
+                })
+                .collect();
+            len = counts.iter().sum();
+        }
+        if len == 0 {
+            return Vec::new();
+        }
+        let n = counts.len();
+        let mut credit: Vec<i64> = vec![0; n];
+        let mut deck: Vec<usize> = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            let mut best = usize::MAX;
+            let mut best_credit = i64::MIN;
+            for i in 0..n {
+                if counts[i] == 0 {
+                    continue; // weight 0 — never scheduled
+                }
+                credit[i] += counts[i] as i64;
+                if credit[i] > best_credit {
+                    best_credit = credit[i];
+                    best = i;
+                }
+            }
+            if best == usize::MAX {
+                break;
+            }
+            credit[best] -= len as i64;
+            deck.push(best);
+        }
+        for i in 1..deck.len() {
+            if self.cur_rng().gen::<bool>() {
+                deck.swap(i - 1, i);
+            }
+        }
+        deck
     }
 
     fn pick_inside_value(&mut self, ranges: &[Expression]) -> Option<Value> {
@@ -41716,6 +42067,12 @@ impl Simulator {
             return Value::from_u64(if disabled { 0 } else { 1 }, 32);
         }
         if method_name == "randomize" {
+            // §18.11: `obj.randomize(null)` is the in-line constraint CHECKER —
+            // it randomizes nothing and just reports whether the object's
+            // current values satisfy its active constraints.
+            if Self::is_randomize_check_args(args) {
+                return self.exec_randomize_check(handle, &[]);
+            }
             return self.exec_randomize(handle);
         }
         // uvm_component::sprint(printer) — the real UVM printer machinery
@@ -42473,21 +42830,58 @@ impl Simulator {
     }
 
     /// Pick a value from `domain` not yet drawn in the current randc cycle
-    /// for (handle, name); record it. When every value has been drawn the
-    /// used-set is reset and a fresh cycle begins.
+    /// for (handle, name); record it TENTATIVELY (see `randc_pending`). When
+    /// every value has been drawn the used-set is reset and a fresh cycle
+    /// begins.
+    ///
+    /// §18.4: "randc variables are cyclic — they iterate over all the values
+    /// in the random set before repeating any value". The solver may retry a
+    /// trial many times before a solution satisfies the other constraints; a
+    /// retried (or abandoned) trial must NOT consume a value out of the
+    /// permutation cycle, or the cycle stops being a permutation. So a pick
+    /// made earlier in this same randomize() call is rolled back first.
     fn pick_randc(&mut self, handle: usize, name: &str, domain: &[u64]) -> u64 {
         use rand::Rng;
         let key = (handle, name.to_string());
+        // Undo this call's earlier tentative pick for the same variable.
+        self.randc_rollback(&key);
         let used = self.randc_used.entry(key.clone()).or_insert_with(HashSet::default);
         let mut avail: Vec<u64> = domain.iter().copied().filter(|v| !used.contains(v)).collect();
+        // `prev` is only Some when this pick wraps the cycle, so the rollback
+        // of a failed trial can put the exhausted cycle back.
+        let mut prev: Option<HashSet<u64>> = None;
         if avail.is_empty() {
+            prev = Some(used.clone());
             used.clear();
             avail = domain.to_vec();
         }
         let pick = avail[self.cur_rng().gen_range(0..avail.len())];
         self.randc_used.get_mut(&key).unwrap().insert(pick);
+        self.randc_pending.insert(key, (pick, prev));
         pick
     }
+
+    /// §18.4: return a tentatively-drawn randc value to its cycle (the trial
+    /// that drew it was retried or abandoned).
+    fn randc_rollback(&mut self, key: &(usize, String)) {
+        if let Some((pick, prev)) = self.randc_pending.remove(key) {
+            if let Some(p) = prev {
+                self.randc_used.insert(key.clone(), p);
+            } else if let Some(u) = self.randc_used.get_mut(key) {
+                u.remove(&pick);
+            }
+        }
+    }
+
+    /// §18.4: give back every randc value tentatively drawn by the in-flight
+    /// randomize() call (used when randomize() fails outright).
+    fn randc_rollback_all(&mut self) {
+        let keys: Vec<(usize, String)> = self.randc_pending.keys().cloned().collect();
+        for k in &keys {
+            self.randc_rollback(k);
+        }
+    }
+
 
     /// IEEE 1800-2023 §18.14.1: `obj.randomize()` draws from the OBJECT's random
     /// stream. Mark the object as the active stream owner for the whole solve
@@ -42506,6 +42900,10 @@ impl Simulator {
         // Reset the dist-pick-once tracker so each randomize call gets a
         // fresh weighted draw per `(handle, prop)`.
         self.dist_picked_once.clear();
+        // §18.4: the previous call's randc draws are final — commit them by
+        // dropping the tentative record, so this call's trials only ever roll
+        // back their OWN picks.
+        self.randc_pending.clear();
         use rand::Rng;
         let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
             inst.class_name.clone()
@@ -42515,6 +42913,12 @@ impl Simulator {
 
         let mut rand_props = Vec::new();
         let mut constraints = Vec::new();
+        // §18.5.14.2: inheritance depth of each collected constraint block
+        // (0 = the object's own class, 1 = its parent, …). A soft constraint
+        // in a DERIVED class has HIGHER priority than a conflicting soft
+        // constraint it inherits, so the lower depth wins.
+        let mut constraint_depth: Vec<usize> = Vec::new();
+        let mut class_depth: usize = 0;
         let mut seen_constraint_names: HashSet<String> = HashSet::default();
         let mut real_rand_props: HashSet<String> = HashSet::default();
         // §18.4.3: subset of rand_props that are declared `randc`.
@@ -42584,9 +42988,11 @@ impl Simulator {
                     }
                     if seen_constraint_names.insert(cname.clone()) {
                         constraints.push(con.clone());
+                        constraint_depth.push(class_depth);
                     }
                 }
                 cur = class_def.extends.clone();
+                class_depth += 1;
             } else {
                 break;
             }
@@ -42989,15 +43395,61 @@ impl Simulator {
                     }
                 }
             }
+            // LRM §18.5.14.2/§18.5.14.3: soft constraints have a PRIORITY
+            // order, and a higher-priority soft constraint DISCARDS a
+            // conflicting lower-priority one instead of failing the solve.
+            // Priority (highest first):
+            //   1. a soft constraint declared in a more-DERIVED class
+            //      (§18.5.14.2: a derived-class soft constraint overrides the
+            //      one it inherits) — i.e. the lower inheritance depth wins;
+            //   2. within one class, the soft constraint that appears LATER in
+            //      the source ("trailing constraints override leading ones"),
+            //      by block source position, then by item position in a block.
+            // For each target variable keep only the winning soft item; the
+            // losers are skipped in the fixpoint below (a base-class
+            // `soft len == 10` must NOT clobber a derived `soft len == 20`).
+            let mut soft_winner: HashMap<String, (usize, usize)> = HashMap::default();
+            let mut soft_rank: HashMap<String, (usize, usize, usize)> = HashMap::default();
+            for (bi, con) in constraints.iter().enumerate() {
+                for (ii, item) in con.items.iter().enumerate() {
+                    if !matches!(item, ConstraintItem::Soft(_)) {
+                        continue;
+                    }
+                    let v = match Self::constraint_item_target(item) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let rank = (constraint_depth[bi], con.span.start, ii);
+                    let wins = match soft_rank.get(&v) {
+                        None => true,
+                        Some(&(d, s, i0)) => {
+                            rank.0 < d
+                                || (rank.0 == d
+                                    && (rank.1 > s || (rank.1 == s && rank.2 > i0)))
+                        }
+                    };
+                    if wins {
+                        soft_rank.insert(v.clone(), rank);
+                        soft_winner.insert(v, (bi, ii));
+                    }
+                }
+            }
             for _pass in 0..16 {
                 let mut changed = false;
-                for con in &constraints {
-                    for item in &con.items {
+                for (bi, con) in constraints.iter().enumerate() {
+                    for (ii, item) in con.items.iter().enumerate() {
                         // Skip a soft constraint whose target variable is
-                        // pinned by a hard constraint (the hard one wins).
+                        // pinned by a hard constraint (the hard one wins),
+                        // or that lost the soft-priority contest above.
                         if let ConstraintItem::Soft(_) = item {
                             if let Some(v) = Self::constraint_item_target(item) {
                                 if hard_target_vars.contains(&v) {
+                                    continue;
+                                }
+                                if soft_winner
+                                    .get(&v)
+                                    .map_or(false, |&(wb, wi)| wb != bi || wi != ii)
+                                {
                                     continue;
                                 }
                             }
@@ -43310,6 +43762,9 @@ impl Simulator {
             }
         }
 
+        // §18.4: randomize() failed — no value was actually produced, so give
+        // every tentatively-drawn randc value back to its permutation cycle.
+        self.randc_rollback_all();
         self.this_stack.pop();
         Value::zero(32)
     }
@@ -43745,7 +44200,8 @@ impl Simulator {
                             return false;
                         }
                         let width = cur.width.max(1);
-                        let picked = self.pick_dist_value(range, dist_weights)
+                        let picked = self
+                            .pick_dist_value(Some(key.clone()), range, dist_weights)
                             .map(|p| p.resize(width));
                         if let Some(p) = picked {
                             self.dist_picked_once.insert(key);
