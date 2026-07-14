@@ -22448,6 +22448,59 @@ impl Simulator {
                 }
                 None
             }
+            // LRM §25.8 — NBA write through a virtual-interface property:
+            // `vif.member <= val` where `vif` is a class property declared
+            // `virtual <iface_t>`. The NBA slow path (`nba_queue`) commits
+            // via `assign_value` AFTER the process context is restored to the
+            // event-loop caller, so `this_stack` is empty at apply time and
+            // the binding lookup in `assign_value` always misses.
+            //
+            // Fix: resolve the binding NOW, while `this_stack` is still valid
+            // (we are inside the process that owns the vif property). Convert
+            // to a fast-path signal ID so the NBA commits to the right signal
+            // without needing `this_stack` at apply time.
+            ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        let prop = hier.path[0].name.name.as_str();
+                        // Check `local_iface_aliases` first (task formal arg vif).
+                        if let Some(frame) = self.local_iface_aliases.last() {
+                            if let Some(bound) = frame.get(prop).cloned() {
+                                let target = format!("{}.{}", bound, member.name);
+                                if let Some(&id) = self.signal_name_to_id.get(target.as_str()) {
+                                    return Some(id);
+                                }
+                            }
+                        }
+                        // Check `virtual_iface_bindings` via `this_stack`.
+                        if let Some(Some(this_h)) = self.this_stack.last().copied() {
+                            let cls_name = self
+                                .heap
+                                .get(this_h)
+                                .and_then(|o| o.as_ref())
+                                .map(|i| i.class_name.clone());
+                            let is_vif = cls_name
+                                .as_ref()
+                                .and_then(|cn| self.module.classes.get(cn))
+                                .map(|cd| cd.virtual_iface_properties.contains_key(prop))
+                                .unwrap_or(false);
+                            if is_vif {
+                                let bound = self
+                                    .virtual_iface_bindings
+                                    .get(&(this_h, prop.to_string()))
+                                    .map(|(n, _)| n.clone());
+                                if let Some(bound_name) = bound {
+                                    let target = format!("{}.{}", bound_name, member.name);
+                                    if let Some(&id) = self.signal_name_to_id.get(target.as_str()) {
+                                        return Some(id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
             _ => None,
         }
     }
