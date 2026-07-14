@@ -29965,9 +29965,21 @@ impl Simulator {
             return;
         }
         let stmts = std::mem::take(&mut self.pending_reactive);
-        for s in stmts {
-            self.exec_statement(&s);
-        }
+        // Program-block (`program ... endprogram`, LRM §24) initial blocks
+        // execute in the reactive region, but they must use the *same* statement
+        // executor as module initials (`run_process_stmts`), not the bare
+        // `exec_statement` loop. That executor carries the task/method
+        // `this`-binding semantics — notably the `run_test` special-case that
+        // inlines `uvm_root::run_test` with `this` bound to the root singleton.
+        // The old `exec_statement` path resolved a bare `run_test(...)` to the
+        // class method with no `this`, so `this.m_children.num()` read 0 and
+        // every `program top` UVM test failed with NOCOMP. Routing through
+        // `run_process_stmts` makes module-top and program-top behavior
+        // identical. Allocate a fresh pid so process-scoped bookkeeping
+        // (disable labels, scope hints) has somewhere to attach.
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        self.run_process_stmts(pid, &stmts);
     }
 
     /// LRM §16.5: edge-detect each registered SVA clock, then for each
