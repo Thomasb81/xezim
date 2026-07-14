@@ -1988,6 +1988,11 @@ pub struct Simulator {
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,
+    /// Stack of the names of the functions/tasks currently executing (innermost
+    /// last), so `%m` inside a package subroutine resolves to `<pkg>.<name>`
+    /// (matching real simulators) rather than the top-module name. Pushed in
+    /// `exec_function_call` / `exec_task_call` around the body and popped after.
+    func_call_stack: Vec<String>,
     /// Return value from last function call.
     return_value: Option<Value>,
     /// Default random number generator — the stream used by any object or
@@ -3591,6 +3596,7 @@ impl Simulator {
             timescale_scope_override: None,
             pending_ret_collection: None,
             current_scope: String::new(),
+            func_call_stack: Vec::new(),
             return_value: None,
             rng: SvRng::from_entropy(),
             proc_rng: HashMap::default(),
@@ -29645,13 +29651,30 @@ impl Simulator {
                             // module with the running process's instance scope
                             // so a multiply-instantiated module reports
                             // `TB.p1` rather than just `TB`.
-                            if self.current_scope.is_empty() {
-                                result.push_str(&self.module.name);
-                            } else {
+                            if !self.current_scope.is_empty() {
                                 result.push_str(&format!(
                                     "{}.{}",
                                     self.module.name, self.current_scope
                                 ));
+                            } else if let Some(fname) = self.func_call_stack.last() {
+                                // Inside a package/module subroutine called with
+                                // no instance scope: `%m` must be the
+                                // subroutine's declaring hierarchy. For a
+                                // package function this is `<pkg>.<name>`
+                                // (matches real simulators, e.g. iverilog), so
+                                // UVM's `uvm_instance_scope()` recovers `uvm_pkg`
+                                // rather than the top-module name. A module-level
+                                // function (absent from `func_decl_scope`) uses
+                                // `<top-module>.<name>`.
+                                let scope = self
+                                    .module
+                                    .func_decl_scope
+                                    .get(fname)
+                                    .cloned()
+                                    .unwrap_or_else(|| self.module.name.clone());
+                                result.push_str(&format!("{}.{}", scope, fname));
+                            } else {
+                                result.push_str(&self.module.name);
                             }
                         }
                         _ => {
@@ -41963,6 +41986,10 @@ impl Simulator {
         // above, in the caller's context.
         self.this_stack.push(None);
         self.class_context_stack.push(None);
+        // Track the running subroutine name so `%m` inside a package function
+        // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
+        // body; recursion keeps the stack ordered.
+        self.func_call_stack.push(fd.name.name.name.clone());
         // Execute function body
         for stmt in &fd.items {
             self.exec_statement(stmt);
@@ -41970,6 +41997,7 @@ impl Simulator {
                 break;
             }
         }
+        self.func_call_stack.pop();
         self.this_stack.pop();
         self.class_context_stack.pop();
         let result = if let Some(rv) = self.return_value.take() {
