@@ -26271,6 +26271,40 @@ impl Simulator {
                                     );
                                 }
                             }
+                            // §7.5.1: `new[n]('{...})` — the argument may be an
+                            // assignment pattern (array literal), not just a
+                            // named source array. Populate elements from it,
+                            // mirroring a plain `arr = '{...}` pattern assign.
+                            if let Some(se) = src_expr {
+                                match &se.kind {
+                                    ExprKind::AssignmentPattern(items) => {
+                                        for (i, item) in items.iter().enumerate() {
+                                            if (i as u64) >= n {
+                                                break;
+                                            }
+                                            let v = self.eval_expr(item.expr());
+                                            self.set_signal_value_by_name(
+                                                &format!("{}[{}]", name, i),
+                                                v,
+                                            );
+                                        }
+                                    }
+                                    // A non-array scalar argument (`new[n](3.0)`,
+                                    // `new[n]("A")`) broadcasts to every element
+                                    // (matches Icarus). Ident sources were already
+                                    // element-copied above.
+                                    ExprKind::Ident(_) => {}
+                                    _ => {
+                                        let v = self.eval_expr(se);
+                                        for i in 0..n {
+                                            self.set_signal_value_by_name(
+                                                &format!("{}[{}]", name, i),
+                                                v.clone(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             self.set_queue_size(&name, n);
                             if !self.in_edge_block {
                                 self.settle_combinatorial();
