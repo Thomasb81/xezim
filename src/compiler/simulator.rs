@@ -2695,6 +2695,13 @@ pub struct Simulator {
     /// already true) would otherwise recurse once per iteration and overflow the
     /// Rust stack; past this depth the continuation goes back to the scheduler.
     forever_depth: u32,
+    /// §11.8.1: while narrowing relational constraint bounds for a target whose
+    /// comparison context is UNSIGNED (the target, or the other operand, is
+    /// unsigned), a bound literal must be read by its unsigned value — e.g. the
+    /// unsized decimal `4294967290` (0xFFFFFFFA), which `to_i64` would otherwise
+    /// sign-extend to -6, collapsing `u >= 4294967290` to `u >= 0`. Scoped to
+    /// the `narrow_relational_bounds` / `affine_*` subtree.
+    constraint_cmp_unsigned: bool,
     stall_iters: u64,
     stall_time: u64,
     /// Process activations at the current timestamp — the accurate signal for
@@ -4019,6 +4026,7 @@ impl Simulator {
             prof_par_ticks: 0,
             prof_par_blocks: 0,
             forever_depth: 0,
+            constraint_cmp_unsigned: false,
             stall_iters: 0,
             stall_time: 0,
             stall_pid_hits: HashMap::default(),
@@ -35864,12 +35872,18 @@ impl Simulator {
                                     } else {
                                         (0, (1i64 << width) - 1)
                                     };
+                                    // §11.8.1: an unsigned target makes each of
+                                    // its relational comparisons unsigned, so a
+                                    // bound literal is read by its unsigned value
+                                    // (see `constraint_cmp_unsigned`).
+                                    self.constraint_cmp_unsigned = !signed;
                                     let mut any = false;
                                     for c in constraints {
                                         self.narrow_relational_bounds(
                                             c, name, &targets, &mut lo, &mut hi, &mut any,
                                         );
                                     }
+                                    self.constraint_cmp_unsigned = false;
                                     if any && lo <= hi {
                                         use rand::Rng;
                                         let pick =
@@ -37163,7 +37177,19 @@ impl Simulator {
         if targets.iter().any(|(n, _)| ids.contains(n)) {
             return None;
         }
-        Some((0, self.eval_expr(e).to_i64()?))
+        let v = self.eval_expr(e);
+        // §11.8.1: in an unsigned comparison context read the bound by its
+        // unsigned value (`to_i64` sign-extends, turning e.g. 0xFFFFFFFA into
+        // -6). Only take the unsigned reading when it stays representable in the
+        // i64 bound domain; otherwise fall back to the signed reading.
+        if self.constraint_cmp_unsigned {
+            if let Some(u) = v.to_u64() {
+                if u <= i64::MAX as u64 {
+                    return Some((0, u as i64));
+                }
+            }
+        }
+        Some((0, v.to_i64()?))
     }
 
     /// Match `expr` (a constraint operand) to one of the randomize targets,
@@ -48282,6 +48308,83 @@ impl Simulator {
                             }
                         }
                     }
+                }
+            }
+            // Plain relational bounds (`prop REL const`) become an allowed
+            // RANGE too, so the picker samples the satisfying interval directly
+            // instead of drawing a full-width random value and hoping the
+            // fixpoint repairs it — which never lands a narrow band near 2^w
+            // (issue #35: `u >= 4294967290` on a 32-bit unsigned is 6 values in
+            // 4.3 billion). The bound is read in i128 with the §11.8.1 sign of
+            // the comparison: an UNSIGNED prop makes it unsigned, so 0xFFFFFFFA
+            // is 4294967290, not the -6 that `to_i64` would sign-extend it to.
+            // Only synthesized for props that have no `inside` range (a mix
+            // would be a union here, not the intended intersection — the
+            // fixpoint still handles that case).
+            for (name, width) in &rand_props {
+                if prop_allowed_ranges.contains_key(name)
+                    || enum_prop_types.contains_key(name)
+                    || real_rand_props.contains(name)
+                {
+                    continue;
+                }
+                let sgn = signed_rand_props.contains(name);
+                let w = (*width).min(127);
+                let (dlo, dhi): (i128, i128) = if sgn {
+                    (-(1i128 << (w.saturating_sub(1))), (1i128 << (w.saturating_sub(1))) - 1)
+                } else {
+                    (0, (1i128 << w) - 1)
+                };
+                let (mut lo, mut hi) = (dlo, dhi);
+                let mut bounded = false;
+                for con in &constraints {
+                    for item in &con.items {
+                        let ConstraintItem::Expr(e) = item else { continue };
+                        let ExprKind::Binary { op, left, right } = &e.kind else { continue };
+                        if !matches!(op, BinaryOp::Geq | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Lt) {
+                            continue;
+                        }
+                        let is_prop = |ex: &Expression| matches!(&ex.kind,
+                            ExprKind::Ident(h) if h.path.last().map_or(false, |s| &s.name.name == name));
+                        let prop_left = is_prop(left);
+                        let prop_right = is_prop(right);
+                        if prop_left == prop_right {
+                            continue; // neither side, or both — not `prop REL const`
+                        }
+                        let lit_side = if prop_left { right } else { left };
+                        // The bound must reference no rand target (a pure const).
+                        let mut ids = HashSet::default();
+                        self.collect_expr_idents(lit_side, &mut ids);
+                        if rand_props.iter().any(|(n, _)| ids.contains(n)) {
+                            continue;
+                        }
+                        let bv = self.eval_expr(lit_side);
+                        let bound: i128 = if sgn {
+                            match bv.to_i64() { Some(x) => x as i128, None => continue }
+                        } else {
+                            bv.to_u128() as i128
+                        };
+                        // Normalize to the prop-on-left orientation.
+                        let eff = if prop_right {
+                            match op {
+                                BinaryOp::Geq => BinaryOp::Leq,
+                                BinaryOp::Leq => BinaryOp::Geq,
+                                BinaryOp::Gt => BinaryOp::Lt,
+                                BinaryOp::Lt => BinaryOp::Gt,
+                                o => *o,
+                            }
+                        } else { *op };
+                        match eff {
+                            BinaryOp::Geq => { lo = lo.max(bound); bounded = true; }
+                            BinaryOp::Gt  => { lo = lo.max(bound + 1); bounded = true; }
+                            BinaryOp::Leq => { hi = hi.min(bound); bounded = true; }
+                            BinaryOp::Lt  => { hi = hi.min(bound - 1); bounded = true; }
+                            _ => {}
+                        }
+                    }
+                }
+                if bounded && lo <= hi && (lo > dlo || hi < dhi) {
+                    prop_allowed_ranges.insert(name.clone(), vec![(lo, hi)]);
                 }
             }
             // Published for the fixpoint: an affine solve and a `!=` re-pick
