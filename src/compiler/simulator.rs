@@ -2066,6 +2066,11 @@ pub struct Simulator {
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,
+    /// Stack of the names of the functions/tasks currently executing (innermost
+    /// last), so `%m` inside a package subroutine resolves to `<pkg>.<name>`
+    /// (matching real simulators) rather than the top-module name. Pushed in
+    /// `exec_function_call` / `exec_task_call` around the body and popped after.
+    func_call_stack: Vec<String>,
     /// Return value from last function call.
     return_value: Option<Value>,
     /// Default random number generator — the stream used by any object or
@@ -2285,6 +2290,18 @@ pub struct Simulator {
     /// statements. `put` drains a waiter, assigns the value into its lvalue,
     /// and re-schedules the continuation at the current time.
     mailbox_get_waiters: HashMap<usize, std::collections::VecDeque<MailboxGetWaiter>>,
+    /// IEEE 1800-2023 §9.3.2: a fork child's WRITES to the parent's automatic
+    /// variables must be visible to the parent after the child finishes. xezim
+    /// gives each child a COPY of the parent's locals (see
+    /// `inherit_fork_child_context`), then `propagate_fork_locals_to_parent`
+    /// merges the child's frames back. To avoid clobbering a parent variable
+    /// that the child only INHERITED (never wrote) — which the parent may have
+    /// since modified (e.g. a mailbox `get` delivery writing `phase` while a
+    /// `fork ... join_none` child is still running, as in UVM's
+    /// `m_run_phases`) — each child's local frames are snapshotted here at
+    /// fork time as a baseline; propagate merges only the keys whose value the
+    /// child CHANGED relative to this baseline.
+    fork_baselines: HashMap<usize, Vec<HashMap<String, Value>>>,
     /// Processes blocked in `semaphore.get()` on an under-full semaphore.
     semaphore_get_waiters: HashMap<usize, std::collections::VecDeque<SemGetWaiter>>,
     /// IEEE 1800-2017 §9.4.5 intra-assignment delay (`lhs = #d rhs`): RHS
@@ -3793,6 +3810,7 @@ impl Simulator {
             timescale_scope_override: None,
             pending_ret_collection: None,
             current_scope: String::new(),
+            func_call_stack: Vec::new(),
             return_value: None,
             rng: SvRng::from_seed(SvRng::DEFAULT_SEED),
             proc_rng: HashMap::default(),
@@ -3857,6 +3875,7 @@ impl Simulator {
             cond_progress: 0,
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
+            fork_baselines: HashMap::default(),
             semaphore_get_waiters: HashMap::default(),
             intra_saved: HashMap::default(),
             intra_saved_next: 0,
@@ -15509,6 +15528,12 @@ impl Simulator {
         if trivial {
             self.process_contexts.remove(&pid);
         } else {
+            // §9.3.2 baseline: snapshot the child's local frames as forked so
+            // `propagate_fork_locals_to_parent` can merge only the keys the
+            // child later WRITES (value changes), not keys it merely inherited
+            // (which the parent may have modified in the meantime — e.g. a
+            // mailbox-get delivery into `phase` while this child runs).
+            self.fork_baselines.insert(pid, ctx.local_stack.clone());
             self.process_contexts.insert(pid, ctx);
         }
     }
@@ -15705,6 +15730,16 @@ impl Simulator {
             Some(p) => p,
             None => return,
         };
+        // §9.3.2 baseline: only the keys the child WROTE (its value now differs
+        // from the fork-time snapshot) are propagated — a key it merely
+        // inherited unchanged must NOT clobber a value the parent modified
+        // after the fork (e.g. a mailbox-get delivery into `phase` while this
+        // child ran, as in UVM `m_run_phases`). If no baseline survived (child
+        // that never had saved context, or an older run), fall back to the
+        // legacy whole-frame merge so the §9.3.2 write-visibility guarantee
+        // (e.g. m_safe_select_item's `select_process = process::self()`)
+        // still holds.
+        let baseline = self.fork_baselines.get(&child_pid).cloned();
         // `self.local_stack` currently holds the CHILD's frames (captured
         // before we restore the event-loop caller's context below).
         let child_frames: Vec<HashMap<String, Value>> = self.local_stack.clone();
@@ -15717,8 +15752,29 @@ impl Simulator {
         let n = parent_ctx.local_stack.len().min(child_frames.len());
         for i in 0..n {
             for (k, v) in &child_frames[i] {
+                // Only propagate keys that exist in the parent's frame (a key
+                // the child declared itself, like a loop-local `succ`, is
+                // child-private and of no interest to the parent).
+                if !parent_ctx.local_stack[i].contains_key(k) {
+                    continue;
+                }
+                let inherited_unchanged = baseline
+                    .as_ref()
+                    .and_then(|b| b.get(i))
+                    .and_then(|f| f.get(k))
+                    .is_some_and(|old| old == v);
+                if inherited_unchanged {
+                    continue;
+                }
                 parent_ctx.local_stack[i].insert(k.clone(), v.clone());
             }
+        }
+        // Drop the baseline once the child is done (no longer suspended) so the
+        // map doesn't grow unboundedly across a forever-fork loop (UVM
+        // `m_run_phases`). A child that merely parked (e.g. on a `#5`) keeps
+        // its baseline for the next propagate.
+        if !self.is_pid_suspended(child_pid) {
+            self.fork_baselines.remove(&child_pid);
         }
     }
 
@@ -15888,15 +15944,14 @@ impl Simulator {
                 }
             }
 
-            // PURE_SV_LRM: bridge `objn.wait_for(UVM_ALL_DROPPED, obj)` to a
-            // condition-wait on the objection total (see synth_objection_wait).
-            // Must run BEFORE Stage 1b would inline wait_for's real body (whose
+            // PURE_SV_LRM: bridge a genuine-UVM objection sync call
+            // `objn.wait_for(evt, obj)` to a condition-wait on the objection
+            // total (see bridge_objection_wait_for). Must run BEFORE Stage 1b
+            // would inline wait_for's real body (whose
             // `@(m_events[obj].all_dropped)` member-event wait can't block).
             if self.pure_sv_lrm {
-                if let Some((recv, obj, all_dropped)) = Self::match_objection_wait_for(stmt) {
-                    let wait_stmt =
-                        Self::synth_objection_wait(&recv, obj.as_ref(), all_dropped, stmt.span);
-                    let mut cont = vec![wait_stmt];
+                if let Some(wait_stmts) = self.bridge_objection_wait_for(stmt) {
+                    let mut cont = wait_stmts;
                     cont.extend_from_slice(&stmts[i + 1..]);
                     self.run_process_stmts(pid, &cont);
                     return;
@@ -16876,20 +16931,105 @@ impl Simulator {
         )
     }
 
-    /// PURE_SV_LRM bridge: rewrite `objn.wait_for(UVM_ALL_DROPPED|UVM_RAISED, obj)`
-    /// into `wait(objn.get_objection_total(obj) <op> 0)`. The real
-    /// `uvm_objection::wait_for` blocks on `@(m_events[obj].all_dropped)` — a
-    /// plain SV `event` MEMBER of an assoc-array-indexed object — which xezim
-    /// can't key (only simple-Identifier named events resolve to a signal), so
-    /// the `@` returns immediately and the phase-end loop spins at t0. Bridging
-    /// to a condition-wait on the (working) objection total lets the calling
-    /// process PARK (so time advances to the drop) and wake when it hits 0.
-    fn synth_objection_wait(
+    /// PURE_SV_LRM bridge: rewrite a genuine-UVM objection sync call
+    /// `objn.wait_for(evt, obj)` into condition-wait(s) on the objection total.
+    ///
+    /// The real `uvm_objection::wait_for` blocks on
+    /// `@(m_events[obj].all_dropped)` — a plain SV `event` MEMBER of an
+    /// assoc-array-indexed object — which xezim can't key (only
+    /// simple-Identifier named events resolve to a signal), so the `@`
+    /// returns immediately and the phase-end loop spins at t0. Bridging to a
+    /// condition-wait on the (working) objection total lets the calling process
+    /// PARK (so time advances to the drop) and wake when the total moves.
+    ///
+    /// `evt` may be a *literal* (`UVM_ALL_DROPPED`) or a *runtime enum
+    /// variable*. The literal form appears in `execute_phase`
+    /// (`phase_done.wait_for(UVM_ALL_DROPPED, top)`); the variable form appears
+    /// after `uvm_phase_hopper::wait_for_objection(objt_event, obj)` is inlined
+    /// and routes its parameter through to the inner `objection.wait_for(...)`
+    /// — which is the call that ends `run_phases`. The variable case is why a
+    /// literal-only matcher missed it and `run_phases` fell through to the
+    /// empty-sensitivity `@()` and ended the schedule at t0.
+    ///
+    /// Semantics:
+    ///   - UVM_ALL_DROPPED (4): `wait(total > 0); wait(total == 0)`. The
+    ///     two-step idiom is required because `run_phases` reaches this wait
+    ///     BEFORE the run phase has raised (total is 0 at entry); a bare
+    ///     `wait(total == 0)` would return immediately and finish at t0.
+    ///     `execute_phase`'s call is already gated on `total > 0` in the SV, so
+    ///     the first wait passes through there.
+    ///   - UVM_RAISED (1): `wait(total > 0)`.
+    ///
+    /// Returns the synthesized wait statement(s), or None if `stmt` is not an
+    /// objection `wait_for` call (so other `wait_for`-named methods —
+    /// uvm_event/barrier — are never hijacked).
+    fn bridge_objection_wait_for(
+        &mut self,
+        stmt: &Statement,
+    ) -> Option<Vec<Statement>> {
+        let (recv, obj, evt_expr) = Self::match_objection_wait_call(stmt)?;
+        // Resolve the event: literal enum ident first, else evaluate the
+        // (inlined-parameter) variable to its enum integer.
+        let evt_int: Option<u64> = match &evt_expr.kind {
+            ExprKind::Ident(h) => match h.path.last().map(|s| s.name.name.as_str()).as_deref() {
+                Some("UVM_ALL_DROPPED") => Some(4),
+                Some("UVM_DROPPED") => Some(2),
+                Some("UVM_RAISED") => Some(1),
+                _ => None,
+            },
+            _ => None,
+        };
+        let evt_int = match evt_int {
+            Some(v) => v,
+            None => self.eval_expr(&evt_expr).to_u64()?,
+        };
+        let span = stmt.span;
+        let total = Self::objection_total_call_expr(&recv, obj.as_ref(), span);
+        let zero = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: NumberBase::Decimal,
+                value: "0".to_string(),
+                cached_val: Cell::new(None),
+            }),
+            span,
+        );
+        let mk_wait = |op, span: crate::ast::Span| {
+            let cond = Expression::new(
+                ExprKind::Binary {
+                    op,
+                    left: Box::new(total.clone()),
+                    right: Box::new(zero.clone()),
+                },
+                span,
+            );
+            Statement::new(
+                StatementKind::Wait {
+                    condition: cond,
+                    stmt: Box::new(Statement::new(StatementKind::Null, span)),
+                },
+                span,
+            )
+        };
+        if evt_int == 4 {
+            // wait(total > 0); wait(total == 0);
+            Some(vec![
+                mk_wait(BinaryOp::Gt, span),
+                mk_wait(BinaryOp::Eq, span),
+            ])
+        } else {
+            // UVM_RAISED / UVM_DROPPED: wait(total > 0)
+            Some(vec![mk_wait(BinaryOp::Gt, span)])
+        }
+    }
+
+    /// Build `<recv>.get_objection_total(<obj>)` as an expression.
+    fn objection_total_call_expr(
         recv: &Expression,
         obj: Option<&Expression>,
-        all_dropped: bool,
         span: crate::ast::Span,
-    ) -> Statement {
+    ) -> Expression {
         let func = Expression::new(
             ExprKind::MemberAccess {
                 expr: Box::new(recv.clone()),
@@ -16901,38 +17041,19 @@ impl Simulator {
             span,
         );
         let args: Vec<Expression> = obj.cloned().into_iter().collect();
-        let call = Expression::new(ExprKind::Call { func: Box::new(func), args }, span);
-        let zero = Expression::new(
-            ExprKind::Number(NumberLiteral::Integer {
-                size: None,
-                signed: false,
-                base: NumberBase::Decimal,
-                value: "0".to_string(),
-                cached_val: Cell::new(None),
-            }),
-            span,
-        );
-        let op = if all_dropped { BinaryOp::Eq } else { BinaryOp::Gt };
-        let cond = Expression::new(
-            ExprKind::Binary { op, left: Box::new(call), right: Box::new(zero) },
-            span,
-        );
-        Statement::new(
-            StatementKind::Wait {
-                condition: cond,
-                stmt: Box::new(Statement::new(StatementKind::Null, span)),
-            },
-            span,
-        )
+        Expression::new(ExprKind::Call { func: Box::new(func), args }, span)
     }
 
-    /// Recognise an objection `wait_for(UVM_ALL_DROPPED|UVM_RAISED, obj)` call
-    /// statement and return `(receiver, obj_arg, all_dropped)`. Gated on the
-    /// first arg being one of the objection-event idents so it never hijacks
-    /// other `wait_for`-named methods (uvm_event/barrier).
-    fn match_objection_wait_for(
+    /// Recognise an objection `objn.wait_for(evt, obj)` call statement and
+    /// return `(receiver, obj_arg, evt_expr)`. The event argument is returned
+    /// UNRESOLVED — `bridge_objection_wait_for` resolves it (literal ident OR
+    /// a runtime enum variable, after the genuine library routes
+    /// `wait_for_objection`'s parameter through). Only `wait_for`-named methods
+    /// on a receiver match; other `wait_for` methods (uvm_event/barrier) have no
+    /// receiver-shaped `objn` and are handled by their own machinery.
+    fn match_objection_wait_call(
         stmt: &Statement,
-    ) -> Option<(Expression, Option<Expression>, bool)> {
+    ) -> Option<(Expression, Option<Expression>, Expression)> {
         let expr = match &stmt.kind {
             StatementKind::Expr(e) => e,
             _ => return None,
@@ -16944,15 +17065,6 @@ impl Simulator {
         if args.is_empty() {
             return None;
         }
-        let evt = match &args[0].kind {
-            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()).unwrap_or(""),
-            _ => "",
-        };
-        let all_dropped = match evt {
-            "UVM_ALL_DROPPED" => true,
-            "UVM_RAISED" => false,
-            _ => return None,
-        };
         let (recv, method) = match &func.kind {
             ExprKind::MemberAccess { expr: r, member } => ((**r).clone(), member.name.clone()),
             ExprKind::Ident(h) if h.path.len() >= 2 => {
@@ -16965,7 +17077,7 @@ impl Simulator {
         if method != "wait_for" {
             return None;
         }
-        Some((recv, args.get(1).cloned(), all_dropped))
+        Some((recv, args.get(1).cloned(), args[0].clone()))
     }
 
     /// Is `s` a (potentially blocking) mailbox `get`/`peek` call — `mb.get(v)`
@@ -30656,13 +30768,30 @@ impl Simulator {
                             // module with the running process's instance scope
                             // so a multiply-instantiated module reports
                             // `TB.p1` rather than just `TB`.
-                            if self.current_scope.is_empty() {
-                                result.push_str(&self.module.name);
-                            } else {
+                            if !self.current_scope.is_empty() {
                                 result.push_str(&format!(
                                     "{}.{}",
                                     self.module.name, self.current_scope
                                 ));
+                            } else if let Some(fname) = self.func_call_stack.last() {
+                                // Inside a package/module subroutine called with
+                                // no instance scope: `%m` must be the
+                                // subroutine's declaring hierarchy. For a
+                                // package function this is `<pkg>.<name>`
+                                // (matches real simulators, e.g. iverilog), so
+                                // UVM's `uvm_instance_scope()` recovers `uvm_pkg`
+                                // rather than the top-module name. A module-level
+                                // function (absent from `func_decl_scope`) uses
+                                // `<top-module>.<name>`.
+                                let scope = self
+                                    .module
+                                    .func_decl_scope
+                                    .get(fname)
+                                    .cloned()
+                                    .unwrap_or_else(|| self.module.name.clone());
+                                result.push_str(&format!("{}.{}", scope, fname));
+                            } else {
+                                result.push_str(&self.module.name);
                             }
                         }
                         _ => {
@@ -30859,9 +30988,21 @@ impl Simulator {
             return;
         }
         let stmts = std::mem::take(&mut self.pending_reactive);
-        for s in stmts {
-            self.exec_statement(&s);
-        }
+        // Program-block (`program ... endprogram`, LRM §24) initial blocks
+        // execute in the reactive region, but they must use the *same* statement
+        // executor as module initials (`run_process_stmts`), not the bare
+        // `exec_statement` loop. That executor carries the task/method
+        // `this`-binding semantics — notably the `run_test` special-case that
+        // inlines `uvm_root::run_test` with `this` bound to the root singleton.
+        // The old `exec_statement` path resolved a bare `run_test(...)` to the
+        // class method with no `this`, so `this.m_children.num()` read 0 and
+        // every `program top` UVM test failed with NOCOMP. Routing through
+        // `run_process_stmts` makes module-top and program-top behavior
+        // identical. Allocate a fresh pid so process-scoped bookkeeping
+        // (disable labels, scope hints) has somewhere to attach.
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        self.run_process_stmts(pid, &stmts);
     }
 
     /// LRM §16.5: edge-detect each registered SVA clock, then for each
@@ -41740,7 +41881,24 @@ impl Simulator {
             if name.name.name.contains("registry") {
                 if let Some(first) = type_args.first() {
                     if let ExprKind::Ident(hier) = &first.kind {
-                        return Some(hier.path.last().unwrap().name.name.clone());
+                        let leaf = hier.path.last().unwrap().name.name.clone();
+                        // The registered type is often a class-local typedef
+                        // alias, not the class itself — e.g. UVM's
+                        // `uvm_sequencer` declares
+                        //   typedef uvm_sequencer#(REQ,RSP) this_type;
+                        //   `uvm_component_param_utils(this_type)`
+                        // so type_id's first arg is `this_type`. Resolve one
+                        // level through the class's own typedef table to the
+                        // underlying class name (else `this_type` is not a
+                        // class and the factory create returns null → the
+                        // sequencer's `seq_item_export` is never built →
+                        // "Cannot connect to null port handle" build error).
+                        if let Some(DataType::TypeReference { name: real, .. }) =
+                            cd.typedef_targets.get(&leaf)
+                        {
+                            return Some(real.name.name.clone());
+                        }
+                        return Some(leaf);
                     }
                 }
             }
@@ -42375,20 +42533,37 @@ impl Simulator {
             if mname == "put" {
                 let base = self.eval_expr(expr);
                 let handle = base.to_u64().unwrap_or(0) as usize;
-                let val = args.first().map(|a| self.eval_expr(a));
-                let mut changed = false;
-                if let Some(v) = val {
-                    if let Some(q) = self.mailboxes.get_mut(&handle) {
-                        q.push_back(v);
-                        changed = true;
+                if let Some(arg) = args.first() {
+                    let v = self.eval_expr(arg);
+                    // LRM §15.4.3/§15.4.5: a `put` stores in FIFO order and
+                    // unblocks any process waiting in a `get`/`peek` on this
+                    // mailbox. Hand the value directly to the FIFO-ordered
+                    // waiter (skipping the queue) and reschedule its parked
+                    // continuation — exactly as `exec_method_call`'s `put`
+                    // does. This handler is reached when a `put` is evaluated
+                    // in EXPRESSION context (e.g. a forked producer like the
+                    // genuine-UVM `m_run_phases` successor scheduler); without
+                    // the delivery the parked consumer never resumed and the
+                    // schedule deadlocked at the successor hop.
+                    if self.mailboxes.contains_key(&handle) {
+                        let waiter = self
+                            .mailbox_get_waiters
+                            .get_mut(&handle)
+                            .and_then(|q| q.pop_front());
+                        if let Some(MailboxGetWaiter { pid, lvalue, cont, is_peek }) = waiter {
+                            if is_peek {
+                                // peek does not consume — leave the item for the
+                                // subsequent get/try_get.
+                                self.mailboxes.get_mut(&handle).unwrap().push_back(v.clone());
+                            }
+                            self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont);
+                        } else if let Some(q) = self.mailboxes.get_mut(&handle) {
+                            q.push_back(v);
+                        }
                     } else if let Some(count) = self.semaphores.get_mut(&handle) {
                         *count += v.to_u64().unwrap_or(1) as i64;
-                        changed = true;
+                        self.wake_semaphore_waiters(handle);
                     }
-                }
-                if changed {
-                    // Waking up might be needed, but simplified: waking up is usually via events.
-                    // For mailboxes/semaphores, we'd need dedicated waiter queues.
                 }
                 return Value::zero(32);
             }
@@ -44008,6 +44183,10 @@ impl Simulator {
         // above, in the caller's context.
         self.this_stack.push(None);
         self.class_context_stack.push(None);
+        // Track the running subroutine name so `%m` inside a package function
+        // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
+        // body; recursion keeps the stack ordered.
+        self.func_call_stack.push(fd.name.name.name.clone());
         // Execute function body
         for stmt in &fd.items {
             self.exec_statement(stmt);
@@ -44015,6 +44194,7 @@ impl Simulator {
                 break;
             }
         }
+        self.func_call_stack.pop();
         self.this_stack.pop();
         self.class_context_stack.pop();
         let result = if let Some(rv) = self.return_value.take() {
