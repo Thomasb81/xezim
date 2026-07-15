@@ -34389,7 +34389,15 @@ impl Simulator {
         }
 
         let w = self.xtrace_writer.as_mut().unwrap();
+        // A lone `T` is a valid trace_record (§18); emit it so the section is
+        // never empty. The `N,full` only follows if there is something to
+        // snapshot — a design (or `--xtrace-scope`) with no traced signals must
+        // NOT emit a bare `N,full,` (trailing comma, empty payload), which is a
+        // malformed §10.6 record.
         let _ = writeln!(w, "T,+{}", delta);
+        if snap_parts.is_empty() {
+            return;
+        }
         // Long N,full lines are split into 16-signal chunks per the emitter
         // pattern in §A.13 to keep parser memory bounded; continuation chunks
         // reuse the P record form.
@@ -34424,8 +34432,17 @@ impl Simulator {
             return;
         }
         if self.time < self.xtrace_from_t {
-            // Before the window: emit nothing and DON'T advance `prev`, so the
-            // first in-window write shows the true accumulated state at `from`.
+            // Before the window: emit nothing.
+            //
+            // KNOWN LIMITATION (`--xtrace-from N` with N > 0): the pending
+            // checkpoint is emitted at the first in-window *write* (the first
+            // signal change at or after N), stamped and valued at that time —
+            // not at the boundary N with the state accumulated up to N. So the
+            // interval [N, first-change) is not represented. A precise fix needs
+            // the state as-of N (different source than the settled-value read
+            // used for the common N == 0 case), so it is deliberately left for a
+            // dedicated pass rather than risk the N == 0 path. N == 0 (the
+            // default, no window) is exact.
             return;
         }
 

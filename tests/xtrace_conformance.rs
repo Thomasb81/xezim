@@ -814,6 +814,38 @@ fn snapshot_carries_settled_values() {
     );
 }
 
+/// §10.6/§18: a design (or `--xtrace-scope`) with no traced signals must not
+/// emit a bare `N,full,` — a trailing comma with empty payload is a malformed
+/// record. The trace section stays valid via a lone `T` record instead.
+#[test]
+fn no_signals_does_not_emit_malformed_snapshot() {
+    let src = r#"
+module top;
+    initial begin #1 $finish; end
+endmodule
+"#;
+    let xt = dump("empty", src);
+    assert!(
+        !xt.contains("N,full,\n") && !xt.trim_end().ends_with("N,full,"),
+        "a signal-less dump must not emit a bare `N,full,`:\n{}",
+        xt
+    );
+    // The trace section must still be well-formed: at least one T record.
+    let trace: Vec<&str> = xt
+        .lines()
+        .skip_while(|l| *l != "@section trace")
+        .skip(1)
+        .take_while(|l| !l.starts_with("@section"))
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert!(
+        trace.iter().all(|l| l.starts_with("T,+")),
+        "a signal-less trace must contain only T records, got {:?}",
+        trace
+    );
+    assert!(!trace.is_empty(), "trace section must not be empty (§18)");
+}
+
 // ───────────────────────── selection & memories ─────────────────────────
 
 /// §9.1/§9.2: an unpacked array (`logic [7:0] mem [0:3]`) contributes one
