@@ -524,6 +524,28 @@ struct JoinWaiter {
 
 /// Fast-path NBA entry: compact (signal_id, value) pair for pre-resolved targets.
 /// 99%+ of NBA entries use this path. Smaller struct = better cache utilization.
+
+/// IEEE 1800-2023 §9.7: info stored when a process is explicitly suspended
+/// via `process::suspend()`. The process is removed from whatever queue it
+/// was parked in; `resume()` uses this to re-schedule it.
+#[derive(Clone)]
+struct SuspendedProc {
+    /// Continuation statements to run when the process resumes.
+    continuation: Vec<Statement>,
+    /// Original scheduled expiry time if suspended while blocked on a `#delay`.
+    /// `None` if blocked on an event/condition/join/mailbox. On resume, if the
+    /// original delay has transpired (original_time <= self.time), the process
+    /// continues immediately (LRM §9.7).
+    original_delay_expiry: Option<u64>,
+}
+
+/// §9.7 `process::await()`: a process blocked waiting for another's termination.
+struct AwaitWaiter {
+    target_pid: usize,
+    waiter_pid: usize,
+    continuation: Vec<Statement>,
+}
+
 struct NbaFast {
     signal_id: usize,
     value: Value,
@@ -1182,6 +1204,69 @@ impl TimingWheel {
     /// O(1) check: is any event scheduled for this pid anywhere in the queue?
     fn has_pid(&self, pid: usize) -> bool {
         self.pid_counts.contains_key(&pid)
+    }
+
+    /// §9.7: remove ALL events for `pid` from both the wheel and overflow.
+    /// Returns the earliest (scheduled_time, continuation) if found.
+    /// Used by `process::suspend()` and `process::kill()` to desensitize a
+    /// process from its delay.
+    fn remove_pid(&mut self, pid: usize) -> Option<(u64, Vec<Statement>)> {
+        if !self.pid_counts.contains_key(&pid) {
+            return None;
+        }
+        let mut found: Option<(u64, Vec<Statement>)> = None;
+        let cur_slot = Self::slot(self.current_time);
+
+        // 1) Scan the timing wheel: extract matching entries, keep the rest.
+        for s in 0..WHEEL_SIZE {
+            let v = std::mem::take(&mut self.wheel[s]);
+            if v.is_empty() {
+                continue;
+            }
+            let delta = ((s + WHEEL_SIZE - cur_slot) % WHEEL_SIZE) as u64;
+            let abs_time = self.current_time + delta;
+            let mut kept = Vec::new();
+            for (p, stmts) in v {
+                if p == pid {
+                    // Capture the earliest match.
+                    if found.is_none() || abs_time < found.as_ref().unwrap().0 {
+                        found = Some((abs_time, stmts));
+                    }
+                } else {
+                    kept.push((p, stmts));
+                }
+            }
+            if kept.is_empty() {
+                self.bitmap_clear(s);
+            } else {
+                self.wheel[s] = kept;
+            }
+        }
+
+        // 2) Scan overflow (BTreeMap is time-sorted, so first match is earliest).
+        if found.is_none() {
+            let times: Vec<u64> = self.overflow.keys().copied().collect();
+            for t in times {
+                if let Some(v) = self.overflow.get_mut(&t) {
+                    if let Some(idx) = v.iter().position(|(p, _)| *p == pid) {
+                        let stmts = v.remove(idx).1;
+                        found = Some((t, stmts));
+                        if v.is_empty() {
+                            self.overflow.remove(&t);
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Also clean overflow of any remaining entries for this pid.
+            for (_, v) in self.overflow.iter_mut() {
+                v.retain(|(p, _)| *p != pid);
+            }
+            self.overflow.retain(|_, v| !v.is_empty());
+        }
+        self.pid_counts.remove(&pid);
+        found
     }
 }
 
@@ -2167,6 +2252,13 @@ pub struct Simulator {
     warned_assoc_index: HashSet<String>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
+    /// §9.7 `process` class: PIDs explicitly suspended via `suspend()`. The
+    /// continuation + original delay info is in `suspended_proc_info`.
+    suspended_pids: HashSet<usize>,
+    /// §9.7: detailed resumption info for each suspended pid.
+    suspended_proc_info: HashMap<usize, SuspendedProc>,
+    /// §9.7 `process::await()`: processes waiting for another's termination.
+    await_waiters: Vec<AwaitWaiter>,
     /// Names of init-declared (automatic) `for`-loop variables that — because
     /// the enclosing process had no local frame — currently live in the signal
     /// table. A `fork` child must capture these BY VALUE at fork time so the
@@ -3665,6 +3757,9 @@ impl Simulator {
             fork_block_children: HashMap::default(),
             warned_assoc_index: HashSet::default(),
             killed_pids: HashSet::default(),
+            suspended_pids: HashSet::default(),
+            suspended_proc_info: HashMap::default(),
+            await_waiters: Vec::new(),
             auto_loop_vars: Vec::new(),
             ref_binding_stack: Vec::new(),
             task_cleanup: Vec::new(),
@@ -15504,6 +15599,111 @@ impl Simulator {
                 }
             }
 
+            // Stage 0: normalize a parenless task/method call (LRM §13.5
+            // footnote 42 + §13.5.5: parentheses may be omitted for tasks, void
+            // functions, and class methods). A call written without
+            // parentheses — `t;`, `c.m;`, `m_run_phases;`, `run_test;` — parses
+            // as a bare `Expr(Ident([name]))` or `Expr(MemberAccess{...})`, NOT
+            // as `Expr(Call { func, args: [] })`. Every Stage 1/1b/1c inlining
+            // guard below matches on `Call`, so without this rewrite a blocking
+            // task called without parentheses bypasses inlining and falls
+            // through to the synchronous `exec_statement`, which cannot honour
+            // the body's `#delay`/`wait`/`fork` and silently drops it — the
+            // caller never blocks (e.g. `task t; #10; endtask; ... t;` returns
+            // at t=0 instead of t=10). Rewrite the parenless subroutine
+            // reference into the equivalent zero-argument `Call` and
+            // re-dispatch, so the existing guards fire uniformly. Only rewrite
+            // when the callee resolves to a free task (`module.tasks`) or a
+            // method (on the current `this` or on an object handle); a plain
+            // variable reference `x;` is left to the normal expression path.
+            // Non-blocking tasks: the rewritten Call still won't satisfy
+            // `stmts_have_blocking`, so it falls through to `exec_statement`
+            // unchanged — `t()` / `c.m()` with explicit parens already worked.
+            //
+            // Recognized parenless forms (LRM §13.5 `tf_call`/`method_call`):
+            //   `t;`                    -> Ident([t])
+            //   `m;`  (this-method)     -> Ident([m])
+            //   `c.m;`                  -> MemberAccess{expr:Ident([c]), member:m}
+            //   `c.m;` (flattened)      -> Ident([c, m])
+            if let StatementKind::Expr(e) = &stmt.kind {
+                let rewritten: Option<Expression> = match &e.kind {
+                    // Bare name: free task or method on current `this`.
+                    ExprKind::Ident(h) if h.path.len() == 1 => {
+                        let nm = h.path[0].name.name.clone();
+                        let is_free_task = self.module.tasks.contains_key(&nm);
+                        let is_this_method = self
+                            .this_stack
+                            .last()
+                            .copied()
+                            .flatten()
+                            .and_then(|hh| {
+                                self.heap
+                                    .get(hh)
+                                    .and_then(|o| o.as_ref())
+                                    .map(|inst| inst.class_name.clone())
+                            })
+                            .map_or(false, |cls| self.class_has_method(&cls, &nm));
+                        if is_free_task || is_this_method {
+                            Some(Expression::new(
+                                ExprKind::Call {
+                                    func: Box::new(e.clone()),
+                                    args: vec![],
+                                },
+                                e.span,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    // `obj.method;` via member-access dot syntax.
+                    ExprKind::MemberAccess { expr: recv, member } => {
+                        let recv_ok = self
+                            .eval_handle_expr(recv)
+                            .and_then(|hh| self.heap.get(hh).and_then(|o| o.as_ref()).map(|inst| inst.class_name.clone()))
+                            .map_or(false, |cls| self.class_has_method(&cls, &member.name));
+                        if recv_ok {
+                            Some(Expression::new(
+                                ExprKind::Call {
+                                    func: Box::new(e.clone()),
+                                    args: vec![],
+                                },
+                                e.span,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    // `obj.method;` via flattened 2-segment ident.
+                    ExprKind::Ident(h) if h.path.len() == 2 => {
+                        let vn = h.path[0].name.name.clone();
+                        let mn = h.path[1].name.name.clone();
+                        let recv_ok = self
+                            .eval_ident_handle(&vn)
+                            .and_then(|hh| self.heap.get(hh).and_then(|o| o.as_ref()).map(|inst| inst.class_name.clone()))
+                            .map_or(false, |cls| self.class_has_method(&cls, &mn));
+                        if recv_ok {
+                            Some(Expression::new(
+                                ExprKind::Call {
+                                    func: Box::new(e.clone()),
+                                    args: vec![],
+                                },
+                                e.span,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(call) = rewritten {
+                    let call_stmt = Statement::new(StatementKind::Expr(call), stmt.span);
+                    let mut cont = vec![call_stmt];
+                    cont.extend_from_slice(&stmts[i + 1..]);
+                    self.run_process_stmts(pid, &cont);
+                    return;
+                }
+            }
+
             // Stage 1: a call to a free task whose body blocks (top-level
             // `#delay`/`@event`/`wait`) is INLINED — bind the call frame, splice
             // the body + a ScopePop sentinel + the rest into this process's
@@ -16245,6 +16445,18 @@ impl Simulator {
                     return;
                 }
             } else {
+                // §9.7: `process_handle.await()` blocks the calling process
+                // until the target terminates. Must be intercepted here (not
+                // in exec_method_call) because the continuation is needed.
+                if let StatementKind::Expr(expr) = &stmt.kind {
+                    if let Some(target_pid) = self.extract_proc_await_target(expr) {
+                        let cont = stmts[i + 1..].to_vec();
+                        if self.proc_await(target_pid, pid, cont) {
+                            return; // caller suspended — don't execute await
+                        }
+                        // target already terminated — fall through
+                    }
+                }
                 self.exec_statement(stmt);
             }
 
@@ -24461,22 +24673,16 @@ impl Simulator {
                         return if fired { Value::ones(1) } else { Value::zero(1) };
                     }
                 }
-                // LRM process-class state: `<process_handle>.status` returns the
-                // state enum {FINISHED=0, RUNNING=1, WAITING=2, SUSPENDED=3,
-                // KILLED=4}. xezim doesn't model `process` objects, so
-                // `process::self()` yields a null handle. UVM's sequencer
-                // arbitration prunes queued requests whose process_id.status is
-                // in {KILLED,FINISHED}; a null handle would read 0 (==FINISHED)
-                // and spuriously drop a live sequence (SEQREQZMB → lost item /
-                // data=0). A queued requester is by construction alive (blocked
-                // in wait_for_grant), so report RUNNING for a process handle
-                // (any value that is not a live class instance on the heap).
+                // §9.7 `process::status()`: return the state enum. Previously
+                // this was a stub that always returned RUNNING for non-heap
+                // handles. Now delegates to `proc_status` which tracks the
+                // real lifecycle state from the scheduler queues.
                 if member.name == "status" {
-                    let h = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
-                    let is_class_obj = self.heap.get(h).and_then(|o| o.as_ref()).is_some();
-                    if !is_class_obj {
-                        return Value::from_u64(1, 32); // process::RUNNING
+                    let h = self.eval_expr(expr).to_u64().unwrap_or(0);
+                    if let Some(pid) = Self::proc_handle_to_pid(h) {
+                        return Value::from_u64(self.proc_status(pid) as u64, 32);
                     }
+                    // Not a process handle — fall through to property access.
                 }
                 // `ClassName::static_prop` — explicit static property read.
                 if let ExprKind::Ident(hier) = &expr.kind {
@@ -32315,6 +32521,11 @@ impl Simulator {
     }
 
     fn is_pid_suspended(&self, pid: usize) -> bool {
+        // §9.7: a process explicitly suspended via `process::suspend()` is
+        // suspended (and has been removed from all scheduling queues).
+        if self.suspended_pids.contains(&pid) {
+            return true;
+        }
         if self.event_queue.has_pid(pid) {
             return true;
         }
@@ -32353,6 +32564,229 @@ impl Simulator {
             return true;
         }
         false
+    }
+
+    /// §9.7: check if `expr` is a `handle.await()` call on a process handle.
+    /// Handles both parse shapes: `Call{MemberAccess}` and the flattened
+    /// `Call{Ident([handle, await])}`. Returns the target pid if so.
+    fn extract_proc_await_target(&mut self, expr: &Expression) -> Option<usize> {
+        if let ExprKind::Call { func, args } = &expr.kind {
+            if args.is_empty() {
+                // MemberAccess form: `job.await()`
+                if let ExprKind::MemberAccess { expr: receiver, member } = &func.kind {
+                    if member.name.as_str() == "await" {
+                        let h = self.eval_expr(receiver).to_u64().unwrap_or(0);
+                        return Self::proc_handle_to_pid(h);
+                    }
+                }
+                // Flattened Ident form: `job.await` parses as Ident([job, await])
+                if let ExprKind::Ident(hier) = &func.kind {
+                    if hier.path.len() == 2 && hier.path[1].name.name == "await" {
+                        // Clone and truncate to get just the receiver `job`.
+                        let mut recv_hier = hier.clone();
+                        recv_hier.path.pop();
+                        let receiver = Expression::new(
+                            ExprKind::Ident(recv_hier),
+                            func.span,
+                        );
+                        let h = self.eval_expr(&receiver).to_u64().unwrap_or(0);
+                        return Self::proc_handle_to_pid(h);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // §9.7 Fine-grain process control (process class methods)
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Extract a pid from a §9.7 process handle. Returns None if the handle
+    /// is not a process token (i.e. it's a regular heap object or null).
+    fn proc_handle_to_pid(handle_val: u64) -> Option<usize> {
+        if handle_val >= PROCESS_HANDLE_BASE {
+            Some((handle_val - PROCESS_HANDLE_BASE) as usize)
+        } else {
+            None
+        }
+    }
+
+    /// §9.7 `status()`: return the process state enum.
+    ///   FINISHED=0, RUNNING=1, WAITING=2, SUSPENDED=3, KILLED=4
+    fn proc_status(&self, pid: usize) -> u32 {
+        if self.killed_pids.contains(&pid) {
+            return 4; // KILLED
+        }
+        if self.suspended_pids.contains(&pid) {
+            return 3; // SUSPENDED
+        }
+        if pid == self.current_pid {
+            return 1; // RUNNING
+        }
+        if self.is_pid_suspended(pid) {
+            return 2; // WAITING
+        }
+        0 // FINISHED
+    }
+
+    /// §9.7 `kill()`: forcibly terminate the process and all its descendant
+    /// subprocesses. All such processes shall be terminated before kill()
+    /// returns.
+    fn proc_kill(&mut self, pid: usize) {
+        // Collect the process + all descendants.
+        let mut to_kill: HashSet<usize> = HashSet::default();
+        to_kill.insert(pid);
+        to_kill.extend(self.collect_fork_descendants(pid));
+        for &p in &to_kill {
+            self.killed_pids.insert(p);
+            self.suspended_pids.remove(&p);
+            self.suspended_proc_info.remove(&p);
+            self.process_parents.remove(&p);
+            self.process_contexts.remove(&p);
+        }
+        // Purge from every scheduling structure.
+        self.event_queue.remove_pid(pid);
+        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+        self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
+        self.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
+        for q in self.mailbox_get_waiters.values_mut() {
+            q.retain(|w| !to_kill.contains(&w.pid));
+        }
+        for q in self.semaphore_get_waiters.values_mut() {
+            q.retain(|w| !to_kill.contains(&w.pid));
+        }
+        self.release_killed_from_join_waiters(&to_kill);
+        // Wake any process that was awaiting the killed process.
+        self.wake_await_waiters(&to_kill);
+    }
+
+    /// §9.7 `await()`: block the calling process until the target process
+    /// terminates (FINISHED or KILLED). Schedules the caller's continuation
+    /// for later wake-up. Returns true if the caller was suspended (the
+    /// dispatch should then stop executing the caller's current statement
+    /// stream); false if the target is already terminated.
+    fn proc_await(&mut self, target_pid: usize, caller_pid: usize,
+                  continuation: Vec<Statement>) -> bool {
+        let terminated = self.killed_pids.contains(&target_pid)
+            || !self.is_pid_suspended(target_pid) && target_pid != self.current_pid;
+        if terminated {
+            return false; // already done — caller continues
+        }
+        self.await_waiters.push(AwaitWaiter {
+            target_pid,
+            waiter_pid: caller_pid,
+            continuation,
+        });
+        true
+    }
+
+    /// §9.7 `suspend()`: suspend the process, desensitizing it from whatever
+    /// it is blocked on. The process will not run until `resume()`.
+    fn proc_suspend(&mut self, pid: usize) {
+        if self.suspended_pids.contains(&pid) || self.killed_pids.contains(&pid) {
+            return; // already suspended or killed — no effect
+        }
+        // Try to extract the process from wherever it's parked.
+        // 1) Delay (event_queue)
+        if let Some((expiry, stmts)) = self.event_queue.remove_pid(pid) {
+            self.suspended_pids.insert(pid);
+            self.suspended_proc_info.insert(pid, SuspendedProc {
+                continuation: stmts,
+                original_delay_expiry: Some(expiry),
+            });
+            return;
+        }
+        // 2) Event control (event_waiters)
+        if let Some(idx) = self.event_waiters.iter().position(|w| w.pid == pid) {
+            let waiter = self.event_waiters.remove(idx);
+            self.suspended_pids.insert(pid);
+            self.suspended_proc_info.insert(pid, SuspendedProc {
+                continuation: waiter.continuation,
+                original_delay_expiry: None,
+            });
+            return;
+        }
+        // 3) Condition wait (wait(expr))
+        if let Some(idx) = self.condition_waiters.iter().position(|(p, _)| *p == pid) {
+            let (_, stmts) = self.condition_waiters.remove(idx);
+            self.suspended_pids.insert(pid);
+            self.suspended_proc_info.insert(pid, SuspendedProc {
+                continuation: stmts,
+                original_delay_expiry: None,
+            });
+            return;
+        }
+        // 4) Inactive queue (#0)
+        if let Some(idx) = self.inactive_queue.iter().position(|(p, _)| *p == pid) {
+            let (_, stmts) = self.inactive_queue.remove(idx);
+            self.suspended_pids.insert(pid);
+            self.suspended_proc_info.insert(pid, SuspendedProc {
+                continuation: stmts,
+                original_delay_expiry: Some(self.time), // #0 — expired immediately
+            });
+            return;
+        }
+        // 5) Mailbox get / semaphore get
+        for q in self.mailbox_get_waiters.values_mut() {
+            if let Some(idx) = q.iter().position(|w| w.pid == pid) {
+                if let Some(waiter) = q.remove(idx) {
+                    self.suspended_pids.insert(pid);
+                    self.suspended_proc_info.insert(pid, SuspendedProc {
+                        continuation: waiter.cont,
+                        original_delay_expiry: None,
+                    });
+                    return;
+                }
+            }
+        }
+        for q in self.semaphore_get_waiters.values_mut() {
+            if let Some(idx) = q.iter().position(|w| w.pid == pid) {
+                if let Some(waiter) = q.remove(idx) {
+                    self.suspended_pids.insert(pid);
+                    self.suspended_proc_info.insert(pid, SuspendedProc {
+                        continuation: waiter.cont,
+                        original_delay_expiry: None,
+                    });
+                    return;
+                }
+            }
+        }
+        // Process is RUNNING (self) or not found — for self-suspend we'd need
+        // to capture the continuation at the call site. For now this is a no-op
+        // for processes that are actively executing (not blocked).
+    }
+
+    /// §9.7 `resume()`: restart a previously suspended process.
+    fn proc_resume(&mut self, pid: usize) {
+        if let Some(info) = self.suspended_proc_info.remove(&pid) {
+            self.suspended_pids.remove(&pid);
+            // LRM §9.7: if suspended while WAITING on a delay, resensitize.
+            // If the original delay has transpired, continue immediately.
+            let schedule_time = match info.original_delay_expiry {
+                Some(expiry) if expiry <= self.time => self.time,
+                Some(expiry) => expiry,
+                None => self.time, // event/condition: re-evaluate immediately
+            };
+            self.event_queue.schedule(schedule_time, pid, info.continuation);
+        }
+    }
+
+    /// Wake all `await()` waiters whose target process has terminated.
+    fn wake_await_waiters(&mut self, terminated_pids: &HashSet<usize>) {
+        let to_wake: Vec<usize> = self
+            .await_waiters
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| terminated_pids.contains(&w.target_pid))
+            .map(|(i, _)| i)
+            .collect();
+        // Remove in reverse order to keep indices valid.
+        for i in to_wake.into_iter().rev() {
+            let waiter = self.await_waiters.remove(i);
+            self.event_queue
+                .schedule(self.time, waiter.waiter_pid, waiter.continuation);
+        }
     }
 
     /// Collect all active fork descendants of `root` (children, grandchildren,
@@ -32405,6 +32839,11 @@ impl Simulator {
     }
 
     fn child_finished(&mut self, child_pid: usize) {
+        // §9.7: wake any process awaiting this one's termination.
+        let mut terminated = HashSet::default();
+        terminated.insert(child_pid);
+        self.wake_await_waiters(&terminated);
+
         // Reparent any still-running children of the completing process to its
         // own parent, so the fork descendant tree stays connected (a `wait fork`
         // higher up must still see grandchildren whose intermediate parent has
@@ -41600,6 +42039,31 @@ impl Simulator {
                             {
                                 return res;
                             }
+                            // IEEE 1800-2023 §9.7: process-class methods
+                            // (kill/await/suspend/resume/status) on a process
+                            // handle. await() blocking is handled at the
+                            // statement level (needs the continuation); the
+                            // other four are fire-and-forget.
+                            if let Some(pid) = Self::proc_handle_to_pid(handle as u64) {
+                                match method_name.as_str() {
+                                    "status" => {
+                                        return Value::from_u64(self.proc_status(pid) as u64, 32);
+                                    }
+                                    "kill" => {
+                                        self.proc_kill(pid);
+                                        return Value::zero(32);
+                                    }
+                                    "suspend" => {
+                                        self.proc_suspend(pid);
+                                        return Value::zero(32);
+                                    }
+                                    "resume" => {
+                                        self.proc_resume(pid);
+                                        return Value::zero(32);
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                         if handle < self.cg_heap.len() && self.cg_heap[handle].is_some() {
                             return self.exec_cg_method_call(handle, method_name, args);
@@ -43418,6 +43882,46 @@ impl Simulator {
     }
 
     fn exec_method_call(&mut self, handle: usize, method_name: &str, args: &[Expression]) -> Value {
+        // IEEE 1800-2023 §9.7 process class: kill/await/suspend/resume on a
+        // process handle (>= PROCESS_HANDLE_BASE). These are intercepted here,
+        // before any user-class dispatch.
+        if let Some(pid) = Self::proc_handle_to_pid(handle as u64) {
+            match method_name {
+                "status" => {
+                    return Value::from_u64(self.proc_status(pid) as u64, 32);
+                }
+                "kill" => {
+                    self.proc_kill(pid);
+                    return Value::zero(32);
+                }
+                "await" => {
+                    // Block the calling process until `pid` terminates.
+                    // The continuation is the remaining statement stream —
+                    // captured by the CALLER (run_process_stmts) which passes
+                    // an empty args slice; the real continuation is handled
+                    // at the StatementKind::MethodCall dispatch site below.
+                    // For the method-call-via-exec_method_call path (used by
+                    // inline task calls), we mark the suspension here.
+                    //
+                    // NOTE: await() needs the caller's continuation, which
+                    // exec_method_call doesn't have. The actual blocking is
+                    // done at the call site (see the MethodCall dispatch in
+                    // run_process_stmts). If we reach here, it means await()
+                    // was called in a context without continuation capture
+                    // — treat as a no-op (target already terminated).
+                    return Value::zero(32);
+                }
+                "suspend" => {
+                    self.proc_suspend(pid);
+                    return Value::zero(32);
+                }
+                "resume" => {
+                    self.proc_resume(pid);
+                    return Value::zero(32);
+                }
+                _ => {} // fall through to srandom/randstate etc.
+            }
+        }
         // IEEE 1800-2023 §18.13/§18.14 random stability. `srandom(seed)`,
         // `get_randstate()` and `set_randstate(s)` are built-ins of BOTH the
         // §9.7 `process` class (`process::self().srandom(...)` — the token
