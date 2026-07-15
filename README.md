@@ -134,8 +134,6 @@ This repo:
 
 **Simulator** — event-driven VM over a bytecode lowering of cont_assigns and always blocks.
 
-**Native compiler** (`xezim-b`) — AOT-lowers an elaborated design to Rust and links a standalone binary.
-
 ---
 
 # Verified Workloads
