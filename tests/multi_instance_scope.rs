@@ -41,3 +41,75 @@ fn multiply_instantiated_randomize_and_m_are_per_instance() {
     assert!(joined.contains("TB.p0"), "%m did not report TB.p0 scope:\n{}", joined);
     assert!(joined.contains("TB.p1"), "%m did not report TB.p1 scope:\n{}", joined);
 }
+
+/// `%m` inside a *package* function must report the package-qualified
+/// hierarchy (`<pkg>.<func>`), matching real simulators — not the top-module
+/// name. This is what UVM's `uvm_pkg::uvm_instance_scope()` relies on: it
+/// strips `%m` down to the package name (`uvm_pkg`) to scope its factory and
+/// config_db. Before the fix xezim returned the top module name, which left
+/// `uvm_instance_scope` empty and broke the entire genuine-UVM-library path
+/// (`UVM_ERROR [SCPSTR] Illegal name ...`, then a time-0 stall).
+#[test]
+fn percent_m_in_package_function_is_package_qualified() {
+    const SRC: &str = r#"
+package my_pkg;
+  function string where_am_i();
+    string s;
+    $swrite(s, "%m");
+    return s;
+  endfunction
+endpackage
+module top;
+  import my_pkg::*;
+  initial begin
+    $display("PKG_SCOPE=[%s]", where_am_i());
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("PKG_SCOPE=[my_pkg.where_am_i]"),
+        "%m in a package function did not report the package-qualified scope:\n{}",
+        joined
+    );
+}
+
+/// `%m` in a plain module-level function (no package) reports the top-module
+/// hierarchy (`<top-module>.<func>`). Guards the `func_decl_scope`-absent
+/// branch of the `%m` formatter and ensures the module instance path is
+/// unchanged by the package-function fix.
+#[test]
+fn percent_m_in_module_function_is_module_qualified() {
+    const SRC: &str = r#"
+module top;
+  function string where_am_i();
+    string s;
+    $swrite(s, "%m");
+    return s;
+  endfunction
+  initial begin
+    $display("MOD_SCOPE=[%s]", where_am_i());
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("MOD_SCOPE=[top.where_am_i]"),
+        "%m in a module function did not report the top-module-qualified scope:\n{}",
+        joined
+    );
+}
