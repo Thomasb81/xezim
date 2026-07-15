@@ -13625,6 +13625,21 @@ impl Simulator {
         match &expr.kind {
             ExprKind::Ident(hier) => {
                 let name = Self::resolve_hier_name_static(hier, module);
+                // A packed struct/union member (`bar.bar0`) parses as a dotted
+                // hierarchical Ident but has no leaf signal — its value is a bit
+                // slice of the parent. Register the parent (when it is an actual
+                // signal) so a whole-struct write (`bar = ...`) re-fires readers
+                // like `assign foo = bar.bar0`. Without it the dotted name never
+                // receives a change event and the reader stays X.
+                if let Some(dot) = name.rfind('.') {
+                    let parent = &name[..dot];
+                    if !module.signals.contains_key(&name)
+                        && (module.signals.contains_key(parent)
+                            || module.packed_struct_fields.contains_key(parent))
+                    {
+                        reads.insert(parent.to_string());
+                    }
+                }
                 reads.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
@@ -13737,6 +13752,21 @@ impl Simulator {
                             }
                             parts.reverse();
                             reads.insert(parts.join("."));
+                            // A member of a PACKED struct/union has no separate
+                            // leaf signal — the value lives in the parent's bit
+                            // slice. Register the parent when it is an actual
+                            // signal so a write to the whole struct (e.g.
+                            // `word1 = ...`) re-fires this reader
+                            // (`assign foo = word1.high`). Without it the dotted
+                            // name never receives a change event.
+                            if parts.len() >= 2 {
+                                let parent = parts[..parts.len() - 1].join(".");
+                                if module.signals.contains_key(&parent)
+                                    || module.packed_struct_fields.contains_key(&parent)
+                                {
+                                    reads.insert(parent);
+                                }
+                            }
                             flattened = true;
                             break;
                         }
@@ -22287,12 +22317,14 @@ impl Simulator {
                     }
                 }
                 if handle != 0 && handle < self.heap.len() {
-                    if let Some(instance) = &mut self.heap[handle] {
-                        let changed = instance.properties.get(&member.name) != Some(val);
-                        if changed {
-                            instance.properties.insert(member.name.clone(), val.clone());
-                        }
-                        return changed;
+                    if self.heap[handle].is_some() {
+                        // §8.x: a class property assignment truncates/sign-
+                        // extends the rvalue to the property's declared type
+                        // (`byte a; a = 'hfff;` ⇒ 8-bit 0xff, read -1 when
+                        // signed). fit_class_prop clamps the width;
+                        // set_prop_if_changed stamps the declared signedness.
+                        let fitted = self.fit_class_prop(handle, &member.name, val);
+                        return self.set_prop_if_changed(handle, &member.name, fitted);
                     }
                 }
                 false
@@ -38188,6 +38220,14 @@ impl Simulator {
                     return None;
                 }
                 if cd.string_properties.contains(prop) {
+                    return None;
+                }
+                // A property whose type is a TYPE PARAMETER (`class C#(type T);
+                // T value;`) has no fixed width — the concrete bound type may be
+                // `string`, a struct, etc. Truncating to the default-type width
+                // would corrupt a `string` value (dropping leading chars). Leave
+                // such values unclamped.
+                if sig.type_name.as_ref().is_some_and(|t| cd.type_param_names.contains(t)) {
                     return None;
                 }
                 return Some(sig.width).filter(|w| *w > 0);
