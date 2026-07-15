@@ -91,3 +91,34 @@ endmodule
 "#
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Dynamic arrays (§7.5.1): `new[n](arg)` where arg is an assignment pattern
+// (array literal) or a scalar broadcast, and passing a dynamic array as a
+// function argument. Covers sv_darray_args2/2b/3/4.
+// ---------------------------------------------------------------------------
+#[test]
+fn dynamic_array_new_with_pattern_and_scalar_args() {
+    assert!(passes(
+        r#"
+program main;
+  function real sum_array(real array[]);
+    int idx;
+    sum_array = 0.0;
+    for (idx = 0; idx < array.size(); idx = idx+1) sum_array = sum_array + array[idx];
+  endfunction
+  real obj[];
+  real foo;
+  initial begin
+    obj = new[3] ('{4.0, 5.0, 6.0});   // pattern arg
+    foo = sum_array(obj);
+    if (foo != 15.0) begin $display("FAILED pattern %0f", foo); $finish; end
+    obj = new[3] (3.0);                // scalar broadcast
+    foo = sum_array(obj);
+    if (foo != 9.0) begin $display("FAILED scalar %0f", foo); $finish; end
+    $display("PASSED");
+  end
+endprogram
+"#
+    ));
+}
