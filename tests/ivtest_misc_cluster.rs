@@ -169,3 +169,57 @@ endmodule
 "#
     ));
 }
+
+// ---------------------------------------------------------------------------
+// §11.3.5: `&&` short-circuits only on a KNOWN logic 0 — an X/Z left operand
+// must still evaluate the (side-effecting) right operand. Covers
+// logical_short_circuit.
+// ---------------------------------------------------------------------------
+#[test]
+fn logical_and_no_shortcircuit_on_xz() {
+    assert!(passes(
+        r#"
+module t;
+  wire az = 1'bz;
+  integer b;
+  logic [1:0] c;
+  bit failed = 0;
+  initial begin
+    #1;
+    // az is z (not a known 0): `&&` must NOT short-circuit, so b++ runs.
+    b = 0; c = az && b++;
+    if (b !== 1) failed = 1;           // side effect happened
+    if (c !== 2'b00) failed = 1;       // z && 0 == 0
+    // three-operand form: b++ then ++b both evaluated -> b advances by 2.
+    b = 1; c = az && b++ && ++b;
+    if (b !== 3) failed = 1;
+    if (c !== 2'b0x) failed = 1;       // z && 1 && 3 == x
+    if (failed) $display("FAILED b=%0d c=%b", b, c); else $display("PASSED");
+  end
+endmodule
+"#
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// §11.4.7 / §20.5: `<->` (and `->`) in constant expressions, plus
+// `$signed()` sign-extension of a 1-bit result. Covers l_equiv_const.
+// ---------------------------------------------------------------------------
+#[test]
+fn const_logic_equiv_and_signed() {
+    assert!(passes(
+        r#"
+module t;
+  parameter le0 = 1'b0 <-> 1'b0;  // 1
+  parameter le1 = 1'b0 <-> 1'b1;  // 0
+  parameter [1:0] lew  = 4'b0110 <-> 4'b1001;          // 2'b01
+  parameter [1:0] lews = $signed(4'b0110 <-> 4'b1001); // 2'b11
+  initial begin
+    if (le0 === 1'b1 && le1 === 1'b0 && lew === 2'b01 && lews === 2'b11)
+      $display("PASSED");
+    else $display("FAILED le0=%b le1=%b lew=%b lews=%b", le0, le1, lew, lews);
+  end
+endmodule
+"#
+    ));
+}

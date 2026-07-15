@@ -23066,7 +23066,12 @@ impl Simulator {
                     let l = self.eval_expr_ctx(left, ctx_width);
                     match op {
                         BinaryOp::LogAnd => {
-                            if l.to_u64() == Some(0) {
+                            // §11.3.5: `&&` short-circuits only when the left is a
+                            // KNOWN logic 0. An X/Z left is ambiguous — the right
+                            // (with its side effects) must still be evaluated,
+                            // because `x && 1` is x, not 0. `z.to_u64()` yields
+                            // Some(0), so guard on has_xz too.
+                            if !l.has_xz() && l.to_u64() == Some(0) {
                                 return Value::from_u64(0, 1);
                             }
                             let r = self.eval_expr_ctx(right, ctx_width);
