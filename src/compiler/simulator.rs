@@ -44403,17 +44403,40 @@ impl Simulator {
     ///
     /// Only tasks did this; functions bound nothing, so `arr.size()` on an assoc
     /// formal read 0.
+    /// Is this formal an associative array — either via a direct unpacked
+    /// `[key]` dimension (`int aa[int]`) or through an associative typedef
+    /// (`typedef int edges_t[uvm_phase]; … ref edges_t s`), where the dim
+    /// lives on the typedef rather than the port?
+    fn port_is_assoc_array(&self, port: &crate::ast::decl::FunctionPort) -> bool {
+        use crate::ast::types::UnpackedDimension as UD;
+        if port
+            .dimensions
+            .iter()
+            .any(|d| matches!(d, UD::Associative { .. }))
+        {
+            return true;
+        }
+        if let crate::ast::types::DataType::TypeReference { name, .. } = &port.data_type {
+            let tn = &name.name.name;
+            let concrete = self
+                .resolve_type_param_binding(tn)
+                .unwrap_or_else(|| tn.clone());
+            return self
+                .module
+                .typedef_unpacked_dims
+                .get(&concrete)
+                .map(|dims| dims.iter().any(|d| matches!(d, UD::Associative { .. })))
+                .unwrap_or(false);
+        }
+        false
+    }
+
     fn bind_assoc_param(
         &mut self,
         port: &crate::ast::decl::FunctionPort,
         arg: &Expression,
     ) -> Option<(String, String)> {
-        use crate::ast::types::UnpackedDimension as UD;
-        if !port
-            .dimensions
-            .iter()
-            .any(|d| matches!(d, UD::Associative { .. }))
-        {
+        if !self.port_is_assoc_array(port) {
             return None;
         }
         let ExprKind::Ident(hier) = &arg.kind else { return None };
@@ -44457,6 +44480,13 @@ impl Simulator {
     /// Copy a `ref`/`output`/`inout` associative formal back onto the caller's
     /// array, replacing its contents.
     fn writeback_assoc_param(&mut self, param: &str, caller: &str) {
+        // When the formal and the caller's actual share a name, the body's
+        // writes landed directly in the caller's signal namespace (they
+        // alias). There is nothing to copy back, and the clear-then-copy
+        // below would delete the caller's data. (§13.5.2 ref aliasing.)
+        if param == caller {
+            return;
+        }
         let cprefix = format!("{}[", caller);
         let old: Vec<String> = self
             .signals
@@ -44777,6 +44807,12 @@ impl Simulator {
         };
         // Array formals copy element-wise; scalars go through `output_bindings`.
         for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+            if param == caller {
+                // Formal aliases the caller's namespace; the body's writes
+                // already live there. Copying back would duplicate, and
+                // purging would delete the caller's data. Leave as-is.
+                continue;
+            }
             if is_out {
                 self.writeback_assoc_param(&param, &caller);
             }
@@ -51757,15 +51793,33 @@ impl Simulator {
                     let mut output_bindings: Vec<(String, Expression)> = Vec::new();
                     let mut queue_writebacks: Vec<(String, String)> = Vec::new();
                     let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
+                    let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
                     for (i, port) in ports.iter().enumerate() {
+                        let is_assoc = self.port_is_assoc_array(port);
+                        // An associative-array `output`/`inout`/`ref` formal
+                        // is copied back via the assoc-param signal-namespace
+                        // merge, NOT the scalar `output_bindings` path (which
+                        // can't represent an AA). §13.5.2.
                         if matches!(
                             port.direction,
                             PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-                        ) && i < args.len()
+                        ) && i < args.len() && !is_assoc
                         {
                             output_bindings.push((port.name.name.clone(), args[i].clone()));
                         }
                         if i < args.len() {
+                            if let Some((param, caller)) =
+                                self.bind_assoc_param(port, &args[i])
+                            {
+                                let is_out = matches!(
+                                    port.direction,
+                                    PortDirection::Output
+                                        | PortDirection::Inout
+                                        | PortDirection::Ref
+                                );
+                                assoc_params.push((param, caller, is_out));
+                                continue;
+                            }
                             // §6.18/§6.20.3: typedef'd / type-param-bound
                             // formal — dims live on the type (see the same
                             // resolution in exec_function_call).
@@ -52045,6 +52099,18 @@ impl Simulator {
                     }
                     for (v, caller) in writebacks {
                         self.assign_value(&caller, &v);
+                    }
+                    // §13.5.2: copy `output`/`inout`/`ref` associative-array
+                    // formals back onto the caller's AA (signal-namespace
+                    // merge), then drop the formal's temporary copy.
+                    for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+                        if param == caller {
+                            continue;
+                        }
+                        if is_out {
+                            self.writeback_assoc_param(&param, &caller);
+                        }
+                        self.purge_assoc_param(&param);
                     }
                     return ret;
                 }
