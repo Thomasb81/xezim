@@ -22566,6 +22566,16 @@ impl Simulator {
                             }
                         }
                     }
+                    // Class VALUE parameter of a specialized class, referenced
+                    // bare inside a STATIC method (no instance → not in
+                    // `properties`). Resolve from the active specialization
+                    // BEFORE the static-property fallback, which would return
+                    // the declared default instead (e.g.
+                    // `uvm_object_registry#(T,"base_class")::get_type_name()`
+                    // must return the string param `Tname`, not `<unknown>`).
+                    if let Some(v) = self.resolve_value_param_from_spec(name) {
+                        return v;
+                    }
                     // Static class property referenced bare inside a method.
                     if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
                         if let Some(v) = self.class_static_get(&ctx, name) {
@@ -45760,6 +45770,193 @@ impl Simulator {
     fn resolve_type_param_binding(&self, tn: &str) -> Option<String> {
         let spec = self.current_spec.clone();
         self.resolve_type_param_with(tn, &spec)
+    }
+
+    /// Resolve a class VALUE parameter `name` from the active specialization
+    /// (`current_spec`). This is the value-param counterpart of
+    /// [`resolve_type_param_with`] (which handles TYPE params): a static
+    /// method such as `uvm_object_registry#(T,"base_class")::get_type_name()`
+    /// references the string value parameter `Tname`, but no instance is
+    /// constructed for a static call, so the binding only exists in the
+    /// specialization's argument list. Without this, the bare identifier fell
+    /// through to the class default value (e.g. `<unknown>`) instead of the
+    /// specialized value (`base_class`), so the factory's type-name lookup and
+    /// `is_type_registered` always failed.
+    ///
+    /// Returns None when no specialization is active or `name` is not a value
+    /// parameter (type parameters are handled by `resolve_type_param_with`).
+    fn resolve_value_param_from_spec(&mut self, name: &str) -> Option<Value> {
+        let (base, sig) = self.current_spec.clone()?;
+        let cd = self.module.classes.get(&base)?.clone();
+        // Type parameters are resolved elsewhere — don't shadow them.
+        if cd.type_param_names.iter().any(|t| t == name) {
+            return None;
+        }
+        // Match `param_order` exactly like `class_param_arg_map` (with the
+        // same legacy fallback for older caches lacking `param_order`).
+        let legacy_order: Vec<String>;
+        let order: &[String] = if cd.param_order.is_empty()
+            && !(cd.param_defaults.is_empty() && cd.type_param_names.is_empty())
+        {
+            legacy_order = cd
+                .param_defaults
+                .iter()
+                .map(|(n, _)| n.clone())
+                .chain(cd.type_param_names.iter().cloned())
+                .collect();
+            &legacy_order
+        } else {
+            &cd.param_order
+        };
+        let idx = order.iter().position(|p| p == name)?;
+        // Split the specialization's raw arg text on TOP-LEVEL commas (a naive
+        // split would break on commas inside a string literal or a nested
+        // call), then evaluate the fragment at `name`'s position.
+        let frags = Self::split_spec_args(&sig);
+        let frag = frags.get(idx)?;
+        self.eval_spec_arg_fragment(frag)
+    }
+
+    /// Split a specialization argument-list text on top-level commas,
+    /// respecting string literals, parentheses, brackets and braces so that
+    /// `#("a,b", f(1,2))` yields two fragments, not four.
+    fn split_spec_args(sig: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut depth: i32 = 0;
+        let mut in_str = false;
+        let mut prev = '\0';
+        for ch in sig.chars() {
+            match (in_str, ch) {
+                (false, '"') => {
+                    in_str = true;
+                    cur.push(ch);
+                }
+                (true, '"') if prev != '\\' => {
+                    in_str = false;
+                    cur.push(ch);
+                }
+                (true, _) => {
+                    cur.push(ch);
+                }
+                (false, '(' | '[' | '{') => {
+                    depth += 1;
+                    cur.push(ch);
+                }
+                (false, ')' | ']' | '}') => {
+                    depth -= 1;
+                    cur.push(ch);
+                }
+                (false, ',') if depth == 0 => {
+                    out.push(std::mem::take(&mut cur));
+                }
+                (false, _) => {
+                    cur.push(ch);
+                }
+            }
+            prev = ch;
+        }
+        if !cur.trim().is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// Evaluate a single specialization argument fragment to a `Value`.
+    /// Handles the shapes that appear in value-parameter positions: string
+    /// literals (UVM's factory type names like `"base_class"`), numeric
+    /// literals, and bare name references (enum members / parameters), the
+    /// last by constructing an identifier expression and deferring to the
+    /// normal evaluator.
+    fn eval_spec_arg_fragment(&mut self, frag: &str) -> Option<Value> {
+        let t = frag.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let bytes = t.as_bytes();
+        // String literal "..."
+        if bytes[0] == b'"' && bytes.len() >= 2 && bytes[bytes.len() - 1] == b'"' {
+            let inner = std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()?;
+            let w = (inner.len() * 8).max(8) as u32;
+            let mut val = Value::zero(w);
+            for (i, byte) in inner.bytes().rev().enumerate() {
+                for bit in 0..8 {
+                    if (byte >> bit) & 1 == 1 && i * 8 + bit < val.width as usize {
+                        val.set_bit(i * 8 + bit, LogicBit::One);
+                    }
+                }
+            }
+            return Some(val);
+        }
+        // Numeric literal (plain decimal or sized `'h/'d/'b/'o). Build a
+        // `NumberLiteral` from the text and evaluate via `eval_number`.
+        if let Some(nl) = Self::parse_spec_number(t) {
+            return Some(self.eval_number(&nl));
+        }
+        // Bare name reference — delegate to the normal identifier evaluator
+        // (resolves enum members, parameters, static constants).
+        let expr = Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: t.to_string(),
+                        span: crate::ast::Span::dummy(),
+                    },
+                    selects: Vec::new(),
+                }],
+                span: crate::ast::Span::dummy(),
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            crate::ast::Span::dummy(),
+        );
+        Some(self.eval_expr(&expr))
+    }
+
+    /// Parse a specialization-argument fragment into a `NumberLiteral` for the
+    /// shapes that appear in value-parameter positions: plain decimal
+    /// integers (`42`, `-5`) and optionally-sized based literals
+    /// (`'h10`, `8'd3`, `16'hFF`). Returns None for anything else.
+    fn parse_spec_number(t: &str) -> Option<NumberLiteral> {
+        let s = t.trim();
+        // Optionally-sized based literal: `[size]'<base><digits>`.
+        if let Some(pos) = s.find('\'') {
+            let size_part = &s[..pos];
+            let rest = &s[pos + 1..];
+            let (base, val_str) = match rest.chars().next() {
+                Some('b') => (NumberBase::Binary, &rest[1..]),
+                Some('d') => (NumberBase::Decimal, &rest[1..]),
+                Some('h') => (NumberBase::Hex, &rest[1..]),
+                Some('o') => (NumberBase::Octal, &rest[1..]),
+                _ => return None,
+            };
+            let size = if size_part.is_empty() {
+                None
+            } else {
+                size_part.parse::<u32>().ok()
+            };
+            return Some(NumberLiteral::Integer {
+                size,
+                signed: false,
+                base,
+                value: val_str.trim().to_string(),
+                cached_val: std::cell::Cell::new(None),
+            });
+        }
+        // Plain decimal integer (optional leading sign).
+        let neg = s.starts_with('-');
+        let body = s.trim_start_matches(['+', '-']);
+        if !body.is_empty() && body.bytes().all(|c| c.is_ascii_digit()) {
+            return Some(NumberLiteral::Integer {
+                size: None,
+                signed: neg,
+                base: NumberBase::Decimal,
+                value: body.to_string(),
+                cached_val: std::cell::Cell::new(None),
+            });
+        }
+        None
     }
 
     /// Resolve a type-parameter name `tn` to its concrete type, using (in order)
