@@ -22653,20 +22653,37 @@ impl Simulator {
                     }
                     field_path.reverse();
                     let mut indices: Vec<u64> = Vec::new();
-                    let root_ident = loop {
+                    let root_name: Option<String> = loop {
                         match &cur_expr.kind {
                             ExprKind::Index { expr: b, index } => {
                                 indices.push(self.eval_expr(index).to_u64().unwrap_or(0));
                                 cur_expr = b.as_ref();
                             }
-                            ExprKind::Ident(h) => break Some(h),
+                            ExprKind::Ident(h) => break Some(self.resolve_hier_name(h)),
+                            // §7.4.2: root may itself be a struct-member path
+                            // (`main.sub_list[0].f`) — build the dotted name so
+                            // the `packed_struct_fields["main.sub_list"]` layout
+                            // registered at elaboration resolves it.
+                            ExprKind::MemberAccess { .. } => {
+                                let mut segs: Vec<String> = Vec::new();
+                                let mut c = cur_expr;
+                                while let ExprKind::MemberAccess { expr: b, member: m } = &c.kind {
+                                    segs.push(m.name.clone());
+                                    c = b.as_ref();
+                                }
+                                if let ExprKind::Ident(h) = &c.kind {
+                                    segs.push(self.resolve_hier_name(h));
+                                    segs.reverse();
+                                    break Some(segs.join("."));
+                                }
+                                break None;
+                            }
                             _ => break None,
                         }
                     };
-                    if let Some(bhier) = root_ident {
+                    if let Some(arr_name) = root_name {
                         if !indices.is_empty() {
                             indices.reverse();
-                            let arr_name = self.resolve_hier_name(bhier);
                             if let Some(fields) = self
                                 .module
                                 .packed_struct_fields
@@ -25962,20 +25979,35 @@ impl Simulator {
                     }
                     field_path.reverse();
                     let mut indices: Vec<u64> = Vec::new();
-                    let root_ident = loop {
+                    let root_name: Option<String> = loop {
                         match &cur_expr.kind {
                             ExprKind::Index { expr: b, index } => {
                                 indices.push(self.eval_expr(index).to_u64().unwrap_or(0));
                                 cur_expr = b.as_ref();
                             }
-                            ExprKind::Ident(h) => break Some(h),
+                            ExprKind::Ident(h) => break Some(self.resolve_hier_name(h)),
+                            // §7.4.2: root may itself be a struct-member path
+                            // (`main.sub_list[0].f`) — mirror of assign_value.
+                            ExprKind::MemberAccess { .. } => {
+                                let mut segs: Vec<String> = Vec::new();
+                                let mut c = cur_expr;
+                                while let ExprKind::MemberAccess { expr: b, member: m } = &c.kind {
+                                    segs.push(m.name.clone());
+                                    c = b.as_ref();
+                                }
+                                if let ExprKind::Ident(h) = &c.kind {
+                                    segs.push(self.resolve_hier_name(h));
+                                    segs.reverse();
+                                    break Some(segs.join("."));
+                                }
+                                break None;
+                            }
                             _ => break None,
                         }
                     };
-                    if let Some(bhier) = root_ident {
+                    if let Some(arr_name) = root_name {
                         if !indices.is_empty() {
                             indices.reverse();
-                            let arr_name = self.resolve_hier_name(bhier);
                             if let Some(fields) = self
                                 .module
                                 .packed_struct_fields
