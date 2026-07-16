@@ -2075,6 +2075,22 @@ pub struct Simulator {
     /// (matching real simulators) rather than the top-module name. Pushed in
     /// `exec_function_call` / `exec_task_call` around the body and popped after.
     func_call_stack: Vec<String>,
+    /// IEEE 1800-2017 §6.21 / §13.3.1: `static` variables declared inside a
+    /// (possibly automatic) subroutine keep ONE persistent storage across all
+    /// runtime calls, and their declaration initializer runs only once. Keyed
+    /// `"<subroutine>::<var>"`. Only scalar integral/real statics are tracked;
+    /// arrays/queues fall back to per-call storage.
+    static_local_vars: HashMap<String, Value>,
+    /// True while evaluating elaboration-time constant (local)parameter
+    /// initializers that call user functions. Each such constant-function call
+    /// is independent (§13.4.3), so `static` locals must NOT share the runtime
+    /// persistent store during this window.
+    in_const_param_eval: bool,
+    /// Per-subroutine-call stack of `(local_name, persistent_key)` recording
+    /// which locals in the current call are `static` so their final values are
+    /// written back to `static_local_vars` on return. The `String` head is the
+    /// subroutine name (used to build the persistent key).
+    static_local_syncs: Vec<(String, Vec<(String, String)>)>,
     /// Return value from last function call.
     return_value: Option<Value>,
     /// Default random number generator — the stream used by any object or
@@ -3882,6 +3898,9 @@ impl Simulator {
             pending_ret_collection: None,
             current_scope: String::new(),
             func_call_stack: Vec::new(),
+            static_local_vars: HashMap::default(),
+            static_local_syncs: Vec::new(),
+            in_const_param_eval: false,
             return_value: None,
             rng: SvRng::from_seed(SvRng::DEFAULT_SEED),
             proc_rng: HashMap::default(),
@@ -6932,12 +6951,14 @@ impl Simulator {
         // Evaluate parameter expressions whose initializers contained function
         // calls and were deferred by the elaborator.
         let deferred: Vec<(String, Expression)> = self.module.deferred_param_exprs.clone();
+        self.in_const_param_eval = true;
         for (pname, expr) in deferred {
             let v = self.eval_expr(&expr);
             let w = self.lookup_signal_width(&pname).unwrap_or(v.width);
             let rv = v.resize(w);
             self.set_signal_value_by_name(&pname, rv);
         }
+        self.in_const_param_eval = false;
         self.classify_always_blocks();
         // JIT-redesign Stage 1: allocate `signal_inline_bits` BEFORE
         // `compile_edge_blocks` so the JIT module gets a non-empty
@@ -29957,6 +29978,52 @@ impl Simulator {
                         }
                     }
                 }
+                // §6.21 / §13.3.1: a `static` local declared inside a subroutine
+                // keeps ONE persistent storage across all runtime calls, and its
+                // initializer runs only once. On the FIRST call we persist the
+                // just-initialized value; on later calls we restore the persisted
+                // value (undoing this call's re-initialization). The final value
+                // is written back on return by `sync_static_locals`. Only scalar
+                // integral/real statics are tracked — arrays/queues keep per-call
+                // storage.
+                if matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+                    && !self.static_local_syncs.is_empty()
+                    && !self.in_const_param_eval
+                {
+                    let sub_name = self
+                        .static_local_syncs
+                        .last()
+                        .map(|(n, _)| n.clone())
+                        .unwrap_or_default();
+                    for d in declarators {
+                        let nm = &d.name.name;
+                        // Skip aggregates: arrays/queues/assoc are not persisted.
+                        if !d.dimensions.is_empty()
+                            || self.module.arrays.contains_key(nm)
+                            || self.module.dynamic_arrays.contains(nm)
+                            || self.module.associative_arrays.contains_key(nm)
+                        {
+                            continue;
+                        }
+                        let key = format!("{}::{}", sub_name, nm);
+                        if let Some(pv) = self.static_local_vars.get(&key).cloned() {
+                            if let Some(l) = self.local_stack.last_mut() {
+                                l.insert(nm.clone(), pv);
+                            }
+                        } else {
+                            let cur = self
+                                .local_stack
+                                .last()
+                                .and_then(|l| l.get(nm))
+                                .cloned()
+                                .unwrap_or_else(|| Value::zero(w));
+                            self.static_local_vars.insert(key.clone(), cur);
+                        }
+                        if let Some((_n, syncs)) = self.static_local_syncs.last_mut() {
+                            syncs.push((nm.clone(), key));
+                        }
+                    }
+                }
             }
             StatementKind::EventTrigger { name, .. } => {
                 let raw = name.name.clone();
@@ -44602,6 +44669,19 @@ impl Simulator {
         Some(out)
     }
 
+    /// §6.21: on subroutine return, copy each `static` local's final value from
+    /// the (about-to-be-popped) local frame back into the persistent store, then
+    /// close this call's sync frame. Called before `local_stack` is popped.
+    fn sync_static_locals(&mut self) {
+        if let Some((_name, syncs)) = self.static_local_syncs.pop() {
+            for (local_name, key) in syncs {
+                if let Some(v) = self.local_stack.last().and_then(|l| l.get(&local_name)) {
+                    self.static_local_vars.insert(key, v.clone());
+                }
+            }
+        }
+    }
+
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
         let normalized = Self::normalize_call_args(&fd.ports, args);
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
@@ -44790,6 +44870,9 @@ impl Simulator {
         // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
         // body; recursion keeps the stack ordered.
         self.func_call_stack.push(fd.name.name.name.clone());
+        // §6.21: open a static-local sync frame keyed by this subroutine name.
+        self.static_local_syncs
+            .push((fd.name.name.name.clone(), Vec::new()));
         // Execute function body
         for stmt in &fd.items {
             self.exec_statement(stmt);
@@ -44797,6 +44880,7 @@ impl Simulator {
                 break;
             }
         }
+        self.sync_static_locals();
         self.func_call_stack.pop();
         self.this_stack.pop();
         self.class_context_stack.pop();
@@ -44889,6 +44973,7 @@ impl Simulator {
         self.ref_binding_stack.pop();
         self.local_iface_aliases.pop();
         self.continue_flag = c.saved_continue;
+        self.sync_static_locals();
         let locals = self.local_stack.pop().unwrap_or_default();
         for (port_name, caller_expr) in &c.output_bindings {
             if let Some(val) = locals.get(port_name) {
@@ -45056,6 +45141,9 @@ impl Simulator {
             }
         }
         self.local_stack.push(locals);
+        // §6.21: open a static-local sync frame keyed by this task name.
+        self.static_local_syncs
+            .push((td.name.name.name.clone(), Vec::new()));
         // LRM §25.9: virtual-interface formals. When a formal's
         // declared data type names a known interface, register an
         // alias from the formal name to the caller's actual ident.
