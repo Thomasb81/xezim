@@ -32035,8 +32035,109 @@ impl Simulator {
                 // String methods (substr/getc-as-string-rare). Keep narrow.
                 false
             }
+            // A method/function call whose return type is `string`
+            // (e.g. `obj.sprint()`, `this.convert2string()`). Without
+            // this, `$fwrite(fd, obj.sprint())` treats the result as an
+            // integer and dumps a garbage decimal number instead of the
+            // formatted text — which is why UVM's `print()` (which does
+            // exactly that) produced hundreds of garbage digits.
+            ExprKind::Call { func, .. } => {
+                self.call_returns_string(func)
+            }
             _ => false,
         }
+    }
+
+    /// Determine whether a call's `func` expression resolves to a method
+    /// whose declared return type is `string`. Handles bare method names
+    /// (`sprint(x)` inside a class body), `this.method()`, `obj.method()`,
+    /// and `Class::method()`. Walks the inheritance chain so a method
+    /// inherited from a base class is recognised.
+    fn call_returns_string(&self, func: &Expression) -> bool {
+        use crate::ast::decl::ClassMethodKind;
+        use crate::ast::types::{DataType, SimpleType};
+        // Extract (class_name, method_name).
+        let (class_name, method_name): (Option<String>, Option<String>) =
+            match &func.kind {
+                ExprKind::MemberAccess { expr: recv, member } => {
+                    // Runtime resolution first (reads the actual class_name
+                    // from the heap handle — reliable for class-typed
+                    // procedural locals). Fall back to static analysis
+                    // when the handle isn't available (e.g. a null check
+                    // before construction, or a `super.method()` call).
+                    let cn = self.runtime_recv_class(recv)
+                        .or_else(|| self.get_expr_type_name(recv))
+                        .or_else(|| self.class_context_stack.last().cloned().flatten());
+                    (cn, Some(member.name.clone()))
+                }
+                ExprKind::Ident(h) if h.path.len() == 1 => {
+                    let cn = self.class_context_stack.last().cloned().flatten();
+                    (cn, Some(h.path[0].name.name.clone()))
+                }
+                ExprKind::Ident(h) if h.path.len() >= 2 => {
+                    // `obj.method(args)` parsed as a flat hierarchical
+                    // path [obj, method]. Resolve `obj` as a runtime
+                    // handle first (reliable for class-typed locals),
+                    // then static type, then assume it's a class name
+                    // for `ClassName::method()` calls.
+                    let first = &h.path[0].name.name;
+                    let cn = self.runtime_recv_class(&Expression {
+                        kind: ExprKind::Ident(h.clone()),
+                        span: h.span,
+                    })
+                    .or_else(|| self.var_class_types.get(first).cloned())
+                    .or_else(|| Some(first.clone()));
+                    let mn = h.path.last().unwrap().name.name.clone();
+                    (cn, Some(mn))
+                }
+                _ => (None, None),
+            };
+        let (cn, mn) = match (class_name, method_name) {
+            (Some(c), Some(m)) => (c, m),
+            _ => return false,
+        };
+        // Walk the class hierarchy looking for the method's return type.
+        let mut cur = Some(cn);
+        while let Some(cname) = cur {
+            if let Some(cd) = self.module.classes.get(&cname) {
+                if let Some(cm) = cd.methods.get(&mn) {
+                    if let ClassMethodKind::Function(fd)
+                        | ClassMethodKind::Extern(fd)
+                        | ClassMethodKind::PureVirtual(fd) = &cm.kind
+                    {
+                        return matches!(
+                            &fd.return_type,
+                            DataType::Simple { kind: SimpleType::String, .. }
+                        );
+                    }
+                    // Task → never returns a string.
+                    return false;
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Best-effort: resolve a receiver expression to its runtime class name
+    /// by reading the handle from `local_stack`/`this_stack` and looking up
+    /// the `ClassInstance.class_name` in the heap. Used by
+    /// `call_returns_string` when static type analysis fails.
+    fn runtime_recv_class(&self, recv: &Expression) -> Option<String> {
+        let name = match &recv.kind {
+            ExprKind::Ident(h) if !h.path.is_empty() => &h.path[0].name.name,
+            _ => return None,
+        };
+        // Get the heap index: from the local frame, or from `this_stack`.
+        let handle: usize = if name == "this" {
+            self.this_stack.last().copied().flatten()?
+        } else {
+            let v = self.local_stack.last().and_then(|m| m.get(name))?;
+            v.to_u64()? as usize
+        };
+        self.heap.get(handle).and_then(|o| o.as_ref()).map(|inst| inst.class_name.clone())
     }
 
     fn format_string(&mut self, fmt: &str, args: &[Expression], tn: &str) -> String {
@@ -37630,6 +37731,26 @@ impl Simulator {
         self.get_signal_value_by_name(name)
     }
 
+    /// Like `get_local_or_signal`, but also resolves **static class
+    /// properties** when `name` refers to one in the current class context.
+    /// Built-in string/array methods (`.len()`, `.substr()`, `.getc()`, …)
+    /// fetch their receiver by name via `eval_builtin_method`, and a static
+    /// property lives in `class_statics` — not in the local frame or the
+    /// signal table — so a bare `m_space.substr(...)` inside a class method
+    /// would otherwise read an empty string and silently produce wrong
+    /// output (e.g. UVM's table printer emitting columns with no padding).
+    fn get_local_signal_or_static(&mut self, name: &str) -> Option<Value> {
+        if let Some(v) = self.get_local_or_signal(name) {
+            return Some(v);
+        }
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            if let Some(v) = self.class_static_get(&ctx, name) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
     /// Set a loop index/iteration variable. Writes to the current call frame's
     /// locals (highest read precedence) when one exists, so a `foreach`/`for`
     /// index properly SHADOWS any same-named outer local or class member —
@@ -42966,7 +43087,7 @@ impl Simulator {
             // Fallback for strings (value may be a frame-local/parameter).
             // Counts the content bytes — including embedded/trailing NULs,
             // which §21.2.1.4 unformatted dumps legitimately contain.
-            let base_val = self.get_local_or_signal(obj_name);
+            let base_val = self.get_local_signal_or_static(obj_name);
 
             if let Some(base) = base_val {
                 return Some(Value::from_u64(base.sv_string_bytes().len() as u64, 32));
@@ -42983,7 +43104,7 @@ impl Simulator {
                 let idx = self.eval_expr(idx_arg).to_u64().unwrap_or(0) as usize;
                 // Byte indexing, not UTF-8: a char above 0x7F is one SV byte.
                 let b = self
-                    .get_local_or_signal(obj_name)
+                    .get_local_signal_or_static(obj_name)
                     .map(|v| v.sv_string_bytes())
                     .unwrap_or_default()
                     .get(idx)
@@ -42999,7 +43120,7 @@ impl Simulator {
                     let start = self.eval_expr(first).to_u64().unwrap_or(0) as usize;
                     let end = self.eval_expr(second).to_u64().unwrap_or(0) as usize;
 
-                    let base_val = self.get_local_or_signal(obj_name);
+                    let base_val = self.get_local_signal_or_static(obj_name);
 
                     if let Some(base) = base_val {
                         let mut highest_bit = 0;
@@ -43046,7 +43167,7 @@ impl Simulator {
                 | "last"
         ) {
             if let Some(h) = self
-                .get_local_or_signal(obj_name)
+                .get_local_signal_or_static(obj_name)
                 .and_then(|v| v.to_u64())
                 .filter(|&h| h != 0)
             {
@@ -44747,6 +44868,35 @@ impl Simulator {
         let real_uvm = self.uses_real_uvm();
         if let ExprKind::MemberAccess { expr, member } = &func.kind {
             let mname = member.name.as_str();
+
+            // Package-qualified static method call: `pkg::Class::method(args)`
+            // parses as MemberAccess { MemberAccess { Ident(pkg), Class }, method }.
+            // Without this, the inner MemberAccess evaluates `pkg` as a local/signal
+            // (fails), and the outer call never dispatches — e.g.
+            // `uvm_pkg::uvm_report_message::new_report_message()` returned null,
+            // which is why UVM macros using the fully-qualified form silently
+            // produced null objects.
+            if let ExprKind::MemberAccess { expr: inner, member: class_id } = &expr.kind {
+                if let ExprKind::Ident(inner_hier) = &inner.kind {
+                    if inner_hier.path.len() == 1 {
+                        let pkg = &inner_hier.path[0].name.name;
+                        let cls = class_id.name.clone();
+                        if !self.local_stack.last().map_or(false, |m| m.contains_key(pkg.as_str()))
+                            && !self.signal_name_to_id.contains_key(pkg.as_str())
+                            && self.module.classes.contains_key(&cls)
+                        {
+                            if let Some(res) = self.exec_static_method(&cls, mname, args) {
+                                return res;
+                            }
+                            if mname == "new" {
+                                if let Some(cd) = self.module.classes.get(&cls).cloned() {
+                                    return self.instantiate_class(&cd, args);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // IEEE 1800-2017 §8.15: `super.m(...)` binds STATICALLY to the
             // method visible in the parent of the class LEXICALLY containing
@@ -46473,6 +46623,35 @@ impl Simulator {
                             || self.semaphores.contains_key(&handle))
                     {
                         return self.exec_method_call(handle, method_name, args);
+                    }
+                }
+                // Package-qualified static method call:
+                // `pkg::Class::method(args)` flattens to a 3-segment
+                // Ident. If path[0] is NOT a local/signal (it's a package
+                // or scope name) and path[1] IS a known class, dispatch as
+                // a 2-segment `Class::method` static call. Without this,
+                // `uvm_pkg::uvm_report_message::new_report_message()` falls
+                // through to the heap-walk handler, which tries to look up
+                // "uvm_pkg" as a local handle, gets 0, and returns null —
+                // which is why UVM macros that use the fully-qualified form
+                // silently produced null objects (e.g. the 10print test's
+                // msg was never populated).
+                if hier.path.len() >= 3 {
+                    let pkg = hier.path[0].name.name.as_str();
+                    let cls = &hier.path[1].name.name;
+                    if !self.local_stack.last().map_or(false, |m| m.contains_key(pkg))
+                        && !self.signal_name_to_id.contains_key(pkg)
+                        && self.module.classes.contains_key(cls)
+                    {
+                        let mname3 = hier.path.last().unwrap().name.name.clone();
+                        if let Some(res) = self.exec_static_method(cls, &mname3, args) {
+                            return res;
+                        }
+                        if mname3 == "new" {
+                            if let Some(cd) = self.module.classes.get(cls).cloned() {
+                                return self.instantiate_class(&cd, args);
+                            }
+                        }
                     }
                 }
                 // IEEE 1800-2023 §8.15/§13.5.5: a method reached through a
