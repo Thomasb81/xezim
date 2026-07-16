@@ -223,3 +223,27 @@ endmodule
 "#
     ));
 }
+
+// ---------------------------------------------------------------------------
+// §20.9: `$countbits` matches X/Z control values written as sized literals
+// (`1'bx`, `1'bz`). Covers sf_countbits.
+// ---------------------------------------------------------------------------
+#[test]
+fn countbits_matches_xz_controls() {
+    assert!(passes(
+        r#"
+module t;
+  integer r;
+  initial begin
+    r = $countbits(4'b01zx, 1'bz, 1'bx);   // one z + one x
+    if (r != 2) begin $display("FAILED zx got %0d", r); $finish; end
+    r = $countbits(4'b01zx, 1'b0, 1'b1);   // one 0 + one 1
+    if (r != 2) begin $display("FAILED 01 got %0d", r); $finish; end
+    r = $countbits(2'bxx, 1'bx);
+    if (r != 2) begin $display("FAILED xx got %0d", r); $finish; end
+    $display("PASSED");
+  end
+endmodule
+"#
+    ));
+}

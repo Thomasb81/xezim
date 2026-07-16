@@ -25132,12 +25132,12 @@ impl Simulator {
                                     _ => super::value::LogicBit::One,
                                 });
                             } else {
-                                let bv = self.eval_expr(arg).to_u64().unwrap_or(1);
-                                targets.push(if bv == 0 {
-                                    super::value::LogicBit::Zero
-                                } else {
-                                    super::value::LogicBit::One
-                                });
+                                // §20.9: a control value like `1'bx`/`1'bz`/`1'b0`
+                                // parses as a sized based literal (not
+                                // UnbasedUnsized), so read the actual LSB LogicBit
+                                // to preserve X/Z rather than collapsing via to_u64.
+                                let cv = self.eval_expr(arg);
+                                targets.push(cv.get_bit(0));
                             }
                         }
                         let mut count = 0u64;
