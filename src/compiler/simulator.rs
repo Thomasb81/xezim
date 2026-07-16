@@ -562,6 +562,28 @@ struct JoinWaiter {
 
 /// Fast-path NBA entry: compact (signal_id, value) pair for pre-resolved targets.
 /// 99%+ of NBA entries use this path. Smaller struct = better cache utilization.
+
+/// IEEE 1800-2023 §9.7: info stored when a process is explicitly suspended
+/// via `process::suspend()`. The process is removed from whatever queue it
+/// was parked in; `resume()` uses this to re-schedule it.
+#[derive(Clone)]
+struct SuspendedProc {
+    /// Continuation statements to run when the process resumes.
+    continuation: Vec<Statement>,
+    /// Original scheduled expiry time if suspended while blocked on a `#delay`.
+    /// `None` if blocked on an event/condition/join/mailbox. On resume, if the
+    /// original delay has transpired (original_time <= self.time), the process
+    /// continues immediately (LRM §9.7).
+    original_delay_expiry: Option<u64>,
+}
+
+/// §9.7 `process::await()`: a process blocked waiting for another's termination.
+struct AwaitWaiter {
+    target_pid: usize,
+    waiter_pid: usize,
+    continuation: Vec<Statement>,
+}
+
 struct NbaFast {
     signal_id: usize,
     value: Value,
@@ -1244,6 +1266,69 @@ impl TimingWheel {
             }
         }
         None
+    }
+
+    /// §9.7: remove ALL events for `pid` from both the wheel and overflow.
+    /// Returns the earliest (scheduled_time, continuation) if found.
+    /// Used by `process::suspend()` and `process::kill()` to desensitize a
+    /// process from its delay.
+    fn remove_pid(&mut self, pid: usize) -> Option<(u64, Vec<Statement>)> {
+        if !self.pid_counts.contains_key(&pid) {
+            return None;
+        }
+        let mut found: Option<(u64, Vec<Statement>)> = None;
+        let cur_slot = Self::slot(self.current_time);
+
+        // 1) Scan the timing wheel: extract matching entries, keep the rest.
+        for s in 0..WHEEL_SIZE {
+            let v = std::mem::take(&mut self.wheel[s]);
+            if v.is_empty() {
+                continue;
+            }
+            let delta = ((s + WHEEL_SIZE - cur_slot) % WHEEL_SIZE) as u64;
+            let abs_time = self.current_time + delta;
+            let mut kept = Vec::new();
+            for (p, stmts) in v {
+                if p == pid {
+                    // Capture the earliest match.
+                    if found.is_none() || abs_time < found.as_ref().unwrap().0 {
+                        found = Some((abs_time, stmts));
+                    }
+                } else {
+                    kept.push((p, stmts));
+                }
+            }
+            if kept.is_empty() {
+                self.bitmap_clear(s);
+            } else {
+                self.wheel[s] = kept;
+            }
+        }
+
+        // 2) Scan overflow (BTreeMap is time-sorted, so first match is earliest).
+        if found.is_none() {
+            let times: Vec<u64> = self.overflow.keys().copied().collect();
+            for t in times {
+                if let Some(v) = self.overflow.get_mut(&t) {
+                    if let Some(idx) = v.iter().position(|(p, _)| *p == pid) {
+                        let stmts = v.remove(idx).1;
+                        found = Some((t, stmts));
+                        if v.is_empty() {
+                            self.overflow.remove(&t);
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Also clean overflow of any remaining entries for this pid.
+            for (_, v) in self.overflow.iter_mut() {
+                v.retain(|(p, _)| *p != pid);
+            }
+            self.overflow.retain(|_, v| !v.is_empty());
+        }
+        self.pid_counts.remove(&pid);
+        found
     }
 }
 
@@ -2295,6 +2380,13 @@ pub struct Simulator {
     warned_assoc_index: HashSet<String>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
+    /// §9.7 `process` class: PIDs explicitly suspended via `suspend()`. The
+    /// continuation + original delay info is in `suspended_proc_info`.
+    suspended_pids: HashSet<usize>,
+    /// §9.7: detailed resumption info for each suspended pid.
+    suspended_proc_info: HashMap<usize, SuspendedProc>,
+    /// §9.7 `process::await()`: processes waiting for another's termination.
+    await_waiters: Vec<AwaitWaiter>,
     /// Names of init-declared (automatic) `for`-loop variables that — because
     /// the enclosing process had no local frame — currently live in the signal
     /// table. A `fork` child must capture these BY VALUE at fork time so the
@@ -2352,6 +2444,19 @@ pub struct Simulator {
     /// fork time as a baseline; propagate merges only the keys whose value the
     /// child CHANGED relative to this baseline.
     fork_baselines: HashMap<usize, Vec<HashMap<String, Value>>>,
+    /// IEEE 1800-2023 §6.21/§9.3.2: automatic variables declared in a
+    /// procedural block (`initial`/`always`) with NO enclosing call frame live
+    /// in the global `self.signals` map (not a `local_stack` frame). At fork
+    /// time `inherit_fork_child_context` copies them (via `auto_loop_vars`)
+    /// INTO the child's `local_stack` frame so each child gets its own
+    /// snapshot. That creates a storage MISMATCH: the child's writes land in
+    /// its private frame, while the parent reads from `self.signals`. The
+    /// `local_stack` merge alone cannot bridge this — the parent has no frame
+    /// for these vars. This map records, per child, the bare names that were
+    /// captured FROM `self.signals`, so the propagate path can write the
+    /// child's changed values back INTO `self.signals` (true shared storage,
+    /// per §6.21's enclosing-scope rule).
+    fork_signal_captures: HashMap<usize, Vec<String>>,
     /// Processes blocked in `semaphore.get()` on an under-full semaphore.
     semaphore_get_waiters: HashMap<usize, std::collections::VecDeque<SemGetWaiter>>,
     /// IEEE 1800-2017 §9.4.5 intra-assignment delay (`lhs = #d rhs`): RHS
@@ -3988,6 +4093,9 @@ impl Simulator {
             fork_block_children: HashMap::default(),
             warned_assoc_index: HashSet::default(),
             killed_pids: HashSet::default(),
+            suspended_pids: HashSet::default(),
+            suspended_proc_info: HashMap::default(),
+            await_waiters: Vec::new(),
             auto_loop_vars: Vec::new(),
             ref_binding_stack: Vec::new(),
             task_cleanup: Vec::new(),
@@ -3997,6 +4105,7 @@ impl Simulator {
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
             fork_baselines: HashMap::default(),
+            fork_signal_captures: HashMap::default(),
             semaphore_get_waiters: HashMap::default(),
             intra_saved: HashMap::default(),
             intra_saved_next: 0,
@@ -16022,11 +16131,22 @@ impl Simulator {
     /// (LRM §9.3.2). Used when spawning fork children.
     fn inherit_fork_child_context(&mut self, pid: usize) {
         let mut ctx = self.snapshot_process_context();
+        // §6.21/§9.3.2: automatic block-locals (no call frame) live in
+        // `self.signals` and are listed in `auto_loop_vars`. Copy their
+        // current VALUES into the child's `local_stack` so each child gets
+        // its own snapshot (the child's reads consult its top frame first).
+        // Record WHICH names were captured from `signals` so the propagate
+        // path can write the child's changed values back into `self.signals`
+        // — the storage the parent actually reads from. Without this
+        // write-back, the child's writes are stranded in its private frame
+        // and the parent sees the stale pre-fork value (§6.21 violation).
+        let mut signal_caps: Vec<String> = Vec::new();
         if !self.auto_loop_vars.is_empty() {
             let mut caps: HashMap<String, Value> = HashMap::default();
             for nm in &self.auto_loop_vars {
                 if let Some(v) = self.signals.get(nm) {
                     caps.insert(nm.clone(), v.clone());
+                    signal_caps.push(nm.clone());
                 }
             }
             if !caps.is_empty() {
@@ -16059,6 +16179,7 @@ impl Simulator {
             // (which the parent may have modified in the meantime — e.g. a
             // mailbox-get delivery into `phase` while this child runs).
             self.fork_baselines.insert(pid, ctx.local_stack.clone());
+            self.fork_signal_captures.insert(pid, signal_caps);
             self.process_contexts.insert(pid, ctx);
         }
     }
@@ -16200,7 +16321,8 @@ impl Simulator {
         let has_pid_ctx = self.process_contexts.contains_key(&pid);
         if !saved_ctx_needed && !has_pid_ctx {
             self.run_process_stmts(pid, stmts);
-            if self.is_pid_suspended(pid) {
+            let susp = self.is_pid_suspended(pid);
+            if susp {
                 // Only snapshot if actually suspended and has state worth saving.
                 if !self.this_stack.is_empty()
                     || !self.local_stack.is_empty()
@@ -16214,7 +16336,7 @@ impl Simulator {
             *self.name_resolve_hint.borrow_mut() = saved_hint;
             return;
         }
-        let saved = self.snapshot_process_context();
+        let mut saved = self.snapshot_process_context();
         let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
         self.restore_process_context(ctx);
         self.run_process_stmts(pid, stmts);
@@ -16224,82 +16346,103 @@ impl Simulator {
         } else {
             self.process_contexts.remove(&pid);
         }
-        // IEEE 1800-2023 §9.3.2: automatic variables declared in the parent
-        // scope are SHARED with fork children — a child's write must be
-        // visible to the parent (and to siblings after the parent resumes).
-        // xezim gives each fork child a COPY of the parent's locals (see
-        // inherit_fork_child_context), so propagate the child's local frames
-        // back into the parent's saved context. Without this, UVM 2020's
-        // m_safe_select_item idiom (`fork … select_process = process::self();
-        // … join_none; wait(select_process != null)`) deadlocks: the parent
-        // never sees the child's assignment and the `wait` parks forever.
-        // 2017's sequencer has no such fork-and-wait idiom, which is why it
-        // completes. We merge every frame the child shares with the parent
-        // (child may have pushed extra frames via nested calls — those are
-        // skipped), exactly mirroring shared-automatic semantics.
-        self.propagate_fork_locals_to_parent(pid);
+        // IEEE 1800-2023 §6.21/§9.3.2: automatic variables declared in the
+        // parent scope are SHARED with fork children — a child's write must be
+        // visible to the parent. xezim gives each fork child a COPY of the
+        // parent's locals (inherit_fork_child_context), so the child's writes
+        // live in its private copy and must be propagated back. Two storage
+        // models must be bridged:
+        //   (a) SUBROUTINE locals — live in a `local_stack` frame; merged into
+        //       the parent's frame (in `process_contexts` if suspended, or in
+        //       `saved` if the parent is the currently-active process whose
+        //       context is on THIS Rust stack — e.g. the child ran inside the
+        //       parent's own `#delay` via `run_events_until`).
+        //   (b) PROCEDURAL block-locals (`initial`/`always`, no call frame) —
+        //       live in the global `self.signals`; `inherit_fork_child_context`
+        //       copied them into the child's frame and recorded the names in
+        //       `fork_signal_captures`. Write the child's changed values back
+        //       into `self.signals`, which is what the parent reads from.
+        let child_frames: Vec<HashMap<String, Value>> = self.local_stack.clone();
+        let baseline = self.fork_baselines.get(&pid).cloned();
+        let signal_caps = self.fork_signal_captures.get(&pid).cloned();
+        if !child_frames.is_empty() {
+            if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
+                // (a) subroutine-frame merge
+                if let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) {
+                    Self::merge_fork_writes(
+                        &mut parent_ctx.local_stack,
+                        &child_frames,
+                        baseline.as_ref(),
+                    );
+                } else {
+                    // Parent is the active process — its context is `saved`.
+                    Self::merge_fork_writes(
+                        &mut saved.local_stack,
+                        &child_frames,
+                        baseline.as_ref(),
+                    );
+                }
+            }
+        }
+        // (b) signal-capture write-back: procedural block-locals that live in
+        // `self.signals`. Write only keys the child CHANGED (relative to the
+        // fork-time baseline) so an inherited-unchanged value doesn't
+        // clobber a sibling's or the parent's concurrent write.
+        if let Some(caps) = &signal_caps {
+            let top = child_frames.last();
+            for nm in caps {
+                let Some(v) = top.and_then(|f| f.get(nm)) else {
+                    continue;
+                };
+                let inherited_unchanged = baseline
+                    .as_ref()
+                    .and_then(|b| b.last())
+                    .and_then(|f| f.get(nm))
+                    .is_some_and(|old| old == v);
+                if !inherited_unchanged {
+                    self.signals.insert(nm.clone(), v.clone());
+                }
+            }
+        }
+        if !self.is_pid_suspended(pid) {
+            self.fork_baselines.remove(&pid);
+            self.fork_signal_captures.remove(&pid);
+        }
         self.restore_process_context(saved);
         self.auto_loop_vars.truncate(saved_auto_len);
         *self.name_resolve_hint.borrow_mut() = saved_hint;
     }
 
-    /// Merge a (just-run) fork child's local frames into its parent process's
-    /// saved context so the parent observes the child's writes to shared
-    /// automatic variables (IEEE 1800-2023 §9.3.2). See the call site in
-    /// `run_scheduled_process` for the full rationale. Only frames that exist
-    /// in BOTH the child and parent stacks are merged (the child may hold
-    //  extra frames from nested subroutine calls; the parent may hold extra
-    //  frames pushed after the fork).
-    fn propagate_fork_locals_to_parent(&mut self, child_pid: usize) {
-        let parent_pid = match self.process_parents.get(&child_pid).copied() {
-            Some(p) => p,
-            None => return,
-        };
-        // §9.3.2 baseline: only the keys the child WROTE (its value now differs
-        // from the fork-time snapshot) are propagated — a key it merely
-        // inherited unchanged must NOT clobber a value the parent modified
-        // after the fork (e.g. a mailbox-get delivery into `phase` while this
-        // child ran, as in UVM `m_run_phases`). If no baseline survived (child
-        // that never had saved context, or an older run), fall back to the
-        // legacy whole-frame merge so the §9.3.2 write-visibility guarantee
-        // (e.g. m_safe_select_item's `select_process = process::self()`)
-        // still holds.
-        let baseline = self.fork_baselines.get(&child_pid).cloned();
-        // `self.local_stack` currently holds the CHILD's frames (captured
-        // before we restore the event-loop caller's context below).
-        let child_frames: Vec<HashMap<String, Value>> = self.local_stack.clone();
-        if child_frames.is_empty() {
-            return;
-        }
-        let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) else {
-            return;
-        };
-        let n = parent_ctx.local_stack.len().min(child_frames.len());
+    /// Merge a fork child's local-frame writes into a parent's `local_stack`.
+    ///
+    /// §9.3.2 baseline: only the keys the child WROTE (its value now differs
+    /// from the fork-time snapshot) are propagated — a key it merely
+    /// inherited unchanged must NOT clobber a value the parent modified
+    /// after the fork (e.g. a mailbox-get delivery into `phase` while this
+    /// child ran). If no baseline survived, fall back to the legacy
+    /// whole-frame merge so the §9.3.2 write-visibility guarantee still
+    /// holds. Only keys that exist in the parent's frame are propagated (a
+    /// key the child declared itself, like a loop-local, is child-private).
+    fn merge_fork_writes(
+        parent_frames: &mut [HashMap<String, Value>],
+        child_frames: &[HashMap<String, Value>],
+        baseline: Option<&Vec<HashMap<String, Value>>>,
+    ) {
+        let n = parent_frames.len().min(child_frames.len());
         for i in 0..n {
             for (k, v) in &child_frames[i] {
-                // Only propagate keys that exist in the parent's frame (a key
-                // the child declared itself, like a loop-local `succ`, is
-                // child-private and of no interest to the parent).
-                if !parent_ctx.local_stack[i].contains_key(k) {
+                if !parent_frames[i].contains_key(k) {
                     continue;
                 }
                 let inherited_unchanged = baseline
-                    .as_ref()
                     .and_then(|b| b.get(i))
                     .and_then(|f| f.get(k))
                     .is_some_and(|old| old == v);
                 if inherited_unchanged {
                     continue;
                 }
-                parent_ctx.local_stack[i].insert(k.clone(), v.clone());
+                parent_frames[i].insert(k.clone(), v.clone());
             }
-        }
-        // Drop the baseline once the child is done (no longer suspended) so the
-        // map doesn't grow unboundedly across a forever-fork loop (UVM
-        // `m_run_phases`). A child that merely parked (e.g. on a `#5`) keeps
-        // its baseline for the next propagate.
-        if !self.is_pid_suspended(child_pid) {
-            self.fork_baselines.remove(&child_pid);
         }
     }
 
@@ -16477,6 +16620,111 @@ impl Simulator {
             if self.pure_sv_lrm {
                 if let Some(wait_stmts) = self.bridge_objection_wait_for(stmt) {
                     let mut cont = wait_stmts;
+                    cont.extend_from_slice(&stmts[i + 1..]);
+                    self.run_process_stmts(pid, &cont);
+                    return;
+                }
+            }
+
+            // Stage 0: normalize a parenless task/method call (LRM §13.5
+            // footnote 42 + §13.5.5: parentheses may be omitted for tasks, void
+            // functions, and class methods). A call written without
+            // parentheses — `t;`, `c.m;`, `m_run_phases;`, `run_test;` — parses
+            // as a bare `Expr(Ident([name]))` or `Expr(MemberAccess{...})`, NOT
+            // as `Expr(Call { func, args: [] })`. Every Stage 1/1b/1c inlining
+            // guard below matches on `Call`, so without this rewrite a blocking
+            // task called without parentheses bypasses inlining and falls
+            // through to the synchronous `exec_statement`, which cannot honour
+            // the body's `#delay`/`wait`/`fork` and silently drops it — the
+            // caller never blocks (e.g. `task t; #10; endtask; ... t;` returns
+            // at t=0 instead of t=10). Rewrite the parenless subroutine
+            // reference into the equivalent zero-argument `Call` and
+            // re-dispatch, so the existing guards fire uniformly. Only rewrite
+            // when the callee resolves to a free task (`module.tasks`) or a
+            // method (on the current `this` or on an object handle); a plain
+            // variable reference `x;` is left to the normal expression path.
+            // Non-blocking tasks: the rewritten Call still won't satisfy
+            // `stmts_have_blocking`, so it falls through to `exec_statement`
+            // unchanged — `t()` / `c.m()` with explicit parens already worked.
+            //
+            // Recognized parenless forms (LRM §13.5 `tf_call`/`method_call`):
+            //   `t;`                    -> Ident([t])
+            //   `m;`  (this-method)     -> Ident([m])
+            //   `c.m;`                  -> MemberAccess{expr:Ident([c]), member:m}
+            //   `c.m;` (flattened)      -> Ident([c, m])
+            if let StatementKind::Expr(e) = &stmt.kind {
+                let rewritten: Option<Expression> = match &e.kind {
+                    // Bare name: free task or method on current `this`.
+                    ExprKind::Ident(h) if h.path.len() == 1 => {
+                        let nm = h.path[0].name.name.clone();
+                        let is_free_task = self.module.tasks.contains_key(&nm);
+                        let is_this_method = self
+                            .this_stack
+                            .last()
+                            .copied()
+                            .flatten()
+                            .and_then(|hh| {
+                                self.heap
+                                    .get(hh)
+                                    .and_then(|o| o.as_ref())
+                                    .map(|inst| inst.class_name.clone())
+                            })
+                            .map_or(false, |cls| self.class_has_method(&cls, &nm));
+                        if is_free_task || is_this_method {
+                            Some(Expression::new(
+                                ExprKind::Call {
+                                    func: Box::new(e.clone()),
+                                    args: vec![],
+                                },
+                                e.span,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    // `obj.method;` via member-access dot syntax.
+                    ExprKind::MemberAccess { expr: recv, member } => {
+                        let recv_ok = self
+                            .eval_handle_expr(recv)
+                            .and_then(|hh| self.heap.get(hh).and_then(|o| o.as_ref()).map(|inst| inst.class_name.clone()))
+                            .map_or(false, |cls| self.class_has_method(&cls, &member.name));
+                        if recv_ok {
+                            Some(Expression::new(
+                                ExprKind::Call {
+                                    func: Box::new(e.clone()),
+                                    args: vec![],
+                                },
+                                e.span,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    // `obj.method;` via flattened 2-segment ident.
+                    ExprKind::Ident(h) if h.path.len() == 2 => {
+                        let vn = h.path[0].name.name.clone();
+                        let mn = h.path[1].name.name.clone();
+                        let recv_ok = self
+                            .eval_ident_handle(&vn)
+                            .and_then(|hh| self.heap.get(hh).and_then(|o| o.as_ref()).map(|inst| inst.class_name.clone()))
+                            .map_or(false, |cls| self.class_has_method(&cls, &mn));
+                        if recv_ok {
+                            Some(Expression::new(
+                                ExprKind::Call {
+                                    func: Box::new(e.clone()),
+                                    args: vec![],
+                                },
+                                e.span,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(call) = rewritten {
+                    let call_stmt = Statement::new(StatementKind::Expr(call), stmt.span);
+                    let mut cont = vec![call_stmt];
                     cont.extend_from_slice(&stmts[i + 1..]);
                     self.run_process_stmts(pid, &cont);
                     return;
@@ -16908,37 +17156,22 @@ impl Simulator {
                     i += 1;
                     continue;
                 } else {
-                    let sig_names = self.extract_signal_names(condition);
-                    // Only suspend on a signal EDGE for names that are real
-                    // edge-trackable signals (in the compact signal table).
-                    // A `wait(...)` over class members / procedural locals (the
-                    // UVM arbitration's wait(lock_arb_size != m_lock_arb_size),
-                    // wait(m_arb_size != m_lock_arb_size), ...) extracts names
-                    // that look like signals but never fire an edge, so it would
-                    // park in event_waiters forever — route it to the
-                    // condition-waiter fixpoint instead.
-                    let sens: Vec<Sensitivity> = sig_names
-                        .into_iter()
-                        .filter(|name| self.signal_name_to_id.contains_key(name.as_str()))
-                        .map(|name| Sensitivity {
-                            signal_name: name,
-                            edge: EdgeKind::AnyEdge,
-                            iff: None,
-                        })
-                        .collect();
-                    if !sens.is_empty() {
-                        let mut cont = vec![stmt.clone()];
-                        cont.extend_from_slice(&stmts[i + 1..]);
-                        self.event_waiters
-                            .push(self.make_event_waiter(pid, sens, cont));
-                        return;
-                    }
-                    // No signal sensitivities: the condition depends on class
-                    // members / locals another same-time process mutates (the
-                    // UVM sequencer arbitration). Park as a condition-waiter and
-                    // suspend; the fixpoint in run_one_tick re-checks it after
-                    // the batch drains. (Previously this fell through as if the
-                    // wait were satisfied, which spun m_select_sequence forever.)
+                    // IEEE 1800-2023 §9.7.4: `wait(cond)` is LEVEL-
+                    // sensitive — the process resumes the moment the
+                    // condition is true, including in the SAME timestep via a
+                    // delta-cycle (#0) write from another process. The
+                    // condition-waiter fixpoint in run_one_tick re-evaluates
+                    // the actual expression every tick, so it handles same-
+                    // timestep (delta), cross-timestep (#delay), and time-0
+                    // init uniformly. Routing a signal-naming wait through the
+                    // edge-triggered event_waiter path instead BREAKS delta-
+                    // cycle wakeup: its `registered_time == self.time` guard
+                    // (correct for edge-sensitive `@()`) skips any same-
+                    // timestep edge, so `wait(sig==v)` never resumes when a
+                    // peer process writes `sig` at the same simtime. The UVM
+                    // phase hopper (`fork ... join_none; wait(all_dropped)`)
+                    // and sequencer arbitration depend on exactly this delta-
+                    // cycle handoff. Always park in condition_waiters.
                     let mut cont = vec![stmt.clone()];
                     cont.extend_from_slice(&stmts[i + 1..]);
                     self.condition_waiters.push((pid, cont));
@@ -17231,6 +17464,18 @@ impl Simulator {
                     return;
                 }
             } else {
+                // §9.7: `process_handle.await()` blocks the calling process
+                // until the target terminates. Must be intercepted here (not
+                // in exec_method_call) because the continuation is needed.
+                if let StatementKind::Expr(expr) = &stmt.kind {
+                    if let Some(target_pid) = self.extract_proc_await_target(expr) {
+                        let cont = stmts[i + 1..].to_vec();
+                        if self.proc_await(target_pid, pid, cont) {
+                            return; // caller suspended — don't execute await
+                        }
+                        // target already terminated — fall through
+                    }
+                }
                 self.exec_statement(stmt);
             }
 
@@ -23018,6 +23263,16 @@ impl Simulator {
                             }
                         }
                     }
+                    // Class VALUE parameter of a specialized class, referenced
+                    // bare inside a STATIC method (no instance → not in
+                    // `properties`). Resolve from the active specialization
+                    // BEFORE the static-property fallback, which would return
+                    // the declared default instead (e.g.
+                    // `uvm_object_registry#(T,"base_class")::get_type_name()`
+                    // must return the string param `Tname`, not `<unknown>`).
+                    if let Some(v) = self.resolve_value_param_from_spec(name) {
+                        return v;
+                    }
                     // Static class property referenced bare inside a method.
                     if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
                         if let Some(v) = self.class_static_get(&ctx, name) {
@@ -25869,22 +26124,16 @@ impl Simulator {
                         return if fired { Value::ones(1) } else { Value::zero(1) };
                     }
                 }
-                // LRM process-class state: `<process_handle>.status` returns the
-                // state enum {FINISHED=0, RUNNING=1, WAITING=2, SUSPENDED=3,
-                // KILLED=4}. xezim doesn't model `process` objects, so
-                // `process::self()` yields a null handle. UVM's sequencer
-                // arbitration prunes queued requests whose process_id.status is
-                // in {KILLED,FINISHED}; a null handle would read 0 (==FINISHED)
-                // and spuriously drop a live sequence (SEQREQZMB → lost item /
-                // data=0). A queued requester is by construction alive (blocked
-                // in wait_for_grant), so report RUNNING for a process handle
-                // (any value that is not a live class instance on the heap).
+                // §9.7 `process::status()`: return the state enum. Previously
+                // this was a stub that always returned RUNNING for non-heap
+                // handles. Now delegates to `proc_status` which tracks the
+                // real lifecycle state from the scheduler queues.
                 if member.name == "status" {
-                    let h = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
-                    let is_class_obj = self.heap.get(h).and_then(|o| o.as_ref()).is_some();
-                    if !is_class_obj {
-                        return Value::from_u64(1, 32); // process::RUNNING
+                    let h = self.eval_expr(expr).to_u64().unwrap_or(0);
+                    if let Some(pid) = Self::proc_handle_to_pid(h) {
+                        return Value::from_u64(self.proc_status(pid) as u64, 32);
                     }
+                    // Not a process handle — fall through to property access.
                 }
                 // `ClassName::static_prop` — explicit static property read.
                 if let ExprKind::Ident(hier) = &expr.kind {
@@ -34929,6 +35178,11 @@ impl Simulator {
     }
 
     fn is_pid_suspended(&self, pid: usize) -> bool {
+        // §9.7: a process explicitly suspended via `process::suspend()` is
+        // suspended (and has been removed from all scheduling queues).
+        if self.suspended_pids.contains(&pid) {
+            return true;
+        }
         if self.event_queue.has_pid(pid) {
             return true;
         }
@@ -34967,6 +35221,229 @@ impl Simulator {
             return true;
         }
         false
+    }
+
+    /// §9.7: check if `expr` is a `handle.await()` call on a process handle.
+    /// Handles both parse shapes: `Call{MemberAccess}` and the flattened
+    /// `Call{Ident([handle, await])}`. Returns the target pid if so.
+    fn extract_proc_await_target(&mut self, expr: &Expression) -> Option<usize> {
+        if let ExprKind::Call { func, args } = &expr.kind {
+            if args.is_empty() {
+                // MemberAccess form: `job.await()`
+                if let ExprKind::MemberAccess { expr: receiver, member } = &func.kind {
+                    if member.name.as_str() == "await" {
+                        let h = self.eval_expr(receiver).to_u64().unwrap_or(0);
+                        return Self::proc_handle_to_pid(h);
+                    }
+                }
+                // Flattened Ident form: `job.await` parses as Ident([job, await])
+                if let ExprKind::Ident(hier) = &func.kind {
+                    if hier.path.len() == 2 && hier.path[1].name.name == "await" {
+                        // Clone and truncate to get just the receiver `job`.
+                        let mut recv_hier = hier.clone();
+                        recv_hier.path.pop();
+                        let receiver = Expression::new(
+                            ExprKind::Ident(recv_hier),
+                            func.span,
+                        );
+                        let h = self.eval_expr(&receiver).to_u64().unwrap_or(0);
+                        return Self::proc_handle_to_pid(h);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // §9.7 Fine-grain process control (process class methods)
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Extract a pid from a §9.7 process handle. Returns None if the handle
+    /// is not a process token (i.e. it's a regular heap object or null).
+    fn proc_handle_to_pid(handle_val: u64) -> Option<usize> {
+        if handle_val >= PROCESS_HANDLE_BASE {
+            Some((handle_val - PROCESS_HANDLE_BASE) as usize)
+        } else {
+            None
+        }
+    }
+
+    /// §9.7 `status()`: return the process state enum.
+    ///   FINISHED=0, RUNNING=1, WAITING=2, SUSPENDED=3, KILLED=4
+    fn proc_status(&self, pid: usize) -> u32 {
+        if self.killed_pids.contains(&pid) {
+            return 4; // KILLED
+        }
+        if self.suspended_pids.contains(&pid) {
+            return 3; // SUSPENDED
+        }
+        if pid == self.current_pid {
+            return 1; // RUNNING
+        }
+        if self.is_pid_suspended(pid) {
+            return 2; // WAITING
+        }
+        0 // FINISHED
+    }
+
+    /// §9.7 `kill()`: forcibly terminate the process and all its descendant
+    /// subprocesses. All such processes shall be terminated before kill()
+    /// returns.
+    fn proc_kill(&mut self, pid: usize) {
+        // Collect the process + all descendants.
+        let mut to_kill: HashSet<usize> = HashSet::default();
+        to_kill.insert(pid);
+        to_kill.extend(self.collect_fork_descendants(pid));
+        for &p in &to_kill {
+            self.killed_pids.insert(p);
+            self.suspended_pids.remove(&p);
+            self.suspended_proc_info.remove(&p);
+            self.process_parents.remove(&p);
+            self.process_contexts.remove(&p);
+        }
+        // Purge from every scheduling structure.
+        self.event_queue.remove_pid(pid);
+        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+        self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
+        self.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
+        for q in self.mailbox_get_waiters.values_mut() {
+            q.retain(|w| !to_kill.contains(&w.pid));
+        }
+        for q in self.semaphore_get_waiters.values_mut() {
+            q.retain(|w| !to_kill.contains(&w.pid));
+        }
+        self.release_killed_from_join_waiters(&to_kill);
+        // Wake any process that was awaiting the killed process.
+        self.wake_await_waiters(&to_kill);
+    }
+
+    /// §9.7 `await()`: block the calling process until the target process
+    /// terminates (FINISHED or KILLED). Schedules the caller's continuation
+    /// for later wake-up. Returns true if the caller was suspended (the
+    /// dispatch should then stop executing the caller's current statement
+    /// stream); false if the target is already terminated.
+    fn proc_await(&mut self, target_pid: usize, caller_pid: usize,
+                  continuation: Vec<Statement>) -> bool {
+        let terminated = self.killed_pids.contains(&target_pid)
+            || !self.is_pid_suspended(target_pid) && target_pid != self.current_pid;
+        if terminated {
+            return false; // already done — caller continues
+        }
+        self.await_waiters.push(AwaitWaiter {
+            target_pid,
+            waiter_pid: caller_pid,
+            continuation,
+        });
+        true
+    }
+
+    /// §9.7 `suspend()`: suspend the process, desensitizing it from whatever
+    /// it is blocked on. The process will not run until `resume()`.
+    fn proc_suspend(&mut self, pid: usize) {
+        if self.suspended_pids.contains(&pid) || self.killed_pids.contains(&pid) {
+            return; // already suspended or killed — no effect
+        }
+        // Try to extract the process from wherever it's parked.
+        // 1) Delay (event_queue)
+        if let Some((expiry, stmts)) = self.event_queue.remove_pid(pid) {
+            self.suspended_pids.insert(pid);
+            self.suspended_proc_info.insert(pid, SuspendedProc {
+                continuation: stmts,
+                original_delay_expiry: Some(expiry),
+            });
+            return;
+        }
+        // 2) Event control (event_waiters)
+        if let Some(idx) = self.event_waiters.iter().position(|w| w.pid == pid) {
+            let waiter = self.event_waiters.remove(idx);
+            self.suspended_pids.insert(pid);
+            self.suspended_proc_info.insert(pid, SuspendedProc {
+                continuation: waiter.continuation,
+                original_delay_expiry: None,
+            });
+            return;
+        }
+        // 3) Condition wait (wait(expr))
+        if let Some(idx) = self.condition_waiters.iter().position(|(p, _)| *p == pid) {
+            let (_, stmts) = self.condition_waiters.remove(idx);
+            self.suspended_pids.insert(pid);
+            self.suspended_proc_info.insert(pid, SuspendedProc {
+                continuation: stmts,
+                original_delay_expiry: None,
+            });
+            return;
+        }
+        // 4) Inactive queue (#0)
+        if let Some(idx) = self.inactive_queue.iter().position(|(p, _)| *p == pid) {
+            let (_, stmts) = self.inactive_queue.remove(idx);
+            self.suspended_pids.insert(pid);
+            self.suspended_proc_info.insert(pid, SuspendedProc {
+                continuation: stmts,
+                original_delay_expiry: Some(self.time), // #0 — expired immediately
+            });
+            return;
+        }
+        // 5) Mailbox get / semaphore get
+        for q in self.mailbox_get_waiters.values_mut() {
+            if let Some(idx) = q.iter().position(|w| w.pid == pid) {
+                if let Some(waiter) = q.remove(idx) {
+                    self.suspended_pids.insert(pid);
+                    self.suspended_proc_info.insert(pid, SuspendedProc {
+                        continuation: waiter.cont,
+                        original_delay_expiry: None,
+                    });
+                    return;
+                }
+            }
+        }
+        for q in self.semaphore_get_waiters.values_mut() {
+            if let Some(idx) = q.iter().position(|w| w.pid == pid) {
+                if let Some(waiter) = q.remove(idx) {
+                    self.suspended_pids.insert(pid);
+                    self.suspended_proc_info.insert(pid, SuspendedProc {
+                        continuation: waiter.cont,
+                        original_delay_expiry: None,
+                    });
+                    return;
+                }
+            }
+        }
+        // Process is RUNNING (self) or not found — for self-suspend we'd need
+        // to capture the continuation at the call site. For now this is a no-op
+        // for processes that are actively executing (not blocked).
+    }
+
+    /// §9.7 `resume()`: restart a previously suspended process.
+    fn proc_resume(&mut self, pid: usize) {
+        if let Some(info) = self.suspended_proc_info.remove(&pid) {
+            self.suspended_pids.remove(&pid);
+            // LRM §9.7: if suspended while WAITING on a delay, resensitize.
+            // If the original delay has transpired, continue immediately.
+            let schedule_time = match info.original_delay_expiry {
+                Some(expiry) if expiry <= self.time => self.time,
+                Some(expiry) => expiry,
+                None => self.time, // event/condition: re-evaluate immediately
+            };
+            self.event_queue.schedule(schedule_time, pid, info.continuation);
+        }
+    }
+
+    /// Wake all `await()` waiters whose target process has terminated.
+    fn wake_await_waiters(&mut self, terminated_pids: &HashSet<usize>) {
+        let to_wake: Vec<usize> = self
+            .await_waiters
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| terminated_pids.contains(&w.target_pid))
+            .map(|(i, _)| i)
+            .collect();
+        // Remove in reverse order to keep indices valid.
+        for i in to_wake.into_iter().rev() {
+            let waiter = self.await_waiters.remove(i);
+            self.event_queue
+                .schedule(self.time, waiter.waiter_pid, waiter.continuation);
+        }
     }
 
     /// Collect all active fork descendants of `root` (children, grandchildren,
@@ -35019,6 +35496,11 @@ impl Simulator {
     }
 
     fn child_finished(&mut self, child_pid: usize) {
+        // §9.7: wake any process awaiting this one's termination.
+        let mut terminated = HashSet::default();
+        terminated.insert(child_pid);
+        self.wake_await_waiters(&terminated);
+
         // Reparent any still-running children of the completing process to its
         // own parent, so the fork descendant tree stays connected (a `wait fork`
         // higher up must still see grandchildren whose intermediate parent has
@@ -45351,6 +45833,45 @@ impl Simulator {
                         return self.exec_method_call(handle, method_name, args);
                     }
                 }
+                // IEEE 1800-2023 §8.15/§13.5.5: a method reached through a
+                // flattened multi-segment path — `o.in.getval()` parses as
+                // Ident([o, in, getval]). The receiver is the FULL prefix
+                // `path[0..len-1]`, NOT `path[0]`: each intermediate segment
+                // is a class-handle property that must be dereferenced to
+                // reach the object that actually OWNS the method. Without
+                // this, the fallthrough below resolved only `path[0]` (the
+                // OUTER object), bound `this` to it, and looked the method up
+                // there — so `o.in.getval()` ran getval on `o` (Outer has no
+                // getval) and silently returned 0; `o.in.setval(x)` wrote
+                // nothing. Walk the prefix through the heap to the real owner
+                // and dispatch on it. Path[0] may be a local, a signal, or
+                // `this`; intermediate segments are heap-object properties.
+                // (The mailbox/array-builtin/rand_mode special cases above
+                // already `return` for their own >=3-segment shapes, so this
+                // only catches ordinary user methods on nested objects.)
+                if hier.path.len() >= 3 {
+                    let head = hier.path[0].name.name.as_str();
+                    let mut handle = if head == "this" {
+                        self.this_stack.last().copied().flatten().unwrap_or(0)
+                    } else {
+                        self.eval_ident_handle(head).unwrap_or(0)
+                    };
+                    for seg in &hier.path[1..hier.path.len() - 1] {
+                        if handle == 0 {
+                            break;
+                        }
+                        handle = self
+                            .heap
+                            .get(handle)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|i| i.properties.get(&seg.name.name))
+                            .and_then(|v| v.to_u64())
+                            .unwrap_or(0) as usize;
+                    }
+                    if handle != 0 && handle < self.heap.len() && self.heap[handle].is_some() {
+                        return self.exec_method_call(handle, method_name, args);
+                    }
+                }
                 let obj_val = if let Some(locals) = self.local_stack.last() {
                     locals.get(obj_name).cloned()
                 } else {
@@ -45397,6 +45918,31 @@ impl Simulator {
                                 self.exec_rand_state_method(handle, method_name, args)
                             {
                                 return res;
+                            }
+                            // IEEE 1800-2023 §9.7: process-class methods
+                            // (kill/await/suspend/resume/status) on a process
+                            // handle. await() blocking is handled at the
+                            // statement level (needs the continuation); the
+                            // other four are fire-and-forget.
+                            if let Some(pid) = Self::proc_handle_to_pid(handle as u64) {
+                                match method_name.as_str() {
+                                    "status" => {
+                                        return Value::from_u64(self.proc_status(pid) as u64, 32);
+                                    }
+                                    "kill" => {
+                                        self.proc_kill(pid);
+                                        return Value::zero(32);
+                                    }
+                                    "suspend" => {
+                                        self.proc_suspend(pid);
+                                        return Value::zero(32);
+                                    }
+                                    "resume" => {
+                                        self.proc_resume(pid);
+                                        return Value::zero(32);
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         if handle < self.cg_heap.len() && self.cg_heap[handle].is_some() {
@@ -45587,17 +46133,40 @@ impl Simulator {
     ///
     /// Only tasks did this; functions bound nothing, so `arr.size()` on an assoc
     /// formal read 0.
+    /// Is this formal an associative array — either via a direct unpacked
+    /// `[key]` dimension (`int aa[int]`) or through an associative typedef
+    /// (`typedef int edges_t[uvm_phase]; … ref edges_t s`), where the dim
+    /// lives on the typedef rather than the port?
+    fn port_is_assoc_array(&self, port: &crate::ast::decl::FunctionPort) -> bool {
+        use crate::ast::types::UnpackedDimension as UD;
+        if port
+            .dimensions
+            .iter()
+            .any(|d| matches!(d, UD::Associative { .. }))
+        {
+            return true;
+        }
+        if let crate::ast::types::DataType::TypeReference { name, .. } = &port.data_type {
+            let tn = &name.name.name;
+            let concrete = self
+                .resolve_type_param_binding(tn)
+                .unwrap_or_else(|| tn.clone());
+            return self
+                .module
+                .typedef_unpacked_dims
+                .get(&concrete)
+                .map(|dims| dims.iter().any(|d| matches!(d, UD::Associative { .. })))
+                .unwrap_or(false);
+        }
+        false
+    }
+
     fn bind_assoc_param(
         &mut self,
         port: &crate::ast::decl::FunctionPort,
         arg: &Expression,
     ) -> Option<(String, String)> {
-        use crate::ast::types::UnpackedDimension as UD;
-        if !port
-            .dimensions
-            .iter()
-            .any(|d| matches!(d, UD::Associative { .. }))
-        {
+        if !self.port_is_assoc_array(port) {
             return None;
         }
         let ExprKind::Ident(hier) = &arg.kind else { return None };
@@ -45641,6 +46210,13 @@ impl Simulator {
     /// Copy a `ref`/`output`/`inout` associative formal back onto the caller's
     /// array, replacing its contents.
     fn writeback_assoc_param(&mut self, param: &str, caller: &str) {
+        // When the formal and the caller's actual share a name, the body's
+        // writes landed directly in the caller's signal namespace (they
+        // alias). There is nothing to copy back, and the clear-then-copy
+        // below would delete the caller's data. (§13.5.2 ref aliasing.)
+        if param == caller {
+            return;
+        }
         let cprefix = format!("{}[", caller);
         let old: Vec<String> = self
             .signals
@@ -46037,6 +46613,12 @@ impl Simulator {
         };
         // Array formals copy element-wise; scalars go through `output_bindings`.
         for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+            if param == caller {
+                // Formal aliases the caller's namespace; the body's writes
+                // already live there. Copying back would duplicate, and
+                // purging would delete the caller's data. Leave as-is.
+                continue;
+            }
             if is_out {
                 self.writeback_assoc_param(&param, &caller);
             }
@@ -47016,6 +47598,193 @@ impl Simulator {
         self.resolve_type_param_with(tn, &spec)
     }
 
+    /// Resolve a class VALUE parameter `name` from the active specialization
+    /// (`current_spec`). This is the value-param counterpart of
+    /// [`resolve_type_param_with`] (which handles TYPE params): a static
+    /// method such as `uvm_object_registry#(T,"base_class")::get_type_name()`
+    /// references the string value parameter `Tname`, but no instance is
+    /// constructed for a static call, so the binding only exists in the
+    /// specialization's argument list. Without this, the bare identifier fell
+    /// through to the class default value (e.g. `<unknown>`) instead of the
+    /// specialized value (`base_class`), so the factory's type-name lookup and
+    /// `is_type_registered` always failed.
+    ///
+    /// Returns None when no specialization is active or `name` is not a value
+    /// parameter (type parameters are handled by `resolve_type_param_with`).
+    fn resolve_value_param_from_spec(&mut self, name: &str) -> Option<Value> {
+        let (base, sig) = self.current_spec.clone()?;
+        let cd = self.module.classes.get(&base)?.clone();
+        // Type parameters are resolved elsewhere — don't shadow them.
+        if cd.type_param_names.iter().any(|t| t == name) {
+            return None;
+        }
+        // Match `param_order` exactly like `class_param_arg_map` (with the
+        // same legacy fallback for older caches lacking `param_order`).
+        let legacy_order: Vec<String>;
+        let order: &[String] = if cd.param_order.is_empty()
+            && !(cd.param_defaults.is_empty() && cd.type_param_names.is_empty())
+        {
+            legacy_order = cd
+                .param_defaults
+                .iter()
+                .map(|(n, _)| n.clone())
+                .chain(cd.type_param_names.iter().cloned())
+                .collect();
+            &legacy_order
+        } else {
+            &cd.param_order
+        };
+        let idx = order.iter().position(|p| p == name)?;
+        // Split the specialization's raw arg text on TOP-LEVEL commas (a naive
+        // split would break on commas inside a string literal or a nested
+        // call), then evaluate the fragment at `name`'s position.
+        let frags = Self::split_spec_args(&sig);
+        let frag = frags.get(idx)?;
+        self.eval_spec_arg_fragment(frag)
+    }
+
+    /// Split a specialization argument-list text on top-level commas,
+    /// respecting string literals, parentheses, brackets and braces so that
+    /// `#("a,b", f(1,2))` yields two fragments, not four.
+    fn split_spec_args(sig: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut depth: i32 = 0;
+        let mut in_str = false;
+        let mut prev = '\0';
+        for ch in sig.chars() {
+            match (in_str, ch) {
+                (false, '"') => {
+                    in_str = true;
+                    cur.push(ch);
+                }
+                (true, '"') if prev != '\\' => {
+                    in_str = false;
+                    cur.push(ch);
+                }
+                (true, _) => {
+                    cur.push(ch);
+                }
+                (false, '(' | '[' | '{') => {
+                    depth += 1;
+                    cur.push(ch);
+                }
+                (false, ')' | ']' | '}') => {
+                    depth -= 1;
+                    cur.push(ch);
+                }
+                (false, ',') if depth == 0 => {
+                    out.push(std::mem::take(&mut cur));
+                }
+                (false, _) => {
+                    cur.push(ch);
+                }
+            }
+            prev = ch;
+        }
+        if !cur.trim().is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// Evaluate a single specialization argument fragment to a `Value`.
+    /// Handles the shapes that appear in value-parameter positions: string
+    /// literals (UVM's factory type names like `"base_class"`), numeric
+    /// literals, and bare name references (enum members / parameters), the
+    /// last by constructing an identifier expression and deferring to the
+    /// normal evaluator.
+    fn eval_spec_arg_fragment(&mut self, frag: &str) -> Option<Value> {
+        let t = frag.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let bytes = t.as_bytes();
+        // String literal "..."
+        if bytes[0] == b'"' && bytes.len() >= 2 && bytes[bytes.len() - 1] == b'"' {
+            let inner = std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()?;
+            let w = (inner.len() * 8).max(8) as u32;
+            let mut val = Value::zero(w);
+            for (i, byte) in inner.bytes().rev().enumerate() {
+                for bit in 0..8 {
+                    if (byte >> bit) & 1 == 1 && i * 8 + bit < val.width as usize {
+                        val.set_bit(i * 8 + bit, LogicBit::One);
+                    }
+                }
+            }
+            return Some(val);
+        }
+        // Numeric literal (plain decimal or sized `'h/'d/'b/'o). Build a
+        // `NumberLiteral` from the text and evaluate via `eval_number`.
+        if let Some(nl) = Self::parse_spec_number(t) {
+            return Some(self.eval_number(&nl));
+        }
+        // Bare name reference — delegate to the normal identifier evaluator
+        // (resolves enum members, parameters, static constants).
+        let expr = Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: t.to_string(),
+                        span: crate::ast::Span::dummy(),
+                    },
+                    selects: Vec::new(),
+                }],
+                span: crate::ast::Span::dummy(),
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            crate::ast::Span::dummy(),
+        );
+        Some(self.eval_expr(&expr))
+    }
+
+    /// Parse a specialization-argument fragment into a `NumberLiteral` for the
+    /// shapes that appear in value-parameter positions: plain decimal
+    /// integers (`42`, `-5`) and optionally-sized based literals
+    /// (`'h10`, `8'd3`, `16'hFF`). Returns None for anything else.
+    fn parse_spec_number(t: &str) -> Option<NumberLiteral> {
+        let s = t.trim();
+        // Optionally-sized based literal: `[size]'<base><digits>`.
+        if let Some(pos) = s.find('\'') {
+            let size_part = &s[..pos];
+            let rest = &s[pos + 1..];
+            let (base, val_str) = match rest.chars().next() {
+                Some('b') => (NumberBase::Binary, &rest[1..]),
+                Some('d') => (NumberBase::Decimal, &rest[1..]),
+                Some('h') => (NumberBase::Hex, &rest[1..]),
+                Some('o') => (NumberBase::Octal, &rest[1..]),
+                _ => return None,
+            };
+            let size = if size_part.is_empty() {
+                None
+            } else {
+                size_part.parse::<u32>().ok()
+            };
+            return Some(NumberLiteral::Integer {
+                size,
+                signed: false,
+                base,
+                value: val_str.trim().to_string(),
+                cached_val: std::cell::Cell::new(None),
+            });
+        }
+        // Plain decimal integer (optional leading sign).
+        let neg = s.starts_with('-');
+        let body = s.trim_start_matches(['+', '-']);
+        if !body.is_empty() && body.bytes().all(|c| c.is_ascii_digit()) {
+            return Some(NumberLiteral::Integer {
+                size: None,
+                signed: neg,
+                base: NumberBase::Decimal,
+                value: body.to_string(),
+                cached_val: std::cell::Cell::new(None),
+            });
+        }
+        None
+    }
+
     /// Resolve a type-parameter name `tn` to its concrete type, using (in order)
     /// the current object's bindings (instance context) then a given active
     /// `spec = (base, sig)` (static context — `tn`'s position in `base`'s
@@ -47349,6 +48118,46 @@ impl Simulator {
     }
 
     fn exec_method_call(&mut self, handle: usize, method_name: &str, args: &[Expression]) -> Value {
+        // IEEE 1800-2023 §9.7 process class: kill/await/suspend/resume on a
+        // process handle (>= PROCESS_HANDLE_BASE). These are intercepted here,
+        // before any user-class dispatch.
+        if let Some(pid) = Self::proc_handle_to_pid(handle as u64) {
+            match method_name {
+                "status" => {
+                    return Value::from_u64(self.proc_status(pid) as u64, 32);
+                }
+                "kill" => {
+                    self.proc_kill(pid);
+                    return Value::zero(32);
+                }
+                "await" => {
+                    // Block the calling process until `pid` terminates.
+                    // The continuation is the remaining statement stream —
+                    // captured by the CALLER (run_process_stmts) which passes
+                    // an empty args slice; the real continuation is handled
+                    // at the StatementKind::MethodCall dispatch site below.
+                    // For the method-call-via-exec_method_call path (used by
+                    // inline task calls), we mark the suspension here.
+                    //
+                    // NOTE: await() needs the caller's continuation, which
+                    // exec_method_call doesn't have. The actual blocking is
+                    // done at the call site (see the MethodCall dispatch in
+                    // run_process_stmts). If we reach here, it means await()
+                    // was called in a context without continuation capture
+                    // — treat as a no-op (target already terminated).
+                    return Value::zero(32);
+                }
+                "suspend" => {
+                    self.proc_suspend(pid);
+                    return Value::zero(32);
+                }
+                "resume" => {
+                    self.proc_resume(pid);
+                    return Value::zero(32);
+                }
+                _ => {} // fall through to srandom/randstate etc.
+            }
+        }
         // IEEE 1800-2023 §18.13/§18.14 random stability. `srandom(seed)`,
         // `get_randstate()` and `set_randstate(s)` are built-ins of BOTH the
         // §9.7 `process` class (`process::self().srandom(...)` — the token
@@ -53152,15 +53961,33 @@ impl Simulator {
                     let mut output_bindings: Vec<(String, Expression)> = Vec::new();
                     let mut queue_writebacks: Vec<(String, String)> = Vec::new();
                     let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
+                    let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
                     for (i, port) in ports.iter().enumerate() {
+                        let is_assoc = self.port_is_assoc_array(port);
+                        // An associative-array `output`/`inout`/`ref` formal
+                        // is copied back via the assoc-param signal-namespace
+                        // merge, NOT the scalar `output_bindings` path (which
+                        // can't represent an AA). §13.5.2.
                         if matches!(
                             port.direction,
                             PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-                        ) && i < args.len()
+                        ) && i < args.len() && !is_assoc
                         {
                             output_bindings.push((port.name.name.clone(), args[i].clone()));
                         }
                         if i < args.len() {
+                            if let Some((param, caller)) =
+                                self.bind_assoc_param(port, &args[i])
+                            {
+                                let is_out = matches!(
+                                    port.direction,
+                                    PortDirection::Output
+                                        | PortDirection::Inout
+                                        | PortDirection::Ref
+                                );
+                                assoc_params.push((param, caller, is_out));
+                                continue;
+                            }
                             // §6.18/§6.20.3: typedef'd / type-param-bound
                             // formal — dims live on the type (see the same
                             // resolution in exec_function_call).
@@ -53440,6 +54267,18 @@ impl Simulator {
                     }
                     for (v, caller) in writebacks {
                         self.assign_value(&caller, &v);
+                    }
+                    // §13.5.2: copy `output`/`inout`/`ref` associative-array
+                    // formals back onto the caller's AA (signal-namespace
+                    // merge), then drop the formal's temporary copy.
+                    for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+                        if param == caller {
+                            continue;
+                        }
+                        if is_out {
+                            self.writeback_assoc_param(&param, &caller);
+                        }
+                        self.purge_assoc_param(&param);
                     }
                     return ret;
                 }
