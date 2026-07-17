@@ -312,3 +312,58 @@ endmodule
     let line = find_line(&sim, "HITS ").expect("no HITS line").to_string();
     assert_eq!(line.trim(), "HITS 5", "one wake per posedge, got: {}", line);
 }
+
+/// The NBA-feedback delta loop (`always @(fb) fb <= ~fb;` — the classic PLL
+/// behavioral model) used to be silently DROPPED after the cascade limit: the
+/// pending non-blocking writes were discarded and the sim continued with stale
+/// state. It must instead stop with an attributed stall report naming the
+/// feedback signal.
+#[test]
+fn nba_feedback_loop_is_reported_not_dropped() {
+    let dir = std::env::temp_dir().join("xezim_nba_loop");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sv = dir.join("nba_loop.sv");
+    std::fs::write(
+        &sv,
+        "module pll_cell(); reg fb = 0; always @(fb) fb <= ~fb; endmodule\n\
+         module tb; pll_cell u_pll(); initial #100 $finish; endmodule\n",
+    )
+    .unwrap();
+    let mut bin = std::env::current_exe().unwrap();
+    bin.pop();
+    if bin.ends_with("deps") { bin.pop(); }
+    let out = std::process::Command::new(bin.join("xezim"))
+        .arg(&sv)
+        .output()
+        .expect("run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("did not converge") && err.contains("u_pll.fb"),
+        "NBA loop must be reported with the feedback signal named:\n{}",
+        err
+    );
+}
+
+/// §9.2.1: `always` with no timing control anywhere is a COMPILE error (it can
+/// never yield). It used to be classified as combinational with self-written
+/// vars dropped from sensitivity — ran once, silently.
+#[test]
+fn always_without_timing_control_is_a_compile_error() {
+    let bad = "module t; reg fb = 0; always fb = ~fb; endmodule";
+    assert!(
+        xezim::simulate(bad, 1000).is_err(),
+        "timing-control-less always must be rejected"
+    );
+    // The legal neighbors must stay accepted.
+    for good in [
+        "module t; reg c = 0; always #10 c = ~c; endmodule",
+        "module t; reg c = 0, q; always @(posedge c) q <= 1; endmodule",
+        "module t; task automatic tk; #5; endtask always tk(); endmodule",
+    ] {
+        assert!(
+            xezim::simulate(good, 100).is_ok(),
+            "legal always form over-rejected: {}",
+            good
+        );
+    }
+}
