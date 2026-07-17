@@ -263,6 +263,8 @@ Common options:
 | `-v <file>` | Library file: modules compiled only to resolve unresolved instantiations |
 | `-y <dir>` | Library directory: `<module>.<ext>` loaded on demand |
 | `+libext+<ext>+…` | Extension list for `-y` search (replaces the default `.v`/`.sv`/`.V`) |
+| `+nospecify` | Suppress specify-block path delays — zero-delay gate simulation (`-nospecify` also accepted) |
+| `+notimingcheck` | Accepted no-op: specify timing checks are not modeled (also `+notimingchecks`/`-notimingchecks`) |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 

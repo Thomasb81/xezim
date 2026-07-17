@@ -168,6 +168,19 @@ fn sim_debug_enabled() -> bool {
 /// runs the `Simulator` internally — there is no other channel from `main` into
 /// the dump, and threading two more arguments through a 24-argument public
 /// signature would churn every caller in the tree.
+/// `+nospecify` (commercial GLS flag): suppress specify-block module path
+/// delays — zero-delay gate simulation. Timing checks are not modeled at all
+/// in xezim, so `+notimingcheck` is accepted by the CLI as a documented no-op.
+static NOSPECIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_nospecify(v: bool) {
+    NOSPECIFY.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn nospecify() -> bool {
+    NOSPECIFY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone, Default)]
 pub struct XtraceOptions {
     pub profile: Option<String>,
@@ -7390,7 +7403,11 @@ impl Simulator {
         // Lazy-allocate sdf_delays only when there's an annotation or
         // specify_delays — saves 8 × num_signals B (288 MB on c910)
         // when neither is present (the common case).
-        let need_sdf = self.sdf_annotation.is_some() || !self.module.specify_delays.is_empty();
+        // `+nospecify`: module path delays from specify blocks are suppressed
+        // (SDF annotation given explicitly via --sdf still applies — the CLI
+        // warns when both are combined, since that pairing contradicts itself).
+        let use_specify = !nospecify() && !self.module.specify_delays.is_empty();
+        let need_sdf = self.sdf_annotation.is_some() || use_specify;
         if need_sdf && self.sdf_delays.len() != self.signal_table.len() {
             self.sdf_delays.resize(self.signal_table.len(), 0);
         }
@@ -7404,9 +7421,11 @@ impl Simulator {
             }
             eprintln!("[SDF] annotated {} signals with delays", count);
         }
-        for (sig_name, &delay) in &self.module.specify_delays {
-            if let Some(&id) = self.signal_name_to_id.get(sig_name.as_str()) {
-                self.sdf_delays[id] = self.sdf_delays[id].max(delay);
+        if use_specify {
+            for (sig_name, &delay) in &self.module.specify_delays {
+                if let Some(&id) = self.signal_name_to_id.get(sig_name.as_str()) {
+                    self.sdf_delays[id] = self.sdf_delays[id].max(delay);
+                }
             }
         }
         self.build_comb_entries();

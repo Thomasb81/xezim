@@ -85,7 +85,9 @@ fn print_usage() {
     eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
   -v <file>        Library file: modules compiled only to resolve instantiations
   -y <dir>         Library directory: <module>.<ext> loaded on demand
-  +libext+<ext>+.. Extension list for -y search (replaces default .v/.sv/.V)");
+  +libext+<ext>+.. Extension list for -y search (replaces default .v/.sv/.V)
+  +nospecify       Suppress specify-block path delays (zero-delay gate sim)
+  +notimingcheck   Accepted no-op (specify timing checks are not modeled)");
     eprintln!("  --xtrace <file>  Emit an XTrace dump to <file> (compliance Level 0:");
     eprintln!("                   dictionary + time + signal deltas + event records).");
     eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
@@ -370,6 +372,7 @@ fn process_command_file(
     plusargs: &mut Vec<String>,
     lib_files: &mut Vec<String>,
     lib_exts: &mut Option<Vec<String>>,
+    nospecify: &mut bool,
 ) -> Result<(), String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read command file '{}': {}", path, e))?;
@@ -440,6 +443,10 @@ fn process_command_file(
                 _ if t.starts_with("+libext+") => {
                     push_plus_libext(t, lib_exts);
                 }
+                "+nospecify" | "-nospecify" => {
+                    *nospecify = true;
+                }
+                "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {}
                 "-f" | "-c" => {
                     i += 1;
                     if i < toks.len() {
@@ -453,6 +460,7 @@ fn process_command_file(
                             plusargs,
                             lib_files,
                             lib_exts,
+                            nospecify,
                         )?;
                     }
                 }
@@ -478,6 +486,7 @@ fn process_command_file(
                         plusargs,
                         lib_files,
                         lib_exts,
+                        nospecify,
                     )?;
                 }
                 _ if t.starts_with("+incdir+") => {
@@ -575,6 +584,7 @@ fn main() {
     let mut lib_dirs: Vec<String> = Vec::new();
     let mut lib_files: Vec<String> = Vec::new();
     let mut lib_exts: Option<Vec<String>> = None;
+    let mut nospecify = false;
     let mut log_file: Option<String> = None;
     let mut settle_limit: Option<u32> = None;
     let mut activity_mon = false;
@@ -682,6 +692,7 @@ fn main() {
                         &mut plusargs,
                         &mut lib_files,
                         &mut lib_exts,
+                        &mut nospecify,
                     ) {
                         Ok(()) => {}
                         Err(e) => {
@@ -701,6 +712,7 @@ fn main() {
                     &mut plusargs,
                     &mut lib_files,
                     &mut lib_exts,
+                    &mut nospecify,
                 ) {
                     Ok(()) => {}
                     Err(e) => {
@@ -735,6 +747,17 @@ fn main() {
             }
             _ if arg.starts_with("+libext+") => {
                 push_plus_libext(arg, &mut lib_exts);
+            }
+            // Commercial GLS flags. `+nospecify` suppresses specify-block path
+            // delays (zero-delay gate sim). `+notimingcheck(s)` is accepted as a
+            // documented no-op: xezim does not model specify timing checks, so
+            // they are permanently "disabled" already. Xcelium's `-` spellings
+            // are accepted too.
+            "+nospecify" | "-nospecify" => {
+                nospecify = true;
+            }
+            "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {
+                // no-op by design; recognized so flows don't carry a mystery plusarg
             }
             _ if arg.starts_with('+') => {
                 plusargs.push(arg.clone());
@@ -1104,6 +1127,15 @@ fn main() {
     // Library search config (`-v` files, `+libext+` extensions) — consumed by
     // the core resolver that satisfies unresolved instantiations from `-y`
     // directories and `-v` files.
+    if nospecify {
+        xezim::compiler::simulator::set_nospecify(true);
+        if sdf_file.is_some() {
+            eprintln!(
+                "Warning: +nospecify combined with --sdf — specify path delays are \
+suppressed but the explicit SDF annotation still applies."
+            );
+        }
+    }
     if !lib_files.is_empty() || lib_exts.is_some() {
         xezim::set_library_cli(xezim::LibraryCli {
             lib_files: lib_files.clone(),
