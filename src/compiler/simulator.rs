@@ -13804,6 +13804,7 @@ impl Simulator {
                 !self.module.arrays.contains_key(&name)
                     && !self.module.arrays_2d.contains_key(&name)
                     && !self.module.arrays_nd.contains_key(&name)
+                    && !self.signal_name_to_id.contains_key(name.as_str())
             }
             ExprKind::Index { expr, .. } => {
                 let ExprKind::Index {
@@ -13816,8 +13817,12 @@ impl Simulator {
                     return false;
                 };
                 let name = self.resolve_hier_name(hier);
+                // A multi-D PACKED vector root (`logic [1:0][3:0][7:0] foo`)
+                // is a real write target for `foo[i][j]` — only drop the
+                // assign when the root resolves to nothing at all.
                 !self.module.arrays_2d.contains_key(&name)
                     && !self.module.arrays_nd.contains_key(&name)
+                    && !self.signal_name_to_id.contains_key(name.as_str())
             }
             _ => false,
         }
@@ -34973,6 +34978,26 @@ impl Simulator {
                     if let Some((shape, w)) = self.module.arrays_nd.get(&n) {
                         if depth == shape.len() {
                             return *w;
+                        }
+                    }
+                    // Multi-D PACKED vector (`logic [1:0][3:0][7:0] foo`):
+                    // `foo[i]`/`foo[i][j]` select a SLICE — its width is the
+                    // product of the remaining dims, not 1 bit.
+                    if let Some(dims) = self.module.packed_full_dims.get(&n) {
+                        if depth < dims.len() {
+                            let w: u64 = dims[depth..]
+                                .iter()
+                                .map(|(l, r)| (l - r).unsigned_abs() + 1)
+                                .product();
+                            if w > 1 {
+                                return w as u32;
+                            }
+                        }
+                    } else if depth == 1 {
+                        if let Some(&ew) = self.module.packed_signal_elem_widths.get(&n) {
+                            if ew > 1 {
+                                return ew;
+                            }
                         }
                     }
                 }

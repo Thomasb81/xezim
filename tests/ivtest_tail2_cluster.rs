@@ -278,3 +278,84 @@ end
 endmodule
 "#));
 }
+
+/// §7.4.1: genloop port connections onto elements of a multi-D PACKED net
+/// (`wire logic [3:0][7:0] foo; test dut(.sum(foo[idx]))`) drive the full
+/// element slice, and `foo[i]` reads a slice, not a bit (ivtest packeda2).
+#[test]
+fn packed_net_elem_port_connection() {
+    assert!(passes(r#"
+module main;
+   wire logic [3:0][7:0] foo;
+   genvar idx;
+   for (idx = 0 ; idx <= 3 ; idx = idx+1) begin: test
+      test dut (.sum(foo[idx]), .a(idx));
+   end
+   logic [7:0] tmp;
+   initial begin
+      #1;
+      for (tmp = 0 ; tmp <= 3 ; tmp = tmp+1) begin
+	 if (foo[tmp] !== (tmp+8'd5)) begin
+	    $display("FAILED -- foo[%d] = %b", tmp, foo[tmp]);
+	    $finish;
+	 end
+      end
+      $display("PASSED");
+   end
+endmodule
+module test (output logic[7:0] sum, input logic [7:0]a);
+   assign sum = a + 8'd5;
+endmodule
+"#));
+}
+
+/// §6.6.1: an undriven net reads Z, not X — and bits of a net nothing
+/// drives stay z after partial continuous assigns (ivtest
+/// struct_packed_write_read2's word_se0/sw0/ep0 checks).
+#[test]
+fn undriven_net_defaults_to_z() {
+    assert!(passes(r#"
+module main;
+   typedef struct packed {
+      logic [7:0] high;
+      logic [7:0] low;
+   } word_t;
+   wire word_t word_se0;
+   wire word_t word_ep1;
+   assign word_ep1.high [3:0] = 4'b1111;
+   assign word_ep1.low  [3:0] = 4'b0000;
+   initial begin
+      #1;
+      if (word_se0 !== 16'bzzzzzzzz_zzzzzzzz) begin
+	 $display("FAILED -- word_se0 = 'b%b", word_se0); $finish;
+      end
+      if (word_ep1 !== 16'bzzzz1111_zzzz0000) begin
+	 $display("FAILED -- word_ep1 = 'b%b", word_ep1); $finish;
+      end
+      $display("PASSED");
+   end
+endmodule
+"#));
+}
+
+/// Nested cont-assign selects on a multi-D packed NET write the addressed
+/// slice with full element width (regression probe for the interpreted
+/// ContAssign path: infer_lhs_width must not truncate to 1 bit).
+#[test]
+fn packed_net_nested_index_cont_assign() {
+    assert!(passes(r#"
+module main;
+   wire logic [1:0][3:0][7:0] foo;
+   assign foo[0][0] = 8'hA5;
+   assign foo[0][3] = 8'hC3;
+   assign foo[1][2] = 8'h7E;
+   initial begin
+      #1;
+      if (foo !== 64'hzz7ezzzzc3zzzza5) begin
+	 $display("FAILED -- foo=%h", foo); $finish;
+      end
+      $display("PASSED");
+   end
+endmodule
+"#));
+}
