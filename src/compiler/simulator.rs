@@ -14909,6 +14909,52 @@ impl Simulator {
             }
             cascade_iter += 1;
         }
+        // Exiting at the limit with NBAs STILL pending is a zero-delay
+        // livelock through the NBA region (`always @(fb) fb <= ~fb;` — the
+        // classic PLL-feedback model). The old behavior silently DISCARDED the
+        // pending writes and carried on with stale state — worse than a hang,
+        // because nothing ever said so. Report it like the other delta-loop
+        // detectors and stop. The pending targets ARE the feedback signals.
+        if cascade_iter >= cascade_limit
+            && !(self.nba_fast.is_empty() && self.nba_queue.is_empty())
+            && !self.finished
+        {
+            eprintln!(
+                "[xezim][error] simulation STALLED at time {} — the edge/NBA cascade did not converge after {} delta cycles (XEZIM_CASCADE_LIMIT).",
+                self.time, cascade_iter
+            );
+            eprintln!(
+                "               This is a zero-delay (delta) livelock: non-blocking writes keep"
+            );
+            eprintln!(
+                "               re-triggering edge-sensitive blocks at the same timestamp."
+            );
+            let mut names: Vec<String> = Vec::new();
+            for e in &self.nba_fast {
+                if let Some(n) = self.id_to_name.get(e.signal_id) {
+                    names.push(n.to_string());
+                }
+            }
+            for e in &self.nba_queue {
+                if let Some(n) = e.resolved_id.and_then(|i| self.id_to_name.get(i)) {
+                    names.push(n.to_string());
+                }
+            }
+            names.sort();
+            names.dedup();
+            if !names.is_empty() {
+                eprintln!(
+                    "               Pending non-blocking writes that keep the loop alive:"
+                );
+                for n in names.iter().take(5) {
+                    eprintln!("                 {} <= ... (re-armed every cycle)", n);
+                }
+            }
+            eprintln!(
+                "               Raise XEZIM_CASCADE_LIMIT=<n> if the design legitimately needs deeper same-time NBA cascades."
+            );
+            self.finished = true;
+        }
         // Final propagation pass: level-sensitive always blocks fired by the
         // last check_edges may have done blocking-writes to regs that feed
         // downstream cont-assigns (e.g. cr_iu_decd's ill_expt16 always block
@@ -18416,13 +18462,33 @@ impl Simulator {
             }
             self.exec_statement(s);
         }
-        // No delay/event in forever body — safety limit
-        let mut safety = 0;
-        while !self.finished && safety < 10000 {
+        // No delay/event in the forever body: the loop can never yield, so
+        // running it is a zero-delay livelock (`always fb = ~fb;`). The old
+        // code silently STOPPED after 10k iterations and let the sim continue
+        // with whatever state the truncated loop left — silent wrongness.
+        // Run up to the stall limit, then report with full attribution.
+        let cap = if self.stall_limit > 0 { self.stall_limit } else { 10_000 };
+        let mut safety: u64 = 0;
+        while !self.finished && safety < cap {
             safety += 1;
             for s in &body_stmts {
                 self.exec_statement(s);
             }
+        }
+        if !self.finished && safety >= cap {
+            eprintln!(
+                "[xezim][error] simulation STALLED at time {} — a `forever`/`always` body with no timing control ran {} times.",
+                self.time, safety
+            );
+            let id = self.stall_pid_identity(pid);
+            eprintln!("{} — no `#delay`/`@event`/`wait` anywhere in its body", id);
+            eprintln!(
+                "               Simulated time can never advance past this loop. Add a timing control,"
+            );
+            eprintln!(
+                "               or raise/disable the check with XEZIM_STALL_LIMIT=<n>."
+            );
+            self.finished = true;
         }
     }
 
