@@ -86,6 +86,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     }
                 }
             }
+            SourceDefinition::Udp(_) => {}
         }
     }
     errs
