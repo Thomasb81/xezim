@@ -1,4 +1,4 @@
-//! `$deposit(target, value)` (Verilog-XL/VCS/Questa): set the target's value
+//! `$deposit(target, value)` (Verilog-XL/VCS): set the target's value
 //! immediately WITHOUT a persistent driver — it holds until the next driver
 //! transaction overwrites it; on an undriven net it simply sticks. Previously
 //! an unknown task: the deposit silently did nothing and the target stayed X.

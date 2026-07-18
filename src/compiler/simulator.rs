@@ -2528,7 +2528,7 @@ pub struct Simulator {
     /// SAME active pass (before `apply_nba`), so scheduling a `#0`
     /// continuation there made it resume BEFORE the NBA region committed —
     /// an NBA posted before the `#0` was invisible after it. Commercial
-    /// simulators (VCS / Questa / Riviera) all make an NBA posted before a
+    /// simulators (VCS / Riviera) all make an NBA posted before a
     /// `#0` visible after it, so entries parked here are promoted back into
     /// the event queue only at the END of the current tick, after
     /// `apply_nba` has run (see `promote_inactive_to_active`).
@@ -15324,7 +15324,7 @@ impl Simulator {
     /// time. Called only AFTER `apply_nba` has committed this pass's NBA
     /// region, so when the caller's loop re-drains same-time events the
     /// promoted continuations observe post-NBA values — matching the
-    /// commercial consensus (VCS / Questa / Riviera): an NBA posted before
+    /// commercial consensus (VCS / Riviera): an NBA posted before
     /// a `#0` is visible after it in the same time slot.
     fn promote_inactive_to_active(&mut self) {
         if self.inactive_queue.is_empty() {
@@ -16114,7 +16114,7 @@ impl Simulator {
         // == self.time and re-enters run_one_tick without advancing time.
         // Because this runs after this tick's apply_nba / settle /
         // check_edges, the promoted continuations observe post-NBA values,
-        // matching the commercial consensus (VCS/Questa/Riviera print `aa`
+        // matching the commercial consensus (VCS/Riviera print `aa`
         // for `nb <= 8'hAA; #0; $display(nb)`).
         self.promote_inactive_to_active();
 
@@ -18065,7 +18065,7 @@ impl Simulator {
                             // self.time would resume it in the same batch
                             // drain, BEFORE apply_nba — so an NBA posted
                             // before the `#0` would not be visible after it.
-                            // Commercial consensus (VCS/Questa/Riviera): it IS
+                            // Commercial consensus (VCS/Riviera): it IS
                             // visible. Park here; run_one_tick promotes after
                             // the NBA region of this tick has been applied.
                             self.inactive_queue.push((pid, cont));
