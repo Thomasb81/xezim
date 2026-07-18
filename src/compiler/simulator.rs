@@ -53150,6 +53150,330 @@ impl Simulator {
         }
     }
 
+    /// §18.5.8.2 — recognize `<arr>.sum()` (with or without an identity `with`
+    /// clause) as an array reduction over a rand collection. Returns the bare
+    /// array name and, for the `with` form, the filter to identity-check.
+    /// Three parse shapes are matched (see `WithClause` handling in `eval`).
+    fn sum_reduction_array(e: &Expression) -> Option<(String, Option<Expression>)> {
+        match &e.kind {
+            ExprKind::Paren(inner) => Self::sum_reduction_array(inner),
+            ExprKind::WithClause { expr, filter } => {
+                Self::plain_sum_array(expr).map(|n| (n, Some((**filter).clone())))
+            }
+            _ => Self::plain_sum_array(e).map(|n| (n, None)),
+        }
+    }
+
+    /// The bare array name of a `<arr>.sum()` call (no `with`).
+    fn plain_sum_array(e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Call { func, args } if args.is_empty() => Self::plain_sum_array(func),
+            ExprKind::MemberAccess { expr, member } if member.name == "sum" => {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    return h.path.last().map(|s| s.name.name.clone());
+                }
+                None
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.path.last().map_or(false, |s| s.name.name == "sum") =>
+            {
+                Some(h.path[h.path.len() - 2].name.name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// A reduction `with` filter is identity when `filter(item) == item` for a
+    /// spread of probe values — this covers `item`, `(item)`, `int'(item)` and
+    /// `unsigned'(item)` without matching the (lowered) cast AST directly.
+    fn filter_is_identity(&mut self, filter: &Expression) -> bool {
+        self.local_stack.push(HashMap::default());
+        let mut ok = true;
+        for &p in &[0u64, 1, 7, 255, 1000] {
+            if let Some(f) = self.local_stack.last_mut() {
+                f.insert("item".to_string(), Value::from_u64(p, 32));
+            }
+            if self.eval_expr(filter).to_u64() != Some(p) {
+                ok = false;
+                break;
+            }
+        }
+        self.local_stack.pop();
+        ok
+    }
+
+    /// §18.5.8.2 — if `item` is `<arr>.sum() == <const>` (either operand order)
+    /// over a single rand collection, return the collection and the constant
+    /// target. The non-sum side must be a compile/solve-time constant (it may
+    /// not reference any rand variable), so the sum has one solvable target.
+    fn array_sum_eq_target(
+        &mut self,
+        item: &ConstraintItem,
+        colls: &[RandColl],
+        rand_names: &HashSet<String>,
+    ) -> Option<(RandColl, i128)> {
+        let ConstraintItem::Expr(e) = item else { return None };
+        let ExprKind::Binary { op: BinaryOp::Eq, left, right } = &e.kind else {
+            return None;
+        };
+        for (sum_side, const_side) in [(left, right), (right, left)] {
+            let Some((name, filter)) = Self::sum_reduction_array(sum_side) else {
+                continue;
+            };
+            let Some(c) = colls.iter().find(|c| c.prop == name).cloned() else {
+                continue;
+            };
+            if let Some(f) = &filter {
+                if !self.filter_is_identity(f) {
+                    continue;
+                }
+            }
+            // The target side must be a stable constant — no rand variable and
+            // no element of a managed collection may appear on it.
+            let mut ids: HashSet<String> = HashSet::default();
+            self.collect_expr_idents(const_side, &mut ids);
+            if ids
+                .iter()
+                .any(|n| rand_names.contains(n) || colls.iter().any(|c| &c.prop == n))
+            {
+                continue;
+            }
+            let Some(k) = self.eval_expr(const_side).to_i64() else {
+                continue;
+            };
+            return Some((c, k as i128));
+        }
+        None
+    }
+
+    /// §18.5.8.2 — solve `<arr>.sum() == K` by DISTRIBUTING a random valid
+    /// assignment over the array's elements (rejection sampling cannot find a
+    /// point-target sum in a wide domain). Elements already pinned by another
+    /// constraint keep their value and reduce the residual target; the rest are
+    /// each drawn inside their `foreach … inside {…}` range (or the full type
+    /// width) so the total lands exactly on `K`. Infeasible targets are left
+    /// untouched — the trial checker then rejects and retries.
+    fn distribute_array_sum(
+        &mut self,
+        c: &RandColl,
+        target: i128,
+        constraints: &[ClassConstraint],
+        pinned: &mut HashSet<String>,
+    ) {
+        let keys = self.coll_elem_keys(c);
+        let ranges = self.elem_allowed_ranges(&c.prop, constraints);
+        let (lo, hi): (i128, i128) = if ranges.is_empty() {
+            let hi = if c.width >= 64 { u64::MAX } else { (1u64 << c.width) - 1 };
+            (0, hi as i128)
+        } else {
+            (
+                ranges.iter().map(|(l, _)| *l as i128).min().unwrap(),
+                ranges.iter().map(|(_, h)| *h as i128).max().unwrap(),
+            )
+        };
+        self.distribute_sum_over(&keys, target, lo, hi, c.width, pinned);
+    }
+
+    /// Core of the array-sum solver: assign `keys` so their total equals
+    /// `target`, each element inside `[lo, hi]`. Already-pinned keys keep their
+    /// value and reduce the residual; infeasible targets leave the array as-is.
+    fn distribute_sum_over(
+        &mut self,
+        keys: &[String],
+        target: i128,
+        lo: i128,
+        hi: i128,
+        width: u32,
+        pinned: &mut HashSet<String>,
+    ) {
+        use rand::Rng;
+        if keys.is_empty() {
+            return;
+        }
+        let mut fixed_sum: i128 = 0;
+        let mut free: Vec<String> = Vec::new();
+        for k in keys {
+            if pinned.contains(k) {
+                fixed_sum += self.read_coll_elem(k).and_then(|v| v.to_u64()).unwrap_or(0) as i128;
+            } else {
+                free.push(k.clone());
+            }
+        }
+        if free.is_empty() {
+            return;
+        }
+        let n = free.len() as i128;
+        let want = target - fixed_sum;
+        if want < n * lo || want > n * hi {
+            return; // infeasible — leave for the trial checker to reject
+        }
+        let cap = hi - lo;
+        let mut rem = want - n * lo; // 0 ..= n*cap
+        let mut order: Vec<usize> = (0..free.len()).collect();
+        for i in (1..order.len()).rev() {
+            let j = self.cur_rng().gen_range(0..=i);
+            order.swap(i, j);
+        }
+        for (pos, &idx) in order.iter().enumerate() {
+            let remaining_after = (order.len() - pos - 1) as i128;
+            let give = if remaining_after == 0 {
+                rem
+            } else {
+                // Keep the residual absorbable by the still-unassigned elements.
+                let lo_b = (rem - remaining_after * cap).max(0);
+                let hi_b = rem.min(cap);
+                if hi_b <= lo_b {
+                    lo_b
+                } else {
+                    lo_b + self.cur_rng().gen_range(0..=(hi_b - lo_b))
+                }
+            };
+            rem -= give;
+            self.write_coll_elem(&free[idx], Value::from_u64((lo + give) as u64, width));
+            pinned.insert(free[idx].clone());
+        }
+    }
+
+    /// §18.5.8.2 — run `distribute_array_sum` for every `arr.sum() == K`
+    /// equality in the constraint set (flattening `{}`/`soft` wrappers).
+    fn solve_array_sum_eqs(
+        &mut self,
+        constraints: &[ClassConstraint],
+        colls: &[RandColl],
+        rand_names: &HashSet<String>,
+        pinned: &mut HashSet<String>,
+    ) {
+        let mut items: Vec<ConstraintItem> = Vec::new();
+        fn walk(it: &ConstraintItem, out: &mut Vec<ConstraintItem>) {
+            match it {
+                ConstraintItem::Block(is) => {
+                    for i in is {
+                        walk(i, out);
+                    }
+                }
+                ConstraintItem::Soft(i) => walk(i, out),
+                other => out.push(other.clone()),
+            }
+        }
+        for con in constraints {
+            for it in &con.items {
+                walk(it, &mut items);
+            }
+        }
+        for it in &items {
+            if let Some((c, k)) = self.array_sum_eq_target(it, colls, rand_names) {
+                self.distribute_array_sum(&c, k, constraints, pinned);
+            } else if let Some((c, idxs, k)) =
+                self.explicit_elem_sum_eq_target(it, colls, rand_names)
+            {
+                // `a[0] + a[1] + a[2] == K`: distribute over just the named
+                // elements, honoring any `foreach … inside {…}` element range.
+                let ranges = self.elem_allowed_ranges(&c.prop, constraints);
+                let (lo, hi): (i128, i128) = if ranges.is_empty() {
+                    let hi = if c.width >= 64 { u64::MAX } else { (1u64 << c.width) - 1 };
+                    (0, hi as i128)
+                } else {
+                    (
+                        ranges.iter().map(|(l, _)| *l as i128).min().unwrap(),
+                        ranges.iter().map(|(_, h)| *h as i128).max().unwrap(),
+                    )
+                };
+                let keys: Vec<String> =
+                    idxs.iter().map(|i| format!("{}[{}]", c.scoped, i)).collect();
+                self.distribute_sum_over(&keys, k, lo, hi, c.width, pinned);
+            }
+        }
+    }
+
+    /// §18.5.8 — recognize `a[c0] + a[c1] + … == K`: a `+`-chain of
+    /// CONSTANT-index selects of ONE rand collection compared to a constant.
+    /// Returns the collection, the (distinct) element indices, and the target.
+    fn explicit_elem_sum_eq_target(
+        &mut self,
+        item: &ConstraintItem,
+        colls: &[RandColl],
+        rand_names: &HashSet<String>,
+    ) -> Option<(RandColl, Vec<i64>, i128)> {
+        let ConstraintItem::Expr(e) = item else { return None };
+        let ExprKind::Binary { op: BinaryOp::Eq, left, right } = &e.kind else {
+            return None;
+        };
+        // Collect the index selects on a `+`-chain over a single array `name`.
+        // Index expressions are gathered as-is, then const-evaluated below.
+        fn chain<'a>(
+            e: &'a Expression,
+            name: &mut Option<String>,
+            idxs: &mut Vec<&'a Expression>,
+        ) -> bool {
+            match &e.kind {
+                ExprKind::Paren(i) => chain(i, name, idxs),
+                ExprKind::Binary { op: BinaryOp::Add, left, right } => {
+                    chain(left, name, idxs) && chain(right, name, idxs)
+                }
+                ExprKind::Index { expr, index } => {
+                    let ExprKind::Ident(h) = &expr.kind else { return false };
+                    let arr = match h.path.last() {
+                        Some(s) => s.name.name.clone(),
+                        None => return false,
+                    };
+                    match name {
+                        Some(n) if *n != arr => return false,
+                        _ => *name = Some(arr),
+                    }
+                    idxs.push(index);
+                    true
+                }
+                _ => false,
+            }
+        }
+        for (sum_side, const_side) in [(left, right), (right, left)] {
+            let mut name: Option<String> = None;
+            let mut idx_exprs: Vec<&Expression> = Vec::new();
+            if !chain(sum_side, &mut name, &mut idx_exprs) || idx_exprs.len() < 2 {
+                continue;
+            }
+            let mut idxs: Vec<i64> = Vec::new();
+            let mut all_const = true;
+            for ie in &idx_exprs {
+                match self.eval_expr(ie).to_i64() {
+                    Some(v) => idxs.push(v),
+                    None => {
+                        all_const = false;
+                        break;
+                    }
+                }
+            }
+            if !all_const {
+                continue;
+            }
+            // Distinct indices only — a repeated element is not a simple sum.
+            let mut sorted = idxs.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.len() != idxs.len() {
+                continue;
+            }
+            let Some(nm) = name else { continue };
+            let Some(c) = colls.iter().find(|c| c.prop == nm).cloned() else {
+                continue;
+            };
+            let mut ids: HashSet<String> = HashSet::default();
+            self.collect_expr_idents(const_side, &mut ids);
+            if ids
+                .iter()
+                .any(|n| rand_names.contains(n) || colls.iter().any(|c| &c.prop == n))
+            {
+                continue;
+            }
+            let Some(k) = self.eval_expr(const_side).to_i64() else {
+                continue;
+            };
+            return Some((c, idxs, k as i128));
+        }
+        None
+    }
+
     /// §18.5.9 — an lvalue reaching THROUGH a rand class-handle member
     /// (`sub_inst.sub_data`). Returns the sub-object's handle and the member
     /// name, so a cross-object equality can be forced onto it.
@@ -54812,6 +55136,19 @@ impl Simulator {
                         break;
                     }
                 }
+            }
+
+            // §18.5.8.2: `arr.sum() == K` cannot be met by rejection over a wide
+            // domain — distribute a random valid assignment onto the elements so
+            // their total lands exactly on the target (respecting per-element
+            // ranges and any element already pinned by another constraint).
+            if !rand_colls.is_empty() {
+                self.solve_array_sum_eqs(
+                    &constraints,
+                    &rand_colls,
+                    &rand_set,
+                    &mut pinned_elems,
+                );
             }
 
             let mut all_ok = true;
@@ -56632,9 +56969,13 @@ impl Simulator {
         match &expr.kind {
             ExprKind::Call { func, args } => {
                 if let ExprKind::MemberAccess { member, .. } = &func.kind {
+                    // NOTE: `sum` is deliberately absent — a `.sum() == K`
+                    // equality is now solved by `distribute_array_sum` and must
+                    // be CHECKED (so an infeasible target retries/fails instead
+                    // of silently passing). The rest stay unmodeled.
                     if matches!(
                         member.name.as_str(),
-                        "size" | "sum" | "exists" | "len" | "product" | "min" | "max"
+                        "size" | "exists" | "len" | "product" | "min" | "max"
                             | "num" | "and" | "or" | "xor"
                     ) {
                         return true;
