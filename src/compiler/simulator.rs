@@ -30653,6 +30653,7 @@ impl Simulator {
                             }
                             self.auto_loop_vars.truncate(fe_auto_len);
                             self.restore_loop_vars(&fe_saved);
+                            if !self.return_flag { self.break_flag = false; }
                             return;
                         }
                         // Multi-var foreach over a FIXED multi-dim class member
@@ -30698,12 +30699,22 @@ impl Simulator {
                                 is_str = false;
                             } else {
                                 let prefix = format!("{}[", an);
+                                // An assoc-of-collections member (e.g.
+                                // `bq_t all[int]`) stores elements as
+                                // `all[5][0]` etc. — extract the key up to
+                                // the FIRST `]` and dedup so multiple
+                                // sub-elements don't each produce a phantom key.
                                 let mut ks: Vec<String> = self
                                     .signals
                                     .keys()
-                                    .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
-                                    .map(|k| k[prefix.len()..k.len() - 1].to_string())
+                                    .filter_map(|k| {
+                                        let rest = k.strip_prefix(&prefix)?;
+                                        let end = rest.find(']')?;
+                                        Some(rest[..end].to_string())
+                                    })
                                     .collect();
+                                ks.sort();
+                                ks.dedup();
                                 is_str = self
                                     .module
                                     .associative_arrays
@@ -30746,6 +30757,10 @@ impl Simulator {
                         }
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
+                        // A `break` inside the loop consumed the loop exit.
+                        // Only a `return` (return_flag) should propagate to
+                        // the enclosing function body (IEEE 1800-2023 §12.8).
+                        if !self.return_flag { self.break_flag = false; }
                         return;
                     }
                 }
@@ -30824,6 +30839,7 @@ impl Simulator {
                                 );
                                 self.auto_loop_vars.truncate(fe_auto_len);
                                 self.restore_loop_vars(&fe_saved);
+                                if !self.return_flag { self.break_flag = false; }
                                 return;
                             }
                         }
@@ -30832,12 +30848,22 @@ impl Simulator {
                         self.widths.insert(var.name.clone(), 32);
                         if self.is_associative_array(&name) {
                             let prefix = format!("{}[", name);
+                            // An assoc-of-collections (e.g. `bq_t all[int]`
+                            // where `bq_t = Base[$]`) stores elements as
+                            // `all[5][0]` etc. — extract the key up to the
+                            // FIRST `]` and dedup so multiple sub-elements
+                            // don't each produce a phantom key.
                             let mut keys: Vec<String> = self
                                 .signals
                                 .keys()
-                                .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
-                                .map(|k| k[prefix.len()..k.len() - 1].to_string())
+                                .filter_map(|k| {
+                                    let rest = k.strip_prefix(&prefix)?;
+                                    let end = rest.find(']')?;
+                                    Some(rest[..end].to_string())
+                                })
                                 .collect();
+                            keys.sort();
+                            keys.dedup();
                             let is_str = self
                                 .module
                                 .associative_arrays
@@ -30952,6 +30978,7 @@ impl Simulator {
                 }
                 self.auto_loop_vars.truncate(fe_auto_len);
                 self.restore_loop_vars(&fe_saved);
+                if !self.return_flag { self.break_flag = false; }
             }
             StatementKind::While { condition, body } => {
                 let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT")
@@ -32349,6 +32376,23 @@ impl Simulator {
                             {
                                 self.var_class_types
                                     .insert(d.name.name.clone(), cn.clone());
+                                // A typedef'd local (e.g. `table_q_t rq` where
+                                // `table_q_t = uvm_shared#(Foo[$])`) resolves to
+                                // `cn` but hides the type_args inside the
+                                // typedef chain. Record them so a separate
+                                // `rq = new()` constructs the right
+                                // specialization with type_bindings populated
+                                // (§8.25 — otherwise `T` stays unbound).
+                                if let crate::ast::types::DataType::TypeReference { name, .. } =
+                                    data_type
+                                {
+                                    if let Some((_, Some(ta))) =
+                                        self.resolve_typeref_class_with_type_args(name)
+                                    {
+                                        self.var_type_args
+                                            .insert(d.name.name.clone(), ta);
+                                    }
+                                }
                             } else if self.pure_sv_lrm
                                 && self
                                     .this_stack
@@ -32374,7 +32418,20 @@ impl Simulator {
                         // Record a parameterized local's declared `#(...)` type
                         // args so a SEPARATE `name = new(...)` constructs the right
                         // specialization (config_db's `uvm_resource#(T) r; r=new`).
+                        // A typedef'd local (e.g. `table_q_t rq` where `table_q_t =
+                        // uvm_shared#(Foo[$])`) has EMPTY explicit type_args but
+                        // the args are hidden in the typedef chain — resolve
+                        // them so the new() populates type_bindings (§8.25).
                         // Clear a stale same-named entry when this decl has none.
+                        let resolved_ta =
+                            if let crate::ast::types::DataType::TypeReference { name, .. } =
+                                data_type
+                            {
+                                self.resolve_typeref_class_with_type_args(name)
+                                    .and_then(|(_, ta)| ta)
+                            } else {
+                                None
+                            };
                         if let crate::ast::types::DataType::TypeReference {
                             type_args,
                             ..
@@ -32383,6 +32440,9 @@ impl Simulator {
                             if !type_args.is_empty() {
                                 self.var_type_args
                                     .insert(d.name.name.clone(), type_args.clone());
+                            } else if let Some(ta) = resolved_ta {
+                                self.var_type_args
+                                    .insert(d.name.name.clone(), ta);
                             } else {
                                 self.var_type_args.remove(&d.name.name);
                             }
@@ -38888,6 +38948,66 @@ impl Simulator {
         }
     }
 
+    /// Like `resolve_typeref_class_name`, but also returns the parameterized
+    /// type args from the typedef chain. A typedef like `table_q_t =
+    /// uvm_shared#(rsrc_sv_q_t)` (possibly through multiple alias layers)
+    /// resolves to `("uvm_shared", Some([rsrc_sv_q_t]))`. This lets a
+    /// typedef'd local `table_q_t rq` carry the type args forward to `rq =
+    /// new()` so the instance's type_bindings are populated — otherwise `T`
+    /// stays unbound and collection builtins can't see a queue/array member.
+    fn resolve_typeref_class_with_type_args(
+        &self,
+        tref: &crate::ast::types::TypeName,
+    ) -> Option<(String, Option<Vec<Expression>>)> {
+        use crate::ast::types::DataType;
+        let base_class = |s: &str| -> Option<String> {
+            if self.module.classes.contains_key(s) {
+                return Some(s.to_string());
+            }
+            let b = s.split('#').next().unwrap_or(s);
+            if b != s && self.module.classes.contains_key(b) {
+                return Some(b.to_string());
+            }
+            None
+        };
+        let nm = &tref.name.name;
+        // Direct class match (possibly parameterized) — extract type_args.
+        if let Some(c) = base_class(nm) {
+            let ta = match self.module.typedef_types.get(nm)
+                .or_else(|| self.module.typedef_types.get(nm))
+            {
+                Some(DataType::TypeReference { type_args, .. }) if !type_args.is_empty() =>
+                    Some(type_args.clone()),
+                _ => None,
+            };
+            return Some((c, ta));
+        }
+        // Walk the typedef chain, tracking type_args from the deepest layer
+        // that has them. `table_q_t` → `rsrc_shared_q_t` → `uvm_shared#(...)`.
+        let mut cur_name = nm.clone();
+        let mut found_ta: Option<Vec<Expression>> = None;
+        for _ in 0..16 {
+            let target = self.lookup_typedef_target(&cur_name);
+            let dt = match target {
+                Some(dt) => dt,
+                None => break,
+            };
+            match dt {
+                DataType::TypeReference { name: inner, type_args, .. } => {
+                    if !type_args.is_empty() {
+                        found_ta = Some(type_args.clone());
+                    }
+                    if let Some(c) = base_class(&inner.name.name) {
+                        return Some((c, found_ta));
+                    }
+                    cur_name = inner.name.name.clone();
+                }
+                _ => break,
+            }
+        }
+        None
+    }
+
     /// True if a TypeReference data type names a class handle (directly, via a
     /// parameterized base, or through a typedef chain). Defaults such an
     /// uninitialized handle to `null` (LRM §8.4) instead of X.
@@ -39827,12 +39947,22 @@ impl Simulator {
             return ((0..sz).map(|i| i.to_string()).collect(), false);
         }
         let prefix = format!("{}[", name);
+        // For an associative array whose VALUES are themselves collections
+        // (e.g. `bq_t all[int]` where `bq_t = Base[$]`), an element at key 5
+        // is stored as `all[5][0]`, `all[5][1]`, etc. The key must be
+        // extracted up to the FIRST `]`, not `k.len()-1` (which would grab
+        // `5][0`). Dedup because multiple sub-elements share one key.
         let mut ks: Vec<String> = self
             .signals
             .keys()
-            .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
-            .map(|k| k[prefix.len()..k.len() - 1].to_string())
+            .filter_map(|k| {
+                let rest = k.strip_prefix(&prefix)?;
+                let end = rest.find(']')?;
+                Some(rest[..end].to_string())
+            })
             .collect();
+        ks.sort();
+        ks.dedup();
         let is_str = self
             .module
             .associative_arrays
@@ -46527,23 +46657,37 @@ impl Simulator {
         // A type-param binding resolves first; otherwise the raw name may
         // itself be an array/queue typedef (`my_array_t data;` — the class
         // property elaboration is dim-blind for typedef'd types).
+        let raw_dbg = raw.clone();
         let concrete = self
             .heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .and_then(|i| i.type_bindings.get(&raw).cloned())
             .unwrap_or(raw);
-        self.module
-            .typedef_unpacked_dims
-            .get(&concrete)
-            .and_then(|dims| dims.first())
-            .map_or(false, |d| {
+        // A typedef name may itself be a class-LOCAL typedef (e.g. UVM's
+        // `uvm_resource_types::rsrc_sv_q_t` = `uvm_resource_base[$]`), which
+        // lives in the declaring class's `typedef_unpacked_dims`, NOT the
+        // module-level map. Search BOTH: module-level first (package
+        // typedefs), then every class's local typedefs for a matching name
+        // with an unsized/queue first dimension.
+        let is_collection_dim = |dims: &Vec<crate::ast::types::UnpackedDimension>| {
+            dims.first().map_or(false, |d| {
                 matches!(
                     d,
                     crate::ast::types::UnpackedDimension::Unsized(_)
                         | crate::ast::types::UnpackedDimension::Queue { .. }
                 )
             })
+        };
+        if let Some(dims) = self.module.typedef_unpacked_dims.get(&concrete) {
+            return is_collection_dim(dims);
+        }
+        for cd in self.module.classes.values() {
+            if let Some(dims) = cd.typedef_unpacked_dims.get(&concrete) {
+                return is_collection_dim(dims);
+            }
+        }
+        false
     }
 
     fn class_assoc_member(&self, class_name: &str, member: &str) -> bool {
@@ -47632,7 +47776,8 @@ impl Simulator {
                 )
             {
                 if let Some(an) = self.expr_assoc_name(expr) {
-                    if let Some(res) = self.eval_builtin_method(&an, mname, args) {
+                    let res = self.eval_builtin_method(&an, mname, args);
+                    if let Some(res) = res {
                         return res;
                     }
                 }
@@ -48348,7 +48493,20 @@ impl Simulator {
             // `member.num()` resolves via `instance_assoc_member`; this is the
             // external counterpart UVM's phase graph depends on
             // (`domain.m_successors.num()`, `phase.m_predecessors.exists(p)`).
-            if len >= 2 && Self::is_array_builtin_method(path[len - 1].name.name.as_str()) {
+            // Also covers queue MUTATION builtins (`o.q.push_back(x)` etc.)
+            // because the parser flattens `o.q.push_back(x)` into the same
+            // 3-segment Ident shape — without this, `sh.value.push_back(x)` on
+            // a `uvm_shared#(T[$])` member silently no-ops and the resource
+            // pool's per-name queues stay empty.
+            if len >= 2
+                && (Self::is_array_builtin_method(path[len - 1].name.name.as_str())
+                    || matches!(
+                        path[len - 1].name.name.as_str(),
+                        "push_back" | "push_front" | "pop_back" | "pop_front"
+                            | "insert" | "delete" | "sort" | "rsort"
+                            | "reverse" | "shuffle" | "unique"
+                    ))
+            {
                 let m = path[len - 1].name.name.clone();
                 let base = HierarchicalIdentifier {
                     root: hier.root.clone(),
