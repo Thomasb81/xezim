@@ -26210,6 +26210,33 @@ impl Simulator {
                     }
                     return out;
                 }
+                // §28.4 pull-strength marker. A lone pull driver just carries
+                // its value; multi-driver resolution unwraps it (see
+                // `resolve_multi_driver_nets`), so this identity path only runs
+                // when a pullup/pulldown is the net's sole driver.
+                "$__pull" => {
+                    return args.first().map(|a| self.eval_expr(a)).unwrap_or_else(|| Value::new(1));
+                }
+                // Strong-over-weak resolution: `$__wres_pull(strong, weak)`.
+                // The STRONG chain (all non-pull drivers, already $__wres-folded)
+                // wins on every bit it drives; the WEAK pull value fills only the
+                // bits where strong is z. This is the pull-up/pull-down behavior
+                // — a strong driver overrides the resistor, which otherwise holds
+                // the net at its pull value.
+                "$__wres_pull" => {
+                    if args.len() < 2 {
+                        return Value::new(1);
+                    }
+                    let st = self.eval_expr(&args[0]);
+                    let wk = self.eval_expr(&args[1]);
+                    let w = st.width.max(wk.width).max(1);
+                    let mut out = Value::zero(w);
+                    for i in 0..w as usize {
+                        let sb = st.get_bit(i);
+                        out.set_bit(i, if sb == LogicBit::Z { wk.get_bit(i) } else { sb });
+                    }
+                    return out;
+                }
                 // `$__tranif(own_self, own_other, ctl, active)` — the value of
                 // THIS terminal of a bidirectional switch.
                 "$__tranif" => {
