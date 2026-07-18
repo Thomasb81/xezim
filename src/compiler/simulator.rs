@@ -14137,6 +14137,7 @@ impl Simulator {
         // Drive the output net.
         let out_ref = self.udp_runtime[idx].out_ref;
         let delay = self.udp_runtime[idx].delay;
+        let is_seq = self.udp_runtime[idx].is_sequential;
         let id = out_ref.sig_id as usize;
         let bit = out_ref.bit as usize;
         // §29.7 instance delay: applied to every transition, including the
@@ -14148,7 +14149,25 @@ impl Simulator {
                 v.set_bit_code(bit, new_code);
                 self.schedule_delayed_with_delay(id, v, delay);
             }
+        } else if is_seq {
+            // A SEQUENTIAL UDP is a flip-flop/latch: its output must update with
+            // non-blocking semantics so that other sequential UDPs sampling the
+            // SAME clock edge see this output's OLD value, not the new one.
+            // Committing immediately (like a comb UDP) shifts a whole DFF chain
+            // through in one edge — a shift register would collapse. Verified
+            // against a commercial simulator and Icarus: a `q0->q1` chain must
+            // shift one stage per clock. Route through the NBA queue like a flop.
+            if self.signal_table[id].get_bit_code(bit) != new_code {
+                let mut v = self.signal_table[id].clone();
+                v.set_bit_code(bit, new_code);
+                self.nba_fast.push(NbaFast {
+                    signal_id: id,
+                    value: v,
+                    block_index: 0,
+                });
+            }
         } else if self.signal_table[id].set_bit_code(bit, new_code) {
+            // Combinational UDP: propagate immediately, like a continuous assign.
             self.table_modified = true;
             self.after_signal_write(id);
             self.mark_dirty_id(id);
