@@ -17057,6 +17057,37 @@ impl Simulator {
         }
     }
 
+    /// Phase 2 (§9.3.3 `break`/`continue` in suspend-aware loops): when a
+    /// blocking loop is RE-ENTERED in the flattened process stream after its
+    /// body ran, decide what to do with the loop-control flags the body set.
+    ///
+    /// Returns `true` if the caller should EXIT this loop now (`break`/
+    /// `return` — skip to the statement after the loop); `false` if the loop
+    /// should PROCEED (re-enter for the next iteration, or first entry).
+    ///
+    /// - `return_flag` (set with `break_flag` by a `return` in an inlined
+    ///   task body): do NOT consume — unwind to the task's ScopePop is driven
+    ///   by the top-of-loop `return_flag` skip. Exit this loop.
+    /// - `break_flag` alone: the body's `break` exits this loop — consume it
+    ///   (clear break+continue) and exit.
+    /// - `continue_flag` alone: consume it and proceed (re-enter the next
+    ///   iteration); the body statements after the `continue` were already
+    ///   skipped by `exec_statement`'s flag-check at entry.
+    ///
+    /// First entry (all flags clear) is a no-op → proceed normally.
+    fn blocking_loop_flag_gate(&mut self) -> bool {
+        if self.return_flag {
+            return true;
+        }
+        if self.break_flag {
+            self.break_flag = false;
+            self.continue_flag = false;
+            return true;
+        }
+        self.continue_flag = false;
+        false
+    }
+
     fn run_process_stmts(&mut self, pid: usize, stmts: &[Statement]) {
         self.current_pid = pid;
         // Track run_process_stmts recursion depth so the suspend-aware loop
@@ -17861,6 +17892,11 @@ impl Simulator {
                 // m_select_sequence loop) so each iteration suspends via the
                 // suspend-aware path instead of spinning synchronously.
                 if self.stmt_has_event_wait(body) || self.stmt_is_blocking(body) {
+                    if self.blocking_loop_flag_gate() {
+                        // `break`/`return` exits the while loop.
+                        i += 1;
+                        continue;
+                    }
                     let cond_val = self.eval_expr(condition).is_true();
                     if cond_val {
                         let body_stmts = match &body.kind {
@@ -17998,12 +18034,177 @@ impl Simulator {
                         // target already terminated — fall through
                     }
                 }
+                // INTERNAL: `ForeachTail` continuation sentinel — run the
+                // next iteration (or exit) of a blocking-body `foreach`.
+                // §9.4.3: a process blocked inside the loop body resumes HERE,
+                // at the next iteration, not by restarting the whole foreach.
+                if let StatementKind::ForeachTail {
+                    loop_var,
+                    var_scope,
+                    body,
+                    keys,
+                    is_str,
+                    idx,
+                    fe_auto_len,
+                    live_size_name,
+                } = &stmt.kind
+                {
+                    // A `return` from an inlined task body propagates to the
+                    // task's ScopePop (handled by the top-of-loop return_flag
+                    // skip). Just exit this foreach without consuming flags.
+                    if self.return_flag {
+                        self.auto_loop_vars.truncate(*fe_auto_len);
+                        i += 1;
+                        continue;
+                    }
+                    // A `break` (set WITHOUT return_flag) exits this loop —
+                    // consume it, mirroring the synchronous `while` at L30181.
+                    if self.break_flag {
+                        self.break_flag = false;
+                        self.continue_flag = false;
+                        self.auto_loop_vars.truncate(*fe_auto_len);
+                        i += 1;
+                        continue;
+                    }
+                    self.continue_flag = false;
+                    // Bounds check. For dynamic arrays/queues whose size can
+                    // change between iterations (because the body suspended
+                    // and another process shrunk the collection), re-check the
+                    // LIVE size instead of the frozen key count.
+                    let exhausted = if let Some(ln) = live_size_name {
+                        *idx as u64 >= self.get_queue_size(ln)
+                    } else {
+                        *idx >= keys.len()
+                    };
+                    if exhausted {
+                        // loop exhausted — restore automatic-loop-var scope
+                        self.auto_loop_vars.truncate(*fe_auto_len);
+                        i += 1;
+                        continue;
+                    }
+                    // advance the loop variable to keys[idx]
+                    if let Some(vn) = loop_var {
+                        // For a live-size collection, synthesize the index key
+                        // from `idx` (the frozen keys may be stale).
+                        let key_str = if live_size_name.is_some() {
+                            idx.to_string()
+                        } else {
+                            keys[*idx].clone()
+                        };
+                        let kv = if *is_str {
+                            Value::from_string(&key_str)
+                        } else {
+                            Value::from_u64(key_str.parse::<u64>().unwrap_or(0), 32)
+                        };
+                        self.set_loop_var_aliased(var_scope.as_deref(), vn, kv);
+                    }
+                    let body_stmts = match &body.kind {
+                        StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                        _ => vec![(**body).clone()],
+                    };
+                    let mut cont = body_stmts;
+                    cont.push(Statement::new(
+                        StatementKind::ForeachTail {
+                            loop_var: loop_var.clone(),
+                            var_scope: var_scope.clone(),
+                            body: body.clone(),
+                            keys: keys.clone(),
+                            is_str: *is_str,
+                            idx: idx + 1,
+                            fe_auto_len: *fe_auto_len,
+                            live_size_name: live_size_name.clone(),
+                        },
+                        stmt.span,
+                    ));
+                    cont.extend_from_slice(&stmts[i + 1..]);
+                    self.continue_stmts_or_trampoline(pid, cont);
+                    return;
+                }
+                // Blocking-body `foreach` (single loop variable): unroll one
+                // iteration and re-append a `ForeachTail` sentinel, exactly
+                // like the `while`/`for` unroll above, so a `wait`/`#delay`
+                // inside the body (often nested several inlined-task frames
+                // deep — UVM's `foreach (siblings[sib])
+                // sib.wait_for_state(…)`) parks and resumes at the NEXT
+                // iteration instead of restarting from index 0. The previous
+                // `exec_park_cont` replay re-ran the whole loop (and its
+                // bodies' pre-wait side effects), corrupting consuming
+                // handshakes and never actually blocking on DORMANT siblings.
+                if let StatementKind::Foreach { array, vars, body } = &stmt.kind {
+                    if self.stmt_is_blocking(body) {
+                        if let Some((keys, is_str, var_scope, live_size_name)) =
+                            self.foreach_materialize_keys_1d(array, vars)
+                        {
+                            let fe_names: Vec<String> = vars
+                                .iter()
+                                .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
+                                .collect();
+                            let fe_auto_len = self.auto_loop_vars.len();
+                            // foreach index vars are automatic (§9.7.3); like
+                            // for-init vars, record for fork capture.
+                            if self.local_stack.last().is_none() {
+                                for nm in &fe_names {
+                                    self.auto_loop_vars.push(nm.clone());
+                                }
+                            }
+                            let loop_var =
+                                vars.first().and_then(|v| v.as_ref().map(|id| id.name.clone()));
+                            if let Some(vn) = &loop_var {
+                                self.widths.insert(vn.clone(), 32);
+                            }
+                            if keys.is_empty() {
+                                self.auto_loop_vars.truncate(fe_auto_len);
+                                i += 1;
+                                continue;
+                            }
+                            // run the FIRST iteration now
+                            if let Some(vn) = &loop_var {
+                                let kv = if is_str {
+                                    Value::from_string(&keys[0])
+                                } else {
+                                    Value::from_u64(keys[0].parse::<u64>().unwrap_or(0), 32)
+                                };
+                                self.set_loop_var_aliased(var_scope.as_deref(), vn, kv);
+                            }
+                            self.continue_flag = false;
+                            let body_stmts = match &body.kind {
+                                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                                _ => vec![(**body).clone()],
+                            };
+                            let mut cont = body_stmts;
+                            cont.push(Statement::new(
+                                StatementKind::ForeachTail {
+                                    loop_var,
+                                    var_scope,
+                                    body: body.clone(),
+                                    keys,
+                                    is_str,
+                                    idx: 1,
+                                    fe_auto_len,
+                                    live_size_name,
+                                },
+                                stmt.span,
+                            ));
+                            cont.extend_from_slice(&stmts[i + 1..]);
+                            self.continue_stmts_or_trampoline(pid, cont);
+                            return;
+                        }
+                        // else: multi-var / unhandled shape → fall through to
+                        // the synchronous exec_statement (exec_park_cont) below.
+                    }
+                }
                 // Set up a parking continuation for blocking waits inside
                 // loop bodies (foreach) processed by exec_statement's
                 // synchronous path. exec_statement's Wait handler reads this
                 // to park the process with `[stmt, rest]` when a wait
                 // condition is false, so the process re-runs this statement
                 // when resumed.
+                //
+                // FALLBACK only: the common single-loop-variable case is
+                // handled by the suspend-aware unroll above (which resumes at
+                // the NEXT iteration per §9.4.3). This replay-from-zero path
+                // remains for multi-variable / unhandled shapes that
+                // `foreach_materialize_keys_1d` declined.
                 if matches!(&stmt.kind, StatementKind::Foreach { .. }) {
                     self.exec_park_cont = Some({
                         let mut c = vec![stmt.clone()];
@@ -27653,6 +27854,10 @@ impl Simulator {
                     self.unwind_task_frame(c);
                 }
             }
+            // INTERNAL continuation sentinel — only meaningful in the
+            // suspend-aware `run_process_stmts` stream. If reached here
+            // (synchronous exec), it is a no-op.
+            StatementKind::ForeachTail { .. } => {}
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
                 // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
@@ -38609,6 +38814,132 @@ impl Simulator {
                 }
             }
         }
+    }
+
+    /// Compute the iteration keys for a named array/collection
+    /// (`<name>.size` dense fallback, else raw key-scan of `<name>[…]`).
+    /// Returns `(keys, is_str)`. Integer keys are sorted numerically.
+    fn array_iter_keys(&self, name: &str) -> (Vec<String>, bool) {
+        // A queue / dynamic array carries an authoritative `<name>.size`
+        // shadow and is DENSE: iterate the logical range [0, size). Scanning
+        // the raw signal keys instead would visit stale elements left behind
+        // when the queue shrank. Only TRUE associative arrays (sparse) fall
+        // through to the key-scan.
+        if let Some(sz) = self
+            .signals
+            .get(&format!("{}.size", name))
+            .and_then(|v| v.to_u64())
+        {
+            return ((0..sz).map(|i| i.to_string()).collect(), false);
+        }
+        let prefix = format!("{}[", name);
+        let mut ks: Vec<String> = self
+            .signals
+            .keys()
+            .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
+            .map(|k| k[prefix.len()..k.len() - 1].to_string())
+            .collect();
+        let is_str = self
+            .module
+            .associative_arrays
+            .get(name)
+            .copied()
+            .unwrap_or(false);
+        if is_str {
+            ks.sort();
+        } else {
+            ks.sort_by_key(|k| k.parse::<u64>().unwrap_or(0));
+        }
+        (ks, is_str)
+    }
+
+    /// Materialize the iteration keys for a SINGLE-loop-variable `foreach`
+    /// (the UVM phase `foreach (siblings[sib]) …` shape, and ordinary 1-D
+    /// fixed/dynamic/assoc arrays). Returns `(keys, is_str, var_scope)` on
+    /// success — `var_scope` is the array's instance prefix for aliased loop
+    /// vars (submodule foreach). Returns `None` for multi-variable or
+    /// unhandled shapes (caller falls back to the synchronous path).
+    fn foreach_materialize_keys_1d(
+        &mut self,
+        array: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+    ) -> Option<(Vec<String>, bool, Option<String>, Option<String>)> {
+        if vars.len() != 1 {
+            return None;
+        }
+        // Class-member / collection associative array resolved via
+        // expr_assoc_name (handles `obj.assoc_member[k]`, array-element bases,
+        // etc.) — the UVM phase-siblings case.
+        if let Some(an) = self.expr_assoc_name(array) {
+            let (keys, is_str) = self.array_iter_keys(&an);
+            // A `.size`-shadowed collection (queue/dynamic) may shrink mid-
+            // loop; use live-size bounds for it.
+            let live = if self.signals.contains_key(&format!("{}.size", an)) {
+                Some(an)
+            } else {
+                None
+            };
+            return Some((keys, is_str, None, live));
+        }
+        // Direct named array (fixed / dynamic / assoc array or queue).
+        if let ExprKind::Ident(hier) = &array.kind {
+            let mut name = self.resolve_hier_name(hier);
+            if let Some(scoped) = self.instance_assoc_member(&name) {
+                name = scoped;
+            }
+            // A bare array name inside a SUBMODULE process resolves under the
+            // process's instance scope, like the synchronous foreach path.
+            if !self.module.arrays.contains_key(&name)
+                && !self.module.arrays_2d.contains_key(&name)
+                && !self.module.arrays_nd.contains_key(&name)
+                && !self.module.dynamic_arrays.contains(&name)
+                && !self.is_associative_array(&name)
+            {
+                let hint = self.name_resolve_hint.borrow().clone();
+                if let Some(h) = hint {
+                    let scoped = format!("{}.{}", h, name);
+                    if self.module.arrays.contains_key(&scoped)
+                        || self.module.arrays_2d.contains_key(&scoped)
+                        || self.module.arrays_nd.contains_key(&scoped)
+                        || self.module.dynamic_arrays.contains(&scoped)
+                        || self.is_associative_array(&scoped)
+                    {
+                        name = scoped;
+                    }
+                }
+            }
+            let var_scope: Option<String> =
+                name.rsplit_once('.').map(|(p, _)| p.to_string());
+            // Dispatch by storage type, mirroring the synchronous foreach
+            // (exec_statement's Ident arm).
+            if self.is_associative_array(&name) {
+                let (keys, is_str) = self.array_iter_keys(&name);
+                return Some((keys, is_str, var_scope, None));
+            }
+            if self.module.dynamic_arrays.contains(&name) {
+                let size = self.get_queue_size(&name);
+                let keys: Vec<String> = (0..size).map(|i| i.to_string()).collect();
+                return Some((keys, false, var_scope, Some(name)));
+            }
+            if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
+                let descending = self.module.descending_arrays.contains(&name);
+                let mut keys: Vec<String> = Vec::new();
+                let mut idx = lo;
+                while idx <= hi {
+                    let v = if descending { hi - (idx - lo) } else { idx };
+                    keys.push(v.to_string());
+                    idx += 1;
+                }
+                return Some((keys, false, var_scope, None));
+            }
+            // Queue / dynamic array surfaced via `.size` shadow only.
+            let (keys, is_str) = self.array_iter_keys(&name);
+            if keys.is_empty() {
+                return None;
+            }
+            return Some((keys, is_str, var_scope, Some(name)));
+        }
+        None
     }
 
     /// Push a fresh queue-local save frame on entry to a subroutine.
