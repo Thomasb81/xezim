@@ -1035,19 +1035,20 @@ struct EventWaiter {
     /// consulted afterwards — dropped.
     resolved_sensitivities: Vec<SensitivityId>,
     continuation: Vec<Statement>,
-    /// Value of `Simulator::snap_gen` when this waiter registered. A waiter
-    /// only fires on edges detected against a snapshot taken AFTER it
-    /// registered (`registered_snap_gen != snap_gen`). This protects a
-    /// waiter registered mid-tick from the tick's pre-registration edges —
-    /// notably the time-0 init pseudo-edges (prev seeded to X so every
-    /// initialized signal "fires" at the first check_edges) and the
-    /// re-registration of a `forever @(posedge clk)` loop against the edge
-    /// it just consumed. Unlike the old `registered_time == self.time`
-    /// guard, it does NOT suppress edges produced in LATER delta cycles of
-    /// the same timestamp (an inactive-region `#0 clk = 1;` toggle must
-    /// wake an `@(posedge clk)` waiter registered earlier at that time —
-    /// IEEE 1800-2023 §4.4.2.3, matching Icarus/commercial simulators).
-    registered_snap_gen: u64,
+    /// Each sensitivity signal's value captured AT registration time
+    /// (`raw_bits()` for the ≤64-bit fast path). The waiter fires when the
+    /// signal changes relative to this captured baseline — NOT the global
+    /// per-tick `prev_val` snapshot. This is what makes `nba <= v; @(nba)`
+    /// (UVM's `uvm_wait_for_nba_region`) work: the NBA commits to the new
+    /// value AFTER registration in the same tick, and the waiter must wake
+    /// for that change. It also subsumes the old `snap_gen` guard: a
+    /// `forever @(posedge clk)` re-registered just after consuming a
+    /// posedge captures clk's now-high value, so the consumed edge cannot
+    /// re-fire (IEEE 1800-2023 §9.4.2.3).
+    captured_prev: Vec<(u64, u64)>,
+    /// Full captured value for >64-bit sensitivity signals (parallel to
+    /// `captured_prev`); `None` for ≤64-bit signals.
+    captured_prev_wide: Vec<Option<Value>>,
 }
 
 /// Pad a string to a given width with spaces (or zeros if zero_pad).
@@ -2156,6 +2157,16 @@ pub struct Simulator {
     uvm_components: Vec<usize>,
     /// Set once the post-run phases have executed so they run exactly once.
     uvm_post_run_done: bool,
+    /// True once extract/check/report/final (+ report_summarize) have run,
+    /// whether by the genuine UVM library (PURE_SV_LRM, via `$finish`) or by
+    /// the shim. Prevents double-firing these stateful callbacks.
+    uvm_cleanup_done: bool,
+    /// Set when the genuine UVM library (PURE_SV_LRM) calls `$finish`, meaning
+    /// its own phase schedule ran the cleanup phases and report_summarize. The
+    /// shim's `end_run_phase` backstop checks this to avoid double-firing
+    /// extract/check/report/final, and the event-loop-exit backstop uses it to
+    /// decide whether cleanup still needs to run for objection-free tests.
+    genuine_uvm_finished: bool,
     /// UVM report-server tallies for the `--- UVM Report Summary ---` block
     /// emitted at end_run_phase: counts by severity [INFO, WARNING, ERROR,
     /// FATAL] and by message id (sorted). Populated at the report choke point.
@@ -2220,6 +2231,11 @@ pub struct Simulator {
     /// declared in `base_class` (so unrelated/inherited statics stay shared),
     /// giving each specialization its own cell (§8.25). None = shared cell.
     current_spec: Option<(String, String)>,
+    /// Tracks class names currently being constructed via the `type_id::create()`
+    /// PURE-mode shortcut, to prevent infinite recursion when a parameterized
+    /// class's constructor or static initializers re-enter `type_id::create()`
+    /// for the same class.
+    type_id_create_in_progress: HashSet<String>,
     /// Tracks which `(base, sig)` specializations have already had their
     /// static-call initializers run. Per §8.25/§6.21, each parameterized-class
     /// specialization has its own set of static properties, and side-effecting
@@ -4360,6 +4376,8 @@ impl Simulator {
             tb_cache: std::cell::RefCell::new(HashMap::default()),
             uvm_components: Vec::new(),
             uvm_post_run_done: false,
+            uvm_cleanup_done: false,
+            genuine_uvm_finished: false,
             uvm_sev_counts: [0; 4],
             uvm_id_counts: std::collections::BTreeMap::new(),
             tlm_connections: HashMap::default(),
@@ -4370,6 +4388,7 @@ impl Simulator {
             rand_ranges: HashMap::default(),
             class_statics: HashMap::default(),
             current_spec: None,
+            type_id_create_in_progress: HashSet::default(),
             initialized_spec_statics: std::collections::HashSet::default(),
             pending_spec_inits: Vec::new(),
             spec_init_depth: 0,
@@ -15351,11 +15370,30 @@ impl Simulator {
             .collect();
         // `sens` (Vec<Sensitivity>) is consumed for resolution and dropped;
         // EventWaiter only carries the resolved IDs from here on.
+        //
+        // Capture each sensitivity signal's current value at registration
+        // so the waiter fires on a change relative to THIS point (see the
+        // `captured_prev` field doc for the NBA reasoning).
+        let captured_prev: Vec<(u64, u64)> = resolved
+            .iter()
+            .map(|s| self.signal_table[s.signal_id].raw_bits())
+            .collect();
+        let captured_prev_wide: Vec<Option<Value>> = resolved
+            .iter()
+            .map(|s| {
+                if self.signal_widths[s.signal_id] > 64 {
+                    Some(self.signal_table[s.signal_id].clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
         EventWaiter {
             pid,
             resolved_sensitivities: resolved,
             continuation,
-            registered_snap_gen: self.snap_gen,
+            captured_prev,
+            captured_prev_wide,
         }
     }
 
@@ -16439,11 +16477,32 @@ impl Simulator {
             if let Some(b) = tick_barrier {
                 b.wait();
             }
+            // UVM phasing and objection handshakes legitimately spend many
+            // delta cycles at one timestamp: every `wait_for_waiters` does
+            // `#0`, and each `wait_for_state(DONE)` resume advances
+            // `cond_progress`. The zero-delay stall detector exists to catch
+            // livelocks (a process re-arming forever with nothing changing),
+            // NOT finite delta-dense settling. So only count an iteration
+            // toward `stall_iters` when the tick made NO wait-driven progress:
+            // reset the counter whenever `cond_progress` advanced. (The
+            // per-process `stall_pid_hits` detector still catches a single
+            // spinning process; `drain_edge_cascade`'s `cascade_limit` still
+            // catches NBA feedback loops.)
+            let cond_prog_before = self.cond_progress;
             self.run_one_tick(&mut accum, cascade_limit, iters, trace_loop);
+            if self.cond_progress != cond_prog_before {
+                self.stall_iters = 0;
+            }
             if let Some(b) = tick_barrier {
                 b.wait();
             }
             // UVM objection-driven run-phase end (after the drain elapses).
+            // In PURE_SV_LRM the genuine library normally completes via
+            // `$finish`; end_run_phase checks genuine_uvm_finished to avoid
+            // double-firing cleanup. It still must run for tests whose
+            // run_phase forever-loops aren't killed by m_phase_proc.kill()
+            // (not yet wired) — objections dropping is the only termination
+            // signal, so keep driving it.
             self.maybe_end_run_phase();
             // Periodic invariant check — every 1000 iters; bail on
             // mismatch to surface bugs early.
@@ -16458,6 +16517,17 @@ impl Simulator {
                     break;
                 }
             }
+        }
+        // PURE_SV_LRM backstop: tests with NO run-phase objections (e.g.
+        // 00hello) never trigger the objection-driven `end_run_phase`, and the
+        // genuine schedule's terminal propagation (uvm.uvm_end -> DONE) is not
+        // yet wired, so their genuine extract/check/report/final never fire.
+        // If we drained the event loop without the genuine library reaching
+        // `$finish` and without cleanup having run, run it now so the test
+        // gets its report_phase / PASSED output. run_uvm_cleanup_phases is
+        // idempotent, and genuine_uvm_finished gates the double-fire.
+        if self.pure_sv_lrm && !self.genuine_uvm_finished {
+            self.run_uvm_cleanup_phases();
         }
         if verify_inline_bits && !self.signal_inline_bits.is_empty() {
             let mismatches = self.verify_inline_bits_invariant(iters);
@@ -18372,6 +18442,78 @@ impl Simulator {
                 }
             }
 
+            // Suspend-aware Case (mirror of the If handler above). An inlined
+            // task body that is a `case` (e.g. UVM's `uvm_phase::wait_for_state`,
+            // `case(op) wait(...); endcase`) must select its arm HERE — falling
+            // through to `exec_statement(Case)` would run the matched arm's
+            // `wait` on the SYNCHRONOUS path, where a false condition with no
+            // foreach parking continuation silently falls through instead of
+            // blocking (IEEE 1800-2023 §9.7.4). Evaluate the selector ONCE
+            // (side-effect conditions must not double-fire), pick the first
+            // matching item or the default, and if the chosen arm blocks,
+            // flatten its body and recurse so its waits reach the suspend-aware
+            // Wait arm.
+            if let StatementKind::Case {
+                kind,
+                expr,
+                items,
+                unique_priority: _,
+            } = &stmt.kind
+            {
+                // Pattern case (`case(x) matches p: ...`) binds variables;
+                // delegate to the synchronous path which performs the bindings.
+                if !items.iter().any(|i| i.pattern.is_some()) {
+                    let val = self.eval_expr(expr);
+                    let chosen: Option<&Statement> = items.iter().find_map(|item| {
+                        if item.is_default {
+                            return None;
+                        }
+                        for pat in &item.patterns {
+                            let hit = match kind {
+                                CaseKind::CaseInside => self.case_inside_match(&val, pat),
+                                CaseKind::Casez => {
+                                    let pv = self.eval_expr(pat);
+                                    val.casez_eq(&pv).is_true()
+                                }
+                                CaseKind::Casex => {
+                                    let pv = self.eval_expr(pat);
+                                    val.casex_eq(&pv).is_true()
+                                }
+                                _ => {
+                                    let pv = self.eval_expr(pat);
+                                    val.case_eq(&pv).is_true()
+                                }
+                            };
+                            if hit {
+                                return Some(&item.stmt);
+                            }
+                        }
+                        None
+                    }).or_else(|| {
+                        items
+                            .iter()
+                            .find(|item| item.is_default)
+                            .map(|item| &item.stmt)
+                    });
+                    match chosen {
+                        Some(arm) if self.stmt_is_blocking(arm) => {
+                            let arm_stmts: Vec<Statement> = match &arm.kind {
+                                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                                _ => vec![arm.clone()],
+                            };
+                            let mut cont = arm_stmts;
+                            cont.extend_from_slice(&stmts[i + 1..]);
+                            self.run_process_stmts(pid, &cont);
+                            return;
+                        }
+                        Some(arm) => self.exec_statement(arm),
+                        None => {}
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+
             // A `for` loop with a blocking body (e.g. a UVM sequence's
             // `for (i=0; i<n; i++) `uvm_do(req)`) must iterate via the
             // suspend-aware path — otherwise the synchronous exec runs the
@@ -19710,9 +19852,31 @@ impl Simulator {
     /// Check edge: compare signal_table[id] vs (prev_val[id], prev_xz[id]).
     #[inline]
     fn check_edge_id(&self, id: usize, edge: EdgeKind) -> bool {
+        self.edge_fires_prev(
+            id,
+            edge,
+            self.prev_val[id],
+            self.prev_xz[id],
+            self.prev_wide.get(&id),
+        )
+    }
+
+    /// Edge comparison against an EXPLICIT prev baseline (rather than the
+    /// global `prev_val`/`prev_xz` snapshot). Used by event_waiters, which
+    /// capture each sensitivity's value at registration so they fire on a
+    /// change relative to that point — critical for `nba <= v; @(nba)`
+    /// (UVM's uvm_wait_for_nba_region), where the NBA commits to the new
+    /// value AFTER registration in the same tick and the waiter must wake
+    /// (IEEE 1800-2023 §4.10, §9.4.2.3).
+    fn edge_fires_prev(
+        &self,
+        id: usize,
+        edge: EdgeKind,
+        prev_v: u64,
+        prev_x: u64,
+        prev_wide: Option<&Value>,
+    ) -> bool {
         let (cur_v, cur_x) = self.signal_table[id].raw_bits();
-        let prev_v = self.prev_val[id];
-        let prev_x = self.prev_xz[id];
         // LogicBit at bit 0: One iff v&1==1 && x&1==0; Zero iff v&1==0 && x&1==0.
         let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
         let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
@@ -19723,7 +19887,7 @@ impl Simulator {
             EdgeKind::Negedge => !pb_zero && cb_zero,
             EdgeKind::AnyEdge => {
                 if self.signal_widths[id] > 64 {
-                    if let Some(p) = self.prev_wide.get(&id) {
+                    if let Some(p) = prev_wide {
                         return self.signal_table[id] != *p;
                     }
                 }
@@ -20969,21 +21133,11 @@ impl Simulator {
         self.event_waiters_swap.clear();
         let mut triggered_conts: Vec<(usize, Vec<Statement>)> = Vec::new();
         for waiter in waiters {
-            // Skip waiters registered since the last snapshot: the prev
-            // values their edges would be checked against were captured
-            // BEFORE they registered, so a detected "edge" may predate the
-            // registration (time-0 init pseudo-edges, a forever-@ loop
-            // re-registering against the edge it just consumed). Waiters
-            // registered in an EARLIER delta cycle of this same timestamp
-            // stay eligible — an inactive-region (`#0`) toggle or an NBA
-            // commit at the current time must wake them (§4.4.2.3/§4.4.5).
-            if waiter.registered_snap_gen == self.snap_gen {
-                self.event_waiters_swap.push(waiter);
-                continue;
-            }
             let mut triggered = false;
-            for sid in &waiter.resolved_sensitivities {
-                if !self.check_edge_id(sid.signal_id, sid.edge) {
+            for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
+                let (pv, px) = waiter.captured_prev[i];
+                let pw = waiter.captured_prev_wide[i].as_ref();
+                if !self.edge_fires_prev(sid.signal_id, sid.edge, pv, px, pw) {
                     continue;
                 }
                 // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
@@ -33227,6 +33381,13 @@ impl Simulator {
                     let bt = std::backtrace::Backtrace::force_capture();
                     eprintln!("[xezim][trace] {} called at sim_time={}\n{}",
                               name, self.time, bt);
+                }
+                // PURE_SV_LRM: the genuine UVM library reached `$finish`, so its
+                // phase schedule ran the cleanup phases + report_summarize. Mark
+                // it so the shim's objection-driven end_run_phase backstop does
+                // NOT re-fire them (double-exec would break stateful callbacks).
+                if self.pure_sv_lrm {
+                    self.genuine_uvm_finished = true;
                 }
                 self.finished = true;
             }
@@ -47324,8 +47485,27 @@ impl Simulator {
         {
             if name.name.name.contains("registry") {
                 if let Some(first) = type_args.first() {
-                    if let ExprKind::Ident(hier) = &first.kind {
-                        let leaf = hier.path.last().unwrap().name.name.clone();
+                    // The first type arg is the registered class. It can be:
+                    //   1. A plain `Ident` (non-parameterized class): my_comp
+                    //   2. A `Specialization` (parameterized class): C#(T)
+                    //      — e.g. `uvm_resource_db_default_implementation_t#(T)`
+                    //        whose `type_id` typedef is
+                    //        `uvm_object_registry#(uvm_resource_db_default_implementation_t#(T), "...")`
+                    // Extract the leaf class name from whichever form.
+                    let leaf_opt = match &first.kind {
+                        ExprKind::Ident(hier) => {
+                            Some(hier.path.last().unwrap().name.name.clone())
+                        }
+                        ExprKind::Specialization { base, .. } => {
+                            if let ExprKind::Ident(hier) = &base.kind {
+                                Some(hier.path.last().unwrap().name.name.clone())
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(leaf) = leaf_opt {
                         // The registered type is often a class-local typedef
                         // alias, not the class itself — e.g. UVM's
                         // `uvm_sequencer` declares
@@ -48294,13 +48474,24 @@ impl Simulator {
                     if inner_member.name.as_str() == "type_id" {
                         if let ExprKind::Ident(hier) = &inner_expr.kind {
                             let class_name = hier.path[0].name.name.clone();
-                            if let Some(target) =
-                                self.resolve_type_id_target_class(&class_name)
-                            {
-                                if let Some(class_def) =
-                                    self.module.classes.get(&target).cloned()
+                            // Guard against infinite recursion: a parameterized
+                            // uvm_component's constructor (or its static/property
+                            // initializers) may re-enter `type_id::create()` for
+                            // the same class during construction. If we're already
+                            // constructing this class via the shortcut, fall
+                            // through to the factory bridge instead.
+                            if !self.type_id_create_in_progress.contains(&class_name) {
+                                if let Some(target) =
+                                    self.resolve_type_id_target_class(&class_name)
                                 {
-                                    return self.instantiate_class(&class_def, args);
+                                    if let Some(class_def) =
+                                        self.module.classes.get(&target).cloned()
+                                    {
+                                        self.type_id_create_in_progress.insert(class_name.clone());
+                                        let r = self.instantiate_class(&class_def, args);
+                                        self.type_id_create_in_progress.remove(&class_name);
+                                        return r;
+                                    }
                                 }
                             }
                             // `typedef uvm_sequencer#(item) sqr_t; sqr_t::type_id::
@@ -51554,6 +51745,19 @@ impl Simulator {
                         .unwrap_or(concrete);
                     instance.type_bindings.insert(tp_name.clone(), resolved);
                 }
+            } else if let Some((b, _)) = &self.current_spec {
+                // No explicit type_args carried this param, but the active
+                // specialization (`current_spec`) targets THIS class —
+                // resolve the type param from it. This covers
+                // `C#(int)::type_id::create()` where the factory intercept
+                // constructs `C` without forwarding the `#(int)` args: the
+                // outer `eval_call` already set `current_spec = (C, "int")`,
+                // so `resolve_type_param_binding("T")` yields `int`.
+                if *b == class_def.name {
+                    if let Some(resolved) = self.resolve_type_param_binding(tp_name) {
+                        instance.type_bindings.insert(tp_name.clone(), resolved);
+                    }
+                }
             }
         }
         // Capture the active specialization on the instance when it targets
@@ -52391,20 +52595,22 @@ impl Simulator {
         }
     }
 
-    /// Triggered when the run-phase objection count returns to 0 (after a
-    /// raise) and the drain has elapsed.
-    fn end_run_phase(&mut self) {
-        if self.uvm_post_run_done {
+    /// Run the post-run function phases (extract/check/report/final) across
+    /// all live uvm_components, then emit the UVM Report Summary. Mirrors what
+    /// `uvm_root::run_test` does after the run domain ends. Idempotent via
+    /// `uvm_cleanup_done`.
+    fn run_uvm_cleanup_phases(&mut self) {
+        if self.uvm_cleanup_done {
             return;
         }
-        self.uvm_post_run_done = true;
+        self.uvm_cleanup_done = true;
         let mut comps = self.uvm_components.clone();
         if comps.is_empty() {
-            // PURE_SV_LRM: the real UVM phaser builds components via the factory,
-            // not the route-B bootstrap that fills `uvm_components` — so collect
-            // every live uvm_component from the heap for the post-run phases
-            // (extract/check/report/final). Without this a pure run ended with an
-            // empty summary and no monitor `report_phase` (COLLECTED PACKETS).
+            // PURE_SV_LRM: the real UVM phaser builds components via the
+            // factory, not the route-B bootstrap that fills `uvm_components` —
+            // so collect every live uvm_component from the heap. Without this
+            // a pure run ended with an empty summary and no monitor
+            // `report_phase` (COLLECTED PACKETS).
             for i in 1..self.heap.len() {
                 if let Some(cn) = self
                     .heap
@@ -52436,8 +52642,31 @@ impl Simulator {
             }
         }
         // uvm_root::run_test calls report_server.report_summarize() after the
-        // report phase — emit the summary block before $finish.
+        // report phase — emit the summary block.
         self.emit_uvm_report_summary();
+    }
+
+    /// Triggered when the run-phase objection count returns to 0 (after a
+    /// raise) and the drain has elapsed. In PURE_SV_LRM this only TERMINATES
+    /// the sim (sets `finished`); it never runs the cleanup phases itself —
+    /// those are run either by the genuine UVM library (which calls `$finish`
+    /// after its own extract/check/report/final) or by the event-loop-exit
+    /// backstop (for objection-free tests whose genuine schedule deadlocks).
+    /// Centralising termination here lets the `genuine_uvm_finished` flag
+    /// prevent double-firing regardless of the tick-level race between
+    /// objection-drop and genuine `$finish`.
+    fn end_run_phase(&mut self) {
+        if self.uvm_post_run_done {
+            return;
+        }
+        self.uvm_post_run_done = true;
+        if self.pure_sv_lrm {
+            // Legacy shim mode is the only path that runs cleanup here. In
+            // pure mode the genuine library + exit backstop own cleanup.
+            self.finished = true;
+            return;
+        }
+        self.run_uvm_cleanup_phases();
         self.finished = true;
     }
 
