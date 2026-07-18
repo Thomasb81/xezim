@@ -409,3 +409,33 @@ endmodule
         "simulation should complete despite the malformed table:\n{stdout}"
     );
 }
+
+/// A chain of sequential UDPs (DFF cells) must behave as a shift register:
+/// each stage captures the PREVIOUS stage's OLD value on the clock edge, not
+/// the new one. A comb-style immediate output write collapses the chain
+/// (every stage sees the new value in one edge). Verified against a commercial
+/// simulator AND Icarus: `xxx1 -> xx10 -> x100 -> 1000`. Regression guard for
+/// the NBA deferral of sequential UDP outputs.
+#[test]
+fn sequential_udp_chain_shifts_one_stage_per_clock() {
+    let src = r#"
+primitive dff(q,clk,d); output q; reg q; input clk,d;
+table (01) 0:?:0; (01) 1:?:1; (0?) 1:1:1; (0?) 0:0:0; (?0) ?:?:-; ? (??):?:-; endtable endprimitive
+module t; reg clk,din; wire q0,q1,q2,q3;
+ dff a(q0,clk,din); dff b(q1,clk,q0); dff c(q2,clk,q1); dff d(q3,clk,q2);
+ task tick; begin #1 clk=1; #1 clk=0; end endtask
+ initial begin clk=0;din=1;
+   tick; $display("C1 %b%b%b%b",q3,q2,q1,q0);
+   din=0; tick; $display("C2 %b%b%b%b",q3,q2,q1,q0);
+   tick; $display("C3 %b%b%b%b",q3,q2,q1,q0);
+   tick; $display("C4 %b%b%b%b",q3,q2,q1,q0);
+   $finish; end
+endmodule
+"#;
+    let sim = xezim::simulate(src, 100).expect("simulate");
+    let o: String = sim.output.iter().map(|m| m.message.clone()).collect::<Vec<_>>().join("\n");
+    assert!(o.contains("C1 xxx1"), "stage 1:\n{}", o);
+    assert!(o.contains("C2 xx10"), "stage 2:\n{}", o);
+    assert!(o.contains("C3 x100"), "stage 3:\n{}", o);
+    assert!(o.contains("C4 1000"), "stage 4 (shifted through):\n{}", o);
+}
