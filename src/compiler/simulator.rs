@@ -29088,10 +29088,10 @@ impl Simulator {
                 // `q.min()` parses as a Call, which the old match missed, so the
                 // result was a packed scalar written to a queue container signal
                 // that nothing reads — the destination came back as X.
-                if let Some((arr_name, mname, filter)) = self.locator_call(rvalue) {
+                if let Some((arr_name, mname, filter, iter_name)) = self.locator_call(rvalue) {
                     if let ExprKind::Ident(lhier) = &lvalue.kind {
                         let lname = self.resolve_hier_name(lhier);
-                        let idxs = self.locator_indices(&arr_name, &mname, filter.as_ref());
+                        let idxs = self.locator_indices_named(&arr_name, &mname, filter.as_ref(), iter_name.as_deref());
                         self.materialize_locator(&lname, &arr_name, &mname, &idxs);
                         if !self.in_edge_block {
                             self.settle_combinatorial();
@@ -44327,13 +44327,26 @@ impl Simulator {
     /// `(array, method, filter)` when `e` is a locator call on an array/queue,
     /// with or without a `with (...)` clause. `q.min()` parses as a Call, while
     /// `q.min` (no parens) parses as a 2-segment identifier.
-    fn locator_call(&mut self, e: &Expression) -> Option<(String, String, Option<Expression>)> {
+    fn locator_call(&mut self, e: &Expression) -> Option<(String, String, Option<Expression>, Option<String>)> {
         let (inner, filter) = match &e.kind {
             ExprKind::WithClause { expr, filter } => (expr.as_ref(), Some((**filter).clone())),
             _ => (e, None),
         };
+        // A custom iterator name from `find(x) with (x > 3)` — the first Call
+        // argument. Without capturing it the filter's `x` is unbound and the
+        // method wrongly returns an empty result.
+        let mut iter_name: Option<String> = None;
         let target = match &inner.kind {
-            ExprKind::Call { func, .. } => func.as_ref(),
+            ExprKind::Call { func, args } => {
+                if let Some(a0) = args.first() {
+                    if let ExprKind::Ident(h) = &a0.kind {
+                        if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                            iter_name = Some(h.path[0].name.name.clone());
+                        }
+                    }
+                }
+                func.as_ref()
+            }
             _ => inner,
         };
         let (arr, mname) = match &target.kind {
@@ -44351,7 +44364,7 @@ impl Simulator {
             return None;
         }
         if self.module.arrays.contains_key(&arr) || self.module.dynamic_arrays.contains(&arr) {
-            Some((arr, mname, filter))
+            Some((arr, mname, filter, iter_name))
         } else {
             None
         }
@@ -44366,6 +44379,16 @@ impl Simulator {
         arr: &str,
         method: &str,
         filter: Option<&Expression>,
+    ) -> Vec<usize> {
+        self.locator_indices_named(arr, method, filter, None)
+    }
+
+    fn locator_indices_named(
+        &mut self,
+        arr: &str,
+        method: &str,
+        filter: Option<&Expression>,
+        iter_name: Option<&str>,
     ) -> Vec<usize> {
         let size = self.get_queue_size(arr) as usize;
         if size == 0 {
@@ -44393,6 +44416,11 @@ impl Simulator {
                 .unwrap_or_else(|| Value::zero(32));
             if let Some(f) = self.local_stack.last_mut() {
                 f.insert("item".to_string(), v.clone());
+                if let Some(nm) = iter_name {
+                    if nm != "item" {
+                        f.insert(nm.to_string(), v.clone());
+                    }
+                }
             }
             match filter {
                 Some(f) => {
