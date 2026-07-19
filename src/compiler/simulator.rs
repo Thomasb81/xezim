@@ -2014,6 +2014,13 @@ pub struct Simulator {
     pub widths: HashMap<String, u32>,
     pub signed_signals: HashSet<String>,
     pub real_signals: HashSet<String>,
+    /// Base names of 2D/ND UNPACKED arrays (union of `module.arrays_2d` and
+    /// `module.arrays_nd` keys). The bytecode compiler consults this so a
+    /// continuous-assign LHS `m[0][j]` on a genuine 2D array is NOT mistaken
+    /// for a flattened-signal bit-select (`flattened_outer_zero_signal_id`) —
+    /// it must bail to the interpreter's element-aware path like `m[1][j]`
+    /// already does. Computed once at construction.
+    pub multi_dim_array_names: HashSet<String>,
     /// Fast prev signal table for edge detection (indexed by signal_id).
     /// SoA storage for "previous-iter" edge-detection state (A3 from the
     /// compression analysis). Replaces `prev_table: Vec<Value>` for signals
@@ -4333,6 +4340,13 @@ impl Simulator {
             .collect();
         let num_signals_at_init = signal_table.len();
 
+        let multi_dim_array_names: HashSet<String> = module
+            .arrays_2d
+            .keys()
+            .chain(module.arrays_nd.keys())
+            .cloned()
+            .collect();
+
         let mut sim = Self {
             prev_val,
             prev_xz,
@@ -4347,6 +4361,7 @@ impl Simulator {
             widths,
             signed_signals,
             real_signals,
+            multi_dim_array_names,
             forced_signals: HashMap::default(),
             forced_names: HashSet::default(),
             signal_has_xz: signal_has_xz_init,
@@ -11109,6 +11124,7 @@ impl Simulator {
             compiler.set_tasks(&self.module.tasks);
             compiler.set_params(&self.module.parameters);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
             compiler.set_string_signals(&self.module.string_signals);
             compiler.top_module_name = Some(self.module.name.clone());
             if compiler.compile_stmt(&block.stmt) {
@@ -13418,6 +13434,7 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.top_module_name = Some(self.module.name.clone());
                 if compiler.compile_cont_assign(&ca.rhs, dst_id, width) {
                     CombItem::CompiledContAssign {
@@ -13469,6 +13486,7 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.top_module_name = Some(self.module.name.clone());
                 let lhs_w = compiler.infer_lhs_width_pub(&ca.lhs);
                 if lhs_w > 0 && compiler.compile_cont_assign_lhs(&ca.lhs, &ca.rhs, lhs_w) {
@@ -13720,6 +13738,7 @@ impl Simulator {
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_params(&self.module.parameters);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                     compiler.top_module_name = Some(self.module.name.clone());
                     // Enable AST fallback so partially-unsupported constructs
                     // compile to StmtFallback insns instead of failing the
