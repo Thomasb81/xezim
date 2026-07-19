@@ -1558,6 +1558,12 @@ struct SvaClockedSite {
     /// current signal values BEFORE the body evaluation (so the body
     /// sees the previous-cycle snapshots).
     past_snapshots: HashMap<String, std::collections::VecDeque<Value>>,
+    /// LRM §16.5 pass/fail action blocks (`assert property (...) <pass>
+    /// else <fail>;`). Run when the property tallies a non-vacuous
+    /// pass / a fail at a clock fire — so a failing concurrent assertion
+    /// actually reports (e.g. its `else $error(...)`), not just tallies.
+    pass_action: Option<Statement>,
+    fail_action: Option<Statement>,
 }
 
 #[derive(Debug, Clone)]
@@ -31302,6 +31308,8 @@ impl Simulator {
                                 s_eventually: Vec::new(),
                                 s_always: Vec::new(),
                                 past_snapshots: HashMap::default(),
+                                pass_action: a.action.as_deref().cloned(),
+                                fail_action: a.else_action.as_deref().cloned(),
                             });
                         }
                         return;
@@ -34455,6 +34463,19 @@ impl Simulator {
     ///   3. If `|=>`, push consequent with cycles_remaining=1.
     ///      If `lhs ##N rhs` (Binary{HashHash, …}), push rhs with N.
     ///      If `|->`, tally `!lhs || rhs` immediately.
+    /// LRM §16.5 — run a concurrent assertion's pass/fail action block at a
+    /// clock fire (`assert property (...) <pass> else <fail>;`). Cloned out of
+    /// the site first so the exec holds no borrow on `sva_sites`. A vacuous pass
+    /// must NOT run the pass action, so callers pass `passed=false`/skip there.
+    fn fire_sva_action(&mut self, site_idx: usize, passed: bool) {
+        let act = self.sva_sites.get(site_idx).and_then(|s| {
+            if passed { s.pass_action.clone() } else { s.fail_action.clone() }
+        });
+        if let Some(stmt) = act {
+            self.exec_statement(&stmt);
+        }
+    }
+
     fn tick_sva_sites(&mut self) {
         if self.sva_sites.is_empty() {
             return;
@@ -34515,6 +34536,7 @@ impl Simulator {
                             fail_count: 0,
                         });
                     stat.pass_count += 1;
+                    self.fire_sva_action(i, true);
                 } else {
                     self.sva_sites[i].s_eventually.push(w);
                 }
@@ -34539,6 +34561,7 @@ impl Simulator {
                             fail_count: 0,
                         });
                     stat.fail_count += 1;
+                    self.fire_sva_action(i, false);
                 }
             }
             let span_key = self.sva_sites[i].span_key;
@@ -34557,6 +34580,7 @@ impl Simulator {
                 } else {
                     stat.fail_count += 1;
                 }
+                self.fire_sva_action(i, v);
             }
             // 2) Process the property body for this clock fire.
             let body = self.sva_sites[i].body.clone();
@@ -34769,6 +34793,7 @@ impl Simulator {
                 } else {
                     stat.fail_count += 1;
                 }
+                self.fire_sva_action(site_idx, outcome);
             }
             // Plain boolean body: tally directly each clock.
             _ => {
@@ -34786,6 +34811,7 @@ impl Simulator {
                 } else {
                     stat.fail_count += 1;
                 }
+                self.fire_sva_action(site_idx, outcome);
             }
         }
     }
