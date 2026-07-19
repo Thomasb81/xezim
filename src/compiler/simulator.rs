@@ -36,6 +36,8 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 static SIM_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+/// `--dump-timescales`: print every module's timescale before the run starts.
+static DUMP_TIMESCALES: AtomicBool = AtomicBool::new(false);
 static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 /// Opaque handle base for `process::self()` (IEEE 1800-2023 §9.7). The token is
@@ -154,6 +156,16 @@ const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
 
 pub fn set_sim_debug(enabled: bool) {
     SIM_DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// `--dump-timescales`: enable the pre-run per-module timescale dump.
+pub fn set_dump_timescales(enabled: bool) {
+    DUMP_TIMESCALES.store(enabled, Ordering::Relaxed);
+}
+
+#[inline]
+fn dump_timescales_enabled() -> bool {
+    DUMP_TIMESCALES.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -1026,6 +1038,15 @@ struct MailboxGetWaiter {
     is_peek: bool,
 }
 
+/// §15.4.1 — a process blocked on `mailbox.put(v)` because a BOUNDED mailbox is
+/// full. The value is captured at the (blocking) call; when a `get`/`try_get`
+/// frees a slot the value is stored and `cont` is rescheduled.
+struct MailboxPutWaiter {
+    pid: usize,
+    value: Value,
+    cont: Vec<Statement>,
+}
+
 /// A process waiting for a signal edge event.
 #[derive(Debug, Clone)]
 struct EventWaiter {
@@ -1305,6 +1326,30 @@ impl TimingWheel {
         self.overflow.keys().next().copied()
     }
 
+    /// Earliest scheduled time STRICTLY greater than `after`, if any. Used to
+    /// break a zero-delay (#0) livelock: when the current time slot can't make
+    /// progress but real events exist ahead, jump to them.
+    fn next_time_after(&self, after: u64) -> Option<u64> {
+        let base_slot = Self::slot(self.current_time);
+        let mut best: Option<u64> = None;
+        // Wheel events all live in [current_time, current_time+WHEEL_SIZE); each
+        // occupied slot maps to exactly one time in that window.
+        for slot in 0..WHEEL_SIZE {
+            if self.bitmap[slot >> 6] & (1u64 << (slot & 63)) == 0 {
+                continue;
+            }
+            let delta = (slot + WHEEL_SIZE - base_slot) % WHEEL_SIZE;
+            let t = self.current_time + delta as u64;
+            if t > after {
+                best = Some(best.map_or(t, |b| b.min(t)));
+            }
+        }
+        if let Some((&t, _)) = self.overflow.range((after + 1)..).next() {
+            best = Some(best.map_or(t, |b| b.min(t)));
+        }
+        best
+    }
+
     /// Remove and return all events at the given time.
     fn remove(&mut self, time: u64) -> EventList {
         self.current_time = time;
@@ -1538,6 +1583,12 @@ struct SvaClockedSite {
     /// current signal values BEFORE the body evaluation (so the body
     /// sees the previous-cycle snapshots).
     past_snapshots: HashMap<String, std::collections::VecDeque<Value>>,
+    /// LRM §16.5 pass/fail action blocks (`assert property (...) <pass>
+    /// else <fail>;`). Run when the property tallies a non-vacuous
+    /// pass / a fail at a clock fire — so a failing concurrent assertion
+    /// actually reports (e.g. its `else $error(...)`), not just tallies.
+    pass_action: Option<Statement>,
+    fail_action: Option<Statement>,
 }
 
 #[derive(Debug, Clone)]
@@ -2289,6 +2340,12 @@ pub struct Simulator {
     queue_frame_saves: Vec<HashMap<String, Vec<(String, Value)>>>,
     /// Built-in mailboxes (handle -> queue of values)
     mailboxes: HashMap<usize, std::collections::VecDeque<Value>>,
+    /// §15.4.1 bounded-mailbox capacity (handle -> bound). Absent or 0 means
+    /// UNBOUNDED — `try_put` never fails and `put` never blocks. `new(N)` with
+    /// N>0 records N here; a full box rejects `try_put` and parks `put`.
+    mailbox_bound: HashMap<usize, usize>,
+    /// Producers parked on `put` to a full bounded mailbox (handle -> queue).
+    mailbox_put_waiters: HashMap<usize, std::collections::VecDeque<MailboxPutWaiter>>,
     /// §18.13 rand_mode: per-instance set of rand properties whose
     /// randomization is currently disabled. `obj.x.rand_mode(0)` adds "x".
     /// `obj.rand_mode(0)` disables ALL rand props.
@@ -4404,6 +4461,8 @@ impl Simulator {
             string_signals: HashSet::default(),
             queue_frame_saves: Vec::new(),
             mailboxes: HashMap::default(),
+            mailbox_bound: HashMap::default(),
+            mailbox_put_waiters: HashMap::default(),
             rand_mode_disabled: HashMap::default(),
             constraint_mode_disabled: HashMap::default(),
             static_constraint_disabled: HashSet::default(),
@@ -10473,6 +10532,10 @@ impl Simulator {
         if !self.compiled {
             self.compile();
         }
+        // `--dump-timescales`: report every module's timescale before the run.
+        if dump_timescales_enabled() {
+            self.dump_module_timescales();
+        }
         let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
         let self_ptr = self as *mut Simulator;
         ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
@@ -10898,7 +10961,16 @@ impl Simulator {
                 // change of `s`. Route those through the edge path, which fires
                 // exactly on a change of a listed signal.
                 let self_ref = Self::body_is_self_referential(&body);
-                if all_level && !has_named_event && !self_ref {
+                // A body with a BLOCKING control (`#delay`, inner `@event`,
+                // `wait`) cannot go through the comb-settle path — that path
+                // strips the `@()` and re-runs the body in a zero-time settle
+                // loop, which drops the delay and (for `always @(a) #5 z=a`)
+                // spins/starves the rest of the schedule. The edge path DOES
+                // honor a delayed body (same as `always @(posedge clk) #1 q=d`),
+                // so route a blocking-bodied level block there instead.
+                if all_level && !has_named_event && !self_ref
+                    && !self.stmt_is_blocking(&body)
+                {
                     return Some(AlwaysBlock {
                         kind: ab.kind,
                         stmt: body,
@@ -16486,9 +16558,40 @@ impl Simulator {
                     self.stall_iters = 1;
                 }
                 if self.stall_limit > 0 && self.stall_iters > self.stall_limit {
-                    self.report_zero_delay_stall(None);
-                    self.finished = true;
-                    break;
+                    // Try to BREAK the zero-delay livelock: if real events are
+                    // scheduled AHEAD, defer the stuck current-time processes to
+                    // the next future event and advance time — a commercial
+                    // simulator lets time move past a #0 spinner (e.g. a
+                    // `#(period)` clock gen whose period is 0 during reset) once
+                    // its input is set later, rather than aborting the whole run.
+                    // Only a livelock with NOTHING ahead is fatal.
+                    let future = self
+                        .event_queue
+                        .next_time_after(self.time)
+                        .into_iter()
+                        .chain(next_clk_time.filter(|&t| t > self.time))
+                        .chain(next_delayed.filter(|&t| t > self.time))
+                        .chain(self.uvm_pending_end.filter(|&t| t > self.time))
+                        .min()
+                        .filter(|&t| t <= self.max_time);
+                    if let Some(ft) = future {
+                        let stuck = self.event_queue.remove(self.time);
+                        for (p, c) in stuck {
+                            self.event_queue.schedule(ft, p, c);
+                        }
+                        let inact = std::mem::take(&mut self.inactive_queue);
+                        for (p, c) in inact {
+                            self.event_queue.schedule(ft, p, c);
+                        }
+                        self.time = ft;
+                        self.stall_iters = 0;
+                        self.stall_time = ft;
+                        self.stall_pid_hits.clear();
+                    } else {
+                        self.report_zero_delay_stall(None);
+                        self.finished = true;
+                        break;
+                    }
                 }
             }
             if self.time > old_time && !self.dpi_next_time_cbs.is_empty() {
@@ -18215,6 +18318,29 @@ impl Simulator {
                             }
                         }
                     }
+                    // §15.4.1: blocking `mailbox.put(v)` on a FULL bounded
+                    // mailbox. Capture the value now, park the producer, and
+                    // return; a later get/try_get admits it and resumes here.
+                    if method == "put" && !args.is_empty() {
+                        if let Some(recv) = recv_expr_opt.clone() {
+                            let recv_val = self.eval_expr(&recv);
+                            let handle = recv_val.to_u64().unwrap_or(0) as usize;
+                            let bound = self.mailbox_bound.get(&handle).copied().unwrap_or(0);
+                            if bound > 0 {
+                                let len =
+                                    self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
+                                if len >= bound {
+                                    let value = self.eval_expr(&args[0]);
+                                    let cont: Vec<Statement> = stmts[i + 1..].to_vec();
+                                    self.mailbox_put_waiters
+                                        .entry(handle)
+                                        .or_insert_with(std::collections::VecDeque::new)
+                                        .push_back(MailboxPutWaiter { pid, value, cont });
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     // §15.3.3: blocking `semaphore.get(n)` on an under-full
                     // semaphore. Park until a `put` raises the count enough; the
                     // decrement happens at wake. A get that CAN proceed falls
@@ -19148,6 +19274,11 @@ impl Simulator {
                     | "try_next_item"
                     | "peek"
                     | "get"
+                    // §15.4.1: `put` blocks on a FULL bounded mailbox, so a
+                    // block containing one must flatten into the suspend-aware
+                    // runner. A non-mailbox / unbounded `put` simply falls
+                    // through the park handler (its handle has no bound).
+                    | "put"
                     | "wait_for_sequences"
                     | "get_response"
                     | "finish_item"
@@ -25760,7 +25891,16 @@ impl Simulator {
                     // only where both branches agree; otherwise X.
                     let t = self.eval_expr_ctx(then_expr, ctx_width);
                     let e = self.eval_expr_ctx(else_expr, ctx_width);
-                    t.merge_unknown(&e)
+                    // A REAL result cannot hold X, so the bitwise merge would
+                    // read the IEEE-754 bits of the operands as garbage (e.g. a
+                    // real `1000.0` came out as 4.65e18). §11.3.1: the result is
+                    // real when either branch is real — return a defined real
+                    // value (x condition → the else/false branch) instead.
+                    if t.is_real || e.is_real {
+                        e
+                    } else {
+                        t.merge_unknown(&e)
+                    }
                 } else if c.is_true() {
                     self.eval_expr_ctx(then_expr, ctx_width)
                 } else {
@@ -29871,6 +30011,7 @@ impl Simulator {
                                 } else {
                                     self.mailboxes
                                         .insert(handle, std::collections::VecDeque::new());
+                                    self.record_mailbox_bound(handle, args);
                                 }
                                 self.assign_value(lvalue, &Value::from_u64(handle as u64, 32).resize(w));
                                 if !self.in_edge_block {
@@ -29944,6 +30085,7 @@ impl Simulator {
                                     }));
                                     self.mailboxes
                                         .insert(handle, std::collections::VecDeque::new());
+                                    self.record_mailbox_bound(handle, args);
                                     Value::from_u64(handle as u64, 32)
                                 } else if let Some(class_def) =
                                     self.module.classes.get(&tname).cloned()
@@ -31687,6 +31829,8 @@ impl Simulator {
                                 s_eventually: Vec::new(),
                                 s_always: Vec::new(),
                                 past_snapshots: HashMap::default(),
+                                pass_action: a.action.as_deref().cloned(),
+                                fail_action: a.else_action.as_deref().cloned(),
                             });
                         }
                         return;
@@ -32528,26 +32672,57 @@ impl Simulator {
                                 };
                                 if let Some(class_def) = self.module.classes.get(cn).cloned() {
                                     if let Some(call_args) = is_new {
-                                        // Pass the declared type's `#(...)` args
-                                        // (e.g. `uvm_resource#(int) r = new()`) so
-                                        // the instance records its type bindings
-                                        // (`T -> int`) — needed for per-spec static
-                                        // member resolution (get_type vs
-                                        // get_type_handle → config_db GET).
-                                        let ta: Option<&[Expression]> = match data_type {
-                                            crate::ast::types::DataType::TypeReference {
-                                                type_args,
-                                                ..
-                                            } if !type_args.is_empty() => {
-                                                Some(type_args.as_slice())
+                                        // §8.12 copy constructor: `T x = new src;`
+                                        // with a single CLASS-HANDLE argument
+                                        // shallow-copies `src`, it does NOT run
+                                        // the constructor. The assignment path
+                                        // handles this; the decl-init path used
+                                        // to fall straight through to construction
+                                        // (passing the handle as an ignored ctor
+                                        // arg), so `T x = new src;` silently ran
+                                        // `new()` and produced a fresh object.
+                                        if call_args.len() == 1
+                                            && matches!(
+                                                &call_args[0].kind,
+                                                ExprKind::Ident(_)
+                                                    | ExprKind::MemberAccess { .. }
+                                                    | ExprKind::Index { .. }
+                                            )
+                                            && self.expr_is_class_handle(&call_args[0])
+                                        {
+                                            let src_h = self
+                                                .eval_expr(&call_args[0])
+                                                .to_u64()
+                                                .unwrap_or(0)
+                                                as usize;
+                                            if src_h != 0
+                                                && matches!(self.heap.get(src_h), Some(Some(_)))
+                                            {
+                                                produced = Some(self.copy_construct(src_h));
                                             }
-                                            _ => None,
-                                        };
-                                        produced = Some(self.instantiate_class_with_type_args(
-                                            &class_def,
-                                            &call_args,
-                                            ta,
-                                        ));
+                                        }
+                                        if produced.is_none() {
+                                            // Pass the declared type's `#(...)` args
+                                            // (e.g. `uvm_resource#(int) r = new()`) so
+                                            // the instance records its type bindings
+                                            // (`T -> int`) — needed for per-spec static
+                                            // member resolution (get_type vs
+                                            // get_type_handle → config_db GET).
+                                            let ta: Option<&[Expression]> = match data_type {
+                                                crate::ast::types::DataType::TypeReference {
+                                                    type_args,
+                                                    ..
+                                                } if !type_args.is_empty() => {
+                                                    Some(type_args.as_slice())
+                                                }
+                                                _ => None,
+                                            };
+                                            produced = Some(self.instantiate_class_with_type_args(
+                                                &class_def,
+                                                &call_args,
+                                                ta,
+                                            ));
+                                        }
                                     }
                                 } else if let Some(cg_def) =
                                     self.module.covergroups.get(cn).cloned()
@@ -33301,15 +33476,7 @@ impl Simulator {
                             .find(|i| i.path == cand)
                             .map(|i| i.def_name.clone())
                         {
-                            let ts = self
-                                .module
-                                .module_timescale_exp
-                                .get(&def)
-                                .copied()
-                                .unwrap_or((
-                                    self.module.timeunit_exp,
-                                    self.module.timeprecision_exp,
-                                ));
+                            let ts = self.reported_timescale_exp(&def);
                             found = Some((
                                 ts.0,
                                 ts.1,
@@ -33321,12 +33488,14 @@ impl Simulator {
                     match found {
                         Some(f) => f,
                         None => {
-                            let (u, p) = self.current_timescale_exp();
+                            let def = self.current_module_def().to_string();
+                            let (u, p) = self.reported_timescale_exp(&def);
                             (u, p, format!("{}.{}", self.module.name, rel))
                         }
                     }
                 } else {
-                    let (u, p) = self.current_timescale_exp();
+                    let def = self.current_module_def().to_string();
+                    let (u, p) = self.reported_timescale_exp(&def);
                     let scope = match self.process_scope_hint.get(&self.current_pid) {
                         Some(s) if !s.is_empty() => {
                             format!("{}.{}", self.module.name, s)
@@ -34444,13 +34613,27 @@ impl Simulator {
                         't' | 'T' => {
                             if ai < args.len() {
                                 // The argument carries a time in the scope's
-                                // unit. $time/$realtime compute it directly; any
-                                // other expression is read as scope-unit too.
+                                // unit. §20.3: `$realtime` keeps sub-unit
+                                // precision, but `$time`/`$stime` are the time
+                                // ROUNDED to the module unit (an integer) — `%t`
+                                // must format that rounded value, not the raw
+                                // simulation time. Any other expression is read
+                                // as a scope-unit value directly.
                                 let value = match &args[ai].kind {
                                     ExprKind::SystemCall { name, .. }
-                                        if matches!(name.as_str(), "$time" | "$realtime" | "$stime") =>
+                                        if name.as_str() == "$realtime" =>
                                     {
                                         self.time_in_current_unit()
+                                    }
+                                    ExprKind::SystemCall { name, .. }
+                                        if matches!(name.as_str(), "$time" | "$stime") =>
+                                    {
+                                        let r = self.time_in_current_unit().round();
+                                        if name.as_str() == "$stime" {
+                                            ((r as u64) & 0xFFFF_FFFF) as f64
+                                        } else {
+                                            r
+                                        }
                                     }
                                     _ => self.eval_expr(&args[ai]).to_f64(),
                                 };
@@ -34858,6 +35041,19 @@ impl Simulator {
     ///   3. If `|=>`, push consequent with cycles_remaining=1.
     ///      If `lhs ##N rhs` (Binary{HashHash, …}), push rhs with N.
     ///      If `|->`, tally `!lhs || rhs` immediately.
+    /// LRM §16.5 — run a concurrent assertion's pass/fail action block at a
+    /// clock fire (`assert property (...) <pass> else <fail>;`). Cloned out of
+    /// the site first so the exec holds no borrow on `sva_sites`. A vacuous pass
+    /// must NOT run the pass action, so callers pass `passed=false`/skip there.
+    fn fire_sva_action(&mut self, site_idx: usize, passed: bool) {
+        let act = self.sva_sites.get(site_idx).and_then(|s| {
+            if passed { s.pass_action.clone() } else { s.fail_action.clone() }
+        });
+        if let Some(stmt) = act {
+            self.exec_statement(&stmt);
+        }
+    }
+
     fn tick_sva_sites(&mut self) {
         if self.sva_sites.is_empty() {
             return;
@@ -34918,6 +35114,7 @@ impl Simulator {
                             fail_count: 0,
                         });
                     stat.pass_count += 1;
+                    self.fire_sva_action(i, true);
                 } else {
                     self.sva_sites[i].s_eventually.push(w);
                 }
@@ -34942,6 +35139,7 @@ impl Simulator {
                             fail_count: 0,
                         });
                     stat.fail_count += 1;
+                    self.fire_sva_action(i, false);
                 }
             }
             let span_key = self.sva_sites[i].span_key;
@@ -34960,6 +35158,7 @@ impl Simulator {
                 } else {
                     stat.fail_count += 1;
                 }
+                self.fire_sva_action(i, v);
             }
             // 2) Process the property body for this clock fire.
             let body = self.sva_sites[i].body.clone();
@@ -35172,6 +35371,7 @@ impl Simulator {
                 } else {
                     stat.fail_count += 1;
                 }
+                self.fire_sva_action(site_idx, outcome);
             }
             // Plain boolean body: tally directly each clock.
             _ => {
@@ -35189,6 +35389,7 @@ impl Simulator {
                 } else {
                     stat.fail_count += 1;
                 }
+                self.fire_sva_action(site_idx, outcome);
             }
         }
     }
@@ -37828,6 +38029,44 @@ impl Simulator {
                     }
                 }
                 _ => break,
+            }
+        }
+    }
+
+    /// §15.4.1 — record a bounded mailbox's capacity from its `new(N)` arg.
+    /// N absent or 0 leaves it unbounded (no entry).
+    fn record_mailbox_bound(&mut self, handle: usize, args: &[Expression]) {
+        let bound = args
+            .first()
+            .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as usize)
+            .unwrap_or(0);
+        if bound > 0 {
+            self.mailbox_bound.insert(handle, bound);
+        }
+    }
+
+    /// §15.4.1 — a slot just freed on a bounded mailbox: admit one parked `put`
+    /// (store its value, resume the producer). No-op for an unbounded mailbox or
+    /// when no producer is waiting.
+    fn admit_mailbox_put_waiter(&mut self, handle: usize) {
+        let bound = self.mailbox_bound.get(&handle).copied().unwrap_or(0);
+        if bound == 0 {
+            return;
+        }
+        let len = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
+        if len >= bound {
+            return;
+        }
+        if let Some(w) = self
+            .mailbox_put_waiters
+            .get_mut(&handle)
+            .and_then(|q| q.pop_front())
+        {
+            self.mailboxes.get_mut(&handle).unwrap().push_back(w.value);
+            if w.cont.is_empty() {
+                self.child_finished(w.pid);
+            } else {
+                self.event_queue.schedule(self.time, w.pid, w.cont);
             }
         }
     }
@@ -43030,6 +43269,54 @@ impl Simulator {
             .get(def)
             .copied()
             .unwrap_or((self.module.timeunit_exp, self.module.timeprecision_exp))
+    }
+
+    /// §3.14.2 / §20.4 — the timescale a module REPORTS via `$printtimescale`.
+    /// A module with no `timescale directive (and none preceding it in
+    /// compilation order, so it is absent from `module_timescale_exp`) reports
+    /// the IEEE default `1s / 1s` — NOT the global/top-module unit that drives
+    /// `$time` scaling. This keeps xezim's pragmatic 1 ns simulation default for
+    /// delays while matching a reference simulator's printed timescale (a
+    /// directive-less module must not display another module's timescale).
+    fn reported_timescale_exp(&self, def: &str) -> (i32, i32) {
+        self.module
+            .module_timescale_exp
+            .get(def)
+            .copied()
+            .unwrap_or((0, 0))
+    }
+
+    /// `--dump-timescales`: print every module definition's timescale before the
+    /// run. Shows the REPORTED unit/precision (`$printtimescale` semantics: an
+    /// explicit/inherited `timescale, or the 1s/1s default when a module has
+    /// none — flagged, since such a module's effective delay unit collapses to
+    /// the global tick). No source `$printtimescale` calls are needed.
+    fn dump_module_timescales(&self) {
+        // Every module definition reachable in the design: the top plus every
+        // instantiated def_name (deduplicated, sorted for stable output).
+        let mut defs: Vec<String> = vec![self.module.name.clone()];
+        let mut seen: std::collections::HashSet<String> =
+            std::iter::once(self.module.name.clone()).collect();
+        for inst in &self.module.instances {
+            if seen.insert(inst.def_name.clone()) {
+                defs.push(inst.def_name.clone());
+            }
+        }
+        defs.sort();
+        println!("=== module timescales ({} modules) ===", defs.len());
+        for d in &defs {
+            let (u, p) = self.reported_timescale_exp(d);
+            let has_ts = self.module.module_timescale_exp.contains_key(d);
+            let note = if has_ts { "" } else { "   (no `timescale — 1s/1s default)" };
+            println!(
+                "  {:<28} {} / {}{}",
+                d,
+                Self::time_exp_to_str(u),
+                Self::time_exp_to_str(p),
+                note
+            );
+        }
+        println!("======================================");
     }
 
     /// Current simulation time in the current module's time unit, as
@@ -48590,6 +48877,7 @@ impl Simulator {
                             let w = self.infer_lhs_width(arg);
                             self.assign_value(arg, &val.resize(w));
                         }
+                        self.admit_mailbox_put_waiter(handle);
                         return Value::zero(32);
                     } else {
                         // BLOCKING: simplified, just retry later or return for now
@@ -48633,6 +48921,7 @@ impl Simulator {
                     if let (Some(v), Some(arg)) = (val, args.first()) {
                         let w = self.infer_lhs_width(arg);
                         self.assign_value(arg, &v.resize(w));
+                        self.admit_mailbox_put_waiter(handle);
                         return Value::from_u64(1, 32);
                     }
                     return Value::zero(32);
@@ -49858,18 +50147,49 @@ impl Simulator {
                 let mut segs: Vec<&str> = vec![head_owned.as_str()];
                 segs.extend(hier.path[1..].iter().map(|s| s.name.name.as_str()));
                 let full = segs.join(".");
+                // Nested cross-module call: `l.deep()` invoked from inside a
+                // subroutine already running in scope `m` flattens to
+                // `m.l.deep`. When the bare dotted name is not itself a known
+                // subroutine, retry with the caller's resolve-hint scope
+                // prepended so the enclosing instance is honored.
+                let full = if self.module.functions.contains_key(&full)
+                    || self.module.tasks.contains_key(&full)
+                {
+                    full
+                } else if let Some(h) = self.name_resolve_hint.borrow().clone() {
+                    let prefixed = format!("{}.{}", h, full);
+                    if self.module.functions.contains_key(&prefixed)
+                        || self.module.tasks.contains_key(&prefixed)
+                    {
+                        prefixed
+                    } else {
+                        full
+                    }
+                } else {
+                    full
+                };
                 let scope = full.rsplit_once('.').map(|(s, _)| s.to_string());
                 if let Some(fd) = self.module.functions.get(&full).cloned() {
                     let saved = self.name_resolve_hint.borrow().clone();
-                    *self.name_resolve_hint.borrow_mut() = scope;
+                    *self.name_resolve_hint.borrow_mut() = scope.clone();
+                    // §20.3: `$time`/`$realtime`/`%m` inside a subroutine reference
+                    // the module where it is DEFINED — i.e. the instance we
+                    // dispatched into — not the caller. Point the timescale scope
+                    // at that instance for the duration of the body.
+                    let saved_ts = self.timescale_scope_override.take();
+                    self.timescale_scope_override = scope.clone();
                     let r = self.exec_function_call(&fd, args);
+                    self.timescale_scope_override = saved_ts;
                     *self.name_resolve_hint.borrow_mut() = saved;
                     return r;
                 }
                 if let Some(td) = self.module.tasks.get(&full).cloned() {
                     let saved = self.name_resolve_hint.borrow().clone();
-                    *self.name_resolve_hint.borrow_mut() = scope;
+                    *self.name_resolve_hint.borrow_mut() = scope.clone();
+                    let saved_ts = self.timescale_scope_override.take();
+                    self.timescale_scope_override = scope.clone();
                     self.exec_task_call(&td, args);
+                    self.timescale_scope_override = saved_ts;
                     *self.name_resolve_hint.borrow_mut() = saved;
                     return Value::zero(32);
                 }
@@ -52453,10 +52773,24 @@ impl Simulator {
                         let w = self.infer_lhs_width(arg);
                         self.assign_value(arg, &v.resize(w));
                     }
+                    // A consuming `get` frees a slot — admit a parked producer.
+                    if method_name == "get" {
+                        self.admit_mailbox_put_waiter(handle);
+                    }
                     return Value::zero(32);
                 }
                 "try_put" => {
                     if let Some(arg) = args.first() {
+                        // §15.4.1: a bounded mailbox that is full rejects try_put
+                        // (returns 0). A full box has no parked get-waiter (those
+                        // park only on empty), so len>=bound is the whole test.
+                        let bound = self.mailbox_bound.get(&handle).copied().unwrap_or(0);
+                        if bound > 0 {
+                            let len = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
+                            if len >= bound {
+                                return Value::zero(32);
+                            }
+                        }
                         let v = self.eval_expr(arg);
                         let waiter = self
                             .mailbox_get_waiters
@@ -52483,6 +52817,9 @@ impl Simulator {
                     if let (Some(v), Some(arg)) = (val, args.first()) {
                         let w = self.infer_lhs_width(arg);
                         self.assign_value(arg, &v.resize(w));
+                        if method_name == "try_get" {
+                            self.admit_mailbox_put_waiter(handle);
+                        }
                         return Value::from_u64(1, 32);
                     }
                     return Value::zero(32);
@@ -54200,6 +54537,330 @@ impl Simulator {
         }
     }
 
+    /// §18.5.8.2 — recognize `<arr>.sum()` (with or without an identity `with`
+    /// clause) as an array reduction over a rand collection. Returns the bare
+    /// array name and, for the `with` form, the filter to identity-check.
+    /// Three parse shapes are matched (see `WithClause` handling in `eval`).
+    fn sum_reduction_array(e: &Expression) -> Option<(String, Option<Expression>)> {
+        match &e.kind {
+            ExprKind::Paren(inner) => Self::sum_reduction_array(inner),
+            ExprKind::WithClause { expr, filter } => {
+                Self::plain_sum_array(expr).map(|n| (n, Some((**filter).clone())))
+            }
+            _ => Self::plain_sum_array(e).map(|n| (n, None)),
+        }
+    }
+
+    /// The bare array name of a `<arr>.sum()` call (no `with`).
+    fn plain_sum_array(e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Call { func, args } if args.is_empty() => Self::plain_sum_array(func),
+            ExprKind::MemberAccess { expr, member } if member.name == "sum" => {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    return h.path.last().map(|s| s.name.name.clone());
+                }
+                None
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.path.last().map_or(false, |s| s.name.name == "sum") =>
+            {
+                Some(h.path[h.path.len() - 2].name.name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// A reduction `with` filter is identity when `filter(item) == item` for a
+    /// spread of probe values — this covers `item`, `(item)`, `int'(item)` and
+    /// `unsigned'(item)` without matching the (lowered) cast AST directly.
+    fn filter_is_identity(&mut self, filter: &Expression) -> bool {
+        self.local_stack.push(HashMap::default());
+        let mut ok = true;
+        for &p in &[0u64, 1, 7, 255, 1000] {
+            if let Some(f) = self.local_stack.last_mut() {
+                f.insert("item".to_string(), Value::from_u64(p, 32));
+            }
+            if self.eval_expr(filter).to_u64() != Some(p) {
+                ok = false;
+                break;
+            }
+        }
+        self.local_stack.pop();
+        ok
+    }
+
+    /// §18.5.8.2 — if `item` is `<arr>.sum() == <const>` (either operand order)
+    /// over a single rand collection, return the collection and the constant
+    /// target. The non-sum side must be a compile/solve-time constant (it may
+    /// not reference any rand variable), so the sum has one solvable target.
+    fn array_sum_eq_target(
+        &mut self,
+        item: &ConstraintItem,
+        colls: &[RandColl],
+        rand_names: &HashSet<String>,
+    ) -> Option<(RandColl, i128)> {
+        let ConstraintItem::Expr(e) = item else { return None };
+        let ExprKind::Binary { op: BinaryOp::Eq, left, right } = &e.kind else {
+            return None;
+        };
+        for (sum_side, const_side) in [(left, right), (right, left)] {
+            let Some((name, filter)) = Self::sum_reduction_array(sum_side) else {
+                continue;
+            };
+            let Some(c) = colls.iter().find(|c| c.prop == name).cloned() else {
+                continue;
+            };
+            if let Some(f) = &filter {
+                if !self.filter_is_identity(f) {
+                    continue;
+                }
+            }
+            // The target side must be a stable constant — no rand variable and
+            // no element of a managed collection may appear on it.
+            let mut ids: HashSet<String> = HashSet::default();
+            self.collect_expr_idents(const_side, &mut ids);
+            if ids
+                .iter()
+                .any(|n| rand_names.contains(n) || colls.iter().any(|c| &c.prop == n))
+            {
+                continue;
+            }
+            let Some(k) = self.eval_expr(const_side).to_i64() else {
+                continue;
+            };
+            return Some((c, k as i128));
+        }
+        None
+    }
+
+    /// §18.5.8.2 — solve `<arr>.sum() == K` by DISTRIBUTING a random valid
+    /// assignment over the array's elements (rejection sampling cannot find a
+    /// point-target sum in a wide domain). Elements already pinned by another
+    /// constraint keep their value and reduce the residual target; the rest are
+    /// each drawn inside their `foreach … inside {…}` range (or the full type
+    /// width) so the total lands exactly on `K`. Infeasible targets are left
+    /// untouched — the trial checker then rejects and retries.
+    fn distribute_array_sum(
+        &mut self,
+        c: &RandColl,
+        target: i128,
+        constraints: &[ClassConstraint],
+        pinned: &mut HashSet<String>,
+    ) {
+        let keys = self.coll_elem_keys(c);
+        let ranges = self.elem_allowed_ranges(&c.prop, constraints);
+        let (lo, hi): (i128, i128) = if ranges.is_empty() {
+            let hi = if c.width >= 64 { u64::MAX } else { (1u64 << c.width) - 1 };
+            (0, hi as i128)
+        } else {
+            (
+                ranges.iter().map(|(l, _)| *l as i128).min().unwrap(),
+                ranges.iter().map(|(_, h)| *h as i128).max().unwrap(),
+            )
+        };
+        self.distribute_sum_over(&keys, target, lo, hi, c.width, pinned);
+    }
+
+    /// Core of the array-sum solver: assign `keys` so their total equals
+    /// `target`, each element inside `[lo, hi]`. Already-pinned keys keep their
+    /// value and reduce the residual; infeasible targets leave the array as-is.
+    fn distribute_sum_over(
+        &mut self,
+        keys: &[String],
+        target: i128,
+        lo: i128,
+        hi: i128,
+        width: u32,
+        pinned: &mut HashSet<String>,
+    ) {
+        use rand::Rng;
+        if keys.is_empty() {
+            return;
+        }
+        let mut fixed_sum: i128 = 0;
+        let mut free: Vec<String> = Vec::new();
+        for k in keys {
+            if pinned.contains(k) {
+                fixed_sum += self.read_coll_elem(k).and_then(|v| v.to_u64()).unwrap_or(0) as i128;
+            } else {
+                free.push(k.clone());
+            }
+        }
+        if free.is_empty() {
+            return;
+        }
+        let n = free.len() as i128;
+        let want = target - fixed_sum;
+        if want < n * lo || want > n * hi {
+            return; // infeasible — leave for the trial checker to reject
+        }
+        let cap = hi - lo;
+        let mut rem = want - n * lo; // 0 ..= n*cap
+        let mut order: Vec<usize> = (0..free.len()).collect();
+        for i in (1..order.len()).rev() {
+            let j = self.cur_rng().gen_range(0..=i);
+            order.swap(i, j);
+        }
+        for (pos, &idx) in order.iter().enumerate() {
+            let remaining_after = (order.len() - pos - 1) as i128;
+            let give = if remaining_after == 0 {
+                rem
+            } else {
+                // Keep the residual absorbable by the still-unassigned elements.
+                let lo_b = (rem - remaining_after * cap).max(0);
+                let hi_b = rem.min(cap);
+                if hi_b <= lo_b {
+                    lo_b
+                } else {
+                    lo_b + self.cur_rng().gen_range(0..=(hi_b - lo_b))
+                }
+            };
+            rem -= give;
+            self.write_coll_elem(&free[idx], Value::from_u64((lo + give) as u64, width));
+            pinned.insert(free[idx].clone());
+        }
+    }
+
+    /// §18.5.8.2 — run `distribute_array_sum` for every `arr.sum() == K`
+    /// equality in the constraint set (flattening `{}`/`soft` wrappers).
+    fn solve_array_sum_eqs(
+        &mut self,
+        constraints: &[ClassConstraint],
+        colls: &[RandColl],
+        rand_names: &HashSet<String>,
+        pinned: &mut HashSet<String>,
+    ) {
+        let mut items: Vec<ConstraintItem> = Vec::new();
+        fn walk(it: &ConstraintItem, out: &mut Vec<ConstraintItem>) {
+            match it {
+                ConstraintItem::Block(is) => {
+                    for i in is {
+                        walk(i, out);
+                    }
+                }
+                ConstraintItem::Soft(i) => walk(i, out),
+                other => out.push(other.clone()),
+            }
+        }
+        for con in constraints {
+            for it in &con.items {
+                walk(it, &mut items);
+            }
+        }
+        for it in &items {
+            if let Some((c, k)) = self.array_sum_eq_target(it, colls, rand_names) {
+                self.distribute_array_sum(&c, k, constraints, pinned);
+            } else if let Some((c, idxs, k)) =
+                self.explicit_elem_sum_eq_target(it, colls, rand_names)
+            {
+                // `a[0] + a[1] + a[2] == K`: distribute over just the named
+                // elements, honoring any `foreach … inside {…}` element range.
+                let ranges = self.elem_allowed_ranges(&c.prop, constraints);
+                let (lo, hi): (i128, i128) = if ranges.is_empty() {
+                    let hi = if c.width >= 64 { u64::MAX } else { (1u64 << c.width) - 1 };
+                    (0, hi as i128)
+                } else {
+                    (
+                        ranges.iter().map(|(l, _)| *l as i128).min().unwrap(),
+                        ranges.iter().map(|(_, h)| *h as i128).max().unwrap(),
+                    )
+                };
+                let keys: Vec<String> =
+                    idxs.iter().map(|i| format!("{}[{}]", c.scoped, i)).collect();
+                self.distribute_sum_over(&keys, k, lo, hi, c.width, pinned);
+            }
+        }
+    }
+
+    /// §18.5.8 — recognize `a[c0] + a[c1] + … == K`: a `+`-chain of
+    /// CONSTANT-index selects of ONE rand collection compared to a constant.
+    /// Returns the collection, the (distinct) element indices, and the target.
+    fn explicit_elem_sum_eq_target(
+        &mut self,
+        item: &ConstraintItem,
+        colls: &[RandColl],
+        rand_names: &HashSet<String>,
+    ) -> Option<(RandColl, Vec<i64>, i128)> {
+        let ConstraintItem::Expr(e) = item else { return None };
+        let ExprKind::Binary { op: BinaryOp::Eq, left, right } = &e.kind else {
+            return None;
+        };
+        // Collect the index selects on a `+`-chain over a single array `name`.
+        // Index expressions are gathered as-is, then const-evaluated below.
+        fn chain<'a>(
+            e: &'a Expression,
+            name: &mut Option<String>,
+            idxs: &mut Vec<&'a Expression>,
+        ) -> bool {
+            match &e.kind {
+                ExprKind::Paren(i) => chain(i, name, idxs),
+                ExprKind::Binary { op: BinaryOp::Add, left, right } => {
+                    chain(left, name, idxs) && chain(right, name, idxs)
+                }
+                ExprKind::Index { expr, index } => {
+                    let ExprKind::Ident(h) = &expr.kind else { return false };
+                    let arr = match h.path.last() {
+                        Some(s) => s.name.name.clone(),
+                        None => return false,
+                    };
+                    match name {
+                        Some(n) if *n != arr => return false,
+                        _ => *name = Some(arr),
+                    }
+                    idxs.push(index);
+                    true
+                }
+                _ => false,
+            }
+        }
+        for (sum_side, const_side) in [(left, right), (right, left)] {
+            let mut name: Option<String> = None;
+            let mut idx_exprs: Vec<&Expression> = Vec::new();
+            if !chain(sum_side, &mut name, &mut idx_exprs) || idx_exprs.len() < 2 {
+                continue;
+            }
+            let mut idxs: Vec<i64> = Vec::new();
+            let mut all_const = true;
+            for ie in &idx_exprs {
+                match self.eval_expr(ie).to_i64() {
+                    Some(v) => idxs.push(v),
+                    None => {
+                        all_const = false;
+                        break;
+                    }
+                }
+            }
+            if !all_const {
+                continue;
+            }
+            // Distinct indices only — a repeated element is not a simple sum.
+            let mut sorted = idxs.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.len() != idxs.len() {
+                continue;
+            }
+            let Some(nm) = name else { continue };
+            let Some(c) = colls.iter().find(|c| c.prop == nm).cloned() else {
+                continue;
+            };
+            let mut ids: HashSet<String> = HashSet::default();
+            self.collect_expr_idents(const_side, &mut ids);
+            if ids
+                .iter()
+                .any(|n| rand_names.contains(n) || colls.iter().any(|c| &c.prop == n))
+            {
+                continue;
+            }
+            let Some(k) = self.eval_expr(const_side).to_i64() else {
+                continue;
+            };
+            return Some((c, idxs, k as i128));
+        }
+        None
+    }
+
     /// §18.5.9 — an lvalue reaching THROUGH a rand class-handle member
     /// (`sub_inst.sub_data`). Returns the sub-object's handle and the member
     /// name, so a cross-object equality can be forced onto it.
@@ -55862,6 +56523,19 @@ impl Simulator {
                         break;
                     }
                 }
+            }
+
+            // §18.5.8.2: `arr.sum() == K` cannot be met by rejection over a wide
+            // domain — distribute a random valid assignment onto the elements so
+            // their total lands exactly on the target (respecting per-element
+            // ranges and any element already pinned by another constraint).
+            if !rand_colls.is_empty() {
+                self.solve_array_sum_eqs(
+                    &constraints,
+                    &rand_colls,
+                    &rand_set,
+                    &mut pinned_elems,
+                );
             }
 
             let mut all_ok = true;
@@ -57682,9 +58356,13 @@ impl Simulator {
         match &expr.kind {
             ExprKind::Call { func, args } => {
                 if let ExprKind::MemberAccess { member, .. } = &func.kind {
+                    // NOTE: `sum` is deliberately absent — a `.sum() == K`
+                    // equality is now solved by `distribute_array_sum` and must
+                    // be CHECKED (so an infeasible target retries/fails instead
+                    // of silently passing). The rest stay unmodeled.
                     if matches!(
                         member.name.as_str(),
-                        "size" | "sum" | "exists" | "len" | "product" | "min" | "max"
+                        "size" | "exists" | "len" | "product" | "min" | "max"
                             | "num" | "and" | "or" | "xor"
                     ) {
                         return true;
