@@ -154,3 +154,80 @@ fn sub_ns_precision_emits_no_warning() {
     let joined = sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n");
     assert!(!joined.contains("ticks are 1ns"), "stale sub-ns warning leaked: {}", joined);
 }
+
+// §3.14.2 / §20.4 — a module with NO `timescale directive (and none preceding
+// it in compilation order) must REPORT the IEEE default 1s/1s via
+// $printtimescale — not the 1 ns simulation default, and not another module's
+// timescale. Regression for the leaked-testscale bug.
+#[test]
+fn no_timescale_module_reports_one_second_default() {
+    let o = out("module m; initial $printtimescale; endmodule");
+    assert!(o.contains("is 1s / 1s"), "no-timescale module must report 1s/1s; got: {}", o);
+}
+
+// A directive-less module keeps xezim's 1 ns DELAY default — only the REPORTED
+// timescale changes, so `#5` is still 5 (ns), never 5 seconds.
+#[test]
+fn no_timescale_module_keeps_one_ns_delays() {
+    let o = out("module m; initial begin #5; $display(\"T=%0d\", $time); end endmodule");
+    assert!(o.contains("T=5"), "delay scaling must stay 1ns; got: {}", o);
+}
+
+// §20.3 — `$time`/`$realtime` inside a subroutine reference the DEFINING
+// module's timescale, not the caller's. A task in a 1ns/1ps `sub` called from a
+// 1us/1ns `top` at t=5us must report 5000 (5us in sub's 1ns unit), not 5.
+// Confirmed against iverilog AND a commercial simulator.
+#[test]
+fn cross_module_task_uses_callee_timescale() {
+    let o = out(r#"
+`timescale 1us/1ns
+module top; sub s(); initial #5 s.show(); endmodule
+`timescale 1ns/1ps
+module sub; task show; $display("XT=%0g rt=%0g", $realtime, $time); endtask endmodule
+"#);
+    assert!(o.contains("XT=5000 rt=5000"),
+        "cross-module task must use the callee's 1ns unit (5000), not the caller's 1us (5); got: {}", o);
+}
+
+// Same rule for a FUNCTION returning $realtime across a timescale boundary.
+#[test]
+fn cross_module_function_uses_callee_timescale() {
+    let o = out(r#"
+`timescale 1us/1ns
+module top; sub s(); initial #5 $display("XF=%0g", s.gett()); endmodule
+`timescale 1ns/1ps
+module sub; function real gett; gett = $realtime; endfunction endmodule
+"#);
+    assert!(o.contains("XF=5000"),
+        "cross-module function must evaluate $realtime in the callee's 1ns unit (5000); got: {}", o);
+}
+
+// §20.3 — `%t` of `$time` must format `$time`'s UNIT-ROUNDED value, not the raw
+// sub-unit simulation time. At 1ns/1ps and t=1.234ns: `$time`=1 → %t prints
+// "1000" (1ns in the default ps timeformat), while `$realtime` keeps 1234.
+// Confirmed against iverilog and a commercial simulator.
+#[test]
+fn percent_t_of_time_uses_rounded_value() {
+    let o = out(r#"
+`timescale 1ns/1ps
+module m; initial begin #1.234
+  $display("TT=%0t", $time);        // rounded -> 1000
+  $display("RR=%0t", $realtime);    // full     -> 1234
+end endmodule
+"#);
+    assert!(o.contains("TT=1000"), "%t of $time must be the rounded 1000; got: {}", o);
+    assert!(o.contains("RR=1234"), "%t of $realtime must keep 1234; got: {}", o);
+}
+
+// A module WITHOUT its own directive but PRECEDED by one inherits it (sticky
+// §3.14.2.3) — it reports the inherited scale, not the 1s/1s default.
+#[test]
+fn untimed_module_inherits_preceding_directive() {
+    let o = out(r#"
+`timescale 1us/1ns
+module timed; initial $printtimescale; endmodule
+module inherits_it; initial $printtimescale; endmodule
+"#);
+    assert!(o.contains("(inherits_it) is 1us / 1ns"),
+        "module after a directive must inherit it; got: {}", o);
+}

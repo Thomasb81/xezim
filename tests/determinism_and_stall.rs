@@ -367,11 +367,14 @@ endmodule
     assert_eq!(done, 3, "all zero-delay work must still run");
 }
 
-/// The report's "Parked" section must name the process the spinner is waiting
-/// for — the classic shape: a clock generator spinning on a zero period whose
-/// setter is scheduled at a future time the spin never reaches.
+/// A `#(period)` clock generator whose period is 0 but whose SETTER runs at a
+/// reachable future time is NOT a fatal livelock — time must ADVANCE to the
+/// setter (commercial-simulator parity: a PLL clock gen with period 0 during
+/// reset resumes once reset releases), rather than xezim aborting with a
+/// zero-delay stall report. (A genuine livelock with nothing scheduled ahead
+/// still reports — see the pure-#0 case.)
 #[test]
-fn stall_report_lists_parked_setter() {
+fn zero_period_clock_gen_advances_to_reachable_setter() {
     let dir = std::env::temp_dir().join("xezim_stall_parked");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let sv = dir.join("parked.sv");
@@ -379,7 +382,7 @@ fn stall_report_lists_parked_setter() {
         &sv,
         "`timescale 1ps/1ps\nmodule t; real p; reg clk = 0;\n\
          always #(p/2) clk = ~clk;\n\
-         initial begin #1 p = 100.0; end\nendmodule\n",
+         initial begin #1 p = 100.0; #500 $display(\"ADV t=%0t\", $time); $finish; end\nendmodule\n",
     )
     .expect("write sv");
 
@@ -393,16 +396,19 @@ fn stall_report_lists_parked_setter() {
         .arg(&sv)
         .output()
         .expect("run xezim");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("re-arming via #(p/2)"), "spinner line missing:\n{}", err);
-    assert!(
-        err.contains("Parked (not spinning)"),
-        "parked section missing:\n{}",
-        err
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        err.contains("next event at time 1"),
-        "the parked setter (scheduled at t=1) must be named:\n{}",
-        err
+        !text.contains("zero-delay (delta) livelock"),
+        "must advance past the #0 spin to the setter, not stall-report:\n{}",
+        text
+    );
+    assert!(
+        text.contains("ADV t=501"),
+        "time must advance past the setter (t=1) and run the clock:\n{}",
+        text
     );
 }
