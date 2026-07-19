@@ -25431,7 +25431,16 @@ impl Simulator {
                     // only where both branches agree; otherwise X.
                     let t = self.eval_expr_ctx(then_expr, ctx_width);
                     let e = self.eval_expr_ctx(else_expr, ctx_width);
-                    t.merge_unknown(&e)
+                    // A REAL result cannot hold X, so the bitwise merge would
+                    // read the IEEE-754 bits of the operands as garbage (e.g. a
+                    // real `1000.0` came out as 4.65e18). §11.3.1: the result is
+                    // real when either branch is real — return a defined real
+                    // value (x condition → the else/false branch) instead.
+                    if t.is_real || e.is_real {
+                        e
+                    } else {
+                        t.merge_unknown(&e)
+                    }
                 } else if c.is_true() {
                     self.eval_expr_ctx(then_expr, ctx_width)
                 } else {
