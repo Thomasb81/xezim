@@ -1325,6 +1325,30 @@ impl TimingWheel {
         self.overflow.keys().next().copied()
     }
 
+    /// Earliest scheduled time STRICTLY greater than `after`, if any. Used to
+    /// break a zero-delay (#0) livelock: when the current time slot can't make
+    /// progress but real events exist ahead, jump to them.
+    fn next_time_after(&self, after: u64) -> Option<u64> {
+        let base_slot = Self::slot(self.current_time);
+        let mut best: Option<u64> = None;
+        // Wheel events all live in [current_time, current_time+WHEEL_SIZE); each
+        // occupied slot maps to exactly one time in that window.
+        for slot in 0..WHEEL_SIZE {
+            if self.bitmap[slot >> 6] & (1u64 << (slot & 63)) == 0 {
+                continue;
+            }
+            let delta = (slot + WHEEL_SIZE - base_slot) % WHEEL_SIZE;
+            let t = self.current_time + delta as u64;
+            if t > after {
+                best = Some(best.map_or(t, |b| b.min(t)));
+            }
+        }
+        if let Some((&t, _)) = self.overflow.range((after + 1)..).next() {
+            best = Some(best.map_or(t, |b| b.min(t)));
+        }
+        best
+    }
+
     /// Remove and return all events at the given time.
     fn remove(&mut self, time: u64) -> EventList {
         self.current_time = time;
@@ -16495,9 +16519,40 @@ impl Simulator {
                     self.stall_iters = 1;
                 }
                 if self.stall_limit > 0 && self.stall_iters > self.stall_limit {
-                    self.report_zero_delay_stall(None);
-                    self.finished = true;
-                    break;
+                    // Try to BREAK the zero-delay livelock: if real events are
+                    // scheduled AHEAD, defer the stuck current-time processes to
+                    // the next future event and advance time — a commercial
+                    // simulator lets time move past a #0 spinner (e.g. a
+                    // `#(period)` clock gen whose period is 0 during reset) once
+                    // its input is set later, rather than aborting the whole run.
+                    // Only a livelock with NOTHING ahead is fatal.
+                    let future = self
+                        .event_queue
+                        .next_time_after(self.time)
+                        .into_iter()
+                        .chain(next_clk_time.filter(|&t| t > self.time))
+                        .chain(next_delayed.filter(|&t| t > self.time))
+                        .chain(self.uvm_pending_end.filter(|&t| t > self.time))
+                        .min()
+                        .filter(|&t| t <= self.max_time);
+                    if let Some(ft) = future {
+                        let stuck = self.event_queue.remove(self.time);
+                        for (p, c) in stuck {
+                            self.event_queue.schedule(ft, p, c);
+                        }
+                        let inact = std::mem::take(&mut self.inactive_queue);
+                        for (p, c) in inact {
+                            self.event_queue.schedule(ft, p, c);
+                        }
+                        self.time = ft;
+                        self.stall_iters = 0;
+                        self.stall_time = ft;
+                        self.stall_pid_hits.clear();
+                    } else {
+                        self.report_zero_delay_stall(None);
+                        self.finished = true;
+                        break;
+                    }
                 }
             }
             if self.time > old_time && !self.dpi_next_time_cbs.is_empty() {
