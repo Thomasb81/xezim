@@ -202,6 +202,23 @@ module sub; function real gett; gett = $realtime; endfunction endmodule
         "cross-module function must evaluate $realtime in the callee's 1ns unit (5000); got: {}", o);
 }
 
+// §20.3 — `%t` of `$time` must format `$time`'s UNIT-ROUNDED value, not the raw
+// sub-unit simulation time. At 1ns/1ps and t=1.234ns: `$time`=1 → %t prints
+// "1000" (1ns in the default ps timeformat), while `$realtime` keeps 1234.
+// Confirmed against iverilog and a commercial simulator.
+#[test]
+fn percent_t_of_time_uses_rounded_value() {
+    let o = out(r#"
+`timescale 1ns/1ps
+module m; initial begin #1.234
+  $display("TT=%0t", $time);        // rounded -> 1000
+  $display("RR=%0t", $realtime);    // full     -> 1234
+end endmodule
+"#);
+    assert!(o.contains("TT=1000"), "%t of $time must be the rounded 1000; got: {}", o);
+    assert!(o.contains("RR=1234"), "%t of $realtime must keep 1234; got: {}", o);
+}
+
 // A module WITHOUT its own directive but PRECEDED by one inherits it (sticky
 // §3.14.2.3) — it reports the inherited scale, not the 1s/1s default.
 #[test]
