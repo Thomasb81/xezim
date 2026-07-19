@@ -15,9 +15,16 @@ module test_sva_sequences_advanced;
     req ##1 ack;
   endsequence
 
+  // "req is acknowledged one cycle later, once out of reset." A BARE sequence
+  // used directly as a property is a STRONG check that fails on every cycle the
+  // sequence does not start (req low) — confirmed against iverilog/a commercial
+  // simulator — so the request/ack intent must be an IMPLICATION. The declared
+  // sequence still elaborates and is exercised by the cover below.
   property p_req_ack_after_reset;
-    @(posedge clk) disable iff (!rst_n) s_req_ack;
+    @(posedge clk) disable iff (!rst_n) req |=> ack;
   endproperty
+
+  c_req_ack: cover property (@(posedge clk) disable iff (!rst_n) s_req_ack);
 
   a_req_ack_after_reset: assert property (p_req_ack_after_reset)
     else begin
