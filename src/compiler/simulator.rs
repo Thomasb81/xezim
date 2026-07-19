@@ -33955,13 +33955,27 @@ impl Simulator {
                         't' | 'T' => {
                             if ai < args.len() {
                                 // The argument carries a time in the scope's
-                                // unit. $time/$realtime compute it directly; any
-                                // other expression is read as scope-unit too.
+                                // unit. §20.3: `$realtime` keeps sub-unit
+                                // precision, but `$time`/`$stime` are the time
+                                // ROUNDED to the module unit (an integer) — `%t`
+                                // must format that rounded value, not the raw
+                                // simulation time. Any other expression is read
+                                // as a scope-unit value directly.
                                 let value = match &args[ai].kind {
                                     ExprKind::SystemCall { name, .. }
-                                        if matches!(name.as_str(), "$time" | "$realtime" | "$stime") =>
+                                        if name.as_str() == "$realtime" =>
                                     {
                                         self.time_in_current_unit()
+                                    }
+                                    ExprKind::SystemCall { name, .. }
+                                        if matches!(name.as_str(), "$time" | "$stime") =>
+                                    {
+                                        let r = self.time_in_current_unit().round();
+                                        if name.as_str() == "$stime" {
+                                            ((r as u64) & 0xFFFF_FFFF) as f64
+                                        } else {
+                                            r
+                                        }
                                     }
                                     _ => self.eval_expr(&args[ai]).to_f64(),
                                 };
