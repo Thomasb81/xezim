@@ -11751,7 +11751,17 @@ impl Simulator {
                 }
                 Insn::Select(dest, cond, then_r, else_r) => {
                     let v = if vm_regs[*cond as usize].has_unknown() {
-                        vm_regs[*then_r as usize].merge_unknown(&vm_regs[*else_r as usize])
+                        let t = &vm_regs[*then_r as usize];
+                        let e = &vm_regs[*else_r as usize];
+                        // §11.3.1: a real result can't hold X, so bit-merging the
+                        // branches reads their IEEE-754 bits as garbage (a real
+                        // 1000.0 came out as 4.65e18). Return a defined real value
+                        // (x condition → the else/false branch) instead.
+                        if t.is_real || e.is_real {
+                            e.clone()
+                        } else {
+                            t.merge_unknown(e)
+                        }
                     } else if vm_regs[*cond as usize].is_true() {
                         vm_regs[*then_r as usize].clone()
                     } else {
@@ -12118,7 +12128,17 @@ impl Simulator {
                 }
                 Insn::Select(dest, cond, then_r, else_r) => {
                     let v = if vm_regs[*cond as usize].has_unknown() {
-                        vm_regs[*then_r as usize].merge_unknown(&vm_regs[*else_r as usize])
+                        let t = &vm_regs[*then_r as usize];
+                        let e = &vm_regs[*else_r as usize];
+                        // §11.3.1: a real result can't hold X, so bit-merging the
+                        // branches reads their IEEE-754 bits as garbage (a real
+                        // 1000.0 came out as 4.65e18). Return a defined real value
+                        // (x condition → the else/false branch) instead.
+                        if t.is_real || e.is_real {
+                            e.clone()
+                        } else {
+                            t.merge_unknown(e)
+                        }
                     } else if vm_regs[*cond as usize].is_true() {
                         vm_regs[*then_r as usize].clone()
                     } else {
@@ -12660,7 +12680,15 @@ impl Simulator {
                     let v = if self.vm_regs[*cond as usize].has_unknown() {
                         let t = self.vm_regs[*then_r as usize].clone();
                         let e = self.vm_regs[*else_r as usize].clone();
-                        t.merge_unknown(&e)
+                        // §11.3.1: a real result can't hold X — bit-merging the
+                        // branches would read their IEEE-754 bits as garbage.
+                        // Return a defined real value (else branch) when either
+                        // branch is real.
+                        if t.is_real || e.is_real {
+                            e
+                        } else {
+                            t.merge_unknown(&e)
+                        }
                     } else if self.vm_regs[*cond as usize].is_true() {
                         self.vm_regs[*then_r as usize].clone()
                     } else {
