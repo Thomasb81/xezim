@@ -18625,7 +18625,16 @@ impl Simulator {
             // Check for repeat with event waits inside
             if let StatementKind::Repeat { count, body } = &stmt.kind {
                 let n = self.eval_expr(count).to_u64().unwrap_or(0);
-                if self.stmt_has_event_wait(body) {
+                // Mirror the While/For arms: unroll not only when the body has
+                // a direct `@event`/`#delay`, but also when it blocks via a
+                // CALL to a task whose own body contains a `wait`/`#delay`/
+                // `@event` (a loop like `repeat(N) obj.do_step();` where
+                // do_step() blocks). Otherwise the repeat falls through to the
+                // SYNCHRONOUS exec_statement, the body's calls are never
+                // inlined (Stage 1b), and their nested `wait`s fall through
+                // (IEEE 1800-2023 §9.7.4: a false `wait(cond)` must suspend)
+                // instead of parking the process, busy-spinning the loop.
+                if self.stmt_has_event_wait(body) || self.stmt_is_blocking(body) {
                     // n == 0 (initial count zero, or the natural-exhaustion
                     // sentinel re-entering after the final iteration's body):
                     // clear any loop-control flag left by that body — a
