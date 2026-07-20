@@ -26945,7 +26945,13 @@ impl Simulator {
                         v.is_signed = true;
                         v
                     } else {
-                        Value::from_u64(0, 32)
+                        // §20.15.1: no-seed `$random` draws from the global RNG
+                        // (same stream as no-arg `$urandom`) and returns a SIGNED
+                        // 32-bit value. It used to return a constant 0, so every
+                        // `$random` stimulus was stuck at 0.
+                        let mut v = Value::from_u64(self.rng_u32() as u64, 32);
+                        v.is_signed = true;
+                        v
                     }
                 }
                 "$isunknown" => {

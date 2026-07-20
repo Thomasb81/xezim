@@ -496,3 +496,46 @@ endmodule
     assert!(joined.contains("R1 3"), "$rtoi(3.7)=3:\n{}", joined);
     assert!(joined.contains("R2 -3"), "$rtoi(-3.7)=-3:\n{}", joined);
 }
+
+/// §20.15.1: no-seed $random must draw from the global RNG, not return a
+/// constant 0. It used to be stuck at 0, so every `$random` stimulus was 0.
+#[test]
+fn random_no_seed_varies() {
+    const SRC: &str = r#"
+module top;
+  int nonzero, i, v, seen_neg;
+  initial begin
+    nonzero = 0; seen_neg = 0;
+    for (i = 0; i < 40; i++) begin
+      v = $random;
+      if (v != 0) nonzero++;
+      if (v < 0)  seen_neg++;
+    end
+    $display("NZ %0d NEG %0d", nonzero, seen_neg);
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Essentially all of 40 draws are non-zero, and $random is signed so some
+    // are negative — proves it's a real 32-bit stream, not a stuck 0.
+    let nz: i32 = joined
+        .split("NZ ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let neg: i32 = joined
+        .split("NEG ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(nz >= 38, "$random must vary (got {} non-zero of 40):\n{}", nz, joined);
+    assert!(neg > 0, "$random is signed — expected some negatives:\n{}", joined);
+}
