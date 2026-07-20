@@ -2618,6 +2618,10 @@ pub struct Simulator {
     fork_block_children: HashMap<String, HashSet<usize>>,
     /// Associative arrays already warned about an x/z index.
     warned_assoc_index: HashSet<String>,
+    /// `#delay` sites already warned about a pathological (non-finite / absurdly
+    /// large) real delay value, keyed by the delay expression's source offset —
+    /// warn once per site so a spiking clock names itself without spamming.
+    warned_delay_spikes: HashSet<usize>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
     /// §9.7 `process` class: PIDs explicitly suspended via `suspend()`. The
@@ -4549,6 +4553,7 @@ impl Simulator {
             disable_labels: HashMap::default(),
             fork_block_children: HashMap::default(),
             warned_assoc_index: HashSet::default(),
+            warned_delay_spikes: HashSet::default(),
             killed_pids: HashSet::default(),
             suspended_pids: HashSet::default(),
             suspended_proc_info: HashMap::default(),
@@ -17734,6 +17739,27 @@ impl Simulator {
         let v = self.eval_expr(d);
         let raw = if v.is_real {
             let f = v.to_f64();
+            // Diagnose a pathological real delay: non-finite (NaN/inf) or
+            // absurdly large. A huge `#delay` parks the process ~forever — which
+            // reads as "the clock stopped" — and is almost always a bit-garbage
+            // value (an IEEE-754 pattern read as a ~1e18 number) or a divide that
+            // produced inf/NaN. Warn once per site so the offending delay names
+            // itself in the log instead of silently freezing a clock.
+            if !f.is_finite() || f >= 1e15 {
+                if self.warned_delay_spikes.insert(d.span.start) {
+                    let loc = self
+                        .span_file_line_in(d.span, None)
+                        .map(|l| format!(" at {}", l))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[xezim][warning] a #delay evaluated to a pathological real value {:.4e}{} \
+                         at time {} — the process is parked far in the future, so a clock driven \
+                         by it will appear to stop. This usually means the delay expression \
+                         produced NaN/inf or IEEE-754 bit garbage.",
+                        f, loc, self.time
+                    );
+                }
+            }
             if f.is_finite() && f > 0.0 { f } else { 0.0 }
         } else {
             v.to_u64().unwrap_or(0) as f64
@@ -49914,7 +49940,7 @@ impl Simulator {
         self.func_call_stack.pop();
         self.this_stack.pop();
         self.class_context_stack.pop();
-        let result = if let Some(rv) = self.return_value.take() {
+        let mut result = if let Some(rv) = self.return_value.take() {
             rv
         } else {
             // Return value from function-name variable
@@ -49923,6 +49949,30 @@ impl Simulator {
                 .and_then(|l| l.get(&ret_name).cloned())
                 .unwrap_or(Value::zero(32))
         };
+        // §13.4.1: the return value takes the function's declared type — a
+        // `function signed [7:0]` truncates its result to 8 bits (150 -> -106),
+        // a `function [3:0]` to 4 bits. The return var was sized 32 and never
+        // narrowed, so `s_sum = a + b` returned the full-width sum. Resize
+        // integral returns to the declared width/signedness (skip real, string,
+        // and void — those aren't width-narrowed scalars).
+        if !result.is_real
+            && !Self::is_string_data_type(&fd.return_type)
+            && !matches!(
+                fd.return_type,
+                crate::ast::types::DataType::Void { .. }
+                    | crate::ast::types::DataType::Real { .. }
+            )
+        {
+            let w = super::elaborate::resolve_type_width(
+                &fd.return_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            );
+            if w > 0 && w != result.width {
+                result = result.resize(w);
+            }
+            result.is_signed = super::elaborate::is_type_signed(&fd.return_type);
+        }
         // Array formals copy element-wise; scalars go through `output_bindings`.
         for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
             if param == caller {
