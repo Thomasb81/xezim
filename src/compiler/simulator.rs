@@ -45306,7 +45306,18 @@ impl Simulator {
         // (Vec<(name, value)> in declaration order, which IS the LRM
         // iteration order). Type info is on signal_type_names (keyed by
         // signal_id), since `self.module.signals` may not be the storage.
-        if matches!(mname, "first" | "last" | "next" | "prev" | "num") && args.is_empty() {
+        // §6.19.6: first/last/num take no argument; next/prev take an OPTIONAL
+        // count N (default 1) — `c.next(2)` steps two forward with wrapping.
+        if (matches!(mname, "first" | "last" | "num") && args.is_empty())
+            || (matches!(mname, "next" | "prev") && args.len() <= 1)
+        {
+            let step_n: u64 = if matches!(mname, "next" | "prev") {
+                args.first()
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
+                    .unwrap_or(1)
+            } else {
+                0
+            };
             let tn_opt: Option<String> = self
                 .signal_name_to_id
                 .get(obj_name)
@@ -45335,12 +45346,15 @@ impl Simulator {
                                 .unwrap_or(0);
                             let pos = members.iter().position(|(_, v)| *v == cur);
                             if let Some(p) = pos {
-                                // LRM §6.19.6: next() of last wraps to
-                                // first; prev() of first wraps to last.
+                                // LRM §6.19.6: next(N)/prev(N) step N places with
+                                // wrapping (next of last -> first, prev of first
+                                // -> last). N defaults to 1; N==0 returns current.
+                                let len = members.len() as u64;
+                                let step = (step_n % len) as usize;
                                 let new_p = if mname == "next" {
-                                    if p + 1 >= members.len() { 0 } else { p + 1 }
+                                    (p + step) % members.len()
                                 } else {
-                                    if p == 0 { members.len() - 1 } else { p - 1 }
+                                    (p + members.len() - step) % members.len()
                                 };
                                 Value::from_u64(members[new_p].1, mw)
                             } else {
