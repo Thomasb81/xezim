@@ -12921,10 +12921,19 @@ impl Simulator {
                 }
                 Insn::BlockingAssign(sig_id, val_reg, width) => {
                     let id = *sig_id;
-                    let mut handled = false;
+                    // §10.6.1/§10.6.2: a `force`d or procedurally-continuously-
+                    // `assign`ed target ignores ordinary procedural writes until
+                    // release/deassign. The slow path's `write_sig!` already
+                    // honors this, but the raw-bit fast path below writes
+                    // `signal_table` directly — so an edge/procedural block's
+                    // blocking assign overrode a force. Treat a forced target as
+                    // already handled (drop the write on BOTH paths).
+                    let mut handled = !self.forced_signals.is_empty()
+                        && self.forced_signals.contains_key(&id);
                     // 2-state targets take the slow path so X/Z is dropped
                     // (§6.11.1/§10.7); the raw-bit fast path would keep it.
-                    if *width <= 64
+                    if !handled
+                        && *width <= 64
                         && self.signal_widths[id] == *width
                         && !self.signal_real[id]
                         && !self.signal_two_state.get(id).copied().unwrap_or(false)
@@ -31655,6 +31664,15 @@ impl Simulator {
                             }
                         }
                     }
+                    // A released signal that is a gateable flop's output (`q` in
+                    // `always @(posedge clk) q<=d`) may no longer equal its data
+                    // input — the force broke the "Q provably unchanged" invariant
+                    // the EVENT_EDGE skip relies on. Invalidate every flop
+                    // snapshot so the next edge actually re-fires and re-drives the
+                    // released output, instead of being skipped for "no data
+                    // change" and leaving Q stuck at the forced value. Release is
+                    // rare, so a one-shot re-fire of all flops is cheap.
+                    self.edge_block_snap_valid.iter_mut().for_each(|v| *v = false);
                     self.dirty_any = true;
                 }
             },
