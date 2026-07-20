@@ -1321,6 +1321,26 @@ impl TimingWheel {
                 return Some(self.current_time + delta as u64);
             }
         }
+        // Phase 3: wrap back to start_word's LOW bits (< start_bit). These are
+        // the furthest-ahead slots in the wheel window — a nearly-full wrap
+        // around — and belong AFTER every other word in scan order. Phase 1's
+        // `!0 << start_bit` mask hid them and Phase 2 stops before returning to
+        // start_word, so without this pass a lone event in this range is
+        // INVISIBLE: e.g. current_time=250 (slot 250, word 3 bit 58) with an
+        // event at time 500 (slot 244, word 3 bit 52) — same word, lower bit.
+        // next_time() would then return None and the scheduler would end the
+        // run early, silently dropping the event. (next_time_after scans all
+        // 256 slots and never had this hole.)
+        if start_bit != 0 {
+            let last_masked = self.bitmap[start_word] & !(!0u64 << start_bit);
+            if last_masked != 0 {
+                let bit = last_masked.trailing_zeros() as usize;
+                let slot = (start_word << 6) | bit;
+                // slot < start_slot here, so the wrap delta is always positive.
+                let delta = slot + WHEEL_SIZE - start_slot;
+                return Some(self.current_time + delta as u64);
+            }
+        }
         // Check overflow
         self.overflow.keys().next().copied()
     }
@@ -2622,6 +2642,12 @@ pub struct Simulator {
     /// large) real delay value, keyed by the delay expression's source offset —
     /// warn once per site so a spiking clock names itself without spamming.
     warned_delay_spikes: HashSet<usize>,
+    /// PIDs whose first-at-time-0 variable `#(expr)` delay evaluated to 0 and
+    /// was deferred once past the time-0 settle (so the period signal — e.g. a
+    /// real cont-assign feeding `always #(p/2) clk=~clk` — settles before the
+    /// clock's phase is fixed). Guards the one-shot re-park against a genuine
+    /// zero-period loop re-parking forever at t=0.
+    t0_delay_deferred: HashSet<usize>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
     /// §9.7 `process` class: PIDs explicitly suspended via `suspend()`. The
@@ -4554,6 +4580,7 @@ impl Simulator {
             fork_block_children: HashMap::default(),
             warned_assoc_index: HashSet::default(),
             warned_delay_spikes: HashSet::default(),
+            t0_delay_deferred: HashSet::default(),
             killed_pids: HashSet::default(),
             suspended_pids: HashSet::default(),
             suspended_proc_info: HashMap::default(),
@@ -17524,6 +17551,7 @@ impl Simulator {
                 self.dirty_any = true;
             }
             let processes = self.event_queue.remove(self.time);
+            let ran_process = !processes.is_empty();
             for (pid, stmts) in processes {
                 if self.finished {
                     break;
@@ -17542,7 +17570,7 @@ impl Simulator {
             // After advancing time and any clock/delay fires, check for
             // edge triggers so always_ff blocks fire within this delay
             // window, then re-snapshot for the next iter.
-            if fired_clock || dly_applied {
+            if fired_clock || dly_applied || ran_process {
                 self.check_edges();
                 let _ = self.drain_edge_cascade(self.cascade_limit);
                 self.snapshot_edge_signals();
@@ -18439,6 +18467,38 @@ impl Simulator {
                 match control {
                     TimingControl::Delay(d) => {
                         let delay = self.eval_delay_ticks(d);
+                        // A NON-LITERAL `#(expr)` that evaluates to 0 at the
+                        // very start of time 0 almost always means its period
+                        // signal has not settled yet: e.g. `assign xbOH =
+                        // dTx*d0j;` feeding `always #(xbOH/2) clk=~clk;`, where
+                        // the clock process (a lower pid, scheduled during
+                        // classify_always_blocks) runs before the `initial`
+                        // block that seeds `dTx`. Toggling now would drop a
+                        // spurious edge at t=0 and INVERT the clock's phase for
+                        // the whole run (so a later strobe samples the wrong
+                        // half-cycle). Re-park the WHOLE timing control — not
+                        // the post-`body` continuation — so `#(expr)` RE-
+                        // EVALUATES after the time-0 active+NBA+settle has run
+                        // the initial blocks and propagated the cont-assign.
+                        // One-shot per pid (`t0_delay_deferred`): a genuine
+                        // zero-period loop re-parks the continuation as usual on
+                        // its second pass. Literal `#0` is untouched.
+                        if delay == 0
+                            && self.time == 0
+                            && !matches!(d.kind, ExprKind::Number(_))
+                            && self.t0_delay_deferred.insert(pid)
+                        {
+                            let mut whole = vec![Statement::new(
+                                StatementKind::TimingControl {
+                                    control: TimingControl::Delay(d.clone()),
+                                    stmt: body.clone(),
+                                },
+                                stmt.span,
+                            )];
+                            whole.extend_from_slice(&stmts[i + 1..]);
+                            self.inactive_queue.push((pid, whole));
+                            return;
+                        }
                         let mut cont = vec![*body.clone()];
                         cont.extend_from_slice(&stmts[i + 1..]);
                         if delay == 0 {
@@ -18530,10 +18590,11 @@ impl Simulator {
                 return;
             }
 
-            // Check for repeat with event waits inside
+            // Check for repeat bodies that can suspend, including calls to
+            // blocking user tasks whose waits are not syntactically in-body.
             if let StatementKind::Repeat { count, body } = &stmt.kind {
                 let n = self.eval_expr(count).to_u64().unwrap_or(0);
-                if n > 0 && self.stmt_has_event_wait(body) {
+                if n > 0 && (self.stmt_has_event_wait(body) || self.stmt_is_blocking(body)) {
                     // Unroll: execute body once, then schedule rest
                     let remaining_n = n - 1;
                     let mut cont = Vec::new();
@@ -18936,7 +18997,7 @@ impl Simulator {
             StatementKind::ParBlock { join_type, .. } => {
                 !matches!(join_type, JoinType::JoinNone)
             }
-            // A call to a known blocking task. UVM's TLM/sequencer chains
+            // A call to a blocking task. UVM's TLM/sequencer chains
             // forward through thin wrappers whose body is a single call (e.g.
             // uvm_seq_item_pull_port::get_next_item -> `imp.get_next_item(t)`);
             // such a wrapper is blocking-via-call even though it has no
@@ -18944,22 +19005,20 @@ impl Simulator {
             // (m_select_sequence's waits, m_req_fifo.peek) to reach the
             // suspend-aware path. Recognise the canonical blocking task names.
             StatementKind::Expr(e) => {
-                // Default mode: name whitelist only (behavior unchanged).
-                // Pure-LRM mode: also follow the call into the callee's body so
-                // a task that blocks only transitively (e.g. UVM's `run_test`
-                // -> `uvm_root::run_test` -> `fork m_run_phases join_none;
-                // wait(...)`) is detected and routed through the suspend-aware
-                // runner instead of being executed synchronously.
+                // Follow user task calls into their bodies so blocking tasks
+                // reached through loop/conditional bodies still use the
+                // suspend-aware runner. The name whitelist remains useful for
+                // built-in/UVM calls whose source declaration is unavailable.
                 Self::call_is_blocking_task(e)
-                    || (self.pure_sv_lrm && self.callee_transitively_blocks(e))
+                    || self.callee_transitively_blocks(e)
             }
             StatementKind::Repeat { body, .. } => self.stmt_is_blocking(body),
             _ => false,
         }
     }
 
-    /// Pure-LRM transitive blocking detection: true if the call `expr` targets a
-    /// user subroutine whose body eventually reaches a blocking construct.
+    /// Transitive blocking detection: true if the call `expr` targets a user
+    /// subroutine whose body eventually reaches a blocking construct.
     fn callee_transitively_blocks(&self, expr: &Expression) -> bool {
         // A subroutine call in statement position can parse as Call{func},
         // a bare Ident (`task_name;` with no args), or a MemberAccess
@@ -19265,6 +19324,33 @@ impl Simulator {
                 match control {
                     TimingControl::Delay(d) => {
                         let delay = self.eval_delay_ticks(d);
+                        // `forever #(expr) sig=~sig;` variable-period clock:
+                        // when `expr` evaluates to 0 at the very start of time 0
+                        // its period signal (a real cont-assign like `assign
+                        // xbOH = dTx*d0j;`) has not settled from the initial
+                        // blocks yet — this clock process (a low pid) ran first.
+                        // Toggling now drops a spurious t=0 edge and INVERTS the
+                        // clock phase for the whole run. Restart the loop so
+                        // `#(expr)` RE-EVALUATES after the time-0 active+NBA+
+                        // settle; one-shot per pid so a genuine zero-period loop
+                        // still spins. Only for the pure `#(expr) …` head (i==0)
+                        // and a non-literal delay (literal `#0` untouched).
+                        if i == 0
+                            && delay == 0
+                            && self.time == 0
+                            && !matches!(d.kind, ExprKind::Number(_))
+                            && self.t0_delay_deferred.insert(pid)
+                        {
+                            let mut restart = vec![Statement::new(
+                                StatementKind::Forever {
+                                    body: Box::new(body.clone()),
+                                },
+                                body.span,
+                            )];
+                            restart.extend_from_slice(after);
+                            self.inactive_queue.push((pid, restart));
+                            return;
+                        }
                         let mut cont = vec![*tbody.clone()];
                         cont.extend_from_slice(&body_stmts[i + 1..]);
                         cont.push(Statement::new(
