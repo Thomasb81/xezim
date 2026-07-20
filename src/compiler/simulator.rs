@@ -3132,6 +3132,11 @@ pub struct Simulator {
     /// block index -> executions during the current rescan drain. Read by
     /// `report_edge_rescan_stall` to name the ping-ponging always blocks.
     edge_rescan_block_hits: HashMap<usize, u64>,
+    /// Edge-block executions accumulated while simulated time is not
+    /// advancing. Unlike `edge_rescan_block_hits`, this spans outer scheduler
+    /// iterations so progress/recovery diagnostics can identify a delta-cycle
+    /// loop whose writes are separated by NBA or process scheduling phases.
+    stall_edge_block_hits: HashMap<usize, u64>,
     /// Counter — number of iters whose check_edges ran over just the
     /// toggled clock subset instead of the full edge_signal_ids scan.
     prof_clocks_only_detect: u64,
@@ -4835,6 +4840,7 @@ impl Simulator {
             edge_exec_seen: Vec::new(),
             in_edge_rescan: false,
             edge_rescan_block_hits: HashMap::default(),
+            stall_edge_block_hits: HashMap::default(),
             dirty_edge: std::env::var_os("XEZIM_DIRTY_EDGE").is_some(),
             dirty_edge_shadow: std::env::var_os("XEZIM_DIRTY_EDGE_SHADOW").is_some(),
             prof_clocks_only_detect: 0,
@@ -11531,7 +11537,7 @@ impl Simulator {
         use super::bytecode::BytecodeCompiler;
         let mut compiled = Vec::with_capacity(self.edge_blocks.len());
         let mut bc_count = 0;
-        let mut max_regs: u16 = 0;
+        let mut max_regs: u32 = 0;
         for block in &self.edge_blocks {
             // Scope hint for unqualified idents inside the block: the
             // block's own inlining scope when it has one, else derived from
@@ -16440,6 +16446,7 @@ impl Simulator {
         let Some(ft) = future else {
             return false;
         };
+        self.report_zero_delay_recovery(ft);
         let stuck = self.event_queue.remove(self.time);
         for (p, c) in stuck {
             self.event_queue.schedule(ft, p, c);
@@ -16452,7 +16459,94 @@ impl Simulator {
         self.stall_iters = 0;
         self.stall_time = ft;
         self.stall_pid_hits.clear();
+        self.stall_edge_block_hits.clear();
         true
+    }
+
+    fn edge_block_stall_identity(&self, bi: usize, count: u64) -> Option<String> {
+        let block = self.edge_blocks.get(bi)?;
+        let kind = match block.kind {
+            AlwaysKind::AlwaysFf => "always_ff block",
+            AlwaysKind::AlwaysComb => "always_comb block",
+            AlwaysKind::AlwaysLatch => "always_latch block",
+            AlwaysKind::Always => "always block",
+        };
+        let scope = (!block.scope.is_empty()).then_some(block.scope.as_str());
+        let src_file = self.scope_src_file(scope);
+        let mut line = format!("                 {}", kind);
+        if let Some(loc) = self.span_file_line_in(block.stmt.span, src_file) {
+            line.push_str(" at ");
+            line.push_str(&loc);
+        }
+        if let Some(s) = scope {
+            match self.scope_def_module(Some(s)) {
+                Some(m) if m != self.module.name => {
+                    line.push_str(&format!(" ({}, module {})", s, m));
+                }
+                _ => line.push_str(&format!(" ({})", s)),
+            }
+        }
+        let sens = block
+            .resolved_sensitivities
+            .iter()
+            .map(|si| {
+                let edge = match si.edge {
+                    EdgeKind::Posedge => "posedge ",
+                    EdgeKind::Negedge => "negedge ",
+                    EdgeKind::AnyEdge => "",
+                };
+                format!("{}{}", edge, self.name_for_id(si.signal_id))
+            })
+            .collect::<Vec<_>>()
+            .join(" or ");
+        if !sens.is_empty() {
+            line.push_str(&format!(" — sensitive to @({})", sens));
+        }
+        line.push_str(&format!(" — ran {} times at this timestamp", count));
+        Some(line)
+    }
+
+    fn hottest_stall_edge_block(&self) -> Option<(usize, u64)> {
+        self.stall_edge_block_hits
+            .iter()
+            .map(|(&bi, &count)| (bi, count))
+            .max_by_key(|&(bi, count)| (count, std::cmp::Reverse(bi)))
+    }
+
+    /// A recoverable zero-delay spinner has a future timed event which may
+    /// repair its zero-valued delay (common in behavioral PLL models). Keep
+    /// that compatibility behavior, but make the forced time advance visible
+    /// and attribute the work that prevented normal delta convergence.
+    fn report_zero_delay_recovery(&mut self, future: u64) {
+        eprintln!(
+            "[xezim][warning] simulation made no time progress at {} for {} delta cycles; deferring stuck work to future event at {}.",
+            self.time, self.stall_iters, future
+        );
+        if let Some((&pid, &count)) = self
+            .stall_pid_hits
+            .iter()
+            .max_by_key(|&(pid, count)| (*count, std::cmp::Reverse(*pid)))
+        {
+            let mut line = self.stall_pid_identity(pid);
+            if let Some(reason) =
+                self.describe_stall_offender(pid, None, self.stall_pid_src_file(pid))
+            {
+                line.push_str(" — ");
+                line.push_str(&reason);
+            }
+            line.push_str(&format!(" — ran {} times at this timestamp", count));
+            eprintln!("               Most active scheduled process:");
+            eprintln!("{}", line);
+        }
+        if let Some((bi, count)) = self.hottest_stall_edge_block() {
+            if let Some(line) = self.edge_block_stall_identity(bi, count) {
+                eprintln!("               Most active edge block:");
+                eprintln!("{}", line);
+            }
+        }
+        eprintln!(
+            "               Lower XEZIM_STALL_LIMIT to diagnose sooner; 0 disables this check."
+        );
     }
 
     fn report_zero_delay_stall(&mut self, running: Option<(usize, &[Statement])>) {
@@ -17248,10 +17342,17 @@ impl Simulator {
         while !self.finished && iters < max_iters {
             iters += 1;
             if progress_interval > 0 && sim_start.elapsed() >= next_progress {
-                eprintln!("[PROGRESS] wall={:.1}s sim_time={} iters={} edges_fired={} nba_q={} waiters={}",
+                eprintln!("[PROGRESS] wall={:.1}s sim_time={} iters={} delta_cycles={} edges_fired={} nba_q={} waiters={}",
                     sim_start.elapsed().as_secs_f64(), self.time, iters,
+                    self.stall_iters,
                     self.prof_edges_fired, self.nba_fast.len() + self.nba_queue.len(),
                     self.event_waiters.len());
+                if let Some((bi, count)) = self.hottest_stall_edge_block() {
+                    if let Some(line) = self.edge_block_stall_identity(bi, count) {
+                        eprintln!("[PROGRESS] hottest edge block:");
+                        eprintln!("{}", line);
+                    }
+                }
                 next_progress += std::time::Duration::from_secs(progress_interval);
             }
 
@@ -17318,6 +17419,7 @@ impl Simulator {
                 self.stall_iters = 0;
                 self.stall_time = next_time;
                 self.stall_pid_hits.clear();
+                self.stall_edge_block_hits.clear();
                 // Time advanced on its own — any spinner that asked to be
                 // deferred resolved itself, so DON'T service a stale defer
                 // request (it would fire at the new time and jump past a clock
@@ -21349,6 +21451,15 @@ impl Simulator {
         if self.in_edge_rescan && !triggered.is_empty() {
             for &bi in &triggered {
                 *self.edge_rescan_block_hits.entry(bi).or_insert(0) += 1;
+            }
+        }
+
+        // Attribute edge work that spans multiple scheduler delta cycles at
+        // one timestamp. Normal timed clock ticks have stall_iters == 0, so
+        // they do not pay for these diagnostic hash-map updates.
+        if self.stall_limit > 0 && self.stall_iters > 0 {
+            for &bi in &triggered {
+                *self.stall_edge_block_hits.entry(bi).or_insert(0) += 1;
             }
         }
 

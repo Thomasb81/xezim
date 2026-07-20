@@ -11,7 +11,9 @@ use xezim_core::hasher::{HashMap, HashSet};
 
 const MAX_INLINE_DEPTH: usize = 8;
 
-/// A register in the bytecode VM. Registers hold Values.
+/// A register in the bytecode VM. Registers hold Values. The compact u16
+/// encoding keeps each instruction at 24 bytes; the allocator uses a wider
+/// counter and falls back before an ID would overflow this representation.
 type RegId = u16;
 
 /// Bytecode instruction set. Stack-free, register-based design.
@@ -169,13 +171,14 @@ impl ArrayOperand {
 #[derive(Debug, Clone)]
 pub struct CompiledBlock {
     pub instructions: Vec<Insn>,
-    pub num_regs: u16,
+    pub num_regs: u32,
 }
 
 /// Compiler state for converting AST → bytecode.
 pub struct BytecodeCompiler<'a> {
     insns: Vec<Insn>,
-    next_reg: RegId,
+    next_reg: u32,
+    register_overflow: bool,
     signal_name_to_id: &'a HashMap<Arc<str>, usize>,
     signal_signed: &'a [bool],
     signal_widths: &'a [u32],
@@ -259,6 +262,7 @@ impl<'a> BytecodeCompiler<'a> {
         Self {
             insns: Vec::with_capacity(64),
             next_reg: 0,
+            register_overflow: false,
             signal_name_to_id,
             signal_signed,
             signal_widths,
@@ -503,7 +507,10 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn alloc_reg(&mut self) -> RegId {
-        let r = self.next_reg;
+        let Ok(r) = RegId::try_from(self.next_reg) else {
+            self.register_overflow = true;
+            return 0;
+        };
         self.next_reg += 1;
         r
     }
@@ -748,10 +755,17 @@ impl<'a> BytecodeCompiler<'a> {
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let saved_reason = self.bail_reason;
+        let saved_overflow = self.register_overflow;
         self.bail_reason = None;
-        if self.compile_stmt_strict(stmt) {
+        self.register_overflow = false;
+        let strict_ok = self.compile_stmt_strict(stmt);
+        if strict_ok && !self.register_overflow {
             self.bail_reason = saved_reason;
+            self.register_overflow = saved_overflow;
             return true;
+        }
+        if self.register_overflow {
+            self.bail("bytecode_register_limit");
         }
         if self.allow_ast_fallback {
             let reason = self
@@ -764,8 +778,10 @@ impl<'a> BytecodeCompiler<'a> {
                 reason,
             ))));
             self.bail_reason = saved_reason;
+            self.register_overflow = saved_overflow;
             return true;
         }
+        self.register_overflow = saved_overflow;
         false
     }
 
@@ -2579,6 +2595,10 @@ impl<'a> BytecodeCompiler<'a> {
         // (e.g. 32-bit parameters) are wider than the target wire.
         let ctx = width.max(self.expr_max_width(rhs));
         if let Some(val_reg) = self.compile_expr(rhs, ctx) {
+            if self.register_overflow {
+                self.bail("bytecode_register_limit");
+                return false;
+            }
             self.emit(Insn::Resize(val_reg, width));
             self.emit(Insn::BlockingAssign(dst_id, val_reg, width));
             true
@@ -2602,6 +2622,10 @@ impl<'a> BytecodeCompiler<'a> {
     ) -> bool {
         let ctx = lhs_width.max(self.expr_max_width(rhs));
         if let Some(val_reg) = self.compile_expr(rhs, ctx) {
+            if self.register_overflow {
+                self.bail("bytecode_register_limit");
+                return false;
+            }
             self.emit(Insn::Resize(val_reg, lhs_width));
             self.compile_blocking_target(lhs, val_reg, lhs_width)
         } else {
@@ -2723,10 +2747,17 @@ impl<'a> BytecodeCompiler<'a> {
     /// result. Used by scheduler fast paths that repeatedly evaluate the same
     /// delay expression outside an always-block body.
     pub fn compile_root_expr(&mut self, expr: &Expression) -> Option<RegId> {
-        self.compile_expr(expr, 0)
+        let result = self.compile_expr(expr, 0);
+        if self.register_overflow {
+            self.bail("bytecode_register_limit");
+            None
+        } else {
+            result
+        }
     }
 
     pub fn finish(mut self) -> CompiledBlock {
+        debug_assert!(!self.register_overflow);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
         // up to ~50% slack capacity. With ~100K CompiledBlocks on
@@ -2737,5 +2768,47 @@ impl<'a> BytecodeCompiler<'a> {
             num_regs: self.next_reg,
             instructions: self.insns,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_ids_do_not_wrap_at_u16_limit() {
+        let signals: HashMap<Arc<str>, usize> = HashMap::default();
+        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
+        let widths: HashMap<String, u32> = HashMap::default();
+        let mut compiler = BytecodeCompiler::new(&signals, &[], &[], &arrays, &widths);
+
+        let mut last = 0;
+        for _ in 0..=u16::MAX {
+            last = compiler.alloc_reg();
+        }
+        compiler.emit(Insn::LoadConst(last, Box::new(Value::zero(1))));
+
+        let block = compiler.finish();
+        assert_eq!(last, u16::MAX);
+        assert_eq!(block.num_regs, u16::MAX as u32 + 1);
+        assert!(matches!(
+            block.instructions.last(),
+            Some(Insn::LoadConst(reg, _)) if u32::from(*reg) < block.num_regs
+        ));
+
+        // The next temporary is the first ID that cannot be represented by
+        // the compact instruction encoding. It must request fallback instead
+        // of wrapping to register zero as it did in BUG_REPORT.md.
+        let mut compiler = BytecodeCompiler::new(&signals, &[], &[], &arrays, &widths);
+        for _ in 0..=u16::MAX {
+            compiler.alloc_reg();
+        }
+        let expr = Expression::new(
+            ExprKind::Number(NumberLiteral::UnbasedUnsized('0')),
+            crate::ast::Span::dummy(),
+        );
+        assert_eq!(compiler.compile_root_expr(&expr), None);
+        assert!(compiler.register_overflow);
+        assert_eq!(compiler.next_reg, u16::MAX as u32 + 1);
     }
 }

@@ -407,6 +407,17 @@ fn zero_period_clock_gen_advances_to_reachable_setter() {
         text
     );
     assert!(
+        text.contains("simulation made no time progress at 0"),
+        "the forced advance must be visible instead of silently hiding the spinner:\n{}",
+        text
+    );
+    assert!(
+        text.contains(&format!("always block at {}:3", sv.display()))
+            && text.contains("re-arming via #(p/2) — currently 0"),
+        "the recovery warning must identify the zero-delay clock source:\n{}",
+        text
+    );
+    assert!(
         text.contains("ADV t=501"),
         "time must advance past the setter (t=1) and run the clock:\n{}",
         text
