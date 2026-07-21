@@ -20730,7 +20730,10 @@ impl Simulator {
             {
                 // Pattern case (`case(x) matches p: ...`) binds variables;
                 // delegate to the synchronous path which performs the bindings.
-                if !items.iter().any(|i| i.pattern.is_some()) {
+                // Likewise a case with NO blocking arm: `exec_statement(Case)`
+                // owns the §12.5.3 unique/unique0/priority violation checks,
+                // so only intercept when some arm can actually suspend.
+                if !items.iter().any(|i| i.pattern.is_some()) && self.stmt_is_blocking(stmt) {
                     let val = self.eval_expr(expr);
                     let chosen: Option<&Statement> = items.iter().find_map(|item| {
                         if item.is_default {
