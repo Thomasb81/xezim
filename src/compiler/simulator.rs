@@ -23610,6 +23610,77 @@ impl Simulator {
                             return true;
                         }
                     }
+                    // `ClassName::static_obj_handle.member...` (3+ segments):
+                    // the head names a class whose STATIC property (segment 1)
+                    // holds an object handle; the remaining segments are member
+                    // writes on that object. Needed for
+                    // `ClassName::obj.member = new(...)` / `= handle` so the
+                    // write reaches the real heap object reached through the
+                    // static-property chain (e.g. UVM's `m_t_inst.m_tw_cb_q`).
+                    if hier.path.len() >= 3
+                        && hier.path.iter().all(|s| s.selects.is_empty())
+                    {
+                        let cls = &hier.path[0].name.name;
+                        let sprop = &hier.path[1].name.name;
+                        if self.module.classes.contains_key(cls)
+                            && self.static_prop_key(cls, sprop).is_some()
+                        {
+                            let cur0 = self
+                                .static_prop_key(cls, sprop)
+                                .and_then(|k| self.class_statics.get(&k))
+                                .and_then(|v| v.to_u64())
+                                .map(|h| h as usize)
+                                .unwrap_or(0);
+                            if cur0 != 0 && cur0 < self.heap.len() {
+                                let mut cur = cur0;
+                                let mut done = false;
+                                for i in 2..hier.path.len() {
+                                    if cur == 0 || cur >= self.heap.len() {
+                                        break;
+                                    }
+                                    let mname = hier.path[i].name.name.clone();
+                                    if i == hier.path.len() - 1 {
+                                        // If the final member is a STATIC
+                                        // property of the reached object's
+                                        // class, write the shared static cell
+                                        // (the read path resolves it there).
+                                        // Otherwise write the instance property.
+                                        let cn = self
+                                            .heap
+                                            .get(cur)
+                                            .and_then(|o| o.as_ref())
+                                            .map(|inst| inst.class_name.clone());
+                                        if let Some(cn) = cn {
+                                            if self.static_prop_key(&cn, &mname).is_some()
+                                                && self.class_static_set(
+                                                    &cn,
+                                                    &mname,
+                                                    val.clone(),
+                                                )
+                                            {
+                                                done = true;
+                                            }
+                                        }
+                                        if !done {
+                                            let fitted =
+                                                self.fit_class_prop(cur, &mname, val);
+                                            if let Some(Some(inst)) = self.heap.get_mut(cur) {
+                                                inst.properties.insert(mname, fitted);
+                                                done = true;
+                                            }
+                                        }
+                                    } else if let Some(h) = self.member_handle(cur, &mname) {
+                                        cur = h;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if done {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
                     let obj_name = &hier.path[0].name.name;
                     {
                         let sub = hier.path[1..]
@@ -25897,31 +25968,47 @@ impl Simulator {
                             return v;
                         }
                     }
-                    let val = if let Some(locals) = self.local_stack.last() {
-                        locals.get(obj_name).cloned()
-                    } else {
-                        self.get_signal_value_by_name(obj_name)
-                    };
-                    if let Some(v) = val {
-                        let mut cur_handle = v.to_u64().unwrap_or(0) as usize;
+                    // Resolve the head to a handle from any storage: a
+                    // static class property (e.g. `the_mid` inside a static
+                    // method), a local, a `this` property, or a signal.
+                    // `eval_ident_handle` covers local/this/static; signals
+                    // need an explicit fallback.
+                    let mut cur_handle = self
+                        .eval_ident_handle(obj_name)
+                        .filter(|&h| h != 0 && h < self.heap.len())
+                        .or_else(|| {
+                            self.local_stack
+                                .last()
+                                .and_then(|m| m.get(obj_name))
+                                .and_then(|v| v.to_u64())
+                                .map(|h| h as usize)
+                                .filter(|&h| h != 0 && h < self.heap.len())
+                        })
+                        .or_else(|| {
+                            self.get_signal_value_by_name(obj_name)
+                                .and_then(|v| v.to_u64())
+                                .map(|h| h as usize)
+                                .filter(|&h| h != 0 && h < self.heap.len())
+                        });
+                    while let Some(h) = cur_handle {
                         for i in 1..hier.path.len() {
-                            if cur_handle == 0 || cur_handle >= self.heap.len() {
+                            if h == 0 || h >= self.heap.len() {
+                                cur_handle = None;
                                 break;
                             }
-                            if let Some(Some(inst)) = self.heap.get(cur_handle) {
-                                let member_name = &hier.path[i].name.name;
-                                if let Some(mval) = inst.properties.get(member_name) {
-                                    if i == hier.path.len() - 1 {
-                                        return mval.clone();
-                                    }
-                                    cur_handle = mval.to_u64().unwrap_or(0) as usize;
-                                } else {
-                                    break;
+                            let member_name = &hier.path[i].name.name;
+                            if let Some(mval) = self.read_member_value(h, member_name) {
+                                if i == hier.path.len() - 1 {
+                                    return mval;
                                 }
+                                cur_handle =
+                                    Some(mval.to_u64().unwrap_or(0) as usize);
                             } else {
+                                cur_handle = None;
                                 break;
                             }
                         }
+                        break;
                     }
                 }
                 self.fast_signal_read(hier)
@@ -48172,6 +48259,54 @@ impl Simulator {
         None
     }
 
+    /// Read `handle.member` as a VALUE (handle or scalar): instance property
+    /// first, then the instance's CLASS static cell. Mirrors `member_handle`
+    /// for the value-reading path used by `eval_expr`.
+    fn read_member_value(&self, handle: usize, member: &str) -> Option<Value> {
+        if let Some(v) = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| i.properties.get(member).cloned())
+        {
+            return Some(v);
+        }
+        let cn = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let key = self.static_prop_key(&cn, member)?;
+        self.class_statics.get(&key).cloned()
+    }
+
+    /// Resolve a handle for `handle.member`: try the instance property first,
+    /// then fall back to the instance's CLASS static cell (§8.25: a static
+    /// property accessed through an instance handle refers to the class's
+    /// shared static). Returns None if neither holds a handle.
+    fn member_handle(&self, handle: usize, member: &str) -> Option<usize> {
+        if let Some(h) = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| i.properties.get(member))
+            .and_then(|v| v.to_u64())
+            .map(|h| h as usize)
+        {
+            return Some(h);
+        }
+        let cn = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let key = self.static_prop_key(&cn, member)?;
+        self.class_statics
+            .get(&key)
+            .and_then(|v| v.to_u64())
+            .map(|h| h as usize)
+    }
+
     /// Resolve a handle-valued expression (`h`, `arr[i]`) to its heap handle in
     /// a `&self` context, applying instance scoping for member-array bases.
     fn eval_handle_expr(&self, expr: &Expression) -> Option<usize> {
@@ -48191,13 +48326,7 @@ impl Simulator {
                     if handle == 0 {
                         return None;
                     }
-                    handle = self
-                        .heap
-                        .get(handle)
-                        .and_then(|o| o.as_ref())
-                        .and_then(|i| i.properties.get(&seg.name.name))
-                        .and_then(|v| v.to_u64())
-                        .map(|h| h as usize)?;
+                    handle = self.member_handle(handle, &seg.name.name)?;
                 }
                 Some(handle)
             }
@@ -48228,12 +48357,7 @@ impl Simulator {
                 if bh == 0 {
                     return None;
                 }
-                self.heap
-                    .get(bh)
-                    .and_then(|o| o.as_ref())
-                    .and_then(|i| i.properties.get(&member.name))
-                    .and_then(|v| v.to_u64())
-                    .map(|h| h as usize)
+                self.member_handle(bh, &member.name)
             }
             ExprKind::Index { expr: base, index } => {
                 if let ExprKind::Ident(bh) = &base.kind {
@@ -60003,6 +60127,30 @@ impl Simulator {
                         return Some(t);
                     }
                 }
+                // `ClassName::static_obj_handle.member...` (3+ segments):
+                // resolve the static property's declared type, then walk the
+                // remaining segments through class property types. Needed for
+                // `ClassName::obj.member = new(...)` type inference — e.g.
+                // UVM's `the_pool.inst = new` where `the_pool` is a static
+                // holding an object whose `member` is itself a class handle.
+                if hier.path.len() >= 3 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    let cls = &hier.path[0].name.name;
+                    let prop = &hier.path[1].name.name;
+                    if let Some(mut tn) = self.class_prop_type_named(cls, prop) {
+                        let mut ok = true;
+                        for seg in &hier.path[2..] {
+                            if let Some(next) = self.class_prop_type_named(&tn, &seg.name.name) {
+                                tn = next;
+                            } else {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            return Some(tn);
+                        }
+                    }
+                }
                 None
             }
             // LRM §6.19.6: `<enum_var>.next()` / `.prev()` / `.first()`
@@ -60090,6 +60238,14 @@ impl Simulator {
                             if let Some(Some(inst)) = self.heap.get(handle) {
                                 let cn = inst.class_name.clone();
                                 return self.class_prop_type_named(&cn, &member.name);
+                            }
+                        }
+                    } else if bh.path.len() >= 2 && bh.path.iter().all(|s| s.selects.is_empty()) {
+                        // `ClassName::static_obj.member` — resolve the base
+                        // chain's type, then look up the member.
+                        if let Some(tn) = self.get_expr_type_name(base) {
+                            if let Some(mt) = self.class_prop_type_named(&tn, &member.name) {
+                                return Some(mt);
                             }
                         }
                     }
