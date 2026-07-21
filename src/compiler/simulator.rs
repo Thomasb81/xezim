@@ -16796,6 +16796,32 @@ impl Simulator {
                         return None;
                     }
                 }
+                // Reject packed multi-D element access (`logic [N-1:0][W-1:0] p;
+                // p[i]` with W>1). `p[i]` selects a W-bit element, NOT a single
+                // bit — fusing it as a bit gate would read/write bit `i` instead
+                // of element `i`. This was the FlooNOC "router never forwards"
+                // root cause: common_cells rr_arb_tree/lzc build their index
+                // tree with `assign idx_nodes[n] = idx_lut[k]` over packed-2D
+                // signals; mis-fused as bit copies, the arbiter's selected
+                // index came out wrong and no output valid ever asserted. Let
+                // these fall through to compile_cont_assign_lhs, which emits a
+                // correct elem_w-wide range read/write.
+                let elem_w = self
+                    .module
+                    .packed_signal_elem_widths
+                    .get(&name)
+                    .copied()
+                    .or_else(|| {
+                        hier.path.last().and_then(|s| {
+                            self.module
+                                .packed_signal_elem_widths
+                                .get(s.name.name.as_str())
+                                .copied()
+                        })
+                    });
+                if elem_w.map_or(false, |w| w > 1) {
+                    return None;
+                }
                 let id = self.resolve_ident_id(hier, scope_hint)?;
                 let bit = Self::try_const_u64(index)?;
                 if (bit as u32) < self.signal_widths[id] {
