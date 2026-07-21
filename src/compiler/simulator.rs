@@ -2717,6 +2717,11 @@ pub struct Simulator {
     /// flushes, not in the active region (a same-slot `.triggered` read in an
     /// active/inactive process must still see 0).
     pending_nba_triggers: Vec<String>,
+    /// A `$finish` raised by a waiters-first `@(edge)` continuation is held
+    /// until the current time slot's edge blocks AND postponed-side passes
+    /// (SVA actions, $monitor/$strobe) have run — reference simulators still
+    /// fire a final-cycle assertion action or display racing the finish.
+    finish_deferred: bool,
     /// §15.5.5 event variables are HANDLES to synchronization objects:
     /// `ev_alias = ev_b` makes both names one object. Maps an event variable
     /// (or element key `arr[i]`) to the event it currently aliases;
@@ -4821,6 +4826,7 @@ impl Simulator {
             edge_sequential_work: Vec::new(),
             nba_queue: Vec::new(),
             pending_nba_triggers: Vec::new(),
+            finish_deferred: false,
             event_aliases: HashMap::default(),
             nba_fast: Vec::new(),
             // Named signals stay on the dense hot path. Unnamed large-array
@@ -18127,6 +18133,12 @@ impl Simulator {
         self.drain_reactive_region();
         self.check_monitor();
         self.drain_pending_strobes();
+        // Deferred `$finish` from a waiters-first continuation: this time
+        // slot's edge blocks, SVA actions and monitors have all run — stop.
+        if self.finish_deferred {
+            self.finish_deferred = false;
+            self.finished = true;
+        }
         self.vcd_write_changes();
         if self.xtrace_writer.is_some() {
             self.xtrace_write_changes();
@@ -22652,9 +22664,158 @@ impl Simulator {
     /// only those positions in `edge_signal_ids` instead of the full range —
     /// see `check_edges_clocks_only`.  The dispatch / exec / cascade-prep
     /// path is identical either way.
+    /// §19.5 event-driven covergroup sampling for the edges fired this
+    /// pass. Split out of check_edges_inner so waiters-first mode can run it
+    /// before process continuations (and classic mode after edge blocks).
+    fn sample_edge_covergroups(&mut self) {
+        let _t_cg = self.profile_timing.then(std::time::Instant::now);
+        for i in 0..self.cg_event_waiters.len() {
+            let handle = self.cg_event_waiters[i].0;
+            let mut triggered = false;
+            for j in 0..self.cg_event_waiters[i].1.len() {
+                let sid = &self.cg_event_waiters[i].1[j];
+                if self.check_edge_id(sid.signal_id, sid.edge) {
+                    triggered = true;
+                    break;
+                }
+            }
+            if triggered {
+                self.sample_covergroup(handle);
+            }
+        }
+        if let Some(t) = _t_cg {
+            self.prof_edge_cg += t.elapsed().as_nanos() as u64;
+        }
+    }
+
+    /// Detect which parked event waiters' sensitivities fired (against
+    /// their own captured_prev baselines) and remove them from the parked
+    /// list, refreshing the baseline of everyone left. Returns the (pid,
+    /// continuation) pairs to run. Shared by the classic post-edge-block
+    /// drain and the commercial-order pre-edge-block drain (see
+    /// XEZIM_WAITERS_FIRST in check_edges_inner).
+    fn drain_triggered_event_waiters(&mut self) -> Vec<(usize, Vec<Statement>)> {
+        let waiters = std::mem::take(&mut self.event_waiters);
+        self.prof_waiter_iters += waiters.len() as u64;
+        self.event_waiters_swap.clear();
+        let mut triggered_conts: Vec<(usize, Vec<Statement>)> = Vec::new();
+        for mut waiter in waiters {
+            let mut triggered = false;
+            for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
+                let (pv, px) = waiter.captured_prev[i];
+                let pw = waiter.captured_prev_wide[i].as_ref();
+                if !self.edge_fires_prev(sid.signal_id, sid.edge, pv, px, pw) {
+                    continue;
+                }
+                // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
+                // guard `g` holds at edge time. A false guard re-arms the
+                // waiter (it stays in event_waiters for the next edge)
+                // rather than resuming the process. Evaluated in the module
+                // scope the signal table exposes — sufficient for the usual
+                // reset/enable guards (`iff rst_l === 1'b1`, `iff en`).
+                let guard_ok = match &sid.iff {
+                    Some(g) => self.eval_expr(g).is_true(),
+                    None => true,
+                };
+                if guard_ok {
+                    triggered = true;
+                    break;
+                }
+            }
+            if triggered {
+                sim_dbg_eprintln!(
+                    "[DEBUG] waiter for process {} triggered at time {}",
+                    waiter.pid,
+                    self.time
+                );
+                triggered_conts.push((waiter.pid, waiter.continuation));
+            } else {
+                // Refresh this waiter's `captured_prev` baseline to each
+                // sensitivity signal's CURRENT value so that a qualifying
+                // edge occurring over multiple steps is detected.
+                //
+                // Without this, a waiter armed while its signal sits at the
+                // edge-target level can never see the NEXT edge: e.g. a
+                // process resumes on the first `@(posedge clk)` at t=5
+                // (clk=1) and immediately re-arms on the next line; its
+                // captured_prev is frozen at 1, so when clk later goes
+                // 1→0→1 the Posedge test `!pb_one && cb_one` stays false
+                // (pb_one clings to the stale 1) and the second posedge is
+                // lost — the process strands (see
+                // tests/bound_module / sequential_event_waits). Tracking the
+                // running level here preserves the same-tick NBA-region
+                // semantics captured_prev was added for (a waiter still
+                // won't fire on an edge that completed BEFORE it armed, since
+                // at arm time captured_prev already equals current), while
+                // catching cross-tick transitions through the target level.
+                for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
+                    let (cv, cx) = self.signal_table[sid.signal_id].raw_bits();
+                    waiter.captured_prev[i] = (cv, cx);
+                    if self.signal_widths[sid.signal_id] > 64 {
+                        waiter.captured_prev_wide[i] =
+                            Some(self.signal_table[sid.signal_id].clone());
+                    }
+                }
+                self.event_waiters_swap.push(waiter);
+            }
+        }
+        std::mem::swap(&mut self.event_waiters, &mut self.event_waiters_swap);
+        triggered_conts
+    }
+
     fn check_edges_inner(&mut self, detect_subset: Option<&[usize]>, validate_coverage: bool) {
         if self.event_measure {
             self.event_phase += 1; // flop SAMPLE phase
+        }
+        // Commercial-simulator process ordering: a process PARKED on
+        // `@(posedge clk)` resumes BEFORE the same edge's always blocks run.
+        // The reference-simulator consensus (verified on the OpenRAM SRAM
+        // tb: `always @(posedge clk) dout = 'x;` racing a tb check right
+        // after `@(posedge clk)`) is that the parked continuation reads the
+        // pre-block value. Waiters that depend on an edge block's blocking
+        // write still wake within the same timestep via the §9.2 rescan.
+        static WAITERS_FIRST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let waiters_first = *WAITERS_FIRST.get_or_init(|| {
+            !std::env::var("XEZIM_WAITERS_LAST")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        });
+        if waiters_first {
+            // §19.5: event-driven covergroups sample the values current at
+            // the clocking event — BEFORE same-edge process continuations
+            // (which may immediately drive the next stimulus value).
+            self.sample_edge_covergroups();
+        }
+        if waiters_first && !self.event_waiters.is_empty() {
+            let _t_w = self.profile_timing.then(std::time::Instant::now);
+            let conts = self.drain_triggered_event_waiters();
+            if let Some(t) = _t_w {
+                self.prof_edge_waiters += t.elapsed().as_nanos() as u64;
+            }
+            for (pid, stmts) in conts {
+                if self.finished {
+                    break;
+                }
+                self.run_scheduled_process(pid, &stmts);
+                if !self.is_pid_suspended(pid) {
+                    self.child_finished(pid);
+                }
+                // A continuation that ended on a break/return leaves its
+                // control flags set; everything downstream of this edge pass
+                // (edge blocks' fallback exec, SVA actions) runs through
+                // exec_statement, which no-ops while they're up. Clear them.
+                self.break_flag = false;
+                self.continue_flag = false;
+                self.return_flag = false;
+            }
+            // A `$finish` from one of these continuations ends the run AFTER
+            // this edge delivery completes: the same edge's always blocks
+            // still fire once (reference-simulator behavior — a final-cycle
+            // `$display` monitor racing the testbench's `$finish` prints).
+            if self.finished {
+                self.finish_deferred = true;
+                self.finished = false;
+            }
         }
         let blocks = std::mem::take(&mut self.edge_blocks);
         self.in_edge_block = true;
@@ -23755,25 +23916,11 @@ impl Simulator {
         triggered.clear();
         self.edge_triggered_list = triggered;
 
-        // Trigger covergroup sampling
-        let _t_cg = self.profile_timing.then(std::time::Instant::now);
-        for i in 0..self.cg_event_waiters.len() {
-            let handle = self.cg_event_waiters[i].0;
-            let mut triggered = false;
-            for j in 0..self.cg_event_waiters[i].1.len() {
-                let sid = &self.cg_event_waiters[i].1[j];
-                if self.check_edge_id(sid.signal_id, sid.edge) {
-                    triggered = true;
-                    break;
-                }
-            }
-            if triggered {
-                self.sample_covergroup(handle);
-            }
-        }
-
-        if let Some(t) = _t_cg {
-            self.prof_edge_cg += t.elapsed().as_nanos() as u64;
+        // Trigger covergroup sampling (already done pre-continuation in
+        // waiters-first mode — §19.5 samples must see the values current AT
+        // the event, before a same-edge process continuation mutates them).
+        if !waiters_first {
+            self.sample_edge_covergroups();
         }
 
         // Wake up event_waiters whose sensitivity conditions are met.
@@ -23785,71 +23932,11 @@ impl Simulator {
         // active region. Inline execution restricts the drain to only
         // event_waiter continuations.
         let _t_w = self.profile_timing.then(std::time::Instant::now);
-        let waiters = std::mem::take(&mut self.event_waiters);
-        self.prof_waiter_iters += waiters.len() as u64;
-        self.event_waiters_swap.clear();
-        let mut triggered_conts: Vec<(usize, Vec<Statement>)> = Vec::new();
-        for mut waiter in waiters {
-            let mut triggered = false;
-            for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
-                let (pv, px) = waiter.captured_prev[i];
-                let pw = waiter.captured_prev_wide[i].as_ref();
-                if !self.edge_fires_prev(sid.signal_id, sid.edge, pv, px, pw) {
-                    continue;
-                }
-                // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
-                // guard `g` holds at edge time. A false guard re-arms the
-                // waiter (it stays in event_waiters for the next edge)
-                // rather than resuming the process. Evaluated in the module
-                // scope the signal table exposes — sufficient for the usual
-                // reset/enable guards (`iff rst_l === 1'b1`, `iff en`).
-                let guard_ok = match &sid.iff {
-                    Some(g) => self.eval_expr(g).is_true(),
-                    None => true,
-                };
-                if guard_ok {
-                    triggered = true;
-                    break;
-                }
-            }
-            if triggered {
-                sim_dbg_eprintln!(
-                    "[DEBUG] waiter for process {} triggered at time {}",
-                    waiter.pid,
-                    self.time
-                );
-                triggered_conts.push((waiter.pid, waiter.continuation));
-            } else {
-                // Refresh this waiter's `captured_prev` baseline to each
-                // sensitivity signal's CURRENT value so that a qualifying
-                // edge occurring over multiple steps is detected.
-                //
-                // Without this, a waiter armed while its signal sits at the
-                // edge-target level can never see the NEXT edge: e.g. a
-                // process resumes on the first `@(posedge clk)` at t=5
-                // (clk=1) and immediately re-arms on the next line; its
-                // captured_prev is frozen at 1, so when clk later goes
-                // 1→0→1 the Posedge test `!pb_one && cb_one` stays false
-                // (pb_one clings to the stale 1) and the second posedge is
-                // lost — the process strands (see
-                // tests/bound_module / sequential_event_waits). Tracking the
-                // running level here preserves the same-tick NBA-region
-                // semantics captured_prev was added for (a waiter still
-                // won't fire on an edge that completed BEFORE it armed, since
-                // at arm time captured_prev already equals current), while
-                // catching cross-tick transitions through the target level.
-                for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
-                    let (cv, cx) = self.signal_table[sid.signal_id].raw_bits();
-                    waiter.captured_prev[i] = (cv, cx);
-                    if self.signal_widths[sid.signal_id] > 64 {
-                        waiter.captured_prev_wide[i] =
-                            Some(self.signal_table[sid.signal_id].clone());
-                    }
-                }
-                self.event_waiters_swap.push(waiter);
-            }
-        }
-        std::mem::swap(&mut self.event_waiters, &mut self.event_waiters_swap);
+        let triggered_conts = if waiters_first {
+            Vec::new() // already drained and run before the edge blocks
+        } else {
+            self.drain_triggered_event_waiters()
+        };
         if let Some(t) = _t_w {
             self.prof_edge_waiters += t.elapsed().as_nanos() as u64;
         }
