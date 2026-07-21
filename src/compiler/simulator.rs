@@ -7779,10 +7779,29 @@ impl Simulator {
                         (s.name.name.clone(), is_input)
                     })
                     .collect();
+                // §14.11: alias the parser's reserved `##N` marker to the
+                // `default clocking` block, so the desugared
+                // `repeat (N) @(__xz_default_clocking)` resolves through the
+                // same clocking_meta lookup as a named `@(cb)`.
+                if cd.is_default {
+                    self.clocking_meta
+                        .insert("__xz_default_clocking".to_string(), (clk.clone(), sigs.clone()));
+                }
                 self.clocking_meta.insert(cb_name.clone(), (clk, sigs));
                 self.clocking_prev_clock.insert(cb_name.clone(), 2);
                 self.clocking_snapshots
                     .insert(cb_name.clone(), HashMap::default());
+            }
+        }
+        // Friendly fallback: `##N` with a single clocking block and no
+        // explicit `default` — unambiguous, so use it (strict LRM would
+        // demand the default declaration).
+        if !self.clocking_meta.contains_key("__xz_default_clocking")
+            && self.clocking_meta.len() == 1
+        {
+            if let Some(v) = self.clocking_meta.values().next().cloned() {
+                self.clocking_meta
+                    .insert("__xz_default_clocking".to_string(), v);
             }
         }
         // Seed the runtime string_signals set from the elab-time map so that
@@ -16066,6 +16085,21 @@ impl Simulator {
                     collect_ident_names(&ee.expr, &mut idents);
                     for &h in &idents {
                         let sig = self.resolve_hier_name(h);
+                        // LRM §14.3: `@(cb)` naming a clocking block means the
+                        // block's clock event (`@(posedge clk)`), not a signal
+                        // literally called `cb`. Without this substitution the
+                        // sensitivity targeted a nonexistent signal and never
+                        // fired, so `@(cb)` returned at t=0 (a no-op).
+                        if ee.edge.is_none() {
+                            if let Some((clk, _)) = self.clocking_meta.get(&sig) {
+                                out.push(Sensitivity {
+                                    signal_name: clk.clone(),
+                                    edge: EdgeKind::Posedge,
+                                    iff: ee.iff.clone(),
+                                });
+                                continue;
+                            }
+                        }
                         out.push(Sensitivity {
                             signal_name: sig,
                             edge,
@@ -16103,11 +16137,31 @@ impl Simulator {
                 }
                 out
             }
-            EventControl::Identifier(id) => vec![Sensitivity {
-                signal_name: id.name.clone(),
-                edge: EdgeKind::AnyEdge,
-                iff: None,
-            }],
+            EventControl::Identifier(id) => {
+                // LRM §14.3: `@(cb)` where `cb` names a clocking block
+                // synchronizes to that block's clock event (its declared
+                // `@(posedge clk)`), NOT a signal literally called `cb`. The
+                // old code built a sensitivity on a nonexistent signal `cb`,
+                // which never fired — so `@(cb)` returned at t=0 (a no-op) and
+                // any `@(cb); ...` sampling loop in a direct-SV testbench spun
+                // instead of stepping the clock. Substitute the block's clock
+                // signal with a posedge edge (the edge `tick_clocking_blocks`
+                // already assumes). Falls through to a plain named event when
+                // `id` is an ordinary `event`/signal, preserving prior behavior.
+                if let Some((clk, _)) = self.clocking_meta.get(&id.name) {
+                    vec![Sensitivity {
+                        signal_name: clk.clone(),
+                        edge: EdgeKind::Posedge,
+                        iff: None,
+                    }]
+                } else {
+                    vec![Sensitivity {
+                        signal_name: id.name.clone(),
+                        edge: EdgeKind::AnyEdge,
+                        iff: None,
+                    }]
+                }
+            }
             EventControl::HierIdentifier(expr) => {
                 if let ExprKind::Ident(h) = &expr.kind {
                     vec![Sensitivity {
