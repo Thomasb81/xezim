@@ -1577,6 +1577,24 @@ impl<'a> BytecodeCompiler<'a> {
                         .filter(|&w| w > 1);
                     if let Some(elem_w) = elem_w {
                         let base = self.compile_expr(expr, 0)?;
+                        // Constant index (the common case — genvar-unrolled
+                        // `idx_nodes[n] = idx_lut[k]` in rr_arb_tree/lzc, and
+                        // any literal `b[4]`): emit a CONSTANT-range slice.
+                        // The dynamic RangeSelect below produces a result whose
+                        // width is only known at runtime; feeding that into a
+                        // packed-2D element LHS write (BlockingAssignRangeDyn)
+                        // mis-places the bits and the target reads back X. A
+                        // RangeSelectConst carries a static width, so the LHS
+                        // write lands correctly. (This was the FlooNOC "router
+                        // never forwards" root cause: the arbiter's selected
+                        // index came out X.)
+                        if let Some(idx) = self.eval_const_expr(index) {
+                            let lo = idx * elem_w;
+                            let hi = lo + elem_w - 1;
+                            let dest = self.alloc_reg();
+                            self.emit(Insn::RangeSelectConst(dest, base, hi, lo));
+                            return Some(dest);
+                        }
                         let idx_reg = self.compile_expr(index, 0)?;
                         let elem_w_reg = self.alloc_reg();
                         self.emit(Insn::LoadConst(
