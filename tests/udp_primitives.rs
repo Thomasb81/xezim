@@ -578,3 +578,56 @@ fn primitive_verbose_reports_kind_values_and_implicit_nets() {
         stderr
     );
 }
+
+#[test]
+fn implicit_net_created_for_udp_only_terminal() {
+    // §6.10: an undeclared identifier appearing ONLY in primitive terminals
+    // (e.g. a vendor cell's mux-UDP output feeding its dff-UDP input) gets an
+    // implicit 1-bit net. The cont-assign implicit-net pass never sees such a
+    // net, so both instances used to be DROPPED as unresolved.
+    let dir = std::env::temp_dir().join("xezim_udp_implicit_term");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sv = dir.join("cell.v");
+    std::fs::write(
+        &sv,
+        "`timescale 1ns/1ns\n\
+         primitive udp_m (q, a, b, s); output q; input a, b, s;\n\
+           table 0 ? 0 : 0 ; 1 ? 0 : 1 ; ? 0 1 : 0 ; ? 1 1 : 1 ; 0 0 ? : 0 ; 1 1 ? : 1 ; endtable\n\
+         endprimitive\n\
+         primitive udp_d (q, d, ck); output q; reg q; input d, ck;\n\
+           table 0 (01) : ? : 0 ; 1 (01) : ? : 1 ; ? (10) : ? : - ; * ? : ? : - ; endtable\n\
+         endprimitive\n\
+         module sdcell (output Q, input CK, D, SE, SI);\n\
+           udp_d I0 (n0, n1, CK);\n\
+           udp_m I1 (n1, D, SI, SE);\n\
+           buf B0 (Q, n0);\n\
+         endmodule\n\
+         module top;\n\
+           reg ck = 0, d = 0, se = 0, si = 0; wire q;\n\
+           sdcell u_ff (.Q(q), .CK(ck), .D(d), .SE(se), .SI(si));\n\
+           always #5 ck = ~ck;\n\
+           initial begin d = 1; @(posedge ck); #1 $display(\"Q=%b\", q); $finish; end\n\
+         endmodule\n",
+    )
+    .expect("write sv");
+    let out = std::process::Command::new(xezim_bin())
+        .env("XEZIM_NO_CACHE", "1")
+        .arg(&sv)
+        .arg("--max-time")
+        .arg("100")
+        .output()
+        .expect("run xezim");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("UNRESOLVED"),
+        "UDP-only net still unresolved:\n{}",
+        stderr
+    );
+    assert!(
+        stdout.contains("Q=1"),
+        "cell did not function (mux->dff->buf chain):\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+}
