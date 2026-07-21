@@ -596,6 +596,9 @@ fn process_command_file(
                 "--primitive-verbose" => {
                     *primitive_verbose = true;
                 }
+                "-xenowarn" => {
+                    xezim::set_implicit_net_warn(false);
+                }
                 _ if t.starts_with("+define+") => {
                     push_plus_define(t, defines);
                 }
@@ -919,6 +922,11 @@ fn main() {
             }
             "--primitive-verbose" => {
                 primitive_verbose = true;
+            }
+            // Suppress §6.10 implicit 1-bit net warnings (gate-level designs
+            // with unresolved vendor cells can emit thousands).
+            "-xenowarn" => {
+                xezim::set_implicit_net_warn(false);
             }
             "-V" => {
                 print_version();
