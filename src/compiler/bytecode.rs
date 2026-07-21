@@ -143,6 +143,16 @@ pub enum Insn {
 
     SetSigned(RegId),
     Nop,
+
+    /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
+    /// Produced by the `finish()` peephole when the loaded register is dead
+    /// after the select. Reads the slice straight out of the signal — decisive
+    /// for wide (>64-bit) signals, where `LoadSignal` would copy the whole
+    /// `Wide` storage (1 byte/bit) into a VM register only to slice a few
+    /// bits out. Also removes one dispatch + one 32-byte register write.
+    LoadSignalRange(RegId, usize, u32, u32), // (dest, signal_id, left, right)
+    /// Fused `LoadSignal` + `BitSelectConst`: dest = signal_table[sig][index].
+    LoadSignalBit(RegId, usize, u32), // (dest, signal_id, index)
 }
 
 /// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
@@ -2758,6 +2768,7 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn finish(mut self) -> CompiledBlock {
         debug_assert!(!self.register_overflow);
+        Self::fuse_load_selects(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
         // up to ~50% slack capacity. With ~100K CompiledBlocks on
@@ -2767,6 +2778,151 @@ impl<'a> BytecodeCompiler<'a> {
         CompiledBlock {
             num_regs: self.next_reg,
             instructions: self.insns,
+        }
+    }
+
+    /// Does `insn` read register `r`? Conservative: unknown/AST-fallback
+    /// instructions report `true`. Used by the fuse peephole's liveness
+    /// check — a wrong `false` here would fuse away a load whose register
+    /// is still consumed later, so every variant must be enumerated.
+    fn insn_reads_reg(insn: &Insn, r: RegId) -> bool {
+        match insn {
+            Insn::LoadConst(..)
+            | Insn::LoadSignal(..)
+            | Insn::LoadSignalSigned(..)
+            | Insn::LoadSignalRange(..)
+            | Insn::LoadSignalBit(..)
+            | Insn::Jump(..)
+            | Insn::Nop => false,
+            // In-place mutators read their register.
+            Insn::Resize(a, _) | Insn::SetSigned(a) => *a == r,
+            Insn::Add(_, l, rr)
+            | Insn::Sub(_, l, rr)
+            | Insn::Mul(_, l, rr)
+            | Insn::Div(_, l, rr)
+            | Insn::Mod(_, l, rr)
+            | Insn::BitAnd(_, l, rr)
+            | Insn::BitOr(_, l, rr)
+            | Insn::BitXor(_, l, rr)
+            | Insn::BitXnor(_, l, rr)
+            | Insn::LogAnd(_, l, rr)
+            | Insn::LogOr(_, l, rr)
+            | Insn::Eq(_, l, rr)
+            | Insn::Neq(_, l, rr)
+            | Insn::CaseEq(_, l, rr)
+            | Insn::CasezEq(_, l, rr)
+            | Insn::CasexEq(_, l, rr)
+            | Insn::Lt(_, l, rr)
+            | Insn::Leq(_, l, rr)
+            | Insn::Gt(_, l, rr)
+            | Insn::Geq(_, l, rr)
+            | Insn::Shl(_, l, rr)
+            | Insn::Shr(_, l, rr)
+            | Insn::AShr(_, l, rr) => *l == r || *rr == r,
+            Insn::BitNot(_, s)
+            | Insn::LogNot(_, s)
+            | Insn::Negate(_, s)
+            | Insn::ReduceAnd(_, s)
+            | Insn::ReduceOr(_, s)
+            | Insn::ReduceXor(_, s)
+            | Insn::Move(_, s)
+            | Insn::Replicate(_, s, _) => *s == r,
+            Insn::BitSelect(_, b, i) => *b == r || *i == r,
+            Insn::BitSelectConst(_, b, _) => *b == r,
+            Insn::RangeSelect(_, b, l, rr) => *b == r || *l == r || *rr == r,
+            Insn::RangeSelectConst(_, b, _, _) => *b == r,
+            Insn::Concat(_, parts) => parts.iter().any(|p| *p == r),
+            Insn::BranchIfFalse(c, _) => *c == r,
+            Insn::Select(_, c, t, e) => *c == r || *t == r || *e == r,
+            Insn::NbaAssign(_, v, _) | Insn::BlockingAssign(_, v, _) => *v == r,
+            Insn::NbaAssignRange(_, _, _, v) | Insn::BlockingAssignRange(_, _, _, v) => *v == r,
+            Insn::NbaAssignRangeDyn(_, h, l, v) | Insn::BlockingAssignRangeDyn(_, h, l, v) => {
+                *h == r || *l == r || *v == r
+            }
+            Insn::NbaAssignBitDyn(_, i, v) | Insn::BlockingAssignBitDyn(_, i, v) => {
+                *i == r || *v == r
+            }
+            Insn::LoadArrayElem(_, _, i) => *i == r,
+            Insn::NbaAssignArray(_, i, v, _) | Insn::BlockingAssignArray(_, i, v, _) => {
+                *i == r || *v == r
+            }
+            Insn::NbaAssignArrayRange(_, i, h, l, v)
+            | Insn::BlockingAssignArrayRange(_, i, h, l, v) => {
+                *i == r || *h == r || *l == r || *v == r
+            }
+            // AST fallback can read anything through the interpreter.
+            Insn::StmtFallback(..) => true,
+        }
+    }
+
+    /// Peephole: fuse `LoadSignal(t, s); RangeSelectConst(d, t, l, r)` into
+    /// `LoadSignalRange(d, s, l, r)` (and the BitSelectConst analogue) when
+    /// the loaded register `t` is dead afterwards. The second slot becomes a
+    /// `Nop` so every branch target in the block stays valid. Skipped when a
+    /// jump lands ON the select (the fused load would then be bypassed), or
+    /// when `t` is read again later — unless the select overwrote `t`
+    /// itself (d == t), which destroys the raw value anyway.
+    /// `XEZIM_FUSE=0` disables the pass (A/B escape hatch).
+    fn fuse_load_selects(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        // 0 = off, 1 = range only, 2 = bit only, 3 = both (default).
+        static MODE: OnceLock<u8> = OnceLock::new();
+        let mode = *MODE.get_or_init(|| match std::env::var("XEZIM_FUSE").as_deref() {
+            Ok("0") => 0,
+            Ok("range") => 1,
+            Ok("bit") => 2,
+            _ => 3,
+        });
+        if mode == 0 || insns.len() < 2 {
+            return;
+        }
+        // Branch targets: fusing must not change what a jump lands on.
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::BranchIfFalse(_, t) | Insn::Jump(t) => {
+                    if (*t as usize) < is_target.len() {
+                        is_target[*t as usize] = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for i in 0..insns.len() - 1 {
+            let &Insn::LoadSignal(t, sig) = &insns[i] else {
+                continue;
+            };
+            if is_target[i + 1] {
+                continue;
+            }
+            let fused = match &insns[i + 1] {
+                &Insn::RangeSelectConst(d, b, l, r) if b == t && (mode & 1) != 0 => {
+                    Some((d, Insn::LoadSignalRange(d, sig, l, r)))
+                }
+                &Insn::BitSelectConst(d, b, idx) if b == t && (mode & 2) != 0 => {
+                    Some((d, Insn::LoadSignalBit(d, sig, idx)))
+                }
+                _ => None,
+            };
+            let Some((d, repl)) = fused else { continue };
+            // Liveness: the raw loaded value must not be consumed anywhere
+            // else in the block. Registers are allocated fresh per value
+            // (alloc_reg never reuses ids within a block), so any read of
+            // `t` outside the pair consumes THIS load — scan the whole
+            // block (not just later pcs) so backward jumps can't smuggle a
+            // read of `t` past a suffix-only check. d == t overwrites the
+            // raw value in the same pair, making later reads safe.
+            if d != t {
+                let consumed = insns
+                    .iter()
+                    .enumerate()
+                    .any(|(j, x)| j != i && j != i + 1 && Self::insn_reads_reg(x, t));
+                if consumed {
+                    continue;
+                }
+            }
+            insns[i] = repl;
+            insns[i + 1] = Insn::Nop;
         }
     }
 }
