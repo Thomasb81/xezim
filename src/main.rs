@@ -1,5 +1,41 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn default_design_cache_dir() -> PathBuf {
+    if let Some(path) = env::var_os("XEZIM_CACHE_DIR").filter(|p| !p.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|p| !p.is_empty()) {
+        return PathBuf::from(path).join("xezim").join("designs");
+    }
+    if let Some(home) = env::var_os("HOME").filter(|p| !p.is_empty()) {
+        return PathBuf::from(home).join(".cache").join("xezim").join("designs");
+    }
+    PathBuf::from(".xezim-cache")
+}
+
+fn design_dependency_files(
+    lib_files: &[String],
+    lib_dirs: &[String],
+    lib_exts: Option<&[String]>,
+) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = lib_files.iter().map(PathBuf::from).collect();
+    let default_exts = ["v".to_string(), "sv".to_string(), "V".to_string()];
+    let exts = lib_exts.unwrap_or(&default_exts);
+    for dir in lib_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
+            if path.is_file() && exts.iter().any(|candidate| candidate == ext) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
 
 /// Read a u64 from /proc/<pid|self>/status or /proc/meminfo by key (kB units).
 fn proc_kb(path: &str, key: &str) -> Option<u64> {
@@ -84,6 +120,9 @@ fn print_usage() {
     eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
+    eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs");
+    eprintln!("                    (default: $XEZIM_CACHE_DIR or $XDG_CACHE_HOME/xezim/designs).");
+    eprintln!("  --no-cache       Disable the automatic elaborated-design cache.");
     eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
   -v <file>        Library file: modules compiled only to resolve instantiations
   --primitive-verbose  Show parse/adoption diagnostics for explicit -v files
@@ -645,6 +684,11 @@ fn main() {
     }
     let mut mode: Mode = Mode::Simulate;
     let mut mode_explicit = false;
+    let mut sv2023_mode = true;
+    let mut strict_checks = true;
+    let mut source_delay_select: u8 = 1;
+    let mut design_cache_enabled = env::var("XEZIM_NO_CACHE").ok().as_deref() != Some("1");
+    let mut design_cache_dir: Option<PathBuf> = None;
     let mut verbose = false;
     let mut _output_file: Option<String> = None;
     let mut lib_dirs: Vec<String> = Vec::new();
@@ -830,18 +874,21 @@ fn main() {
             // no --sdf-min/typ/max was given, the SDF annotation too.
             "+mindelays" | "-mindelays" => {
                 xezim::sv_parser::set_delay_select(0);
+                source_delay_select = 0;
                 if sdf_select.is_none() {
                     sdf_select = Some(xezim::compiler::sdf::DelaySelect::Min);
                 }
             }
             "+typdelays" | "-typdelays" => {
                 xezim::sv_parser::set_delay_select(1);
+                source_delay_select = 1;
                 if sdf_select.is_none() {
                     sdf_select = Some(xezim::compiler::sdf::DelaySelect::Typ);
                 }
             }
             "+maxdelays" | "-maxdelays" => {
                 xezim::sv_parser::set_delay_select(2);
+                source_delay_select = 2;
                 if sdf_select.is_none() {
                     sdf_select = Some(xezim::compiler::sdf::DelaySelect::Max);
                 }
@@ -912,17 +959,21 @@ fn main() {
             "--sv2023" => {
                 // No-op now (default), kept for back-compat with existing scripts.
                 sv_parser::set_sv2023(true);
+                sv2023_mode = true;
             }
             "--sv2017" => {
                 sv_parser::set_sv2023(false);
+                sv2023_mode = false;
             }
             // Strict negative-test diagnostics (reject LRM-illegal constructs).
             // ON by default; `--no-strict` (alias `--lenient`) turns it off.
             "--strict" => {
                 sv_parser::set_strict_checks(true);
+                strict_checks = true;
             }
             "--no-strict" | "--lenient" => {
                 sv_parser::set_strict_checks(false);
+                strict_checks = false;
             }
             "--dump-tokens" => {
                 dump_tokens = true;
@@ -1070,6 +1121,22 @@ fn main() {
             }
             _ if arg.starts_with("--threads=") => {
                 threads = arg["--threads=".len()..].parse().unwrap_or(1).max(1);
+            }
+            "--cache-dir" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --cache-dir requires a directory");
+                    std::process::exit(1);
+                }
+                design_cache_dir = Some(PathBuf::from(&args[i]));
+                design_cache_enabled = true;
+            }
+            _ if arg.starts_with("--cache-dir=") => {
+                design_cache_dir = Some(PathBuf::from(&arg["--cache-dir=".len()..]));
+                design_cache_enabled = true;
+            }
+            "--no-cache" => {
+                design_cache_enabled = false;
             }
             "--emit-hypergraph" => {
                 i += 1;
@@ -1247,6 +1314,23 @@ suppressed but the explicit SDF annotation still applies."
             eprintln!("Error: cannot open log file '{}': {}", path, e);
             std::process::exit(1);
         }
+    }
+
+    if design_cache_enabled && mode == Mode::Simulate {
+        let directory = design_cache_dir.clone().unwrap_or_else(default_design_cache_dir);
+        let dependency_files = design_dependency_files(&lib_files, &lib_dirs, lib_exts.as_deref());
+        let semantic_salt = format!(
+            "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={}",
+            sv2023_mode, strict_checks, source_delay_select, module_timescale_args,
+            lib_dirs, lib_files, lib_exts, nospecify,
+        );
+        xezim::set_design_cache(Some(xezim::DesignCacheConfig {
+            directory,
+            semantic_salt,
+            dependency_files,
+        }));
+    } else {
+        xezim::set_design_cache(None);
     }
 
     // Fast path: if the only source file is a xezim compiled artifact, load

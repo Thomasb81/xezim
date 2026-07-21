@@ -19,7 +19,7 @@ type RegId = u16;
 /// Bytecode instruction set. Stack-free, register-based design.
 /// Each instruction specifies source and destination registers explicitly,
 /// enabling the VM to iterate a flat Vec<Insn> with predictable memory access.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Insn {
     /// Load a constant value into a register. `Box<Value>` keeps the
     /// variant small (8 B instead of 32 B for the inline Value) — LoadConst
@@ -139,7 +139,7 @@ pub enum Insn {
     /// Boxed payload keeps the variant at 8 B (Box ptr) instead of
     /// 24 B (Arc + fat-ptr str). StmtFallback is the AST-interpreter
     /// escape hatch — its dispatch cost dwarfs an extra deref.
-    StmtFallback(Box<(Arc<Statement>, &'static str)>),
+    StmtFallback(Box<(Arc<Statement>, Arc<str>)>),
 
     SetSigned(RegId),
     Nop,
@@ -171,7 +171,7 @@ pub enum Insn {
 /// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
 /// retained for diagnostics and the rare unresolved fallback, while normal
 /// execution uses only the dense base/range fields.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ArrayOperand {
     Dense {
         name: String,
@@ -191,7 +191,7 @@ impl ArrayOperand {
 }
 
 /// A compiled bytecode program for one always block or continuous assign.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompiledBlock {
     pub instructions: Vec<Insn>,
     pub num_regs: u32,
@@ -265,8 +265,8 @@ pub struct BytecodeCompiler<'a> {
     /// which case the compiler can only catch the literal-operand case.
     string_signals: Option<&'a HashSet<String>>,
     /// Base names of 2D/ND UNPACKED arrays. When a continuous-assign LHS
-    /// `m[0][j]` (outer index 0) targets one of these, the flattening
-    /// short-circuit (`flattened_outer_zero_signal_id`) must NOT fire — the
+    /// `m[0][j]` targets one of these, the flattening short-circuit
+    /// (`flattened_outer_const_signal_id`) must NOT fire — the
     /// bogus scalar signal `m` would otherwise catch a bit-select write and
     /// silently drop the element. None = no info (older callers); the guard
     /// then only excludes 1D/packed bases as before. Set via
@@ -491,7 +491,7 @@ impl<'a> BytecodeCompiler<'a> {
                 .unwrap_or_else(|| Self::stmt_kind_label(stmt));
             self.emit(Insn::StmtFallback(Box::new((
                 Arc::new(stmt.clone()),
-                reason,
+                Arc::from(reason),
             ))));
             true
         } else {
@@ -651,13 +651,17 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    fn flattened_outer_zero_signal_id(&self, expr: &Expression) -> Option<usize> {
+    fn flattened_outer_const_signal_id(&self, expr: &Expression) -> Option<usize> {
         let ExprKind::Index { expr: base, index } = &expr.kind else {
             return None;
         };
-        if self.eval_const_expr(index)? != 0 {
-            return None;
-        }
+        // Generated-loop expansion has already selected the unpacked element
+        // and baked its index into the hierarchical instance path. The AST
+        // retains the now-redundant constant select (`flat[i][bit]`), while
+        // the signal table contains `flat` as the selected packed element.
+        // Accept every constant here, not only zero; the shape guards below
+        // keep real unpacked and multi-dimensional packed arrays out.
+        self.eval_const_expr(index)?;
         let ExprKind::Ident(hier) = &base.kind else {
             return None;
         };
@@ -672,9 +676,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
         // A genuine 2D/ND UNPACKED array (`logic [7:0] m [2][2]`) also carries
         // a bogus scalar signal for its base name; `m[0][j]` must select the
-        // element (interpreter path), NOT bit-select that scalar. Only `[0]`
-        // hit this — `m[1][j]` already bailed because index != 0 — so the row-0
-        // writes were silently dropped.
+        // element (interpreter path), NOT bit-select that scalar.
         if self.is_multi_dim_array(hier) {
             return None;
         }
@@ -798,7 +800,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.next_reg = start_reg;
             self.emit(Insn::StmtFallback(Box::new((
                 Arc::new(stmt.clone()),
-                reason,
+                Arc::from(reason),
             ))));
             self.bail_reason = saved_reason;
             self.register_overflow = saved_overflow;
@@ -1820,7 +1822,7 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
-                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     if let Some(idx_reg) = self.compile_expr(index, 0) {
                         self.emit(Insn::NbaAssignBitDyn(id, idx_reg, val_reg));
                         return true;
@@ -1884,7 +1886,7 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
-                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     match kind {
                         RangeKind::Constant => {
                             if let (Some(hi), Some(lo)) =
@@ -2094,7 +2096,7 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
-                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     if let Some(idx_reg) = self.compile_expr(index, 0) {
                         self.emit(Insn::BlockingAssignBitDyn(id, idx_reg, val_reg));
                         return true;
@@ -2183,7 +2185,7 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
-                if let Some(id) = self.flattened_outer_zero_signal_id(expr) {
+                if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     match kind {
                         RangeKind::Constant => {
                             if let (Some(hi), Some(lo)) =
@@ -2995,6 +2997,80 @@ impl<'a> BytecodeCompiler<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ident_expr(name: &str) -> Expression {
+        let span = crate::ast::Span::dummy();
+        Expression::new(
+            ExprKind::Ident(HierarchicalIdentifier {
+                root: None,
+                path: vec![HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: name.to_owned(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        )
+    }
+
+    fn indexed_expr(name: &str, index: char) -> Expression {
+        let span = crate::ast::Span::dummy();
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(ident_expr(name)),
+                index: Box::new(Expression::new(
+                    ExprKind::Number(NumberLiteral::UnbasedUnsized(index)),
+                    span,
+                )),
+            },
+            span,
+        )
+    }
+
+    #[test]
+    fn generated_nonzero_outer_index_resolves_to_flattened_signal() {
+        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        signals.insert(Arc::from("flat"), 0);
+        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
+        let widths: HashMap<String, u32> = HashMap::default();
+        let compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
+
+        assert_eq!(
+            compiler.flattened_outer_const_signal_id(&indexed_expr("flat", '1')),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn genuine_array_shapes_do_not_resolve_as_flattened_signals() {
+        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        signals.insert(Arc::from("flat"), 0);
+        let widths: HashMap<String, u32> = HashMap::default();
+        let expr = indexed_expr("flat", '1');
+
+        let mut arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
+        arrays.insert("flat".to_owned(), (0, 3, 160));
+        let compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
+        assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
+
+        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
+        let mut packed_elem_widths: HashMap<String, u32> = HashMap::default();
+        packed_elem_widths.insert("flat".to_owned(), 32);
+        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
+        compiler.set_packed_elem_widths(&packed_elem_widths);
+        assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
+
+        let mut multi_dim_arrays: HashSet<String> = HashSet::default();
+        multi_dim_arrays.insert("flat".to_owned());
+        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
+        compiler.set_multi_dim_arrays(&multi_dim_arrays);
+        assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
+    }
 
     #[test]
     fn register_ids_do_not_wrap_at_u16_limit() {

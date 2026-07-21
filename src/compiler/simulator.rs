@@ -29,6 +29,7 @@ use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::raw::c_void;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -417,8 +418,25 @@ macro_rules! write_sig {
             }
             $self.signal_table[__wsig_id] = __wsig_val;
             // O1 measurement: stamp the signal's last-change phase.
-            if $self.event_measure && __wsig_id < $self.sig_last_change.len() {
+            if $self.event_measure
+                && !$self.armed_edge
+                && __wsig_id < $self.sig_last_change.len()
+            {
                 $self.sig_last_change[__wsig_id] = $self.event_phase;
+            }
+            // Arm only gateable edge blocks that actually read this signal.
+            // The dense bitmap makes unrelated writes a single cheap branch;
+            // positive hits use the sparse CSR fanout built after compilation.
+            if $self.armed_edge
+                && __wsig_id < $self.armed_input_bitmap.len()
+                && $self.armed_input_bitmap[__wsig_id]
+            {
+                if let Some(&(lo, hi)) = $self.armed_input_ranges.get(&(__wsig_id as u32)) {
+                    for __k in lo as usize..hi as usize {
+                        let __bi = $self.armed_input_blocks[__k] as usize;
+                        $self.edge_block_armed[__bi] = 1;
+                    }
+                }
             }
             // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
             // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
@@ -476,7 +494,7 @@ macro_rules! write_sig {
 
 /// A combinatorial item (continuous assign or always @*/always_comb block)
 /// with pre-computed sensitivity set for efficient evaluation.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum CombItem {
     Noop,
     ContAssign {
@@ -560,20 +578,20 @@ struct UdpRuntime {
     warned: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct BitRef {
     sig_id: u32,
     bit: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum GateBin {
     And,
     Or,
     Xor,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 enum FusedGate {
     /// dst = src, or dst = ~src when invert
     Buf1 {
@@ -598,7 +616,7 @@ enum FusedGate {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CombEntry {
     item: CombItem,
     /// Preferred hierarchical scope for resolving unqualified identifiers.
@@ -631,6 +649,32 @@ struct CombEntry {
     /// can name file:line for a non-converging driver. `Span::dummy()` when
     /// the origin has no source (synthesized entries).
     span: crate::ast::Span,
+}
+
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB001";
+
+#[derive(serde::Serialize)]
+struct PreparedCombCacheRef<'a> {
+    signal_count: usize,
+    entries: &'a [CombEntry],
+    dep_offsets: &'a [u32],
+    dep_entries: &'a [u32],
+    unresolved_idx: &'a [usize],
+    time0_idx: &'a [usize],
+    time0_deferred: &'a [CombEntry],
+    cont_driven: &'a HashSet<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct PreparedCombCache {
+    signal_count: usize,
+    entries: Vec<CombEntry>,
+    dep_offsets: Vec<u32>,
+    dep_entries: Vec<u32>,
+    unresolved_idx: Vec<usize>,
+    time0_idx: Vec<usize>,
+    time0_deferred: Vec<CombEntry>,
+    cont_driven: HashSet<usize>,
 }
 
 /// Does `stmt` (transitively, through nested blocks/branches/loops/timing
@@ -2131,6 +2175,10 @@ pub struct Simulator {
     /// continuous assigns like `assign x = bare_leaf;`.
     leaf_name_to_ids: HashMap<Arc<str>, Vec<usize>>,
     id_to_name: Vec<Arc<str>>,
+    /// Indices into `module.instances`, sorted by instance path. Hierarchical
+    /// upward-name resolution probes instance paths repeatedly; binary search
+    /// avoids a full instance-list scan without duplicating the long paths.
+    instance_path_order: Vec<usize>,
     /// Map signal_id → width (for fast width lookup).
     signal_widths: Vec<u32>,
     /// Set of signal IDs that are signed.
@@ -2615,6 +2663,11 @@ pub struct Simulator {
     /// walking fired edge signals so we do not scan the whole bitmap to
     /// discover triggered blocks.
     edge_triggered_list: Vec<usize>,
+    /// Generation marker for gateable blocks rejected by ARMED filtering
+    /// during fanout dispatch. This deduplicates multi-sensitivity blocks
+    /// without appending skipped work to `edge_triggered_list`.
+    edge_prefilter_seen: Vec<u32>,
+    edge_prefilter_generation: u32,
     edge_parallel_work: Vec<usize>,
     edge_sequential_work: Vec<usize>,
     nba_queue: Vec<NbaEntry>,
@@ -3006,6 +3059,9 @@ pub struct Simulator {
     fst_prev_signals: Vec<Value>,
     /// Pre-computed combinatorial entries with sensitivity sets.
     comb_entries: Vec<CombEntry>,
+    /// Optional content-addressed cache for the compiled combinational
+    /// worklist. The elaborated-design cache key is embedded in this path.
+    prepared_comb_cache_path: Option<PathBuf>,
     /// Static topological level per comb entry (longest producer chain).
     /// Populated when the level-BSP settle path is enabled; entries within one
     /// level write disjoint signals (no read-after-write), so they can be
@@ -3206,6 +3262,17 @@ pub struct Simulator {
     // execution; every skip is still verified against the value snapshot.
     edge_block_change_streak: Vec<u8>,
     edge_block_epoch_probe_left: Vec<u8>,
+    /// ARMED event-edge prefilter. Writes first test a compact signal bitmap;
+    /// only data-input hits walk the sparse signal -> gateable-block fanout.
+    /// An unarmed block can skip without reading its operand snapshots.
+    armed_edge: bool,
+    armed_edge_shadow: bool,
+    armed_input_bitmap: Vec<bool>,
+    armed_input_ranges: HashMap<u32, (u32, u32)>,
+    armed_input_blocks: Vec<u32>,
+    edge_block_armed: Vec<u8>,
+    armed_fast_skips: u64,
+    armed_shadow_checks: u64,
     // Phase-granular monotonic counter: bumped at each check_edges entry AND
     // each settle entry, so a flop's SAMPLE phase (check_edges) and the
     // comb-SETTLE phase that produces its next data have distinct timestamps
@@ -3315,7 +3382,7 @@ pub struct Simulator {
     /// Fine-grained phase timing calls `Instant::now` several times per
     /// simulation tick. Keep it opt-in so normal runs do not pay that cost.
     profile_timing: bool,
-    prof_fallback_by_reason: HashMap<&'static str, (u64, u64)>,
+    prof_fallback_by_reason: HashMap<Arc<str>, (u64, u64)>,
     prof_settle_dc_ns: u64,
     prof_settle_ca_ns: u64,
     prof_settle_ab_ns: u64,
@@ -4539,6 +4606,10 @@ impl Simulator {
             .chain(module.arrays_nd.keys())
             .cloned()
             .collect();
+        let mut instance_path_order: Vec<usize> = (0..module.instances.len()).collect();
+        instance_path_order.sort_unstable_by(|&a, &b| {
+            module.instances[a].path.cmp(&module.instances[b].path)
+        });
 
         let mut sim = Self {
             prev_val,
@@ -4567,6 +4638,7 @@ impl Simulator {
             array_first_id,
             leaf_name_to_ids,
             id_to_name,
+            instance_path_order,
             signal_widths: signal_widths_vec,
             signal_signed: signal_signed_vec,
             signal_real: signal_real_vec,
@@ -4688,6 +4760,8 @@ impl Simulator {
             in_edge_block: false,
             edge_triggered_bitmap: Vec::new(),
             edge_triggered_list: Vec::new(),
+            edge_prefilter_seen: Vec::new(),
+            edge_prefilter_generation: 0,
             edge_parallel_work: Vec::new(),
             edge_sequential_work: Vec::new(),
             nba_queue: Vec::new(),
@@ -4803,6 +4877,7 @@ impl Simulator {
             fst_trace: Vec::new(),
             fst_prev_signals: Vec::new(),
             comb_entries: Vec::new(),
+            prepared_comb_cache_path: None,
             comb_level: Vec::new(),
             comb_has_nba: Vec::new(),
             comb_par_safe: Vec::new(),
@@ -4860,6 +4935,15 @@ impl Simulator {
             edge_block_snap_valid: Vec::new(),
             edge_block_change_streak: Vec::new(),
             edge_block_epoch_probe_left: Vec::new(),
+            armed_edge: std::env::var("XEZIM_ARMED_EDGE").ok().as_deref() != Some("0")
+                || std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
+            armed_edge_shadow: std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
+            armed_input_bitmap: Vec::new(),
+            armed_input_ranges: HashMap::default(),
+            armed_input_blocks: Vec::new(),
+            edge_block_armed: Vec::new(),
+            armed_fast_skips: 0,
+            armed_shadow_checks: 0,
             event_phase: 0,
             event_would_skip: 0,
             event_gateable_total: 0,
@@ -5027,6 +5111,13 @@ impl Simulator {
     pub fn set_threads(&mut self, n: usize) {
         self.threads = n.max(1);
         self.pdes_worker_pool = None;
+    }
+
+    /// Reuse the runtime-neutral combinational worklist associated with an
+    /// elaborated-design cache entry. Designs with UDP or annotated timing
+    /// state bypass this cache in `build_comb_entries`.
+    pub fn set_prepared_comb_cache_path(&mut self, path: Option<PathBuf>) {
+        self.prepared_comb_cache_path = path;
     }
 
     /// Store the full CLI invocation (binary name + args + plusargs)
@@ -7774,6 +7865,15 @@ impl Simulator {
         if self.compiled {
             return;
         }
+        let trace_compile_phases = std::env::var_os("XEZIM_COMPILE_PHASES").is_some();
+        let mut compile_phase_start = std::time::Instant::now();
+        let mark_compile_phase = |label: &str, start: &mut std::time::Instant| {
+            if trace_compile_phases {
+                eprintln!("[COMPILE-PHASE] {}: {:.1}ms", label,
+                          start.elapsed().as_secs_f64() * 1000.0);
+            }
+            *start = std::time::Instant::now();
+        };
         self.sanitize_class_hierarchy();
         // LRM §14.3 — populate clocking-block metadata: per-cb clock
         // signal + per-signal direction. `tick_clocking_blocks`
@@ -7922,7 +8022,9 @@ impl Simulator {
             self.set_signal_value_by_name(&pname, rv);
         }
         self.in_const_param_eval = false;
+        mark_compile_phase("runtime metadata and static init", &mut compile_phase_start);
         self.classify_always_blocks();
+        mark_compile_phase("classify always blocks", &mut compile_phase_start);
         // JIT-redesign Stage 1: allocate `signal_inline_bits` BEFORE
         // `compile_edge_blocks` so the JIT module gets a non-empty
         // pointer in `set_inline_bits_storage`.  Otherwise Stage 2's
@@ -7957,6 +8059,7 @@ impl Simulator {
             self.jit_nba_side_len = 0;
         }
         self.compile_edge_blocks();
+        mark_compile_phase("compile edge blocks", &mut compile_phase_start);
         // Apply SDF / specify delays BEFORE building comb entries — the fused-gate
         // fast path bails out on signals with nonzero delay, so the delay must be
         // visible at build time or cont_assigns to delayed signals will be fused
@@ -8009,7 +8112,9 @@ impl Simulator {
                 }
             }
         }
+        mark_compile_phase("structural delay setup", &mut compile_phase_start);
         self.build_comb_entries();
+        mark_compile_phase("build combinational entries", &mut compile_phase_start);
         if std::env::var_os("XEZIM_SETTLE_LEVELS").is_some() || self.bsp_settle || self.bsp_shadow {
             self.report_comb_levels();
         }
@@ -8191,6 +8296,7 @@ impl Simulator {
             .filter(|(_, b)| b.resolved_sensitivities.iter().any(|s| s.iff.is_some()))
             .map(|(i, _)| i)
             .collect();
+        mark_compile_phase("build edge and dependency indexes", &mut compile_phase_start);
         // IEEE 1800: at time 0, always_comb blocks execute unconditionally.
         // always @* blocks do NOT execute at time 0 unless inputs change.
         // Only seed dirty IDs that have combinational dependents. Large
@@ -8216,6 +8322,7 @@ impl Simulator {
         let ab_ns_before = self.prof_settle_ab_ns;
         let ab_count_before = self.prof_settle_ab_count;
         self.settle_combinatorial();
+        mark_compile_phase("time-0 settle", &mut compile_phase_start);
         let dt = t_settle0.elapsed();
         if dt.as_millis() > 100 {
             eprintln!("[PHASE] time-0 settle: {:.1}ms ({} entry_evals, {} settle_iters, {} comb_entries, {} signals)",
@@ -8345,6 +8452,7 @@ impl Simulator {
         }
         self.auto_partition_by_clock();
         self.auto_partition_by_scope();
+        mark_compile_phase("schedule initial blocks", &mut compile_phase_start);
         self.compiled = true;
     }
 
@@ -13275,7 +13383,8 @@ impl Simulator {
                     self.vm_regs[*d as usize] =
                         self.vm_regs[*base as usize].range_select(*l as usize, *r as usize);
                 }
-                // Fused load+select (finish() peephole).
+                // Fused load+select (finish() peephole): slice straight out of
+                // the signal — no whole-Value copy into a register first.
                 Insn::LoadSignalRange(d, sig_id, l, r) => {
                     self.vm_regs[*d as usize] =
                         self.signal_table[*sig_id].range_select(*l as usize, *r as usize);
@@ -13584,7 +13693,7 @@ impl Simulator {
                 Insn::StmtFallback(payload) => {
                     let s = payload.0.clone();
                     self.prof_fallback_insns += 1;
-                    let r = payload.1;
+                    let r = payload.1.clone();
                     let t0 = std::time::Instant::now();
                     self.exec_statement(&s);
                     let elapsed = t0.elapsed().as_nanos() as u64;
@@ -14042,7 +14151,156 @@ impl Simulator {
         self.prof_insns_executed += local_count;
     }
 
+    fn prepared_comb_cache_eligible(&self) -> bool {
+        self.prepared_comb_cache_path.is_some()
+            && self.module.udp_instances.is_empty()
+            && self.sdf_delays.is_empty()
+    }
+
+    fn drop_comb_source_ast(&mut self) {
+        self.module.continuous_assigns = Vec::new();
+        self.module.pending_cont_assign = Vec::new();
+        self.module.always_blocks = Vec::new();
+        #[cfg(all(target_env = "gnu", not(miri)))]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+
+    fn prepared_comb_cache_is_valid(&self, cache: &PreparedCombCache) -> bool {
+        let signal_count = self.signal_table.len();
+        let entry_count = cache.entries.len();
+        cache.signal_count == signal_count
+            && cache.dep_offsets.len() == signal_count + 1
+            && cache.dep_offsets.first().copied() == Some(0)
+            && cache
+                .dep_offsets
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+            && cache.dep_offsets.last().copied().map(|n| n as usize)
+                == Some(cache.dep_entries.len())
+            && cache
+                .dep_entries
+                .iter()
+                .all(|&idx| (idx as usize) < entry_count)
+            && cache.unresolved_idx.iter().all(|&idx| idx < entry_count)
+            && cache.time0_idx.iter().all(|&idx| idx < entry_count)
+            && cache.entries.iter().chain(cache.time0_deferred.iter()).all(|entry| {
+                entry
+                    .read_signal_ids
+                    .iter()
+                    .chain(entry.write_signal_ids.iter())
+                    .all(|&id| id < signal_count)
+            })
+            && cache.cont_driven.iter().all(|&id| id < signal_count)
+    }
+
+    fn try_load_prepared_comb_cache(&mut self) -> bool {
+        if !self.prepared_comb_cache_eligible() {
+            return false;
+        }
+        let path = self.prepared_comb_cache_path.as_ref().unwrap().clone();
+        let result = (|| -> Result<PreparedCombCache, String> {
+            use std::io::Read;
+            let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+            let mut reader = std::io::BufReader::new(file);
+            let mut magic = [0u8; PREPARED_COMB_MAGIC.len()];
+            reader.read_exact(&mut magic).map_err(|e| e.to_string())?;
+            if &magic != PREPARED_COMB_MAGIC {
+                return Err("bad format marker".to_string());
+            }
+            bincode::deserialize_from(reader).map_err(|e| e.to_string())
+        })();
+        let cache = match result {
+            Ok(cache) if self.prepared_comb_cache_is_valid(&cache) => cache,
+            Ok(_) => {
+                eprintln!(
+                    "[CACHE] prepared-comb rejected invalid payload: {}",
+                    path.display()
+                );
+                let _ = std::fs::remove_file(&path);
+                return false;
+            }
+            Err(err) if path.exists() => {
+                eprintln!(
+                    "[CACHE] prepared-comb unreadable ({}): {}",
+                    err,
+                    path.display()
+                );
+                let _ = std::fs::remove_file(&path);
+                return false;
+            }
+            Err(_) => return false,
+        };
+
+        self.comb_entries = cache.entries;
+        self.comb_dep_offsets = cache.dep_offsets;
+        self.comb_dep_entries = cache.dep_entries;
+        self.comb_unresolved_idx = cache.unresolved_idx;
+        self.comb_time0_idx = cache.time0_idx;
+        self.comb_time0_deferred = cache.time0_deferred;
+        self.cont_driven = cache.cont_driven;
+        self.drop_comb_source_ast();
+        eprintln!(
+            "[CACHE] prepared-comb hit: {} entries from {}",
+            self.comb_entries.len(),
+            path.display()
+        );
+        true
+    }
+
+    fn write_prepared_comb_cache(&self) {
+        if !self.prepared_comb_cache_eligible() {
+            return;
+        }
+        let path = self.prepared_comb_cache_path.as_ref().unwrap();
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!("[CACHE] prepared-comb store skipped: {}", err);
+            return;
+        }
+        let tmp = path.with_extension(format!("xezcomb.tmp.{}", std::process::id()));
+        let result = (|| -> Result<(), String> {
+            let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+            let mut writer = std::io::BufWriter::new(file);
+            writer
+                .write_all(PREPARED_COMB_MAGIC)
+                .map_err(|e| e.to_string())?;
+            let payload = PreparedCombCacheRef {
+                signal_count: self.signal_table.len(),
+                entries: &self.comb_entries,
+                dep_offsets: &self.comb_dep_offsets,
+                dep_entries: &self.comb_dep_entries,
+                unresolved_idx: &self.comb_unresolved_idx,
+                time0_idx: &self.comb_time0_idx,
+                time0_deferred: &self.comb_time0_deferred,
+                cont_driven: &self.cont_driven,
+            };
+            bincode::serialize_into(&mut writer, &payload).map_err(|e| e.to_string())?;
+            writer.flush().map_err(|e| e.to_string())?;
+            drop(writer);
+            std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => eprintln!(
+                "[CACHE] prepared-comb stored: {} entries in {}",
+                self.comb_entries.len(),
+                path.display()
+            ),
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!("[CACHE] prepared-comb store skipped: {}", err);
+            }
+        }
+    }
+
     fn build_comb_entries(&mut self) {
+        if self.try_load_prepared_comb_cache() {
+            return;
+        }
         let mut entries = Vec::new();
 
         // Continuous assigns: drain by-value so that the per-CA AST
@@ -14339,7 +14597,12 @@ impl Simulator {
                     rids.push(id);
                     continue;
                 }
-                if !entry_is_bytecode {
+                // Bytecode lookup also qualifies unresolved multi-segment
+                // relative names with scope_hint. Keep the dependency id in
+                // lockstep with the signal id the VM will read; otherwise a
+                // successfully compiled entry remains "unresolved" and is
+                // needlessly evaluated on every settle call.
+                if !entry_is_bytecode || r.contains('.') {
                     if let Some(scope) = &scope_hint {
                         let qualified = format!("{}.{}", scope, r);
                         if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
@@ -15028,13 +15291,13 @@ impl Simulator {
             .cloned()
             .collect();
         self.comb_entries = entries;
+        self.write_prepared_comb_cache();
         // Drop AST storage for items we've consumed into comb_entries.
         // continuous_assigns live on in CombItem::ContAssign (fallback) or
         // as DirectCopy / FusedGate / CompiledContAssign; the source Vec in
         // the module is no longer read. Same for combinational always blocks
         // — edge-sensitive ones were moved into self.edge_blocks earlier.
-        self.module.continuous_assigns = Vec::new();
-        self.module.always_blocks = Vec::new();
+        self.drop_comb_source_ast();
         // Force the glibc allocator to return freed pages to the OS. On
         // c906 hello the AST drops above release ~1.3 GB but glibc's arena
         // retains it until a future large allocation triggers reuse —
@@ -15042,10 +15305,6 @@ impl Simulator {
         // the entire time-0 settle phase, only dropping to 1.4 GB when the
         // event loop's allocation pattern shifts. malloc_trim(0) forces
         // an immediate release. No-op on non-glibc platforms.
-        #[cfg(all(target_env = "gnu", not(miri)))]
-        unsafe {
-            libc::malloc_trim(0);
-        }
     }
 
     /// IEEE 1800-2017 §29: turn each flattened `UdpInstance` into a comb entry
@@ -15517,6 +15776,20 @@ impl Simulator {
             if let Some(raw) = rhs_raw.as_deref() {
                 if let Some(scope) = parent_n(raw, 1) {
                     return Some(scope);
+                }
+            }
+        }
+
+        // Some elaborated continuous assignments retain an absolute, dotted
+        // LHS as one identifier segment while the RHS remains a relative
+        // multi-segment path. Neither side is a "leaf" under the checks
+        // above, so scope inference used to return None and bytecode lookup
+        // could not distinguish identical RHS paths in replicated instances.
+        // An exact LHS signal anchors the assignment in its direct parent.
+        if let Some(raw) = lhs_raw.as_deref() {
+            if self.signal_name_to_id.contains_key(raw) {
+                if let Some((parent, _)) = raw.rsplit_once('.') {
+                    return Some(parent.to_string());
                 }
             }
         }
@@ -17805,6 +18078,12 @@ impl Simulator {
                     "[EVENT-EDGE] adaptive epoch-fast-exec={} snapshot-checks={}",
                     self.event_epoch_fast_exec, self.event_snapshot_checks
                 );
+                if self.armed_edge {
+                    eprintln!(
+                        "[EVENT-EDGE] armed-fast-skips={} shadow-checks={}",
+                        self.armed_fast_skips, self.armed_shadow_checks
+                    );
+                }
             }
         }
         if self.prof_par_dispatch_partition + self.prof_par_dispatch_legacy > 0 {
@@ -17855,10 +18134,10 @@ impl Simulator {
                 100.0 * imbalance_ms / merge_ms.max(1e-9),
             );
         }
-        let mut reasons: Vec<(&'static str, u64, u64)> = self
+        let mut reasons: Vec<(&str, u64, u64)> = self
             .prof_fallback_by_reason
             .iter()
-            .map(|(k, v)| (*k, v.0, v.1))
+            .map(|(k, v)| (k.as_ref(), v.0, v.1))
             .collect();
         reasons.sort_by_key(|(_, _, ns)| std::cmp::Reverse(*ns));
         for (reason, count, ns) in reasons.iter().take(15) {
@@ -21430,6 +21709,22 @@ impl Simulator {
         let mut triggered = std::mem::take(&mut self.edge_triggered_list);
         triggered.clear();
         let triggered_bitmap = &mut self.edge_triggered_bitmap[..blocks.len()];
+        let armed_prefilter = self.armed_edge
+            && !self.armed_edge_shadow
+            && self.event_skip
+            && self.time >= self.event_after;
+        if armed_prefilter {
+            if self.edge_prefilter_seen.len() < blocks.len() {
+                self.edge_prefilter_seen.resize(blocks.len(), 0);
+            }
+            self.edge_prefilter_generation = self.edge_prefilter_generation.wrapping_add(1);
+            if self.edge_prefilter_generation == 0 {
+                self.edge_prefilter_seen.fill(0);
+                self.edge_prefilter_generation = 1;
+            }
+        }
+        let prefilter_generation = self.edge_prefilter_generation;
+        let mut prefiltered = 0u64;
         // edge_blocks_by_sig is parallel to edge_signal_ids (position-indexed).
         // Two scan modes: full range (default) or a caller-supplied subset of
         // positions (clocks-only fast path).  Stack-allocated enum iterator
@@ -21535,55 +21830,56 @@ impl Simulator {
             // direction packet-flow count (B was waited on N times)
             // which is symmetric for hyperedge weight purposes.
             let mut woke_any = false;
-            if fires_pos {
-                for &block_idx in &fanout.posedge {
+            macro_rules! dispatch_block {
+                ($block_idx:expr) => {{
+                    let block_idx = $block_idx;
                     if block_idx < triggered_bitmap.len()
-                        && !triggered_bitmap[block_idx]
                         && !(iff_active && iff_denied[block_idx])
                     {
-                        triggered_bitmap[block_idx] = true;
-                        triggered.push(block_idx);
-                        woke_any = true;
-                        if self.edge_block_stats_enabled
-                            && block_idx < self.cross_block_wakeup_count.len()
-                        {
-                            self.cross_block_wakeup_count[block_idx] += 1;
+                        let skip_early = armed_prefilter
+                            && self.edge_block_gateable[block_idx]
+                            && self.edge_block_snap_valid[block_idx]
+                            && self.edge_block_armed[block_idx] == 0;
+                        if skip_early {
+                            if self.edge_prefilter_seen[block_idx] != prefilter_generation {
+                                self.edge_prefilter_seen[block_idx] = prefilter_generation;
+                                prefiltered += 1;
+                                self.event_gateable_total += 1;
+                                self.event_would_skip += 1;
+                                self.armed_fast_skips += 1;
+                                woke_any = true;
+                                if self.edge_block_stats_enabled
+                                    && block_idx < self.cross_block_wakeup_count.len()
+                                {
+                                    self.cross_block_wakeup_count[block_idx] += 1;
+                                }
+                            }
+                        } else if !triggered_bitmap[block_idx] {
+                            triggered_bitmap[block_idx] = true;
+                            triggered.push(block_idx);
+                            woke_any = true;
+                            if self.edge_block_stats_enabled
+                                && block_idx < self.cross_block_wakeup_count.len()
+                            {
+                                self.cross_block_wakeup_count[block_idx] += 1;
+                            }
                         }
                     }
+                }};
+            }
+            if fires_pos {
+                for &block_idx in &fanout.posedge {
+                    dispatch_block!(block_idx);
                 }
             }
             if fires_neg {
                 for &block_idx in &fanout.negedge {
-                    if block_idx < triggered_bitmap.len()
-                        && !triggered_bitmap[block_idx]
-                        && !(iff_active && iff_denied[block_idx])
-                    {
-                        triggered_bitmap[block_idx] = true;
-                        triggered.push(block_idx);
-                        woke_any = true;
-                        if self.edge_block_stats_enabled
-                            && block_idx < self.cross_block_wakeup_count.len()
-                        {
-                            self.cross_block_wakeup_count[block_idx] += 1;
-                        }
-                    }
+                    dispatch_block!(block_idx);
                 }
             }
             if fires_any {
                 for &block_idx in &fanout.anyedge {
-                    if block_idx < triggered_bitmap.len()
-                        && !triggered_bitmap[block_idx]
-                        && !(iff_active && iff_denied[block_idx])
-                    {
-                        triggered_bitmap[block_idx] = true;
-                        triggered.push(block_idx);
-                        woke_any = true;
-                        if self.edge_block_stats_enabled
-                            && block_idx < self.cross_block_wakeup_count.len()
-                        {
-                            self.cross_block_wakeup_count[block_idx] += 1;
-                        }
-                    }
+                    dispatch_block!(block_idx);
                 }
             }
             if woke_any
@@ -21596,18 +21892,16 @@ impl Simulator {
         if let Some(t) = t0 {
             self.prof_edge_detect += t.elapsed().as_nanos() as u64;
         }
-        self.prof_edges_fired += triggered.len() as u64;
+        self.prof_edges_fired += triggered.len() as u64 + prefiltered;
         // Return the iff-denial scratch buffer for reuse next delta-cycle.
         self.edge_iff_denied = iff_denied;
         // O1 MEASUREMENT (timestamp-based, gating-agnostic): for every gateable
         // flop firing this tick, it would be SKIPPABLE iff none of its data
         // inputs changed since the flop's previous fire. No behavior change.
         if self.event_skip && self.time >= self.event_after {
-            // REAL SKIP (snapshot-compare): value snapshots remain the authority
-            // for every skip. Blocks that repeatedly observe changed inputs use
-            // epochs for a bounded window to fast-path execution; an epoch miss
-            // falls back to the snapshot, so an uninstrumented write cannot
-            // cause a false skip.
+            // ARMED mode avoids snapshot reads until an input write marks the
+            // block. The legacy path retains adaptive snapshot/epoch filtering
+            // and remains available with XEZIM_ARMED_EDGE=0.
             const CHANGE_STREAK_TO_EPOCH: u8 = 8;
             const EPOCH_PROBE_WINDOW: u8 = 64;
             let now = self.event_phase;
@@ -21620,7 +21914,59 @@ impl Simulator {
                 }
                 let mut snapshot_result = None;
                 let mut epoch_fast = false;
-                let keep = if gate {
+                let keep = if gate && self.armed_edge {
+                    let start = self.edge_block_off[bi] as usize;
+                    let end = self.edge_block_off[bi + 1] as usize;
+                    let was_armed = self.edge_block_armed[bi] != 0;
+                    // Clear before execution. Any write performed by this or
+                    // another block later in the delta cycle re-arms through
+                    // the canonical write hooks.
+                    self.edge_block_armed[bi] = 0;
+                    if !was_armed {
+                        if self.armed_edge_shadow {
+                            self.armed_shadow_checks += 1;
+                            self.event_snapshot_checks += 1;
+                            let mut differ = false;
+                            for k in start..end {
+                                let sid = self.edge_block_reads_flat[k] as usize;
+                                let (v, x) = self.signal_table[sid].raw_bits();
+                                let (sv, sx) = self.edge_block_snap_flat[k];
+                                if v != sv || x != sx {
+                                    differ = true;
+                                    break;
+                                }
+                            }
+                            if differ {
+                                eprintln!(
+                                    "[EVENT-EDGE] ARMED shadow miss at time={} block={} span={:?}",
+                                    self.time, bi, blocks[bi].stmt.span
+                                );
+                                self.finished = true;
+                            }
+                            snapshot_result = Some(differ);
+                            differ
+                        } else {
+                            self.armed_fast_skips += 1;
+                            false
+                        }
+                    } else if !self.edge_block_snap_valid[bi] {
+                        true
+                    } else {
+                        self.event_snapshot_checks += 1;
+                        let mut differ = false;
+                        for k in start..end {
+                            let sid = self.edge_block_reads_flat[k] as usize;
+                            let (v, x) = self.signal_table[sid].raw_bits();
+                            let (sv, sx) = self.edge_block_snap_flat[k];
+                            if v != sv || x != sx {
+                                differ = true;
+                                break;
+                            }
+                        }
+                        snapshot_result = Some(differ);
+                        differ
+                    }
+                } else if gate {
                     let start = self.edge_block_off[bi] as usize;
                     let end = self.edge_block_off[bi + 1] as usize;
                     let reads = &self.edge_block_reads_flat[start..end];
@@ -21664,7 +22010,7 @@ impl Simulator {
                 } else {
                     true
                 };
-                if gate {
+                if gate && !self.armed_edge {
                     self.flop_last_fire[bi] = now;
                     match snapshot_result {
                         Some(true) => {
@@ -21686,15 +22032,15 @@ impl Simulator {
                         if epoch_fast {
                             self.edge_block_snap_valid[bi] = false;
                         } else {
-                        let start = self.edge_block_off[bi] as usize;
-                        let end = self.edge_block_off[bi + 1] as usize;
-                        let st = &self.signal_table;
-                        for k in start..end {
-                            let s = self.edge_block_reads_flat[k] as usize;
-                            self.edge_block_snap_flat[k] = st[s].raw_bits();
+                            let start = self.edge_block_off[bi] as usize;
+                            let end = self.edge_block_off[bi + 1] as usize;
+                            let st = &self.signal_table;
+                            for k in start..end {
+                                let s = self.edge_block_reads_flat[k] as usize;
+                                self.edge_block_snap_flat[k] = st[s].raw_bits();
+                            }
+                            self.edge_block_snap_valid[bi] = true;
                         }
-                        self.edge_block_snap_valid[bi] = true;
-                    }
                     }
                     triggered[w] = bi;
                     w += 1;
@@ -23232,9 +23578,13 @@ impl Simulator {
                             if id < self.signal_inline_bits.len() {
                                 self.signal_inline_bits[id] = [vv, xx];
                             }
-                            if self.event_measure && id < self.sig_last_change.len() {
+                            if self.event_measure
+                                && !self.armed_edge
+                                && id < self.sig_last_change.len()
+                            {
                                 self.sig_last_change[id] = self.event_phase;
                             }
+                            self.note_armed_write(id);
                         }
                         self.table_modified = true;
                         // Propagate to dependents (serial, after the barrier).
@@ -23304,9 +23654,13 @@ impl Simulator {
                                 if id < self.signal_inline_bits.len() {
                                     self.signal_inline_bits[id] = [v, x];
                                 }
-                                if self.event_measure && id < self.sig_last_change.len() {
+                                if self.event_measure
+                                    && !self.armed_edge
+                                    && id < self.sig_last_change.len()
+                                {
                                     self.sig_last_change[id] = self.event_phase;
                                 }
+                                self.note_armed_write(id);
                             }
                             self.table_modified = true;
                         } else {
@@ -33332,6 +33686,7 @@ impl Simulator {
                     self.edge_block_snap_valid
                         .iter_mut()
                         .for_each(|v| *v = false);
+                    self.edge_block_armed.iter_mut().for_each(|v| *v = 1);
                     self.dirty_any = true;
                 }
             },
@@ -37017,6 +37372,14 @@ impl Simulator {
         resolved
     }
 
+    #[inline]
+    fn instance_by_path(&self, path: &str) -> Option<&crate::elaborate::ElabInstance> {
+        self.instance_path_order
+            .binary_search_by(|&idx| self.module.instances[idx].path.as_str().cmp(path))
+            .ok()
+            .map(|pos| &self.module.instances[self.instance_path_order[pos]])
+    }
+
     fn resolve_hier_name_uncached(&self, hier: &HierarchicalIdentifier) -> String {
         let common_prefix_len = |a: &str, b: &str| -> usize {
             let mut n = 0usize;
@@ -37347,10 +37710,7 @@ impl Simulator {
                 if p.is_empty() {
                     return this.module.name == d;
                 }
-                this.module
-                    .instances
-                    .iter()
-                    .any(|i| i.path == p && i.def_name == d)
+                this.instance_by_path(p).map_or(false, |i| i.def_name == d)
             };
             let hint_owned = self.name_resolve_hint.borrow().clone();
             // Walk from the stable executing scope first; the transient
@@ -37389,7 +37749,7 @@ impl Simulator {
                     } else {
                         format!("{}.{}", p, first)
                     };
-                    if self.module.instances.iter().any(|i| i.path == inst) {
+                    if self.instance_by_path(&inst).is_some() {
                         let full = format!("{}.{}", inst, rest);
                         if exists(&full, self) {
                             let parent = parent_of(&full).to_string();
@@ -37649,22 +38009,6 @@ impl Simulator {
         }
     }
 
-    /// Canonical post-write hook for `signal_table[id]`.  All write paths
-    /// that mutate `signal_table[id]` in place (set_bit / set_inline_bits /
-    /// set_bit_code / direct enum-storage assignment) must call this
-    /// helper afterwards to keep `signal_inline_bits` in sync.
-    ///
-    /// IMPORTANT: does NOT update `signal_has_xz`.  The JIT prelude
-    /// reads signal_has_xz as a "may have X/Z" hint and falls back to
-    /// the interpreter when the bit is 1.  Historically the partial-bit
-    /// mutators left signal_has_xz stale-conservative (stuck at 1 even
-    /// after X/Z was cleared); this made the JIT fall back safely.
-    /// Tightening it (e.g. via after_signal_write writing the actual
-    /// post-write x bits) lets the JIT execute MORE blocks and exposes
-    /// latent JIT codegen bugs.  Keep signal_has_xz updates limited to
-    /// `write_sig!` (full-Value writes) for backward-compatible JIT
-    /// behavior.
-    #[inline(always)]
     /// Dirty-driven edge detect: record a write to signal `id` so check_edges
     /// can later scan only changed edge-sensitive positions. No-op (one bool
     /// load) unless XEZIM_DIRTY_EDGE / _SHADOW is active.
@@ -37696,7 +38040,28 @@ impl Simulator {
         }
     }
 
+    #[inline(always)]
+    fn note_armed_write(&mut self, id: usize) {
+        if !self.armed_edge
+            || id >= self.armed_input_bitmap.len()
+            || !self.armed_input_bitmap[id]
+        {
+            return;
+        }
+        let Some(&(lo, hi)) = self.armed_input_ranges.get(&(id as u32)) else {
+            return;
+        };
+        for k in lo as usize..hi as usize {
+            let bi = self.armed_input_blocks[k] as usize;
+            self.edge_block_armed[bi] = 1;
+        }
+    }
+
+    /// Canonical post-write hook for in-place `signal_table[id]` mutations.
+    /// It intentionally leaves `signal_has_xz` stale-conservative; tightening
+    /// that hint can enable JIT paths that do not yet support every X/Z case.
     fn after_signal_write(&mut self, id: usize) {
+        self.note_armed_write(id);
         self.note_edge_write(id);
         if id >= self.signal_table.len() {
             return;
@@ -37706,7 +38071,7 @@ impl Simulator {
             self.signal_inline_bits[id] = [new_v, new_x];
         }
         // O1 measurement: stamp fast-path (set_inline_bits) writes too.
-        if self.event_measure && id < self.sig_last_change.len() {
+        if self.event_measure && !self.armed_edge && id < self.sig_last_change.len() {
             self.sig_last_change[id] = self.event_phase;
         }
         // Value-change callback dispatch lives in the write_sig! macro
@@ -37813,13 +38178,21 @@ impl Simulator {
             data_reads[bi] = reads;
         }
         self.edge_block_gateable = gateable;
-        let tracked_signal_len = (0..nb)
-            .filter(|&bi| self.edge_block_gateable[bi])
-            .flat_map(|bi| data_reads[bi].iter().copied())
-            .max()
-            .map_or(0, |sid| sid as usize + 1);
+        let tracked_signal_len = if self.armed_edge {
+            0
+        } else {
+            (0..nb)
+                .filter(|&bi| self.edge_block_gateable[bi])
+                .flat_map(|bi| data_reads[bi].iter().copied())
+                .max()
+                .map_or(0, |sid| sid as usize + 1)
+        };
         self.sig_last_change = vec![0u64; tracked_signal_len];
-        self.flop_last_fire = vec![0u64; nb];
+        self.flop_last_fire = if self.armed_edge {
+            Vec::new()
+        } else {
+            vec![0u64; nb]
+        };
         let gateable_n = self.edge_block_gateable.iter().filter(|&&g| g).count();
         let empty_reads = (0..nb)
             .filter(|&bi| self.edge_block_gateable[bi] && data_reads[bi].is_empty())
@@ -37829,22 +38202,22 @@ impl Simulator {
             .map(|bi| data_reads[bi].len())
             .sum();
         if self.event_skip {
-        // Flatten gateable per-block reads into a CSR for cache locality.
-        // Non-gateable blocks contribute zero entries (offsets equal).
-        let mut off: Vec<u32> = Vec::with_capacity(nb + 1);
-        let mut flat_reads: Vec<u32> = Vec::new();
-        off.push(0);
-        for bi in 0..nb {
-            if self.edge_block_gateable[bi] {
+            // Flatten gateable per-block reads into a CSR for cache locality.
+            // Non-gateable blocks contribute zero entries (offsets equal).
+            let mut off: Vec<u32> = Vec::with_capacity(nb + 1);
+            let mut flat_reads: Vec<u32> = Vec::new();
+            off.push(0);
+            for bi in 0..nb {
+                if self.edge_block_gateable[bi] {
                     flat_reads.extend_from_slice(&data_reads[bi]);
+                }
+                off.push(flat_reads.len() as u32);
             }
-            off.push(flat_reads.len() as u32);
-        }
-        let total = flat_reads.len();
-        self.edge_block_off = off;
-        self.edge_block_reads_flat = flat_reads;
-        self.edge_block_snap_flat = vec![(0u64, 0u64); total];
-        self.edge_block_snap_valid = vec![false; nb];
+            let total = flat_reads.len();
+            self.edge_block_off = off;
+            self.edge_block_reads_flat = flat_reads;
+            self.edge_block_snap_flat = vec![(0u64, 0u64); total];
+            self.edge_block_snap_valid = vec![false; nb];
             self.edge_block_change_streak = vec![0; nb];
             self.edge_block_epoch_probe_left = vec![0; nb];
             // The timestamp-only measurement path needs the nested read sets;
@@ -37859,10 +38232,69 @@ impl Simulator {
             self.edge_block_change_streak = Vec::new();
             self.edge_block_epoch_probe_left = Vec::new();
         }
+        self.build_armed_edge_state();
         eprintln!(
             "[EVENT-EDGE] measure (timestamp): {} edge blocks, {} gateable, {} gateable-with-EMPTY-data-reads, avg data-reads/gateable={:.2}",
             nb, gateable_n, empty_reads,
             if gateable_n > 0 { total_reads as f64 / gateable_n as f64 } else { 0.0 },
+        );
+    }
+
+    fn build_armed_edge_state(&mut self) {
+        self.armed_input_bitmap.clear();
+        self.armed_input_ranges.clear();
+        self.armed_input_blocks.clear();
+        self.edge_block_armed.clear();
+        if !self.armed_edge || !self.event_skip {
+            return;
+        }
+
+        let nb = self.edge_block_gateable.len();
+        let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(self.edge_block_reads_flat.len());
+        for bi in 0..nb {
+            if !self.edge_block_gateable[bi] {
+                continue;
+            }
+            let lo = self.edge_block_off[bi] as usize;
+            let hi = self.edge_block_off[bi + 1] as usize;
+            for &sid in &self.edge_block_reads_flat[lo..hi] {
+                pairs.push((sid, bi as u32));
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+
+        let bitmap_len = pairs
+            .last()
+            .map_or(0, |(sid, _)| *sid as usize + 1);
+        self.armed_input_bitmap = vec![false; bitmap_len];
+        self.armed_input_blocks.reserve(pairs.len());
+        let mut cursor = 0usize;
+        while cursor < pairs.len() {
+            let sid = pairs[cursor].0;
+            let lo = self.armed_input_blocks.len() as u32;
+            while cursor < pairs.len() && pairs[cursor].0 == sid {
+                self.armed_input_blocks.push(pairs[cursor].1);
+                cursor += 1;
+            }
+            let hi = self.armed_input_blocks.len() as u32;
+            self.armed_input_bitmap[sid as usize] = true;
+            self.armed_input_ranges.insert(sid, (lo, hi));
+        }
+        self.edge_block_armed = self
+            .edge_block_gateable
+            .iter()
+            .map(|&gateable| u8::from(gateable))
+            .collect();
+        eprintln!(
+            "[EVENT-EDGE] ARMED mode ON: {} input signals, {} fanout edges{}",
+            self.armed_input_ranges.len(),
+            self.armed_input_blocks.len(),
+            if self.armed_edge_shadow {
+                " (shadow validation)"
+            } else {
+                ""
+            }
         );
     }
 
@@ -63795,6 +64227,12 @@ pub extern "C" fn vpi_put_value(
                     }
                 }
             }
+            // Release invalidates the event-edge assumption that a flop's
+            // output still reflects its last sampled inputs.
+            sim.edge_block_snap_valid
+                .iter_mut()
+                .for_each(|v| *v = false);
+            sim.edge_block_armed.iter_mut().for_each(|v| *v = 1);
             sim.dirty_any = true;
             return std::ptr::null_mut();
         }
@@ -63901,6 +64339,7 @@ pub extern "C" fn vpi_put_value(
                     let (v, x) = value.raw_bits();
                     sim.signal_inline_bits[sig_id] = [v, x];
                 }
+                sim.after_signal_write(sig_id);
             }
             // Now mark as forced (after the write succeeded)
             sim.forced_signals.insert(sig_id, value);
