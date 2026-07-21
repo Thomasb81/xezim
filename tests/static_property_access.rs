@@ -146,3 +146,101 @@ fn test_static_obj_method_persistence() {
         msgs
     );
 }
+
+// ── §8.25: static member through instance-handle chain ──────────────
+// `ClassName::static_obj.member` where `member` is itself a STATIC
+// property of the reached object's class. The write must reach the
+// shared static cell (which is where the read resolves), and method
+// calls through the chain must persist. (get_expr_type_name 3-segment,
+// assign_value 3-segment static-aware, member_handle/read_member_value
+// static fallback.)
+const STATIC_CHAIN_STATIC_MEMBER_SRC: &str = r#"
+module top;
+  class inner;
+    int q[$];
+    function void push_back(int v); q.push_back(v); endfunction
+    function int size(); return q.size(); endfunction
+  endclass
+  class mid;
+    static inner inst;
+  endclass
+  class outer;
+    static mid the_mid;
+    static function void do_push(int v);
+      the_mid.inst.push_back(v);
+    endfunction
+    static function int get_size();
+      return the_mid.inst.size();
+    endfunction
+  endclass
+  initial begin
+    outer::the_mid = new;
+    outer::the_mid.inst = new;
+    outer::do_push(10);
+    outer::do_push(20);
+    outer::do_push(30);
+    $display("size=%0d", outer::get_size());
+    if (outer::get_size() == 3) $display("TAG_PASS");
+    else $display("TAG_FAIL");
+  end
+endmodule
+"#;
+
+#[test]
+fn test_static_chain_static_member() {
+    let sim = simulate(STATIC_CHAIN_STATIC_MEMBER_SRC, 200).expect("simulate failed");
+    let msgs = messages(&sim);
+    assert!(
+        msgs.iter().any(|m| m == "TAG_PASS"),
+        "push_back through a static-member chain should persist; got {:?}",
+        msgs
+    );
+}
+
+// ── §8.25: instance member through static-property chain, unqualified ─
+// Inside a static method, an unqualified static-property head
+// (`the_mid`) resolves to the shared object, and member writes/reads
+// through it persist. Tests both qualified and unqualified forms.
+const STATIC_CHAIN_INSTANCE_MEMBER_SRC: &str = r#"
+module top;
+  class inner;
+    int q[$];
+    function void push_back(int v); q.push_back(v); endfunction
+    function int size(); return q.size(); endfunction
+  endclass
+  class mid;
+    inner inst;   // NON-static instance member
+  endclass
+  class outer;
+    static mid the_mid;
+    static function void f_unqual(int v);
+      the_mid.inst.push_back(v);          // unqualified static head
+    endfunction
+    static function void f_qual(int v);
+      outer::the_mid.inst.push_back(v);   // qualified static head
+    endfunction
+  endclass
+  initial begin
+    outer::the_mid = new;
+    outer::the_mid.inst = new;
+    outer::f_unqual(1);
+    outer::f_unqual(2);
+    outer::f_unqual(3);
+    outer::f_qual(4);
+    $display("size=%0d", outer::the_mid.inst.size());
+    if (outer::the_mid.inst.size() == 4) $display("TAG_PASS");
+    else $display("TAG_FAIL");
+  end
+endmodule
+"#;
+
+#[test]
+fn test_static_chain_instance_member() {
+    let sim = simulate(STATIC_CHAIN_INSTANCE_MEMBER_SRC, 200).expect("simulate failed");
+    let msgs = messages(&sim);
+    assert!(
+        msgs.iter().any(|m| m == "TAG_PASS"),
+        "push_back through instance-member chain (unqualified + qualified) should persist; got {:?}",
+        msgs
+    );
+}
