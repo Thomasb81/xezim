@@ -5237,7 +5237,9 @@ impl Simulator {
                                 cb.instructions.iter().any(|i| {
                                     matches!(i,
                                     super::bytecode::Insn::LoadSignal(_, s)
-                                    | super::bytecode::Insn::LoadSignalSigned(_, s) if *s == sid)
+                                    | super::bytecode::Insn::LoadSignalSigned(_, s)
+                                    | super::bytecode::Insn::LoadSignalRange(_, s, _, _)
+                                    | super::bytecode::Insn::LoadSignalBit(_, s, _) if *s == sid)
                                 })
                             })
                     })
@@ -5380,7 +5382,9 @@ impl Simulator {
             for insn in cb.instructions.iter() {
                 match insn {
                     super::bytecode::Insn::LoadSignal(_, sid)
-                    | super::bytecode::Insn::LoadSignalSigned(_, sid) => {
+                    | super::bytecode::Insn::LoadSignalSigned(_, sid)
+                    | super::bytecode::Insn::LoadSignalRange(_, sid, _, _)
+                    | super::bytecode::Insn::LoadSignalBit(_, sid, _) => {
                         if !reads_of[bi].contains(sid) {
                             reads_of[bi].push(*sid);
                             readers_of_sig.entry(*sid).or_default().push(bi);
@@ -5805,7 +5809,9 @@ impl Simulator {
             for insn in cb.instructions.iter() {
                 let sid = match insn {
                     super::bytecode::Insn::LoadSignal(_, sid)
-                    | super::bytecode::Insn::LoadSignalSigned(_, sid) => *sid,
+                    | super::bytecode::Insn::LoadSignalSigned(_, sid)
+                    | super::bytecode::Insn::LoadSignalRange(_, sid, _, _)
+                    | super::bytecode::Insn::LoadSignalBit(_, sid, _) => *sid,
                     super::bytecode::Insn::NbaAssign(sid, _, _)
                     | super::bytecode::Insn::NbaAssignRange(sid, _, _, _) => *sid,
                     _ => continue,
@@ -8746,6 +8752,7 @@ impl Simulator {
             for insn in &cb.instructions {
                 let touched_id = match insn {
                     Insn::LoadSignal(_, id) | Insn::LoadSignalSigned(_, id) => Some(*id),
+                    Insn::LoadSignalRange(_, id, _, _) | Insn::LoadSignalBit(_, id, _) => Some(*id),
                     Insn::NbaAssign(id, _, _) => Some(*id),
                     Insn::NbaAssignRange(id, _, _, _) => Some(*id),
                     Insn::NbaAssignBitDyn(id, _, _) => Some(*id),
@@ -10793,7 +10800,11 @@ impl Simulator {
                 }
             }
             for insn in &cb.instructions {
-                if let Insn::LoadSignal(_, id) | Insn::LoadSignalSigned(_, id) = insn {
+                if let Insn::LoadSignal(_, id)
+                | Insn::LoadSignalSigned(_, id)
+                | Insn::LoadSignalRange(_, id, _, _)
+                | Insn::LoadSignalBit(_, id, _) = insn
+                {
                     if *id < n_signals {
                         read_edge[*id] |= 1 << blp;
                     }
@@ -12260,6 +12271,14 @@ impl Simulator {
                     vm_regs[*d as usize] =
                         vm_regs[*base as usize].range_select(*l as usize, *r as usize);
                 }
+                // Fused load+select (finish() peephole).
+                Insn::LoadSignalRange(d, sig_id, l, r) => {
+                    vm_regs[*d as usize] =
+                        signal_table[*sig_id].range_select(*l as usize, *r as usize);
+                }
+                Insn::LoadSignalBit(d, sig_id, idx) => {
+                    vm_regs[*d as usize] = signal_table[*sig_id].bit_select(*idx as usize);
+                }
                 Insn::Concat(d, part_regs) => {
                     let parts: Vec<Value> = part_regs
                         .iter()
@@ -12620,6 +12639,14 @@ impl Simulator {
                 Insn::RangeSelectConst(d, base, l, r) => {
                     vm_regs[*d as usize] =
                         vm_regs[*base as usize].range_select(*l as usize, *r as usize);
+                }
+                // Fused load+select (finish() peephole).
+                Insn::LoadSignalRange(d, sig_id, l, r) => {
+                    vm_regs[*d as usize] =
+                        view[*sig_id].range_select(*l as usize, *r as usize);
+                }
+                Insn::LoadSignalBit(d, sig_id, idx) => {
+                    vm_regs[*d as usize] = view[*sig_id].bit_select(*idx as usize);
                 }
                 Insn::Concat(d, part_regs) => {
                     let parts: Vec<Value> = part_regs
@@ -13147,6 +13174,14 @@ impl Simulator {
                 Insn::RangeSelectConst(d, base, l, r) => {
                     self.vm_regs[*d as usize] =
                         self.vm_regs[*base as usize].range_select(*l as usize, *r as usize);
+                }
+                // Fused load+select (finish() peephole).
+                Insn::LoadSignalRange(d, sig_id, l, r) => {
+                    self.vm_regs[*d as usize] =
+                        self.signal_table[*sig_id].range_select(*l as usize, *r as usize);
+                }
+                Insn::LoadSignalBit(d, sig_id, idx) => {
+                    self.vm_regs[*d as usize] = self.signal_table[*sig_id].bit_select(*idx as usize);
                 }
                 Insn::Concat(d, part_regs) => {
                     let result =
@@ -18027,6 +18062,8 @@ impl Simulator {
             Insn::StmtFallback(..) => "StmtFallback",
             Insn::SetSigned(..) => "SetSigned",
             Insn::Nop => "Nop",
+            Insn::LoadSignalRange(..) => "LoadSignalRange",
+            Insn::LoadSignalBit(..) => "LoadSignalBit",
         }
     }
 
@@ -18035,6 +18072,8 @@ impl Simulator {
         match insn {
             Insn::LoadSignal(_, id)
             | Insn::LoadSignalSigned(_, id)
+            | Insn::LoadSignalRange(_, id, _, _)
+            | Insn::LoadSignalBit(_, id, _)
             | Insn::NbaAssign(id, _, _)
             | Insn::NbaAssignRange(id, _, _, _)
             | Insn::NbaAssignRangeDyn(id, _, _, _)
@@ -37541,7 +37580,10 @@ impl Simulator {
             for insn in &cb.instructions {
                 match insn {
                     Insn::StmtFallback(..) => opaque = true,
-                    Insn::LoadSignal(_, s) | Insn::LoadSignalSigned(_, s) => {
+                    Insn::LoadSignal(_, s)
+                    | Insn::LoadSignalSigned(_, s)
+                    | Insn::LoadSignalRange(_, s, _, _)
+                    | Insn::LoadSignalBit(_, s, _) => {
                         if seen.insert(*s as u32) {
                             reads.push(*s as u32);
                         }
@@ -37698,6 +37740,8 @@ impl Simulator {
             let sig_id = match insn {
                 Insn::LoadSignal(_, id)
                 | Insn::LoadSignalSigned(_, id)
+                | Insn::LoadSignalRange(_, id, ..)
+                | Insn::LoadSignalBit(_, id, _)
                 | Insn::NbaAssign(id, ..)
                 | Insn::NbaAssignRange(id, ..)
                 | Insn::NbaAssignRangeDyn(id, ..)
