@@ -11317,6 +11317,13 @@ impl Simulator {
                 if delay == 0 {
                     return None;
                 }
+                // A runtime-variable delay (`forever #(half) clk = ~clk` with
+                // `half` reprogrammed at runtime) must re-evaluate each toggle,
+                // so it cannot be a fixed-period ClockGen — fall back to the
+                // general forever path (which re-reads the delay every loop).
+                if self.delay_expr_is_dynamic(d_expr) {
+                    return None;
+                }
                 // assign_body (or inner SeqBlock): BA VAR = ~VAR
                 let ba_target = match &assign_body.kind {
                     StatementKind::BlockingAssign { lvalue, rvalue } => (lvalue, rvalue),
@@ -11388,6 +11395,25 @@ impl Simulator {
     }
 
     /// Try to detect `always #N var = ~var` pattern and extract as a ClockGen.
+    /// True if a `#(delay)` expression reads a runtime signal/variable (so its
+    /// value can CHANGE during simulation — e.g. `always #(half) clk = ~clk`
+    /// with `half` reconfigured by a PLL testbench). Such a clock must NOT be
+    /// baked into a fixed-period `ClockGen`; it has to re-evaluate the delay on
+    /// every toggle (the `FastDelayAlways` / general Forever path). A delay of
+    /// only literals/parameters (folded at elaboration, not in
+    /// `signal_name_to_id`) is constant and safe to freeze.
+    fn delay_expr_is_dynamic(&self, d: &Expression) -> bool {
+        let mut reads: HashSet<String> = HashSet::default();
+        Self::collect_expr_reads(d, &self.module, &mut reads);
+        reads.iter().any(|name| {
+            self.signal_name_to_id.contains_key(name.as_str())
+                || {
+                    let suffix = format!(".{}", name);
+                    self.signal_name_to_id.keys().any(|k| k.ends_with(&suffix))
+                }
+        })
+    }
+
     fn try_extract_clock_gen(&self, body: &Statement, half_period: u64) -> Option<ClockGen> {
         // Body should be: var = ~var (blocking assign)
         let assign = match &body.kind {
@@ -11661,7 +11687,11 @@ impl Simulator {
             } = &ab.stmt.kind
             {
                 let delay_val = self.eval_delay_ticks(d);
-                if delay_val > 0 {
+                // A delay that reads a runtime variable (`#(half)` reconfigured
+                // at runtime — the PLL refclk/vco reprogramming pattern) must
+                // re-evaluate every toggle; never freeze it into a fixed
+                // ClockGen (which would keep the ORIGINAL period forever).
+                if delay_val > 0 && !self.delay_expr_is_dynamic(d) {
                     if let Some(clock_gen) = self.try_extract_clock_gen(body, delay_val) {
                         sim_dbg_eprintln!(
                             "[OPT] clock generator: signal {} period {} (always #{} pattern)",
