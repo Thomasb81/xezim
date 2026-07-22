@@ -1104,6 +1104,20 @@ enum EdgeKind {
     LsbEdge,
 }
 
+impl EdgeKind {
+    /// Prefix used when printing a sensitivity in diagnostics
+    /// (`posedge clk`, `edge bus`, …). Centralised so adding an `EdgeKind`
+    /// variant touches one place, not the ~6 hang-report format sites.
+    const fn print_str(&self) -> &'static str {
+        match self {
+            EdgeKind::Posedge => "posedge ",
+            EdgeKind::Negedge => "negedge ",
+            EdgeKind::AnyEdge => "",
+            EdgeKind::LsbEdge => "edge ",
+        }
+    }
+}
+
 /// LRM §15.4.2: a process blocked inside `mailbox.get(var)` on an empty
 /// mailbox. The next `put` drains this waiter, assigns its value into
 /// `lvalue`, and reschedules `cont` under `pid` at the current time.
@@ -17078,13 +17092,7 @@ impl Simulator {
             eprintln!("[xezim][hang-report]{}{}", pad, ident.trim_start());
             if let Some(block) = self.edge_blocks.get(bi) {
                 for sid in block.resolved_sensitivities.iter().take(4) {
-                    let edge = match sid.edge {
-                        EdgeKind::Posedge => "posedge ",
-                        EdgeKind::Negedge => "negedge ",
-                        EdgeKind::AnyEdge => "",
-                    EdgeKind::LsbEdge => "edge ",
-                        EdgeKind::LsbEdge => "edge ",
-                    };
+                    let edge = sid.edge.print_str();
                     eprintln!(
                         "[xezim][hang-report]{}  sensitive to {}{} (now {})",
                         pad,
@@ -17160,12 +17168,7 @@ impl Simulator {
             let age = self.time.saturating_sub(w.parked_time);
             let mut sens_desc: Vec<String> = Vec::new();
             for (k, sid) in w.resolved_sensitivities.iter().enumerate() {
-                let edge = match sid.edge {
-                    EdgeKind::Posedge => "posedge ",
-                    EdgeKind::Negedge => "negedge ",
-                    EdgeKind::AnyEdge => "",
-                    EdgeKind::LsbEdge => "edge ",
-                };
+                let edge = sid.edge.print_str();
                 let cur = self.signal_table[sid.signal_id].raw_bits();
                 let armed = w.arm_bits.get(k).copied().unwrap_or((0, 0));
                 let moved = if cur == armed {
@@ -17613,12 +17616,7 @@ impl Simulator {
             .resolved_sensitivities
             .iter()
             .map(|si| {
-                let edge = match si.edge {
-                    EdgeKind::Posedge => "posedge ",
-                    EdgeKind::Negedge => "negedge ",
-                    EdgeKind::AnyEdge => "",
-                    EdgeKind::LsbEdge => "edge ",
-                };
+                let edge = si.edge.print_str();
                 format!("{}{}", edge, self.name_for_id(si.signal_id))
             })
             .collect::<Vec<_>>()
@@ -17969,13 +17967,7 @@ impl Simulator {
                 .resolved_sensitivities
                 .iter()
                 .map(|s| {
-                    let edge = match s.edge {
-                        EdgeKind::Posedge => "posedge ",
-                        EdgeKind::Negedge => "negedge ",
-                        EdgeKind::AnyEdge => "",
-                    EdgeKind::LsbEdge => "edge ",
-                        EdgeKind::LsbEdge => "edge ",
-                    };
+                    let edge = s.edge.print_str();
                     format!("{}{}", edge, self.name_for_id(s.signal_id))
                 })
                 .collect::<Vec<_>>()
@@ -22936,14 +22928,7 @@ impl Simulator {
                     .resolved_sensitivities
                     .iter()
                     .map(|si| {
-                        let edge = match si.edge {
-                            EdgeKind::Posedge => "posedge ",
-                            EdgeKind::Negedge => "negedge ",
-                            EdgeKind::AnyEdge => "",
-                            EdgeKind::LsbEdge => "edge ",
-                    EdgeKind::LsbEdge => "edge ",
-                        EdgeKind::LsbEdge => "edge ",
-                        };
+                        let edge = si.edge.print_str();
                         format!("{}{}", edge, self.name_for_id(si.signal_id))
                     })
                     .collect::<Vec<_>>()
