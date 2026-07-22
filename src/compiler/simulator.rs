@@ -1085,6 +1085,9 @@ struct EdgeFanout {
     posedge: Vec<usize>,
     negedge: Vec<usize>,
     anyedge: Vec<usize>,
+    /// `@(edge x)` blocks — §9.4.2 LSB edge (posedge OR negedge of bit 0),
+    /// NOT the whole-vector change that `anyedge` (`@(x)` level) fires on.
+    lsbedge: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -8358,7 +8361,8 @@ impl Simulator {
                 match sid.edge {
                     EdgeKind::Posedge => fanout.posedge.push(block_idx),
                     EdgeKind::Negedge => fanout.negedge.push(block_idx),
-                    EdgeKind::AnyEdge | EdgeKind::LsbEdge => fanout.anyedge.push(block_idx),
+                    EdgeKind::AnyEdge => fanout.anyedge.push(block_idx),
+                    EdgeKind::LsbEdge => fanout.lsbedge.push(block_idx),
                 }
             }
         }
@@ -23110,7 +23114,10 @@ impl Simulator {
             };
             let fanout = match self.edge_blocks_by_sig.get(pos) {
                 Some(e)
-                    if !e.posedge.is_empty() || !e.negedge.is_empty() || !e.anyedge.is_empty() =>
+                    if !e.posedge.is_empty()
+                        || !e.negedge.is_empty()
+                        || !e.anyedge.is_empty()
+                        || !e.lsbedge.is_empty() =>
                 {
                     e
                 }
@@ -23226,6 +23233,12 @@ impl Simulator {
             }
             if fires_any {
                 for &block_idx in &fanout.anyedge {
+                    dispatch_block!(block_idx);
+                }
+            }
+            // §9.4.2 `@(edge x)`: an LSB posedge OR negedge (not any change).
+            if fires_pos || fires_neg {
+                for &block_idx in &fanout.lsbedge {
                     dispatch_block!(block_idx);
                 }
             }
