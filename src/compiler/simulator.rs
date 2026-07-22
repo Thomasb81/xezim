@@ -47802,6 +47802,20 @@ impl Simulator {
             if self.module.classes.contains_key(c) {
                 return Some(c.clone());
             }
+            // A local declared with a TYPE PARAMETER as its type
+            // (`T me;` inside a parameterized-class method). Resolve T
+            // to its concrete specialization via the active
+            // `current_spec`, so `$cast(me, obj)` and member access use
+            // the correct dynamic type. Without this, `class_of_var`
+            // returns None (T is not a real class) and `$cast` falls back
+            // to the permissive path (always succeeds), corrupting UVM's
+            // callback type filtering (m_add_tw_cbs adds a typewide
+            // callback to the wrong instances' queues). LRM §6.20.2/§8.25.
+            if let Some(resolved) = self.resolve_type_param_binding(c) {
+                if self.module.classes.contains_key(&resolved) {
+                    return Some(resolved);
+                }
+            }
         }
         if let Some(sig) = self.module.signals.get(vname) {
             if let Some(tn) = &sig.type_name {
