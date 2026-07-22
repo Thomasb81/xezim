@@ -34631,11 +34631,21 @@ impl Simulator {
                 // (§6.21): each entry — e.g. each loop iteration — is a fresh
                 // variable, so pop them on exit.
                 let seq_auto_len = self.auto_loop_vars.len();
+                // §21.2.1.7: a NAMED block adds its name to the `%m` hierarchy.
+                let m_pushed = if let Some(n) = name {
+                    self.m_scope_stack.push(n.name.clone());
+                    true
+                } else {
+                    false
+                };
                 for s in stmts {
                     if self.finished || self.break_flag || self.continue_flag {
                         break;
                     }
                     self.exec_statement(s);
+                }
+                if m_pushed {
+                    self.m_scope_stack.pop();
                 }
                 self.auto_loop_vars.truncate(seq_auto_len);
                 // A `disable` naming THIS block ends here; execution resumes

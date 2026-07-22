@@ -66,3 +66,39 @@ endmodule
     assert!(out.iter().any(|l| l == "T=top.u_a.t"), "u_a: {:?}", out);
     assert!(out.iter().any(|l| l == "T=top.u_b.t"), "u_b: {:?}", out);
 }
+
+#[test]
+fn m_includes_named_and_fork_blocks_with_nesting() {
+    // Named blocks and fork blocks add to the %m hierarchy; blocks nest inside
+    // tasks and restore correctly on exit. Verified against a commercial sim.
+    let src = r#"
+module m;
+  task automatic t();
+    $display("T=%m");
+    begin : blk
+      $display("BLK=%m");
+      begin : inner $display("INNER=%m"); end
+    end
+    $display("T2=%m");
+  endtask
+  initial begin
+    begin : ib $display("IB=%m"); end
+    t();
+    fork begin : fb $display("FORK=%m"); end join
+    $display("DONE=%m");
+  end
+endmodule
+"#;
+    let out = line(src, "m");
+    for w in [
+        "IB=m.ib",
+        "T=m.t",
+        "BLK=m.t.blk",
+        "INNER=m.t.blk.inner",
+        "T2=m.t",       // back out of blk, still in t
+        "FORK=m.fb",
+        "DONE=m",       // all restored
+    ] {
+        assert!(out.iter().any(|l| l == w), "missing {:?}; got {:?}", w, out);
+    }
+}
