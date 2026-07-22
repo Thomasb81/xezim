@@ -321,7 +321,7 @@ fn push_plus_libext(arg: &str, lib_exts: &mut Option<Vec<String>>) {
 }
 
 /// Recognize the commercial gate-level-simulation (GLS) delay/timing flag
-/// family (VCS / Questa / Xcelium) so it never falls silently into the generic
+/// family so it never falls silently into the generic
 /// plusarg bucket. Returns true if `flag` was consumed here.
 ///
 /// - `+delay_mode_zero` / `+delay_mode_unit` are MODELED (force structural
