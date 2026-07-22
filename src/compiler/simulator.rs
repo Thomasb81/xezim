@@ -1832,6 +1832,9 @@ struct ProcessContext {
 /// at the body's `ScopePop` sentinel so the process can suspend in between.
 #[derive(Debug, Clone, Default)]
 struct TaskCleanup {
+    /// Name of the inlined task, for §9.6.2 `disable <task>` bookkeeping
+    /// (`active_task_pids`). None for frames without a stable name.
+    task_name: Option<String>,
     output_bindings: Vec<(String, crate::ast::expr::Expression)>,
     assoc_params: Vec<(String, String)>,
     array_params: Vec<String>,
@@ -2717,6 +2720,10 @@ pub struct Simulator {
     /// flushes, not in the active region (a same-slot `.triggered` read in an
     /// active/inactive process must still see 0).
     pending_nba_triggers: Vec<String>,
+    /// §9.6.2 `disable <task_name>`: which processes are currently executing
+    /// an invocation of each named task. Filled by bind_task_frame, cleared
+    /// by unwind_task_frame; a cross-process disable kills the listed pids.
+    active_task_pids: HashMap<String, HashSet<usize>>,
     /// A `$finish` raised by a waiters-first `@(edge)` continuation is held
     /// until the current time slot's edge blocks AND postponed-side passes
     /// (SVA actions, $monitor/$strobe) have run — reference simulators still
@@ -4826,6 +4833,7 @@ impl Simulator {
             edge_sequential_work: Vec::new(),
             nba_queue: Vec::new(),
             pending_nba_triggers: Vec::new(),
+            active_task_pids: HashMap::default(),
             finish_deferred: false,
             event_aliases: HashMap::default(),
             nba_fast: Vec::new(),
@@ -14451,9 +14459,22 @@ impl Simulator {
             writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
             Self::collect_lhs_writes(&ca.lhs, &self.module, &mut writes);
-            let scope_hint = self
-                .infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
-                .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads));
+            // A bare LHS that IS a registered top-level signal resolves
+            // absolutely — force no scope hint (both inferences would
+            // otherwise scope a multi-driven net's folded
+            // `b = $__wres(u1.b, u2.b)` into one INSTANCE, writing u2.b
+            // instead of b and leaving the net z forever).
+            let lhs_is_absolute = matches!(&ca.lhs.kind,
+                ExprKind::Ident(h) if h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && !h.path[0].name.name.contains('.')
+                    && self.signal_name_to_id.contains_key(h.path[0].name.name.as_str()));
+            let scope_hint = if lhs_is_absolute {
+                None
+            } else {
+                self.infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
+                    .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads))
+            };
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
             let direct_copy = if explicit_delay == 0 {
                 if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) =
@@ -16059,6 +16080,14 @@ impl Simulator {
         }
 
         let lhs_leaf = lhs_leaf_opt?;
+        // A bare LHS that IS a registered signal resolves absolutely — no
+        // scope hint. Without this, a top-level multi-driven net's folded
+        // `b = $__wres(u1.b, u2.b)` matched the `.b`-suffix scan below and
+        // got scoped into one INSTANCE (writing u2.b instead of b — the
+        // net read z forever).
+        if self.signal_name_to_id.contains_key(lhs_leaf.as_str()) {
+            return None;
+        }
         let suffix = format!(".{}", lhs_leaf);
         let mut leaves = HashSet::default();
         Self::collect_leaf_idents(lhs, &mut leaves);
@@ -34535,6 +34564,38 @@ impl Simulator {
                         let mut killed: HashSet<usize> = HashSet::default();
                         killed.insert(pid);
                         self.release_killed_from_join_waiters(&killed);
+                        return;
+                    }
+                }
+                // §9.6.2: `disable <task_name>` where OTHER processes are
+                // currently executing an invocation of that task terminates
+                // those invocations. (Approximation: the whole executing
+                // process is terminated — exact for the common `fork
+                // task_a; task_b; join` + `disable task_b` shape.)
+                if let Some(pids) = self.active_task_pids.get(&name.name).cloned() {
+                    let to_kill: HashSet<usize> = pids
+                        .into_iter()
+                        .filter(|&p| p != self.current_pid && !self.killed_pids.contains(&p))
+                        .collect();
+                    if !to_kill.is_empty() {
+                        for &pid in &to_kill {
+                            self.killed_pids.insert(pid);
+                            self.process_parents.remove(&pid);
+                            self.process_contexts.remove(&pid);
+                        }
+                        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        for q in self.mailbox_get_waiters.values_mut() {
+                            q.retain(|w| !to_kill.contains(&w.pid));
+                        }
+                        for q in self.semaphore_get_waiters.values_mut() {
+                            q.retain(|w| !to_kill.contains(&w.pid));
+                        }
+                        self.release_killed_from_join_waiters(&to_kill);
+                        for set in self.active_task_pids.values_mut() {
+                            for p in &to_kill {
+                                set.remove(p);
+                            }
+                        }
                         return;
                     }
                 }
@@ -54808,6 +54869,11 @@ impl Simulator {
     /// the work that `exec_task_call` runs after the body. Mirrors the original
     /// inline cleanup exactly.
     fn unwind_task_frame(&mut self, c: TaskCleanup) {
+        if let Some(tn) = &c.task_name {
+            if let Some(set) = self.active_task_pids.get_mut(tn) {
+                set.remove(&self.current_pid);
+            }
+        }
         self.current_static_task = c.prev_static;
         if c.pushed_method_this {
             self.this_stack.pop();
@@ -55024,7 +55090,15 @@ impl Simulator {
         if matches!(td.lifetime, Some(crate::ast::types::Lifetime::Static)) {
             self.current_static_task = Some(td.name.name.name.clone());
         }
+        // §9.6.2 bookkeeping: this pid is now executing an invocation of
+        // the named task, so a cross-process `disable <task>` can find it.
+        let tname = td.name.name.name.clone();
+        self.active_task_pids
+            .entry(tname.clone())
+            .or_default()
+            .insert(self.current_pid);
         TaskCleanup {
+            task_name: Some(tname),
             array_writebacks,
             output_bindings,
             assoc_params,
