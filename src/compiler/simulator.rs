@@ -194,7 +194,7 @@ fn nospecify() -> bool {
     NOSPECIFY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Structural-delay mode (VCS/Questa/Xcelium GLS): 0 = normal (specify/SDF path
+/// Structural-delay mode (commercial-simulator GLS convention): 0 = normal (specify/SDF path
 /// delays apply), 1 = `+delay_mode_zero` (all structural delays forced to 0 —
 /// fast functional GLS), 2 = `+delay_mode_unit` (every nonzero structural delay
 /// becomes 1 time unit). Affects specify path delays and SDF back-annotation;
@@ -1832,6 +1832,9 @@ struct ProcessContext {
 /// at the body's `ScopePop` sentinel so the process can suspend in between.
 #[derive(Debug, Clone, Default)]
 struct TaskCleanup {
+    /// Name of the inlined task, for §9.6.2 `disable <task>` bookkeeping
+    /// (`active_task_pids`). None for frames without a stable name.
+    task_name: Option<String>,
     output_bindings: Vec<(String, crate::ast::expr::Expression)>,
     assoc_params: Vec<(String, String)>,
     array_params: Vec<String>,
@@ -2713,6 +2716,25 @@ pub struct Simulator {
     edge_parallel_work: Vec<usize>,
     edge_sequential_work: Vec<usize>,
     nba_queue: Vec<NbaEntry>,
+    /// §15.5.2 `->> e` nonblocking event triggers: fired when the NBA region
+    /// flushes, not in the active region (a same-slot `.triggered` read in an
+    /// active/inactive process must still see 0).
+    pending_nba_triggers: Vec<String>,
+    /// §9.6.2 `disable <task_name>`: which processes are currently executing
+    /// an invocation of each named task. Filled by bind_task_frame, cleared
+    /// by unwind_task_frame; a cross-process disable kills the listed pids.
+    active_task_pids: HashMap<String, HashSet<usize>>,
+    /// A `$finish` raised by a waiters-first `@(edge)` continuation is held
+    /// until the current time slot's edge blocks AND postponed-side passes
+    /// (SVA actions, $monitor/$strobe) have run — reference simulators still
+    /// fire a final-cycle assertion action or display racing the finish.
+    finish_deferred: bool,
+    /// §15.5.5 event variables are HANDLES to synchronization objects:
+    /// `ev_alias = ev_b` makes both names one object. Maps an event variable
+    /// (or element key `arr[i]`) to the event it currently aliases;
+    /// `EVENT_NULL_KEY` marks a null handle. Trigger/`.triggered`/wait_order
+    /// all chase this map to the canonical key first.
+    event_aliases: HashMap<String, String>,
     /// Fast-path NBA buffer: pre-resolved (signal_id, value) pairs.
     nba_fast: Vec<NbaFast>,
     /// Reverse index: signal_id → most recent index in `nba_fast` for that
@@ -4810,6 +4832,10 @@ impl Simulator {
             edge_parallel_work: Vec::new(),
             edge_sequential_work: Vec::new(),
             nba_queue: Vec::new(),
+            pending_nba_triggers: Vec::new(),
+            active_task_pids: HashMap::default(),
+            finish_deferred: false,
+            event_aliases: HashMap::default(),
             nba_fast: Vec::new(),
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.
@@ -7596,7 +7622,7 @@ impl Simulator {
                         .get(i)
                         .map(|e| self.eval_expr(e))
                         .unwrap_or_else(|| Value::zero(*width));
-                    let (mut aval, mut bval) = Self::dpi_value_to_logic_words(&vv, *width);
+                    let (aval, bval) = Self::dpi_value_to_logic_words(&vv, *width);
                     // CRITICAL: store in Vec FIRST, then capture pointer.
                     // Otherwise Vec push may reallocate, invalidating the pointer.
                     logic_aval.push(aval);
@@ -12437,9 +12463,19 @@ impl Simulator {
                     vm_regs[*d as usize] = vm_regs[*base as usize].bit_select(*idx as usize);
                 }
                 Insn::RangeSelect(d, base, l, r) => {
-                    let li = vm_regs[*l as usize].to_u64().unwrap_or(0) as usize;
-                    let ri = vm_regs[*r as usize].to_u64().unwrap_or(0) as usize;
-                    vm_regs[*d as usize] = vm_regs[*base as usize].range_select(li, ri);
+                    // §11.5.1: bounds are 32-bit index arithmetic; a `[l -: W]`
+                    // whose low bound went negative wraps to a large u32. Recover
+                    // the signed value and, only when the low bound is <0, take
+                    // the x-filling signed path (the fast path handles the common
+                    // in-range + high-overrun cases).
+                    let a = (vm_regs[*l as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let b = (vm_regs[*r as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    vm_regs[*d as usize] = if lo < 0 {
+                        vm_regs[*base as usize].range_select_signed(hi, lo)
+                    } else {
+                        vm_regs[*base as usize].range_select(hi as usize, lo as usize)
+                    };
                 }
                 Insn::RangeSelectConst(d, base, l, r) => {
                     vm_regs[*d as usize] =
@@ -12854,9 +12890,19 @@ impl Simulator {
                     vm_regs[*d as usize] = vm_regs[*base as usize].bit_select(*idx as usize);
                 }
                 Insn::RangeSelect(d, base, l, r) => {
-                    let li = vm_regs[*l as usize].to_u64().unwrap_or(0) as usize;
-                    let ri = vm_regs[*r as usize].to_u64().unwrap_or(0) as usize;
-                    vm_regs[*d as usize] = vm_regs[*base as usize].range_select(li, ri);
+                    // §11.5.1: bounds are 32-bit index arithmetic; a `[l -: W]`
+                    // whose low bound went negative wraps to a large u32. Recover
+                    // the signed value and, only when the low bound is <0, take
+                    // the x-filling signed path (the fast path handles the common
+                    // in-range + high-overrun cases).
+                    let a = (vm_regs[*l as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let b = (vm_regs[*r as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    vm_regs[*d as usize] = if lo < 0 {
+                        vm_regs[*base as usize].range_select_signed(hi, lo)
+                    } else {
+                        vm_regs[*base as usize].range_select(hi as usize, lo as usize)
+                    };
                 }
                 Insn::RangeSelectConst(d, base, l, r) => {
                     vm_regs[*d as usize] =
@@ -13448,9 +13494,15 @@ impl Simulator {
                         self.vm_regs[*base as usize].bit_select(*idx as usize);
                 }
                 Insn::RangeSelect(d, base, l, r) => {
-                    let li = self.vm_regs[*l as usize].to_u64().unwrap_or(0) as usize;
-                    let ri = self.vm_regs[*r as usize].to_u64().unwrap_or(0) as usize;
-                    self.vm_regs[*d as usize] = self.vm_regs[*base as usize].range_select(li, ri);
+                    // §11.5.1 signed low-bound recovery — see the twin site.
+                    let a = (self.vm_regs[*l as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let b = (self.vm_regs[*r as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    self.vm_regs[*d as usize] = if lo < 0 {
+                        self.vm_regs[*base as usize].range_select_signed(hi, lo)
+                    } else {
+                        self.vm_regs[*base as usize].range_select(hi as usize, lo as usize)
+                    };
                 }
                 Insn::RangeSelectConst(d, base, l, r) => {
                     self.vm_regs[*d as usize] =
@@ -14433,9 +14485,22 @@ impl Simulator {
             writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
             Self::collect_lhs_writes(&ca.lhs, &self.module, &mut writes);
-            let scope_hint = self
-                .infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
-                .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads));
+            // A bare LHS that IS a registered top-level signal resolves
+            // absolutely — force no scope hint (both inferences would
+            // otherwise scope a multi-driven net's folded
+            // `b = $__wres(u1.b, u2.b)` into one INSTANCE, writing u2.b
+            // instead of b and leaving the net z forever).
+            let lhs_is_absolute = matches!(&ca.lhs.kind,
+                ExprKind::Ident(h) if h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && !h.path[0].name.name.contains('.')
+                    && self.signal_name_to_id.contains_key(h.path[0].name.name.as_str()));
+            let scope_hint = if lhs_is_absolute {
+                None
+            } else {
+                self.infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
+                    .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads))
+            };
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
             let direct_copy = if explicit_delay == 0 {
                 if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) =
@@ -16041,6 +16106,14 @@ impl Simulator {
         }
 
         let lhs_leaf = lhs_leaf_opt?;
+        // A bare LHS that IS a registered signal resolves absolutely — no
+        // scope hint. Without this, a top-level multi-driven net's folded
+        // `b = $__wres(u1.b, u2.b)` matched the `.b`-suffix scan below and
+        // got scoped into one INSTANCE (writing u2.b instead of b — the
+        // net read z forever).
+        if self.signal_name_to_id.contains_key(lhs_leaf.as_str()) {
+            return None;
+        }
         let suffix = format!(".{}", lhs_leaf);
         let mut leaves = HashSet::default();
         Self::collect_leaf_idents(lhs, &mut leaves);
@@ -18129,6 +18202,12 @@ impl Simulator {
         self.drain_reactive_region();
         self.check_monitor();
         self.drain_pending_strobes();
+        // Deferred `$finish` from a waiters-first continuation: this time
+        // slot's edge blocks, SVA actions and monitors have all run — stop.
+        if self.finish_deferred {
+            self.finish_deferred = false;
+            self.finished = true;
+        }
         self.vcd_write_changes();
         if self.xtrace_writer.is_some() {
             self.xtrace_write_changes();
@@ -20556,6 +20635,128 @@ impl Simulator {
             }
 
             // Check for timing control — delay or event
+            // §15.5.3 wait_order (a, b, c) pass else fail — a state machine
+            // over the event list. Each step parks the process on ALL not-yet-
+            // expected events (so an out-of-order fire wakes us too), with the
+            // continuation re-entering this statement `armed`. On wake the
+            // `event_triggered_time` stamps identify which event fired: the
+            // expected one advances the sequence (completing it runs `pass`),
+            // any later one runs `fail` (or a loud warning without an else).
+            if let StatementKind::WaitOrder {
+                events,
+                pass,
+                fail,
+                armed,
+                idx,
+                span,
+            } = &stmt.kind
+            {
+                let k = *idx as usize;
+                let n = events.len();
+                let stamp_now = |sim: &Self, nm: &str| -> bool {
+                    let now = sim.time;
+                    let canon = sim.resolve_event_key(nm);
+                    if sim.event_triggered_time.get(canon.as_str()) == Some(&now) {
+                        return true;
+                    }
+                    let pref = format!("{}.{}", sim.module.name, canon);
+                    sim.event_triggered_time.get(pref.as_str()) == Some(&now)
+                };
+                let mut next_k = k;
+                let mut outcome: Option<bool> = None; // Some(true)=pass, Some(false)=fail
+                if *armed {
+                    let expected_fired = k < n && stamp_now(self, &events[k].name);
+                    let later_fired = events[k.saturating_add(1)..]
+                        .iter()
+                        .any(|e| stamp_now(self, &e.name));
+                    if expected_fired {
+                        if k + 1 == n {
+                            outcome = Some(true);
+                        } else {
+                            next_k = k + 1;
+                        }
+                    } else if later_fired {
+                        outcome = Some(false);
+                    }
+                    // Neither fired this slot (spurious wake): re-park at k.
+                }
+                match outcome {
+                    Some(ok) => {
+                        let action = if ok { pass } else { fail };
+                        if !ok && fail.is_none() {
+                            eprintln!(
+                                "[xezim][warning] wait_order sequence violation at time {}: an event fired out of order and the construct has no else clause (IEEE 1800-2017 §15.5.3)",
+                                self.time
+                            );
+                        }
+                        let mut cont: Vec<Statement> = Vec::new();
+                        if let Some(a) = action {
+                            match &a.kind {
+                                StatementKind::SeqBlock { stmts: b, .. } => {
+                                    cont.extend_from_slice(b)
+                                }
+                                _ => cont.push((**a).clone()),
+                            }
+                        }
+                        cont.extend_from_slice(&stmts[i + 1..]);
+                        self.run_process_stmts(pid, &cont);
+                        return;
+                    }
+                    None => {
+                        // Park on events[next_k..]; continuation re-enters armed.
+                        let evs: Vec<crate::ast::stmt::EventExpr> = events[next_k..]
+                            .iter()
+                            .map(|id| crate::ast::stmt::EventExpr {
+                                edge: None,
+                                expr: Expression::new(
+                                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![crate::ast::expr::HierPathSegment {
+                                            name: id.clone(),
+                                            selects: Vec::new(),
+                                        }],
+                                        span: *span,
+                                        cached_signal_id: std::cell::Cell::new(None),
+                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                    }),
+                                    *span,
+                                ),
+                                iff: None,
+                                span: *span,
+                            })
+                            .collect();
+                        let sens =
+                            self.event_to_sens(&crate::ast::stmt::EventControl::EventExpr(evs));
+                        let mut cont = vec![Statement::new(
+                            StatementKind::WaitOrder {
+                                events: events.clone(),
+                                pass: pass.clone(),
+                                fail: fail.clone(),
+                                armed: true,
+                                idx: next_k as u32,
+                                span: *span,
+                            },
+                            stmt.span,
+                        )];
+                        cont.extend_from_slice(&stmts[i + 1..]);
+                        if !sens.is_empty()
+                            && sens.iter().any(|s| {
+                                self.signal_name_to_id.contains_key(s.signal_name.as_str())
+                            })
+                        {
+                            self.event_waiters
+                                .push(self.make_event_waiter(pid, sens, cont));
+                        } else {
+                            eprintln!(
+                                "[xezim][warning] wait_order at time {}: none of the named events resolve to declared events; process will not resume (IEEE 1800-2017 §15.5.3)",
+                                self.time
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+
             if let StatementKind::TimingControl {
                 control,
                 stmt: body,
@@ -21399,6 +21600,7 @@ impl Simulator {
         match &stmt.kind {
             StatementKind::TimingControl { .. } => true,
             StatementKind::Wait { .. } => true,
+            StatementKind::WaitOrder { .. } => true,
             // §9.6.1: `wait fork` suspends until all descendants finish —
             // inside a begin-block it must route through the suspend-aware
             // runner (the plain exec arm is a no-op).
@@ -22122,6 +22324,13 @@ impl Simulator {
                 self.assign_value(&lhs, &entry.value);
             }
         }
+        // §15.5.2 deferred `->>` triggers fire with the NBA flush.
+        if !self.pending_nba_triggers.is_empty() {
+            let evs = std::mem::take(&mut self.pending_nba_triggers);
+            for ev in evs {
+                self.fire_named_event(&ev);
+            }
+        }
     }
 
     /// PDES Phase 1.5: apply one fast-path NBA entry. Extracted from
@@ -22592,9 +22801,175 @@ impl Simulator {
     /// only those positions in `edge_signal_ids` instead of the full range —
     /// see `check_edges_clocks_only`.  The dispatch / exec / cascade-prep
     /// path is identical either way.
+    /// §19.5 event-driven covergroup sampling for the edges fired this
+    /// pass. Split out of check_edges_inner so waiters-first mode can run it
+    /// before process continuations (and classic mode after edge blocks).
+    fn sample_edge_covergroups(&mut self) {
+        let _t_cg = self.profile_timing.then(std::time::Instant::now);
+        for i in 0..self.cg_event_waiters.len() {
+            let handle = self.cg_event_waiters[i].0;
+            let mut triggered = false;
+            for j in 0..self.cg_event_waiters[i].1.len() {
+                let sid = &self.cg_event_waiters[i].1[j];
+                if self.check_edge_id(sid.signal_id, sid.edge) {
+                    triggered = true;
+                    break;
+                }
+            }
+            if triggered {
+                self.sample_covergroup(handle);
+            }
+        }
+        if let Some(t) = _t_cg {
+            self.prof_edge_cg += t.elapsed().as_nanos() as u64;
+        }
+    }
+
+    /// Detect which parked event waiters' sensitivities fired (against
+    /// their own captured_prev baselines) and remove them from the parked
+    /// list, refreshing the baseline of everyone left. Returns the (pid,
+    /// continuation) pairs to run. Shared by the classic post-edge-block
+    /// drain and the commercial-order pre-edge-block drain (see
+    /// XEZIM_WAITERS_FIRST in check_edges_inner).
+    fn drain_triggered_event_waiters(&mut self) -> Vec<(usize, Vec<Statement>)> {
+        let waiters = std::mem::take(&mut self.event_waiters);
+        self.prof_waiter_iters += waiters.len() as u64;
+        self.event_waiters_swap.clear();
+        let mut triggered_conts: Vec<(usize, Vec<Statement>)> = Vec::new();
+        for mut waiter in waiters {
+            let mut triggered = false;
+            for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
+                let (pv, px) = waiter.captured_prev[i];
+                let pw = waiter.captured_prev_wide[i].as_ref();
+                if !self.edge_fires_prev(sid.signal_id, sid.edge, pv, px, pw) {
+                    continue;
+                }
+                // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
+                // guard `g` holds at edge time. A false guard re-arms the
+                // waiter (it stays in event_waiters for the next edge)
+                // rather than resuming the process. Evaluated in the module
+                // scope the signal table exposes — sufficient for the usual
+                // reset/enable guards (`iff rst_l === 1'b1`, `iff en`).
+                let guard_ok = match &sid.iff {
+                    Some(g) => self.eval_expr(g).is_true(),
+                    None => true,
+                };
+                if guard_ok {
+                    triggered = true;
+                    break;
+                }
+            }
+            if triggered {
+                sim_dbg_eprintln!(
+                    "[DEBUG] waiter for process {} triggered at time {}",
+                    waiter.pid,
+                    self.time
+                );
+                triggered_conts.push((waiter.pid, waiter.continuation));
+            } else {
+                // Refresh this waiter's `captured_prev` baseline to each
+                // sensitivity signal's CURRENT value so that a qualifying
+                // edge occurring over multiple steps is detected.
+                //
+                // Without this, a waiter armed while its signal sits at the
+                // edge-target level can never see the NEXT edge: e.g. a
+                // process resumes on the first `@(posedge clk)` at t=5
+                // (clk=1) and immediately re-arms on the next line; its
+                // captured_prev is frozen at 1, so when clk later goes
+                // 1→0→1 the Posedge test `!pb_one && cb_one` stays false
+                // (pb_one clings to the stale 1) and the second posedge is
+                // lost — the process strands (see
+                // tests/bound_module / sequential_event_waits). Tracking the
+                // running level here preserves the same-tick NBA-region
+                // semantics captured_prev was added for (a waiter still
+                // won't fire on an edge that completed BEFORE it armed, since
+                // at arm time captured_prev already equals current), while
+                // catching cross-tick transitions through the target level.
+                for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
+                    let (cv, cx) = self.signal_table[sid.signal_id].raw_bits();
+                    waiter.captured_prev[i] = (cv, cx);
+                    if self.signal_widths[sid.signal_id] > 64 {
+                        waiter.captured_prev_wide[i] =
+                            Some(self.signal_table[sid.signal_id].clone());
+                    }
+                }
+                self.event_waiters_swap.push(waiter);
+            }
+        }
+        std::mem::swap(&mut self.event_waiters, &mut self.event_waiters_swap);
+        triggered_conts
+    }
+
     fn check_edges_inner(&mut self, detect_subset: Option<&[usize]>, validate_coverage: bool) {
         if self.event_measure {
             self.event_phase += 1; // flop SAMPLE phase
+        }
+        // Commercial-simulator process ordering: a process PARKED on
+        // `@(posedge clk)` resumes BEFORE the same edge's always blocks run.
+        // The reference-simulator consensus (verified on the OpenRAM SRAM
+        // tb: `always @(posedge clk) dout = 'x;` racing a tb check right
+        // after `@(posedge clk)`) is that the parked continuation reads the
+        // pre-block value. Waiters that depend on an edge block's blocking
+        // write still wake within the same timestep via the §9.2 rescan.
+        static WAITERS_FIRST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let waiters_first = *WAITERS_FIRST.get_or_init(|| {
+            !std::env::var("XEZIM_WAITERS_LAST")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        });
+        if waiters_first {
+            // §19.5: event-driven covergroups sample the values current at
+            // the clocking event — BEFORE same-edge process continuations
+            // (which may immediately drive the next stimulus value).
+            self.sample_edge_covergroups();
+        }
+        if waiters_first && !self.event_waiters.is_empty() {
+            let _t_w = self.profile_timing.then(std::time::Instant::now);
+            // Drain and run triggered waiters, then RE-DRAIN: a resumed
+            // continuation may `-> ev` or write a signal that triggers ANOTHER
+            // parked waiter in the SAME time step (thread A resumes on a clock
+            // edge and fires `ev`; thread B parked on `@(ev)` must wake now,
+            // not next tick — §14.13 clocking-block synchronization). Running
+            // inline swallows the follow-up pass the old event-queue path gave,
+            // so loop until no waiter fires. Bounded against #0 event ping-pong.
+            let mut settle_guard = 0u32;
+            loop {
+                let conts = self.drain_triggered_event_waiters();
+                if conts.is_empty() {
+                    break;
+                }
+                for (pid, stmts) in conts {
+                    if self.finished {
+                        break;
+                    }
+                    self.run_scheduled_process(pid, &stmts);
+                    if !self.is_pid_suspended(pid) {
+                        self.child_finished(pid);
+                    }
+                    // A continuation that ended on a break/return leaves its
+                    // control flags set; everything downstream of this edge
+                    // pass (edge blocks' fallback exec, SVA actions) runs
+                    // through exec_statement, which no-ops while they're up.
+                    self.break_flag = false;
+                    self.continue_flag = false;
+                    self.return_flag = false;
+                }
+                settle_guard += 1;
+                if self.finished || settle_guard > 10_000 {
+                    break;
+                }
+            }
+            if let Some(t) = _t_w {
+                self.prof_edge_waiters += t.elapsed().as_nanos() as u64;
+            }
+            // A `$finish` from one of these continuations ends the run AFTER
+            // this edge delivery completes: the same edge's always blocks
+            // still fire once (reference-simulator behavior — a final-cycle
+            // `$display` monitor racing the testbench's `$finish` prints).
+            if self.finished {
+                self.finish_deferred = true;
+                self.finished = false;
+            }
         }
         let blocks = std::mem::take(&mut self.edge_blocks);
         self.in_edge_block = true;
@@ -23695,25 +24070,11 @@ impl Simulator {
         triggered.clear();
         self.edge_triggered_list = triggered;
 
-        // Trigger covergroup sampling
-        let _t_cg = self.profile_timing.then(std::time::Instant::now);
-        for i in 0..self.cg_event_waiters.len() {
-            let handle = self.cg_event_waiters[i].0;
-            let mut triggered = false;
-            for j in 0..self.cg_event_waiters[i].1.len() {
-                let sid = &self.cg_event_waiters[i].1[j];
-                if self.check_edge_id(sid.signal_id, sid.edge) {
-                    triggered = true;
-                    break;
-                }
-            }
-            if triggered {
-                self.sample_covergroup(handle);
-            }
-        }
-
-        if let Some(t) = _t_cg {
-            self.prof_edge_cg += t.elapsed().as_nanos() as u64;
+        // Trigger covergroup sampling (already done pre-continuation in
+        // waiters-first mode — §19.5 samples must see the values current AT
+        // the event, before a same-edge process continuation mutates them).
+        if !waiters_first {
+            self.sample_edge_covergroups();
         }
 
         // Wake up event_waiters whose sensitivity conditions are met.
@@ -23725,71 +24086,11 @@ impl Simulator {
         // active region. Inline execution restricts the drain to only
         // event_waiter continuations.
         let _t_w = self.profile_timing.then(std::time::Instant::now);
-        let waiters = std::mem::take(&mut self.event_waiters);
-        self.prof_waiter_iters += waiters.len() as u64;
-        self.event_waiters_swap.clear();
-        let mut triggered_conts: Vec<(usize, Vec<Statement>)> = Vec::new();
-        for mut waiter in waiters {
-            let mut triggered = false;
-            for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
-                let (pv, px) = waiter.captured_prev[i];
-                let pw = waiter.captured_prev_wide[i].as_ref();
-                if !self.edge_fires_prev(sid.signal_id, sid.edge, pv, px, pw) {
-                    continue;
-                }
-                // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
-                // guard `g` holds at edge time. A false guard re-arms the
-                // waiter (it stays in event_waiters for the next edge)
-                // rather than resuming the process. Evaluated in the module
-                // scope the signal table exposes — sufficient for the usual
-                // reset/enable guards (`iff rst_l === 1'b1`, `iff en`).
-                let guard_ok = match &sid.iff {
-                    Some(g) => self.eval_expr(g).is_true(),
-                    None => true,
-                };
-                if guard_ok {
-                    triggered = true;
-                    break;
-                }
-            }
-            if triggered {
-                sim_dbg_eprintln!(
-                    "[DEBUG] waiter for process {} triggered at time {}",
-                    waiter.pid,
-                    self.time
-                );
-                triggered_conts.push((waiter.pid, waiter.continuation));
-            } else {
-                // Refresh this waiter's `captured_prev` baseline to each
-                // sensitivity signal's CURRENT value so that a qualifying
-                // edge occurring over multiple steps is detected.
-                //
-                // Without this, a waiter armed while its signal sits at the
-                // edge-target level can never see the NEXT edge: e.g. a
-                // process resumes on the first `@(posedge clk)` at t=5
-                // (clk=1) and immediately re-arms on the next line; its
-                // captured_prev is frozen at 1, so when clk later goes
-                // 1→0→1 the Posedge test `!pb_one && cb_one` stays false
-                // (pb_one clings to the stale 1) and the second posedge is
-                // lost — the process strands (see
-                // tests/bound_module / sequential_event_waits). Tracking the
-                // running level here preserves the same-tick NBA-region
-                // semantics captured_prev was added for (a waiter still
-                // won't fire on an edge that completed BEFORE it armed, since
-                // at arm time captured_prev already equals current), while
-                // catching cross-tick transitions through the target level.
-                for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
-                    let (cv, cx) = self.signal_table[sid.signal_id].raw_bits();
-                    waiter.captured_prev[i] = (cv, cx);
-                    if self.signal_widths[sid.signal_id] > 64 {
-                        waiter.captured_prev_wide[i] =
-                            Some(self.signal_table[sid.signal_id].clone());
-                    }
-                }
-                self.event_waiters_swap.push(waiter);
-            }
-        }
-        std::mem::swap(&mut self.event_waiters, &mut self.event_waiters_swap);
+        let triggered_conts = if waiters_first {
+            Vec::new() // already drained and run before the edge blocks
+        } else {
+            self.drain_triggered_event_waiters()
+        };
         if let Some(t) = _t_w {
             self.prof_edge_waiters += t.elapsed().as_nanos() as u64;
         }
@@ -27783,18 +28084,11 @@ impl Simulator {
                 {
                     let mut head = hier.clone();
                     head.path.pop();
-                    let bare = head
-                        .path
-                        .last()
-                        .map(|s| s.name.name.clone())
-                        .unwrap_or_default();
-                    let resolved = self.resolve_hier_name(&head);
+                    let head_expr =
+                        Expression::new(ExprKind::Ident(head), expr.span);
                     let fired = self
-                        .event_triggered_time
-                        .get(&bare)
-                        .copied()
-                        .or_else(|| self.event_triggered_time.get(&resolved).copied())
-                        .map_or(false, |t| t == self.time);
+                        .event_triggered_now(&head_expr)
+                        .unwrap_or(false);
                     return if fired {
                         Value::ones(1)
                     } else {
@@ -29156,7 +29450,18 @@ impl Simulator {
                 let result = match kind {
                     RangeKind::Constant => base.range_select(l, r),
                     RangeKind::IndexedUp => base.range_select(l + r - 1, l),
-                    RangeKind::IndexedDown => base.range_select(l, l.saturating_sub(r - 1)),
+                    RangeKind::IndexedDown => {
+                        // §11.5.1: `[l -: r]` selects r bits down from l. When
+                        // `l < r-1` the low bound is negative — those bits read
+                        // x, and saturating to 0 would drop them AND shrink the
+                        // width. Use the signed-bound select in that case.
+                        let lo_signed = l as i64 - (r as i64 - 1);
+                        if lo_signed >= 0 {
+                            base.range_select(l, lo_signed as usize)
+                        } else {
+                            base.range_select_signed(l as i64, lo_signed)
+                        }
+                    }
                 };
                 result
             }
@@ -29333,6 +29638,7 @@ impl Simulator {
                         Value::zero(32)
                     }
                 }
+                // §6.24.1 literal size cast `N'(x)` — lowered by the parser.
                 "$__xz_size_cast" => {
                     let n = args
                         .first()
@@ -29775,7 +30081,7 @@ impl Simulator {
                 }
                 // §21.3.8 `$feof(fd)`: returns nonzero if the file is at EOF.
                 "$feof" => {
-                    use std::io::{Read, Seek, SeekFrom};
+                    use std::io::{Seek, SeekFrom};
                     let fd = args
                         .first()
                         .map(|a| self.eval_file_handle_arg(a))
@@ -30129,21 +30435,6 @@ impl Simulator {
                     let v = real1(args, &mut |a| self.eval_expr(a));
                     Value::from_f64(v.atanh())
                 }
-                "$clog2" => {
-                    let v = args
-                        .first()
-                        .map(|a| self.eval_expr(a))
-                        .unwrap_or(Value::zero(32));
-                    let n = v.to_u64().unwrap_or(0);
-                    Value::from_u64(
-                        if n <= 1 {
-                            0
-                        } else {
-                            64 - (n - 1).leading_zeros() as u64
-                        },
-                        32,
-                    )
-                }
                 // §6.24.1 TYPE cast `int'(x)` / `real'(x)` — lowered by the
                 // parser. A real → integral cast ROUNDS (§6.12.2); an integral
                 // → real cast widens; otherwise resize to the type's width and
@@ -30239,54 +30530,6 @@ impl Simulator {
                     }
                     // Unknown cast target: pass the operand through unchanged.
                     return inner_v;
-                }
-                // §20.8.2 real math library.
-                "$sin" | "$cos" | "$tan" | "$asin" | "$acos" | "$atan" | "$sinh" | "$cosh"
-                | "$tanh" | "$asinh" | "$acosh" | "$atanh" => {
-                    let x = args
-                        .first()
-                        .map(|a| self.eval_expr(a).to_f64())
-                        .unwrap_or(0.0);
-                    let r = match name.as_str() {
-                        "$sin" => x.sin(),
-                        "$cos" => x.cos(),
-                        "$tan" => x.tan(),
-                        "$asin" => x.asin(),
-                        "$acos" => x.acos(),
-                        "$atan" => x.atan(),
-                        "$sinh" => x.sinh(),
-                        "$cosh" => x.cosh(),
-                        "$tanh" => x.tanh(),
-                        "$asinh" => x.asinh(),
-                        "$acosh" => x.acosh(),
-                        _ => x.atanh(),
-                    };
-                    Value::from_f64(r)
-                }
-                "$atan2" | "$hypot" => {
-                    let x = args
-                        .first()
-                        .map(|a| self.eval_expr(a).to_f64())
-                        .unwrap_or(0.0);
-                    let y = args
-                        .get(1)
-                        .map(|a| self.eval_expr(a).to_f64())
-                        .unwrap_or(0.0);
-                    Value::from_f64(if name == "$atan2" {
-                        x.atan2(y)
-                    } else {
-                        x.hypot(y)
-                    })
-                }
-                // §6.24.1 literal size cast `N'(x)` — lowered by the parser.
-                "$__xz_size_cast" => {
-                    let n = args
-                        .first()
-                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(32))
-                        .unwrap_or(32) as u32;
-                    args.get(1)
-                        .map(|a| self.eval_expr(a).resize(n.max(1)))
-                        .unwrap_or_else(|| Value::zero(n.max(1)))
                 }
                 "$shortrealtobits" => {
                     let v = args
@@ -30938,7 +31181,7 @@ impl Simulator {
                         // matching the base_val width (handles queue elements
                         // where the element type isn't directly registered for
                         // the queue variable name).
-                        for (td_name, td) in &self.module.typedef_types {
+                        for (_td_name, td) in &self.module.typedef_types {
                             let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
                             if let Some(fields) = Self::struct_field_layout(&resolved) {
                                 let total_w: u32 = fields.iter().map(|(_, _, w, _)| w).sum();
@@ -30965,24 +31208,11 @@ impl Simulator {
                 // slot as this query. `EventTrigger` stamps
                 // `event_triggered_time[name] = self.time`.
                 if member.name == "triggered" {
-                    if let ExprKind::Ident(hier) = &expr.kind {
-                        let bare = hier
-                            .path
-                            .last()
-                            .map(|s| s.name.name.clone())
-                            .unwrap_or_default();
-                        let resolved = self.resolve_hier_name(hier);
-                        let fired = self
-                            .event_triggered_time
-                            .get(&bare)
-                            .copied()
-                            .or_else(|| self.event_triggered_time.get(&resolved).copied())
-                            .map_or(false, |t| t == self.time);
-                        return if fired {
-                            Value::ones(1)
-                        } else {
-                            Value::zero(1)
-                        };
+                    if let Some(fired) = self.event_triggered_now(expr) {
+                        return if fired { Value::ones(1) } else { Value::zero(1) };
+                    }
+                    if matches!(expr.kind, ExprKind::Ident(_)) {
+                        return Value::zero(1);
                     }
                 }
                 // §9.7 `process::status()`: return the state enum. Previously
@@ -31646,6 +31876,11 @@ impl Simulator {
             StatementKind::ForeverTail { .. } => {}
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
+                // §15.5.5: `event_var = other_event / null / q[i]` re-binds
+                // the HANDLE, it does not copy a value.
+                if self.try_event_handle_assign(lvalue, rvalue) {
+                    return;
+                }
                 // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
                 // is evaluated exactly ONCE. The assign_value machinery
                 // re-evaluates the index in several candidate branches, so
@@ -34556,6 +34791,38 @@ impl Simulator {
                         return;
                     }
                 }
+                // §9.6.2: `disable <task_name>` where OTHER processes are
+                // currently executing an invocation of that task terminates
+                // those invocations. (Approximation: the whole executing
+                // process is terminated — exact for the common `fork
+                // task_a; task_b; join` + `disable task_b` shape.)
+                if let Some(pids) = self.active_task_pids.get(&name.name).cloned() {
+                    let to_kill: HashSet<usize> = pids
+                        .into_iter()
+                        .filter(|&p| p != self.current_pid && !self.killed_pids.contains(&p))
+                        .collect();
+                    if !to_kill.is_empty() {
+                        for &pid in &to_kill {
+                            self.killed_pids.insert(pid);
+                            self.process_parents.remove(&pid);
+                            self.process_contexts.remove(&pid);
+                        }
+                        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        for q in self.mailbox_get_waiters.values_mut() {
+                            q.retain(|w| !to_kill.contains(&w.pid));
+                        }
+                        for q in self.semaphore_get_waiters.values_mut() {
+                            q.retain(|w| !to_kill.contains(&w.pid));
+                        }
+                        self.release_killed_from_join_waiters(&to_kill);
+                        for set in self.active_task_pids.values_mut() {
+                            for p in &to_kill {
+                                set.remove(p);
+                            }
+                        }
+                        return;
+                    }
+                }
                 // Otherwise unwind this process to the end of the named block
                 // (or the named task): the SeqBlock / task-call arm clears the
                 // flags when it sees its own name, so execution resumes after
@@ -34984,18 +35251,20 @@ impl Simulator {
                     // this a local `pkt_t p;` keeps `p` and `p.field` in
                     // separate storage (a whole write doesn't reach members and
                     // vice-versa). Unpacked structs are intentionally excluded.
-                    if d.dimensions.is_empty() {
-                        // §6.17: an `event` local becomes a real event —
-                        // `->e` / `@(e)` resolve through module.events.
-                        if matches!(
-                            data_type,
-                            crate::ast::types::DataType::Simple {
-                                kind: crate::ast::types::SimpleType::Event,
-                                ..
-                            }
-                        ) {
-                            self.module.events.insert(d.name.name.clone());
+                    // §6.17: an `event` local becomes a real event —
+                    // `->e` / `@(e)` resolve through module.events. Arrays
+                    // and queues of events register their BASE name so
+                    // element refs (`ev_arr[i]`) are recognized as events.
+                    if matches!(
+                        data_type,
+                        crate::ast::types::DataType::Simple {
+                            kind: crate::ast::types::SimpleType::Event,
+                            ..
                         }
+                    ) {
+                        self.module.events.insert(d.name.name.clone());
+                    }
+                    if d.dimensions.is_empty() {
                         // Declared type of a scalar local: the member-wise
                         // struct copy (`u2 = u1`) resolves the element type
                         // through var_decl_types, which only module-scope
@@ -35422,7 +35691,6 @@ impl Simulator {
                                 }
                                 continue;
                             }
-                            _ => {}
                         }
                     }
                     if let Some((lo, hi)) = range {
@@ -35842,8 +36110,198 @@ impl Simulator {
                     }
                 }
             }
-            StatementKind::EventTrigger { name, .. } => {
-                let raw = name.name.clone();
+            StatementKind::EventTrigger { name, nonblocking, .. } => {
+                if *nonblocking {
+                    // §15.5.2: defer to the NBA region of the current slot.
+                    self.pending_nba_triggers.push(name.name.clone());
+                    return;
+                }
+                self.fire_named_event(&name.name);
+            }
+            StatementKind::Coverpoint { .. } | StatementKind::Cross { .. } => {}
+            StatementKind::WaitOrder { .. } => {
+                // The synchronous executor cannot suspend; wait_order is
+                // handled on the process path (run_process_stmts). Reaching
+                // here means the construct sat in a context that never
+                // inlines — warn rather than silently drop.
+                eprintln!(
+                    "[xezim][warning] wait_order reached the non-suspending execution path and was skipped (IEEE 1800-2017 §15.5.3)"
+                );
+            }
+        }
+    }
+
+    /// §15.5.5 null event handle sentinel (`ev = null`).
+    const EVENT_NULL_KEY: &'static str = "\x01evnull";
+
+    /// Chase the §15.5.5 alias map to the canonical synchronization-object
+    /// key for an event name (bounded, alias chains are user-built).
+    fn resolve_event_key(&self, name: &str) -> String {
+        let mut cur = name;
+        for _ in 0..16 {
+            match self.event_aliases.get(cur) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        cur.to_string()
+    }
+
+    /// If `e` is a plain reference to an event variable (optionally with a
+    /// constant/variable element select: `ev`, `ev_arr[i]`), return its
+    /// storage key (`ev` / `ev_arr[3]`). Detection is by the declared-events
+    /// set, so ordinary signals never take this path.
+    fn event_ref_key(&mut self, e: &Expression) -> Option<String> {
+        // Trailing element select parses as Index (`ev_arr[1]` as a full
+        // expression); mid-path selects live on the Ident segment
+        // (`ev_arr[1].triggered`). Accept both shapes.
+        if let ExprKind::Index { expr, index } = &e.kind {
+            if let ExprKind::Ident(h) = &expr.kind {
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    let base = h.path[0].name.name.as_str();
+                    if self.module.events.contains(base) {
+                        let base = base.to_string();
+                        let idx_expr = (**index).clone();
+                        let i = self.eval_expr(&idx_expr).to_i64().unwrap_or(0);
+                        return Some(format!("{}[{}]", base, i));
+                    }
+                }
+            }
+            return None;
+        }
+        let hier = match &e.kind {
+            ExprKind::Ident(h) => h,
+            _ => return None,
+        };
+        if hier.path.len() != 1 {
+            return None;
+        }
+        let seg = &hier.path[0];
+        let base = seg.name.name.as_str();
+        if !self.module.events.contains(base) {
+            return None;
+        }
+        if seg.selects.is_empty() {
+            return Some(base.to_string());
+        }
+        let mut key = base.to_string();
+        let sels = seg.selects.clone();
+        for sel in &sels {
+            let i = self.eval_expr(sel).to_i64().unwrap_or(0);
+            key = format!("{}[{}]", key, i);
+        }
+        Some(key)
+    }
+
+    /// §15.5.5 handle-assignment interception for `lhs = rhs` where `lhs`
+    /// is an event variable. Returns true when the statement was consumed
+    /// as an alias/null re-binding (the caller must then skip the normal
+    /// value assignment).
+    fn try_event_handle_assign(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        let Some(lkey) = self.event_ref_key(lvalue) else {
+            return false;
+        };
+        if matches!(rvalue.kind, ExprKind::Null) {
+            self.event_aliases
+                .insert(lkey, Self::EVENT_NULL_KEY.to_string());
+            return true;
+        }
+        if let Some(rkey) = self.event_ref_key(rvalue) {
+            let target = self.resolve_event_key(&rkey);
+            if target == lkey {
+                self.event_aliases.remove(&lkey);
+            } else {
+                self.event_aliases.insert(lkey, target);
+            }
+            return true;
+        }
+        // A handle pulled out of a container (`e = q[0]`): the container
+        // stores the sync-object key as a string (see queue_store_elem).
+        let v = self.eval_expr(rvalue);
+        let sv = v.to_sv_string();
+        if !sv.is_empty()
+            && (self.module.events.contains(sv.as_str())
+                || self.event_aliases.contains_key(sv.as_str())
+                || self.event_triggered_time.contains_key(sv.as_str()))
+        {
+            let target = self.resolve_event_key(&sv);
+            self.event_aliases.insert(lkey, target);
+            return true;
+        }
+        false
+    }
+
+    /// §15.5.3 `.triggered` truth for an event reference (aliases chased,
+    /// element keys and container-stored string handles included). None if
+    /// `e` is not recognizably an event reference.
+    fn event_triggered_now(&mut self, e: &Expression) -> Option<bool> {
+        let now = self.time;
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(k) = self.event_ref_key(e) {
+            keys.push(k);
+        }
+        if let ExprKind::Ident(h) = &e.kind {
+            if let Some(seg) = h.path.last() {
+                if seg.selects.is_empty() {
+                    keys.push(seg.name.name.clone());
+                }
+            }
+            keys.push(self.resolve_hier_name(h));
+        }
+        // Container element (`q[0].triggered`): the element VALUE is the key.
+        if let ExprKind::Ident(h) = &e.kind {
+            if h.path.len() == 1 && !h.path[0].selects.is_empty() {
+                let v = self.eval_expr(e);
+                let sv = v.to_sv_string();
+                if !sv.is_empty()
+                    && (self.module.events.contains(sv.as_str())
+                        || self.event_aliases.contains_key(sv.as_str())
+                        || self.event_triggered_time.contains_key(sv.as_str()))
+                {
+                    keys.push(sv);
+                }
+            }
+        }
+        if keys.is_empty() {
+            return None;
+        }
+        let mut known_event = false;
+        for k in &keys {
+            let canon = self.resolve_event_key(k);
+            if canon == Self::EVENT_NULL_KEY {
+                known_event = true;
+                continue;
+            }
+            if self.event_triggered_time.get(canon.as_str()) == Some(&now) {
+                return Some(true);
+            }
+            if self.module.events.contains(canon.as_str())
+                || self.event_triggered_time.contains_key(canon.as_str())
+            {
+                known_event = true;
+            }
+        }
+        if known_event {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Fire a named event NOW: toggle its 1-bit signal (the edge `@(e)`
+    /// waiters arm on) and stamp `event_triggered_time` for `.triggered`.
+    /// Shared by the blocking `-> e` statement and the NBA-region flush of
+    /// deferred `->> e` triggers.
+    fn fire_named_event(&mut self, raw_name: &str) {
+        // §15.5.5: the name is a handle — fire the object it references.
+        let canon = self.resolve_event_key(raw_name);
+        if canon == Self::EVENT_NULL_KEY {
+            return; // triggering a null handle is a no-op
+        }
+        let raw_name: &str = &canon;
+        {
+            {
+                let raw = raw_name.to_string();
                 let trimmed = raw.trim_start_matches('.').to_string();
                 let mut candidates = Vec::new();
                 candidates.push(raw.clone());
@@ -35884,13 +36342,12 @@ impl Simulator {
                 // lookup failed because the event was never registered as a
                 // signal — `.triggered` still reads correctly).
                 self.event_triggered_time
-                    .insert(name.name.clone(), self.time);
+                    .insert(raw_name.to_string(), self.time);
                 // Settle combinatorial logic but defer edge-triggered blocks
                 // (always @(e)) to the main event loop so the triggering
                 // process sees pre-event state until its next delay/wait.
                 self.settle_combinatorial();
             }
-            StatementKind::Coverpoint { .. } | StatementKind::Cross { .. } => {}
         }
     }
 
@@ -47840,6 +48297,14 @@ impl Simulator {
     /// each member in its own signal, so writing one packed value (what
     /// `push_back` used to do) loses every member.
     fn queue_store_elem(&mut self, obj_name: &str, elem: &str, arg: &Expression) {
+        // §15.5.5: pushing an event variable stores its synchronization-object
+        // KEY (a string), so a handle later pulled out of the container
+        // (`e = q[0]`, `q[0].triggered`) still names the same object.
+        if let Some(k) = self.event_ref_key(arg) {
+            let canon = self.resolve_event_key(&k);
+            self.set_signal_value_by_name(elem, Value::from_string(&canon));
+            return;
+        }
         // §7.4.5: a queue of FIXED arrays (`int q[$][4]`) stores each row's
         // elements at `q[i][j]` — evaluating the row to one packed value
         // would land in a phantom scalar `q[i]` that no read ever visits.
@@ -54966,6 +55431,11 @@ impl Simulator {
     /// the work that `exec_task_call` runs after the body. Mirrors the original
     /// inline cleanup exactly.
     fn unwind_task_frame(&mut self, c: TaskCleanup) {
+        if let Some(tn) = &c.task_name {
+            if let Some(set) = self.active_task_pids.get_mut(tn) {
+                set.remove(&self.current_pid);
+            }
+        }
         self.current_static_task = c.prev_static;
         if c.pushed_method_this {
             self.this_stack.pop();
@@ -55182,7 +55652,15 @@ impl Simulator {
         if matches!(td.lifetime, Some(crate::ast::types::Lifetime::Static)) {
             self.current_static_task = Some(td.name.name.name.clone());
         }
+        // §9.6.2 bookkeeping: this pid is now executing an invocation of
+        // the named task, so a cross-process `disable <task>` can find it.
+        let tname = td.name.name.name.clone();
+        self.active_task_pids
+            .entry(tname.clone())
+            .or_default()
+            .insert(self.current_pid);
         TaskCleanup {
+            task_name: Some(tname),
             array_writebacks,
             output_bindings,
             assoc_params,
@@ -64646,7 +65124,7 @@ union s_vpi_value_union {
 }
 
 #[repr(C)]
-struct s_vpi_value {
+pub struct s_vpi_value {
     format: libc::c_int,
     value: s_vpi_value_union,
 }
@@ -66066,7 +66544,7 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
     // A constant argument carries its own value and needs no simulator.
     if h.kind == VpiKind::Constant {
         let ok = match &h.value {
-            Some(v) => fill_vpi_value(v, 0, vp),
+            Some(v) => fill_vpi_value(v, 0, Some(h.type_code), vp),
             None => false,
         };
         if !ok {
@@ -66108,7 +66586,7 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
             }
         };
         let current_time = sim.time;
-        fill_vpi_value(&val, current_time, vp)
+        fill_vpi_value(&val, current_time, Some(h.type_code), vp)
     })
     .unwrap_or(false);
 
@@ -66129,18 +66607,26 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
 /// Shared by `vpi_get_value` and the value-change dispatcher, so a
 /// callback sees its trigger object's value in exactly the format a
 /// direct read would have produced.
-fn fill_vpi_value(val: &Value, _current_time: u64, vp: &mut s_vpi_value) -> bool {
+fn fill_vpi_value(
+    val: &Value,
+    _current_time: u64,
+    obj_type_code: Option<libc::c_int>,
+    vp: &mut s_vpi_value,
+) -> bool {
     {
         // vpiObjTypeVal: the simulator picks the object's natural format
         // and reports which one it chose in `format`.
         let mut format = vp.format;
         if format == vpi::OBJ_TYPE_VAL {
-            format = if val.is_real {
-                vpi::REAL_VAL
-            } else if val.width <= 32 {
-                vpi::INT_VAL
-            } else {
-                vpi::VECTOR_VAL
+            format = match obj_type_code {
+                // Preserve declaration-typed object flavor when known.
+                Some(vpi::STRING_VAR) => vpi::STRING_VAL,
+                Some(vpi::TIME_VAR) => vpi::TIME_VAL,
+                Some(vpi::REAL_VAR) | Some(vpi::SHORT_REAL_VAR) => vpi::REAL_VAL,
+                Some(vpi::BIT_VAR) if val.width <= 1 => vpi::SCALAR_VAL,
+                _ if val.is_real => vpi::REAL_VAL,
+                _ if val.width <= 32 => vpi::INT_VAL,
+                _ => vpi::VECTOR_VAL,
             };
             vp.format = format;
         }
@@ -66224,7 +66710,12 @@ fn dispatch_vpi_cb(
         value: s_vpi_value_union { integer: 0 },
     };
     let filled = match (reason, &signal_val) {
-        (vpi::CB_VALUE_CHANGE, Some(v)) => fill_vpi_value(v, current_time, &mut value),
+        (vpi::CB_VALUE_CHANGE, Some(v)) => {
+            let obj_type_code = unsafe {
+                vpi_deref(cb.obj as *mut libc::c_void).map(|h| h.type_code)
+            };
+            fill_vpi_value(v, current_time, obj_type_code, &mut value)
+        }
         _ => false,
     };
     if !filled {
