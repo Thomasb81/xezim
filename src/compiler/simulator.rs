@@ -35694,19 +35694,25 @@ impl Simulator {
                                     }
                                 }
                             } else if self.pure_sv_lrm
-                                && self
-                                    .this_stack
-                                    .last()
-                                    .copied()
-                                    .flatten()
-                                    .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
-                                    .map_or(false, |inst| inst.type_bindings.contains_key(cn))
+                                && self.resolve_type_param_binding(cn).is_some()
                             {
                                 // `cn` is a class TYPE parameter (e.g. `T obj;`
                                 // inside a parameterized-class method). Record
                                 // the param name so a separate `obj = new()`
-                                // resolves it through the current instance's
-                                // `type_bindings` to the concrete class.
+                                // resolves it to the concrete class.
+                                //
+                                // `resolve_type_param_binding` covers BOTH the
+                                // instance path (a method's `this` instance
+                                // `type_bindings`) AND the static path (the
+                                // active specialization `current_spec`). The
+                                // latter matters for STATIC methods of a
+                                // parameterized class — e.g.
+                                // `uvm_callbacks#(T,CB)::get_first` declares
+                                // `CB cb;` with no `this`. Without the static
+                                // branch, `cb` was never registered, so a bare
+                                // `$cast(cb, ...)` assignment and any later
+                                // `new()` could not resolve CB, and the return
+                                // value came back null to the caller.
                                 self.var_class_types.insert(d.name.name.clone(), cn.clone());
                             }
                         }
@@ -42870,6 +42876,45 @@ impl Simulator {
     /// non-empty arg list (so plain class aliases and non-class typedefs keep
     /// their existing fallthrough behavior — this only intercepts genuine
     /// typedef specializations).
+    /// Resolve a simple class typedef (NO specialization args) to its
+    /// target class name: `typedef base alias_t;` ... `alias_t::method()`
+    /// → `base`. Returns None for non-class typedefs, typedefs WITH
+    /// specialization args (handled by `resolve_typedef_spec`), or names
+    /// that aren't typedefs at all.
+    ///
+    /// This is the §6.18/§8.25.1 plain-alias case: a typedef inside a
+    /// class body that names another class with no `#(...)` args. UVM's
+    /// callback infrastructure relies on this heavily — every
+    /// `uvm_typed_callbacks#(T)` and `uvm_callbacks#(T,CB)` declares
+    /// `typedef uvm_callbacks_base super_type;` and then calls
+    /// `super_type::m_initialize()` to set up the shared static pool.
+    /// Without this resolution, those calls silently no-op and the pool
+    /// stays null.
+    fn resolve_simple_typedef_class(&self, name: &str) -> Option<String> {
+        use crate::ast::types::DataType;
+        let dt = self.lookup_typedef_target(name)?;
+        if let DataType::TypeReference {
+            name: tn,
+            type_args,
+            ..
+        } = &dt
+        {
+            if !type_args.is_empty() {
+                return None;
+            }
+            let synth = crate::ast::types::TypeName {
+                scope: None,
+                name: crate::ast::Identifier {
+                    name: tn.name.name.clone(),
+                    span: crate::ast::Span::dummy(),
+                },
+                span: crate::ast::Span::dummy(),
+            };
+            return self.resolve_typeref_class_name(&synth);
+        }
+        None
+    }
+
     fn resolve_typedef_spec(&self, name: &str) -> Option<(String, String)> {
         use crate::ast::types::DataType;
         let dt = self.lookup_typedef_target(name)?;
@@ -47106,6 +47151,26 @@ impl Simulator {
                 }
             }
         }
+        // Static class property: walk the class context hierarchy to find
+        // which class declares `vname` as static. This is essential for
+        // `obj.static_prop = val` inside a method body — the object is a
+        // static variable (like UVM's `m_t_inst`), not a local or signal,
+        // so the checks above miss it. Without this, the write falls
+        // through to instance storage and the shared static cell is never
+        // updated.
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            let mut cur = Some(ctx);
+            while let Some(cname) = cur {
+                if let Some(cd) = self.module.classes.get(&cname) {
+                    if cd.static_properties.contains(vname) {
+                        return Some(cname.clone());
+                    }
+                    cur = cd.extends.clone();
+                } else {
+                    break;
+                }
+            }
+        }
         None
     }
 
@@ -49319,14 +49384,55 @@ impl Simulator {
             self.set_queue_size(pname, parts.len() as u64);
             return Some(String::new());
         }
-        let cname = if let ExprKind::Ident(h) = &arg.kind {
-            let mut n = self.resolve_hier_name(h);
-            if let Some(s) = self.instance_assoc_member(&n) {
-                n = s;
+        let cname = match &arg.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let mut n = self.resolve_hier_name(h);
+                if let Some(s) = self.instance_assoc_member(&n) {
+                    n = s;
+                }
+                n
             }
-            n
-        } else {
-            return None;
+            // Flattened `obj.member` (parsed as Ident path [obj, member]) or
+            // explicit `ExprKind::MemberAccess`. §13.5.2: a queue/dynamic-
+            // array member of ANOTHER object passed as a `ref`/`output`/
+            // `inout` actual — e.g. UVM's callback macro `cb.doit(comp.q)` /
+            // `cb.doit(this.q)`. The member's per-instance storage lives at
+            // `<handle>#member`; resolve the base object to its heap handle,
+            // then map to that flat namespace so the element copy-in /
+            // writeback below targets the right collection. Without this the
+            // arg fell through to a scalar bind and a `push_back` inside the
+            // callee never reached the caller's member queue (the UVM
+            // callback queue stayed empty, so `uvm_do_callbacks` iterated
+            // nothing).
+            // A member-access chain of arbitrary depth: `obj.q`, `a.b.q`,
+            // `a.b.c.q`, … (parsed as a flattened Ident path, all segments
+            // plain identifiers — no index/scope selects). The HEAD is the
+            // base object; each MIDDLE segment is a handle-valued property
+            // of the object the preceding segment resolves to; the LAST
+            // segment is the leaf member that names the queue/dynamic array.
+            // Walk the heap: head handle → member_handle per middle segment
+            // → then map the owning handle + leaf name to the per-instance
+            // `<handle>#member` storage namespace.
+            //
+            // (Scope-qualified names like `pkg::Class::queue` are a different
+            // AST shape — ClassScope, not a member chain — and resolve via
+            // static-property tables elsewhere; they don't reach this path.)
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let head = &h.path[0].name.name;
+                let leaf = h.path.last().unwrap().name.name.clone();
+                let mut handle = self.eval_ident_handle(head)?;
+                for seg in h.path.iter().take(h.path.len() - 1).skip(1) {
+                    handle = self.member_handle(handle, &seg.name.name)?;
+                }
+                self.handle_collection_name(handle, &leaf)?
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let handle = self.eval_handle_expr(expr)?;
+                self.handle_collection_name(handle, &member.name)?
+            }
+            _ => return None,
         };
         if !self.module.arrays.contains_key(&cname) && !self.module.dynamic_arrays.contains(&cname)
         {
@@ -50260,6 +50366,90 @@ impl Simulator {
         self.current_spec = saved_spec;
     }
 
+    /// Compute the specialization signature for `ancestor_class` given a
+    /// leaf class `leaf_class` with spec signature `leaf_sig`.
+    ///
+    /// Walks the `extends` chain from `leaf_class` towards `ancestor_class`,
+    /// resolving the parent's type args at each hop using the child's
+    /// type-param bindings (derived from `leaf_sig` matched to
+    /// `param_order`).
+    ///
+    /// Example: `uvm_callbacks#(my_obj, my_cb)` extends
+    /// `uvm_typed_callbacks#(T)`.  Given leaf `uvm_callbacks` with sig
+    /// `my_obj,my_cb`, the ancestor `uvm_typed_callbacks` gets spec `my_obj`
+    /// (the first type arg, since `T` maps to it).
+    fn ancestor_spec(
+        &self,
+        leaf_class: &str,
+        leaf_sig: &str,
+        ancestor_class: &str,
+    ) -> Option<String> {
+        if leaf_class == ancestor_class {
+            return Some(leaf_sig.to_string());
+        }
+        // Build the leaf's type-param bindings from its spec signature.
+        let leaf_args = Self::split_spec_args(leaf_sig);
+        let mut bindings: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        {
+            let cd = self.module.classes.get(leaf_class)?;
+            let order: &[String] = if cd.param_order.is_empty()
+                && !(cd.param_defaults.is_empty() && cd.type_param_names.is_empty())
+            {
+                return None;
+            } else {
+                &cd.param_order
+            };
+            for (i, arg) in leaf_args.iter().enumerate() {
+                if let Some(pname) = order.get(i) {
+                    bindings.insert(pname.clone(), arg.trim().to_string());
+                }
+            }
+        }
+        // Walk the extends chain resolving type args at each hop.
+        let mut cur = leaf_class.to_string();
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            let cd = self.module.classes.get(&cur)?;
+            let parent = cd.extends.clone()?;
+            // Resolve extends args using current bindings.
+            let parent_args: Vec<String> = cd
+                .extends_args
+                .iter()
+                .map(|e| {
+                    if let crate::ast::expr::ExprKind::Ident(h) = &e.kind {
+                        if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                            let nm = &h.path[0].name.name;
+                            if let Some(v) = bindings.get(nm) {
+                                return v.clone();
+                            }
+                            return nm.clone();
+                        }
+                    }
+                    self.expr_to_spec_fragment(e).unwrap_or_default()
+                })
+                .collect();
+            if parent == ancestor_class {
+                return Some(parent_args.join(","));
+            }
+            // Update bindings for the parent class.
+            let parent_cd = self.module.classes.get(&parent)?;
+            let parent_order: &[String] = &parent_cd.param_order;
+            let mut new_bindings = std::collections::HashMap::new();
+            for (i, arg) in parent_args.iter().enumerate() {
+                if let Some(pname) = parent_order.get(i) {
+                    new_bindings.insert(pname.clone(), arg.clone());
+                }
+            }
+            bindings = new_bindings;
+            cur = parent;
+        }
+    }
+
     /// Walk the class hierarchy from `start_class` and return the
     /// `"DeclClass::prop"` storage key for a static property, if one of
     /// `start_class` or its ancestors declares `prop` as `static`.
@@ -50280,28 +50470,32 @@ impl Simulator {
                     // AND inherited from parameterized ancestors (the common
                     // UVM pattern: `uvm_registry_common::m__initialized` is
                     // inherited by `uvm_object_registry#(T,Tname)`).
-                    return Some(match &self.current_spec {
+                    let key = match &self.current_spec {
                         Some((base, sig))
-                            // Per-spec only when (a) the declaring class is
-                            // the spec base or an ancestor of it (cname is in
-                            // the inheritance chain below `base`), AND (b) the
-                            // declaring class itself is PARAMETERIZED. Without
-                            // (b), a static inherited from a plain
-                            // non-parameterized ancestor (e.g. `Base::counter`)
-                            // would be wrongly split into one cell per derived
-                            // specialization instead of the single shared
-                            // cell IEEE 1800-2023 §8.25 requires: "To share
-                            // static member variables among several class
-                            // specializations, they need to be placed in a
-                            // nonparameterized base class."
                             if (*base == cname
                                 || self.class_extends(base, &cname))
                                 && self.class_is_parameterized(&cname) =>
                         {
-                            format!("{}#{}::{}", base, sig, prop)
+                            // For inherited statics (cname != base), derive
+                            // the DECLARING class's specialization from the
+                            // leaf spec. This ensures that
+                            // `uvm_callbacks#(T,CB)` and
+                            // `uvm_callbacks#(T,uvm_callback)` — which both
+                            // extend `uvm_typed_callbacks#(T)` — share the
+                            // same `m_tw_cb_q` static cell.
+                            if *base == cname {
+                                format!("{}#{}::{}", base, sig, prop)
+                            } else if let Some(ancestor_sig) =
+                                self.ancestor_spec(base, sig, &cname)
+                            {
+                                format!("{}#{}::{}", cname, ancestor_sig, prop)
+                            } else {
+                                format!("{}#{}::{}", base, sig, prop)
+                            }
                         }
                         _ => format!("{}::{}", cname, prop),
-                    });
+                    };
+                    return Some(key);
                 }
                 cur = cd.extends.clone();
             } else {
@@ -52532,6 +52726,20 @@ impl Simulator {
                             return v;
                         }
                     }
+                    // §6.18/§8.25.1: simple class typedef (no specialization
+                    // args) — `typedef base alias;` ... `alias::method()`.
+                    // `resolve_typedef_spec` skips these; resolve the alias
+                    // to its target class and dispatch.
+                    if let Some(resolved) = self.resolve_simple_typedef_class(&name) {
+                        if let Some(res) = self.exec_static_method(&resolved, mname, args) {
+                            return res;
+                        }
+                        if mname == "new" {
+                            if let Some(cd) = self.module.classes.get(&resolved).cloned() {
+                                return self.instantiate_class(&cd, args);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -53724,6 +53932,19 @@ impl Simulator {
                         self.current_spec = saved;
                         if let Some(v) = res {
                             return v;
+                        }
+                    }
+                    // §6.18/§8.25.1: simple class typedef (no specialization
+                    // args) — `typedef base alias;` ... `alias::method()`.
+                    if let Some(resolved) = self.resolve_simple_typedef_class(obj_name) {
+                        let m = method_name.clone();
+                        if let Some(res) = self.exec_static_method(&resolved, &m, args) {
+                            return res;
+                        }
+                        if m == "new" {
+                            if let Some(cd) = self.module.classes.get(&resolved).cloned() {
+                                return self.instantiate_class(&cd, args);
+                            }
                         }
                     }
                 }
