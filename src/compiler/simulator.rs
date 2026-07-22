@@ -34343,22 +34343,41 @@ impl Simulator {
                                 let sz = self.get_queue_size(&name) as i64;
                                 dims[0] = (0, sz - 1);
                             }
-                            // §12.7.3: a loop var BEYOND the unpacked dims maps
-                            // to the element's packed dimension — `foreach
-                            // (array[i,j,k])` on `reg [3:0] array[0:1][0:2]`
-                            // iterates k over the 4 bits.
-                            if dims.len() + 1 == vars.len() {
-                                let ew = self
-                                    .module
-                                    .arrays
-                                    .get(&name)
-                                    .map(|&(_, _, w)| w)
-                                    .or_else(|| {
-                                        self.module.arrays_2d.get(&name).map(|&(_, _, w)| w)
-                                    })
-                                    .or_else(|| self.module.arrays_nd.get(&name).map(|(_, w)| *w));
-                                if let Some(w) = ew.filter(|&w| w > 1) {
-                                    dims.push((0, w as i64 - 1));
+                            // §12.7.3: loop vars BEYOND the unpacked dimensions
+                            // iterate the element's PACKED dimensions — `foreach
+                            // (array[i,j])` on `logic [1:0][7:0] array[0:3]`
+                            // iterates j over the [1:0] packed dim. Use the
+                            // packed dimension STRUCTURE (`packed_full_dims`,
+                            // outermost first) rather than the flattened element
+                            // width, so multi-packed-dim elements and non-zero /
+                            // negative / descending packed ranges iterate the
+                            // correct index set (each dim normalized to
+                            // ascending for the odometer). Fall back to the
+                            // flat width only for a lone packed dim we did not
+                            // record (e.g. a bare `reg [W-1:0]` element).
+                            if dims.len() < vars.len() {
+                                if let Some(pdims) = self.module.packed_full_dims.get(&name) {
+                                    for &(l, r) in pdims.iter() {
+                                        if dims.len() >= vars.len() {
+                                            break;
+                                        }
+                                        dims.push((l.min(r), l.max(r)));
+                                    }
+                                } else if dims.len() + 1 == vars.len() {
+                                    let ew = self
+                                        .module
+                                        .arrays
+                                        .get(&name)
+                                        .map(|&(_, _, w)| w)
+                                        .or_else(|| {
+                                            self.module.arrays_2d.get(&name).map(|&(_, _, w)| w)
+                                        })
+                                        .or_else(|| {
+                                            self.module.arrays_nd.get(&name).map(|(_, w)| *w)
+                                        });
+                                    if let Some(w) = ew.filter(|&w| w > 1) {
+                                        dims.push((0, w as i64 - 1));
+                                    }
                                 }
                             }
                             if dims.len() >= vars.len() {
@@ -34462,7 +34481,7 @@ impl Simulator {
                                 self.set_loop_var_aliased(
                                     var_scope.as_deref(),
                                     &var.name,
-                                    Value::from_u64(v as u64, 32),
+                                    Self::signed_loop_val(v),
                                 );
                                 self.continue_flag = false;
                                 self.exec_statement(body);
@@ -43823,19 +43842,56 @@ impl Simulator {
         };
         let dims = self.module.packed_full_dims.get(&base_name)?.clone();
         let k = idx_exprs.len();
-        if k > dims.len() {
+        idx_exprs.reverse(); // outermost dimension's index first
+
+        // §7.4: unpacked dimensions are indexed BEFORE packed ones. When
+        // `base_name` is an unpacked array whose element type is itself a
+        // packed multi-D vector (`logic [0:0][31:0] arr [0:0]`), the leading
+        // `num_unpacked` indices select the unpacked ELEMENT (a per-element
+        // signal `arr[i]…`) and only the trailing indices index the packed
+        // dims recorded in `packed_full_dims`. Without this split the unpacked
+        // index was consumed as a packed dimension, so `arr[0][0]` collapsed
+        // to a 1-bit select (bit 0) instead of the 32-bit packed slice.
+        // Pure packed vectors (num_unpacked == 0) keep the original behavior:
+        // the whole object is one flat signal named `base_name`.
+        let num_unpacked = if let Some((d, _)) = self.module.arrays_nd.get(&base_name) {
+            d.len()
+        } else if self.module.arrays_2d.contains_key(&base_name) {
+            2
+        } else if self.module.arrays.contains_key(&base_name) {
+            1
+        } else {
+            0
+        };
+        // Not enough indices to reach packed selection — let the generic
+        // unpacked-element path handle a bare element read/write.
+        if num_unpacked >= k {
             return None;
         }
-        idx_exprs.reverse(); // outermost dimension's index first
+        let mut elem_name = base_name.clone();
+        for ie in &idx_exprs[..num_unpacked] {
+            let iv = self.eval_expr(ie);
+            let idx_i = if iv.has_xz() { None } else { iv.to_i64() };
+            match idx_i {
+                // X / unresolved unpacked index: fall back to the generic path.
+                None => return None,
+                Some(i) => elem_name.push_str(&format!("[{}]", i)),
+            }
+        }
+        let packed_idx = &idx_exprs[num_unpacked..];
+        let pk = packed_idx.len();
+        if pk > dims.len() {
+            return None;
+        }
         let counts: Vec<u64> = dims
             .iter()
             .map(|(l, r)| (l - r).unsigned_abs() + 1)
             .collect();
-        let total: u64 = counts.iter().product();
-        let elem_w: u64 = counts[k..].iter().product::<u64>().max(1);
+        let total: u64 = counts.iter().product(); // packed element width in bits
+        let elem_w: u64 = counts[pk..].iter().product::<u64>().max(1);
         let mut msb_off: u64 = 0;
         let mut oob = false;
-        for (j, ie) in idx_exprs.iter().enumerate() {
+        for (j, ie) in packed_idx.iter().enumerate() {
             let iv = self.eval_expr(ie);
             if iv.has_xz() {
                 oob = true;
@@ -43863,10 +43919,10 @@ impl Simulator {
             msb_off += slot * w_j;
         }
         if oob {
-            return Some((base_name, None, elem_w as u32));
+            return Some((elem_name, None, elem_w as u32));
         }
         let lo = total - msb_off - elem_w;
-        Some((base_name, Some(lo as usize), elem_w as u32))
+        Some((elem_name, Some(lo as usize), elem_w as u32))
     }
 
     fn packed_leaf_of_hier(&self, full: &str) -> Option<(String, u32, u32)> {
@@ -45161,6 +45217,18 @@ impl Simulator {
             .map(|&(lo, hi, _)| vec![(lo, hi)])
     }
 
+    /// A `foreach` index variable is implicitly `int` (signed, §12.7.3), so a
+    /// negative declared bound (`foreach (a[i])` on `a[-2:-4]`) must read back
+    /// as a negative number — not `from_u64`'s unsigned 4294967294. Masks to 32
+    /// bits and marks the value signed so `%0d`, arithmetic, and negative array
+    /// indexing (`a[i]`) all behave.
+    #[inline]
+    fn signed_loop_val(i: i64) -> Value {
+        let mut v = Value::from_u64(i as u64, 32);
+        v.is_signed = true;
+        v
+    }
+
     /// Run `body` once per index tuple, last dimension varying fastest.
     /// IEEE 1800-2017 §12.7.3: a dimension whose loop variable is OMITTED
     /// (`foreach (m[, j])`) is not traversed at all — only the named ones are.
@@ -45190,7 +45258,7 @@ impl Simulator {
                 return;
             }
             for (k, (_, id)) in iterated.iter().enumerate() {
-                self.set_loop_var_aliased(scope, &id.name, Value::from_u64(idx[k] as u64, 32));
+                self.set_loop_var_aliased(scope, &id.name, Self::signed_loop_val(idx[k]));
             }
             self.continue_flag = false;
             self.exec_statement(body);
