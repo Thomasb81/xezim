@@ -1091,7 +1091,14 @@ struct EdgeFanout {
 enum EdgeKind {
     Posedge,
     Negedge,
+    /// `@(x)` / `always @(x)` — level sensitivity: fires on ANY change of the
+    /// whole vector (§9.2 implicit event control).
     AnyEdge,
+    /// `@(edge x)` — §9.4.2 explicit any-edge: a posedge OR negedge of the
+    /// LSB only (like posedge/negedge, a multi-bit vector's edge is its bit 0),
+    /// NOT a whole-vector change. Distinct from AnyEdge so `@(edge wide)`
+    /// doesn't fire on a change that leaves bit 0 unchanged.
+    LsbEdge,
 }
 
 /// LRM §15.4.2: a process blocked inside `mailbox.get(var)` on an empty
@@ -8351,7 +8358,7 @@ impl Simulator {
                 match sid.edge {
                     EdgeKind::Posedge => fanout.posedge.push(block_idx),
                     EdgeKind::Negedge => fanout.negedge.push(block_idx),
-                    EdgeKind::AnyEdge => fanout.anyedge.push(block_idx),
+                    EdgeKind::AnyEdge | EdgeKind::LsbEdge => fanout.anyedge.push(block_idx),
                 }
             }
         }
@@ -16866,7 +16873,8 @@ impl Simulator {
                     let edge = match ee.edge {
                         Some(Edge::Posedge) => EdgeKind::Posedge,
                         Some(Edge::Negedge) => EdgeKind::Negedge,
-                        _ => EdgeKind::AnyEdge,
+                        Some(Edge::Edge) => EdgeKind::LsbEdge,
+                        None => EdgeKind::AnyEdge,
                     };
                     let mut idents = Vec::new();
                     collect_ident_names(&ee.expr, &mut idents);
@@ -17038,6 +17046,8 @@ impl Simulator {
                         EdgeKind::Posedge => "posedge ",
                         EdgeKind::Negedge => "negedge ",
                         EdgeKind::AnyEdge => "",
+                    EdgeKind::LsbEdge => "edge ",
+                        EdgeKind::LsbEdge => "edge ",
                     };
                     eprintln!(
                         "[xezim][hang-report]{}  sensitive to {}{} (now {})",
@@ -17118,6 +17128,7 @@ impl Simulator {
                     EdgeKind::Posedge => "posedge ",
                     EdgeKind::Negedge => "negedge ",
                     EdgeKind::AnyEdge => "",
+                    EdgeKind::LsbEdge => "edge ",
                 };
                 let cur = self.signal_table[sid.signal_id].raw_bits();
                 let armed = w.arm_bits.get(k).copied().unwrap_or((0, 0));
@@ -17254,6 +17265,7 @@ impl Simulator {
             EdgeKind::Posedge => !pb_one && cb_one,
             EdgeKind::Negedge => !pb_zero && cb_zero,
             EdgeKind::AnyEdge => cur_v != prev_v || cur_x != prev_x,
+            EdgeKind::LsbEdge => (!pb_one && cb_one) || (!pb_zero && cb_zero),
         }
     }
 
@@ -17569,6 +17581,7 @@ impl Simulator {
                     EdgeKind::Posedge => "posedge ",
                     EdgeKind::Negedge => "negedge ",
                     EdgeKind::AnyEdge => "",
+                    EdgeKind::LsbEdge => "edge ",
                 };
                 format!("{}{}", edge, self.name_for_id(si.signal_id))
             })
@@ -17924,6 +17937,8 @@ impl Simulator {
                         EdgeKind::Posedge => "posedge ",
                         EdgeKind::Negedge => "negedge ",
                         EdgeKind::AnyEdge => "",
+                    EdgeKind::LsbEdge => "edge ",
+                        EdgeKind::LsbEdge => "edge ",
                     };
                     format!("{}{}", edge, self.name_for_id(s.signal_id))
                 })
@@ -22580,6 +22595,8 @@ impl Simulator {
                 }
                 cur_v != prev_v || cur_x != prev_x
             }
+            // §9.4.2 `@(edge x)`: posedge OR negedge of the LSB.
+            EdgeKind::LsbEdge => (!pb_one && cb_one) || (!pb_zero && cb_zero),
         }
     }
 
@@ -22690,6 +22707,9 @@ impl Simulator {
                             EdgeKind::Posedge => "posedge ",
                             EdgeKind::Negedge => "negedge ",
                             EdgeKind::AnyEdge => "",
+                            EdgeKind::LsbEdge => "edge ",
+                    EdgeKind::LsbEdge => "edge ",
+                        EdgeKind::LsbEdge => "edge ",
                         };
                         format!("{}{}", edge, self.name_for_id(si.signal_id))
                     })
