@@ -29019,6 +29019,30 @@ impl Simulator {
                         self.nested_index_name(expr)
                     );
                 }
+                // §7.12.2: a locator method (`min`/`max`/`unique`/`find*`)
+                // returns a QUEUE, so `a.max()[k]` / `(a.find with (..))[k]`
+                // must index that result queue — not bit-select the scalar the
+                // reduction path returns. Compute the selected indices and
+                // return the k-th (for `_index` forms, the index value itself).
+                if let Some((arr_name, mname, filter, iter_name)) = self.locator_call(expr) {
+                    let idxs = self.locator_indices_named(
+                        &arr_name,
+                        &mname,
+                        filter.as_ref(),
+                        iter_name.as_deref(),
+                    );
+                    let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                    if k < 0 || k as usize >= idxs.len() {
+                        return Value::new(32); // out-of-range read -> x
+                    }
+                    let src_i = idxs[k as usize];
+                    if mname.ends_with("_index") {
+                        return Value::from_u64(src_i as u64, 32);
+                    }
+                    return self
+                        .get_signal_value_by_name(&format!("{}[{}]", arr_name, src_i))
+                        .unwrap_or_else(|| Value::new(32));
+                }
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k]` selects
                 // element k of the queue `q[i]` (§7.4.5). Without this the base
                 // resolves to a scalar and `[k]` becomes a bit-select.
@@ -49377,6 +49401,11 @@ impl Simulator {
         &mut self,
         e: &Expression,
     ) -> Option<(String, String, Option<Expression>, Option<String>)> {
+        // `(a.find with (..))[k]` parenthesizes the whole locator; strip it.
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &e.kind {
+            e = inner;
+        }
         let (inner, filter) = match &e.kind {
             ExprKind::WithClause { expr, filter } => (expr.as_ref(), Some((**filter).clone())),
             _ => (e, None),
