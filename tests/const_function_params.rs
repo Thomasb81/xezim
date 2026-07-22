@@ -117,3 +117,62 @@ endmodule
         msgs
     );
 }
+
+#[test]
+fn log_fn_audit_case_return_width_and_direct_range() {
+    // Reference-verified (byte-identical output): case-based log2, narrow
+    // return-type truncation, floor-log2 NAMED clog2 (real body wins over
+    // the $clog2 name assumption), and a function call directly in a range
+    // dimension with no parameter in between.
+    let sim = simulate(
+        r#"
+module top;
+  function integer wlog2(input integer value);
+    begin
+      wlog2 = 0;
+      while (2**wlog2 < value) wlog2 = wlog2 + 1;
+    end
+  endfunction
+  function integer caselog2(input integer d);
+    case (d)
+      2: caselog2 = 1;
+      4: caselog2 = 2;
+      8: caselog2 = 3;
+      16: caselog2 = 4;
+      default: caselog2 = 0;
+    endcase
+  endfunction
+  function [3:0] narrow(input integer v);
+    narrow = v;
+  endfunction
+  function integer clog2(input integer v);
+    integer t;
+    begin
+      t = v; clog2 = 0;
+      while (t > 1) begin t = t >> 1; clog2 = clog2 + 1; end
+    end
+  endfunction
+  localparam W1 = wlog2(64);
+  localparam W2 = caselog2(16);
+  localparam W3 = narrow(20);
+  localparam W4 = clog2(64);
+  localparam W5 = clog2(65);
+  reg [W1-1:0] b1; reg [W2-1:0] b2; reg [W4-1:0] b4; reg [W5-1:0] b5;
+  reg [wlog2(256)-1:0] b6;
+  initial begin
+    $display("A=%0d,%0d,%0d,%0d,%0d bits=%0d,%0d,%0d,%0d,%0d",
+      W1, W2, W3, W4, W5, $bits(b1), $bits(b2), $bits(b4), $bits(b5), $bits(b6));
+    $finish;
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("sim");
+    let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        msgs.iter().any(|m| m == "A=6,4,4,6,6 bits=6,4,6,6,8"),
+        "log-fn audit mismatch; output: {:?}",
+        msgs
+    );
+}
