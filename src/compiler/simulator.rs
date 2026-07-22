@@ -1842,6 +1842,11 @@ struct ProcessContext {
 /// at the body's `ScopePop` sentinel so the process can suspend in between.
 #[derive(Debug, Clone, Default)]
 struct TaskCleanup {
+    /// §21.2.1.7 `%m`: the m_scope_stack to restore on task return (a task
+    /// call RESETS the lexical scope to just the task, since tasks are
+    /// declared at module/package level — the CALLER's scope is not part of
+    /// the callee's `%m`).
+    saved_m_scope: Vec<String>,
     /// Name of the inlined task, for §9.6.2 `disable <task>` bookkeeping
     /// (`active_task_pids`). None for frames without a stable name.
     task_name: Option<String>,
@@ -2669,6 +2674,10 @@ pub struct Simulator {
     /// (matching real simulators) rather than the top-module name. Pushed in
     /// `exec_function_call` / `exec_task_call` around the body and popped after.
     func_call_stack: Vec<String>,
+    /// §21.2.1.7 `%m` lexical-scope hierarchy WITHIN the current instance:
+    /// task / function / named-block / fork-block names, innermost last.
+    /// Pushed on subroutine/named-block entry, popped on exit.
+    m_scope_stack: Vec<String>,
     /// IEEE 1800-2017 §6.21 / §13.3.1: `static` variables declared inside a
     /// (possibly automatic) subroutine keep ONE persistent storage across all
     /// runtime calls, and their declaration initializer runs only once. Keyed
@@ -4825,6 +4834,7 @@ impl Simulator {
             pending_ret_collection: None,
             current_scope: String::new(),
             func_call_stack: Vec::new(),
+            m_scope_stack: Vec::new(),
             static_local_vars: HashMap::default(),
             static_local_syncs: Vec::new(),
             in_const_param_eval: false,
@@ -38307,10 +38317,34 @@ impl Simulator {
                             // so a multiply-instantiated module reports
                             // `TB.p1` rather than just `TB`.
                             if !self.current_scope.is_empty() {
-                                result.push_str(&format!(
-                                    "{}.{}",
-                                    self.module.name, self.current_scope
-                                ));
+                                // §21.2.1.7: instance path, then the lexical
+                                // scope chain (task / function / named block)
+                                // the `%m` sits in — e.g. `top.u_leaf.t_auto`.
+                                let mut out =
+                                    format!("{}.{}", self.module.name, self.current_scope);
+                                for sc in &self.m_scope_stack {
+                                    out.push('.');
+                                    out.push_str(sc);
+                                }
+                                result.push_str(&out);
+                            } else if !self.m_scope_stack.is_empty() {
+                                // No instance scope (top module itself): the
+                                // package/module function/task branch — base at
+                                // the first subroutine's declaring scope, then
+                                // the rest of the lexical chain.
+                                let first = &self.m_scope_stack[0];
+                                let base = self
+                                    .module
+                                    .func_decl_scope
+                                    .get(first)
+                                    .cloned()
+                                    .unwrap_or_else(|| self.module.name.clone());
+                                let mut out = format!("{}.{}", base, first);
+                                for sc in &self.m_scope_stack[1..] {
+                                    out.push('.');
+                                    out.push_str(sc);
+                                }
+                                result.push_str(&out);
                             } else if let Some(fname) = self.func_call_stack.last() {
                                 // Inside a package/module subroutine called with
                                 // no instance scope: `%m` must be the
@@ -55209,6 +55243,8 @@ impl Simulator {
         // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
         // body; recursion keeps the stack ordered.
         self.func_call_stack.push(fd.name.name.name.clone());
+        let m_fn_leaf = fd.name.name.name.rsplit('.').next().unwrap_or(&fd.name.name.name).to_string();
+        let saved_m_scope_fn = std::mem::replace(&mut self.m_scope_stack, vec![m_fn_leaf]);
         // §6.21: open a static-local sync frame keyed by this subroutine name.
         self.static_local_syncs
             .push((fd.name.name.name.clone(), Vec::new()));
@@ -55221,6 +55257,7 @@ impl Simulator {
         }
         self.sync_static_locals();
         self.func_call_stack.pop();
+        self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
         self.class_context_stack.pop();
         let mut result = if let Some(rv) = self.return_value.take() {
@@ -55338,6 +55375,8 @@ impl Simulator {
                 set.remove(&self.current_pid);
             }
         }
+        // §21.2.1.7 `%m`: restore the caller's lexical scope.
+        self.m_scope_stack = c.saved_m_scope;
         self.current_static_task = c.prev_static;
         if c.pushed_method_this {
             self.this_stack.pop();
@@ -55561,7 +55600,13 @@ impl Simulator {
             .entry(tname.clone())
             .or_default()
             .insert(self.current_pid);
+        // §21.2.1.7 `%m`: entering a task RESETS the lexical scope to just
+        // this task (leaf name — the decl name may be instance-qualified),
+        // saving the caller's scope for restoration on return.
+        let m_leaf = tname.rsplit('.').next().unwrap_or(&tname).to_string();
+        let saved_m_scope = std::mem::replace(&mut self.m_scope_stack, vec![m_leaf]);
         TaskCleanup {
+            saved_m_scope,
             task_name: Some(tname),
             array_writebacks,
             output_bindings,
