@@ -51131,6 +51131,30 @@ impl Simulator {
                             if let Some(v) = bindings.get(nm) {
                                 return v.clone();
                             }
+                            // The extends arg is a type/value param of THIS
+                            // class that was NOT provided in the leaf
+                            // specialization (it took its DEFAULT). Substitute
+                            // the default so the ancestor signature matches
+                            // the one a directly-named specialization would
+                            // produce. Without this, a defaulted type param
+                            // like `CB = uvm_callback` leaks its bare name
+                            // ("CB") into the ancestor sig, yielding a static
+                            // key that no writer ever used — so inherited
+                            // statics (`uvm_callbacks::m_typeid`) read as 0
+                            // and UVM's derived-type callback graph stays
+                            // empty. IEEE 1800-2020 §6.20.2.
+                            if let Some((_, frag)) =
+                                cd.type_param_defaults.iter().find(|(n, _)| n == nm)
+                            {
+                                return frag.clone();
+                            }
+                            if let Some((_, Some(init))) =
+                                cd.param_defaults.iter().find(|(n, _)| n == nm)
+                            {
+                                if let Some(frag) = self.expr_to_spec_fragment(init) {
+                                    return frag;
+                                }
+                            }
                             return nm.clone();
                         }
                     }
@@ -51152,6 +51176,89 @@ impl Simulator {
             bindings = new_bindings;
             cur = parent;
         }
+    }
+
+    /// Canonicalize a specialization signature for a class so that two
+    /// references to the SAME specialization produce the SAME static-storage
+    /// key, regardless of how they were written.
+    ///
+    /// Two inconsistencies arise from defaulted parameters (IEEE 1800-2020
+    /// §6.20.2):
+    ///   1. A directly-named `C#(arg)` omits defaulted trailing params
+    ///      (`uvm_callbacks#(a_comp)` → sig `"a_comp"`), but a typedef-based
+    ///      call (`typedef C#(T,ST,CB) this_type;` then `this_type::get()`)
+    ///      expands to ALL params, leaving an unbound one as its bare name
+    ///      (`"a_comp,base_comp,CB"`).
+    ///   2. Reaching `C` via an ancestor's `extends` resolves unbound params
+    ///      differently than naming `C` directly.
+    ///
+    /// This folds both into one canonical form: for each position, if the
+    /// fragment is the bare NAME of that position's parameter AND the param
+    /// has a default, substitute the default; then pad any missing trailing
+    /// positions with their defaults. So both `"a_comp"` and
+    /// `"a_comp,base_comp,CB"` (for `uvm_derived_callbacks#(T,ST,CB=`
+    /// `uvm_callback)`) become `"a_comp,base_comp,uvm_callback"`.
+    ///
+    /// Without this, an inherited static such as
+    /// `uvm_callbacks::m_typeid` was written under one key and read under
+    /// another, so UVM's `register_super_type` read 0 and the derived-type
+    /// callback graph stayed empty.
+    fn canonicalize_spec_sig(&self, class_name: &str, sig: &str) -> String {
+        // Clone the small vecs we need so the `&self` borrow in
+        // `expr_to_spec_fragment` below doesn't conflict.
+        let (order, tp_defaults, v_defaults): (
+            Vec<String>,
+            Vec<(String, String)>,
+            Vec<(String, Option<crate::ast::expr::Expression>)>,
+        ) = match self.module.classes.get(class_name) {
+            Some(cd) => (
+                cd.param_order.clone(),
+                cd.type_param_defaults.clone(),
+                cd.param_defaults.clone(),
+            ),
+            None => return sig.to_string(),
+        };
+        if order.is_empty() {
+            return sig.to_string();
+        }
+        let mut frags: Vec<String> =
+            Self::split_spec_args(sig).into_iter().map(|s| s.trim().to_string()).collect();
+        // Resolve each provided fragment: if it is the bare name of the
+        // parameter at its own position and that param has a default,
+        // substitute the default.
+        for i in 0..frags.len() {
+            if let Some(pname) = order.get(i) {
+                if frags[i] == *pname {
+                    if let Some((_, d)) = tp_defaults.iter().find(|(n, _)| n == pname) {
+                        frags[i] = d.clone();
+                    } else if let Some((_, Some(init))) =
+                        v_defaults.iter().find(|(n, _)| n == pname)
+                    {
+                        if let Some(d) = self.expr_to_spec_fragment(init) {
+                            frags[i] = d;
+                        }
+                    }
+                }
+            }
+        }
+        // Pad missing trailing positions with their defaults.
+        while frags.len() < order.len() {
+            let i = frags.len();
+            if let Some(pname) = order.get(i) {
+                if let Some((_, d)) = tp_defaults.iter().find(|(n, _)| n == pname) {
+                    frags.push(d.clone());
+                    continue;
+                }
+                if let Some((_, Some(init))) = v_defaults.iter().find(|(n, _)| n == pname) {
+                    if let Some(d) = self.expr_to_spec_fragment(init) {
+                        frags.push(d);
+                        continue;
+                    }
+                }
+            }
+            break; // no default for this position — stop (leave partial)
+        }
+        frags.join(",")
     }
 
     /// Walk the class hierarchy from `start_class` and return the
@@ -51188,13 +51295,13 @@ impl Simulator {
                             // extend `uvm_typed_callbacks#(T)` — share the
                             // same `m_tw_cb_q` static cell.
                             if *base == cname {
-                                format!("{}#{}::{}", base, sig, prop)
+                                format!("{}#{}::{}", base, self.canonicalize_spec_sig(base, sig), prop)
                             } else if let Some(ancestor_sig) =
                                 self.ancestor_spec(base, sig, &cname)
                             {
-                                format!("{}#{}::{}", cname, ancestor_sig, prop)
+                                format!("{}#{}::{}", cname, self.canonicalize_spec_sig(&cname, &ancestor_sig), prop)
                             } else {
-                                format!("{}#{}::{}", base, sig, prop)
+                                format!("{}#{}::{}", base, self.canonicalize_spec_sig(base, sig), prop)
                             }
                         }
                         _ => format!("{}::{}", cname, prop),
