@@ -1832,6 +1832,16 @@ struct ProcessContext {
     ref_binding_stack: Vec<HashMap<String, Expression>>,
     queue_frame_saves: Vec<HashMap<String, Vec<(String, Value)>>>,
     task_cleanup: Vec<TaskCleanup>,
+    // Per-call-frame map of a local dynamic-array/queue/assoc LOCAL's bare
+    // name to a process-unique storage key (e.g. `edges` -> `@edges#7`).
+    // SystemVerilog automatic locals are per-invocation: two concurrent
+    // task calls each declaring `int edges[$]` must NOT share the global
+    // `signals` keys `edges.size` / `edges[i]`. By renaming at the VarDecl
+    // and resolving the bare name through this map (see `dyn_name_lookup`
+    // + the `resolve_hier_name` early return), each invocation's data lives
+    // under a distinct key. Stack of frames pushed/popped in sync with
+    // `push_queue_frame`/`pop_and_restore_queue_frame`.
+    local_dyn: Vec<HashMap<String, String>>,
 }
 
 /// Deferred teardown for an inlined blocking task/method call: the work
@@ -2573,6 +2583,12 @@ pub struct Simulator {
     /// (re)declared, we snapshot the caller's `name.*`/`name[*]` signals into
     /// the top frame; on exit we restore them.
     queue_frame_saves: Vec<HashMap<String, Vec<(String, Value)>>>,
+    /// Per-call-frame rename map for local dynamic arrays/queues/assoc
+    /// locals (bare name -> process-unique storage key). See
+    /// `ProcessContext::local_dyn`.
+    local_dyn: Vec<HashMap<String, String>>,
+    /// Monotonic counter backing the process-unique keys in `local_dyn`.
+    next_dyn_id: u64,
     /// Built-in mailboxes (handle -> queue of values)
     mailboxes: HashMap<usize, std::collections::VecDeque<Value>>,
     /// §15.4.1 bounded-mailbox capacity (handle -> bound). Absent or 0 means
@@ -4794,6 +4810,8 @@ impl Simulator {
             var_type_args: HashMap::default(),
             var_container_types: HashMap::default(),
             var_typedef_types: HashMap::default(),
+            local_dyn: Vec::new(),
+            next_dyn_id: 0,
             string_signals: HashSet::default(),
             queue_frame_saves: Vec::new(),
             mailboxes: HashMap::default(),
@@ -19437,6 +19455,7 @@ impl Simulator {
             ref_binding_stack: self.ref_binding_stack.clone(),
             queue_frame_saves: self.queue_frame_saves.clone(),
             task_cleanup: self.task_cleanup.clone(),
+            local_dyn: self.local_dyn.clone(),
         }
     }
 
@@ -19459,6 +19478,7 @@ impl Simulator {
             ref_binding_stack: std::mem::take(&mut self.ref_binding_stack),
             queue_frame_saves: std::mem::take(&mut self.queue_frame_saves),
             task_cleanup: std::mem::take(&mut self.task_cleanup),
+            local_dyn: std::mem::take(&mut self.local_dyn),
         }
     }
 
@@ -19475,6 +19495,7 @@ impl Simulator {
         self.ref_binding_stack = ctx.ref_binding_stack;
         self.queue_frame_saves = ctx.queue_frame_saves;
         self.task_cleanup = ctx.task_cleanup;
+        self.local_dyn = ctx.local_dyn;
     }
 
     fn inherit_current_process_context(&mut self, pid: usize) {
@@ -19487,6 +19508,7 @@ impl Simulator {
             && !ctx.break_flag
             && !ctx.continue_flag
             && !ctx.return_flag
+            && ctx.local_dyn.is_empty()
         {
             self.process_contexts.remove(&pid);
         } else {
@@ -19538,7 +19560,8 @@ impl Simulator {
             && ctx.return_value.is_none()
             && !ctx.break_flag
             && !ctx.continue_flag
-            && !ctx.return_flag;
+            && !ctx.return_flag
+            && ctx.local_dyn.is_empty();
         if trivial {
             self.process_contexts.remove(&pid);
         } else {
@@ -25989,6 +26012,15 @@ impl Simulator {
             ExprKind::Ident(h) => {
                 if h.path.iter().any(|s| !s.selects.is_empty()) {
                     return None;
+                }
+                // Apply the local-dyn-array rename so callers (e.g. `%p`
+                // queue formatting, indexed writes) hit the process-unique
+                // storage key instead of the bare name. `resolve_hier_name`
+                // already does this, but `flat_member_name` bypasses it.
+                if h.path.len() == 1 {
+                    if let Some(uq) = self.dyn_name_lookup(&h.path[0].name.name) {
+                        return Some(uq.to_string());
+                    }
                 }
                 Some(
                     h.path
@@ -35562,7 +35594,27 @@ impl Simulator {
                             }
                             UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. } => {
                                 // Register as dynamic array / queue (initially empty).
-                                let name = d.name.name.clone();
+                                //
+                                // NOTE: queue/dynamic-array LOCALS do NOT yet get
+                                // the per-process unique storage key. Associative-
+                                // array locals do (see the Associative arm below),
+                                // which is what fixes the UVM time-0 stall
+                                // (`sync_phase`'s `edges_t edges`). Queue-local
+                                // isolation is correct in principle (see
+                                // /tmp/svrun/queue_leak_forkjoin.sv and
+                                // tests/concurrent_local_dyn_arrays.rs) but is
+                                // deferred: it regresses the register model
+                                // (`uvm_reg_map::do_bus_access` does
+                                // `addrs = map_info.addr`, a whole-queue copy
+                                // from a struct field, which the rename
+                                // mishandles). Re-enable by replacing `true`
+                                // with `false` below once that path is fixed.
+                                let bare = d.name.name.clone();
+                                let name = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) || true {
+                                    bare.clone()
+                                } else {
+                                    self.declare_local_dyn(&bare)
+                                };
                                 self.module.arrays.insert(name.clone(), (0, -1, w));
                                 self.module.dynamic_arrays.insert(name.clone());
                                 self.widths.insert(name.clone(), w);
@@ -35648,7 +35700,7 @@ impl Simulator {
                                                 root: None,
                                                 path: vec![crate::ast::expr::HierPathSegment {
                                                     name: crate::ast::Identifier {
-                                                        name: name.clone(),
+                                                        name: bare.clone(),
                                                         span: d.name.span,
                                                     },
                                                     selects: Vec::new(),
@@ -35678,7 +35730,12 @@ impl Simulator {
                                 // `int m[string]`). Register so indexed writes/reads
                                 // resolve to the signal-keyed assoc storage instead
                                 // of being mistaken for a scalar.
-                                let name = d.name.name.clone();
+                                let bare = d.name.name.clone();
+                                let name = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) {
+                                    bare.clone()
+                                } else {
+                                    self.declare_local_dyn(&bare)
+                                };
                                 let is_string_key = key_dt.as_ref().map_or(false, |dt| {
                                     matches!(
                                         dt.as_ref(),
@@ -39031,6 +39088,16 @@ impl Simulator {
     }
 
     fn resolve_hier_name(&self, hier: &HierarchicalIdentifier) -> String {
+        // Per-process local dynamic arrays: resolve the bare name through the
+        // current process's per-frame rename map and BYPASS the AST-node cache.
+        // The cache is shared across concurrent processes (they share AST
+        // nodes), so it must not memoize a name that differs per invocation.
+        // Single-segment only — `obj.arr`/`a.b.c` are never local-dyn.
+        if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+            if let Some(uq) = self.dyn_name_lookup(&hier.path[0].name.name) {
+                return uq.to_string();
+            }
+        }
         // Per-hier cache: first call resolves and memoizes the result on the
         // AST node; every subsequent call on the same node returns in O(1)
         // without HashMap lookups, path-join allocation, or hint bookkeeping.
@@ -44352,6 +44419,95 @@ impl Simulator {
     /// Push a fresh queue-local save frame on entry to a subroutine.
     fn push_queue_frame(&mut self) {
         self.queue_frame_saves.push(HashMap::default());
+        self.local_dyn.push(HashMap::default());
+    }
+
+    /// Look up the process-unique storage key for a local dynamic-array /
+    /// queue / associative-array local declared in the current (or an
+    /// enclosing) call frame. Returns `None` if `bare` is not a renamed
+    /// local dyn array of this process (i.e. it is a module-level array, a
+    /// class property, or not a collection at all) — in which case callers
+    /// should use `bare` as-is.
+    fn dyn_name_lookup(&self, bare: &str) -> Option<&str> {
+        // Walk frames innermost-first: a local dyn array declared in an
+        // enclosing call frame is visible in nested scopes (matches how
+        // inlined blocking calls share the caller's scope). A queue/assoc
+        // FORMAL records an identity mapping (see `bind_queue_param`) so it
+        // shadows a caller's same-named renamed local.
+        for frame in self.local_dyn.iter().rev() {
+            if let Some(uq) = frame.get(bare) {
+                return Some(uq.as_str());
+            }
+        }
+        None
+    }
+
+    /// Mint a fresh process-unique storage key for a local dyn array `bare`
+    /// and record the rename in the current call frame. Returns the key. If
+    /// no call frame is active (top-level procedural block), returns `bare`
+    /// unchanged — a single process can't collide with itself, so the legacy
+    /// global-by-bare-name behaviour is preserved there.
+    ///
+    /// If `bare` was already declared in THIS frame (a re-entering loop body
+    /// or a sibling block reusing the name), the previous key's signals are
+    /// cleaned up first so the new declaration starts empty — matching the
+    /// LRM semantics where each automatic-variable declaration gets fresh
+    /// storage. (Nested block-scope shadowing of the same name is not fully
+    /// modelled by a flat per-frame map; it is rare in practice.)
+    fn declare_local_dyn(&mut self, bare: &str) -> String {
+        // Kill-switch for debugging the per-process local-dyn-array rename.
+        if std::env::var("XEZIM_NO_DYN_RENAME").is_ok() {
+            return bare.to_string();
+        }
+        if self.local_dyn.is_empty() {
+            return bare.to_string();
+        }
+        // Clean up a prior same-frame declaration so the new one starts fresh.
+        if let Some(old) = self.local_dyn.last().and_then(|f| f.get(bare)).cloned() {
+            self.cleanup_dyn_storage(&old);
+        }
+        let id = self.next_dyn_id;
+        self.next_dyn_id += 1;
+        let key = format!("@{}#{}", bare, id);
+        self.local_dyn
+            .last_mut()
+            .unwrap()
+            .insert(bare.to_string(), key.clone());
+        key
+    }
+
+    /// Remove all runtime signal/registration bookkeeping for a renamed
+    /// local-dyn-array storage key (its `.size`, its `[i]` elements, and the
+    /// `module.*` collection registrations). Used when a declaration is
+    /// re-entered or its call frame is popped.
+    fn cleanup_dyn_storage(&mut self, key: &str) {
+        // Only clean up process-unique (@-prefixed) keys. Bare names are
+        // shared across processes in the global `module.*` tables, so
+        // removing them here would corrupt a concurrent process's queue.
+        // (Identity-mapped formals and module-level arrays are bare.)
+        if !key.starts_with('@') {
+            return;
+        }
+        let size_key = format!("{}.size", key);
+        let elem_prefix = format!("{}[", key);
+        let stale: Vec<String> = self
+            .signals
+            .keys()
+            .filter(|k| **k == size_key || k.starts_with(&elem_prefix))
+            .cloned()
+            .collect();
+        for k in stale {
+            self.signals.remove(&k);
+            self.widths.remove(&k);
+        }
+        self.module.dynamic_arrays.remove(key);
+        self.module.arrays.remove(key);
+        self.module.associative_arrays.remove(key);
+        self.module.queue_max_sizes.remove(key);
+        self.module.descending_arrays.remove(key);
+        self.signals.remove(&format!("{}.size", key));
+        self.widths.remove(key);
+        self.string_signals.remove(key);
     }
 
     /// Snapshot the caller's current queue storage for `name` (its `name.size`
@@ -44389,6 +44545,8 @@ impl Simulator {
     /// the caller's saved ones.
     fn pop_and_restore_queue_frame(&mut self) {
         let Some(frame) = self.queue_frame_saves.pop() else {
+            // queue_frame_saves and local_dyn are pushed/popped in sync; if
+            // there was no save frame there is no dyn frame either.
             return;
         };
         for (name, saved) in frame {
@@ -44405,6 +44563,14 @@ impl Simulator {
             }
             for (k, v) in saved {
                 self.signals.insert(k, v);
+            }
+        }
+        // Drop this invocation's process-unique local dyn-array storage so
+        // it doesn't leak across the whole simulation (each invocation got
+        // its own `@name#id` keys).
+        if let Some(dyn_frame) = self.local_dyn.pop() {
+            for (_bare, key) in &dyn_frame {
+                self.cleanup_dyn_storage(key);
             }
         }
     }
@@ -49966,6 +50132,16 @@ impl Simulator {
             self.set_signal_value_by_name(&format!("{}[{}]", pname, j), v);
         }
         self.set_queue_size(pname, size);
+        // Identity mapping so the formal SHADOWS any enclosing renamed local
+        // of the same name: without it `dyn_name_lookup` walks up and
+        // redirects the callee's formal `children` to the caller's renamed
+        // `@children#N`, so the body writes to the caller's storage while
+        // the writeback reads the (empty) bare formal and clobbers it.
+        // (`cleanup_dyn_storage` skips bare names, so this is never torn down
+        // here — the existing writeback/snapshot machinery owns the formal.)
+        if let Some(frame) = self.local_dyn.last_mut() {
+            frame.insert(pname.to_string(), pname.to_string());
+        }
         Some(cname)
     }
 
@@ -54955,6 +55131,11 @@ impl Simulator {
         self.module
             .associative_arrays
             .insert(param.clone(), is_string_key);
+        // Identity mapping so the formal shadows any enclosing renamed local
+        // of the same name (see `bind_queue_param`).
+        if let Some(frame) = self.local_dyn.last_mut() {
+            frame.insert(param.clone(), param.clone());
+        }
         Some((param, caller))
     }
 
@@ -57650,6 +57831,7 @@ impl Simulator {
                                 ref_binding_stack: Vec::new(),
                                 queue_frame_saves: Vec::new(),
                                 task_cleanup: Vec::new(),
+                                local_dyn: Vec::new(),
                             },
                         );
                         self.event_queue.schedule(self.time, pid, t.items.clone());
