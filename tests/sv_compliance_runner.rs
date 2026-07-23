@@ -268,6 +268,10 @@ fn test_sv_42_typeparam_default_resolution() {
 fn test_sv_43_typedef_type_id_create() {
     run_positive_compliance_test("tests_advanced", "43_typedef_type_id_create.sv");
 }
+#[test]
+fn test_sv_43_vif_writes() {
+    run_positive_compliance_test("tests_advanced", "43_vif_writes.sv");
+}
 
 #[test]
 fn test_sv_neg01_duplicate_declaration() {
