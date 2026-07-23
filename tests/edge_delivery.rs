@@ -202,7 +202,7 @@ fn signal_ping_pong_livelocks_into_attributed_stall() {
         );
     }
     assert!(
-        stderr.contains("ran 2000 times at this timestamp"),
+        stderr.contains("ran 1000 times at this timestamp"),
         "the count phrasing must carry the per-block execution count:\n{}",
         stderr
     );
@@ -227,13 +227,13 @@ endmodule
     let sim = run(SRC, &[]);
     assert_eq!(sim.time, 10, "the cascade must settle and let time advance");
     let line = find_line(&sim, "CHAIN ").expect("no CHAIN line").to_string();
-    // Each stage runs once at t=0 (xezim's init-detect fires every block
-    // once against the X->init pseudo-edge) and exactly once more for the
-    // #0-driven wave — the b and c re-triggers are the part the old
-    // coalescing dropped. Exact counts also prove no double-delivery.
+    // Declaration initialization creates NO event (§6.8 — reference-simulator
+    // verified), so each stage fires exactly once, for the #0-driven wave.
+    // The b and c re-triggers are the part the old coalescing dropped;
+    // exact counts also prove no double-delivery and no phantom t0 fire.
     assert_eq!(
         line.trim(),
-        "CHAIN na=2 nb=2 nc=2 c=1",
+        "CHAIN na=1 nb=1 nc=1 c=1",
         "every stage of the cascade must re-trigger exactly once per change"
     );
 }
@@ -325,7 +325,7 @@ fn nba_feedback_loop_is_reported_not_dropped() {
     let sv = dir.join("nba_loop.sv");
     std::fs::write(
         &sv,
-        "module pll_cell(); reg fb = 0; always @(fb) fb <= ~fb; endmodule\n\
+        "module pll_cell(); reg fb = 0; always @(fb) fb <= ~fb; initial #1 fb = 1; endmodule\n\
          module tb; pll_cell u_pll(); initial #100 $finish; endmodule\n",
     )
     .unwrap();
