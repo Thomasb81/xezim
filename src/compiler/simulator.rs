@@ -2437,6 +2437,12 @@ pub struct Simulator {
     /// non-null but `vif.member`/edge-waits don't resolve). Entries are
     /// (scope_glob, field, iface_name); get matches scope via UVM glob rules.
     vif_config_db: Vec<(String, String, String)>,
+    /// Reverse map from the sentinel hash value stored in a local virtual-
+    /// interface variable (by `pure_vif_config_db` GET) back to the bound
+    /// interface-instance name.  This lets `resolve_vif_rhs_name` propagate
+    /// the binding when the local var is later assigned to a class property
+    /// (`wr.vif = v`), without needing a class handle for the key.
+    vif_hash_to_iface: HashMap<u64, String>,
     /// UVM uvm_config_db scope-aware store (in addition to the flat
     /// `__uvm_cfgdb__` signal keys, kept as a fallback). Each set records the
     /// fully-resolved scope pattern `<cntxt.get_full_name()>.<inst_name>`, the
@@ -4791,6 +4797,7 @@ impl Simulator {
             heap: vec![None], // index 0 is null
             virtual_iface_bindings: HashMap::default(),
             vif_config_db: Vec::new(),
+            vif_hash_to_iface: HashMap::default(),
             cfgdb_scoped: Vec::new(),
             uvm_obj_count: 0,
             uvm_obj_raised: false,
@@ -22460,6 +22467,59 @@ impl Simulator {
                 }
                 None
             }
+            // LRM §25.8 — NBA write through a virtual-interface property:
+            // `vif.member <= val` where `vif` is a class property declared
+            // `virtual <iface_t>`. The NBA slow path (`nba_queue`) commits
+            // via `assign_value` AFTER the process context is restored to the
+            // event-loop caller, so `this_stack` is empty at apply time and
+            // the binding lookup in `assign_value` always misses.
+            //
+            // Fix: resolve the binding NOW, while `this_stack` is still valid
+            // (we are inside the process that owns the vif property). Convert
+            // to a fast-path signal ID so the NBA commits to the right signal
+            // without needing `this_stack` at apply time.
+            ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        let prop = hier.path[0].name.name.as_str();
+                        // Check `local_iface_aliases` first (task formal arg vif).
+                        if let Some(frame) = self.local_iface_aliases.last() {
+                            if let Some(bound) = frame.get(prop).cloned() {
+                                let target = format!("{}.{}", bound, member.name);
+                                if let Some(&id) = self.signal_name_to_id.get(target.as_str()) {
+                                    return Some(id);
+                                }
+                            }
+                        }
+                        // Check `virtual_iface_bindings` via `this_stack`.
+                        if let Some(Some(this_h)) = self.this_stack.last().copied() {
+                            let cls_name = self
+                                .heap
+                                .get(this_h)
+                                .and_then(|o| o.as_ref())
+                                .map(|i| i.class_name.clone());
+                            let is_vif = cls_name
+                                .as_ref()
+                                .and_then(|cn| self.module.classes.get(cn))
+                                .map(|cd| cd.virtual_iface_properties.contains_key(prop))
+                                .unwrap_or(false);
+                            if is_vif {
+                                let bound = self
+                                    .virtual_iface_bindings
+                                    .get(&(this_h, prop.to_string()))
+                                    .map(|(n, _)| n.clone());
+                                if let Some(bound_name) = bound {
+                                    let target = format!("{}.{}", bound_name, member.name);
+                                    if let Some(&id) = self.signal_name_to_id.get(target.as_str()) {
+                                        return Some(id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -27029,6 +27089,50 @@ impl Simulator {
                                         self.set_signal_value_by_name(&base, nv);
                                     }
                                     return changed;
+                                }
+                            }
+                        }
+                    }
+                }
+                // LRM §25.8 — `vif.member[i] = ...` (bit-select write
+                // through a virtual-interface property). The lvalue parses as
+                // Index { expr: MemberAccess { Ident(vif_prop), signal_member },
+                //          index }.  The scalar-write path (ExprKind::MemberAccess
+                // arm below) handles `vif.member = ...` but misses the indexed
+                // form, causing all bit-select writes to vif-bound signals to be
+                // silently lost.  Detect and redirect here before the generic
+                // flat-name path, which has no knowledge of vif bindings.
+                if let ExprKind::MemberAccess { expr: ma_base, member: ma_member } = &expr.kind {
+                    if let ExprKind::Ident(ma_hier) = &ma_base.kind {
+                        if ma_hier.path.len() == 1 {
+                            let vif_prop = ma_hier.path[0].name.name.as_str();
+                            let sig_member = ma_member.name.as_str();
+                            // Resolve virtual-interface binding (same lookup as
+                            // the scalar MemberAccess arm below ~line 20401).
+                            let binding = self.this_stack.last().copied().flatten().and_then(|this_h| {
+                                let cls_name = self.heap.get(this_h)
+                                    .and_then(|o| o.as_ref())
+                                    .map(|i| i.class_name.clone())?;
+                                self.module.classes.get(&cls_name)
+                                    .and_then(|cd| cd.virtual_iface_properties.get(vif_prop).map(|_| ()))
+                                    .and(self.virtual_iface_bindings.get(&(this_h, vif_prop.to_string())).cloned())
+                            });
+                            if let Some((bound_name, _modport)) = binding {
+                                let target = format!("{}.{}", bound_name, sig_member);
+                                let idx = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
+                                if let Some(prev) = self.get_signal_value_by_name(&target) {
+                                    let w = prev.width as usize;
+                                    if idx < w {
+                                        let nb = val.get_bit(0);
+                                        let old = prev.get_bit(idx);
+                                        let changed = old != nb;
+                                        if changed {
+                                            let mut nv = prev.clone();
+                                            nv.set_bit(idx, nb);
+                                            self.set_signal_value_by_name(&target, nv);
+                                        }
+                                        return changed;
+                                    }
                                 }
                             }
                         }
@@ -45040,13 +45144,27 @@ impl Simulator {
                         // `vif.member` resolves and `@(posedge vif.clk)` events
                         // sensitize on the real interface signal.
                         if let Some(iname) = scoped_vif {
+                            // Determine (handle, prop) for the destination so we can
+                            // record a virtual_iface_bindings entry — the same logic
+                            // used by the pure_vif_config_db path.
                             let hp: Option<(usize, String)> = match &dst.kind {
-                                ExprKind::Ident(h) if h.path.len() == 1 => self
-                                    .this_stack
-                                    .last()
-                                    .copied()
-                                    .flatten()
-                                    .map(|hh| (hh, h.path[0].name.name.clone())),
+                                ExprKind::Ident(h) if h.path.len() == 1 => {
+                                    // Single-segment: could be `this.prop` (when inside a
+                                    // class method) or a plain local/module variable.
+                                    let prop = h.path[0].name.name.clone();
+                                    let th = self.this_stack.last().copied().flatten();
+                                    if let Some(hh) = th {
+                                        Some((hh, prop))
+                                    } else {
+                                        // No class context — record by variable name so that
+                                        // a later `obj.vif = local_var` can propagate.
+                                        self.signals.insert(
+                                            format!("__vif_local__{}", prop),
+                                            Value::from_string(&iname),
+                                        );
+                                        None
+                                    }
+                                }
                                 ExprKind::Ident(h) if h.path.len() == 2 => self
                                     .eval_ident_handle(&h.path[0].name.name)
                                     .map(|hh| (hh, h.path[1].name.name.clone())),
@@ -51771,7 +51889,12 @@ impl Simulator {
                 h ^= b as u64;
                 h = h.wrapping_mul(0x100000001b3);
             }
-            self.assign_value(&args[3], &Value::from_u64((h & 0x7FFF_FFFF) | 1, 32));
+            let sentinel: u64 = (h & 0x7FFF_FFFF) | 1;
+            // Record hash→iface so resolve_vif_rhs_name can propagate the
+            // binding when a local var holding this sentinel is later assigned
+            // to a class property (`wr.vif = v`).
+            self.vif_hash_to_iface.insert(sentinel, iface.clone());
+            self.assign_value(&args[3], &Value::from_u64(sentinel, 32));
             Some(Value::from_u64(1, 32))
         }
     }
@@ -51785,6 +51908,17 @@ impl Simulator {
                 if let Some(th) = self.this_stack.last().copied().flatten() {
                     if let Some((b, _)) = self.virtual_iface_bindings.get(&(th, raw.clone())) {
                         return Some(b.clone());
+                    }
+                }
+                // Check for a recorded local/module-level vif binding: when
+                // config_db GET lands into a variable with no class context, we
+                // record the interface name in signals["__vif_local__<var>"] so a
+                // later `obj.vif_prop = local_var` can propagate the binding.
+                let local_key = format!("__vif_local__{}", raw);
+                if let Some(iface_val) = self.signals.get(&local_key) {
+                    let s = iface_val.to_sv_string();
+                    if !s.is_empty() {
+                        return Some(s);
                     }
                 }
                 if let Some(b) = self.iface_alias_for(&raw) {
