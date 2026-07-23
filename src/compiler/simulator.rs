@@ -55323,6 +55323,28 @@ impl Simulator {
                             return self.exec_cg_method_call(handle, method_name, args);
                         }
                         if handle < self.heap.len() && self.heap[handle].is_some() {
+                            // TLM intercept: statement-level obj.connect()/write()
+                            // flattens to Ident([obj, method]) and never reaches the
+                            // MemberAccess intercept above — mirror it here.
+                            if real_uvm {
+                                if method_name == "connect" {
+                                    let tgt = args
+                                        .first()
+                                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as usize)
+                                        .unwrap_or(0);
+                                    if tgt != 0 {
+                                        self.tlm_connections
+                                            .entry(handle)
+                                            .or_default()
+                                            .push(tgt);
+                                    }
+                                    // fall through to execute the real connect() body
+                                } else if matches!(method_name.as_str(), "write" | "put") {
+                                    if self.tlm_deliver(handle, method_name, args) {
+                                        return Value::zero(32);
+                                    }
+                                }
+                            }
                             return self.exec_method_call(handle, method_name, args);
                         }
                     }
@@ -58773,12 +58795,22 @@ impl Simulator {
             _ => return false,
         };
         for tgt in targets {
-            // A connected target is typically a uvm_*_imp/export that forwards
-            // the call to the actual implementer it wraps (its `m_imp`: the
-            // subscriber, the fifo, ...). Deliver straight to that implementer —
-            // the imp's own forwarding `task put`/`function write` carries a
-            // "port not bound" guard keyed on m_imp_list (which the route-B
-            // phaser doesn't populate), so calling the imp directly would stall.
+            // An analysis `write` must run the connected imp's OWN write method,
+            // because `uvm_analysis_imp_decl(SFX)` generates an imp whose write
+            // forwards to `m_imp.write``SFX` (e.g. `write_in`) — NOT the plain
+            // `write`. Shortcutting to the implementer and calling `write`
+            // directly (as the pull path does) silently no-ops for those
+            // suffixed subscribers. The generated analysis-imp write carries no
+            // "port not bound" guard, so invoking it directly is safe; its body
+            // dispatches to the correct suffixed method on the implementer.
+            if mname == "write" {
+                self.exec_method_call(tgt, mname, args);
+                continue;
+            }
+            // Pull/blocking traffic (`put`/`get`): the imp's own forwarding
+            // carries a "port not bound" guard keyed on m_imp_list (which the
+            // route-B phaser doesn't populate), so calling the imp directly
+            // would stall — deliver straight to the implementer it wraps.
             let implementer = self
                 .heap
                 .get(tgt)

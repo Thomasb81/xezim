@@ -47,6 +47,44 @@ package uvm_pkg;
     endfunction
   endclass
 
+  // Needed so uses_real_uvm() returns true when PURE_SV_LRM=0.
+  class uvm_objection;
+  endclass
+
+  // TLM analysis port: connect() and write() are intercepted by xezim's
+  // tlm_deliver shim when uses_real_uvm() is true (PURE_SV_LRM=0).
+  class uvm_analysis_port #(type T = int);
+    string name;
+    function new(string n, uvm_component parent = null); name = n; endfunction
+    function void connect(/* imp */ imp); endfunction
+    function void write(T t); endfunction
+  endclass
+
+  // Plain analysis imp (no suffix): write() forwards to m_imp.write().
+  class uvm_analysis_imp #(type T = int, type IMP = int);
+    string name;
+    IMP m_imp;
+    function new(string n, IMP imp); name = n; m_imp = imp; endfunction
+    function void write(T t); m_imp.write(t); endfunction
+  endclass
+
+  // uvm_analysis_imp_decl(_in) / (_out): write() dispatches to the suffixed
+  // method on the subscriber so xezim's tlm_deliver can call imp.write()
+  // and still reach write_in() / write_out() on the implementer.
+  class uvm_analysis_imp_in #(type T = int, type IMP = int);
+    string name;
+    IMP m_imp;
+    function new(string n, IMP imp); name = n; m_imp = imp; endfunction
+    function void write(T t); m_imp.write_in(t); endfunction
+  endclass
+
+  class uvm_analysis_imp_out #(type T = int, type IMP = int);
+    string name;
+    IMP m_imp;
+    function new(string n, IMP imp); name = n; m_imp = imp; endfunction
+    function void write(T t); m_imp.write_out(t); endfunction
+  endclass
+
   class uvm_root extends uvm_component;
     uvm_component test_inst;
 
