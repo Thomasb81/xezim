@@ -97,8 +97,11 @@ module top;
     end
 
     // Check the %d conversion.
+    // (Zero-fill expectations updated to reference-simulator behavior: a
+    // leading zero in a %d width is part of the WIDTH; decimals space-pad.
+    // The %+08d C-style sign+zero-fill form is kept as an extension.)
     dval = 123;
-    cmp = "00000123";
+    cmp = "     123";
     $sformat(str, "%08d", dval);
     if (str != cmp) begin
       $display("FAILED: %%08d, expected %0s, got %0s", cmp, str);
@@ -134,13 +137,14 @@ module top;
     end
 
     dval = -123;
-    cmp = "-0000123";
+    cmp = "    -123";
     $sformat(str, "%08d", dval);
     if (str != cmp) begin
       $display("FAILED: %%08d, expected %0s, got %0s", cmp, str);
       pass = 1'b0;
     end
 
+    cmp = "-0000123";
     $sformat(str, "%+08d", dval);
     if (str != cmp) begin
       $display("FAILED: %%+08d, expected %0s, got %0s", cmp, str);

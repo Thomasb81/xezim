@@ -9,7 +9,12 @@ module tb;
       nb <= 8'hAA;
       `CK("nba not yet visible", nb == 8'h00)
       #0;
-      `CK("nba visible after region", nb == 8'hAA)
+      // §4.5: the inactive region (#0) activates BEFORE the NBA region —
+      // the resumed read still sees the old value (reference-simulator
+      // verified; a differing commercial camp applies NBAs first).
+      `CK("nba not visible in inactive region", nb == 8'h00)
+      #1;
+      `CK("nba visible after the time step", nb == 8'hAA)
     end
     begin // 10.9 assignment patterns
       int a[4]; int m[string]; int q[$];

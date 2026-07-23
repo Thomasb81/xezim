@@ -3572,6 +3572,31 @@ pub struct Simulator {
     next_file_handle: i32,
     /// Best-effort hierarchical context for resolving ambiguous leaf identifiers.
     name_resolve_hint: RefCell<Option<String>>,
+    /// §16.9.3 sampled-value function watches: per call site, a history of
+    /// the operand sampled (preponed) at each matching clock edge. hist[0]
+    /// is the sample at the most recent edge, hist[1] one edge earlier, …
+    sampled_watches: Vec<SampledWatch>,
+    /// §9.2.2.2 timing: `-> ev` fired from a comb block during the PRE-process
+    /// time-0 settle (compile) happens before any `always @(ev)` process has
+    /// registered its waiter — the trigger would be lost. Queue them and
+    /// re-fire at the end of the time-0 active region.
+    pending_t0_triggers: Vec<String>,
+    /// True while the compile-time (pre-process) time-0 settle runs.
+    in_pre_process_settle: bool,
+    /// Call-site (expression span start) → index into `sampled_watches`.
+    sampled_watch_site: HashMap<usize, usize>,
+}
+
+/// One `$rose/$fell/$stable/$changed/$past(x, @(edge clk))` call site.
+struct SampledWatch {
+    clk_id: usize,
+    edge: EdgeKind,
+    /// Simple-signal operand: sampled PREPONED via the prev-value snapshot.
+    sig_id: Option<usize>,
+    /// General operand fallback: evaluated at edge time (post-slot values).
+    expr: Expression,
+    hist: std::collections::VecDeque<Value>,
+    depth: usize,
 }
 
 /// Empty static used as fallback name for unnamed array-element ids
@@ -5154,6 +5179,10 @@ impl Simulator {
             current_static_task: None,
             next_file_handle: 3,
             name_resolve_hint: RefCell::new(None),
+            sampled_watches: Vec::new(),
+            sampled_watch_site: HashMap::default(),
+            pending_t0_triggers: Vec::new(),
+            in_pre_process_settle: false,
         };
         let total_ms = phase_total.elapsed().as_secs_f64() * 1000.0;
         if total_ms > 100.0 {
@@ -8428,7 +8457,16 @@ impl Simulator {
         let ca_count_before = self.prof_settle_ca_count;
         let ab_ns_before = self.prof_settle_ab_ns;
         let ab_count_before = self.prof_settle_ab_count;
+        self.in_pre_process_settle = true;
         self.settle_combinatorial();
+        self.in_pre_process_settle = false;
+        // Baseline edge snapshot: prev values = the SETTLED initial state
+        // (x for uninitialized regs, z for undriven nets). Without this the
+        // first check_edges compared against zero-initialized prev arrays and
+        // delivered phantom 0->x/0->z "edges" at time 0 — an `always @(y)`
+        // whose y never changed fired once with y=x/z (a reference simulator
+        // stays parked until a REAL change).
+        self.snapshot_edge_signals();
         mark_compile_phase("time-0 settle", &mut compile_phase_start);
         let dt = t_settle0.elapsed();
         if dt.as_millis() > 100 {
@@ -8463,6 +8501,10 @@ impl Simulator {
         // #7 lazy-prefix path: also drain `pending_initial` one-at-a-time.
         // A pending block is materialized just before scheduling and dropped
         // after, so peak memory is at most one materialized InitialBlock.
+        // §16.9.3: pre-register sampled-value watches BEFORE the initial
+        // blocks are consumed into scheduled processes, so clock-edge
+        // history accumulates from the first edge.
+        self.register_sampled_watches();
         let pending_initial = std::mem::take(&mut self.module.pending_initial);
         let initial_blocks = std::mem::take(&mut self.module.initial_blocks);
         // Static/package-global initializers must run before any `initial`
@@ -17409,14 +17451,15 @@ impl Simulator {
     /// promoted continuations observe post-NBA values — matching the
     /// commercial consensus (VCS / Riviera): an NBA posted before
     /// a `#0` is visible after it in the same time slot.
-    fn promote_inactive_to_active(&mut self) {
+    fn promote_inactive_to_active(&mut self) -> bool {
         if self.inactive_queue.is_empty() {
-            return;
+            return false;
         }
         let moved = std::mem::take(&mut self.inactive_queue);
         for (pid, cont) in moved {
             self.event_queue.schedule(self.time, pid, cont);
         }
+        true
     }
 
     /// Drain pending NBAs and repeatedly snapshot → apply_nba → settle →
@@ -18206,34 +18249,70 @@ impl Simulator {
                 batch.len()
             );
         }
-        while !batch.is_empty() {
-            if self.finished || self.zero_delay_defer_pending {
-                break;
-            }
-            let (pid, stmts) = batch.remove(0);
-            let t_now = self.time;
-            for (p, s) in batch.drain(..) {
-                self.event_queue.schedule(t_now, p, s);
-            }
-            if trace_loop {
-                eprintln!("[xezim]   running pid={} stmts={}", pid, stmts.len());
-                for (idx, s) in stmts.iter().enumerate() {
-                    eprintln!(
-                        "[xezim]     stmt[{}]: {:?}",
-                        idx,
-                        std::mem::discriminant(&s.kind)
-                    );
+        loop {
+            while !batch.is_empty() {
+                if self.finished || self.zero_delay_defer_pending {
+                    break;
+                }
+                let (pid, stmts) = batch.remove(0);
+                let t_now = self.time;
+                for (p, s) in batch.drain(..) {
+                    self.event_queue.schedule(t_now, p, s);
+                }
+                if trace_loop {
+                    eprintln!("[xezim]   running pid={} stmts={}", pid, stmts.len());
+                    for (idx, s) in stmts.iter().enumerate() {
+                        eprintln!(
+                            "[xezim]     stmt[{}]: {:?}",
+                            idx,
+                            std::mem::discriminant(&s.kind)
+                        );
+                    }
+                }
+                self.run_scheduled_process(pid, &stmts);
+                if !self.is_pid_suspended(pid) {
+                    self.child_finished(pid);
+                }
+                if self.event_queue.next_time() == Some(self.time) {
+                    batch = self.event_queue.remove(self.time);
+                } else {
+                    batch.clear();
                 }
             }
-            self.run_scheduled_process(pid, &stmts);
-            if !self.is_pid_suspended(pid) {
-                self.child_finished(pid);
+            if self.finished || self.zero_delay_defer_pending {
+                // A defer-requested break can leave not-yet-run activations in
+                // the local batch — requeue them (dropping them would silently
+                // KILL those processes; the deferred spinner would vanish and
+                // the outer loop would "advance on its own" past the livelock
+                // without ever reporting or re-arming it).
+                for (p, c) in batch.drain(..) {
+                    let t_now = self.time;
+                    self.event_queue.schedule(t_now, p, c);
+                }
+                break;
             }
-            if self.event_queue.next_time() == Some(self.time) {
+            // IEEE 1800-2017 §4.5: once the ACTIVE region empties, the
+            // INACTIVE region (`#0` continuations) activates and runs BEFORE
+            // the NBA region — a `#0`-resumed read must see pre-NBA values
+            // (reference-simulator verified; the previous NBA-first order
+            // followed a differing commercial camp).
+            if self.promote_inactive_to_active()
+                && self.event_queue.next_time() == Some(self.time)
+            {
+                // Cont-assign propagation and edge-sensitive blocks are
+                // ACTIVE-region work (§4.4.2): complete them so the resumed
+                // `#0` observes settled combinational state (a $deposit
+                // through a port, a blocking write's fanout). NO NBA flush
+                // here (drain_edge_cascade would apply_nba) — the NBA region
+                // stays strictly after the inactive region (§4.5).
+                if self.dirty_any {
+                    self.settle_combinatorial();
+                }
+                self.check_edges();
                 batch = self.event_queue.remove(self.time);
-            } else {
-                batch.clear();
+                continue;
             }
+            break;
         }
         if let Some(t) = _t {
             accum.t_process += t.elapsed().as_nanos() as u64;
@@ -18255,9 +18334,22 @@ impl Simulator {
             }
             self.comb_time0_deferred = deferred;
         }
+        // Deliver `-> ev` triggers that fired during the pre-process settle
+        // now that every process has started and parked its waiters.
+        if self.time == 0 && !self.pending_t0_triggers.is_empty() {
+            let evs = std::mem::take(&mut self.pending_t0_triggers);
+            for ev in evs {
+                self.fire_named_event(&ev);
+            }
+        }
 
         let _t = profile_timing.then(std::time::Instant::now);
-        if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
+        if !self.nba_fast.is_empty()
+            || !self.nba_queue.is_empty()
+            // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
+            // region even when no NBA DATA is queued.
+            || !self.pending_nba_triggers.is_empty()
+        {
             self.apply_nba();
             if self.nba_touched_edge_non_clock {
                 non_clock_change = true;
@@ -18353,7 +18445,12 @@ impl Simulator {
                     batch.clear();
                 }
             }
-            if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
+            if !self.nba_fast.is_empty()
+            || !self.nba_queue.is_empty()
+            // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
+            // region even when no NBA DATA is queued.
+            || !self.pending_nba_triggers.is_empty()
+        {
                 self.apply_nba();
             }
             if self.dirty_any {
@@ -18366,14 +18463,10 @@ impl Simulator {
             }
         }
 
-        // Inactive → Active promotion (IEEE 1800-2017 §4.4.2.3): `#0`
-        // continuations parked during this tick resume in the NEXT tick at
-        // the SAME time — the outer event_loop sees event_queue.next_time()
-        // == self.time and re-enters run_one_tick without advancing time.
-        // Because this runs after this tick's apply_nba / settle /
-        // check_edges, the promoted continuations observe post-NBA values,
-        // matching the commercial consensus (VCS/Riviera print `aa`
-        // for `nb <= 8'hAA; #0; $display(nb)`).
+        // `#0` continuations parked during the POST-active stages of this
+        // tick (edge cascades, reactive work) resume in the next same-time
+        // delta: promote so the outer event_loop re-enters run_one_tick,
+        // where they run at the top — BEFORE that delta's NBA region (§4.5).
         self.promote_inactive_to_active();
 
         self.loop_iters += 1;
@@ -19846,9 +19939,6 @@ impl Simulator {
         let saved_return = self.return_flag;
         // §4.4.2.3: `#0` continuations parked by earlier same-batch
         // processes must resume in THIS time slot, not drift to a later nt.
-        // Our caller (the synchronous Delay handler in exec_statement) has
-        // already run apply_nba for the current pass, so promoting here
-        // preserves the NBA-before-#0-continuation ordering.
         self.promote_inactive_to_active();
         loop {
             // Advance to the EARLIEST of: event_queue, clock_generators,
@@ -19897,7 +19987,24 @@ impl Simulator {
                     self.child_finished(pid);
                 }
             }
-            if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
+            // §4.5: `#0` continuations parked by the processes above activate
+            // and run BEFORE this slot's NBA region — loop again at the same
+            // time without applying NBAs yet. Settle first so they observe
+            // completed active-region (cont-assign) state.
+            if self.promote_inactive_to_active()
+                && self.event_queue.next_time() == Some(self.time)
+            {
+                if self.dirty_any {
+                    self.settle_combinatorial();
+                }
+                continue;
+            }
+            if !self.nba_fast.is_empty()
+            || !self.nba_queue.is_empty()
+            // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
+            // region even when no NBA DATA is queued.
+            || !self.pending_nba_triggers.is_empty()
+        {
                 self.apply_nba();
             }
             if self.dirty_any {
@@ -20110,12 +20217,15 @@ impl Simulator {
         // again before asking the outer loop to seek a future event.
         if self.stall_limit > 0 {
             let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            *hits += 1;
-            if *hits > self.stall_limit {
+            // Check BEFORE counting: the activation that trips the guard is
+            // re-parked UNEXECUTED, so it must not inflate the "ran N times"
+            // attribution in the stall report.
+            if *hits >= self.stall_limit {
                 self.event_queue.schedule(self.time, pid, Vec::new());
                 self.zero_delay_defer_pending = true;
                 return;
             }
+            *hits += 1;
         }
 
         // Temporarily own the entry so evaluation and assignment can mutably
@@ -20393,7 +20503,6 @@ impl Simulator {
         };
         if self.stall_limit > 0 {
             let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            *hits += 1;
             // One process re-activated this many times at a SINGLE timestamp is
             // not a busy design, it is a livelock: it keeps re-arming itself and
             // time can never advance. (Counting per-process, rather than
@@ -20402,7 +20511,9 @@ impl Simulator {
             // processes at time 0.) run_one_tick's inner drain loop re-reads the
             // queue at the current time, so a self-rescheduling process never
             // reaches the outer event loop — the check has to live here.
-            if *hits > self.stall_limit {
+            // Check BEFORE counting: the activation that trips the guard is
+            // re-parked UNEXECUTED and must not inflate "ran N times".
+            if *hits >= self.stall_limit {
                 // A single process re-arming this many times at one timestamp is
                 // a zero-delay livelock (e.g. `always #(period) clk=~clk` whose
                 // real `period` momentarily glitched to 0). Rather than abort the
@@ -20416,6 +20527,7 @@ impl Simulator {
                 self.zero_delay_defer_pending = true;
                 return;
             }
+            *hits += 1;
         }
         sim_dbg_eprintln!(
             "[DEBUG] running process {} ({} stmts) at time {}",
@@ -22838,7 +22950,11 @@ impl Simulator {
         let mut i = 0;
         while i < self.delayed_updates.len() {
             if self.delayed_updates[i].0 <= self.time {
-                let (_, id, val) = self.delayed_updates.swap_remove(i);
+                let (_, id, mut val) = self.delayed_updates.swap_remove(i);
+                // The committed value carries the TARGET's signedness — a
+                // delayed NBA of a signed 32-bit literal into a plain
+                // `reg [3:0]` must not read back signed (-7 for 4'b1001).
+                val.is_signed = self.signal_signed[id];
                 if self.signal_table[id] != val {
                     write_sig!(self, id, val);
                     self.mark_dirty_id(id);
@@ -23325,9 +23441,256 @@ impl Simulator {
         triggered_conts
     }
 
+    /// §16.9.3 sampled-value function with an EXPLICIT clocking argument
+    /// (`$rose(x, @(posedge clk))`) or, in a procedural context, the
+    /// module's `default clocking`. Returns `(sample_at_latest_edge,
+    /// sample_n_edges_back)`; None -> caller uses its legacy (inferred/SVA)
+    /// path.
+    fn sampled_fn_via_watch(
+        &mut self,
+        expr: &Expression,
+        args: &[Expression],
+        n: usize,
+    ) -> Option<(Value, Option<Value>)> {
+        // Explicit `@(...)` argument anywhere in the arg list.
+        let mut edge_code: Option<u8> = None;
+        let mut clk_id: Option<usize> = None;
+        for a in args.iter().skip(1) {
+            if let Some((ec, clk)) = Self::clocking_arg_marker(a) {
+                edge_code = Some(ec);
+                clk_id = self.get_lhs_signal_id(clk);
+                break;
+            }
+        }
+        if edge_code.is_none() {
+            // Procedural context + default clocking: infer from it.
+            if self.active_sva_site.is_some() {
+                return None;
+            }
+            let (clk_str, _) = self.clocking_meta.get("__xz_default_clocking")?.clone();
+            // clocking_meta stores the bare clock SIGNAL name (the parser
+            // drops the event's edge); default clocking events are
+            // overwhelmingly posedge — same assumption the `##N` cycle-delay
+            // machinery makes.
+            edge_code = Some(1);
+            clk_id = self.signal_name_to_id.get(clk_str.trim()).copied();
+        }
+        let clk_id = clk_id?;
+        let operand = args.first()?.clone();
+        let site = expr.span.start;
+        let widx = self.sampled_watch_for(site, &operand, edge_code.unwrap_or(0), clk_id, n)?;
+        let w = &self.sampled_watches[widx];
+        let cur = match w.hist.front() {
+            Some(v) => v.clone(),
+            None => {
+                let op = operand.clone();
+                self.eval_expr(&op)
+            }
+        };
+        let past = self.sampled_watches[widx].hist.get(n).cloned();
+        Some((cur, past))
+    }
+
+    /// Pre-register sampled-value watches for every `$rose/$fell/$stable/
+    /// $changed/$past` call in procedural code, so their clock-edge history
+    /// accumulates from time 0 (lazy registration at first eval would miss
+    /// every earlier edge).
+    fn register_sampled_watches(&mut self) {
+        if self.clocking_meta.is_empty() {
+            // Explicit @(...) args can still appear; scan anyway.
+        }
+        let mut stmts: Vec<Statement> = Vec::new();
+        for ib in &self.module.initial_blocks {
+            stmts.push(ib.stmt.clone());
+        }
+        for ab in &self.module.always_blocks {
+            stmts.push(ab.stmt.clone());
+        }
+        for st in stmts {
+            self.scan_sampled_stmt(&st);
+        }
+    }
+
+    fn scan_sampled_stmt(&mut self, st: &Statement) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    self.scan_sampled_stmt(s);
+                }
+            }
+            SK::If { condition, then_stmt, else_stmt, .. } => {
+                self.scan_sampled_expr(condition);
+                self.scan_sampled_stmt(then_stmt);
+                if let Some(e) = else_stmt {
+                    self.scan_sampled_stmt(e);
+                }
+            }
+            SK::TimingControl { stmt, .. } => self.scan_sampled_stmt(stmt),
+            SK::For { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body }
+            | SK::Foreach { body, .. } => self.scan_sampled_stmt(body),
+            SK::Case { expr, items, .. } => {
+                self.scan_sampled_expr(expr);
+                for it in items {
+                    self.scan_sampled_stmt(&it.stmt);
+                }
+            }
+            SK::BlockingAssign { rvalue, .. } => self.scan_sampled_expr(rvalue),
+            SK::NonblockingAssign { rvalue, .. } => self.scan_sampled_expr(rvalue),
+            SK::Expr(e) => self.scan_sampled_expr(e),
+            _ => {}
+        }
+    }
+
+    fn scan_sampled_expr(&mut self, e: &Expression) {
+        match &e.kind {
+            ExprKind::SystemCall { name, args }
+                if matches!(
+                    name.as_str(),
+                    "$rose" | "$fell" | "$stable" | "$changed" | "$past"
+                ) =>
+            {
+                // Registration mirrors the eval-time dispatcher; ignore
+                // failures (no clock resolvable) — eval falls back.
+                let ex = e.clone();
+                let ar = args.clone();
+                let _ = self.sampled_fn_via_watch(&ex, &ar, 1);
+            }
+            ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.scan_sampled_expr(a);
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.scan_sampled_expr(left);
+                self.scan_sampled_expr(right);
+            }
+            ExprKind::Unary { operand, .. } => self.scan_sampled_expr(operand),
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                self.scan_sampled_expr(condition);
+                self.scan_sampled_expr(then_expr);
+                self.scan_sampled_expr(else_expr);
+            }
+            ExprKind::Concatenation(items) => {
+                for i in items {
+                    self.scan_sampled_expr(i);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                self.scan_sampled_expr(expr);
+                self.scan_sampled_expr(index);
+            }
+            _ => {}
+        }
+    }
+
+    /// `$__xz_clocking_arg(edge_code, clk)` marker from the parser (the
+    /// explicit clocking argument of a §16.9.3 sampled-value function).
+    fn clocking_arg_marker(e: &Expression) -> Option<(u8, &Expression)> {
+        if let ExprKind::SystemCall { name, args } = &e.kind {
+            if name == "$__xz_clocking_arg" && args.len() == 2 {
+                if let ExprKind::Number(NumberLiteral::Integer { value, .. }) = &args[0].kind {
+                    return Some((value.parse().unwrap_or(0), &args[1]));
+                }
+            }
+        }
+        None
+    }
+
+    /// Reconstruct a signal's PREPONED (slot-entry) value from the edge
+    /// snapshot arrays.
+    fn preponed_value_of(&self, id: usize) -> Value {
+        if let Some(w) = self.prev_wide.get(&id) {
+            return w.clone();
+        }
+        let width = self.signal_widths.get(id).copied().unwrap_or(1).min(64);
+        Value::from_inline(self.prev_val[id], self.prev_xz[id], width)
+    }
+
+    /// Get-or-create the sampled watch for a call site. Registers the clock
+    /// (and a simple-signal operand) into `edge_signal_ids` so the snapshot
+    /// pass keeps their preponed values fresh.
+    fn sampled_watch_for(
+        &mut self,
+        site: usize,
+        operand: &Expression,
+        edge_code: u8,
+        clk_id: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        if let Some(&i) = self.sampled_watch_site.get(&site) {
+            if depth + 1 > self.sampled_watches[i].depth {
+                self.sampled_watches[i].depth = depth + 1;
+            }
+            return Some(i);
+        }
+        let edge = match edge_code {
+            1 => EdgeKind::Posedge,
+            2 => EdgeKind::Negedge,
+            _ => EdgeKind::AnyEdge,
+        };
+        let sig_id = self.get_lhs_signal_id(operand);
+        if !self.edge_signal_ids.contains(&clk_id) {
+            self.edge_signal_ids.push(clk_id);
+        }
+        if let Some(sid) = sig_id {
+            if !self.edge_signal_ids.contains(&sid) {
+                self.edge_signal_ids.push(sid);
+            }
+        }
+        let i = self.sampled_watches.len();
+        self.sampled_watches.push(SampledWatch {
+            clk_id,
+            edge,
+            sig_id,
+            expr: operand.clone(),
+            hist: std::collections::VecDeque::new(),
+            depth: depth + 1,
+        });
+        self.sampled_watch_site.insert(site, i);
+        Some(i)
+    }
+
+    /// Advance each sampled watch whose clock edged this delta: push the
+    /// PREPONED sample of the operand onto its history.
+    fn tick_sampled_watches(&mut self) {
+        for i in 0..self.sampled_watches.len() {
+            let (clk_id, edge) = {
+                let w = &self.sampled_watches[i];
+                (w.clk_id, w.edge)
+            };
+            if !self.check_edge_id(clk_id, edge) {
+                continue;
+            }
+            let sample = match self.sampled_watches[i].sig_id {
+                Some(sid) => self.preponed_value_of(sid),
+                None => {
+                    let e = self.sampled_watches[i].expr.clone();
+                    self.eval_expr(&e)
+                }
+            };
+            let w = &mut self.sampled_watches[i];
+            w.hist.push_front(sample);
+            let cap = w.depth + 1;
+            while w.hist.len() > cap {
+                w.hist.pop_back();
+            }
+        }
+    }
+
     fn check_edges_inner(&mut self, detect_subset: Option<&[usize]>, validate_coverage: bool) {
         if self.event_measure {
             self.event_phase += 1; // flop SAMPLE phase
+        }
+        // §16.9.3 sampled-value histories advance FIRST — a waiter
+        // continuation resumed on this same clock edge reads the
+        // just-sampled cycle.
+        if !self.sampled_watches.is_empty() {
+            self.tick_sampled_watches();
         }
         // Commercial-simulator process ordering: a process PARKED on
         // `@(posedge clk)` resumes BEFORE the same edge's always blocks run.
@@ -30234,6 +30597,23 @@ impl Simulator {
                 // inside an SVA clocked body; falls back to current
                 // value when no active site (compile-time use).
                 "$past" => {
+                    // §16.9.3 explicit clocking (4th arg) or default
+                    // clocking in a procedural context.
+                    {
+                        let n = args
+                            .get(1)
+                            .filter(|a| !matches!(a.kind, ExprKind::Null))
+                            .map(|a| self.eval_expr(a).to_u64().unwrap_or(1) as usize)
+                            .unwrap_or(1);
+                        if let Some((_, past_opt)) = self.sampled_fn_via_watch(expr, args, n) {
+                            if let Some(p) = past_opt {
+                                return p;
+                            }
+                            // Not enough history yet: LRM default-value = the
+                            // operand type's default (x for 4-state).
+                            return Value::new(1);
+                        }
+                    }
                     let sig_name = match args.first().map(|a| &a.kind) {
                         Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
                         _ => String::new(),
@@ -30267,6 +30647,28 @@ impl Simulator {
                 // `$stable(x)` = value unchanged from previous cycle;
                 // `$changed(x)` = value differs from previous cycle.
                 "$rose" | "$fell" | "$stable" | "$changed" => {
+                    // §16.9.3 explicit clocking argument (or default
+                    // clocking, procedural context): sample via the
+                    // clock-edge watch history.
+                    if let Some((cur, prev_opt)) = self.sampled_fn_via_watch(expr, args, 1) {
+                        let cur_bit = (cur.to_u64().unwrap_or(0) & 1) as u8;
+                        let prev_bit = prev_opt
+                            .as_ref()
+                            .map(|v| (v.to_u64().unwrap_or(0) & 1) as u8)
+                            .unwrap_or(cur_bit);
+                        let result = match name.as_str() {
+                            "$rose" => cur_bit == 1 && prev_bit == 0,
+                            "$fell" => cur_bit == 0 && prev_bit == 1,
+                            "$stable" => {
+                                prev_opt.as_ref().is_none_or(|p| p.to_u64() == cur.to_u64())
+                            }
+                            "$changed" => {
+                                prev_opt.as_ref().is_some_and(|p| p.to_u64() != cur.to_u64())
+                            }
+                            _ => unreachable!(),
+                        };
+                        return if result { Value::ones(1) } else { Value::zero(1) };
+                    }
                     let sig_name = match args.first().map(|a| &a.kind) {
                         Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
                         _ => String::new(),
@@ -31258,7 +31660,12 @@ impl Simulator {
                                         .map(|&id| self.signal_widths[id])
                                 })
                                 .unwrap_or(0);
-                            let packed_dim: u64 = if elem_w > 1 { 1 } else { 0 };
+                            let packed_dim: u64 = self
+                                .module
+                                .packed_full_dims
+                                .get(&aname)
+                                .map(|d| d.len() as u64)
+                                .unwrap_or(if elem_w > 1 { 1 } else { 0 });
                             let total = packed_dim + unpacked_dim;
                             return Value::from_u64(total.max(1), 32);
                         }
@@ -31348,7 +31755,18 @@ impl Simulator {
                             };
                             let sel = dims.as_ref().and_then(|d| d.get(dim.saturating_sub(1)));
                             let n_unpacked = dims.as_ref().map(|d| d.len()).unwrap_or(0);
-                            let (lo, hi, descending) = if let Some(&(l, h)) = sel {
+                            // Declared per-dimension order (`[3:1]` -> left=3,
+                            // right=1) — the arrays* tables normalize to
+                            // (lo, hi) and would report the bounds flipped.
+                            let decl_sel = self
+                                .module
+                                .unpacked_decl_dims
+                                .get(&aname)
+                                .and_then(|d| d.get(dim.saturating_sub(1)))
+                                .copied();
+                            let (lo, hi, descending) = if let Some((l, r)) = decl_sel {
+                                (l.min(r), l.max(r), l > r)
+                            } else if let Some(&(l, h)) = sel {
                                 let desc =
                                     dim == 1 && self.module.descending_arrays.contains(&aname);
                                 (l, h, desc)
@@ -31385,7 +31803,12 @@ impl Simulator {
                                 }
                                 _ => 0,
                             };
-                            return Value::from_u64(result, 32);
+                            // §20.7: array query functions return `int`
+                            // (signed) — `$increment` of an ascending range is
+                            // -1, and negative declared bounds print negative.
+                            let mut rv = Value::from_u64(result & 0xFFFF_FFFF, 32);
+                            rv.is_signed = true;
+                            return rv;
                         }
                         let v = self.eval_expr(arg);
                         match sn.as_str() {
@@ -35417,7 +35840,12 @@ impl Simulator {
                             self.fire_clock_generators();
                             self.dirty_any = true;
                         }
-                        if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
+                        if !self.nba_fast.is_empty()
+            || !self.nba_queue.is_empty()
+            // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
+            // region even when no NBA DATA is queued.
+            || !self.pending_nba_triggers.is_empty()
+        {
                             self.apply_nba();
                         }
                         self.settle_combinatorial();
@@ -37041,6 +37469,12 @@ impl Simulator {
         if canon == Self::EVENT_NULL_KEY {
             return; // triggering a null handle is a no-op
         }
+        if self.in_pre_process_settle {
+            // §9.2.2.2: no process has registered a waiter yet — deliver at
+            // the end of the time-0 active region instead.
+            self.pending_t0_triggers.push(canon);
+            return;
+        }
         let raw_name: &str = &canon;
         {
             {
@@ -37652,9 +38086,12 @@ impl Simulator {
                 }
             }
             "$monitor" | "$monitorb" | "$monitorh" | "$monitoro" => {
+                // §21.2.3: the first print happens at the END of the current
+                // time step (Postponed region — the slot-end check_monitor),
+                // not at arming — values written later in this same step
+                // (another initial block's `v = 0`) must be reflected.
                 self.monitor = Some((name.to_string(), args.to_vec()));
-                self.monitor_arg_prev = None; // fresh arm ⇒ print immediately
-                self.check_monitor();
+                self.monitor_arg_prev = None; // fresh arm ⇒ slot-end print
             }
             // §21.2.3 file variant: SHARES the single $monitor slot (xezim
             // models one active monitor; the LRM allows any number of
@@ -37663,8 +38100,7 @@ impl Simulator {
             // the file descriptor in args[0] and watches args[1..].
             "$fmonitor" | "$fmonitorb" | "$fmonitorh" | "$fmonitoro" => {
                 self.monitor = Some((name.to_string(), args.to_vec()));
-                self.monitor_arg_prev = None; // fresh arm ⇒ print immediately
-                self.check_monitor();
+                self.monitor_arg_prev = None; // fresh arm ⇒ slot-end print
             }
             "$monitoroff" => {
                 self.monitor_paused = true;
@@ -39059,7 +39495,31 @@ impl Simulator {
                                             core.insert(0, '+');
                                         }
                                         let dw = Self::dec_default_width(v.width, v.is_signed);
-                                        result.push_str(&field(core, dw));
+                                        // Reference-simulator behavior: a
+                                        // leading zero in a %d width (`%06d`)
+                                        // is part of the WIDTH, not a
+                                        // zero-fill flag — decimals space-pad.
+                                        // (`%0d` alone stays the §21.2.1.2
+                                        // minimum-width form.) Exception: the
+                                        // `%+d` sign flag is an xezim
+                                        // EXTENSION the reference simulator
+                                        // rejects outright — keep C-style
+                                        // zero-fill there (`%+08d` ->
+                                        // `+0000123`).
+                                        if plus_sign {
+                                            result.push_str(&field(core, dw));
+                                        } else {
+                                            let w = if has_width { pad_width } else { dw };
+                                            if core.len() >= w {
+                                                result.push_str(&core);
+                                            } else if left_align {
+                                                result.push_str(&core);
+                                                result.push_str(&" ".repeat(w - core.len()));
+                                            } else {
+                                                result.push_str(&" ".repeat(w - core.len()));
+                                                result.push_str(&core);
+                                            }
+                                        }
                                     }
                                     'b' | 'B' => {
                                         let full = v.to_bin_string();
