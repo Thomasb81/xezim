@@ -98,6 +98,42 @@ endmodule
 }
 
 #[test]
+fn defparam_does_not_override_localparam() {
+    // §6.20.4: a localparam is NOT overridable — the defparam must be ignored,
+    // keeping the localparam's own value (0xAB, not 0xCD).
+    assert!(passes(
+        r#"
+module m(output [7:0] z); localparam L = 8'hAB; assign z = L; endmodule
+module top;
+  wire [7:0] z;
+  m u(.z(z));
+  defparam u.L = 8'hCD;                 // illegal target; must be ignored
+  initial begin #1; if (z===8'hAB) $display("TEST_PASS"); else $display("TEST_FAIL"); end
+endmodule
+"#
+    ));
+}
+
+#[test]
+fn defparam_array_of_instances_element() {
+    // §23.3.2 + §23.10.1: target a specific element of an instance array
+    // (`u[2].V`). Array expansion names elements `u[<j>]`, so the defparam path
+    // must fold the index into that instance name.
+    assert!(passes(
+        r#"
+module mcell (output o); parameter V=0; assign o = V[0]; endmodule
+module top;
+  wire [3:0] o;
+  mcell u [3:0] (.o(o));
+  defparam u[0].V = 1;
+  defparam u[3].V = 1;                  // set elements 0 and 3 only
+  initial begin #1; if (o===4'b1001) $display("TEST_PASS"); else $display("TEST_FAIL"); end
+endmodule
+"#
+    ));
+}
+
+#[test]
 fn defparam_multiple_assignments_last_wins() {
     // comma-separated + duplicate target (last write wins).
     assert!(passes(
