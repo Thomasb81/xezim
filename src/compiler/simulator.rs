@@ -54870,6 +54870,28 @@ impl Simulator {
                             return self.exec_cg_method_call(handle, method_name, args);
                         }
                         if handle < self.heap.len() && self.heap[handle].is_some() {
+                            // TLM intercept: statement-level obj.connect()/write()
+                            // flattens to Ident([obj, method]) and never reaches the
+                            // MemberAccess intercept above — mirror it here.
+                            if real_uvm {
+                                if method_name == "connect" {
+                                    let tgt = args
+                                        .first()
+                                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as usize)
+                                        .unwrap_or(0);
+                                    if tgt != 0 {
+                                        self.tlm_connections
+                                            .entry(handle)
+                                            .or_default()
+                                            .push(tgt);
+                                    }
+                                    // fall through to execute the real connect() body
+                                } else if matches!(method_name.as_str(), "write" | "put") {
+                                    if self.tlm_deliver(handle, method_name, args) {
+                                        return Value::zero(32);
+                                    }
+                                }
+                            }
                             return self.exec_method_call(handle, method_name, args);
                         }
                     }
