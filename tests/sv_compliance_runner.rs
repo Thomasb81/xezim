@@ -272,6 +272,10 @@ fn test_sv_43_typedef_type_id_create() {
 fn test_sv_43_vif_writes() {
     run_positive_compliance_test("tests_advanced", "43_vif_writes.sv");
 }
+#[test]
+fn test_sv_43_packed_struct_assign() {
+    run_positive_compliance_test("tests_advanced", "43_packed_struct_assign.sv");
+}
 
 #[test]
 fn test_sv_neg01_duplicate_declaration() {
