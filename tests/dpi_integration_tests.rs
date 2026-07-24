@@ -159,6 +159,17 @@ fn assert_dpi_pass(c_file: &str, stem: &str, sv_file: &str) {
 }
 
 #[test]
+fn dpi_type_mappings_test() {
+    // Import type-mapping coverage: atoms, real, out/inout, packed 2-state
+    // (svBitVecVal*) and 4-state (svLogicVecVal*, incl. x/z), string.
+    assert_dpi_pass(
+        "tests/dpi/type_mappings.c",
+        "type_mappings",
+        "tests/dpi/type_mappings_test.sv",
+    );
+}
+
+#[test]
 fn dpi_export_roundtrip_test() {
     // §35.5.4: an imported context C function calls back into exported SV
     // functions + a task. Verifies the exported-symbol trampoline + dispatch.
