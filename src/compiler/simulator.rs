@@ -1227,6 +1227,14 @@ struct EventWaiter {
     /// Full captured value for >64-bit sensitivity signals (parallel to
     /// `captured_prev`); `None` for ≤64-bit signals.
     captured_prev_wide: Vec<Option<Value>>,
+    /// LRM §14.13: this waiter is parked on a CLOCKING event (`@(cb)` / `##N`),
+    /// not a raw `@(posedge clk)`. Its continuation must resume in the Reactive
+    /// region — AFTER the same-edge NBA updates commit and the clocking input
+    /// snapshot refreshes — so it reads post-edge design state and this cycle's
+    /// `cb.<in>` samples. Raw edge waiters keep the default "resume before
+    /// same-edge blocks" behavior (`waiters_first`), which some gate-level tbs
+    /// depend on; only clocking waiters are deferred.
+    is_clocking: bool,
 }
 
 /// Pad a string to a given width with spaces (or zeros if zero_pad).
@@ -2432,6 +2440,11 @@ pub struct Simulator {
     /// NBA update. Without this, `cb.<in>` reads the post-edge value (off by
     /// one clock relative to a reference simulator).
     clocking_preponed: HashMap<String, Value>,
+    /// Continuations of clocking-event waiters (`@(cb)` / `##N`) that fired this
+    /// slot, held for resumption in the Reactive region — after `apply_nba` and
+    /// `tick_clocking_blocks` — instead of running in the Active region with the
+    /// raw edge. See `EventWaiter::is_clocking`.
+    deferred_clocking_conts: Vec<(usize, Vec<Statement>)>,
     /// LRM §4.4 "reactive region" — drained AFTER the observed region
     /// has fired and BEFORE the postponed region runs. In a strict LRM
     /// implementation this hosts `program`-block procedural code so a
@@ -4871,6 +4884,7 @@ impl Simulator {
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
             clocking_preponed: HashMap::default(),
+            deferred_clocking_conts: Vec::new(),
             pending_reactive: Vec::new(),
             active_union_tag: HashMap::default(),
             max_time,
@@ -17686,6 +17700,16 @@ impl Simulator {
         sens: Vec<Sensitivity>,
         continuation: Vec<Statement>,
     ) -> EventWaiter {
+        self.make_event_waiter_kind(pid, sens, continuation, false)
+    }
+
+    fn make_event_waiter_kind(
+        &self,
+        pid: usize,
+        sens: Vec<Sensitivity>,
+        continuation: Vec<Statement>,
+        is_clocking: bool,
+    ) -> EventWaiter {
         let resolved: Vec<SensitivityId> = sens
             .iter()
             .filter_map(|s| {
@@ -17735,6 +17759,34 @@ impl Simulator {
             continuation,
             captured_prev,
             captured_prev_wide,
+            is_clocking,
+        }
+    }
+
+    /// True when an event control names a clocking block (`@(cb)`) or the
+    /// synthesized default clocking used by `##N` — a clocking event whose
+    /// waiter must resume in the Reactive region (see `EventWaiter::is_clocking`).
+    fn is_clocking_event(&self, event: &EventControl) -> bool {
+        // `@(cb)` parses as an EventExpr with an edge-less ident that names a
+        // clocking block; mirror the detection in `event_to_sens`.
+        match event {
+            EventControl::Identifier(id) => {
+                id.name == "__xz_default_clocking"
+                    || self.clocking_meta.contains_key(&id.name)
+            }
+            EventControl::EventExpr(exprs) => exprs.iter().any(|ee| {
+                // `@(cb)` is an edge-less bare ident naming a clocking block.
+                if ee.edge.is_some() {
+                    return false;
+                }
+                if let ExprKind::Ident(h) = &ee.expr.kind {
+                    let sig = self.resolve_hier_name(h);
+                    sig == "__xz_default_clocking" || self.clocking_meta.contains_key(&sig)
+                } else {
+                    false
+                }
+            }),
+            _ => false,
         }
     }
 
@@ -18752,6 +18804,11 @@ impl Simulator {
         // sample state so subsequent `cb.<sig>` reads see the pre-edge
         // value (`#1step` input skew).
         self.tick_clocking_blocks();
+        // §14.13: now that this edge's NBA updates have committed and the
+        // clocking input snapshots are refreshed, resume the clocking-event
+        // waiters (`@(cb)` / `##N`) that fired this slot — in the Reactive
+        // region — so they observe post-edge state and this cycle's samples.
+        self.drain_deferred_clocking_conts();
         self.drain_reactive_region();
         self.check_monitor();
         self.drain_pending_strobes();
@@ -21710,6 +21767,7 @@ impl Simulator {
                     TimingControl::Event(event) => {
                         // Suspend process until the event fires
                         let sens = self.event_to_sens(event);
+                        let is_clk_ev = self.is_clocking_event(event);
                         if !sens.is_empty() {
                             let mut cont = vec![*body.clone()];
                             cont.extend_from_slice(&stmts[i + 1..]);
@@ -21718,7 +21776,7 @@ impl Simulator {
                             });
                             if has_real {
                                 self.event_waiters
-                                    .push(self.make_event_waiter(pid, sens, cont));
+                                    .push(self.make_event_waiter_kind(pid, sens, cont, is_clk_ev));
                             } else {
                                 // `@(x)` where x is not a real signal — a
                                 // procedural local that was NBA-assigned then
@@ -22922,6 +22980,7 @@ impl Simulator {
                     }
                     TimingControl::Event(event) => {
                         let sens = self.event_to_sens(event);
+                        let is_clk_ev = self.is_clocking_event(event);
                         if !sens.is_empty() {
                             let mut cont = vec![*tbody.clone()];
                             cont.extend_from_slice(&body_stmts[i + 1..]);
@@ -22933,7 +22992,7 @@ impl Simulator {
                             ));
                             cont.extend_from_slice(after);
                             self.event_waiters
-                                .push(self.make_event_waiter(pid, sens, cont));
+                                .push(self.make_event_waiter_kind(pid, sens, cont, is_clk_ev));
                             return;
                         }
                     }
@@ -23821,7 +23880,16 @@ impl Simulator {
                     waiter.pid,
                     self.time
                 );
-                triggered_conts.push((waiter.pid, waiter.continuation));
+                if waiter.is_clocking {
+                    // §14.13: resume in the Reactive region, not here in the
+                    // Active region — defer the continuation past apply_nba +
+                    // tick_clocking_blocks so it reads post-edge state and this
+                    // cycle's clocking samples.
+                    self.deferred_clocking_conts
+                        .push((waiter.pid, waiter.continuation));
+                } else {
+                    triggered_conts.push((waiter.pid, waiter.continuation));
+                }
             } else {
                 // Refresh this waiter's `captured_prev` baseline to each
                 // sensitivity signal's CURRENT value so that a qualifying
@@ -36286,6 +36354,7 @@ impl Simulator {
                     }
                     TimingControl::Event(e) => {
                         let sens = self.event_to_sens(e);
+                        let is_clk_ev = self.is_clocking_event(e);
                         sim_dbg_eprintln!(
                             "[DEBUG] process {} waiting for event {:?} at time {}",
                             self.current_pid,
@@ -36297,7 +36366,7 @@ impl Simulator {
                         let cont = vec![*stmt.clone()];
                         let pid = self.cg_this.unwrap_or(0); // placeholder
                         self.event_waiters
-                            .push(self.make_event_waiter(pid, sens, cont));
+                            .push(self.make_event_waiter_kind(pid, sens, cont, is_clk_ev));
                         self.break_flag = true;
                         return;
                     }
@@ -40806,6 +40875,34 @@ impl Simulator {
                     );
                     self.assign_value(&lval, &val);
                 }
+            }
+        }
+    }
+
+    /// Resume the clocking-event waiters (`@(cb)` / `##N`) that fired this slot,
+    /// held aside by `drain_triggered_event_waiters` and run here in the
+    /// Reactive region — after `apply_nba` + `tick_clocking_blocks` — so their
+    /// continuations read post-edge design state and this cycle's `cb.<in>`
+    /// samples (§14.13). Mirrors the Active-region waiter run loop.
+    fn drain_deferred_clocking_conts(&mut self) {
+        let mut guard = 0u32;
+        while !self.deferred_clocking_conts.is_empty() {
+            let conts = std::mem::take(&mut self.deferred_clocking_conts);
+            for (pid, stmts) in conts {
+                if self.finished {
+                    break;
+                }
+                self.run_scheduled_process(pid, &stmts);
+                if !self.is_pid_suspended(pid) {
+                    self.child_finished(pid);
+                }
+                self.break_flag = false;
+                self.continue_flag = false;
+                self.return_flag = false;
+            }
+            guard += 1;
+            if self.finished || guard > 10_000 {
+                break;
             }
         }
     }

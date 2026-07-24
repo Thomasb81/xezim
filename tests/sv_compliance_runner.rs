@@ -176,6 +176,10 @@ fn test_sv_20b_clocking_input_skew() {
     run_positive_compliance_test("tests", "20b_clocking_input_skew.sv");
 }
 #[test]
+fn test_sv_20c_clocking_resume() {
+    run_positive_compliance_test("tests", "20c_clocking_resume.sv");
+}
+#[test]
 fn test_sv_21_strings_typedef_casts() {
     run_positive_compliance_test("tests_advanced", "21_strings_typedef_casts.sv");
 }
