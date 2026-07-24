@@ -15,8 +15,11 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .map(|h| {
+            // Only TRACKED modifications count as dirty — stray untracked
+            // scratch files in the working tree say nothing about which source
+            // the binary was built from.
             let dirty = Command::new("git")
-                .args(["status", "--porcelain"])
+                .args(["status", "--porcelain", "--untracked-files=no"])
                 .output()
                 .ok()
                 .map(|o| !o.stdout.is_empty())
