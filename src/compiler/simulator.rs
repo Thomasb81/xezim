@@ -53356,9 +53356,17 @@ impl Simulator {
         let Some(cd) = self.module.classes.get(class_name) else {
             return false;
         };
+        // Only `param_order` and `type_param_names` reflect the class's
+        // header `#(...)` parameter list. Do NOT check `param_defaults`,
+        // which also contains class-BODY `localparam` declarations (e.g.
+        // UVM's `localparam int DO_NOT_CATCH = 1;` inside
+        // `uvm_report_catcher`). A class with only body localparams is NOT
+        // parameterized — checking `param_defaults` wrongly classified it
+        // as parameterized, causing its static-call initializers (like
+        // `uvm_register_cb`) to be skipped, which broke callback
+        // registration (CBUNREG) for many tests.
         !cd.param_order.is_empty()
         || !cd.type_param_names.is_empty()
-        || !cd.param_defaults.is_empty()
     }
 
     /// Check if `derived` extends `ancestor` (directly or transitively).
