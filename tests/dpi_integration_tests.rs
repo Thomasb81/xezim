@@ -159,6 +159,38 @@ fn assert_dpi_pass(c_file: &str, stem: &str, sv_file: &str) {
 }
 
 #[test]
+fn dpi_scalar_types_test() {
+    // §35.5.6.1: svBit / svLogic canonical scalar types from svdpi.h.
+    assert_dpi_pass(
+        "tests/dpi/scalar_types.c",
+        "scalar_types",
+        "tests/dpi/scalar_types_test.sv",
+    );
+}
+
+#[test]
+fn dpi_type_mappings_test() {
+    // Import type-mapping coverage: atoms, real, out/inout, packed 2-state
+    // (svBitVecVal*) and 4-state (svLogicVecVal*, incl. x/z), string.
+    assert_dpi_pass(
+        "tests/dpi/type_mappings.c",
+        "type_mappings",
+        "tests/dpi/type_mappings_test.sv",
+    );
+}
+
+#[test]
+fn dpi_export_roundtrip_test() {
+    // §35.5.4: an imported context C function calls back into exported SV
+    // functions + a task. Verifies the exported-symbol trampoline + dispatch.
+    assert_dpi_pass(
+        "tests/dpi/export_roundtrip.c",
+        "export_roundtrip",
+        "tests/dpi/export_roundtrip_test.sv",
+    );
+}
+
+#[test]
 fn dpi_simple_test() {
     assert_dpi_pass(
         "tests/dpi/simple_dpi.c",

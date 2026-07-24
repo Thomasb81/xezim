@@ -1789,6 +1789,11 @@ struct SvaClockedSite {
     /// actually reports (e.g. its `else $error(...)`), not just tallies.
     pass_action: Option<Statement>,
     fail_action: Option<Statement>,
+    /// LRM §16.5.1 — signal ids referenced anywhere in `body`. Their
+    /// slot-entry (Preponed) values are cached in `Simulator::sva_preponed`
+    /// and swapped in while this site's predicate is evaluated, so the
+    /// property samples pre-edge values (see `eval_sva_sampled`).
+    sampled_ids: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1890,6 +1895,21 @@ struct TaskCleanup {
     pushed_method_this: bool,
 }
 
+/// Scalar kind of a DPI-EXPORT subroutine's port or return, for the generated
+/// C trampoline (§35.5.4). `Bad` = a type not modeled for C callback (string,
+/// chandle, aggregate, or a packed vector wider than 64 bits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DpiExpKind {
+    Void,
+    I32,
+    I64,
+    Real,
+    /// `string` — modeled only as an INPUT argument (`const char*`); a string
+    /// RETURN is not modeled (mapped to Bad).
+    StrIn,
+    Bad,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DpiRetKind {
     Void,
@@ -1932,11 +1952,6 @@ struct DpiBinding {
     fn_ptr: CodePtr,
 }
 
-#[repr(C)]
-struct DpiLogicVecVal {
-    aval: *mut u32,
-    bval: *mut u32,
-}
 
 /// Parse `<base>[<idx>]` and resolve via the compact 1D-array map.
 /// Free function so it can be shared between the `&self` resolver on
@@ -2364,6 +2379,17 @@ pub struct Simulator {
     /// site's snapshot map. `None` when no SVA body is active —
     /// `$past` then returns 0.
     active_sva_site: Option<usize>,
+    /// LRM §16.5.1 Preponed-region sample cache for clocked concurrent
+    /// assertions. Keyed by signal id, holds each SVA-referenced signal's
+    /// value as of the START of the current time slot (captured at slot
+    /// entry, before the active/NBA regions run). When a clocked property
+    /// fires on its clock edge, its predicate is evaluated against these
+    /// sampled values rather than the live post-NBA values, so a signal
+    /// that changes on the SAME edge is seen with its old (preponed) value
+    /// — matching the §16.5.1/§16.9 sampled-value semantics instead of
+    /// being one clock cycle early. Only populated when `sva_sites` is
+    /// non-empty; the referenced ids are those collected per site.
+    sva_preponed: HashMap<usize, Value>,
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge
@@ -3588,6 +3614,31 @@ pub struct Simulator {
     next_file_handle: i32,
     /// Best-effort hierarchical context for resolving ambiguous leaf identifiers.
     name_resolve_hint: RefCell<Option<String>>,
+    /// §16.9.3 sampled-value function watches: per call site, a history of
+    /// the operand sampled (preponed) at each matching clock edge. hist[0]
+    /// is the sample at the most recent edge, hist[1] one edge earlier, …
+    sampled_watches: Vec<SampledWatch>,
+    /// §9.2.2.2 timing: `-> ev` fired from a comb block during the PRE-process
+    /// time-0 settle (compile) happens before any `always @(ev)` process has
+    /// registered its waiter — the trigger would be lost. Queue them and
+    /// re-fire at the end of the time-0 active region.
+    pending_t0_triggers: Vec<String>,
+    /// True while the compile-time (pre-process) time-0 settle runs.
+    in_pre_process_settle: bool,
+    /// Call-site (expression span start) → index into `sampled_watches`.
+    sampled_watch_site: HashMap<usize, usize>,
+}
+
+/// One `$rose/$fell/$stable/$changed/$past(x, @(edge clk))` call site.
+struct SampledWatch {
+    clk_id: usize,
+    edge: EdgeKind,
+    /// Simple-signal operand: sampled PREPONED via the prev-value snapshot.
+    sig_id: Option<usize>,
+    /// General operand fallback: evaluated at edge time (post-slot values).
+    expr: Expression,
+    hist: std::collections::VecDeque<Value>,
+    depth: usize,
 }
 
 /// Empty static used as fallback name for unnamed array-element ids
@@ -4799,6 +4850,7 @@ impl Simulator {
             pending_observed: Vec::new(),
             sva_sites: Vec::new(),
             active_sva_site: None,
+            sva_preponed: HashMap::default(),
             clocking_snapshots: HashMap::default(),
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
@@ -5194,6 +5246,10 @@ impl Simulator {
             current_static_task: None,
             next_file_handle: 3,
             name_resolve_hint: RefCell::new(None),
+            sampled_watches: Vec::new(),
+            sampled_watch_site: HashMap::default(),
+            pending_t0_triggers: Vec::new(),
+            in_pre_process_settle: false,
         };
         let total_ms = phase_total.elapsed().as_secs_f64() * 1000.0;
         if total_ms > 100.0 {
@@ -7039,6 +7095,14 @@ impl Simulator {
     }
 
     fn load_dpi_libraries(&mut self) {
+        // §35.5.4 DPI EXPORT: a user DPI library references each exported SV
+        // function as an undefined C symbol (`extern int sv_add(int,int);`).
+        // Provide those symbols BEFORE loading the user libs by generating a
+        // tiny trampoline shared object — one C function per exported name that
+        // forwards into `__xezim_dpi_export_dispatch`, which runs the SV
+        // subroutine. Loaded RTLD_GLOBAL so the user libs' RTLD_NOW resolution
+        // of the exported names finds them.
+        self.load_dpi_export_trampoline();
         for path in configured_dpi_libs() {
             // SAFETY: Loading a dynamic library is inherently unsafe; we keep
             // each handle alive for the simulator lifetime.
@@ -7047,6 +7111,257 @@ impl Simulator {
                 Err(e) => eprintln!("[DPI] failed to load '{}': {}", path, e),
             }
         }
+    }
+
+    /// Scalar DPI-export kind of a type. `real`/`shortreal` -> Real; integer
+    /// vectors/atoms up to 64 bits -> I32/I64; everything else -> Bad.
+    fn dpi_export_kind(&self, dt: &crate::ast::types::DataType) -> DpiExpKind {
+        use crate::ast::types::{DataType, SimpleType};
+        if super::elaborate::is_type_real(dt) {
+            return DpiExpKind::Real;
+        }
+        if let DataType::Simple { kind, .. } = dt {
+            match kind {
+                SimpleType::String => return DpiExpKind::StrIn,
+                SimpleType::Chandle | SimpleType::Event => return DpiExpKind::Bad,
+            }
+        }
+        let w = super::elaborate::resolve_type_width(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        )
+        .max(1);
+        match w {
+            1..=32 => DpiExpKind::I32,
+            33..=64 => DpiExpKind::I64,
+            _ => DpiExpKind::Bad,
+        }
+    }
+
+    /// `(return_kind, arg_kinds)` for an exported subroutine. `void`-returning
+    /// functions and tasks report `Void`. None if the name is neither a
+    /// function nor a task. Any `Bad` kind means the C signature can't be
+    /// modeled and the trampoline must be a stub.
+    fn dpi_export_signature(&self, name: &str) -> Option<(DpiExpKind, Vec<DpiExpKind>)> {
+        if let Some(fd) = self.module.functions.get(name) {
+            let ret = if matches!(fd.return_type, crate::ast::types::DataType::Void(_)) {
+                DpiExpKind::Void
+            } else {
+                match self.dpi_export_kind(&fd.return_type) {
+                    // A `string`-returning export isn't modeled (the returned
+                    // char* would need a lifetime past the call).
+                    DpiExpKind::StrIn => DpiExpKind::Bad,
+                    k => k,
+                }
+            };
+            let args = fd.ports.iter().map(|p| self.dpi_export_kind(&p.data_type)).collect();
+            Some((ret, args))
+        } else if let Some(td) = self.module.tasks.get(name) {
+            let args = td.ports.iter().map(|p| self.dpi_export_kind(&p.data_type)).collect();
+            Some((DpiExpKind::Void, args))
+        } else {
+            None
+        }
+    }
+
+    fn load_dpi_export_trampoline(&mut self) {
+        let exports = self.module.dpi_exports.clone();
+        if exports.is_empty() {
+            return;
+        }
+        // Exported functions are only reachable from a loaded DPI library; with
+        // none configured, nothing can call them from C — skip the compile.
+        if configured_dpi_libs().is_empty() {
+            return;
+        }
+        let c_ty = |k: DpiExpKind| match k {
+            DpiExpKind::Void => "void",
+            DpiExpKind::I32 => "int",
+            DpiExpKind::I64 => "long long",
+            DpiExpKind::Real => "double",
+            DpiExpKind::StrIn => "const char*",
+            DpiExpKind::Bad => "long long",
+        };
+        let mut body = String::new();
+        body.push_str("#include <string.h>\n");
+        body.push_str(
+            "extern long long __xezim_dpi_export_dispatch(long long id, long long n, const long long* a);\n",
+        );
+        let mut emitted = 0usize;
+        for (id, name) in exports.iter().enumerate() {
+            let Some((ret, args)) = self.dpi_export_signature(name) else {
+                continue;
+            };
+            let supported = ret != DpiExpKind::Bad && !args.contains(&DpiExpKind::Bad);
+            let params: Vec<String> = if supported {
+                args.iter().enumerate().map(|(i, k)| format!("{} a{}", c_ty(*k), i)).collect()
+            } else {
+                // Stub keeps the right arity so the symbol resolves (the user
+                // library loads) but the call is a warned no-op.
+                (0..args.len()).map(|i| format!("long long a{}", i)).collect()
+            };
+            let param_list = if params.is_empty() { "void".to_string() } else { params.join(", ") };
+            if !supported {
+                eprintln!(
+                    "[DPI] exported subroutine '{}' has a type not modeled for C callback \
+                     (real/string/chandle/aggregate or a vector wider than 64 bits handled only \
+                     partially) — calls from C return 0",
+                    name
+                );
+                let ret_c = if ret == DpiExpKind::Void { "void" } else { "long long" };
+                if ret == DpiExpKind::Void {
+                    body.push_str(&format!("void {}({}) {{ }}\n", name, param_list));
+                } else {
+                    body.push_str(&format!("{} {}({}) {{ return 0; }}\n", ret_c, name, param_list));
+                }
+                emitted += 1;
+                continue;
+            }
+            // Pack each argument into a 64-bit slot: integers by value, reals by
+            // their IEEE-754 bit pattern (so the single integer dispatch carries
+            // both). The dispatch reconstructs the correct Value per port type.
+            let mut pack = String::new();
+            if args.is_empty() {
+                pack.push_str("    long long __a[1]; (void)__a;\n");
+            } else {
+                pack.push_str(&format!("    long long __a[{}];\n", args.len()));
+                for (i, k) in args.iter().enumerate() {
+                    match k {
+                        DpiExpKind::Real => pack.push_str(&format!(
+                            "    {{ double __t = a{}; memcpy(&__a[{}], &__t, 8); }}\n",
+                            i, i
+                        )),
+                        _ => pack.push_str(&format!("    __a[{}] = (long long)a{};\n", i, i)),
+                    }
+                }
+            }
+            let call = format!("__xezim_dpi_export_dispatch({}, {}, __a)", id, args.len());
+            match ret {
+                DpiExpKind::Void => body.push_str(&format!(
+                    "void {}({}) {{\n{}    (void){};\n}}\n",
+                    name, param_list, pack, call
+                )),
+                DpiExpKind::Real => body.push_str(&format!(
+                    "double {}({}) {{\n{}    long long __r = {};\n    double __d; memcpy(&__d, &__r, 8); return __d;\n}}\n",
+                    name, param_list, pack, call
+                )),
+                _ => body.push_str(&format!(
+                    "{} {}({}) {{\n{}    return ({}){};\n}}\n",
+                    c_ty(ret), name, param_list, pack, c_ty(ret), call
+                )),
+            }
+            emitted += 1;
+        }
+        if emitted == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir();
+        let stem = format!("xezim_dpi_exports_{}", std::process::id());
+        let cpath = dir.join(format!("{}.c", stem));
+        let sopath = dir.join(format!("{}.so", stem));
+        if let Err(e) = std::fs::write(&cpath, &body) {
+            eprintln!("[DPI] could not write export trampoline source: {}", e);
+            return;
+        }
+        let status = std::process::Command::new("cc")
+            .args(["-m64", "-fPIC", "-shared", "-O1", "-o"])
+            .arg(&sopath)
+            .arg(&cpath)
+            .status();
+        match status {
+            Ok(st) if st.success() => {}
+            Ok(st) => {
+                eprintln!(
+                    "[DPI] export trampoline compile failed (exit {:?}); C callbacks into \
+                     exported SV functions will be unresolved",
+                    st.code()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[DPI] could not run the C compiler for the export trampoline ({}); \
+                     is `cc`/`gcc` on PATH?",
+                    e
+                );
+                return;
+            }
+        }
+        use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
+        match unsafe { UnixLibrary::open(Some(&sopath), RTLD_NOW | RTLD_GLOBAL) } {
+            Ok(l) => self.dpi_libraries.push(Library::from(l)),
+            Err(e) => eprintln!("[DPI] failed to load export trampoline: {}", e),
+        }
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&sopath);
+    }
+
+    /// §35.5.4: run an exported SV subroutine identified by its declaration-order
+    /// id, called from C through the generated trampoline. `args` points at
+    /// `nargs` 64-bit slots (integers by value, reals as IEEE-754 bits). The
+    /// return is a 64-bit slot: an integer value, or a real's bit pattern.
+    fn run_dpi_export(&mut self, id: usize, nargs: usize, args: *const i64) -> i64 {
+        let Some(name) = self.module.dpi_exports.get(id).cloned() else {
+            return 0;
+        };
+        let Some((ret_kind, arg_kinds)) = self.dpi_export_signature(&name) else {
+            return 0;
+        };
+        let raw: Vec<i64> = (0..nargs).map(|i| unsafe { *args.add(i) }).collect();
+        let arg_exprs: Vec<Expression> = raw
+            .iter()
+            .enumerate()
+            .map(|(i, &slot)| {
+                match arg_kinds.get(i) {
+                    Some(DpiExpKind::Real) => {
+                        return Expression::new(
+                            ExprKind::Number(NumberLiteral::Real(f64::from_bits(slot as u64))),
+                            crate::ast::Span::dummy(),
+                        );
+                    }
+                    Some(DpiExpKind::StrIn) => {
+                        let sval = if slot == 0 {
+                            String::new()
+                        } else {
+                            unsafe { std::ffi::CStr::from_ptr(slot as *const libc::c_char) }
+                                .to_string_lossy()
+                                .into_owned()
+                        };
+                        return Expression::new(
+                            ExprKind::StringLiteral(sval),
+                            crate::ast::Span::dummy(),
+                        );
+                    }
+                    _ => {}
+                }
+                {
+                    Expression::new(
+                        ExprKind::Number(NumberLiteral::Integer {
+                            size: Some(64),
+                            signed: true,
+                            base: NumberBase::Decimal,
+                            value: slot.to_string(),
+                            cached_val: Cell::new(Some((slot as u64, 0u64, 64u32))),
+                        }),
+                        crate::ast::Span::dummy(),
+                    )
+                }
+            })
+            .collect();
+        if let Some(fd) = self.module.functions.get(&name).cloned() {
+            let r = self.exec_function_call(&fd, &arg_exprs);
+            return match ret_kind {
+                DpiExpKind::Real => r.to_f64().to_bits() as i64,
+                DpiExpKind::Void => 0,
+                _ => r.to_i64().unwrap_or(0),
+            };
+        }
+        if let Some(td) = self.module.tasks.get(&name).cloned() {
+            self.exec_task_call(&td, &arg_exprs);
+            return 0;
+        }
+        0
     }
 
     fn bind_all_dpi_imports(&mut self) {
@@ -7165,30 +7480,21 @@ impl Simulator {
                         Some(&self.module.parameters),
                         Some(&self.module.typedefs),
                     );
-                    if w <= 64 {
-                        Some(if out_dir {
-                            DpiArgKind::Int64Out
-                        } else {
-                            DpiArgKind::Int64In
-                        })
-                    } else {
-                        // 2-state `bit` -> svBitVecVal* (just uint32_t*).
-                        // 4-state `logic`/`reg` -> svLogicVecVal* ({aval, bval}*).
-                        let is_2state = matches!(kind, crate::ast::types::IntegerVectorType::Bit);
-                        Some(if out_dir {
-                            if is_2state {
-                                DpiArgKind::VecBitOut(w)
-                            } else {
-                                DpiArgKind::VecLogicOut(w)
-                            }
-                        } else {
-                            if is_2state {
-                                DpiArgKind::VecBitIn(w)
-                            } else {
-                                DpiArgKind::VecLogicIn(w)
-                            }
-                        })
-                    }
+                    // IEEE 1800-2017 Annex H.10.2: a PACKED array `bit [N]` /
+                    // `logic [N]` maps to svBitVecVal* / svLogicVecVal* — a
+                    // POINTER — for EVERY width, not only > 64 bits. (The
+                    // scalar atoms int/byte/shortint/longint pass by value via
+                    // their own arms.) Passing a packed vector by value where
+                    // the C dereferences the svBitVecVal* pointer crashed.
+                    // 2-state `bit` -> svBitVecVal* (plain uint32_t*).
+                    // 4-state `logic`/`reg` -> svLogicVecVal* ({aval, bval}*).
+                    let is_2state = matches!(kind, crate::ast::types::IntegerVectorType::Bit);
+                    Some(match (out_dir, is_2state) {
+                        (true, true) => DpiArgKind::VecBitOut(w),
+                        (true, false) => DpiArgKind::VecLogicOut(w),
+                        (false, true) => DpiArgKind::VecBitIn(w),
+                        (false, false) => DpiArgKind::VecLogicIn(w),
+                    })
                 }
             }
             DataType::Implicit { dimensions, .. } if dimensions.is_empty() => Some(if out_dir {
@@ -7197,28 +7503,19 @@ impl Simulator {
                 DpiArgKind::Int32In
             }),
             DataType::Implicit { dimensions, .. } => {
-                let w = if dimensions.is_empty() {
-                    32
+                // Implicitly-typed with a packed range (`[N:0] x`) is a 4-state
+                // packed vector -> svLogicVecVal* pointer at every width
+                // (Annex H.10.2), same as an explicit `logic [N:0]`.
+                let w = super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                Some(if out_dir {
+                    DpiArgKind::VecLogicOut(w)
                 } else {
-                    super::elaborate::resolve_type_width(
-                        dt,
-                        Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
-                    )
-                };
-                if w <= 64 {
-                    Some(if out_dir {
-                        DpiArgKind::Int64Out
-                    } else {
-                        DpiArgKind::Int64In
-                    })
-                } else {
-                    Some(if out_dir {
-                        DpiArgKind::VecLogicOut(w)
-                    } else {
-                        DpiArgKind::VecLogicIn(w)
-                    })
-                }
+                    DpiArgKind::VecLogicIn(w)
+                })
             }
             DataType::Real { kind, .. } => match kind {
                 crate::ast::types::RealType::ShortReal => Some(if out_dir {
@@ -7409,16 +7706,46 @@ impl Simulator {
             let w = bit / 32;
             let m = 1u32 << (bit % 32);
             match v.get_bit(bit) {
+                // §35.5.5 encoding: 0=(a0,b0) 1=(a1,b0) Z=(a0,b1) X=(a1,b1).
+                // (Matches VPI's bit_code_to_ab and the shipped header — DPI
+                // previously had X and Z swapped.)
                 LogicBit::Zero => {}
                 LogicBit::One => aval[w] |= m,
-                LogicBit::X => bval[w] |= m,
-                LogicBit::Z => {
+                LogicBit::Z => bval[w] |= m,
+                LogicBit::X => {
                     aval[w] |= m;
                     bval[w] |= m;
                 }
             }
         }
         (aval, bval)
+    }
+
+    /// Value -> the STANDARD svLogicVecVal buffer: an array of `s_vpi_vecval`
+    /// {aval, bval} pairs, i.e. INTERLEAVED u32 words [a0, b0, a1, b1, ...]
+    /// (§35.5.5 / Annex H.10.2). This is the layout xezim's shipped svdpi.h
+    /// declares and what standard DPI code + UVM's HDL backdoor expect.
+    fn dpi_value_to_logic_interleaved(v: &Value, width: u32) -> Vec<u32> {
+        let (aval, bval) = Self::dpi_value_to_logic_words(v, width);
+        let n = aval.len();
+        let mut out = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            out.push(aval[i]);
+            out.push(bval[i]);
+        }
+        out
+    }
+
+    /// The inverse: an interleaved [a0, b0, a1, b1, ...] buffer -> Value.
+    fn dpi_logic_interleaved_to_value(buf: &[u32], width: u32) -> Value {
+        let n = buf.len() / 2;
+        let mut aval = Vec::with_capacity(n);
+        let mut bval = Vec::with_capacity(n);
+        for i in 0..n {
+            aval.push(buf[2 * i]);
+            bval.push(buf[2 * i + 1]);
+        }
+        Self::dpi_logic_words_to_value(&aval, &bval, width)
     }
 
     fn dpi_logic_words_to_value(aval: &[u32], bval: &[u32], width: u32) -> Value {
@@ -7431,8 +7758,8 @@ impl Simulator {
             let lb = match (a, b) {
                 (false, false) => LogicBit::Zero,
                 (true, false) => LogicBit::One,
-                (false, true) => LogicBit::X,
-                (true, true) => LogicBit::Z,
+                (false, true) => LogicBit::Z,
+                (true, true) => LogicBit::X,
             };
             out.set_bit(bit, lb);
         }
@@ -7567,7 +7894,7 @@ impl Simulator {
         let mut i64_vals: Vec<Box<i64>> = Vec::with_capacity(arg_kinds.len());
         let mut f32_vals: Vec<Box<f32>> = Vec::with_capacity(arg_kinds.len());
         let mut f64_vals: Vec<Box<f64>> = Vec::with_capacity(arg_kinds.len());
-        // CRITICAL: ptr_vals, logic_aval, logic_bval must never reallocate
+        // CRITICAL: ptr_vals, logic_aval must never reallocate
         // after the loop, because arg_refs holds references into their Box
         // contents. Pre-allocate capacity to prevent mid-loop reallocation.
         let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::with_capacity(arg_kinds.len());
@@ -7575,8 +7902,6 @@ impl Simulator {
         let mut open_i32_vals: Vec<Vec<i32>> = Vec::with_capacity(arg_kinds.len());
         let mut cstrings: Vec<CString> = Vec::with_capacity(arg_kinds.len());
         let mut logic_aval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
-        let mut logic_bval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
-        let mut logic_hdrs: Vec<Box<DpiLogicVecVal>> = Vec::with_capacity(arg_kinds.len());
         let mut writebacks: Vec<(usize, DpiArgKind, Expression)> = Vec::new();
 
         for (i, kind) in arg_kinds.iter().enumerate() {
@@ -7692,24 +8017,16 @@ impl Simulator {
                     }
                 }
                 DpiArgKind::VecLogicIn(width) => {
+                    // Standard svLogicVecVal*: pointer to an interleaved array
+                    // of {aval, bval} u32 pairs (see dpi_value_to_logic_interleaved).
                     let vv = args
                         .get(i)
                         .map(|e| self.eval_expr(e))
                         .unwrap_or_else(|| Value::zero(*width));
-                    let (aval, bval) = Self::dpi_value_to_logic_words(&vv, *width);
-                    // CRITICAL: store in Vec FIRST, then capture pointer.
-                    // Otherwise Vec push may reallocate, invalidating the pointer.
-                    logic_aval.push(aval);
-                    logic_bval.push(bval);
-                    let hdr = Box::new(DpiLogicVecVal {
-                        aval: logic_aval.last_mut().unwrap().as_mut_ptr(),
-                        bval: logic_bval.last_mut().unwrap().as_mut_ptr(),
-                    });
-                    let p = Box::new(
-                        (&*hdr as *const DpiLogicVecVal as *mut DpiLogicVecVal).cast::<c_void>(),
-                    );
-                    logic_hdrs.push(hdr);
-                    ptr_vals.push(p);
+                    let buf = Self::dpi_value_to_logic_interleaved(&vv, *width);
+                    logic_aval.push(buf);
+                    let raw_ptr = logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>();
+                    ptr_vals.push(Box::new(raw_ptr));
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                 }
                 DpiArgKind::VecLogicOut(width) => {
@@ -7717,22 +8034,13 @@ impl Simulator {
                         .get(i)
                         .map(|e| self.eval_expr(e))
                         .unwrap_or_else(|| Value::zero(*width));
-                    let (aval, bval) = Self::dpi_value_to_logic_words(&init, *width);
-                    // CRITICAL: store in Vec FIRST, then capture pointer (see VecLogicIn).
-                    logic_aval.push(aval);
-                    logic_bval.push(bval);
-                    let hdr = Box::new(DpiLogicVecVal {
-                        aval: logic_aval.last_mut().unwrap().as_mut_ptr(),
-                        bval: logic_bval.last_mut().unwrap().as_mut_ptr(),
-                    });
-                    let p = Box::new(
-                        (&*hdr as *const DpiLogicVecVal as *mut DpiLogicVecVal).cast::<c_void>(),
-                    );
-                    logic_hdrs.push(hdr);
-                    ptr_vals.push(p);
+                    let buf = Self::dpi_value_to_logic_interleaved(&init, *width);
+                    logic_aval.push(buf);
+                    let raw_ptr = logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>();
+                    ptr_vals.push(Box::new(raw_ptr));
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
-                        writebacks.push((logic_hdrs.len() - 1, *kind, expr.clone()));
+                        writebacks.push((logic_aval.len() - 1, *kind, expr.clone()));
                     }
                 }
                 DpiArgKind::VecBitIn(width) => {
@@ -7960,21 +8268,13 @@ impl Simulator {
                     }
                 }
                 DpiArgKind::VecLogicOut(width) => {
-                    if idx < logic_aval.len() && idx < logic_bval.len() {
-                        let out = Self::dpi_logic_words_to_value(
+                    if idx < logic_aval.len() {
+                        let out = Self::dpi_logic_interleaved_to_value(
                             &logic_aval[idx],
-                            &logic_bval[idx],
-                        width,
+                            width,
                         );
                         let w = self.infer_lhs_width(&expr);
                         self.assign_value(&expr, &out.resize(w));
-                    } else {
-                        eprintln!(
-                            "[DBG-WB] VecLogicOut idx={} OUT OF RANGE aval.len={} bval.len={}",
-                            idx,
-                            logic_aval.len(),
-                            logic_bval.len()
-                        );
                     }
                 }
                 DpiArgKind::VecBitOut(width)
@@ -8481,7 +8781,16 @@ impl Simulator {
         let ca_count_before = self.prof_settle_ca_count;
         let ab_ns_before = self.prof_settle_ab_ns;
         let ab_count_before = self.prof_settle_ab_count;
+        self.in_pre_process_settle = true;
         self.settle_combinatorial();
+        self.in_pre_process_settle = false;
+        // Baseline edge snapshot: prev values = the SETTLED initial state
+        // (x for uninitialized regs, z for undriven nets). Without this the
+        // first check_edges compared against zero-initialized prev arrays and
+        // delivered phantom 0->x/0->z "edges" at time 0 — an `always @(y)`
+        // whose y never changed fired once with y=x/z (a reference simulator
+        // stays parked until a REAL change).
+        self.snapshot_edge_signals();
         mark_compile_phase("time-0 settle", &mut compile_phase_start);
         let dt = t_settle0.elapsed();
         if dt.as_millis() > 100 {
@@ -8516,6 +8825,10 @@ impl Simulator {
         // #7 lazy-prefix path: also drain `pending_initial` one-at-a-time.
         // A pending block is materialized just before scheduling and dropped
         // after, so peak memory is at most one materialized InitialBlock.
+        // §16.9.3: pre-register sampled-value watches BEFORE the initial
+        // blocks are consumed into scheduled processes, so clock-edge
+        // history accumulates from the first edge.
+        self.register_sampled_watches();
         let pending_initial = std::mem::take(&mut self.module.pending_initial);
         let initial_blocks = std::mem::take(&mut self.module.initial_blocks);
         // Static/package-global initializers must run before any `initial`
@@ -15081,13 +15394,27 @@ impl Simulator {
                         }
                     }
                 };
+                let is_pure_observer = wids.is_empty();
                 entries.push(CombEntry {
                     item,
                     scope_hint,
                     read_signal_ids: rids,
                     write_signal_ids: wids,
                     has_unresolved_reads,
-                    defer_at_time0: !is_always_comb && stmt_has_finish_or_stop(&ab.stmt),
+                    // §9.2.2.1: a level-only `always @(sensitivity)` block
+                    // suspends at its event control initially and runs only on
+                    // a sensitivity CHANGE — declaration init is not an event
+                    // (§6.8). xezim routes such blocks through the comb-settle
+                    // path, which would fire them once at t0 against their X
+                    // init. For a block that WRITES a signal this is
+                    // observationally harmless (X-in -> X-out, recomputed on
+                    // the first real change), so keep firing it (combinational
+                    // modeling relies on t0 settle). For a pure OBSERVER
+                    // (no signal write: `always @(y) $display(...)`) or one
+                    // that can $finish, the t0 fire is a spurious side effect a
+                    // reference simulator does not produce — defer it.
+                    defer_at_time0: !is_always_comb
+                        && (is_pure_observer || stmt_has_finish_or_stop(&ab.stmt)),
                     span: ab.stmt.span,
                 });
             }
@@ -17462,14 +17789,15 @@ impl Simulator {
     /// promoted continuations observe post-NBA values — matching the
     /// commercial consensus (VCS / Riviera): an NBA posted before
     /// a `#0` is visible after it in the same time slot.
-    fn promote_inactive_to_active(&mut self) {
+    fn promote_inactive_to_active(&mut self) -> bool {
         if self.inactive_queue.is_empty() {
-            return;
+            return false;
         }
         let moved = std::mem::take(&mut self.inactive_queue);
         for (pid, cont) in moved {
             self.event_queue.schedule(self.time, pid, cont);
         }
+        true
     }
 
     /// Drain pending NBAs and repeatedly snapshot → apply_nba → settle →
@@ -18234,6 +18562,11 @@ impl Simulator {
         if let Some(t) = _t {
             accum.t_snap += t.elapsed().as_nanos() as u64;
         }
+        // LRM §16.5.1: capture Preponed (slot-entry) samples of every
+        // SVA-referenced signal BEFORE the active/NBA regions run, so a
+        // clocked assertion firing later this slot (tick_sva_sites) samples
+        // pre-edge values rather than same-edge NBA updates.
+        self.refresh_sva_preponed();
 
         if self.apply_delayed_updates() {
             self.settle_combinatorial();
@@ -18259,34 +18592,70 @@ impl Simulator {
                 batch.len()
             );
         }
-        while !batch.is_empty() {
-            if self.finished || self.zero_delay_defer_pending {
-                break;
-            }
-            let (pid, stmts) = batch.remove(0);
-            let t_now = self.time;
-            for (p, s) in batch.drain(..) {
-                self.event_queue.schedule(t_now, p, s);
-            }
-            if trace_loop {
-                eprintln!("[xezim]   running pid={} stmts={}", pid, stmts.len());
-                for (idx, s) in stmts.iter().enumerate() {
-                    eprintln!(
-                        "[xezim]     stmt[{}]: {:?}",
-                        idx,
-                        std::mem::discriminant(&s.kind)
-                    );
+        loop {
+            while !batch.is_empty() {
+                if self.finished || self.zero_delay_defer_pending {
+                    break;
+                }
+                let (pid, stmts) = batch.remove(0);
+                let t_now = self.time;
+                for (p, s) in batch.drain(..) {
+                    self.event_queue.schedule(t_now, p, s);
+                }
+                if trace_loop {
+                    eprintln!("[xezim]   running pid={} stmts={}", pid, stmts.len());
+                    for (idx, s) in stmts.iter().enumerate() {
+                        eprintln!(
+                            "[xezim]     stmt[{}]: {:?}",
+                            idx,
+                            std::mem::discriminant(&s.kind)
+                        );
+                    }
+                }
+                self.run_scheduled_process(pid, &stmts);
+                if !self.is_pid_suspended(pid) {
+                    self.child_finished(pid);
+                }
+                if self.event_queue.next_time() == Some(self.time) {
+                    batch = self.event_queue.remove(self.time);
+                } else {
+                    batch.clear();
                 }
             }
-            self.run_scheduled_process(pid, &stmts);
-            if !self.is_pid_suspended(pid) {
-                self.child_finished(pid);
+            if self.finished || self.zero_delay_defer_pending {
+                // A defer-requested break can leave not-yet-run activations in
+                // the local batch — requeue them (dropping them would silently
+                // KILL those processes; the deferred spinner would vanish and
+                // the outer loop would "advance on its own" past the livelock
+                // without ever reporting or re-arming it).
+                for (p, c) in batch.drain(..) {
+                    let t_now = self.time;
+                    self.event_queue.schedule(t_now, p, c);
+                }
+                break;
             }
-            if self.event_queue.next_time() == Some(self.time) {
+            // IEEE 1800-2017 §4.5: once the ACTIVE region empties, the
+            // INACTIVE region (`#0` continuations) activates and runs BEFORE
+            // the NBA region — a `#0`-resumed read must see pre-NBA values
+            // (reference-simulator verified; the previous NBA-first order
+            // followed a differing commercial camp).
+            if self.promote_inactive_to_active()
+                && self.event_queue.next_time() == Some(self.time)
+            {
+                // Cont-assign propagation and edge-sensitive blocks are
+                // ACTIVE-region work (§4.4.2): complete them so the resumed
+                // `#0` observes settled combinational state (a $deposit
+                // through a port, a blocking write's fanout). NO NBA flush
+                // here (drain_edge_cascade would apply_nba) — the NBA region
+                // stays strictly after the inactive region (§4.5).
+                if self.dirty_any {
+                    self.settle_combinatorial();
+                }
+                self.check_edges();
                 batch = self.event_queue.remove(self.time);
-            } else {
-                batch.clear();
+                continue;
             }
+            break;
         }
         if let Some(t) = _t {
             accum.t_process += t.elapsed().as_nanos() as u64;
@@ -18308,9 +18677,22 @@ impl Simulator {
             }
             self.comb_time0_deferred = deferred;
         }
+        // Deliver `-> ev` triggers that fired during the pre-process settle
+        // now that every process has started and parked its waiters.
+        if self.time == 0 && !self.pending_t0_triggers.is_empty() {
+            let evs = std::mem::take(&mut self.pending_t0_triggers);
+            for ev in evs {
+                self.fire_named_event(&ev);
+            }
+        }
 
         let _t = profile_timing.then(std::time::Instant::now);
-        if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
+        if !self.nba_fast.is_empty()
+            || !self.nba_queue.is_empty()
+            // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
+            // region even when no NBA DATA is queued.
+            || !self.pending_nba_triggers.is_empty()
+        {
             self.apply_nba();
             if self.nba_touched_edge_non_clock {
                 non_clock_change = true;
@@ -18406,7 +18788,12 @@ impl Simulator {
                     batch.clear();
                 }
             }
-            if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
+            if !self.nba_fast.is_empty()
+            || !self.nba_queue.is_empty()
+            // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
+            // region even when no NBA DATA is queued.
+            || !self.pending_nba_triggers.is_empty()
+        {
                 self.apply_nba();
             }
             if self.dirty_any {
@@ -18419,14 +18806,10 @@ impl Simulator {
             }
         }
 
-        // Inactive → Active promotion (IEEE 1800-2017 §4.4.2.3): `#0`
-        // continuations parked during this tick resume in the NEXT tick at
-        // the SAME time — the outer event_loop sees event_queue.next_time()
-        // == self.time and re-enters run_one_tick without advancing time.
-        // Because this runs after this tick's apply_nba / settle /
-        // check_edges, the promoted continuations observe post-NBA values,
-        // matching the commercial consensus (VCS/Riviera print `aa`
-        // for `nb <= 8'hAA; #0; $display(nb)`).
+        // `#0` continuations parked during the POST-active stages of this
+        // tick (edge cascades, reactive work) resume in the next same-time
+        // delta: promote so the outer event_loop re-enters run_one_tick,
+        // where they run at the top — BEFORE that delta's NBA region (§4.5).
         self.promote_inactive_to_active();
 
         self.loop_iters += 1;
@@ -19904,9 +20287,6 @@ impl Simulator {
         let saved_return = self.return_flag;
         // §4.4.2.3: `#0` continuations parked by earlier same-batch
         // processes must resume in THIS time slot, not drift to a later nt.
-        // Our caller (the synchronous Delay handler in exec_statement) has
-        // already run apply_nba for the current pass, so promoting here
-        // preserves the NBA-before-#0-continuation ordering.
         self.promote_inactive_to_active();
         loop {
             // Advance to the EARLIEST of: event_queue, clock_generators,
@@ -19955,7 +20335,24 @@ impl Simulator {
                     self.child_finished(pid);
                 }
             }
-            if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
+            // §4.5: `#0` continuations parked by the processes above activate
+            // and run BEFORE this slot's NBA region — loop again at the same
+            // time without applying NBAs yet. Settle first so they observe
+            // completed active-region (cont-assign) state.
+            if self.promote_inactive_to_active()
+                && self.event_queue.next_time() == Some(self.time)
+            {
+                if self.dirty_any {
+                    self.settle_combinatorial();
+                }
+                continue;
+            }
+            if !self.nba_fast.is_empty()
+            || !self.nba_queue.is_empty()
+            // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
+            // region even when no NBA DATA is queued.
+            || !self.pending_nba_triggers.is_empty()
+        {
                 self.apply_nba();
             }
             if self.dirty_any {
@@ -20168,12 +20565,15 @@ impl Simulator {
         // again before asking the outer loop to seek a future event.
         if self.stall_limit > 0 {
             let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            *hits += 1;
-            if *hits > self.stall_limit {
+            // Check BEFORE counting: the activation that trips the guard is
+            // re-parked UNEXECUTED, so it must not inflate the "ran N times"
+            // attribution in the stall report.
+            if *hits >= self.stall_limit {
                 self.event_queue.schedule(self.time, pid, Vec::new());
                 self.zero_delay_defer_pending = true;
                 return;
             }
+            *hits += 1;
         }
 
         // Temporarily own the entry so evaluation and assignment can mutably
@@ -20451,7 +20851,6 @@ impl Simulator {
         };
         if self.stall_limit > 0 {
             let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            *hits += 1;
             // One process re-activated this many times at a SINGLE timestamp is
             // not a busy design, it is a livelock: it keeps re-arming itself and
             // time can never advance. (Counting per-process, rather than
@@ -20460,7 +20859,9 @@ impl Simulator {
             // processes at time 0.) run_one_tick's inner drain loop re-reads the
             // queue at the current time, so a self-rescheduling process never
             // reaches the outer event loop — the check has to live here.
-            if *hits > self.stall_limit {
+            // Check BEFORE counting: the activation that trips the guard is
+            // re-parked UNEXECUTED and must not inflate "ran N times".
+            if *hits >= self.stall_limit {
                 // A single process re-arming this many times at one timestamp is
                 // a zero-delay livelock (e.g. `always #(period) clk=~clk` whose
                 // real `period` momentarily glitched to 0). Rather than abort the
@@ -20474,6 +20875,7 @@ impl Simulator {
                 self.zero_delay_defer_pending = true;
                 return;
             }
+            *hits += 1;
         }
         sim_dbg_eprintln!(
             "[DEBUG] running process {} ({} stmts) at time {}",
@@ -20975,6 +21377,62 @@ impl Simulator {
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // IEEE 1800-2017 §9.4.5 intra-assignment EVENT control
+            // `lhs = [repeat(n)] @(edge sig) rhs` (canonicalized to
+            // `$__xz_intra_ev(n, edge, sig, rhs)`): evaluate the RHS NOW,
+            // then wait the event n times, then assign the saved value.
+            // Expand into n chained event controls + the saved assign so the
+            // existing top-level TimingControl::Event park machinery does
+            // the waiting.
+            if let StatementKind::BlockingAssign { lvalue, rvalue } = &stmt.kind {
+                if let ExprKind::SystemCall { name, args } = &rvalue.kind {
+                    if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
+                        let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(0) as i64;
+                        let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
+                        let val = self.eval_expr(&args[3]);
+                        let saved = self.make_intra_saved_expr(val, rvalue.span);
+                        let assign = Statement::new(
+                            StatementKind::BlockingAssign {
+                                lvalue: lvalue.clone(),
+                                rvalue: saved,
+                            },
+                            stmt.span,
+                        );
+                        let mut cont: Vec<Statement> = Vec::new();
+                        // §9.4.5: a zero/negative repeat count degenerates to
+                        // an immediate assignment (no event wait).
+                        let edge = match edge_code {
+                            1 => Some(Edge::Posedge),
+                            2 => Some(Edge::Negedge),
+                            _ => None,
+                        };
+                        for _ in 0..n_val.max(0) {
+                            cont.push(Statement::new(
+                                StatementKind::TimingControl {
+                                    control: TimingControl::Event(EventControl::EventExpr(vec![
+                                        EventExpr {
+                                            edge,
+                                            expr: args[2].clone(),
+                                            iff: None,
+                                            span: stmt.span,
+                                        },
+                                    ])),
+                                    stmt: Box::new(Statement::new(
+                                        StatementKind::Null,
+                                        stmt.span,
+                                    )),
+                                },
+                                stmt.span,
+                            ));
+                        }
+                        cont.push(assign);
+                        cont.extend_from_slice(&stmts[i + 1..]);
+                        self.run_process_stmts(pid, &cont);
+                        return;
                     }
                 }
             }
@@ -22840,7 +23298,11 @@ impl Simulator {
         let mut i = 0;
         while i < self.delayed_updates.len() {
             if self.delayed_updates[i].0 <= self.time {
-                let (_, id, val) = self.delayed_updates.swap_remove(i);
+                let (_, id, mut val) = self.delayed_updates.swap_remove(i);
+                // The committed value carries the TARGET's signedness — a
+                // delayed NBA of a signed 32-bit literal into a plain
+                // `reg [3:0]` must not read back signed (-7 for 4'b1001).
+                val.is_signed = self.signal_signed[id];
                 if self.signal_table[id] != val {
                     write_sig!(self, id, val);
                     self.mark_dirty_id(id);
@@ -22863,6 +23325,14 @@ impl Simulator {
     fn schedule_delayed(&mut self, id: usize, val: Value) {
         let delay = self.sdf_delays.get(id).copied().unwrap_or(0);
         self.schedule_delayed_with_delay(id, val, delay);
+    }
+
+    /// §10.3.3 inertial cancellation: a driver reverting to the signal's
+    /// CURRENT value while an opposite-value update is still pending means
+    /// the pulse was narrower than the delay — the pending update must be
+    /// dropped (no visible glitch), not left to fire.
+    fn cancel_delayed(&mut self, id: usize) {
+        self.delayed_updates.retain(|(_, sid, _)| *sid != id);
     }
 
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
@@ -23319,9 +23789,256 @@ impl Simulator {
         triggered_conts
     }
 
+    /// §16.9.3 sampled-value function with an EXPLICIT clocking argument
+    /// (`$rose(x, @(posedge clk))`) or, in a procedural context, the
+    /// module's `default clocking`. Returns `(sample_at_latest_edge,
+    /// sample_n_edges_back)`; None -> caller uses its legacy (inferred/SVA)
+    /// path.
+    fn sampled_fn_via_watch(
+        &mut self,
+        expr: &Expression,
+        args: &[Expression],
+        n: usize,
+    ) -> Option<(Value, Option<Value>)> {
+        // Explicit `@(...)` argument anywhere in the arg list.
+        let mut edge_code: Option<u8> = None;
+        let mut clk_id: Option<usize> = None;
+        for a in args.iter().skip(1) {
+            if let Some((ec, clk)) = Self::clocking_arg_marker(a) {
+                edge_code = Some(ec);
+                clk_id = self.get_lhs_signal_id(clk);
+                break;
+            }
+        }
+        if edge_code.is_none() {
+            // Procedural context + default clocking: infer from it.
+            if self.active_sva_site.is_some() {
+                return None;
+            }
+            let (clk_str, _) = self.clocking_meta.get("__xz_default_clocking")?.clone();
+            // clocking_meta stores the bare clock SIGNAL name (the parser
+            // drops the event's edge); default clocking events are
+            // overwhelmingly posedge — same assumption the `##N` cycle-delay
+            // machinery makes.
+            edge_code = Some(1);
+            clk_id = self.signal_name_to_id.get(clk_str.trim()).copied();
+        }
+        let clk_id = clk_id?;
+        let operand = args.first()?.clone();
+        let site = expr.span.start;
+        let widx = self.sampled_watch_for(site, &operand, edge_code.unwrap_or(0), clk_id, n)?;
+        let w = &self.sampled_watches[widx];
+        let cur = match w.hist.front() {
+            Some(v) => v.clone(),
+            None => {
+                let op = operand.clone();
+                self.eval_expr(&op)
+            }
+        };
+        let past = self.sampled_watches[widx].hist.get(n).cloned();
+        Some((cur, past))
+    }
+
+    /// Pre-register sampled-value watches for every `$rose/$fell/$stable/
+    /// $changed/$past` call in procedural code, so their clock-edge history
+    /// accumulates from time 0 (lazy registration at first eval would miss
+    /// every earlier edge).
+    fn register_sampled_watches(&mut self) {
+        if self.clocking_meta.is_empty() {
+            // Explicit @(...) args can still appear; scan anyway.
+        }
+        let mut stmts: Vec<Statement> = Vec::new();
+        for ib in &self.module.initial_blocks {
+            stmts.push(ib.stmt.clone());
+        }
+        for ab in &self.module.always_blocks {
+            stmts.push(ab.stmt.clone());
+        }
+        for st in stmts {
+            self.scan_sampled_stmt(&st);
+        }
+    }
+
+    fn scan_sampled_stmt(&mut self, st: &Statement) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    self.scan_sampled_stmt(s);
+                }
+            }
+            SK::If { condition, then_stmt, else_stmt, .. } => {
+                self.scan_sampled_expr(condition);
+                self.scan_sampled_stmt(then_stmt);
+                if let Some(e) = else_stmt {
+                    self.scan_sampled_stmt(e);
+                }
+            }
+            SK::TimingControl { stmt, .. } => self.scan_sampled_stmt(stmt),
+            SK::For { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body }
+            | SK::Foreach { body, .. } => self.scan_sampled_stmt(body),
+            SK::Case { expr, items, .. } => {
+                self.scan_sampled_expr(expr);
+                for it in items {
+                    self.scan_sampled_stmt(&it.stmt);
+                }
+            }
+            SK::BlockingAssign { rvalue, .. } => self.scan_sampled_expr(rvalue),
+            SK::NonblockingAssign { rvalue, .. } => self.scan_sampled_expr(rvalue),
+            SK::Expr(e) => self.scan_sampled_expr(e),
+            _ => {}
+        }
+    }
+
+    fn scan_sampled_expr(&mut self, e: &Expression) {
+        match &e.kind {
+            ExprKind::SystemCall { name, args }
+                if matches!(
+                    name.as_str(),
+                    "$rose" | "$fell" | "$stable" | "$changed" | "$past"
+                ) =>
+            {
+                // Registration mirrors the eval-time dispatcher; ignore
+                // failures (no clock resolvable) — eval falls back.
+                let ex = e.clone();
+                let ar = args.clone();
+                let _ = self.sampled_fn_via_watch(&ex, &ar, 1);
+            }
+            ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.scan_sampled_expr(a);
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.scan_sampled_expr(left);
+                self.scan_sampled_expr(right);
+            }
+            ExprKind::Unary { operand, .. } => self.scan_sampled_expr(operand),
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                self.scan_sampled_expr(condition);
+                self.scan_sampled_expr(then_expr);
+                self.scan_sampled_expr(else_expr);
+            }
+            ExprKind::Concatenation(items) => {
+                for i in items {
+                    self.scan_sampled_expr(i);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                self.scan_sampled_expr(expr);
+                self.scan_sampled_expr(index);
+            }
+            _ => {}
+        }
+    }
+
+    /// `$__xz_clocking_arg(edge_code, clk)` marker from the parser (the
+    /// explicit clocking argument of a §16.9.3 sampled-value function).
+    fn clocking_arg_marker(e: &Expression) -> Option<(u8, &Expression)> {
+        if let ExprKind::SystemCall { name, args } = &e.kind {
+            if name == "$__xz_clocking_arg" && args.len() == 2 {
+                if let ExprKind::Number(NumberLiteral::Integer { value, .. }) = &args[0].kind {
+                    return Some((value.parse().unwrap_or(0), &args[1]));
+                }
+            }
+        }
+        None
+    }
+
+    /// Reconstruct a signal's PREPONED (slot-entry) value from the edge
+    /// snapshot arrays.
+    fn preponed_value_of(&self, id: usize) -> Value {
+        if let Some(w) = self.prev_wide.get(&id) {
+            return w.clone();
+        }
+        let width = self.signal_widths.get(id).copied().unwrap_or(1).min(64);
+        Value::from_inline(self.prev_val[id], self.prev_xz[id], width)
+    }
+
+    /// Get-or-create the sampled watch for a call site. Registers the clock
+    /// (and a simple-signal operand) into `edge_signal_ids` so the snapshot
+    /// pass keeps their preponed values fresh.
+    fn sampled_watch_for(
+        &mut self,
+        site: usize,
+        operand: &Expression,
+        edge_code: u8,
+        clk_id: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        if let Some(&i) = self.sampled_watch_site.get(&site) {
+            if depth + 1 > self.sampled_watches[i].depth {
+                self.sampled_watches[i].depth = depth + 1;
+            }
+            return Some(i);
+        }
+        let edge = match edge_code {
+            1 => EdgeKind::Posedge,
+            2 => EdgeKind::Negedge,
+            _ => EdgeKind::AnyEdge,
+        };
+        let sig_id = self.get_lhs_signal_id(operand);
+        if !self.edge_signal_ids.contains(&clk_id) {
+            self.edge_signal_ids.push(clk_id);
+        }
+        if let Some(sid) = sig_id {
+            if !self.edge_signal_ids.contains(&sid) {
+                self.edge_signal_ids.push(sid);
+            }
+        }
+        let i = self.sampled_watches.len();
+        self.sampled_watches.push(SampledWatch {
+            clk_id,
+            edge,
+            sig_id,
+            expr: operand.clone(),
+            hist: std::collections::VecDeque::new(),
+            depth: depth + 1,
+        });
+        self.sampled_watch_site.insert(site, i);
+        Some(i)
+    }
+
+    /// Advance each sampled watch whose clock edged this delta: push the
+    /// PREPONED sample of the operand onto its history.
+    fn tick_sampled_watches(&mut self) {
+        for i in 0..self.sampled_watches.len() {
+            let (clk_id, edge) = {
+                let w = &self.sampled_watches[i];
+                (w.clk_id, w.edge)
+            };
+            if !self.check_edge_id(clk_id, edge) {
+                continue;
+            }
+            let sample = match self.sampled_watches[i].sig_id {
+                Some(sid) => self.preponed_value_of(sid),
+                None => {
+                    let e = self.sampled_watches[i].expr.clone();
+                    self.eval_expr(&e)
+                }
+            };
+            let w = &mut self.sampled_watches[i];
+            w.hist.push_front(sample);
+            let cap = w.depth + 1;
+            while w.hist.len() > cap {
+                w.hist.pop_back();
+            }
+        }
+    }
+
     fn check_edges_inner(&mut self, detect_subset: Option<&[usize]>, validate_coverage: bool) {
         if self.event_measure {
             self.event_phase += 1; // flop SAMPLE phase
+        }
+        // §16.9.3 sampled-value histories advance FIRST — a waiter
+        // continuation resumed on this same clock edge reads the
+        // just-sampled cycle.
+        if !self.sampled_watches.is_empty() {
+            self.tick_sampled_watches();
         }
         // Commercial-simulator process ordering: a process PARKED on
         // `@(posedge clk)` resumes BEFORE the same edge's always blocks run.
@@ -24739,6 +25456,8 @@ impl Simulator {
                 if let Some(id) = lhs_id {
                     if self.signal_table[id] != val {
                         self.schedule_delayed_with_delay(id, val, delay);
+                    } else {
+                        self.cancel_delayed(id);
                     }
                 }
             } else if let Some(id) = lhs_id {
@@ -24838,7 +25557,15 @@ impl Simulator {
                 }
             }
         }
-        cone.extend_from_slice(&self.comb_unresolved_idx);
+        if skip_deferred_at_t0 {
+            for &eidx in self.comb_unresolved_idx.iter() {
+                if !self.comb_entries[eidx].defer_at_time0 {
+                    cone.push(eidx);
+                }
+            }
+        } else {
+            cone.extend_from_slice(&self.comb_unresolved_idx);
+        }
         if self.time == 0 && !self.comb_time0_fired {
             cone.extend_from_slice(&self.comb_time0_idx);
         }
@@ -25646,6 +26373,8 @@ impl Simulator {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             self.schedule_delayed_with_delay(id, val, delay);
+                        } else {
+                            self.cancel_delayed(id);
                         }
                     }
                 } else if let Some(id) = lhs_id {
@@ -25836,9 +26565,15 @@ impl Simulator {
 
         // Unresolved entries always re-eval. Iterate the precomputed
         // index list instead of scanning `0..num_entries` (can be ~500K
-        // and is called on every BlockingAssign).
+        // and is called on every BlockingAssign). A t0-deferred entry (a
+        // write-free `always @(list)` observer, unresolved because it reads
+        // $time) is held back on the first t0 settle — same rule the
+        // dirty-seed loop above applies (§9.2.2.1).
         for &eidx in self.comb_unresolved_idx.iter() {
             if eidx < num_entries && !self.settle_triggered[eidx] {
+                if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
+                    continue;
+                }
                 self.settle_triggered[eidx] = true;
                 self.settle_triggered_list.push(eidx);
             }
@@ -30247,6 +30982,23 @@ impl Simulator {
                 // inside an SVA clocked body; falls back to current
                 // value when no active site (compile-time use).
                 "$past" => {
+                    // §16.9.3 explicit clocking (4th arg) or default
+                    // clocking in a procedural context.
+                    {
+                        let n = args
+                            .get(1)
+                            .filter(|a| !matches!(a.kind, ExprKind::Null))
+                            .map(|a| self.eval_expr(a).to_u64().unwrap_or(1) as usize)
+                            .unwrap_or(1);
+                        if let Some((_, past_opt)) = self.sampled_fn_via_watch(expr, args, n) {
+                            if let Some(p) = past_opt {
+                                return p;
+                            }
+                            // Not enough history yet: LRM default-value = the
+                            // operand type's default (x for 4-state).
+                            return Value::new(1);
+                        }
+                    }
                     let sig_name = match args.first().map(|a| &a.kind) {
                         Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
                         _ => String::new(),
@@ -30280,6 +31032,28 @@ impl Simulator {
                 // `$stable(x)` = value unchanged from previous cycle;
                 // `$changed(x)` = value differs from previous cycle.
                 "$rose" | "$fell" | "$stable" | "$changed" => {
+                    // §16.9.3 explicit clocking argument (or default
+                    // clocking, procedural context): sample via the
+                    // clock-edge watch history.
+                    if let Some((cur, prev_opt)) = self.sampled_fn_via_watch(expr, args, 1) {
+                        let cur_bit = (cur.to_u64().unwrap_or(0) & 1) as u8;
+                        let prev_bit = prev_opt
+                            .as_ref()
+                            .map(|v| (v.to_u64().unwrap_or(0) & 1) as u8)
+                            .unwrap_or(cur_bit);
+                        let result = match name.as_str() {
+                            "$rose" => cur_bit == 1 && prev_bit == 0,
+                            "$fell" => cur_bit == 0 && prev_bit == 1,
+                            "$stable" => {
+                                prev_opt.as_ref().is_none_or(|p| p.to_u64() == cur.to_u64())
+                            }
+                            "$changed" => {
+                                prev_opt.as_ref().is_some_and(|p| p.to_u64() != cur.to_u64())
+                            }
+                            _ => unreachable!(),
+                        };
+                        return if result { Value::ones(1) } else { Value::zero(1) };
+                    }
                     let sig_name = match args.first().map(|a| &a.kind) {
                         Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
                         _ => String::new(),
@@ -31271,7 +32045,12 @@ impl Simulator {
                                         .map(|&id| self.signal_widths[id])
                                 })
                                 .unwrap_or(0);
-                            let packed_dim: u64 = if elem_w > 1 { 1 } else { 0 };
+                            let packed_dim: u64 = self
+                                .module
+                                .packed_full_dims
+                                .get(&aname)
+                                .map(|d| d.len() as u64)
+                                .unwrap_or(if elem_w > 1 { 1 } else { 0 });
                             let total = packed_dim + unpacked_dim;
                             return Value::from_u64(total.max(1), 32);
                         }
@@ -31361,7 +32140,18 @@ impl Simulator {
                             };
                             let sel = dims.as_ref().and_then(|d| d.get(dim.saturating_sub(1)));
                             let n_unpacked = dims.as_ref().map(|d| d.len()).unwrap_or(0);
-                            let (lo, hi, descending) = if let Some(&(l, h)) = sel {
+                            // Declared per-dimension order (`[3:1]` -> left=3,
+                            // right=1) — the arrays* tables normalize to
+                            // (lo, hi) and would report the bounds flipped.
+                            let decl_sel = self
+                                .module
+                                .unpacked_decl_dims
+                                .get(&aname)
+                                .and_then(|d| d.get(dim.saturating_sub(1)))
+                                .copied();
+                            let (lo, hi, descending) = if let Some((l, r)) = decl_sel {
+                                (l.min(r), l.max(r), l > r)
+                            } else if let Some(&(l, h)) = sel {
                                 let desc =
                                     dim == 1 && self.module.descending_arrays.contains(&aname);
                                 (l, h, desc)
@@ -31398,7 +32188,12 @@ impl Simulator {
                                 }
                                 _ => 0,
                             };
-                            return Value::from_u64(result, 32);
+                            // §20.7: array query functions return `int`
+                            // (signed) — `$increment` of an ascending range is
+                            // -1, and negative declared bounds print negative.
+                            let mut rv = Value::from_u64(result & 0xFFFF_FFFF, 32);
+                            rv.is_signed = true;
+                            return rv;
                         }
                         let v = self.eval_expr(arg);
                         match sn.as_str() {
@@ -35423,7 +36218,12 @@ impl Simulator {
                             self.fire_clock_generators();
                             self.dirty_any = true;
                         }
-                        if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
+                        if !self.nba_fast.is_empty()
+            || !self.nba_queue.is_empty()
+            // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
+            // region even when no NBA DATA is queued.
+            || !self.pending_nba_triggers.is_empty()
+        {
                             self.apply_nba();
                         }
                         self.settle_combinatorial();
@@ -35686,6 +36486,14 @@ impl Simulator {
                                 ExprKind::Ident(h) => self.resolve_hier_name(h),
                                 _ => String::new(),
                             };
+                            // LRM §16.5.1: collect the ids of every signal
+                            // referenced in the property body so their
+                            // Preponed (slot-entry) values can be sampled
+                            // when the assertion fires (see eval_sva_sampled).
+                            let mut sampled_ids = Vec::new();
+                            self.collect_sva_signal_ids(body, &mut sampled_ids);
+                            sampled_ids.sort_unstable();
+                            sampled_ids.dedup();
                             self.sva_sites.push(SvaClockedSite {
                                 span_key,
                                 clock_signal,
@@ -35697,6 +36505,7 @@ impl Simulator {
                                 past_snapshots: HashMap::default(),
                                 pass_action: a.action.as_deref().cloned(),
                                 fail_action: a.else_action.as_deref().cloned(),
+                                sampled_ids,
                             });
                         }
                         return;
@@ -37078,6 +37887,12 @@ impl Simulator {
         if canon == Self::EVENT_NULL_KEY {
             return; // triggering a null handle is a no-op
         }
+        if self.in_pre_process_settle {
+            // §9.2.2.2: no process has registered a waiter yet — deliver at
+            // the end of the time-0 active region instead.
+            self.pending_t0_triggers.push(canon);
+            return;
+        }
         let raw_name: &str = &canon;
         {
             {
@@ -37684,9 +38499,12 @@ impl Simulator {
                 }
             }
             "$monitor" | "$monitorb" | "$monitorh" | "$monitoro" => {
+                // §21.2.3: the first print happens at the END of the current
+                // time step (Postponed region — the slot-end check_monitor),
+                // not at arming — values written later in this same step
+                // (another initial block's `v = 0`) must be reflected.
                 self.monitor = Some((name.to_string(), args.to_vec()));
-                self.monitor_arg_prev = None; // fresh arm ⇒ print immediately
-                self.check_monitor();
+                self.monitor_arg_prev = None; // fresh arm ⇒ slot-end print
             }
             // §21.2.3 file variant: SHARES the single $monitor slot (xezim
             // models one active monitor; the LRM allows any number of
@@ -37695,8 +38513,7 @@ impl Simulator {
             // the file descriptor in args[0] and watches args[1..].
             "$fmonitor" | "$fmonitorb" | "$fmonitorh" | "$fmonitoro" => {
                 self.monitor = Some((name.to_string(), args.to_vec()));
-                self.monitor_arg_prev = None; // fresh arm ⇒ print immediately
-                self.check_monitor();
+                self.monitor_arg_prev = None; // fresh arm ⇒ slot-end print
             }
             "$monitoroff" => {
                 self.monitor_paused = true;
@@ -39091,7 +39908,31 @@ impl Simulator {
                                             core.insert(0, '+');
                                         }
                                         let dw = Self::dec_default_width(v.width, v.is_signed);
-                                        result.push_str(&field(core, dw));
+                                        // Reference-simulator behavior: a
+                                        // leading zero in a %d width (`%06d`)
+                                        // is part of the WIDTH, not a
+                                        // zero-fill flag — decimals space-pad.
+                                        // (`%0d` alone stays the §21.2.1.2
+                                        // minimum-width form.) Exception: the
+                                        // `%+d` sign flag is an xezim
+                                        // EXTENSION the reference simulator
+                                        // rejects outright — keep C-style
+                                        // zero-fill there (`%+08d` ->
+                                        // `+0000123`).
+                                        if plus_sign {
+                                            result.push_str(&field(core, dw));
+                                        } else {
+                                            let w = if has_width { pad_width } else { dw };
+                                            if core.len() >= w {
+                                                result.push_str(&core);
+                                            } else if left_align {
+                                                result.push_str(&core);
+                                                result.push_str(&" ".repeat(w - core.len()));
+                                            } else {
+                                                result.push_str(&" ".repeat(w - core.len()));
+                                                result.push_str(&core);
+                                            }
+                                        }
                                     }
                                     'b' | 'B' => {
                                         let full = v.to_bin_string();
@@ -39345,6 +40186,155 @@ impl Simulator {
         }
     }
 
+    /// LRM §16.5.1 — walk an SVA property body and collect the ids of every
+    /// referenced signal (base ids of index/part-selects included). These are
+    /// the signals whose Preponed slot-entry values must be sampled when the
+    /// clocked assertion fires. Over-collection is harmless — an id that never
+    /// changes on the clock edge has an identical preponed and live value.
+    fn collect_sva_signal_ids(&self, expr: &Expression, out: &mut Vec<usize>) {
+        match &expr.kind {
+            ExprKind::Ident(_) => {
+                if let Some(id) = self.get_lhs_signal_id(expr) {
+                    out.push(id);
+                }
+            }
+            ExprKind::Unary { operand, .. } => self.collect_sva_signal_ids(operand, out),
+            ExprKind::Binary { left, right, .. } => {
+                self.collect_sva_signal_ids(left, out);
+                self.collect_sva_signal_ids(right, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_sva_signal_ids(condition, out);
+                self.collect_sva_signal_ids(then_expr, out);
+                self.collect_sva_signal_ids(else_expr, out);
+            }
+            ExprKind::Paren(inner) => self.collect_sva_signal_ids(inner, out),
+            ExprKind::Index { expr: base, index } => {
+                // The base identifier is the sampled signal; also walk the
+                // index (it may itself reference a sampled signal).
+                if let Some(id) = self.get_lhs_signal_id(base) {
+                    out.push(id);
+                }
+                self.collect_sva_signal_ids(base, out);
+                self.collect_sva_signal_ids(index, out);
+            }
+            ExprKind::RangeSelect {
+                expr: base,
+                left,
+                right,
+                ..
+            } => {
+                if let Some(id) = self.get_lhs_signal_id(base) {
+                    out.push(id);
+                }
+                self.collect_sva_signal_ids(base, out);
+                self.collect_sva_signal_ids(left, out);
+                self.collect_sva_signal_ids(right, out);
+            }
+            ExprKind::Concatenation(exprs) => {
+                for e in exprs {
+                    self.collect_sva_signal_ids(e, out);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                self.collect_sva_signal_ids(count, out);
+                for e in exprs {
+                    self.collect_sva_signal_ids(e, out);
+                }
+            }
+            ExprKind::SystemCall { name, args } => {
+                // `$past/$rose/$fell/$stable/$changed` already read from the
+                // per-site ring buffers; their bare argument must NOT be
+                // preponed here (that would double-sample). Skip a leading
+                // bare-Ident argument to those calls; still walk the rest.
+                let skip_first = matches!(
+                    name.as_str(),
+                    "$past" | "$rose" | "$fell" | "$stable" | "$changed"
+                );
+                for (i, a) in args.iter().enumerate() {
+                    if skip_first && i == 0 && matches!(a.kind, ExprKind::Ident(_)) {
+                        continue;
+                    }
+                    self.collect_sva_signal_ids(a, out);
+                }
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.collect_sva_signal_ids(a, out);
+                }
+            }
+            ExprKind::Inside { expr, ranges } => {
+                self.collect_sva_signal_ids(expr, out);
+                for r in ranges {
+                    self.collect_sva_signal_ids(r, out);
+                }
+            }
+            ExprKind::SvaClocked { body, .. } => self.collect_sva_signal_ids(body, out),
+            _ => {}
+        }
+    }
+
+    /// LRM §16.5.1 — capture the Preponed (slot-entry) value of every
+    /// SVA-referenced signal. Called once at the top of each time slot,
+    /// before the active/NBA regions run, so `sva_preponed[id]` holds the
+    /// value as of the start of the slot. No-op when no clocked sites exist.
+    fn refresh_sva_preponed(&mut self) {
+        if self.sva_sites.is_empty() {
+            return;
+        }
+        self.sva_preponed.clear();
+        for i in 0..self.sva_sites.len() {
+            for j in 0..self.sva_sites[i].sampled_ids.len() {
+                let id = self.sva_sites[i].sampled_ids[j];
+                if id < self.signal_table.len() {
+                    self.sva_preponed
+                        .insert(id, self.signal_table[id].clone());
+                }
+            }
+        }
+    }
+
+    /// LRM §16.5.1/§16.9 — evaluate a clocked-assertion predicate against the
+    /// Preponed sampled values. Temporarily swaps each referenced signal's
+    /// live (post-NBA) value in `signal_table` for its slot-entry value from
+    /// `sva_preponed`, evaluates, then restores. A signal that has NOT changed
+    /// this slot has an identical preponed/live value, so this is a no-op for
+    /// the common case and only shifts sampling for signals that change on the
+    /// same edge as the clock (the off-by-one-cycle bug this fixes).
+    fn eval_sva_sampled(&mut self, sampled_ids: &[usize], expr: &Expression) -> bool {
+        let saved = self.install_preponed(sampled_ids);
+        let r = self.eval_expr(expr).is_true();
+        self.restore_preponed(saved);
+        r
+    }
+
+    /// Swap in the Preponed sample for each `id` that has one cached; returns
+    /// the saved live values for `restore_preponed`.
+    fn install_preponed(&mut self, ids: &[usize]) -> Vec<(usize, Value)> {
+        let mut saved: Vec<(usize, Value)> = Vec::new();
+        for &id in ids {
+            if id >= self.signal_table.len() {
+                continue;
+            }
+            if let Some(pre) = self.sva_preponed.get(&id) {
+                let pre = pre.clone();
+                saved.push((id, std::mem::replace(&mut self.signal_table[id], pre)));
+            }
+        }
+        saved
+    }
+
+    /// Restore the live values swapped out by `install_preponed`.
+    fn restore_preponed(&mut self, saved: Vec<(usize, Value)>) {
+        for (id, v) in saved.into_iter().rev() {
+            self.signal_table[id] = v;
+        }
+    }
+
     fn tick_sva_sites(&mut self) {
         if self.sva_sites.is_empty() {
             return;
@@ -39370,6 +40360,9 @@ impl Simulator {
             if !(prev == 0 && cur_clk_bit == 1) {
                 continue;
             }
+            // LRM §16.5.1: the referenced-signal ids whose Preponed samples
+            // this fire's predicates must read (see eval_sva_sampled).
+            let sampled_ids = self.sva_sites[i].sampled_ids.clone();
             // 1) Drain pending consequents whose counter is 1 (they're
             //    due this cycle), decrement the rest.
             let mut due: Vec<Expression> = Vec::new();
@@ -39393,7 +40386,7 @@ impl Simulator {
             let span_key_for_evt = self.sva_sites[i].span_key;
             let watchers: Vec<Expression> = std::mem::take(&mut self.sva_sites[i].s_eventually);
             for w in watchers {
-                let outcome = self.eval_expr(&w).is_true();
+                let outcome = self.eval_sva_sampled(&sampled_ids, &w);
                 if outcome {
                     let stat = self
                         .assertion_stats
@@ -39415,7 +40408,7 @@ impl Simulator {
             // a follow-up.)
             let always_watchers: Vec<Expression> = std::mem::take(&mut self.sva_sites[i].s_always);
             for w in always_watchers {
-                let outcome = self.eval_expr(&w).is_true();
+                let outcome = self.eval_sva_sampled(&sampled_ids, &w);
                 if outcome {
                     self.sva_sites[i].s_always.push(w);
                 } else {
@@ -39433,7 +40426,7 @@ impl Simulator {
             }
             let span_key = self.sva_sites[i].span_key;
             for e in due {
-                let v = self.eval_expr(&e).is_true();
+                let v = self.eval_sva_sampled(&sampled_ids, &e);
                 let stat = self
                     .assertion_stats
                     .entry(span_key)
@@ -39457,7 +40450,7 @@ impl Simulator {
             // once to collect the `$past`-referenced signal names.
             self.refresh_sva_past_snapshots(i, &body);
             let prev_active = self.active_sva_site.replace(i);
-            self.tick_sva_body(span_key, i, &body);
+            self.tick_sva_body(span_key, i, &body, &sampled_ids);
             self.active_sva_site = prev_active;
         }
     }
@@ -39542,7 +40535,16 @@ impl Simulator {
     }
 
     /// LRM §16.5: process one clock fire of an SVA property body.
-    fn tick_sva_body(&mut self, span_key: usize, site_idx: usize, body: &Expression) {
+    /// `sampled_ids` are the body's referenced signal ids whose Preponed
+    /// (slot-entry) values the antecedent/consequent predicates must sample
+    /// (see `eval_sva_sampled`).
+    fn tick_sva_body(
+        &mut self,
+        span_key: usize,
+        site_idx: usize,
+        body: &Expression,
+        sampled_ids: &[usize],
+    ) {
         // LRM §16.6 `disable iff (g)` wrapper. The parser encodes the
         // clause as `Binary{LogAnd, !g, inner_body}`. When `g` is true
         // (so `!g` is false), the property is suppressed for this
@@ -39561,7 +40563,7 @@ impl Simulator {
                         }
                         // Guard false: process the inner body as
                         // normal.
-                        return self.tick_sva_body(span_key, site_idx, right);
+                        return self.tick_sva_body(span_key, site_idx, right, sampled_ids);
                     }
                 }
             }
@@ -39576,7 +40578,7 @@ impl Simulator {
             ExprKind::Binary { op, left, right }
                 if matches!(op, crate::ast::expr::BinaryOp::OrFatArrow) =>
             {
-                let lhs_true = self.eval_expr(left).is_true();
+                let lhs_true = self.eval_sva_sampled(sampled_ids, left);
                 if lhs_true {
                     if let ExprKind::Unary { op: uop, operand } = &right.kind {
                         if matches!(uop, crate::ast::expr::UnaryOp::SEventually) {
@@ -39620,7 +40622,7 @@ impl Simulator {
             ExprKind::Binary { op, left, right }
                 if matches!(op, crate::ast::expr::BinaryOp::OrMinusArrow) =>
             {
-                let lhs = self.eval_expr(left).is_true();
+                let lhs = self.eval_sva_sampled(sampled_ids, left);
                 if !lhs {
                     let stat =
                         self.assertion_stats
@@ -39650,7 +40652,7 @@ impl Simulator {
                     }
                 }
                 // `lhs |-> rhs` (overlap): check rhs now.
-                let outcome = self.eval_expr(right).is_true();
+                let outcome = self.eval_sva_sampled(sampled_ids, right);
                 let stat = self
                     .assertion_stats
                     .entry(span_key)
@@ -39668,7 +40670,7 @@ impl Simulator {
             }
             // Plain boolean body: tally directly each clock.
             _ => {
-                let outcome = self.eval_expr(body).is_true();
+                let outcome = self.eval_sva_sampled(sampled_ids, body);
                 let stat = self
                     .assertion_stats
                     .entry(span_key)
@@ -67597,6 +68599,21 @@ fn vpi_slice_write(sim: &Simulator, h: &VpiHandle, val: &Value) -> Option<Value>
 /// forever. Any unresolvable dotted name hung the simulator — reachable
 /// straight from `uvm_hdl_check_path`, whose whole job is to ask about
 /// paths that may not exist.
+/// §35.5.4 DPI export dispatch. The generated trampoline shared object calls
+/// this from C to run an exported SystemVerilog subroutine. `id` is the
+/// subroutine's declaration-order index; `n` args are 64-bit integer slots.
+#[no_mangle]
+pub extern "C" fn __xezim_dpi_export_dispatch(
+    id: libc::c_longlong,
+    n: libc::c_longlong,
+    a: *const libc::c_longlong,
+) -> libc::c_longlong {
+    try_active_sim("__xezim_dpi_export_dispatch", |sim| {
+        sim.run_dpi_export(id as usize, n.max(0) as usize, a as *const i64) as libc::c_longlong
+    })
+    .unwrap_or(0)
+}
+
 #[no_mangle]
 pub extern "C" fn vpi_handle_by_name(
     name: *mut libc::c_char,
