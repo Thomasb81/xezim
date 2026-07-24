@@ -60356,6 +60356,42 @@ impl Simulator {
                     }
                     continue;
                 }
+                // A class-typed property with an inline `= new(...)` must be
+                // CONSTRUCTED here, mirroring the statement-assignment path
+                // (`lvalue = new(args)` -> instantiate_class_with_type_args).
+                // The expr_contains_call skip below leaves it null otherwise,
+                // so a property like `my_catcher catcher = new(14);` (whose
+                // constructor is never explicitly called in the enclosing
+                // new()) stays null -- surfacing as UVM "Null callback object
+                // cannot be registered" (CBUNREG) and silent null-handle
+                // failures across many tests. Only fires for a property whose
+                // declared type is a user class (containers are handled above).
+                if is_new {
+                    let prop_tn = cdef
+                        .properties
+                        .get(&pname)
+                        .and_then(|s| s.type_name.clone());
+                    if let Some(tn) = prop_tn {
+                        if self.module.classes.contains_key(&tn) {
+                            if let ExprKind::Call { args, .. } = &init.kind {
+                                if let Some(cd2) = self.module.classes.get(&tn).cloned() {
+                                    // Resolve any type-parameter bindings the
+                                    // ctor args may need from the active spec.
+                                    let ta = self.this_property_type_args(&pname);
+                                    let v = self.instantiate_class_with_type_args(
+                                        &cd2,
+                                        args,
+                                        ta.as_deref(),
+                                    );
+                                    if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                        inst.properties.insert(pname, v);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
                 // Only re-evaluate side-effect-free initializers. Ones that call
                 // a function or constructor (`= new`, `= f()`) can recurse or
                 // mutate state and are the constructor's job; leave their
