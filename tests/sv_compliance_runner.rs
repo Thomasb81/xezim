@@ -180,6 +180,10 @@ fn test_sv_20c_clocking_resume() {
     run_positive_compliance_test("tests", "20c_clocking_resume.sv");
 }
 #[test]
+fn test_sv_20d_clocking_negedge() {
+    run_positive_compliance_test("tests", "20d_clocking_negedge.sv");
+}
+#[test]
 fn test_sv_21_strings_typedef_casts() {
     run_positive_compliance_test("tests_advanced", "21_strings_typedef_casts.sv");
 }

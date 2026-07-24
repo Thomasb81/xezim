@@ -2432,6 +2432,11 @@ pub struct Simulator {
     clocking_output_pending: HashMap<String, Vec<(String, Value)>>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
+    /// LRM §14.3: each clocking block's clock EDGE (`@(posedge/negedge clk)`).
+    /// `tick_clocking_blocks` and `@(cb)` resolution consult this so a
+    /// `@(negedge clk)` block samples/advances on the negedge, not the posedge.
+    /// Absent ⇒ posedge (the default and by far the common case).
+    clocking_edge: HashMap<String, EdgeKind>,
     /// LRM §14.4 `#1step` input skew — Preponed (slot-entry) value of every
     /// clocking-block INPUT signal, keyed by signal name. Captured at the top
     /// of each time slot BEFORE the active/NBA regions run (same point as
@@ -4883,6 +4888,7 @@ impl Simulator {
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
+            clocking_edge: HashMap::default(),
             clocking_preponed: HashMap::default(),
             deferred_clocking_conts: Vec::new(),
             pending_reactive: Vec::new(),
@@ -8360,6 +8366,11 @@ impl Simulator {
         // consumes this to maintain `clocking_snapshots`.
         for (cb_name, cd) in self.module.clocking_blocks.iter() {
             let clk = cd.clock_signal.as_ref().map(|i| i.name.clone());
+            let edge = match cd.clock_edge {
+                Some(crate::ast::stmt::Edge::Negedge) => EdgeKind::Negedge,
+                Some(crate::ast::stmt::Edge::Edge) => EdgeKind::LsbEdge,
+                _ => EdgeKind::Posedge,
+            };
             if let Some(clk) = clk {
                 let sigs: Vec<(String, bool)> = cd
                     .signals
@@ -8380,8 +8391,11 @@ impl Simulator {
                 if cd.is_default {
                     self.clocking_meta
                         .insert("__xz_default_clocking".to_string(), (clk.clone(), sigs.clone()));
+                    self.clocking_edge
+                        .insert("__xz_default_clocking".to_string(), edge);
                 }
                 self.clocking_meta.insert(cb_name.clone(), (clk, sigs));
+                self.clocking_edge.insert(cb_name.clone(), edge);
                 self.clocking_prev_clock.insert(cb_name.clone(), 2);
                 self.clocking_snapshots
                     .insert(cb_name.clone(), HashMap::default());
@@ -8396,6 +8410,11 @@ impl Simulator {
             if let Some(v) = self.clocking_meta.values().next().cloned() {
                 self.clocking_meta
                     .insert("__xz_default_clocking".to_string(), v);
+            }
+            if let Some((k, e)) = self.clocking_edge.iter().next().map(|(k, e)| (k.clone(), *e)) {
+                let _ = k;
+                self.clocking_edge
+                    .insert("__xz_default_clocking".to_string(), e);
             }
         }
         // Seed the runtime string_signals set from the elab-time map so that
@@ -17404,7 +17423,11 @@ impl Simulator {
                             if let Some((clk, _)) = self.clocking_meta.get(&sig) {
                                 out.push(Sensitivity {
                                     signal_name: clk.clone(),
-                                    edge: EdgeKind::Posedge,
+                                    edge: self
+                                        .clocking_edge
+                                        .get(&sig)
+                                        .copied()
+                                        .unwrap_or(EdgeKind::Posedge),
                                     iff: ee.iff.clone(),
                                 });
                                 continue;
@@ -40828,7 +40851,20 @@ impl Simulator {
                 .unwrap_or(2);
             let prev = *self.clocking_prev_clock.get(&cb).unwrap_or(&2);
             self.clocking_prev_clock.insert(cb.clone(), cur);
-            if !(prev == 0 && cur == 1) {
+            // §14.3: advance on the block's declared clock edge (posedge by
+            // default; negedge / any-edge when so declared).
+            let edge = self
+                .clocking_edge
+                .get(&cb)
+                .copied()
+                .unwrap_or(EdgeKind::Posedge);
+            let fired = match edge {
+                EdgeKind::Negedge => prev == 1 && cur == 0,
+                EdgeKind::Posedge => prev == 0 && cur == 1,
+                // `edge` / any: any resolved 0↔1 transition.
+                _ => prev != cur && prev != 2 && cur != 2,
+            };
+            if !fired {
                 continue;
             }
             // Posedge: refresh input snapshots from the Preponed samples
