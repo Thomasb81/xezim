@@ -1942,11 +1942,6 @@ struct DpiBinding {
     fn_ptr: CodePtr,
 }
 
-#[repr(C)]
-struct DpiLogicVecVal {
-    aval: *mut u32,
-    bval: *mut u32,
-}
 
 /// Parse `<base>[<idx>]` and resolve via the compact 1D-array map.
 /// Free function so it can be shared between the `&self` resolver on
@@ -7445,30 +7440,21 @@ impl Simulator {
                         Some(&self.module.parameters),
                         Some(&self.module.typedefs),
                     );
-                    if w <= 64 {
-                        Some(if out_dir {
-                            DpiArgKind::Int64Out
-                        } else {
-                            DpiArgKind::Int64In
-                        })
-                    } else {
-                        // 2-state `bit` -> svBitVecVal* (just uint32_t*).
-                        // 4-state `logic`/`reg` -> svLogicVecVal* ({aval, bval}*).
-                        let is_2state = matches!(kind, crate::ast::types::IntegerVectorType::Bit);
-                        Some(if out_dir {
-                            if is_2state {
-                                DpiArgKind::VecBitOut(w)
-                            } else {
-                                DpiArgKind::VecLogicOut(w)
-                            }
-                        } else {
-                            if is_2state {
-                                DpiArgKind::VecBitIn(w)
-                            } else {
-                                DpiArgKind::VecLogicIn(w)
-                            }
-                        })
-                    }
+                    // IEEE 1800-2017 Annex H.10.2: a PACKED array `bit [N]` /
+                    // `logic [N]` maps to svBitVecVal* / svLogicVecVal* — a
+                    // POINTER — for EVERY width, not only > 64 bits. (The
+                    // scalar atoms int/byte/shortint/longint pass by value via
+                    // their own arms.) Passing a packed vector by value where
+                    // the C dereferences the svBitVecVal* pointer crashed.
+                    // 2-state `bit` -> svBitVecVal* (plain uint32_t*).
+                    // 4-state `logic`/`reg` -> svLogicVecVal* ({aval, bval}*).
+                    let is_2state = matches!(kind, crate::ast::types::IntegerVectorType::Bit);
+                    Some(match (out_dir, is_2state) {
+                        (true, true) => DpiArgKind::VecBitOut(w),
+                        (true, false) => DpiArgKind::VecLogicOut(w),
+                        (false, true) => DpiArgKind::VecBitIn(w),
+                        (false, false) => DpiArgKind::VecLogicIn(w),
+                    })
                 }
             }
             DataType::Implicit { dimensions, .. } if dimensions.is_empty() => Some(if out_dir {
@@ -7477,28 +7463,19 @@ impl Simulator {
                 DpiArgKind::Int32In
             }),
             DataType::Implicit { dimensions, .. } => {
-                let w = if dimensions.is_empty() {
-                    32
+                // Implicitly-typed with a packed range (`[N:0] x`) is a 4-state
+                // packed vector -> svLogicVecVal* pointer at every width
+                // (Annex H.10.2), same as an explicit `logic [N:0]`.
+                let w = super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                Some(if out_dir {
+                    DpiArgKind::VecLogicOut(w)
                 } else {
-                    super::elaborate::resolve_type_width(
-                        dt,
-                        Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
-                    )
-                };
-                if w <= 64 {
-                    Some(if out_dir {
-                        DpiArgKind::Int64Out
-                    } else {
-                        DpiArgKind::Int64In
-                    })
-                } else {
-                    Some(if out_dir {
-                        DpiArgKind::VecLogicOut(w)
-                    } else {
-                        DpiArgKind::VecLogicIn(w)
-                    })
-                }
+                    DpiArgKind::VecLogicIn(w)
+                })
             }
             DataType::Real { kind, .. } => match kind {
                 crate::ast::types::RealType::ShortReal => Some(if out_dir {
@@ -7689,16 +7666,46 @@ impl Simulator {
             let w = bit / 32;
             let m = 1u32 << (bit % 32);
             match v.get_bit(bit) {
+                // §35.5.5 encoding: 0=(a0,b0) 1=(a1,b0) Z=(a0,b1) X=(a1,b1).
+                // (Matches VPI's bit_code_to_ab and the shipped header — DPI
+                // previously had X and Z swapped.)
                 LogicBit::Zero => {}
                 LogicBit::One => aval[w] |= m,
-                LogicBit::X => bval[w] |= m,
-                LogicBit::Z => {
+                LogicBit::Z => bval[w] |= m,
+                LogicBit::X => {
                     aval[w] |= m;
                     bval[w] |= m;
                 }
             }
         }
         (aval, bval)
+    }
+
+    /// Value -> the STANDARD svLogicVecVal buffer: an array of `s_vpi_vecval`
+    /// {aval, bval} pairs, i.e. INTERLEAVED u32 words [a0, b0, a1, b1, ...]
+    /// (§35.5.5 / Annex H.10.2). This is the layout xezim's shipped svdpi.h
+    /// declares and what standard DPI code + UVM's HDL backdoor expect.
+    fn dpi_value_to_logic_interleaved(v: &Value, width: u32) -> Vec<u32> {
+        let (aval, bval) = Self::dpi_value_to_logic_words(v, width);
+        let n = aval.len();
+        let mut out = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            out.push(aval[i]);
+            out.push(bval[i]);
+        }
+        out
+    }
+
+    /// The inverse: an interleaved [a0, b0, a1, b1, ...] buffer -> Value.
+    fn dpi_logic_interleaved_to_value(buf: &[u32], width: u32) -> Value {
+        let n = buf.len() / 2;
+        let mut aval = Vec::with_capacity(n);
+        let mut bval = Vec::with_capacity(n);
+        for i in 0..n {
+            aval.push(buf[2 * i]);
+            bval.push(buf[2 * i + 1]);
+        }
+        Self::dpi_logic_words_to_value(&aval, &bval, width)
     }
 
     fn dpi_logic_words_to_value(aval: &[u32], bval: &[u32], width: u32) -> Value {
@@ -7711,8 +7718,8 @@ impl Simulator {
             let lb = match (a, b) {
                 (false, false) => LogicBit::Zero,
                 (true, false) => LogicBit::One,
-                (false, true) => LogicBit::X,
-                (true, true) => LogicBit::Z,
+                (false, true) => LogicBit::Z,
+                (true, true) => LogicBit::X,
             };
             out.set_bit(bit, lb);
         }
@@ -7847,7 +7854,7 @@ impl Simulator {
         let mut i64_vals: Vec<Box<i64>> = Vec::with_capacity(arg_kinds.len());
         let mut f32_vals: Vec<Box<f32>> = Vec::with_capacity(arg_kinds.len());
         let mut f64_vals: Vec<Box<f64>> = Vec::with_capacity(arg_kinds.len());
-        // CRITICAL: ptr_vals, logic_aval, logic_bval must never reallocate
+        // CRITICAL: ptr_vals, logic_aval must never reallocate
         // after the loop, because arg_refs holds references into their Box
         // contents. Pre-allocate capacity to prevent mid-loop reallocation.
         let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::with_capacity(arg_kinds.len());
@@ -7855,8 +7862,6 @@ impl Simulator {
         let mut open_i32_vals: Vec<Vec<i32>> = Vec::with_capacity(arg_kinds.len());
         let mut cstrings: Vec<CString> = Vec::with_capacity(arg_kinds.len());
         let mut logic_aval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
-        let mut logic_bval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
-        let mut logic_hdrs: Vec<Box<DpiLogicVecVal>> = Vec::with_capacity(arg_kinds.len());
         let mut writebacks: Vec<(usize, DpiArgKind, Expression)> = Vec::new();
 
         for (i, kind) in arg_kinds.iter().enumerate() {
@@ -7972,24 +7977,16 @@ impl Simulator {
                     }
                 }
                 DpiArgKind::VecLogicIn(width) => {
+                    // Standard svLogicVecVal*: pointer to an interleaved array
+                    // of {aval, bval} u32 pairs (see dpi_value_to_logic_interleaved).
                     let vv = args
                         .get(i)
                         .map(|e| self.eval_expr(e))
                         .unwrap_or_else(|| Value::zero(*width));
-                    let (aval, bval) = Self::dpi_value_to_logic_words(&vv, *width);
-                    // CRITICAL: store in Vec FIRST, then capture pointer.
-                    // Otherwise Vec push may reallocate, invalidating the pointer.
-                    logic_aval.push(aval);
-                    logic_bval.push(bval);
-                    let hdr = Box::new(DpiLogicVecVal {
-                        aval: logic_aval.last_mut().unwrap().as_mut_ptr(),
-                        bval: logic_bval.last_mut().unwrap().as_mut_ptr(),
-                    });
-                    let p = Box::new(
-                        (&*hdr as *const DpiLogicVecVal as *mut DpiLogicVecVal).cast::<c_void>(),
-                    );
-                    logic_hdrs.push(hdr);
-                    ptr_vals.push(p);
+                    let buf = Self::dpi_value_to_logic_interleaved(&vv, *width);
+                    logic_aval.push(buf);
+                    let raw_ptr = logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>();
+                    ptr_vals.push(Box::new(raw_ptr));
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                 }
                 DpiArgKind::VecLogicOut(width) => {
@@ -7997,22 +7994,13 @@ impl Simulator {
                         .get(i)
                         .map(|e| self.eval_expr(e))
                         .unwrap_or_else(|| Value::zero(*width));
-                    let (aval, bval) = Self::dpi_value_to_logic_words(&init, *width);
-                    // CRITICAL: store in Vec FIRST, then capture pointer (see VecLogicIn).
-                    logic_aval.push(aval);
-                    logic_bval.push(bval);
-                    let hdr = Box::new(DpiLogicVecVal {
-                        aval: logic_aval.last_mut().unwrap().as_mut_ptr(),
-                        bval: logic_bval.last_mut().unwrap().as_mut_ptr(),
-                    });
-                    let p = Box::new(
-                        (&*hdr as *const DpiLogicVecVal as *mut DpiLogicVecVal).cast::<c_void>(),
-                    );
-                    logic_hdrs.push(hdr);
-                    ptr_vals.push(p);
+                    let buf = Self::dpi_value_to_logic_interleaved(&init, *width);
+                    logic_aval.push(buf);
+                    let raw_ptr = logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>();
+                    ptr_vals.push(Box::new(raw_ptr));
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
-                        writebacks.push((logic_hdrs.len() - 1, *kind, expr.clone()));
+                        writebacks.push((logic_aval.len() - 1, *kind, expr.clone()));
                     }
                 }
                 DpiArgKind::VecBitIn(width) => {
@@ -8240,21 +8228,13 @@ impl Simulator {
                     }
                 }
                 DpiArgKind::VecLogicOut(width) => {
-                    if idx < logic_aval.len() && idx < logic_bval.len() {
-                        let out = Self::dpi_logic_words_to_value(
+                    if idx < logic_aval.len() {
+                        let out = Self::dpi_logic_interleaved_to_value(
                             &logic_aval[idx],
-                            &logic_bval[idx],
-                        width,
+                            width,
                         );
                         let w = self.infer_lhs_width(&expr);
                         self.assign_value(&expr, &out.resize(w));
-                    } else {
-                        eprintln!(
-                            "[DBG-WB] VecLogicOut idx={} OUT OF RANGE aval.len={} bval.len={}",
-                            idx,
-                            logic_aval.len(),
-                            logic_bval.len()
-                        );
                     }
                 }
                 DpiArgKind::VecBitOut(width)
