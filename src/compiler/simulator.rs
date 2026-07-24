@@ -2866,6 +2866,14 @@ pub struct Simulator {
     /// re-triggers itself through its own delay could recurse without bound.
     /// Bounded by `EDGE_PASS_DEPTH_LIMIT`.
     edge_pass_depth: u32,
+    /// §9.4.2 bit-select event terms: `(signal_id, block_idx) -> bit`, for
+    /// `always @(v[3])` / `@(posedge v[3])`. Edge sensitivity is otherwise
+    /// tracked per SIGNAL, so a block watching `v[0]` also woke on a change to
+    /// `v[3]`. Kept as a sparse side map rather than a field on `SensitivityId`
+    /// because bit-select terms are rare and the dispatch loop is the hottest
+    /// path in the simulator: when this map is empty the extra work is a single
+    /// already-hot bool test.
+    bitsel_edge_sens: HashMap<(usize, usize), u32>,
     /// Reusable bitmap for `check_edges`. Hoisted out of the per-iteration
     /// `vec![false; blocks.len()]` to avoid ~10 K-byte alloc/drop on every
     /// settle iter (8938 iters × ~10 K blocks = 89 MB churn on c910 hello).
@@ -5132,6 +5140,7 @@ impl Simulator {
             settling: false,
             in_edge_block: false,
             edge_pass_depth: 0,
+            bitsel_edge_sens: HashMap::default(),
             edge_triggered_bitmap: Vec::new(),
             edge_triggered_list: Vec::new(),
             edge_prefilter_seen: Vec::new(),
@@ -12387,6 +12396,64 @@ impl Simulator {
         }
     }
 
+    /// Constant bit-select event terms of an explicit event control, as
+    /// `(signal_id, bit)`. `@(v[3])`, `@(posedge v[3])` and `@(v[3] or w)` all
+    /// yield the pair for `v`; a non-constant index (`@(v[i])`) yields nothing,
+    /// so those keep whole-signal sensitivity — that block also needs to wake
+    /// when the INDEX moves.
+    fn const_bitselect_event_terms(&self, stmt: &Statement) -> Vec<(usize, u32)> {
+        let mut out: Vec<(usize, u32)> = Vec::new();
+        let control = match &stmt.kind {
+            StatementKind::TimingControl { control, .. } => Some(control),
+            StatementKind::SeqBlock { stmts, .. } => match stmts.first().map(|s| &s.kind) {
+                Some(StatementKind::TimingControl { control, .. }) => Some(control),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(TimingControl::Event(EventControl::EventExpr(exprs))) = control else {
+            return out;
+        };
+        let top_prefix = format!("{}.", self.module.name);
+        for ee in exprs {
+            let mut e = &ee.expr;
+            while let ExprKind::Paren(inner) = &e.kind {
+                e = inner;
+            }
+            let ExprKind::Index { expr: base, index } = &e.kind else {
+                continue;
+            };
+            let ExprKind::Ident(h) = &base.kind else {
+                continue;
+            };
+            // A select on an ARRAY picks an element, not a bit — leave it.
+            if self.module.arrays.contains_key(Self::resolve_hier_name_static(h, &self.module).as_str()) {
+                continue;
+            }
+            let Some(bit) = Self::try_const_u64(index).and_then(|b| u32::try_from(b).ok())
+            else {
+                continue;
+            };
+            let raw = Self::resolve_hier_name_static(h, &self.module);
+            let sid = self
+                .signal_name_to_id
+                .get(raw.as_str())
+                .copied()
+                .or_else(|| {
+                    raw.strip_prefix(&top_prefix)
+                        .and_then(|b| self.signal_name_to_id.get(b).copied())
+                });
+            if let Some(sid) = sid {
+                // Only bits the u64 fast path can test; wider selects keep the
+                // whole-signal superset.
+                if bit < 64 && (self.signal_widths.get(sid).copied().unwrap_or(0) as u32) > bit {
+                    out.push((sid, bit));
+                }
+            }
+        }
+        out
+    }
+
     fn classify_one_always_block(&mut self, ab: AlwaysBlock) -> Option<AlwaysBlock> {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
@@ -12514,6 +12581,16 @@ impl Simulator {
                         None
                     })
                     .collect();
+                let block_idx = self.edge_blocks.len();
+                // §9.4.2: record constant bit-select event terms (`@(v[3])`).
+                // `event_to_sens` walks past the select and yields the BASE
+                // signal, so without this the block would wake on a change to
+                // any bit of `v`. `check_edges_inner` narrows the wake to this
+                // bit; terms whose index is not a constant keep the (safe,
+                // superset) whole-signal behaviour.
+                for (sid, bit) in self.const_bitselect_event_terms(&ab.stmt) {
+                    self.bitsel_edge_sens.insert((sid, block_idx), bit);
+                }
                 Arc::make_mut(&mut self.edge_blocks).push(EdgeSensitiveBlock {
                     resolved_sensitivities: resolved,
                     stmt: body,
@@ -24999,6 +25076,7 @@ impl Simulator {
         let mut triggered = std::mem::take(&mut self.edge_triggered_list);
         triggered.clear();
         let triggered_bitmap = &mut self.edge_triggered_bitmap[..blocks.len()];
+        let bitsel_active = !self.bitsel_edge_sens.is_empty();
         let armed_prefilter = self.armed_edge
             && !self.armed_edge_shadow
             && self.event_skip
@@ -25126,9 +25204,36 @@ impl Simulator {
             // which is symmetric for hyperedge weight purposes.
             let mut woke_any = false;
             macro_rules! dispatch_block {
-                ($block_idx:expr) => {{
+                ($block_idx:expr, $kind:expr) => {{
                     let block_idx = $block_idx;
-                    if block_idx < triggered_bitmap.len()
+                    // §9.4.2 bit-select term (`@(v[3])`): detection above is per
+                    // SIGNAL, so re-test the one bit this block actually watches
+                    // and drop the wake when only a sibling bit moved. Mirrors
+                    // the whole-signal formulas, on bit `b` instead of bit 0.
+                    let bitsel_ok = !bitsel_active
+                        || match self.bitsel_edge_sens.get(&(sid, block_idx)) {
+                            None => true,
+                            Some(&b) => {
+                                let cb = (cur_v >> b) & 1;
+                                let cx = (cur_x >> b) & 1;
+                                let pb = (prev_v >> b) & 1;
+                                let px = (prev_x >> b) & 1;
+                                let cur_one = cb == 1 && cx == 0;
+                                let cur_zero = cb == 0 && cx == 0;
+                                let prev_one = pb == 1 && px == 0;
+                                let prev_zero = pb == 0 && px == 0;
+                                match $kind {
+                                    EdgeKind::Posedge => !prev_one && cur_one,
+                                    EdgeKind::Negedge => !prev_zero && cur_zero,
+                                    EdgeKind::AnyEdge => cb != pb || cx != px,
+                                    EdgeKind::LsbEdge => {
+                                        (!prev_one && cur_one) || (!prev_zero && cur_zero)
+                                    }
+                                }
+                            }
+                        };
+                    if bitsel_ok
+                        && block_idx < triggered_bitmap.len()
                         && !(iff_active && iff_denied[block_idx])
                     {
                         let skip_early = armed_prefilter
@@ -25164,23 +25269,23 @@ impl Simulator {
             }
             if fires_pos {
                 for &block_idx in &fanout.posedge {
-                    dispatch_block!(block_idx);
+                    dispatch_block!(block_idx, EdgeKind::Posedge);
                 }
             }
             if fires_neg {
                 for &block_idx in &fanout.negedge {
-                    dispatch_block!(block_idx);
+                    dispatch_block!(block_idx, EdgeKind::Negedge);
                 }
             }
             if fires_any {
                 for &block_idx in &fanout.anyedge {
-                    dispatch_block!(block_idx);
+                    dispatch_block!(block_idx, EdgeKind::AnyEdge);
                 }
             }
             // §9.4.2 `@(edge x)`: an LSB posedge OR negedge (not any change).
             if fires_pos || fires_neg {
                 for &block_idx in &fanout.lsbedge {
-                    dispatch_block!(block_idx);
+                    dispatch_block!(block_idx, EdgeKind::LsbEdge);
                 }
             }
             if woke_any

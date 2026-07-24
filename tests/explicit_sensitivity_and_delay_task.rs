@@ -154,3 +154,36 @@ fn edge_made_inside_nested_delay_is_delivered() {
     let sim = simulate(NESTED_EDGE_CLOCK, 100).expect("simulate failed");
     assert_eq!(get(&sim, "fires") & 0xFF, 2);
 }
+
+/// §9.4.2 — `always @(v[0])` must wake only on bit 0. Edge sensitivity is
+/// tracked per SIGNAL, so a block watching `datain[0]` also woke when
+/// `datain[3]` changed. A constant bit-select term now narrows the wake to its
+/// own bit; a non-constant index (`@(v[i])`) keeps whole-signal sensitivity,
+/// since that block must also wake when the INDEX moves.
+const BITSEL_SENSITIVITY: &str = r#"
+module tb;
+  reg [3:0] datain;
+  reg [7:0] hits_b0, hits_b3;
+
+  initial begin datain = 4'b0000; hits_b0 = 8'h00; hits_b3 = 8'h00; end
+
+  always @(datain[0]) hits_b0 = hits_b0 + 8'h01;
+  always @(datain[3]) hits_b3 = hits_b3 + 8'h01;
+
+  initial begin
+    #1 datain[3] = 1'b1;   // only bit 3 -> hits_b3 only
+    #1 datain[3] = 1'b0;   // only bit 3 -> hits_b3 only
+    #1 datain[0] = 1'b1;   // only bit 0 -> hits_b0 only
+    #1;
+  end
+endmodule
+"#;
+
+#[test]
+fn bit_select_sensitivity_wakes_only_on_its_own_bit() {
+    let sim = simulate(BITSEL_SENSITIVITY, 100).expect("simulate failed");
+    // One init fire (x->0) + one real change on bit 0.
+    assert_eq!(get(&sim, "hits_b0") & 0xFF, 2);
+    // One init fire + two real changes on bit 3.
+    assert_eq!(get(&sim, "hits_b3") & 0xFF, 3);
+}
