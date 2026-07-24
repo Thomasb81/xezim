@@ -2859,6 +2859,13 @@ pub struct Simulator {
     obj_rng_stack: Vec<usize>,
     settling: bool,
     in_edge_block: bool,
+    /// Nesting depth of `check_edges_inner`. A `#delay` inside an edge block's
+    /// body re-enters the edge machinery through the synchronous
+    /// `TimingControl::Delay` arm; now that a nested pass sees the real block
+    /// list (see `edge_blocks`) it can genuinely fire blocks, so a block that
+    /// re-triggers itself through its own delay could recurse without bound.
+    /// Bounded by `EDGE_PASS_DEPTH_LIMIT`.
+    edge_pass_depth: u32,
     /// Reusable bitmap for `check_edges`. Hoisted out of the per-iteration
     /// `vec![false; blocks.len()]` to avoid ~10 K-byte alloc/drop on every
     /// settle iter (8938 iters × ~10 K blocks = 89 MB churn on c910 hello).
@@ -2905,7 +2912,13 @@ pub struct Simulator {
     /// many partial-range NBAs (c910 testbench wrappers — thousands per
     /// posedge clk). Cleared by `apply_nba` once the entries are drained.
     nba_fast_index: NbaFastIndex,
-    edge_blocks: Vec<EdgeSensitiveBlock>,
+    /// Edge-sensitive always blocks. Behind an `Arc` so an edge pass can hold a
+    /// cheap handle to the list while `self` stays fully usable: the pass used
+    /// to `mem::take` this Vec, which left it EMPTY for the duration. Any
+    /// re-entrant lookup — a nested `check_edges` from a `#delay` in an edge
+    /// block's body, or the `self.edge_blocks.get(bi)` probes elsewhere — then
+    /// saw nothing and silently dropped every block (see `check_edges_inner`).
+    edge_blocks: Arc<Vec<EdgeSensitiveBlock>>,
     /// Bytecode-compiled edge blocks (for blocks that compiled successfully).
     /// Index matches edge_blocks. None = fallback to AST interpreter.
     compiled_edge_blocks: Vec<Option<super::bytecode::CompiledBlock>>,
@@ -5118,6 +5131,7 @@ impl Simulator {
             obj_rng_stack: Vec::new(),
             settling: false,
             in_edge_block: false,
+            edge_pass_depth: 0,
             edge_triggered_bitmap: Vec::new(),
             edge_triggered_list: Vec::new(),
             edge_prefilter_seen: Vec::new(),
@@ -5133,7 +5147,7 @@ impl Simulator {
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.
             nba_fast_index: NbaFastIndex::with_dense_prefix(named_count),
-            edge_blocks: Vec::new(),
+            edge_blocks: Arc::new(Vec::new()),
             compiled_edge_blocks: Vec::new(),
             jit_fns: Vec::new(),
             jit_module: None,
@@ -8841,7 +8855,7 @@ impl Simulator {
         // local Vec first so we can release the &self.id_to_name borrow
         // before mutating self.edge_signal_names.
         let mut edge_sens: Vec<(String, usize)> = Vec::new();
-        for block in &self.edge_blocks {
+        for block in self.edge_blocks.iter() {
             for sens in &block.resolved_sensitivities {
                 if sens.signal_id < self.id_to_name.len() {
                     edge_sens.push((self.name_for_id(sens.signal_id).to_string(), sens.signal_id));
@@ -8863,7 +8877,7 @@ impl Simulator {
         // for RTL edge blocks and always-on rather than --primitive-verbose.)
         if !self.module.implicit_nets.is_empty() {
             let mut hit: HashMap<String, usize> = HashMap::default();
-            for block in &self.edge_blocks {
+            for block in self.edge_blocks.iter() {
                 for sens in &block.resolved_sensitivities {
                     let name = self.name_for_id(sens.signal_id);
                     if self.module.implicit_nets.contains(name) {
@@ -12500,7 +12514,7 @@ impl Simulator {
                         None
                     })
                     .collect();
-                self.edge_blocks.push(EdgeSensitiveBlock {
+                Arc::make_mut(&mut self.edge_blocks).push(EdgeSensitiveBlock {
                     resolved_sensitivities: resolved,
                     stmt: body,
                     kind: ab.kind,
@@ -12644,7 +12658,7 @@ impl Simulator {
         let mut compiled = Vec::with_capacity(self.edge_blocks.len());
         let mut bc_count = 0;
         let mut max_regs: u32 = 0;
-        for block in &self.edge_blocks {
+        for block in self.edge_blocks.iter() {
             // Scope hint for unqualified idents inside the block: the
             // block's own inlining scope when it has one, else derived from
             // the first sensitivity signal. (Sensitivity-only derivation
@@ -24830,6 +24844,18 @@ impl Simulator {
     }
 
     fn check_edges_inner(&mut self, detect_subset: Option<&[usize]>, validate_coverage: bool) {
+        // A `#delay` in an edge block's body re-enters here through the
+        // synchronous `TimingControl::Delay` arm. That is legitimate — the
+        // delay's own region flush must deliver edges made before it — but a
+        // block that keeps re-triggering itself across its delay would recurse
+        // forever, so bound the nesting. At the cap we stop descending; the
+        // outer pass's post-exec rescan still delivers what is pending.
+        const EDGE_PASS_DEPTH_LIMIT: u32 = 8;
+        if self.edge_pass_depth >= EDGE_PASS_DEPTH_LIMIT {
+            return;
+        }
+        self.edge_pass_depth += 1;
+        let outermost_pass = !self.in_edge_block;
         if self.event_measure {
             self.event_phase += 1; // flop SAMPLE phase
         }
@@ -24906,7 +24932,9 @@ impl Simulator {
                 self.finished = false;
             }
         }
-        let blocks = std::mem::take(&mut self.edge_blocks);
+        // Cheap handle; `self.edge_blocks` stays populated so nested passes and
+        // `edge_blocks.get(bi)` probes still see the real list.
+        let blocks = Arc::clone(&self.edge_blocks);
         self.in_edge_block = true;
 
         // Honor `iff` guards on edge-sensitive always blocks (LRM §9.4.2.3).
@@ -25078,6 +25106,8 @@ impl Simulator {
                     self.time, pos, sid
                 );
                 self.finished = true;
+                self.edge_pass_depth -= 1;
+                self.in_edge_block = !outermost_pass;
                 return;
             }
             // Phase-2 toggle counter: any edge means this signal
@@ -26078,8 +26108,10 @@ impl Simulator {
                 *p = val;
             }
         }
-        self.edge_blocks = blocks;
-        self.in_edge_block = false;
+        drop(blocks);
+        self.edge_pass_depth -= 1;
+        // A nested pass must not clear the flag out from under its caller.
+        self.in_edge_block = !outermost_pass;
 
         // Run the triggered waiter continuations IMMEDIATELY (active
         // region of current time-step, before apply_nba commits) so
