@@ -159,6 +159,17 @@ fn assert_dpi_pass(c_file: &str, stem: &str, sv_file: &str) {
 }
 
 #[test]
+fn dpi_export_roundtrip_test() {
+    // §35.5.4: an imported context C function calls back into exported SV
+    // functions + a task. Verifies the exported-symbol trampoline + dispatch.
+    assert_dpi_pass(
+        "tests/dpi/export_roundtrip.c",
+        "export_roundtrip",
+        "tests/dpi/export_roundtrip_test.sv",
+    );
+}
+
+#[test]
 fn dpi_simple_test() {
     assert_dpi_pass(
         "tests/dpi/simple_dpi.c",
