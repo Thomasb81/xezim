@@ -3703,7 +3703,7 @@ where
 /// queue-limit registration, restoring both on return. Without the
 /// registration restore, the caller's queue stays unregistered after the
 /// nested call returns, so its later `delete()` and element reads become
-/// silent no-ops (seen in UVM `09callbacks/20inherit`'s `check_phase`, whose
+/// silent no-ops (seen in UVM's callbacks `check_phase`, whose
 /// local `string p[$]` was unregistered by a nested helper's same-named
 /// local — IEEE 1800-2020 §6.21 automatic-variable per-invocation storage).
 #[derive(Clone, Default, Debug)]
@@ -29577,10 +29577,43 @@ impl Simulator {
                             }
                         }
                     }
-                    if let Some(Some(handle)) = self.this_stack.last() {
-                        if let Some(Some(instance)) = self.heap.get(*handle) {
-                            if let Some(val) = instance.properties.get(name) {
-                                return val.clone();
+                    // A `static` class property must NOT be read from the
+                    // instance's `properties` map: each specialization's
+                    // singleton carries a stale construction-time copy that
+                    // diverges from the shared static cell (e.g. UVM's
+                    // `m_t_inst`, which `get()` writes to the static cell but
+                    // the singleton also retains in its instance map). Defer
+                    // to the `class_static_get` fallback below. LRM §8.9:
+                    // a static property has ONE cell shared across all
+                    // instances.
+                    let is_static_prop = self
+                        .class_context_stack
+                        .last()
+                        .cloned()
+                        .flatten()
+                        .map(|ctx| {
+                            let mut cur = Some(ctx);
+                            let mut found = false;
+                            while let Some(cn) = cur {
+                                if let Some(cd) = self.module.classes.get(&cn) {
+                                    if cd.static_properties.contains(name) {
+                                        found = true;
+                                        break;
+                                    }
+                                    cur = cd.extends.clone();
+                                } else {
+                                    break;
+                                }
+                            }
+                            found
+                        })
+                        .unwrap_or(false);
+                    if !is_static_prop {
+                        if let Some(Some(handle)) = self.this_stack.last() {
+                            if let Some(Some(instance)) = self.heap.get(*handle) {
+                                if let Some(val) = instance.properties.get(name) {
+                                    return val.clone();
+                                }
                             }
                         }
                     }
@@ -46318,7 +46351,7 @@ impl Simulator {
     /// queue-limit registration, restoring both on return. Without the
     /// registration restore, the caller's queue stays unregistered after the
     /// nested call returns, so its later `delete()` / element reads become
-    /// silent no-ops (seen in UVM `09callbacks/20inherit`'s `check_phase`,
+    /// silent no-ops (seen in UVM's callbacks `check_phase`,
     /// whose local `string p[$]` was unregistered by a nested helper's
     /// same-named local).
 
@@ -49706,6 +49739,19 @@ impl Simulator {
             // callback to the wrong instances' queues). LRM §6.20.2/§8.25.
             if let Some(resolved) = self.resolve_type_param_binding(c) {
                 if self.module.classes.contains_key(&resolved) {
+                    return Some(resolved);
+                }
+                // The resolved type may be a value-parameterized
+                // specialization like `special_comp#(1)` (a type param
+                // bound to a value-parameterized class). Return it WITH
+                // the `#(args)` so callers like `$cast`'s cast_type_ok
+                // can strip the base class for the hierarchy check and
+                // compare the value params. Without this, class_of_var
+                // returns None and `$cast` falls back to permissive,
+                // accepting an object of type `special_comp#(2)` as a
+                // `special_comp#(1)` (LRM §8.25: value-param differences
+                // make distinct, non-assignable types).
+                if resolved.contains('#') {
                     return Some(resolved);
                 }
             }
@@ -54524,7 +54570,18 @@ impl Simulator {
                 // (SQRSNDREQCAST). Resolve it to the concrete class via the
                 // current instance's bindings; if it can't be resolved to a known
                 // class, don't enforce (stay permissive like the None case).
-                let raw = if self.module.classes.contains_key(&dt) {
+                //
+                // When the resolved type is ALREADY a value-parameterized
+                // specialization form (e.g. `special_comp#(1)` — produced by
+                // class_of_var resolving a type param bound to a
+                // value-parameterized class), it is NOT a type-param name and
+                // resolve_type_param_binding returns None. Detect the `#` and
+                // pass it through directly; strip_class_specialization below
+                // extracts the base class for the hierarchy check and retains
+                // the args for the value-param comparison. Without this, the
+                // `None` fallback made `$cast` permissive and accepted an
+                // object of `special_comp#(2)` as a `special_comp#(1)`.
+                let raw = if self.module.classes.contains_key(&dt) || dt.contains('#') {
                     dt
                 } else {
                     match self.resolve_type_param_binding(&dt) {
@@ -54540,7 +54597,7 @@ impl Simulator {
                 // `special_comp#(2)` is not in `module.classes`, so the dest
                 // type is unknown and `$cast` falls back to permissive —
                 // leaking a `special_comp#(2)` typewide callback onto a
-                // `special_comp#(1)` instance (UVM 09callbacks/25params).
+                // `special_comp#(1)` instance (a UVM callbacks specialization case).
                 let (base, spec_args_from_name) = Self::strip_class_specialization(&raw);
                 let resolved = if self.module.classes.contains_key(&base) {
                     base
@@ -54561,7 +54618,6 @@ impl Simulator {
             None => true, // unknown dest type — stay permissive
         }
     }
-
     /// Parse a value-parameter spec fragment (decimal or based literal)
     /// to a `u64`, for the `$cast` value-param comparison.
     fn spec_fragment_to_u64(t: &str) -> Option<u64> {
@@ -59507,7 +59563,7 @@ impl Simulator {
     /// class property typed with a parameterized type
     /// (`special_comp#(1) a1;`) had neither, so `this.a1 = new(...)` bound no
     /// type-args and value parameters defaulted — collapsing `#(1)`/`#(2)`
-    /// to `#(0)` (UVM 09callbacks/25params). Elaboration now records these in
+    /// to `#(0)` (a UVM callbacks specialization case). Elaboration now records these in
     /// `ElaboratedClass::property_type_args`; this looks them up.
     fn this_property_type_args(&self, prop_name: &str) -> Option<Vec<Expression>> {
         let h = self.this_stack.last().copied().flatten()?;
@@ -67369,10 +67425,39 @@ impl Simulator {
                 return v.to_u64().map(|h| h as usize);
             }
         }
-        if let Some(Some(handle)) = self.this_stack.last() {
-            if let Some(Some(inst)) = self.heap.get(*handle) {
-                if let Some(v) = inst.properties.get(name) {
-                    return v.to_u64().map(|h| h as usize);
+        // A `static` class property must NOT be read from the instance's
+        // `properties` map: each specialization's singleton carries a stale
+        // construction-time copy that diverges from the shared static cell
+        // (e.g. UVM's `m_t_inst`). Defer to the static fallback below.
+        // LRM §8.9: a static property has ONE cell shared across instances.
+        let is_static_prop = self
+            .class_context_stack
+            .last()
+            .cloned()
+            .flatten()
+            .map(|ctx| {
+                let mut cur = Some(ctx);
+                let mut found = false;
+                while let Some(cn) = cur {
+                    if let Some(cd) = self.module.classes.get(&cn) {
+                        if cd.static_properties.contains(name) {
+                            found = true;
+                            break;
+                        }
+                        cur = cd.extends.clone();
+                    } else {
+                        break;
+                    }
+                }
+                found
+            })
+            .unwrap_or(false);
+        if !is_static_prop {
+            if let Some(Some(handle)) = self.this_stack.last() {
+                if let Some(Some(inst)) = self.heap.get(*handle) {
+                    if let Some(v) = inst.properties.get(name) {
+                        return v.to_u64().map(|h| h as usize);
+                    }
                 }
             }
         }
