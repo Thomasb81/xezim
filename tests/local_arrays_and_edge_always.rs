@@ -97,9 +97,11 @@ fn every_pattern_form_works_on_a_local_array() {
 #[test]
 fn an_explicit_sensitivity_list_fires_once_per_change() {
     let sim = simulate(EDGE_ALWAYS, 200).expect("simulate failed");
-    // `s` goes x->0 at t0 then 0->1 and 1->0: three AnyEdge events.
-    // Before the fix this was 100 (the settle cap).
-    assert_eq!(u(&sim, "c_any"), 3, "always @(edge s) ran away");
+    // Declaration initialization (`logic s = 0`) creates NO event (§6.8,
+    // reference-simulator verified) — only the two real transitions 0->1 and
+    // 1->0 fire. Before the runaway fix this was 100 (the settle cap);
+    // before the t0-baseline fix it was 3 (a phantom x->0 pseudo-edge).
+    assert_eq!(u(&sim, "c_any"), 2, "always @(edge s) ran away");
     assert_eq!(u(&sim, "c_pos"), 1);
     // A blocking `@(edge s)` never had the bug; it sees the two real edges.
     assert_eq!(u(&sim, "c_blk"), 2);
