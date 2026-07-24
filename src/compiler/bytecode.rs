@@ -278,6 +278,15 @@ pub struct BytecodeCompiler<'a> {
     /// then only excludes 1D/packed bases as before. Set via
     /// `set_multi_dim_arrays`.
     multi_dim_arrays: Option<&'a HashSet<String>>,
+    /// Packed-struct field layout: container name → ordered
+    /// `(member, lsb_offset, width)`. Lets a member-write LHS like
+    /// `s.m0` (parsed as a 2-segment `Ident(["<scope>.s", "m0"])` after
+    /// submodule inlining) compile to a constant bit-range write into the
+    /// container signal, instead of bailing to the AST interpreter — where
+    /// its read dependency would resolve bare-first to the wrong (top-scope)
+    /// input and never re-trigger when the real scoped input changes. Set via
+    /// `set_packed_struct_fields`.
+    packed_struct_fields: Option<&'a HashMap<String, Vec<(String, u32, u32)>>>,
 }
 
 impl<'a> BytecodeCompiler<'a> {
@@ -313,7 +322,51 @@ impl<'a> BytecodeCompiler<'a> {
             loop_continue_patches: Vec::new(),
             string_signals: None,
             multi_dim_arrays: None,
+            packed_struct_fields: None,
         }
+    }
+
+    pub fn set_packed_struct_fields(
+        &mut self,
+        f: &'a HashMap<String, Vec<(String, u32, u32)>>,
+    ) {
+        self.packed_struct_fields = Some(f);
+    }
+
+    /// If `hier` names a packed-struct member (`base.member`, where the base
+    /// resolves to a container signal with a registered field layout), return
+    /// `(container_signal_id, lsb_offset, member_width)`. The base may be a
+    /// single segment (`s`) or already scope-qualified with a dot inside the
+    /// first path segment (`d1.s`) after submodule inlining; the member is the
+    /// final path segment.
+    fn packed_struct_member_target(
+        &self,
+        hier: &HierarchicalIdentifier,
+    ) -> Option<(usize, u32, u32)> {
+        let fields_map = self.packed_struct_fields?;
+        if hier.path.len() < 2 || hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let member = hier.path.last()?.name.name.as_str();
+        let base: String = hier.path[..hier.path.len() - 1]
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        // Resolve the container signal id, honoring scope_hint for a bare base.
+        let base_id = self.lookup_signal_id_by_name(&base).or_else(|| {
+            self.scope_hint
+                .as_ref()
+                .and_then(|sc| self.lookup_signal_id_by_name(&format!("{}.{}", sc, base)))
+        })?;
+        // Field layout is keyed by both the bare and scope-qualified base name.
+        let fields = fields_map.get(base.as_str()).or_else(|| {
+            self.scope_hint
+                .as_ref()
+                .and_then(|sc| fields_map.get(&format!("{}.{}", sc, base)))
+        })?;
+        let (_, off, w) = fields.iter().find(|(m, _, _)| m == member)?;
+        Some((base_id, *off, *w))
     }
 
     pub fn set_string_signals(&mut self, s: &'a HashSet<String>) {
@@ -2130,6 +2183,19 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.emit(Insn::BlockingAssign(id, val_reg, width));
                     true
+                } else if let Some((base_id, off, mw)) = self.packed_struct_member_target(hier) {
+                    // Packed-struct member write (`s.m0 = …`): splice the value
+                    // into `[off + mw - 1 : off]` of the container signal.
+                    let resized = self.alloc_reg();
+                    self.emit(Insn::Move(resized, val_reg));
+                    self.emit(Insn::Resize(resized, mw));
+                    self.emit(Insn::BlockingAssignRange(
+                        base_id,
+                        off + mw - 1,
+                        off,
+                        resized,
+                    ));
+                    true
                 } else {
                     self.bail("blocking_target");
                     false
@@ -2427,6 +2493,8 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Ident(hier) => {
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.signal_widths[id]
+                } else if let Some((_, _, mw)) = self.packed_struct_member_target(hier) {
+                    mw
                 } else {
                     let raw = Self::hier_raw_name(hier);
                     self.widths.get(&raw).copied().unwrap_or(32)
