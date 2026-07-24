@@ -15329,6 +15329,69 @@ impl Simulator {
             // gate-level netlists whose per-bit assigns `assign d[0] = expr;`
             // would otherwise clobber the whole vector wire.
             let lhs_is_bare_ident = matches!(ca.lhs.kind, ExprKind::Ident(_));
+            // A packed-struct member LHS (`assign s.m0 = …`) parses as a 2+-
+            // segment `Ident` whose base names a container with a registered
+            // field layout (after submodule inlining the scope is baked into
+            // the first segment, e.g. `Ident(["d1.s", "m0"])`). It resolves to
+            // no leaf signal, so `wids` is empty and it would fall to the AST
+            // interpreter — where its read dependency mis-resolves bare-first
+            // to the wrong (top-scope) input and never re-triggers when the
+            // real scoped input changes. Detect it here so it is routed through
+            // the bytecode sub-range path (which splices into the container),
+            // and record the container id as the write target so downstream
+            // readers re-fire when the member changes.
+            let struct_member_base_id: Option<usize> =
+                if let ExprKind::Ident(h) = &ca.lhs.kind {
+                    if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) {
+                        let member = h.path.last().unwrap().name.name.as_str();
+                        let base: String = h.path[..h.path.len() - 1]
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        let base_id = self
+                            .signal_name_to_id
+                            .get(base.as_str())
+                            .copied()
+                            .or_else(|| {
+                                scope_hint.as_ref().and_then(|sc| {
+                                    self.signal_name_to_id
+                                        .get(format!("{}.{}", sc, base).as_str())
+                                        .copied()
+                                })
+                            });
+                        let has_field = self
+                            .module
+                            .packed_struct_fields
+                            .get(base.as_str())
+                            .or_else(|| {
+                                scope_hint.as_ref().and_then(|sc| {
+                                    self.module
+                                        .packed_struct_fields
+                                        .get(&format!("{}.{}", sc, base))
+                                })
+                            })
+                            .is_some_and(|f| f.iter().any(|(m, _, _)| m == member));
+                        base_id.filter(|_| has_field)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            // Ensure the container is in the write set so the settle DAG links
+            // this entry to downstream readers of the whole struct.
+            let wids: Vec<usize> = if let Some(bid) = struct_member_base_id {
+                if wids.contains(&bid) {
+                    wids
+                } else {
+                    let mut w = wids;
+                    w.push(bid);
+                    w
+                }
+            } else {
+                wids
+            };
             // Try fused-gate fast path first: recognizes yosys patterns like
             // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
             // without VM dispatch, just bit reads + 4-state combinator + set_bit.
@@ -15347,7 +15410,7 @@ impl Simulator {
                 CombItem::FusedGate { op }
             } else if let Some(dc_val) = direct_copy {
                 dc_val
-            } else if wids.len() == 1 && lhs_is_bare_ident {
+            } else if wids.len() == 1 && lhs_is_bare_ident && struct_member_base_id.is_none() {
                 let dst_id = wids[0];
                 let width = self.signal_widths[dst_id];
                 let mut compiler = super::bytecode::BytecodeCompiler::new(
@@ -15401,9 +15464,11 @@ impl Simulator {
                         }
                     }
                 }
-            } else if !lhs_is_bare_ident {
+            } else if !lhs_is_bare_ident || struct_member_base_id.is_some() {
                 // Sub-range LHS: try bytecode compile so bit/range writes run
                 // at VM speed instead of through the interpreted assign_value.
+                // Packed-struct member LHS (`s.m0`) also routes here — the
+                // compiler splices it into the container's bit range.
                 let mut compiler = super::bytecode::BytecodeCompiler::new(
                     &self.signal_name_to_id,
                     &self.signal_signed,
@@ -15416,6 +15481,7 @@ impl Simulator {
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.top_module_name = Some(self.module.name.clone());
                 let lhs_w = compiler.infer_lhs_width_pub(&ca.lhs);
