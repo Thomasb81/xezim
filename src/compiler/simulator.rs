@@ -17466,19 +17466,34 @@ impl Simulator {
                     let mut idents = Vec::new();
                     collect_ident_names(&ee.expr, &mut idents);
                     for &h in &idents {
-                        let sig = self.resolve_hier_name(h);
                         // LRM §14.3: `@(cb)` naming a clocking block means the
                         // block's clock event (`@(posedge clk)`), not a signal
                         // literally called `cb`. Without this substitution the
                         // sensitivity targeted a nonexistent signal and never
-                        // fired, so `@(cb)` returned at t=0 (a no-op).
+                        // fired, so `@(cb)` returned at t=0 (a no-op). For an
+                        // interface-scoped block `@(iface.cb)` the clocking key
+                        // is the RAW dotted path (`iface.cb`); `resolve_hier_name`
+                        // strips the instance prefix to `cb`, so try the raw path
+                        // first, then the resolved name.
+                        let raw = h
+                            .path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        let sig = self.resolve_hier_name(h);
+                        let cb_key = if self.clocking_meta.contains_key(&raw) {
+                            raw.clone()
+                        } else {
+                            sig.clone()
+                        };
                         if ee.edge.is_none() {
-                            if let Some((clk, _)) = self.clocking_meta.get(&sig) {
+                            if let Some((clk, _)) = self.clocking_meta.get(&cb_key) {
                                 out.push(Sensitivity {
                                     signal_name: clk.clone(),
                                     edge: self
                                         .clocking_edge
-                                        .get(&sig)
+                                        .get(&cb_key)
                                         .copied()
                                         .unwrap_or(EdgeKind::Posedge),
                                     iff: ee.iff.clone(),
@@ -17856,6 +17871,17 @@ impl Simulator {
                     return false;
                 }
                 if let ExprKind::Ident(h) = &ee.expr.kind {
+                    // Interface-scoped `@(iface.cb)` keys on the raw dotted path;
+                    // resolve_hier_name strips it to `cb`. Try both.
+                    let raw = h
+                        .path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    if self.clocking_meta.contains_key(&raw) {
+                        return true;
+                    }
                     let sig = self.resolve_hier_name(h);
                     sig == "__xz_default_clocking" || self.clocking_meta.contains_key(&sig)
                 } else {
@@ -29675,20 +29701,37 @@ impl Simulator {
                 // returns the snapshot taken at the most recent posedge
                 // of the cb's clock (`#1step` input skew). Falls through
                 // to generic lookup when the cb is unknown or the
-                // signal isn't an input.
-                if hier.path.len() == 2 {
-                    let cb = hier.path[0].name.name.as_str();
-                    let sig = hier.path[1].name.name.as_str();
-                    if let Some(snap) = self.clocking_snapshots.get(cb) {
+                // signal isn't an input. Handles both a module-scoped
+                // `cb.sig` (2 segments) and an interface-scoped
+                // `iface_inst.cb.sig` (≥3): the clocking block key is every
+                // segment but the last, and its snapshot/meta signals are the
+                // RESOLVED nets (`iface_inst.sig`), so match the trailing
+                // `sig` by exact name or `.sig` suffix.
+                if hier.path.len() >= 2 {
+                    let cb = hier
+                        .path
+                        .iter()
+                        .take(hier.path.len() - 1)
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let sig = hier.path.last().unwrap().name.name.as_str();
+                    let matches_sig =
+                        |k: &str| k == sig || k.rsplit('.').next() == Some(sig);
+                    if let Some(snap) = self.clocking_snapshots.get(&cb) {
                         if let Some(v) = snap.get(sig) {
                             return v.clone();
                         }
-                        // Known cb but signal not in snapshot yet:
-                        // first read before any posedge — return the
-                        // current value as a sensible default.
-                        if let Some((_, sigs)) = self.clocking_meta.get(cb) {
-                            if sigs.iter().any(|(n, is_in)| n == sig && *is_in) {
-                                if let Some(v) = self.get_signal_value_by_name(sig) {
+                        if let Some((_, v)) = snap.iter().find(|(k, _)| matches_sig(k)) {
+                            return v.clone();
+                        }
+                        // Known cb but signal not in snapshot yet (first read
+                        // before any posedge) — return the current net value.
+                        if let Some((_, sigs)) = self.clocking_meta.get(&cb) {
+                            if let Some((net, _)) =
+                                sigs.iter().find(|(n, is_in)| *is_in && matches_sig(n))
+                            {
+                                if let Some(v) = self.get_signal_value_by_name(net) {
                                     return v;
                                 }
                             }
@@ -35422,19 +35465,32 @@ impl Simulator {
                 };
                 // LRM §14.4: clocking-block output drive
                 // `cb.<out_sig> <= val`. Defer to the cb's next clock
-                // edge (output skew) instead of driving now.
+                // edge (output skew) instead of driving now. Handles both a
+                // module-scoped `cb.sig` and an interface-scoped
+                // `iface_inst.cb.sig` (≥3 segments): the block key is every
+                // segment but the last, and the queued signal is the RESOLVED
+                // output net (matched from the block's signal list by exact
+                // name or `.sig` suffix) so `tick_clocking_blocks` drives it.
                 if let ExprKind::Ident(hier) = &lvalue.kind {
-                    if hier.path.len() == 2 {
-                        let cb = hier.path[0].name.name.as_str();
-                        let sig = hier.path[1].name.name.as_str();
-                        if let Some((_, sigs)) = self.clocking_meta.get(cb) {
-                            // Output signals are the non-input entries.
-                            let is_output = sigs.iter().any(|(n, is_in)| n == sig && !*is_in);
-                            if is_output {
+                    if hier.path.len() >= 2 {
+                        let cb = hier
+                            .path
+                            .iter()
+                            .take(hier.path.len() - 1)
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        let sig = hier.path.last().unwrap().name.name.as_str();
+                        if let Some((_, sigs)) = self.clocking_meta.get(&cb) {
+                            let out_net = sigs.iter().find(|(n, is_in)| {
+                                !*is_in && (n == sig || n.rsplit('.').next() == Some(sig))
+                            });
+                            if let Some((net, _)) = out_net {
+                                let net = net.clone();
                                 self.clocking_output_pending
-                                    .entry(cb.to_string())
+                                    .entry(cb)
                                     .or_default()
-                                    .push((sig.to_string(), val));
+                                    .push((net, val));
                                 return;
                             }
                         }
