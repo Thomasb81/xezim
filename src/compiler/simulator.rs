@@ -7045,6 +7045,14 @@ impl Simulator {
     }
 
     fn load_dpi_libraries(&mut self) {
+        // §35.5.4 DPI EXPORT: a user DPI library references each exported SV
+        // function as an undefined C symbol (`extern int sv_add(int,int);`).
+        // Provide those symbols BEFORE loading the user libs by generating a
+        // tiny trampoline shared object — one C function per exported name that
+        // forwards into `__xezim_dpi_export_dispatch`, which runs the SV
+        // subroutine. Loaded RTLD_GLOBAL so the user libs' RTLD_NOW resolution
+        // of the exported names finds them.
+        self.load_dpi_export_trampoline();
         for path in configured_dpi_libs() {
             // SAFETY: Loading a dynamic library is inherently unsafe; we keep
             // each handle alive for the simulator lifetime.
@@ -7053,6 +7061,210 @@ impl Simulator {
                 Err(e) => eprintln!("[DPI] failed to load '{}': {}", path, e),
             }
         }
+    }
+
+    /// C type + a value-cast for a DPI-exported subroutine's port/return of the
+    /// given resolved bit width. Only scalar integer forms are modeled; a
+    /// wider/aggregate type returns None (the trampoline for that subroutine is
+    /// skipped with a warning).
+    fn dpi_c_scalar_type(width: u32) -> Option<&'static str> {
+        match width {
+            1..=32 => Some("int"),
+            33..=64 => Some("long long"),
+            _ => None,
+        }
+    }
+
+    fn load_dpi_export_trampoline(&mut self) {
+        let exports = self.module.dpi_exports.clone();
+        if exports.is_empty() {
+            return;
+        }
+        // Exported functions are only reachable from a loaded DPI library; with
+        // none configured, nothing can call them from C — skip the compile.
+        if configured_dpi_libs().is_empty() {
+            return;
+        }
+        let mut body = String::new();
+        body.push_str(
+            "extern long long __xezim_dpi_export_dispatch(long long id, long long n, const long long* a);
+",
+        );
+        let mut emitted = 0usize;
+        for (id, name) in exports.iter().enumerate() {
+            // Look up the actual subroutine to learn its arity + scalar C types.
+            let (ret_c, arg_cs): (Option<&'static str>, Vec<&'static str>) =
+                if let Some(fd) = self.module.functions.get(name) {
+                    let rw = super::elaborate::resolve_type_width(
+                        &fd.return_type,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    );
+                    let ret = Self::dpi_c_scalar_type(rw.max(1));
+                    let mut ok = ret.is_some();
+                    let mut acs = Vec::new();
+                    for p in &fd.ports {
+                        let w = super::elaborate::resolve_type_width(
+                            &p.data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        );
+                        match Self::dpi_c_scalar_type(w.max(1)) {
+                            Some(c) => acs.push(c),
+                            None => ok = false,
+                        }
+                    }
+                    if ok { (ret, acs) } else { (None, Vec::new()) }
+                } else if self.module.tasks.contains_key(name) {
+                    // Exported task → C `void` return; args from the task ports.
+                    let td = self.module.tasks.get(name).unwrap();
+                    let mut ok = true;
+                    let mut acs = Vec::new();
+                    for p in &td.ports {
+                        let w = super::elaborate::resolve_type_width(
+                            &p.data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        );
+                        match Self::dpi_c_scalar_type(w.max(1)) {
+                            Some(c) => acs.push(c),
+                            None => ok = false,
+                        }
+                    }
+                    if ok { (Some("void"), acs) } else { (None, Vec::new()) }
+                } else {
+                    (None, Vec::new())
+                };
+            let Some(ret_c) = ret_c else {
+                eprintln!(
+                    "[DPI] exported subroutine '{}' has a non-scalar-integer signature —                      C callback into it is not modeled (only byte/shortint/int/longint                      and packed vectors up to 64 bits)",
+                    name
+                );
+                continue;
+            };
+            let params: Vec<String> = arg_cs
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{} a{}", c, i))
+                .collect();
+            let param_list = if params.is_empty() {
+                "void".to_string()
+            } else {
+                params.join(", ")
+            };
+            let arr = if arg_cs.is_empty() {
+                "    long long __a[1]; (void)__a;
+".to_string()
+            } else {
+                let items: Vec<String> =
+                    (0..arg_cs.len()).map(|i| format!("(long long)a{}", i)).collect();
+                format!("    long long __a[{}] = {{ {} }};
+", arg_cs.len(), items.join(", "))
+            };
+            let call = format!(
+                "__xezim_dpi_export_dispatch({}, {}, __a)",
+                id,
+                arg_cs.len()
+            );
+            if ret_c == "void" {
+                body.push_str(&format!(
+                    "void {}({}) {{
+{}    (void){};
+}}
+",
+                    name, param_list, arr, call
+                ));
+            } else {
+                body.push_str(&format!(
+                    "{} {}({}) {{
+{}    return ({}){};
+}}
+",
+                    ret_c, name, param_list, arr, ret_c, call
+                ));
+            }
+            emitted += 1;
+        }
+        if emitted == 0 {
+            return;
+        }
+        // Write, compile, and load the trampoline.
+        let dir = std::env::temp_dir();
+        let stem = format!("xezim_dpi_exports_{}", std::process::id());
+        let cpath = dir.join(format!("{}.c", stem));
+        let sopath = dir.join(format!("{}.so", stem));
+        if let Err(e) = std::fs::write(&cpath, &body) {
+            eprintln!("[DPI] could not write export trampoline source: {}", e);
+            return;
+        }
+        let status = std::process::Command::new("cc")
+            .args(["-m64", "-fPIC", "-shared", "-O1", "-o"])
+            .arg(&sopath)
+            .arg(&cpath)
+            .status();
+        match status {
+            Ok(st) if st.success() => {}
+            Ok(st) => {
+                eprintln!(
+                    "[DPI] export trampoline compile failed (exit {:?}); C callbacks into                      exported SV functions will be unresolved",
+                    st.code()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[DPI] could not run the C compiler for the export trampoline ({});                      is `cc`/`gcc` on PATH?",
+                    e
+                );
+                return;
+            }
+        }
+        // RTLD_NOW | RTLD_GLOBAL so the trampoline's exported names are visible
+        // to the user DPI libraries loaded next.
+        use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
+        match unsafe { UnixLibrary::open(Some(&sopath), RTLD_NOW | RTLD_GLOBAL) } {
+            Ok(l) => self.dpi_libraries.push(Library::from(l)),
+            Err(e) => eprintln!("[DPI] failed to load export trampoline: {}", e),
+        }
+        let _ = std::fs::remove_file(&cpath);
+        let _ = std::fs::remove_file(&sopath);
+    }
+
+    /// §35.5.4: run an exported SV subroutine identified by its declaration-order
+    /// id, called from C through the generated trampoline. `args` points at
+    /// `nargs` 64-bit integer argument slots. Returns the subroutine's result
+    /// as a 64-bit integer (0 for tasks/void).
+    fn run_dpi_export(&mut self, id: usize, nargs: usize, args: *const i64) -> i64 {
+        let Some(name) = self.module.dpi_exports.get(id).cloned() else {
+            return 0;
+        };
+        let arg_vals: Vec<i64> = (0..nargs)
+            .map(|i| unsafe { *args.add(i) })
+            .collect();
+        let arg_exprs: Vec<Expression> = arg_vals
+            .iter()
+            .map(|&v| {
+                Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: Some(64),
+                        signed: true,
+                        base: NumberBase::Decimal,
+                        value: v.to_string(),
+                        cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                    }),
+                    crate::ast::Span::dummy(),
+                )
+            })
+            .collect();
+        if let Some(fd) = self.module.functions.get(&name).cloned() {
+            let r = self.exec_function_call(&fd, &arg_exprs);
+            return r.to_i64().unwrap_or(0);
+        }
+        if let Some(td) = self.module.tasks.get(&name).cloned() {
+            self.exec_task_call(&td, &arg_exprs);
+            return 0;
+        }
+        0
     }
 
     fn bind_all_dpi_imports(&mut self) {
@@ -67246,6 +67458,21 @@ fn vpi_slice_write(sim: &Simulator, h: &VpiHandle, val: &Value) -> Option<Value>
 /// forever. Any unresolvable dotted name hung the simulator — reachable
 /// straight from `uvm_hdl_check_path`, whose whole job is to ask about
 /// paths that may not exist.
+/// §35.5.4 DPI export dispatch. The generated trampoline shared object calls
+/// this from C to run an exported SystemVerilog subroutine. `id` is the
+/// subroutine's declaration-order index; `n` args are 64-bit integer slots.
+#[no_mangle]
+pub extern "C" fn __xezim_dpi_export_dispatch(
+    id: libc::c_longlong,
+    n: libc::c_longlong,
+    a: *const libc::c_longlong,
+) -> libc::c_longlong {
+    try_active_sim("__xezim_dpi_export_dispatch", |sim| {
+        sim.run_dpi_export(id as usize, n.max(0) as usize, a as *const i64) as libc::c_longlong
+    })
+    .unwrap_or(0)
+}
+
 #[no_mangle]
 pub extern "C" fn vpi_handle_by_name(
     name: *mut libc::c_char,
