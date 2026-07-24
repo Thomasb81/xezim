@@ -12338,6 +12338,41 @@ impl Simulator {
         walk(stmt)
     }
 
+    /// True when every term of an explicit event control is a PLAIN identifier
+    /// (edge qualifier allowed). A term carrying a select or an expression —
+    /// `@(vco_tap[c_ph_val[0]])`, `@(sig[5:0])`, `@({a,b})` — collapses to just
+    /// its base identifier in `event_to_sens`, which drops the signals that
+    /// appear in the INDEX. Such a block genuinely needs the comb path's
+    /// read-set sensitivity so it re-evaluates when the index changes
+    /// (tests/prtest/pr2011429.v: `c_ph_val[0]` selects which tap is watched).
+    /// Only for all-plain lists is the explicit list a complete description of
+    /// what may trigger the block, and only then may we require the read set to
+    /// stay within it.
+    fn event_terms_all_plain_idents(stmt: &Statement) -> bool {
+        fn check(control: &TimingControl) -> bool {
+            let TimingControl::Event(EventControl::EventExpr(exprs)) = control else {
+                // `@*`, a named event, or any other form: leave the existing
+                // routing untouched.
+                return false;
+            };
+            exprs.iter().all(|ee| {
+                let mut e = &ee.expr;
+                while let ExprKind::Paren(inner) = &e.kind {
+                    e = inner;
+                }
+                matches!(&e.kind, ExprKind::Ident(_))
+            })
+        }
+        match &stmt.kind {
+            StatementKind::TimingControl { control, .. } => check(control),
+            StatementKind::SeqBlock { stmts, .. } => match stmts.first().map(|s| &s.kind) {
+                Some(StatementKind::TimingControl { control, .. }) => check(control),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     fn classify_one_always_block(&mut self, ab: AlwaysBlock) -> Option<AlwaysBlock> {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
@@ -12372,7 +12407,71 @@ impl Simulator {
                 // spins/starves the rest of the schedule. The edge path DOES
                 // honor a delayed body (same as `always @(posedge clk) #1 q=d`),
                 // so route a blocking-bodied level block there instead.
-                if all_level && !has_named_event && !self_ref && !self.stmt_is_blocking(&body) {
+                // §9.4.2: an explicit event control fires ONLY on the signals it
+                // lists. The comb-settle path DISCARDS the `@()` list (it takes
+                // `body`, not `ab.stmt`) and re-derives sensitivity from the
+                // body's READ SET, so it is faithful only when the body reads
+                // nothing beyond what the list already covers. A vendor
+                // timing-check notifier block breaks that assumption:
+                //     always @(notifier)
+                //        if (se && !bypass) cell.q <= 1'bx;
+                //        else if (wclk_seen == 0) corrupt_memory;
+                // reads se/bypass/wclk_seen — none of them listed — so the comb
+                // path re-fired it on every change of those and corrupted the
+                // memory model (a whole register-file testbench read back X).
+                // Compare RESOLVED signal ids, the same way the comb path
+                // resolves them, and keep the fast path only when the read set
+                // adds nothing. Unresolvable reads (parameters, genvars, loop
+                // locals) can never trigger anything, so they don't count.
+                let comb_sensitivity_is_faithful = if !Self::event_terms_all_plain_idents(&ab.stmt)
+                {
+                    // Index-dependent / select / concat sensitivity: the list
+                    // does not name everything that may trigger the block, so
+                    // the read-set superset is the intended behaviour.
+                    true
+                } else {
+                    let mut b_reads: HashSet<String> = HashSet::default();
+                    let mut b_writes: HashSet<String> = HashSet::default();
+                    Self::collect_stmt_reads(&body, &self.module, &mut b_reads, &mut b_writes);
+                    let scope_hint = self.infer_scope_from_rw_sets(&b_writes, &b_reads);
+                    let name_to_id = &self.signal_name_to_id;
+                    let resolve_ids = |name: &str| -> Vec<usize> {
+                        let mut out: Vec<usize> = Vec::new();
+                        if let Some(scope) = &scope_hint {
+                            if let Some(&id) =
+                                name_to_id.get(format!("{}.{}", scope, name).as_str())
+                            {
+                                out.push(id);
+                            }
+                        }
+                        if let Some(&id) = name_to_id.get(name) {
+                            out.push(id);
+                        } else if let Some(stripped) = name.strip_prefix(&top_prefix) {
+                            if let Some(&id) = name_to_id.get(stripped) {
+                                out.push(id);
+                            }
+                        }
+                        out
+                    };
+                    let mut sens_ids: Vec<usize> = Vec::new();
+                    for s in &sens {
+                        for id in resolve_ids(s.signal_name.as_str()) {
+                            if !sens_ids.contains(&id) {
+                                sens_ids.push(id);
+                            }
+                        }
+                    }
+                    // Mirror the comb path's `sens_reads = reads - writes`.
+                    b_reads
+                        .difference(&b_writes)
+                        .all(|r| resolve_ids(r.as_str()).iter().all(|id| sens_ids.contains(id)))
+                };
+                if all_level
+                    && !has_named_event
+                    && !self_ref
+                    && !self.stmt_is_blocking(&body)
+                    && comb_sensitivity_is_faithful
+                {
                     return Some(AlwaysBlock {
                         kind: ab.kind,
                         stmt: body,
@@ -23071,6 +23170,114 @@ impl Simulator {
                 Self::call_is_blocking_task(e) || self.callee_transitively_blocks(e)
             }
             StatementKind::Repeat { body, .. } => self.stmt_is_blocking(body),
+            _ => false,
+        }
+    }
+
+    /// Does this statement need a real *process* context (the ability to
+    /// suspend and resume) — as opposed to merely containing a `#delay`?
+    ///
+    /// `stmt_is_blocking` answers the broader question "must this run through
+    /// the suspend-aware runner", and says YES for a plain `#delay` too. But
+    /// the synchronous `exec_statement` path DOES implement `TimingControl::
+    /// Delay`: it flushes NBA, settles, advances time and runs the intervening
+    /// event regions. Only genuinely suspending constructs — event controls,
+    /// `wait`, `fork…join`, `forever` — cannot run there.
+    ///
+    /// `exec_expr_stmt` uses this instead of `stmt_is_blocking` so that a
+    /// parenless enable of a delay-only task still RUNS. It previously used the
+    /// broad predicate and silently DROPPED the whole call: a vendor
+    /// register-file cell enabled its write task from an `always @(wclk)`
+    /// block, that task reached a `#0` two levels down, and so every write was
+    /// discarded — the memory read back all-X. Tasks that truly need
+    /// suspension keep the old (skip) behaviour, which this does not change.
+    fn stmt_needs_process_context(&self, stmt: &Statement, depth: u32) -> bool {
+        // Guard against deep/cyclic call chains; treat an over-deep chain as
+        // needing a process (conservative = preserves the old skip).
+        if depth > 8 {
+            return true;
+        }
+        match &stmt.kind {
+            StatementKind::TimingControl { control, stmt: inner } => match control {
+                // A pure delay is executable synchronously.
+                TimingControl::Delay(_) => self.stmt_needs_process_context(inner, depth),
+                // Event control / repeat-event genuinely suspend.
+                _ => true,
+            },
+            StatementKind::Wait { .. }
+            | StatementKind::WaitOrder { .. }
+            | StatementKind::WaitFork => true,
+            // `forever` in a synchronous context would spin without ever
+            // yielding to the scheduler.
+            StatementKind::Forever { .. } => true,
+            StatementKind::ParBlock { join_type, .. } => !matches!(join_type, JoinType::JoinNone),
+            // Intra-assignment delay: keep the conservative old behaviour.
+            StatementKind::BlockingAssign { rvalue, .. } => {
+                Self::intra_delay_marker(rvalue).is_some()
+            }
+            StatementKind::RandCase { items } => items
+                .iter()
+                .any(|(_, s)| self.stmt_needs_process_context(s, depth)),
+            StatementKind::SeqBlock { stmts, .. } => stmts
+                .iter()
+                .any(|s| self.stmt_needs_process_context(s, depth)),
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.stmt_needs_process_context(then_stmt, depth)
+                    || else_stmt
+                        .as_ref()
+                        .is_some_and(|e| self.stmt_needs_process_context(e, depth))
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::Repeat { body, .. } => {
+                self.stmt_needs_process_context(body, depth)
+            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| self.stmt_needs_process_context(&it.stmt, depth)),
+            StatementKind::Expr(e) => {
+                if Self::expr_is_proc_await(e) {
+                    return true;
+                }
+                // A call whose name matches the built-in/UVM blocking
+                // whitelist has no visible body — assume it suspends.
+                if Self::call_is_blocking_task(e) {
+                    return true;
+                }
+                // Follow user task/function calls into their bodies.
+                let callee = match &e.kind {
+                    ExprKind::Call { func, .. } => &**func,
+                    ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => e,
+                    _ => return false,
+                };
+                let name = match &callee.kind {
+                    ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                    ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                    _ => None,
+                };
+                let Some(n) = name else { return false };
+                // Resolve against both the leaf name and the instance-scoped
+                // key the elaborator bakes in (`ZKK.the_task`).
+                let items = self.module.tasks.get(n).map(|t| &t.items).or_else(|| {
+                    self.module
+                        .tasks
+                        .iter()
+                        .find(|(k, _)| k.rsplit('.').next() == Some(n))
+                        .map(|(_, t)| &t.items)
+                });
+                match items {
+                    Some(its) => its
+                        .iter()
+                        .any(|s| self.stmt_needs_process_context(s, depth + 1)),
+                    None => false,
+                }
+            }
             _ => false,
         }
     }
@@ -38757,10 +38964,20 @@ impl Simulator {
             ExprKind::Ident(hier) => {
                 let name = self.resolve_hier_name(hier);
                 if let Some(td) = self.module.tasks.get(&name).cloned() {
-                    // Execute bare task-enable only for zero-time tasks.
-                    // Blocking tasks (with delay/event/wait/forever blocking) require
-                    // process suspension semantics that expr-stmt fast path does not model.
-                    if !td.items.iter().any(|s| self.stmt_is_blocking(s)) {
+                    // Execute a bare task-enable unless the body genuinely needs
+                    // a suspendable process (event control, `wait`, `fork…join`,
+                    // `forever`) — those need semantics this synchronous path
+                    // cannot model. A body that merely contains a `#delay` IS
+                    // executable here: the `TimingControl::Delay` arm of
+                    // `exec_statement` flushes NBA, settles and advances time.
+                    // Testing the broader `stmt_is_blocking` here silently
+                    // DROPPED such calls entirely (see
+                    // `stmt_needs_process_context`).
+                    if !td
+                        .items
+                        .iter()
+                        .any(|s| self.stmt_needs_process_context(s, 0))
+                    {
                         self.exec_task_call(&td, &[]);
                     }
                 } else {
