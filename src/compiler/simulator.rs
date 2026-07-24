@@ -2424,6 +2424,14 @@ pub struct Simulator {
     clocking_output_pending: HashMap<String, Vec<(String, Value)>>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
+    /// LRM §14.4 `#1step` input skew — Preponed (slot-entry) value of every
+    /// clocking-block INPUT signal, keyed by signal name. Captured at the top
+    /// of each time slot BEFORE the active/NBA regions run (same point as
+    /// `sva_preponed`), so when a clock posedge fires later in the slot the
+    /// input snapshot is the value from *before* the edge, not the same-edge
+    /// NBA update. Without this, `cb.<in>` reads the post-edge value (off by
+    /// one clock relative to a reference simulator).
+    clocking_preponed: HashMap<String, Value>,
     /// LRM §4.4 "reactive region" — drained AFTER the observed region
     /// has fired and BEFORE the postponed region runs. In a strict LRM
     /// implementation this hosts `program`-block procedural code so a
@@ -4862,6 +4870,7 @@ impl Simulator {
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
+            clocking_preponed: HashMap::default(),
             pending_reactive: Vec::new(),
             active_union_tag: HashMap::default(),
             max_time,
@@ -18571,6 +18580,10 @@ impl Simulator {
         // clocked assertion firing later this slot (tick_sva_sites) samples
         // pre-edge values rather than same-edge NBA updates.
         self.refresh_sva_preponed();
+        // LRM §14.4 `#1step` clocking-input skew: capture the same Preponed
+        // (slot-entry) samples for clocking-block inputs, so `cb.<in>` read
+        // after a posedge later this slot sees the pre-edge value.
+        self.refresh_clocking_preponed();
 
         if self.apply_delayed_updates() {
             self.settle_combinatorial();
@@ -40294,6 +40307,31 @@ impl Simulator {
     /// SVA-referenced signal. Called once at the top of each time slot,
     /// before the active/NBA regions run, so `sva_preponed[id]` holds the
     /// value as of the start of the slot. No-op when no clocked sites exist.
+    /// LRM §14.4 — capture the Preponed (slot-entry) value of every
+    /// clocking-block INPUT signal, keyed by name, before the active/NBA
+    /// regions run. `tick_clocking_blocks` reads these on a posedge so the
+    /// `#1step` input skew samples pre-edge values. No-op with no clocking
+    /// blocks.
+    fn refresh_clocking_preponed(&mut self) {
+        if self.clocking_meta.is_empty() {
+            return;
+        }
+        let names: Vec<String> = self
+            .clocking_meta
+            .values()
+            .flat_map(|(_, sigs)| {
+                sigs.iter()
+                    .filter(|(_, is_input)| *is_input)
+                    .map(|(n, _)| n.clone())
+            })
+            .collect();
+        for n in names {
+            if let Some(v) = self.get_signal_value_by_name(&n) {
+                self.clocking_preponed.insert(n, v);
+            }
+        }
+    }
+
     fn refresh_sva_preponed(&mut self) {
         if self.sva_sites.is_empty() {
             return;
@@ -40724,17 +40762,20 @@ impl Simulator {
             if !(prev == 0 && cur == 1) {
                 continue;
             }
-            // Posedge: refresh input snapshots. We snapshot the
-            // CURRENT signal values — this matches LRM `#1step` for
-            // designs where the producer drives the input signal in
-            // the active region of the same cycle. For
-            // skew-into-prev-cycle semantics, the caller would need
-            // to register the snapshot earlier in the tick; that's
-            // a follow-up.
+            // Posedge: refresh input snapshots from the Preponed samples
+            // captured at slot-entry (`refresh_clocking_preponed`), so `cb.<in>`
+            // reads the value from BEFORE this edge (`#1step` input skew,
+            // §14.4), not the same-edge NBA update. Fall back to the current
+            // value if no preponed sample was captured (e.g. first slot).
             let mut snap = HashMap::default();
             for (sig, is_input) in &sigs {
                 if *is_input {
-                    if let Some(v) = self.get_signal_value_by_name(sig) {
+                    if let Some(v) = self
+                        .clocking_preponed
+                        .get(sig)
+                        .cloned()
+                        .or_else(|| self.get_signal_value_by_name(sig))
+                    {
                         snap.insert(sig.clone(), v);
                     }
                 }
