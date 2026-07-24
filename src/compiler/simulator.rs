@@ -3476,6 +3476,20 @@ pub struct Simulator {
     // execution; every skip is still verified against the value snapshot.
     edge_block_change_streak: Vec<u8>,
     edge_block_epoch_probe_left: Vec<u8>,
+    /// Self-heal for the flop-fire skip: consecutive SKIPPED clock edges per
+    /// gateable block. After XEZIM_EVENT_EDGE_HEAL consecutive skips (default
+    /// 16, 0 disables) the block is force-executed once and its snapshot
+    /// rebuilt. For a correctly-idle flop the forced execution changes nothing
+    /// (inputs unchanged ⇒ same outputs, NBA elided), so this is semantically
+    /// invisible — but it BOUNDS the damage of any skip-bookkeeping wedge
+    /// (e.g. a divider flop frozen for a dozen cycles while its clock toggles,
+    /// as seen on a customer PLL model) to at most HEAL clock edges.
+    edge_block_skip_streak: Vec<u16>,
+    /// Heal threshold (consecutive skipped edges before a forced execution).
+    event_heal: u16,
+    /// Count of forced heal executions — nonzero means a skip streak hit the
+    /// threshold; a LARGE count with wrong waveforms points at a skip bug.
+    event_healed: u64,
     /// ARMED event-edge prefilter. Writes first test a compact signal bitmap;
     /// only data-input hits walk the sparse signal -> gateable-block fanout.
     /// An unarmed block can skip without reading its operand snapshots.
@@ -5216,6 +5230,9 @@ impl Simulator {
             edge_block_off: Vec::new(),
             edge_block_snap_valid: Vec::new(),
             edge_block_change_streak: Vec::new(),
+            edge_block_skip_streak: Vec::new(),
+            event_heal: 16,
+            event_healed: 0,
             edge_block_epoch_probe_left: Vec::new(),
             armed_edge: std::env::var("XEZIM_ARMED_EDGE").ok().as_deref() != Some("0")
                 || std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
@@ -8691,6 +8708,48 @@ impl Simulator {
         for (name, sig_id) in edge_sens {
             self.edge_signal_names.insert(name);
             self.edge_signal_ids.push(sig_id);
+        }
+        // Dropped-cell early warning: a flop clock/reset that is an IMPLICIT
+        // (undeclared) net means the driver instance was dropped — almost
+        // always an unresolved vendor cell (see the '-v resolution summary'
+        // notes). The X clock/reset then silently corrupts everything
+        // downstream (dead clocks, dividers stuck in reset), which shows up
+        // hours later as a hang or an oracle mismatch. Say it up front, once,
+        // with the offending nets, so the missing library is fixed instead of
+        // debugged. (Same family as the UDP-terminal IMPLICIT-NET note, but
+        // for RTL edge blocks and always-on rather than --primitive-verbose.)
+        if !self.module.implicit_nets.is_empty() {
+            let mut hit: HashMap<String, usize> = HashMap::default();
+            for block in &self.edge_blocks {
+                for sens in &block.resolved_sensitivities {
+                    let name = self.name_for_id(sens.signal_id);
+                    if self.module.implicit_nets.contains(name) {
+                        *hit.entry(name.to_string()).or_default() += 1;
+                    }
+                }
+            }
+            if !hit.is_empty() {
+                let mut names: Vec<(&String, &usize)> = hit.iter().collect();
+                names.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                let shown: Vec<String> = names
+                    .iter()
+                    .take(8)
+                    .map(|(n, c)| format!("'{}' ({} block(s))", n, c))
+                    .collect();
+                eprintln!(
+                    "[xezim][warning] {} edge-block clock/reset input(s) are IMPLICIT \
+                     (undeclared) nets — the driving instance was likely DROPPED as an \
+                     unresolved cell (see 'unresolved definition' notes above). These \
+                     clocks/resets stay X and everything they clock is dead: {}{}",
+                    hit.len(),
+                    shown.join(", "),
+                    if names.len() > 8 {
+                        format!(", … and {} more", names.len() - 8)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
         }
         // Also collect from event waiters that are registered at time 0
         self.edge_signal_ids.sort_unstable();
@@ -19637,8 +19696,8 @@ impl Simulator {
             );
             if self.event_skip {
                 eprintln!(
-                    "[EVENT-EDGE] adaptive epoch-fast-exec={} snapshot-checks={}",
-                    self.event_epoch_fast_exec, self.event_snapshot_checks
+                    "[EVENT-EDGE] adaptive epoch-fast-exec={} snapshot-checks={} healed={}",
+                    self.event_epoch_fast_exec, self.event_snapshot_checks, self.event_healed
                 );
                 if self.armed_edge {
                     eprintln!(
@@ -24741,6 +24800,30 @@ impl Simulator {
                         None => {}
                     }
                 }
+                // Skip self-heal (see `edge_block_skip_streak`): after
+                // `event_heal` consecutive skipped edges, force one real
+                // execution + snapshot rebuild. Invisible for correctly-idle
+                // flops; bounds any skip-bookkeeping wedge.
+                let keep = if !keep && gate && self.event_heal != 0 {
+                    let streak = self.edge_block_skip_streak[bi].saturating_add(1);
+                    if streak >= self.event_heal {
+                        self.edge_block_skip_streak[bi] = 0;
+                        self.event_healed += 1;
+                        // Invalidate the snapshot so the keep path below
+                        // rebuilds it from current values after this forced
+                        // execution.
+                        self.edge_block_snap_valid[bi] = false;
+                        true
+                    } else {
+                        self.edge_block_skip_streak[bi] = streak;
+                        false
+                    }
+                } else {
+                    if keep && gate {
+                        self.edge_block_skip_streak[bi] = 0;
+                    }
+                    keep
+                };
                 if keep {
                     if gate {
                         if epoch_fast {
@@ -42065,6 +42148,11 @@ impl Simulator {
             self.edge_block_snap_valid = vec![false; nb];
             self.edge_block_change_streak = vec![0; nb];
             self.edge_block_epoch_probe_left = vec![0; nb];
+            self.edge_block_skip_streak = vec![0; nb];
+            self.event_heal = std::env::var("XEZIM_EVENT_EDGE_HEAL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(16);
             // The timestamp-only measurement path needs the nested read sets;
             // normal skip mode uses only the compact CSR above.
             self.edge_block_data_reads = Vec::new();
@@ -42076,6 +42164,7 @@ impl Simulator {
             self.edge_block_snap_valid = Vec::new();
             self.edge_block_change_streak = Vec::new();
             self.edge_block_epoch_probe_left = Vec::new();
+            self.edge_block_skip_streak = Vec::new();
         }
         self.build_armed_edge_state();
         eprintln!(
