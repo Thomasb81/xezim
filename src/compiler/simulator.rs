@@ -1254,6 +1254,10 @@ fn pad_string(s: &str, width: usize, zero_pad: bool) -> String {
 /// Events within WHEEL_SIZE ticks of current time use a circular array.
 /// Events further out fall back to a BTreeMap.
 const WHEEL_SIZE: usize = 256;
+
+/// Prefix of the hidden per-clocking-input sample mirror signals (§14.13).
+/// Not expressible in SV source, so it can never collide with a user name.
+const CB_SAMPLE_PREFIX: &str = "__xz_cbsample.";
 /// Number of u64 words needed for the occupancy bitmap (256 / 64 = 4).
 const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
 
@@ -2447,6 +2451,19 @@ pub struct Simulator {
     /// `@(negedge clk)` block samples/advances on the negedge, not the posedge.
     /// Absent ⇒ posedge (the default and by far the common case).
     clocking_edge: HashMap<String, EdgeKind>,
+    /// Set when `tick_clocking_blocks` published a changed sample mirror, so
+    /// the caller runs one more edge pass — the publish happens after this
+    /// slot's edge detection, and the next iteration's snapshot would
+    /// otherwise absorb the change and swallow the `@(cb.sig)` event.
+    clocking_mirror_dirty: bool,
+    /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
+    /// cb → [(remaining_cycles, net, value)]. Decremented at each edge of that
+    /// block; applied (with output skew) when it reaches zero.
+    clocking_cycle_pending: HashMap<String, Vec<(u64, String, Value)>>,
+    /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
+    /// resolved net). The snapshot/meta store the NET; reads and drives use
+    /// the clocking name, so they translate through this first.
+    clocking_sig_alias: HashMap<String, HashMap<String, String>>,
     /// §14.4 per-cb default OUTPUT skew in ticks (absent = #0).
     clocking_out_skew: HashMap<String, u64>,
     /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
@@ -4481,6 +4498,48 @@ impl Simulator {
                 signal_real_vec.push(false);
             }
         }
+        // §14.13 clocking-sample event signals. `always @(cb.sig)` /
+        // `@(cb.sig)` must fire AT the clocking edge and ONLY when the newly
+        // sampled value differs from the previous sample — neither the net's
+        // own edges (which can occur between clock events) nor the clock
+        // itself expresses that. Give every clocking INPUT a hidden mirror
+        // signal that `tick_clocking_blocks` writes with each fresh sample;
+        // the ordinary edge machinery then delivers exactly the right events.
+        // Name is unreachable from SV source, so it cannot collide.
+        for (cb_name, cd) in module.clocking_blocks.iter() {
+            for csig in cd.signals.iter() {
+                let is_input = matches!(
+                    csig.direction,
+                    crate::ast::types::PortDirection::Input
+                        | crate::ast::types::PortDirection::Inout
+                );
+                if !is_input {
+                    continue;
+                }
+                let net = csig
+                    .bound_to
+                    .as_ref()
+                    .and_then(Self::flatten_member_path)
+                    .map(|segs| segs.join("."))
+                    .unwrap_or_else(|| csig.name.name.clone());
+                let width = signal_name_to_id
+                    .get(net.as_str())
+                    .map(|&id| signal_widths_vec[id])
+                    .unwrap_or(1);
+                let hidden = format!("{}{}.{}", CB_SAMPLE_PREFIX, cb_name, csig.name.name);
+                if signal_name_to_id.contains_key(hidden.as_str()) {
+                    continue;
+                }
+                let id = signal_table.len();
+                let arc_name: Arc<str> = Arc::from(hidden.as_str());
+                signal_name_to_id.insert(arc_name.clone(), id);
+                id_to_name.push(arc_name);
+                signal_table.push(Value::new(width));
+                signal_widths_vec.push(width);
+                signal_signed_vec.push(false);
+                signal_real_vec.push(false);
+            }
+        }
         let static_ms = phase_static.elapsed().as_secs_f64() * 1000.0;
         // Phase 2: synthesize per-element entries for unpacked arrays.
         // Elaborate skips the per-element Signal inserts (memory-as-array
@@ -4949,6 +5008,9 @@ impl Simulator {
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
             clocking_edge: HashMap::default(),
+            clocking_mirror_dirty: false,
+            clocking_cycle_pending: HashMap::default(),
+            clocking_sig_alias: HashMap::default(),
             clocking_out_skew: HashMap::default(),
             clocking_sig_out_skew: HashMap::default(),
             clocking_last_edge: HashMap::default(),
@@ -8440,6 +8502,9 @@ impl Simulator {
                 _ => EdgeKind::Posedge,
             };
             if let Some(clk) = clk {
+                // §14.3 renaming: the meta/snapshot key on the RESOLVED NET;
+                // `alias_map` translates the clocking-visible name to it.
+                let mut alias_map: HashMap<String, String> = HashMap::default();
                 let sigs: Vec<(String, bool)> = cd
                     .signals
                     .iter()
@@ -8449,9 +8514,24 @@ impl Simulator {
                             crate::ast::types::PortDirection::Input
                                 | crate::ast::types::PortDirection::Inout
                         );
-                        (s.name.name.clone(), is_input)
+                        let net = match s.bound_to.as_ref().and_then(Self::flatten_member_path) {
+                            Some(segs) if !segs.is_empty() => {
+                                let n = segs.join(".");
+                                alias_map.insert(s.name.name.clone(), n.clone());
+                                n
+                            }
+                            _ => s.name.name.clone(),
+                        };
+                        (net, is_input)
                     })
                     .collect();
+                if !alias_map.is_empty() {
+                    if cd.is_default {
+                        self.clocking_sig_alias
+                            .insert("__xz_default_clocking".to_string(), alias_map.clone());
+                    }
+                    self.clocking_sig_alias.insert(cb_name.clone(), alias_map);
+                }
                 // §14.11: alias the parser's reserved `##N` marker to the
                 // `default clocking` block, so the desugared
                 // `repeat (N) @(__xz_default_clocking)` resolves through the
@@ -16936,6 +17016,25 @@ impl Simulator {
         module: &ElaboratedModule,
         reads: &mut HashSet<String>,
     ) {
+        // §14.13: a clocking-signal read (`cb.sig`, `iface.cb.sig`, either the
+        // flat-Ident or MemberAccess shape) depends on the hidden sample mirror,
+        // NOT on the underlying net — the sample only moves at the block's clock
+        // edge. Registering the net instead made `always @(cb.sig)` re-fire on
+        // the net's own (possibly mid-cycle) changes.
+        if let Some(segs) = Self::flatten_member_path(expr) {
+            if segs.len() >= 2 {
+                let cb = segs[..segs.len() - 1].join(".");
+                if module.clocking_blocks.contains_key(&cb) {
+                    reads.insert(format!(
+                        "{}{}.{}",
+                        CB_SAMPLE_PREFIX,
+                        cb,
+                        segs[segs.len() - 1]
+                    ));
+                    return;
+                }
+            }
+        }
         match &expr.kind {
             ExprKind::Ident(hier) => {
                 let name = Self::resolve_hier_name_static(hier, module);
@@ -17599,6 +17698,27 @@ impl Simulator {
                         // first, then the resolved name.
                         let segs: Vec<&str> =
                             h.path.iter().map(|s| s.name.name.as_str()).collect();
+                        // §14.13 `@(cb.sig)` — sensitize to the hidden sample
+                        // mirror so the event lands at the clocking edge and
+                        // only when the sample actually changed.
+                        if segs.len() >= 2 {
+                            if let Some(cbk) = self.resolve_clocking_key(&segs[..segs.len() - 1]) {
+                                let hidden = format!(
+                                    "{}{}.{}",
+                                    CB_SAMPLE_PREFIX,
+                                    cbk,
+                                    segs[segs.len() - 1]
+                                );
+                                if self.signal_name_to_id.contains_key(hidden.as_str()) {
+                                    out.push(Sensitivity {
+                                        signal_name: hidden,
+                                        edge: EdgeKind::AnyEdge,
+                                        iff: ee.iff.clone(),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
                         let sig = self.resolve_hier_name(h);
                         let cb_key = self
                             .resolve_clocking_key(&segs)
@@ -17629,6 +17749,38 @@ impl Simulator {
                     // virtual-interface binding (`<bound>.member`) so the driver/
                     // monitor suspend on the real interface clock/reset instead
                     // of spinning on an empty sensitivity.
+                    // §14.13 `@(cb.sig)` written as a MemberAccess (the shape
+                    // the parser produces for a sensitivity list, and inside
+                    // subroutines): sensitize to the hidden sample mirror so
+                    // the event lands at the clocking edge, only on a change.
+                    // Without this the sensitivity came out EMPTY and the
+                    // always block fired once at t=0 and never again.
+                    if idents.is_empty() && ee.edge.is_none() {
+                        if let Some(segs) = Self::flatten_member_path(&ee.expr) {
+                            if segs.len() >= 2 {
+                                let refs: Vec<&str> =
+                                    segs.iter().map(|x| x.as_str()).collect();
+                                if let Some(cbk) =
+                                    self.resolve_clocking_key(&refs[..refs.len() - 1])
+                                {
+                                    let hidden = format!(
+                                        "{}{}.{}",
+                                        CB_SAMPLE_PREFIX,
+                                        cbk,
+                                        refs[refs.len() - 1]
+                                    );
+                                    if self.signal_name_to_id.contains_key(hidden.as_str()) {
+                                        out.push(Sensitivity {
+                                            signal_name: hidden,
+                                            edge: EdgeKind::AnyEdge,
+                                            iff: ee.iff.clone(),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if idents.is_empty() {
                         if let ExprKind::MemberAccess { expr: base, member } = &ee.expr.kind {
                             if let ExprKind::Ident(bh) = &base.kind {
@@ -19019,6 +19171,13 @@ impl Simulator {
         // sample state so subsequent `cb.<sig>` reads see the pre-edge
         // value (`#1step` input skew).
         self.tick_clocking_blocks();
+        // §14.13: deliver `@(cb.sig)` events for samples just published. The
+        // publish happens after this slot's edge pass, so run one more.
+        if self.clocking_mirror_dirty {
+            self.clocking_mirror_dirty = false;
+            self.check_edges();
+            let _ = self.drain_edge_cascade(cascade_limit);
+        }
         // §14.13: now that this edge's NBA updates have committed and the
         // clocking input snapshots are refreshed, resume the clocking-event
         // waiters (`@(cb)` / `##N`) that fired this slot — in the Reactive
@@ -21091,6 +21250,18 @@ impl Simulator {
     /// `lhs <= #d rhs` is canonicalized at source level (see
     /// `crate::intra_delay`) into `lhs = $__xz_intra_delay(d, rhs)`.
     /// Returns `(delay_expr, rhs_expr)` when `rvalue` is that marker.
+    /// §14.16 `cb.out <= ##N rhs` marker: returns (count_expr, rhs).
+    fn intra_cycle_marker(rvalue: &Expression) -> Option<(&Expression, &Expression)> {
+        match &rvalue.kind {
+            ExprKind::SystemCall { name, args }
+                if name == crate::intra_delay::INTRA_CYCLE_MARKER && args.len() == 2 =>
+            {
+                Some((&args[0], &args[1]))
+            }
+            _ => None,
+        }
+    }
+
     fn intra_delay_marker(rvalue: &Expression) -> Option<(&Expression, &Expression)> {
         match &rvalue.kind {
             ExprKind::SystemCall { name, args }
@@ -29834,47 +30005,13 @@ impl Simulator {
                         return v;
                     }
                 }
-                // LRM §14.3 clocking-block input read — `cb.<sig>`
-                // returns the snapshot taken at the most recent posedge
-                // of the cb's clock (`#1step` input skew). Falls through
-                // to generic lookup when the cb is unknown or the
-                // signal isn't an input. Handles both a module-scoped
-                // `cb.sig` (2 segments) and an interface-scoped
-                // `iface_inst.cb.sig` (≥3): the clocking block key is every
-                // segment but the last, and its snapshot/meta signals are the
-                // RESOLVED nets (`iface_inst.sig`), so match the trailing
-                // `sig` by exact name or `.sig` suffix.
+                // LRM §14.3 clocking-block input read — `cb.<sig>` returns
+                // the snapshot taken at the block's most recent clock edge.
                 if hier.path.len() >= 2 {
-                    let cb_segs: Vec<&str> = hier
-                        .path
-                        .iter()
-                        .take(hier.path.len() - 1)
-                        .map(|s| s.name.name.as_str())
-                        .collect();
-                    let cb = self
-                        .resolve_clocking_key(&cb_segs)
-                        .unwrap_or_else(|| cb_segs.join("."));
-                    let sig = hier.path.last().unwrap().name.name.as_str();
-                    let matches_sig =
-                        |k: &str| k == sig || k.rsplit('.').next() == Some(sig);
-                    if let Some(snap) = self.clocking_snapshots.get(&cb) {
-                        if let Some(v) = snap.get(sig) {
-                            return v.clone();
-                        }
-                        if let Some((_, v)) = snap.iter().find(|(k, _)| matches_sig(k)) {
-                            return v.clone();
-                        }
-                        // Known cb but signal not in snapshot yet (first read
-                        // before any posedge) — return the current net value.
-                        if let Some((_, sigs)) = self.clocking_meta.get(&cb) {
-                            if let Some((net, _)) =
-                                sigs.iter().find(|(n, is_in)| *is_in && matches_sig(n))
-                            {
-                                if let Some(v) = self.get_signal_value_by_name(net) {
-                                    return v;
-                                }
-                            }
-                        }
+                    let segs: Vec<&str> =
+                        hier.path.iter().map(|s| s.name.name.as_str()).collect();
+                    if let Some(v) = self.try_clocking_signal_read(&segs) {
+                        return v;
                     }
                 }
                 // LRM §15.5.3: `e.triggered` on a named event.
@@ -32802,6 +32939,16 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §14.3 clocking-block signal read. Inside a task/function the
+                // parser yields MemberAccess for `cb.sig` (module scope yields
+                // a flat hier Ident), so this arm needs the same handling.
+                if let Some(mut segs) = Self::flatten_member_path(expr) {
+                    segs.push(member.name.clone());
+                    let refs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
+                    if let Some(v) = self.try_clocking_signal_read(&refs) {
+                        return v;
+                    }
+                }
                 // §25.10: member access through an indexed plain virtual-
                 // interface array (`vifs[i].data`). Resolve the element alias
                 // before generic flattened aggregate handling creates/reads a
@@ -35595,6 +35742,16 @@ impl Simulator {
                 // canonicalized to `$__xz_intra_delay(d, rhs)`): the RHS is
                 // evaluated now; the update is scheduled d ticks out.
                 let mut intra_d: Option<u64> = None;
+                // §14.16 `cb.out <= ##N rhs`: strip the cycle marker and keep
+                // N; the clocking-drive path below defers by N clock events.
+                let mut intra_cycles: Option<u64> = None;
+                let rvalue: &Expression = match Self::intra_cycle_marker(rvalue) {
+                    Some((n_expr, rhs)) => {
+                        intra_cycles = Some(self.eval_expr(n_expr).to_u64().unwrap_or(0));
+                        rhs
+                    }
+                    None => rvalue,
+                };
                 let rvalue: &Expression = match Self::intra_delay_marker(rvalue) {
                     Some((d_expr, rhs)) => {
                         intra_d = Some(self.eval_delay_ticks(d_expr));
@@ -35630,13 +35787,29 @@ impl Simulator {
                         let cb = self
                             .resolve_clocking_key(&cb_segs)
                             .unwrap_or_else(|| cb_segs.join("."));
-                        let sig = hier.path.last().unwrap().name.name.as_str();
+                        let raw_sig = hier.path.last().unwrap().name.name.as_str();
+                        let sig: &str = self
+                            .clocking_sig_alias
+                            .get(&cb)
+                            .and_then(|m| m.get(raw_sig))
+                            .map(|s| s.as_str())
+                            .unwrap_or(raw_sig);
                         if let Some((_, sigs)) = self.clocking_meta.get(&cb) {
                             let out_net = sigs.iter().find(|(n, is_in)| {
                                 !*is_in && (n == sig || n.rsplit('.').next() == Some(sig))
                             });
                             if let Some((net, _)) = out_net {
                                 let net = net.clone();
+                                // §14.16 `##N`: wait N further clocking events.
+                                if let Some(n) = intra_cycles {
+                                    if n > 0 {
+                                        self.clocking_cycle_pending
+                                            .entry(cb)
+                                            .or_default()
+                                            .push((n, net, val));
+                                        return;
+                                    }
+                                }
                                 // §14.16.1: a drive executed AT the clocking
                                 // event matures at edge + OUTPUT SKEW (per-sig
                                 // override, else block default, else #0 =
@@ -41203,6 +41376,31 @@ impl Simulator {
             // §14.16.1: record the edge time — a drive executed AT this time
             // matures at edge + output skew instead of waiting a full cycle.
             self.clocking_last_edge.insert(cb.clone(), self.time);
+            // §14.16 `##N` drives: one clocking event elapsed — mature any
+            // whose countdown hits zero (honoring output skew), keep the rest.
+            if let Some(mut pend) = self.clocking_cycle_pending.remove(&cb) {
+                let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
+                let mut keep: Vec<(u64, String, Value)> = Vec::new();
+                for (n, net, val) in pend.drain(..) {
+                    if n <= 1 {
+                        let skew = self
+                            .clocking_sig_out_skew
+                            .get(&cb)
+                            .and_then(|m| m.get(&net))
+                            .copied()
+                            .unwrap_or(dskew);
+                        if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
+                            let w = self.signal_widths[id];
+                            self.schedule_delayed_with_delay(id, val.resize(w), skew);
+                        }
+                    } else {
+                        keep.push((n - 1, net, val));
+                    }
+                }
+                if !keep.is_empty() {
+                    self.clocking_cycle_pending.insert(cb.clone(), keep);
+                }
+            }
             // Posedge: refresh input snapshots from the Preponed samples
             // captured at slot-entry (`refresh_clocking_preponed`), so `cb.<in>`
             // reads the value from BEFORE this edge (`#1step` input skew,
@@ -41218,6 +41416,36 @@ impl Simulator {
                         .or_else(|| self.get_signal_value_by_name(sig))
                     {
                         snap.insert(sig.clone(), v);
+                    }
+                }
+            }
+            // §14.13: publish each fresh sample to its hidden mirror signal so
+            // `@(cb.sig)` fires at THIS edge, and only on an actual change.
+            let mirror: Vec<(String, Value)> = snap
+                .iter()
+                .map(|(net, v)| (net.clone(), v.clone()))
+                .collect();
+            for (net, v) in mirror {
+                // meta stores resolved nets; the mirror is keyed by the
+                // clocking-visible name, so translate back through the alias.
+                let vis = self
+                    .clocking_sig_alias
+                    .get(&cb)
+                    .and_then(|m| {
+                        m.iter()
+                            .find(|(_, n)| **n == net)
+                            .map(|(vis, _)| vis.clone())
+                    })
+                    .unwrap_or_else(|| net.clone());
+                let hidden = format!("{}{}.{}", CB_SAMPLE_PREFIX, cb, vis);
+                if let Some(&id) = self.signal_name_to_id.get(hidden.as_str()) {
+                    let w = self.signal_widths[id];
+                    let nv = v.resize(w);
+                    if self.signal_table[id] != nv {
+                        write_sig!(self, id, nv);
+                        self.mark_dirty_id(id);
+                        self.table_modified = true;
+                        self.clocking_mirror_dirty = true;
                     }
                 }
             }
@@ -54496,6 +54724,61 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// §14.3 clocking-block input read for a dotted path whose LAST segment is
+    /// the signal: `cb.sig`, `iface.cb.sig`, `vif.cb.sig`. Returns the value
+    /// sampled at the block's most recent clock edge (`#1step` input skew), or
+    /// the live net before the first edge. `None` when the path doesn't name a
+    /// clocking block, so callers fall through to generic resolution.
+    ///
+    /// Shared by the flat-hier-Ident and the MemberAccess shapes — inside a
+    /// task/function body the parser emits `MemberAccess`, so without the
+    /// second call site `cb.sig` read 0 in every subroutine (and in `wait()`
+    /// conditions), while the same read worked at module scope.
+    /// Flatten a plain dotted MemberAccess/Ident chain to its segments.
+    /// `None` for any shape with indexing/calls (not a simple hierarchical
+    /// name), so callers don't misread `a[i].b` as a clocking path.
+    fn flatten_member_path(expr: &Expression) -> Option<Vec<String>> {
+        match &expr.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                Some(h.path.iter().map(|s| s.name.name.clone()).collect())
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                let mut v = Self::flatten_member_path(base)?;
+                v.push(member.name.clone());
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    fn try_clocking_signal_read(&self, segs: &[&str]) -> Option<Value> {
+        if segs.len() < 2 {
+            return None;
+        }
+        let cb = self.resolve_clocking_key(&segs[..segs.len() - 1])?;
+        let raw_sig = segs[segs.len() - 1];
+        // §14.3 renaming: `cb.alias` samples the bound net.
+        let sig: &str = self
+            .clocking_sig_alias
+            .get(&cb)
+            .and_then(|m| m.get(raw_sig))
+            .map(|s| s.as_str())
+            .unwrap_or(raw_sig);
+        let matches_sig = |k: &str| k == sig || k.rsplit('.').next() == Some(sig);
+        let snap = self.clocking_snapshots.get(&cb)?;
+        if let Some(v) = snap.get(sig) {
+            return Some(v.clone());
+        }
+        if let Some((_, v)) = snap.iter().find(|(k, _)| matches_sig(k)) {
+            return Some(v.clone());
+        }
+        // Known cb but not sampled yet (read before the first edge) — the
+        // live net value is the sensible answer.
+        let (_, sigs) = self.clocking_meta.get(&cb)?;
+        let (net, _) = sigs.iter().find(|(n, is_in)| *is_in && matches_sig(n))?;
+        self.get_signal_value_by_name(net)
     }
 
     fn iface_alias_for(&self, name: &str) -> Option<String> {
