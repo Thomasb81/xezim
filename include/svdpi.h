@@ -30,6 +30,28 @@ typedef s_vpi_vecval svLogicVecVal;
 
 typedef svLogicVecVal* p_svLogicVecVal;
 
+/* Canonical scalar types - IEEE 1800-2017 section 35.5.6.1. A single
+ * `bit` maps to svBit, a single `logic`/`reg` to svLogic; both are a
+ * byte-wide value. */
+typedef uint8_t svScalar;
+typedef svScalar svBit;    /* 2-state: sv_0 / sv_1 */
+typedef svScalar svLogic;  /* 4-state: sv_0 / sv_1 / sv_z / sv_x */
+
+/* Scalar bit values (section 35.5.6.1). */
+#ifndef sv_0
+#define sv_0 0
+#define sv_1 1
+#define sv_z 2
+#define sv_x 3
+#endif
+/* Alternate spelling used by some codebases. */
+#ifndef sv_b_0
+#define sv_b_0 sv_0
+#define sv_b_1 sv_1
+#define sv_b_z sv_z
+#define sv_b_x sv_x
+#endif
+
 /* Open array types */
 typedef struct svOpenArrayType {
     void* dhandle;

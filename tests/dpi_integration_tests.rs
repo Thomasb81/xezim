@@ -159,6 +159,16 @@ fn assert_dpi_pass(c_file: &str, stem: &str, sv_file: &str) {
 }
 
 #[test]
+fn dpi_scalar_types_test() {
+    // §35.5.6.1: svBit / svLogic canonical scalar types from svdpi.h.
+    assert_dpi_pass(
+        "tests/dpi/scalar_types.c",
+        "scalar_types",
+        "tests/dpi/scalar_types_test.sv",
+    );
+}
+
+#[test]
 fn dpi_type_mappings_test() {
     // Import type-mapping coverage: atoms, real, out/inout, packed 2-state
     // (svBitVecVal*) and 4-state (svLogicVecVal*, incl. x/z), string.
