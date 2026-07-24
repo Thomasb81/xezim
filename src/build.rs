@@ -2,6 +2,50 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // Capture the current git commit so the runtime banner can identify the
+    // exact build (customer logs otherwise carry only the crate version, which
+    // is not enough to pin a commit when triaging). Best-effort: an unknown or
+    // missing git returns "unknown"; a dirty tree gets a "-dirty" suffix. Rerun
+    // whenever HEAD moves so the baked-in hash stays current.
+    let git_hash = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|h| {
+            let dirty = Command::new("git")
+                .args(["status", "--porcelain"])
+                .output()
+                .ok()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false);
+            if dirty {
+                format!("{}-dirty", h)
+            } else {
+                h
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=XEZIM_GIT_HASH={}", git_hash);
+    // Commit timestamp (author/committer date, ISO-8601 strict) so a log can be
+    // tied to a point in history, not just a hash. Best-effort; "unknown" if git
+    // is absent or HEAD is unresolvable.
+    let git_date = Command::new("git")
+        .args(["show", "-s", "--format=%cI", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=XEZIM_GIT_DATE={}", git_date);
+    // HEAD ref + index changes should retrigger the build script so the hash
+    // does not go stale between commits.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/index");
+
     // VPI symbols must be resolvable by dlopen'd DPI/VPI modules.
     //
     // The flag is spelled differently per linker: GNU/ELF ld takes

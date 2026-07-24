@@ -1482,6 +1482,7 @@ suppressed but the explicit SDF annotation still applies."
                 match xezim::read_compiled(sf) {
                     Ok(Some(elab)) => {
                         println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
+                        println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
                         println!("Loaded compiled: {}", sf);
                         println!("Max time: {} ns", max_time);
                         println!("------------------------------");
@@ -1756,6 +1757,7 @@ suppressed but the explicit SDF annotation still applies."
     }
 
     println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
+    println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
     println!("Max time: {} ns", max_time);
     println!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
