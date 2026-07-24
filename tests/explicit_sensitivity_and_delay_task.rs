@@ -114,3 +114,43 @@ fn parenless_enable_of_delay_only_task_runs() {
     let sim = simulate(DELAY_TASK_ENABLE, 100).expect("simulate failed");
     assert_eq!(get(&sim, "witness") & 0xFF, 0xA5);
 }
+
+/// An edge block that produces a clock edge inside its own `#0` window. The
+/// delay re-enters the edge machinery through the synchronous
+/// `TimingControl::Delay` arm; the downstream flop must still see the posedge.
+///
+/// The edge pass used to `mem::take` the block list, so a nested pass ran
+/// against an EMPTY list: every block index failed the bounds check and was
+/// dropped silently, while the prev-value snapshot still advanced — consuming
+/// the edge so no pass ever delivered it. On a vendor register-file cell this
+/// killed all 20 read-data flops (0 executions vs 1680 in a reference
+/// simulator) and the whole memory read back X.
+const NESTED_EDGE_CLOCK: &str = r#"
+module tb;
+  reg trig, clk_int;
+  reg [7:0] fires;
+  initial begin fires = 8'h00; clk_int = 1'b0; trig = 1'b0; end
+
+  always @(posedge trig) begin
+    clk_int = 1'b0;
+    #0 clk_int = 1'b1;     // posedge made DURING a nested delay window
+  end
+
+  always @(posedge clk_int) begin
+    fires = fires + 8'h01;
+  end
+
+  initial begin
+    #1 trig = 1'b1;
+    #1 trig = 1'b0;
+    #1 trig = 1'b1;
+    #1;
+  end
+endmodule
+"#;
+
+#[test]
+fn edge_made_inside_nested_delay_is_delivered() {
+    let sim = simulate(NESTED_EDGE_CLOCK, 100).expect("simulate failed");
+    assert_eq!(get(&sim, "fires") & 0xFF, 2);
+}
