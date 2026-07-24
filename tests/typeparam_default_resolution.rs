@@ -11,7 +11,7 @@
 //! params (the elided case), the trailing param came back unbound, flipped
 //! the `get()` if/else, and the base-callback `typeid_map` write never ran.
 //! That broke UVM callback registration for any type with a non-base callback
-//! (the `09callbacks/20inherit` grandchild edge).
+//! (a callbacks-inheritance grandchild edge).
 //!
 //! This test models the elision via static-function accessors (xezim resolves
 //! per-spec statics through static calls, the same path UVM's `get()` uses).

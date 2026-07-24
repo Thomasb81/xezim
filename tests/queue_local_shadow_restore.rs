@@ -15,7 +15,7 @@
 //! empty. After the fix, `delete()` clears and the two later pushes bring
 //! the size back to 2.
 //!
-//! This was the real blocker for UVM `09callbacks/20inherit`: its
+//! This was the real blocker for a UVM callbacks-inheritance test: its
 //! `check_phase` declares `string p[$]` and rebuilds it across 6 blocks
 //! with `p.delete()` between them; UVM-internal helpers reached during
 //! `uvm_callbacks#(...)::display()` declared their own `p`, unregistering
