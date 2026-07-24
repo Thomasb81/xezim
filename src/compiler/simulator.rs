@@ -394,6 +394,26 @@ macro_rules! sim_dbg_eprintln {
 /// consistent. Both fields are simple `Vec`s on `Self`, so the macro
 /// expands to a single pair of indexed writes — the borrow checker
 /// sees disjoint field borrows just like the bare assignment did.
+/// Mark a signal id dirty for the next incremental VCD flush. A macro (not a
+/// method) so it expands to disjoint FIELD accesses — a `&mut self` method call
+/// would conflict with call sites that already hold a mutable borrow of another
+/// field (e.g. `for cg in &mut self.clock_generators`). Cheap: one bounds check
+/// + one epoch compare when the dump is active, a single branch otherwise. The
+/// rolling epoch dedups repeat writes within a flush.
+macro_rules! vcd_mark {
+    ($self:ident, $id:expr) => {{
+        if $self.vcd_dirty_active {
+            let __vm_id = $id;
+            if __vm_id < $self.vcd_dirty_mark.len()
+                && $self.vcd_dirty_mark[__vm_id] != $self.vcd_dirty_epoch
+            {
+                $self.vcd_dirty_mark[__vm_id] = $self.vcd_dirty_epoch;
+                $self.vcd_dirty.push(__vm_id as u32);
+            }
+        }
+    }};
+}
+
 macro_rules! write_sig {
     ($self:ident, $id:expr, $val:expr) => {{
         let __wsig_id = $id;
@@ -417,6 +437,10 @@ macro_rules! write_sig {
                 $self.signal_inline_bits[__wsig_id] = [__wsig_v, __wsig_x];
             }
             $self.signal_table[__wsig_id] = __wsig_val;
+            // Incremental VCD: mark this write dirty (no-op when the dump is off
+            // or the full scan is forced). Superset-safe — the flush re-checks
+            // prev vs cur, so marking an unchanged write costs only a skip.
+            vcd_mark!($self, __wsig_id);
             // O1 measurement: stamp the signal's last-change phase.
             if $self.event_measure
                 && !$self.armed_edge
@@ -3084,6 +3108,27 @@ pub struct Simulator {
     /// Last sim time at which each `vcd_trace` entry that is an `event` emitted
     /// its trigger pulse — dedups repeat triggers inside one time slot.
     vcd_event_last: Vec<u64>,
+    /// Incremental (dirty-set) change detection for `vcd_write_changes`. The
+    /// full scan is O(all dumped signals) per timestep; for a large dump where
+    /// few signals move per step (e.g. a 291k-signal gate-level netlist) that
+    /// dominates wall time. Instead every real signal write marks the signal
+    /// dirty (a SUPERSET of actual changes — the prev-value compare in
+    /// vcd_write_changes still guarantees only genuine changes are emitted), so
+    /// the flush visits O(written signals) not O(all). Coverage: both value
+    /// write choke points (the `write_sig!` macro and `after_signal_write`) call
+    /// `vcd_mark_written`; SVA preponed swaps deliberately do not (they restore).
+    /// `vcd_dirty` is the per-flush list of dirty signal ids; `vcd_dirty_mark`
+    /// dedups within a flush via a rolling epoch (mark==epoch ⇒ already listed).
+    /// `vcd_id_to_trace` maps a signal id to its (possibly aliased) trace slots.
+    /// `vcd_event_indices` are the event trace slots, always checked (events
+    /// fire via event_triggered_time, not signal writes). Disabled — falling
+    /// back to the full scan — via XEZIM_VCD_FULL=1 or when the maps are unbuilt.
+    vcd_dirty: Vec<u32>,
+    vcd_dirty_mark: Vec<u64>,
+    vcd_dirty_epoch: u64,
+    vcd_id_to_trace: Vec<Vec<u32>>,
+    vcd_event_indices: Vec<usize>,
+    vcd_dirty_active: bool,
     /// §21.7.1.8 `$dumplimit`: byte budget for the dump, and the running
     /// (approximate) count of bytes handed to the sink. `vcd_limit_hit` latches
     /// once the budget is spent and permanently stops the dump.
@@ -4995,6 +5040,12 @@ impl Simulator {
             vcd_file: None,
             vcd_writer: None,
             vcd_trace: Vec::new(),
+            vcd_dirty: Vec::new(),
+            vcd_dirty_mark: Vec::new(),
+            vcd_dirty_epoch: 1,
+            vcd_id_to_trace: Vec::new(),
+            vcd_event_indices: Vec::new(),
+            vcd_dirty_active: false,
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
@@ -41484,6 +41535,10 @@ impl Simulator {
     fn after_signal_write(&mut self, id: usize) {
         self.note_armed_write(id);
         self.note_edge_write(id);
+        // Incremental VCD: this is the post-write hook for the direct
+        // signal_table writes (bit/part-select, struct/array element) and the
+        // NBA/vpi fast paths, so mark the id dirty here too. Superset-safe.
+        vcd_mark!(self, id);
         if id >= self.signal_table.len() {
             return;
         }
@@ -43176,7 +43231,35 @@ impl Simulator {
         self.vcd_limit_hit = false;
         self.vcd_last_time = self.time;
         self.vcd_account_bytes(nbytes);
+
+        // Build the incremental-dump reverse maps (id → trace slots, and the
+        // event slots) unless the full scan is forced. When active, every
+        // signal write marks the id dirty so vcd_write_changes visits only
+        // written signals; see the field docs on `vcd_dirty`.
+        let force_full = std::env::var("XEZIM_VCD_FULL").ok().as_deref() == Some("1");
+        if force_full {
+            self.vcd_dirty_active = false;
+        } else {
+            let nsig = self.signal_table.len();
+            let mut id_to_trace: Vec<Vec<u32>> = vec![Vec::new(); nsig];
+            let mut event_indices: Vec<usize> = Vec::new();
+            for (idx, &(sid, _)) in self.vcd_trace.iter().enumerate() {
+                if self.vcd_var_kinds[idx] == VcdVarKind::Event {
+                    event_indices.push(idx);
+                }
+                if sid < nsig {
+                    id_to_trace[sid].push(idx as u32);
+                }
+            }
+            self.vcd_id_to_trace = id_to_trace;
+            self.vcd_event_indices = event_indices;
+            self.vcd_dirty_mark = vec![0u64; nsig];
+            self.vcd_dirty.clear();
+            self.vcd_dirty_epoch = 1;
+            self.vcd_dirty_active = true;
+        }
     }
+
 
     // NOTE: `Simulator::vcd_write_value` is GONE. It was a second, divergent
     // copy of `vcd_sink::write_vcd_value` (the two disagreed about `real` and
@@ -43238,40 +43321,75 @@ impl Simulator {
             return;
         }
 
-        // Walk the compact trace table directly: no name hashing, and
         // vcd_prev_signals is a parallel Vec<Value> (index == position in
         // vcd_trace), so change detection is a single indexed compare.
         let now = self.time;
         let mut changes: Vec<(Arc<str>, Value)> = Vec::new();
-        for idx in 0..self.vcd_trace.len() {
-            let id = self.vcd_trace[idx].0;
-            if self.vcd_var_kinds[idx] == VcdVarKind::Event {
-                // §21.7.2.1: an event has no level — it emits a bare `1<id>`
-                // record at EVERY trigger. Treating it as a level signal with
-                // prev!=cur dedup drops a repeat `->ev` whose 0→1→0 toggle
-                // cancels inside one time slot.
-                let fired = self
-                    .id_to_name
-                    .get(id)
-                    .and_then(|n| self.event_triggered_time.get(n.as_ref()))
-                    .copied()
-                    == Some(now);
-                if fired && self.vcd_event_last[idx] != now {
-                    self.vcd_event_last[idx] = now;
-                    changes.push((self.vcd_trace[idx].1.clone(), Value::ones(1)));
+
+        // Per-trace-slot change check, shared by the incremental and full paths.
+        // Returns the record to emit, if any, and keeps vcd_prev_signals in step.
+        macro_rules! check_slot {
+            ($idx:expr) => {{
+                let idx = $idx;
+                let id = self.vcd_trace[idx].0;
+                if self.vcd_var_kinds[idx] == VcdVarKind::Event {
+                    // §21.7.2.1: an event has no level — it emits a bare `1<id>`
+                    // record at EVERY trigger. Treating it as a level signal
+                    // with prev!=cur dedup drops a repeat `->ev` whose 0→1→0
+                    // toggle cancels inside one time slot.
+                    let fired = self
+                        .id_to_name
+                        .get(id)
+                        .and_then(|n| self.event_triggered_time.get(n.as_ref()))
+                        .copied()
+                        == Some(now);
+                    if fired && self.vcd_event_last[idx] != now {
+                        self.vcd_event_last[idx] = now;
+                        changes.push((self.vcd_trace[idx].1.clone(), Value::ones(1)));
+                    }
+                    // Keep the level mirror in step so the toggle never leaks out.
+                    self.vcd_prev_signals[idx] = self.signal_table[id].clone();
+                } else {
+                    let val = &self.signal_table[id];
+                    if self.vcd_prev_signals[idx] != *val {
+                        let mut out = val.clone();
+                        if self.signal_real.get(id).copied().unwrap_or(false) {
+                            out.is_real = true;
+                        }
+                        self.vcd_prev_signals[idx] = val.clone();
+                        changes.push((self.vcd_trace[idx].1.clone(), out));
+                    }
                 }
-                // Keep the level mirror in step so the toggle never leaks out.
-                self.vcd_prev_signals[idx] = self.signal_table[id].clone();
-                continue;
+            }};
+        }
+
+        if self.vcd_dirty_active {
+            // Incremental: only signals written since the last flush can have
+            // changed. Gather their trace slots plus the (few) event slots
+            // (events fire independently of signal writes), then emit in
+            // trace-index order so the per-timestep record order is byte-
+            // identical to the full scan. Still O(written signals), not O(all).
+            let dirty = std::mem::take(&mut self.vcd_dirty);
+            let mut slots: Vec<u32> = Vec::with_capacity(dirty.len() + self.vcd_event_indices.len());
+            for &sid in &dirty {
+                let sid = sid as usize;
+                if sid < self.vcd_id_to_trace.len() {
+                    slots.extend_from_slice(&self.vcd_id_to_trace[sid]);
+                }
             }
-            let val = &self.signal_table[id];
-            if self.vcd_prev_signals[idx] != *val {
-                let mut out = val.clone();
-                if self.signal_real.get(id).copied().unwrap_or(false) {
-                    out.is_real = true;
-                }
-                self.vcd_prev_signals[idx] = val.clone();
-                changes.push((self.vcd_trace[idx].1.clone(), out));
+            slots.extend(self.vcd_event_indices.iter().map(|&i| i as u32));
+            slots.sort_unstable();
+            slots.dedup();
+            for &idx in &slots {
+                check_slot!(idx as usize);
+            }
+            self.vcd_dirty = dirty;
+            self.vcd_dirty.clear();
+            self.vcd_dirty_epoch = self.vcd_dirty_epoch.wrapping_add(1);
+        } else {
+            // Full scan: walk every dumped trace slot.
+            for idx in 0..self.vcd_trace.len() {
+                check_slot!(idx);
             }
         }
 
