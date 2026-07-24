@@ -2447,6 +2447,14 @@ pub struct Simulator {
     /// `@(negedge clk)` block samples/advances on the negedge, not the posedge.
     /// Absent ⇒ posedge (the default and by far the common case).
     clocking_edge: HashMap<String, EdgeKind>,
+    /// §14.4 per-cb default OUTPUT skew in ticks (absent = #0).
+    clocking_out_skew: HashMap<String, u64>,
+    /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
+    clocking_sig_out_skew: HashMap<String, HashMap<String, u64>>,
+    /// Sim time of each cb's most recent clock edge — a `cb.out <= v` executed
+    /// AT the edge time drives at edge+skew (§14.16.1); between edges it waits
+    /// for the next edge.
+    clocking_last_edge: HashMap<String, u64>,
     /// LRM §14.4 `#1step` input skew — Preponed (slot-entry) value of every
     /// clocking-block INPUT signal, keyed by signal name. Captured at the top
     /// of each time slot BEFORE the active/NBA regions run (same point as
@@ -4941,6 +4949,9 @@ impl Simulator {
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
             clocking_edge: HashMap::default(),
+            clocking_out_skew: HashMap::default(),
+            clocking_sig_out_skew: HashMap::default(),
+            clocking_last_edge: HashMap::default(),
             clocking_preponed: HashMap::default(),
             deferred_clocking_conts: Vec::new(),
             pending_reactive: Vec::new(),
@@ -8456,6 +8467,58 @@ impl Simulator {
                 self.clocking_prev_clock.insert(cb_name.clone(), 2);
                 self.clocking_snapshots
                     .insert(cb_name.clone(), HashMap::default());
+            }
+        }
+        // §14.4 output skews: evaluate the per-cb default and per-signal
+        // output-skew expressions to ticks. Collected first (clones) because
+        // eval_delay_ticks needs &mut self.
+        let skew_specs: Vec<(String, bool, Option<Expression>, Vec<(String, Expression)>)> = self
+            .module
+            .clocking_blocks
+            .iter()
+            .map(|(n, cd)| {
+                let per_sig: Vec<(String, Expression)> = cd
+                    .signals
+                    .iter()
+                    .filter(|s| {
+                        !matches!(
+                            s.direction,
+                            crate::ast::types::PortDirection::Input
+                                | crate::ast::types::PortDirection::Inout
+                        )
+                    })
+                    .filter_map(|s| s.skew.clone().map(|e| (s.name.name.clone(), e)))
+                    .collect();
+                (n.clone(), cd.is_default, cd.default_output_skew.clone(), per_sig)
+            })
+            .collect();
+        let skew_ticks = |slf: &mut Self, e: &Expression| -> u64 {
+            // A `#1ns` skew is an ABSOLUTE time literal (stored in seconds);
+            // convert against the global tick directly — eval_delay_ticks'
+            // module-timescale context isn't established at compile time.
+            if let ExprKind::Number(crate::ast::expr::NumberLiteral::Time(secs)) = &e.kind {
+                return (secs / slf.tick_s).round() as u64;
+            }
+            slf.eval_delay_ticks(e)
+        };
+        for (cb, is_default, dskew, per_sig) in skew_specs {
+            if let Some(e) = dskew {
+                let t = skew_ticks(self, &e);
+                if t > 0 {
+                    self.clocking_out_skew.insert(cb.clone(), t);
+                    if is_default {
+                        self.clocking_out_skew
+                            .insert("__xz_default_clocking".to_string(), t);
+                    }
+                }
+            }
+            let mut m: HashMap<String, u64> = HashMap::default();
+            for (net, e) in per_sig {
+                let t = skew_ticks(self, &e);
+                m.insert(net, t);
+            }
+            if !m.is_empty() {
+                self.clocking_sig_out_skew.insert(cb, m);
             }
         }
         // Friendly fallback: `##N` with a single clocking block and no
@@ -17534,18 +17597,12 @@ impl Simulator {
                         // is the RAW dotted path (`iface.cb`); `resolve_hier_name`
                         // strips the instance prefix to `cb`, so try the raw path
                         // first, then the resolved name.
-                        let raw = h
-                            .path
-                            .iter()
-                            .map(|s| s.name.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(".");
+                        let segs: Vec<&str> =
+                            h.path.iter().map(|s| s.name.name.as_str()).collect();
                         let sig = self.resolve_hier_name(h);
-                        let cb_key = if self.clocking_meta.contains_key(&raw) {
-                            raw.clone()
-                        } else {
-                            sig.clone()
-                        };
+                        let cb_key = self
+                            .resolve_clocking_key(&segs)
+                            .unwrap_or_else(|| sig.clone());
                         if ee.edge.is_none() {
                             if let Some((clk, _)) = self.clocking_meta.get(&cb_key) {
                                 out.push(Sensitivity {
@@ -17930,15 +17987,12 @@ impl Simulator {
                     return false;
                 }
                 if let ExprKind::Ident(h) = &ee.expr.kind {
-                    // Interface-scoped `@(iface.cb)` keys on the raw dotted path;
-                    // resolve_hier_name strips it to `cb`. Try both.
-                    let raw = h
-                        .path
-                        .iter()
-                        .map(|s| s.name.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    if self.clocking_meta.contains_key(&raw) {
+                    // Interface-scoped `@(iface.cb)` / vif-aliased `@(vif.cb)`
+                    // key on the (alias-resolved) dotted path; resolve_hier_name
+                    // strips it to `cb`. Try both.
+                    let segs: Vec<&str> =
+                        h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    if self.resolve_clocking_key(&segs).is_some() {
                         return true;
                     }
                     let sig = self.resolve_hier_name(h);
@@ -29791,13 +29845,15 @@ impl Simulator {
                 // RESOLVED nets (`iface_inst.sig`), so match the trailing
                 // `sig` by exact name or `.sig` suffix.
                 if hier.path.len() >= 2 {
-                    let cb = hier
+                    let cb_segs: Vec<&str> = hier
                         .path
                         .iter()
                         .take(hier.path.len() - 1)
                         .map(|s| s.name.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(".");
+                        .collect();
+                    let cb = self
+                        .resolve_clocking_key(&cb_segs)
+                        .unwrap_or_else(|| cb_segs.join("."));
                     let sig = hier.path.last().unwrap().name.name.as_str();
                     let matches_sig =
                         |k: &str| k == sig || k.rsplit('.').next() == Some(sig);
@@ -33503,11 +33559,20 @@ impl Simulator {
                 v
             }
             NumberLiteral::Real(f) => Value::from_f64(*f),
-            // A time literal in a value context evaluates to its magnitude in the
-            // simulation tick unit (1 ns) — `10ns` → 10.0 — matching the prior
-            // behaviour. (Delay contexts route through eval_delay_ticks, which
-            // applies the timescale/precision conversion.)
-            NumberLiteral::Time(s) => Value::from_f64(*s * 1e9),
+            // §5.8: a time literal in a value context scales to the MODULE's
+            // timeunit, snapped to the precision so the result is exact —
+            // `30000ps` under `timescale 1ns/1ps` must compare EQUAL to a
+            // `$time` delta of 30, not 29.999999999999996 (the raw
+            // secs/unit_s float residue). Computed as
+            // round(secs/prec) / 10^(unit−prec): both operands are integral
+            // f64s, so the division is exact for real timescale ratios.
+            // (Delay contexts route through eval_delay_ticks instead.)
+            NumberLiteral::Time(s) => {
+                let (unit_exp, prec_exp) = self.current_timescale_exp();
+                let prec_s = 10f64.powi(prec_exp);
+                let ratio = 10f64.powi(unit_exp - prec_exp);
+                Value::from_f64((*s / prec_s).round() / ratio)
+            }
             // §5.7.1: unbased-unsized literal — a 1-bit FILL value; binary ops
             // and resize replicate it to the consuming context's width.
             NumberLiteral::UnbasedUnsized(c) => Value::fill_of(*c),
@@ -35556,13 +35621,15 @@ impl Simulator {
                 // name or `.sig` suffix) so `tick_clocking_blocks` drives it.
                 if let ExprKind::Ident(hier) = &lvalue.kind {
                     if hier.path.len() >= 2 {
-                        let cb = hier
+                        let cb_segs: Vec<&str> = hier
                             .path
                             .iter()
                             .take(hier.path.len() - 1)
                             .map(|s| s.name.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(".");
+                            .collect();
+                        let cb = self
+                            .resolve_clocking_key(&cb_segs)
+                            .unwrap_or_else(|| cb_segs.join("."));
                         let sig = hier.path.last().unwrap().name.name.as_str();
                         if let Some((_, sigs)) = self.clocking_meta.get(&cb) {
                             let out_net = sigs.iter().find(|(n, is_in)| {
@@ -35570,6 +35637,33 @@ impl Simulator {
                             });
                             if let Some((net, _)) = out_net {
                                 let net = net.clone();
+                                // §14.16.1: a drive executed AT the clocking
+                                // event matures at edge + OUTPUT SKEW (per-sig
+                                // override, else block default, else #0 =
+                                // Re-NBA of this timestep). Only a drive issued
+                                // BETWEEN events waits for the next edge.
+                                let skew = self
+                                    .clocking_sig_out_skew
+                                    .get(&cb)
+                                    .and_then(|m| m.get(&net))
+                                    .copied()
+                                    .or_else(|| self.clocking_out_skew.get(&cb).copied())
+                                    .unwrap_or(0);
+                                if self.clocking_last_edge.get(&cb).copied()
+                                    == Some(self.time)
+                                {
+                                    if let Some(&id) =
+                                        self.signal_name_to_id.get(net.as_str())
+                                    {
+                                        let w = self.signal_widths[id];
+                                        self.schedule_delayed_with_delay(
+                                            id,
+                                            val.resize(w),
+                                            skew,
+                                        );
+                                        return;
+                                    }
+                                }
                                 self.clocking_output_pending
                                     .entry(cb)
                                     .or_default()
@@ -41106,6 +41200,9 @@ impl Simulator {
             if !fired {
                 continue;
             }
+            // §14.16.1: record the edge time — a drive executed AT this time
+            // matures at edge + output skew instead of waiting a full cycle.
+            self.clocking_last_edge.insert(cb.clone(), self.time);
             // Posedge: refresh input snapshots from the Preponed samples
             // captured at slot-entry (`refresh_clocking_preponed`), so `cb.<in>`
             // reads the value from BEFORE this edge (`#1step` input skew,
@@ -41131,7 +41228,26 @@ impl Simulator {
             // lvalue) so width/signedness handling matches a normal
             // procedural assignment.
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
+                let dskew = self
+                    .clocking_out_skew
+                    .get(&cb)
+                    .copied()
+                    .unwrap_or(0);
                 for (sig, val) in pending {
+                    // §14.4 output skew for drives maturing at THIS edge.
+                    let skew = self
+                        .clocking_sig_out_skew
+                        .get(&cb)
+                        .and_then(|m| m.get(&sig))
+                        .copied()
+                        .unwrap_or(dskew);
+                    if skew > 0 {
+                        if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
+                            let w = self.signal_widths[id];
+                            self.schedule_delayed_with_delay(id, val.resize(w), skew);
+                            continue;
+                        }
+                    }
                     let lval = Expression::new(
                         ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
                             root: None,
@@ -54355,6 +54471,33 @@ impl Simulator {
     /// frame (vif FORMALS) wins; a plain `virtual <iface>` VARIABLE
     /// alias (`vif = bus;` — see `viface_var_aliases`) is the
     /// fallback. Returns the bound interface instance name.
+    /// Resolve a dotted clocking-block reference (`cb`, `iface.cb`, or
+    /// `vif.cb` through a virtual-interface alias) to its `clocking_meta`
+    /// key. `segs` is the dotted path WITHOUT the trailing signal segment
+    /// (for `cb.sig` forms) or the full path (for `@(cb)` forms).
+    fn resolve_clocking_key(&self, segs: &[&str]) -> Option<String> {
+        if segs.is_empty() {
+            return None;
+        }
+        let raw = segs.join(".");
+        if self.clocking_meta.contains_key(&raw) {
+            return Some(raw);
+        }
+        // §25.9 virtual interface: rewrite the head through the vif alias
+        // (`vif.cb_main` → `master_if.cb_main`).
+        if let Some(bound) = self.iface_alias_for(segs[0]) {
+            let mut aliased = bound;
+            for seg in &segs[1..] {
+                aliased.push('.');
+                aliased.push_str(seg);
+            }
+            if self.clocking_meta.contains_key(&aliased) {
+                return Some(aliased);
+            }
+        }
+        None
+    }
+
     fn iface_alias_for(&self, name: &str) -> Option<String> {
         if let Some(b) = self
             .local_iface_aliases

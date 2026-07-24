@@ -188,6 +188,10 @@ fn test_sv_20e_interface_clocking() {
     run_positive_compliance_test("tests", "20e_interface_clocking.sv");
 }
 #[test]
+fn test_sv_20f_clocking_skew_vif() {
+    run_positive_compliance_test("tests", "20f_clocking_skew_vif.sv");
+}
+#[test]
 fn test_sv_21_strings_typedef_casts() {
     run_positive_compliance_test("tests_advanced", "21_strings_typedef_casts.sv");
 }
