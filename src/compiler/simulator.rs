@@ -394,6 +394,26 @@ macro_rules! sim_dbg_eprintln {
 /// consistent. Both fields are simple `Vec`s on `Self`, so the macro
 /// expands to a single pair of indexed writes — the borrow checker
 /// sees disjoint field borrows just like the bare assignment did.
+/// Mark a signal id dirty for the next incremental VCD flush. A macro (not a
+/// method) so it expands to disjoint FIELD accesses — a `&mut self` method call
+/// would conflict with call sites that already hold a mutable borrow of another
+/// field (e.g. `for cg in &mut self.clock_generators`). Cheap: one bounds check
+/// + one epoch compare when the dump is active, a single branch otherwise. The
+/// rolling epoch dedups repeat writes within a flush.
+macro_rules! vcd_mark {
+    ($self:ident, $id:expr) => {{
+        if $self.vcd_dirty_active {
+            let __vm_id = $id;
+            if __vm_id < $self.vcd_dirty_mark.len()
+                && $self.vcd_dirty_mark[__vm_id] != $self.vcd_dirty_epoch
+            {
+                $self.vcd_dirty_mark[__vm_id] = $self.vcd_dirty_epoch;
+                $self.vcd_dirty.push(__vm_id as u32);
+            }
+        }
+    }};
+}
+
 macro_rules! write_sig {
     ($self:ident, $id:expr, $val:expr) => {{
         let __wsig_id = $id;
@@ -417,6 +437,10 @@ macro_rules! write_sig {
                 $self.signal_inline_bits[__wsig_id] = [__wsig_v, __wsig_x];
             }
             $self.signal_table[__wsig_id] = __wsig_val;
+            // Incremental VCD: mark this write dirty (no-op when the dump is off
+            // or the full scan is forced). Superset-safe — the flush re-checks
+            // prev vs cur, so marking an unchanged write costs only a skip.
+            vcd_mark!($self, __wsig_id);
             // O1 measurement: stamp the signal's last-change phase.
             if $self.event_measure
                 && !$self.armed_edge
@@ -1203,6 +1227,14 @@ struct EventWaiter {
     /// Full captured value for >64-bit sensitivity signals (parallel to
     /// `captured_prev`); `None` for ≤64-bit signals.
     captured_prev_wide: Vec<Option<Value>>,
+    /// LRM §14.13: this waiter is parked on a CLOCKING event (`@(cb)` / `##N`),
+    /// not a raw `@(posedge clk)`. Its continuation must resume in the Reactive
+    /// region — AFTER the same-edge NBA updates commit and the clocking input
+    /// snapshot refreshes — so it reads post-edge design state and this cycle's
+    /// `cb.<in>` samples. Raw edge waiters keep the default "resume before
+    /// same-edge blocks" behavior (`waiters_first`), which some gate-level tbs
+    /// depend on; only clocking waiters are deferred.
+    is_clocking: bool,
 }
 
 /// Pad a string to a given width with spaces (or zeros if zero_pad).
@@ -2410,6 +2442,24 @@ pub struct Simulator {
     clocking_output_pending: HashMap<String, Vec<(String, Value)>>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
+    /// LRM §14.3: each clocking block's clock EDGE (`@(posedge/negedge clk)`).
+    /// `tick_clocking_blocks` and `@(cb)` resolution consult this so a
+    /// `@(negedge clk)` block samples/advances on the negedge, not the posedge.
+    /// Absent ⇒ posedge (the default and by far the common case).
+    clocking_edge: HashMap<String, EdgeKind>,
+    /// LRM §14.4 `#1step` input skew — Preponed (slot-entry) value of every
+    /// clocking-block INPUT signal, keyed by signal name. Captured at the top
+    /// of each time slot BEFORE the active/NBA regions run (same point as
+    /// `sva_preponed`), so when a clock posedge fires later in the slot the
+    /// input snapshot is the value from *before* the edge, not the same-edge
+    /// NBA update. Without this, `cb.<in>` reads the post-edge value (off by
+    /// one clock relative to a reference simulator).
+    clocking_preponed: HashMap<String, Value>,
+    /// Continuations of clocking-event waiters (`@(cb)` / `##N`) that fired this
+    /// slot, held for resumption in the Reactive region — after `apply_nba` and
+    /// `tick_clocking_blocks` — instead of running in the Active region with the
+    /// raw edge. See `EventWaiter::is_clocking`.
+    deferred_clocking_conts: Vec<(usize, Vec<Statement>)>,
     /// LRM §4.4 "reactive region" — drained AFTER the observed region
     /// has fired and BEFORE the postponed region runs. In a strict LRM
     /// implementation this hosts `program`-block procedural code so a
@@ -3100,6 +3150,27 @@ pub struct Simulator {
     /// Last sim time at which each `vcd_trace` entry that is an `event` emitted
     /// its trigger pulse — dedups repeat triggers inside one time slot.
     vcd_event_last: Vec<u64>,
+    /// Incremental (dirty-set) change detection for `vcd_write_changes`. The
+    /// full scan is O(all dumped signals) per timestep; for a large dump where
+    /// few signals move per step (e.g. a 291k-signal gate-level netlist) that
+    /// dominates wall time. Instead every real signal write marks the signal
+    /// dirty (a SUPERSET of actual changes — the prev-value compare in
+    /// vcd_write_changes still guarantees only genuine changes are emitted), so
+    /// the flush visits O(written signals) not O(all). Coverage: both value
+    /// write choke points (the `write_sig!` macro and `after_signal_write`) call
+    /// `vcd_mark_written`; SVA preponed swaps deliberately do not (they restore).
+    /// `vcd_dirty` is the per-flush list of dirty signal ids; `vcd_dirty_mark`
+    /// dedups within a flush via a rolling epoch (mark==epoch ⇒ already listed).
+    /// `vcd_id_to_trace` maps a signal id to its (possibly aliased) trace slots.
+    /// `vcd_event_indices` are the event trace slots, always checked (events
+    /// fire via event_triggered_time, not signal writes). Disabled — falling
+    /// back to the full scan — via XEZIM_VCD_FULL=1 or when the maps are unbuilt.
+    vcd_dirty: Vec<u32>,
+    vcd_dirty_mark: Vec<u64>,
+    vcd_dirty_epoch: u64,
+    vcd_id_to_trace: Vec<Vec<u32>>,
+    vcd_event_indices: Vec<usize>,
+    vcd_dirty_active: bool,
     /// §21.7.1.8 `$dumplimit`: byte budget for the dump, and the running
     /// (approximate) count of bytes handed to the sink. `vcd_limit_hit` latches
     /// once the budget is spent and permanently stops the dump.
@@ -4855,6 +4926,9 @@ impl Simulator {
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
+            clocking_edge: HashMap::default(),
+            clocking_preponed: HashMap::default(),
+            deferred_clocking_conts: Vec::new(),
             pending_reactive: Vec::new(),
             active_union_tag: HashMap::default(),
             max_time,
@@ -5035,6 +5109,12 @@ impl Simulator {
             vcd_file: None,
             vcd_writer: None,
             vcd_trace: Vec::new(),
+            vcd_dirty: Vec::new(),
+            vcd_dirty_mark: Vec::new(),
+            vcd_dirty_epoch: 1,
+            vcd_id_to_trace: Vec::new(),
+            vcd_event_indices: Vec::new(),
+            vcd_dirty_active: false,
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
@@ -8326,6 +8406,11 @@ impl Simulator {
         // consumes this to maintain `clocking_snapshots`.
         for (cb_name, cd) in self.module.clocking_blocks.iter() {
             let clk = cd.clock_signal.as_ref().map(|i| i.name.clone());
+            let edge = match cd.clock_edge {
+                Some(crate::ast::stmt::Edge::Negedge) => EdgeKind::Negedge,
+                Some(crate::ast::stmt::Edge::Edge) => EdgeKind::LsbEdge,
+                _ => EdgeKind::Posedge,
+            };
             if let Some(clk) = clk {
                 let sigs: Vec<(String, bool)> = cd
                     .signals
@@ -8346,8 +8431,11 @@ impl Simulator {
                 if cd.is_default {
                     self.clocking_meta
                         .insert("__xz_default_clocking".to_string(), (clk.clone(), sigs.clone()));
+                    self.clocking_edge
+                        .insert("__xz_default_clocking".to_string(), edge);
                 }
                 self.clocking_meta.insert(cb_name.clone(), (clk, sigs));
+                self.clocking_edge.insert(cb_name.clone(), edge);
                 self.clocking_prev_clock.insert(cb_name.clone(), 2);
                 self.clocking_snapshots
                     .insert(cb_name.clone(), HashMap::default());
@@ -8362,6 +8450,11 @@ impl Simulator {
             if let Some(v) = self.clocking_meta.values().next().cloned() {
                 self.clocking_meta
                     .insert("__xz_default_clocking".to_string(), v);
+            }
+            if let Some((k, e)) = self.clocking_edge.iter().next().map(|(k, e)| (k.clone(), *e)) {
+                let _ = k;
+                self.clocking_edge
+                    .insert("__xz_default_clocking".to_string(), e);
             }
         }
         // Seed the runtime string_signals set from the elab-time map so that
@@ -12278,6 +12371,7 @@ impl Simulator {
             compiler.set_tasks(&self.module.tasks);
             compiler.set_params(&self.module.parameters);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
@@ -12320,6 +12414,7 @@ impl Simulator {
                 compiler.set_tasks(&self.module.tasks);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.set_string_signals(&self.module.string_signals);
@@ -12342,6 +12437,7 @@ impl Simulator {
                 delay_compiler.set_tasks(&self.module.tasks);
                 delay_compiler.set_params(&self.module.parameters);
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 delay_compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 delay_compiler.set_array_first_id(&self.array_first_id);
                 delay_compiler.set_string_signals(&self.module.string_signals);
@@ -15062,6 +15158,7 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.top_module_name = Some(self.module.name.clone());
@@ -15115,6 +15212,7 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.top_module_name = Some(self.module.name.clone());
@@ -15374,6 +15472,7 @@ impl Simulator {
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_params(&self.module.parameters);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_packed_full_dims(&self.module.packed_full_dims);
                     compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                     compiler.set_array_first_id(&self.array_first_id);
                     compiler.top_module_name = Some(self.module.name.clone());
@@ -17367,17 +17466,36 @@ impl Simulator {
                     let mut idents = Vec::new();
                     collect_ident_names(&ee.expr, &mut idents);
                     for &h in &idents {
-                        let sig = self.resolve_hier_name(h);
                         // LRM §14.3: `@(cb)` naming a clocking block means the
                         // block's clock event (`@(posedge clk)`), not a signal
                         // literally called `cb`. Without this substitution the
                         // sensitivity targeted a nonexistent signal and never
-                        // fired, so `@(cb)` returned at t=0 (a no-op).
+                        // fired, so `@(cb)` returned at t=0 (a no-op). For an
+                        // interface-scoped block `@(iface.cb)` the clocking key
+                        // is the RAW dotted path (`iface.cb`); `resolve_hier_name`
+                        // strips the instance prefix to `cb`, so try the raw path
+                        // first, then the resolved name.
+                        let raw = h
+                            .path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        let sig = self.resolve_hier_name(h);
+                        let cb_key = if self.clocking_meta.contains_key(&raw) {
+                            raw.clone()
+                        } else {
+                            sig.clone()
+                        };
                         if ee.edge.is_none() {
-                            if let Some((clk, _)) = self.clocking_meta.get(&sig) {
+                            if let Some((clk, _)) = self.clocking_meta.get(&cb_key) {
                                 out.push(Sensitivity {
                                     signal_name: clk.clone(),
-                                    edge: EdgeKind::Posedge,
+                                    edge: self
+                                        .clocking_edge
+                                        .get(&cb_key)
+                                        .copied()
+                                        .unwrap_or(EdgeKind::Posedge),
                                     iff: ee.iff.clone(),
                                 });
                                 continue;
@@ -17673,6 +17791,16 @@ impl Simulator {
         sens: Vec<Sensitivity>,
         continuation: Vec<Statement>,
     ) -> EventWaiter {
+        self.make_event_waiter_kind(pid, sens, continuation, false)
+    }
+
+    fn make_event_waiter_kind(
+        &self,
+        pid: usize,
+        sens: Vec<Sensitivity>,
+        continuation: Vec<Statement>,
+        is_clocking: bool,
+    ) -> EventWaiter {
         let resolved: Vec<SensitivityId> = sens
             .iter()
             .filter_map(|s| {
@@ -17722,6 +17850,45 @@ impl Simulator {
             continuation,
             captured_prev,
             captured_prev_wide,
+            is_clocking,
+        }
+    }
+
+    /// True when an event control names a clocking block (`@(cb)`) or the
+    /// synthesized default clocking used by `##N` — a clocking event whose
+    /// waiter must resume in the Reactive region (see `EventWaiter::is_clocking`).
+    fn is_clocking_event(&self, event: &EventControl) -> bool {
+        // `@(cb)` parses as an EventExpr with an edge-less ident that names a
+        // clocking block; mirror the detection in `event_to_sens`.
+        match event {
+            EventControl::Identifier(id) => {
+                id.name == "__xz_default_clocking"
+                    || self.clocking_meta.contains_key(&id.name)
+            }
+            EventControl::EventExpr(exprs) => exprs.iter().any(|ee| {
+                // `@(cb)` is an edge-less bare ident naming a clocking block.
+                if ee.edge.is_some() {
+                    return false;
+                }
+                if let ExprKind::Ident(h) = &ee.expr.kind {
+                    // Interface-scoped `@(iface.cb)` keys on the raw dotted path;
+                    // resolve_hier_name strips it to `cb`. Try both.
+                    let raw = h
+                        .path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    if self.clocking_meta.contains_key(&raw) {
+                        return true;
+                    }
+                    let sig = self.resolve_hier_name(h);
+                    sig == "__xz_default_clocking" || self.clocking_meta.contains_key(&sig)
+                } else {
+                    false
+                }
+            }),
+            _ => false,
         }
     }
 
@@ -18567,6 +18734,10 @@ impl Simulator {
         // clocked assertion firing later this slot (tick_sva_sites) samples
         // pre-edge values rather than same-edge NBA updates.
         self.refresh_sva_preponed();
+        // LRM §14.4 `#1step` clocking-input skew: capture the same Preponed
+        // (slot-entry) samples for clocking-block inputs, so `cb.<in>` read
+        // after a posedge later this slot sees the pre-edge value.
+        self.refresh_clocking_preponed();
 
         if self.apply_delayed_updates() {
             self.settle_combinatorial();
@@ -18735,6 +18906,11 @@ impl Simulator {
         // sample state so subsequent `cb.<sig>` reads see the pre-edge
         // value (`#1step` input skew).
         self.tick_clocking_blocks();
+        // §14.13: now that this edge's NBA updates have committed and the
+        // clocking input snapshots are refreshed, resume the clocking-event
+        // waiters (`@(cb)` / `##N`) that fired this slot — in the Reactive
+        // region — so they observe post-edge state and this cycle's samples.
+        self.drain_deferred_clocking_conts();
         self.drain_reactive_region();
         self.check_monitor();
         self.drain_pending_strobes();
@@ -18995,6 +19171,13 @@ impl Simulator {
         let mut wd_ref_time: u64 = self.time;
         let mut wd_ref_edges: u64 = self.prof_edges_fired;
         let mut wd_ref_wall = sim_start.elapsed();
+        // Event-phase high-water mark when the window opened. A clock returns to
+        // the same value each period, so equal *sampled* bits does NOT prove the
+        // awaited signal is frozen — it may have toggled 0→1→0→1 between checks.
+        // sig_last_change records the phase of each signal's last transition, so
+        // a value > this mark means the signal genuinely moved since the window
+        // opened (a live clock), suppressing the dead-clock false positive.
+        let mut wd_ref_phase: u64 = self.event_phase;
         let mut wd_warned = false;
         // O1 flop-fire skip is default-ON (correct-by-construction snapshot
         // compare; ~1.1-1.6x on c910). Set XEZIM_EVENT_EDGE=0 to disable.
@@ -19037,9 +19220,25 @@ impl Simulator {
                         .iter()
                         .map(|&id| self.signal_table[id].raw_bits())
                         .collect();
+                    // A live clock periodically returns to the same value, so
+                    // comparing sampled bits alone false-positives on a healthy
+                    // toggling clock whenever the 1024-iter sampling aligns with
+                    // its phase. Confirm with sig_last_change (precise per-signal
+                    // transition phase): if any awaited signal moved since the
+                    // window opened, it is a LIVE clock — treat as progress.
+                    let toggled_since_ref = self.event_measure
+                        && cur_sigs.iter().any(|&id| {
+                            id < self.sig_last_change.len()
+                                && self.sig_last_change[id] > wd_ref_phase
+                        });
                     // Same monitored signals AND all still at their reference
-                    // value = the awaited clock/reset is frozen.
-                    if !cur_sigs.is_empty() && cur_sigs == wd_sigs && cur_bits == wd_bits {
+                    // value AND no transition since the window opened = the
+                    // awaited clock/reset is genuinely frozen.
+                    if !cur_sigs.is_empty()
+                        && cur_sigs == wd_sigs
+                        && cur_bits == wd_bits
+                        && !toggled_since_ref
+                    {
                         let d_ticks = self.time.saturating_sub(wd_ref_time);
                         let d_edges = self.prof_edges_fired.saturating_sub(wd_ref_edges);
                         let d_wall = sim_start.elapsed().saturating_sub(wd_ref_wall);
@@ -19080,6 +19279,7 @@ impl Simulator {
                         wd_ref_time = self.time;
                         wd_ref_edges = self.prof_edges_fired;
                         wd_ref_wall = sim_start.elapsed();
+                        wd_ref_phase = self.event_phase;
                     }
                 }
             }
@@ -19116,6 +19316,37 @@ impl Simulator {
                         eprintln!("[PROGRESS] hottest edge block:");
                         eprintln!("{}", line);
                     }
+                }
+                // Live PROF breakdown: the end-of-run [PROF] summary never
+                // prints for a run that doesn't finish (the exact case we need
+                // to profile), so emit the cumulative phase split with each
+                // PROGRESS tick. The percentages localize the hot phase —
+                // edge_exec (bytecode) vs settle (combinational) vs process
+                // (procedural/waiter) vs sched/nba — without a profiler build.
+                // Only meaningful when the phase timers are armed, so gate on
+                // XEZIM_PROFILE_TIMING (else the numbers would all read 0).
+                if self.profile_timing {
+                    let wall_ns = sim_start.elapsed().as_nanos().max(1) as f64;
+                    let pct = |ns: u64| 100.0 * ns as f64 / wall_ns;
+                    let ms = |ns: u64| ns as f64 / 1e6;
+                    eprintln!(
+                        "[PROGRESS][PROF] settle={:.0}ms({:.0}%) edges={:.0}ms({:.0}%) nba={:.0}ms({:.0}%) process={:.0}ms({:.0}%) sched={:.0}ms({:.0}%) snap={:.0}ms({:.0}%)",
+                        ms(accum.t_settle), pct(accum.t_settle),
+                        ms(accum.t_edges), pct(accum.t_edges),
+                        ms(accum.t_nba), pct(accum.t_nba),
+                        ms(accum.t_process), pct(accum.t_process),
+                        ms(accum.t_sched), pct(accum.t_sched),
+                        ms(accum.t_snap), pct(accum.t_snap),
+                    );
+                    eprintln!(
+                        "[PROGRESS][PROF] edge_exec={:.0}ms({:.0}%) edge_detect={:.0}ms({:.0}%) waiters={:.0}ms({:.0}%) insns={} ns/insn={:.1} edges_fired={}",
+                        ms(self.prof_edge_exec), pct(self.prof_edge_exec),
+                        ms(self.prof_edge_detect), pct(self.prof_edge_detect),
+                        ms(self.prof_edge_waiters), pct(self.prof_edge_waiters),
+                        self.prof_insns_executed,
+                        if self.prof_insns_executed > 0 { self.prof_edge_exec as f64 / self.prof_insns_executed as f64 } else { 0.0 },
+                        self.prof_edges_fired,
+                    );
                 }
                 next_progress += std::time::Duration::from_secs(progress_interval);
             }
@@ -21643,6 +21874,7 @@ impl Simulator {
                     TimingControl::Event(event) => {
                         // Suspend process until the event fires
                         let sens = self.event_to_sens(event);
+                        let is_clk_ev = self.is_clocking_event(event);
                         if !sens.is_empty() {
                             let mut cont = vec![*body.clone()];
                             cont.extend_from_slice(&stmts[i + 1..]);
@@ -21651,7 +21883,7 @@ impl Simulator {
                             });
                             if has_real {
                                 self.event_waiters
-                                    .push(self.make_event_waiter(pid, sens, cont));
+                                    .push(self.make_event_waiter_kind(pid, sens, cont, is_clk_ev));
                             } else {
                                 // `@(x)` where x is not a real signal — a
                                 // procedural local that was NBA-assigned then
@@ -22855,6 +23087,7 @@ impl Simulator {
                     }
                     TimingControl::Event(event) => {
                         let sens = self.event_to_sens(event);
+                        let is_clk_ev = self.is_clocking_event(event);
                         if !sens.is_empty() {
                             let mut cont = vec![*tbody.clone()];
                             cont.extend_from_slice(&body_stmts[i + 1..]);
@@ -22866,7 +23099,7 @@ impl Simulator {
                             ));
                             cont.extend_from_slice(after);
                             self.event_waiters
-                                .push(self.make_event_waiter(pid, sens, cont));
+                                .push(self.make_event_waiter_kind(pid, sens, cont, is_clk_ev));
                             return;
                         }
                     }
@@ -23754,7 +23987,16 @@ impl Simulator {
                     waiter.pid,
                     self.time
                 );
-                triggered_conts.push((waiter.pid, waiter.continuation));
+                if waiter.is_clocking {
+                    // §14.13: resume in the Reactive region, not here in the
+                    // Active region — defer the continuation past apply_nba +
+                    // tick_clocking_blocks so it reads post-edge state and this
+                    // cycle's clocking samples.
+                    self.deferred_clocking_conts
+                        .push((waiter.pid, waiter.continuation));
+                } else {
+                    triggered_conts.push((waiter.pid, waiter.continuation));
+                }
             } else {
                 // Refresh this waiter's `captured_prev` baseline to each
                 // sensitivity signal's CURRENT value so that a qualifying
@@ -29459,20 +29701,37 @@ impl Simulator {
                 // returns the snapshot taken at the most recent posedge
                 // of the cb's clock (`#1step` input skew). Falls through
                 // to generic lookup when the cb is unknown or the
-                // signal isn't an input.
-                if hier.path.len() == 2 {
-                    let cb = hier.path[0].name.name.as_str();
-                    let sig = hier.path[1].name.name.as_str();
-                    if let Some(snap) = self.clocking_snapshots.get(cb) {
+                // signal isn't an input. Handles both a module-scoped
+                // `cb.sig` (2 segments) and an interface-scoped
+                // `iface_inst.cb.sig` (≥3): the clocking block key is every
+                // segment but the last, and its snapshot/meta signals are the
+                // RESOLVED nets (`iface_inst.sig`), so match the trailing
+                // `sig` by exact name or `.sig` suffix.
+                if hier.path.len() >= 2 {
+                    let cb = hier
+                        .path
+                        .iter()
+                        .take(hier.path.len() - 1)
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let sig = hier.path.last().unwrap().name.name.as_str();
+                    let matches_sig =
+                        |k: &str| k == sig || k.rsplit('.').next() == Some(sig);
+                    if let Some(snap) = self.clocking_snapshots.get(&cb) {
                         if let Some(v) = snap.get(sig) {
                             return v.clone();
                         }
-                        // Known cb but signal not in snapshot yet:
-                        // first read before any posedge — return the
-                        // current value as a sensible default.
-                        if let Some((_, sigs)) = self.clocking_meta.get(cb) {
-                            if sigs.iter().any(|(n, is_in)| n == sig && *is_in) {
-                                if let Some(v) = self.get_signal_value_by_name(sig) {
+                        if let Some((_, v)) = snap.iter().find(|(k, _)| matches_sig(k)) {
+                            return v.clone();
+                        }
+                        // Known cb but signal not in snapshot yet (first read
+                        // before any posedge) — return the current net value.
+                        if let Some((_, sigs)) = self.clocking_meta.get(&cb) {
+                            if let Some((net, _)) =
+                                sigs.iter().find(|(n, is_in)| *is_in && matches_sig(n))
+                            {
+                                if let Some(v) = self.get_signal_value_by_name(net) {
                                     return v;
                                 }
                             }
@@ -35239,19 +35498,32 @@ impl Simulator {
                 };
                 // LRM §14.4: clocking-block output drive
                 // `cb.<out_sig> <= val`. Defer to the cb's next clock
-                // edge (output skew) instead of driving now.
+                // edge (output skew) instead of driving now. Handles both a
+                // module-scoped `cb.sig` and an interface-scoped
+                // `iface_inst.cb.sig` (≥3 segments): the block key is every
+                // segment but the last, and the queued signal is the RESOLVED
+                // output net (matched from the block's signal list by exact
+                // name or `.sig` suffix) so `tick_clocking_blocks` drives it.
                 if let ExprKind::Ident(hier) = &lvalue.kind {
-                    if hier.path.len() == 2 {
-                        let cb = hier.path[0].name.name.as_str();
-                        let sig = hier.path[1].name.name.as_str();
-                        if let Some((_, sigs)) = self.clocking_meta.get(cb) {
-                            // Output signals are the non-input entries.
-                            let is_output = sigs.iter().any(|(n, is_in)| n == sig && !*is_in);
-                            if is_output {
+                    if hier.path.len() >= 2 {
+                        let cb = hier
+                            .path
+                            .iter()
+                            .take(hier.path.len() - 1)
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        let sig = hier.path.last().unwrap().name.name.as_str();
+                        if let Some((_, sigs)) = self.clocking_meta.get(&cb) {
+                            let out_net = sigs.iter().find(|(n, is_in)| {
+                                !*is_in && (n == sig || n.rsplit('.').next() == Some(sig))
+                            });
+                            if let Some((net, _)) = out_net {
+                                let net = net.clone();
                                 self.clocking_output_pending
-                                    .entry(cb.to_string())
+                                    .entry(cb)
                                     .or_default()
-                                    .push((sig.to_string(), val));
+                                    .push((net, val));
                                 return;
                             }
                         }
@@ -36268,6 +36540,7 @@ impl Simulator {
                     }
                     TimingControl::Event(e) => {
                         let sens = self.event_to_sens(e);
+                        let is_clk_ev = self.is_clocking_event(e);
                         sim_dbg_eprintln!(
                             "[DEBUG] process {} waiting for event {:?} at time {}",
                             self.current_pid,
@@ -36279,7 +36552,7 @@ impl Simulator {
                         let cont = vec![*stmt.clone()];
                         let pid = self.cg_this.unwrap_or(0); // placeholder
                         self.event_waiters
-                            .push(self.make_event_waiter(pid, sens, cont));
+                            .push(self.make_event_waiter_kind(pid, sens, cont, is_clk_ev));
                         self.break_flag = true;
                         return;
                     }
@@ -40315,6 +40588,31 @@ impl Simulator {
     /// SVA-referenced signal. Called once at the top of each time slot,
     /// before the active/NBA regions run, so `sva_preponed[id]` holds the
     /// value as of the start of the slot. No-op when no clocked sites exist.
+    /// LRM §14.4 — capture the Preponed (slot-entry) value of every
+    /// clocking-block INPUT signal, keyed by name, before the active/NBA
+    /// regions run. `tick_clocking_blocks` reads these on a posedge so the
+    /// `#1step` input skew samples pre-edge values. No-op with no clocking
+    /// blocks.
+    fn refresh_clocking_preponed(&mut self) {
+        if self.clocking_meta.is_empty() {
+            return;
+        }
+        let names: Vec<String> = self
+            .clocking_meta
+            .values()
+            .flat_map(|(_, sigs)| {
+                sigs.iter()
+                    .filter(|(_, is_input)| *is_input)
+                    .map(|(n, _)| n.clone())
+            })
+            .collect();
+        for n in names {
+            if let Some(v) = self.get_signal_value_by_name(&n) {
+                self.clocking_preponed.insert(n, v);
+            }
+        }
+    }
+
     fn refresh_sva_preponed(&mut self) {
         if self.sva_sites.is_empty() {
             return;
@@ -40742,20 +41040,36 @@ impl Simulator {
                 .unwrap_or(2);
             let prev = *self.clocking_prev_clock.get(&cb).unwrap_or(&2);
             self.clocking_prev_clock.insert(cb.clone(), cur);
-            if !(prev == 0 && cur == 1) {
+            // §14.3: advance on the block's declared clock edge (posedge by
+            // default; negedge / any-edge when so declared).
+            let edge = self
+                .clocking_edge
+                .get(&cb)
+                .copied()
+                .unwrap_or(EdgeKind::Posedge);
+            let fired = match edge {
+                EdgeKind::Negedge => prev == 1 && cur == 0,
+                EdgeKind::Posedge => prev == 0 && cur == 1,
+                // `edge` / any: any resolved 0↔1 transition.
+                _ => prev != cur && prev != 2 && cur != 2,
+            };
+            if !fired {
                 continue;
             }
-            // Posedge: refresh input snapshots. We snapshot the
-            // CURRENT signal values — this matches LRM `#1step` for
-            // designs where the producer drives the input signal in
-            // the active region of the same cycle. For
-            // skew-into-prev-cycle semantics, the caller would need
-            // to register the snapshot earlier in the tick; that's
-            // a follow-up.
+            // Posedge: refresh input snapshots from the Preponed samples
+            // captured at slot-entry (`refresh_clocking_preponed`), so `cb.<in>`
+            // reads the value from BEFORE this edge (`#1step` input skew,
+            // §14.4), not the same-edge NBA update. Fall back to the current
+            // value if no preponed sample was captured (e.g. first slot).
             let mut snap = HashMap::default();
             for (sig, is_input) in &sigs {
                 if *is_input {
-                    if let Some(v) = self.get_signal_value_by_name(sig) {
+                    if let Some(v) = self
+                        .clocking_preponed
+                        .get(sig)
+                        .cloned()
+                        .or_else(|| self.get_signal_value_by_name(sig))
+                    {
                         snap.insert(sig.clone(), v);
                     }
                 }
@@ -40786,6 +41100,34 @@ impl Simulator {
                     );
                     self.assign_value(&lval, &val);
                 }
+            }
+        }
+    }
+
+    /// Resume the clocking-event waiters (`@(cb)` / `##N`) that fired this slot,
+    /// held aside by `drain_triggered_event_waiters` and run here in the
+    /// Reactive region — after `apply_nba` + `tick_clocking_blocks` — so their
+    /// continuations read post-edge design state and this cycle's `cb.<in>`
+    /// samples (§14.13). Mirrors the Active-region waiter run loop.
+    fn drain_deferred_clocking_conts(&mut self) {
+        let mut guard = 0u32;
+        while !self.deferred_clocking_conts.is_empty() {
+            let conts = std::mem::take(&mut self.deferred_clocking_conts);
+            for (pid, stmts) in conts {
+                if self.finished {
+                    break;
+                }
+                self.run_scheduled_process(pid, &stmts);
+                if !self.is_pid_suspended(pid) {
+                    self.child_finished(pid);
+                }
+                self.break_flag = false;
+                self.continue_flag = false;
+                self.return_flag = false;
+            }
+            guard += 1;
+            if self.finished || guard > 10_000 {
+                break;
             }
         }
     }
@@ -41597,6 +41939,10 @@ impl Simulator {
     fn after_signal_write(&mut self, id: usize) {
         self.note_armed_write(id);
         self.note_edge_write(id);
+        // Incremental VCD: this is the post-write hook for the direct
+        // signal_table writes (bit/part-select, struct/array element) and the
+        // NBA/vpi fast paths, so mark the id dirty here too. Superset-safe.
+        vcd_mark!(self, id);
         if id >= self.signal_table.len() {
             return;
         }
@@ -42524,10 +42870,28 @@ impl Simulator {
                     }
                     // Multi-D PACKED vector (`logic [1:0][3:0][7:0] foo`):
                     // `foo[i]`/`foo[i][j]` select a SLICE — its width is the
-                    // product of the remaining dims, not 1 bit.
+                    // product of the remaining dims, not 1 bit. §7.4: UNPACKED
+                    // dimensions are indexed FIRST, so when the base is an
+                    // unpacked array of packed vectors (`logic [1:0][7:0] v
+                    // [0:1]`, `v[0][0]`) the leading indices consume the
+                    // unpacked dims and only the rest index the packed ones.
+                    // Without this subtraction the packed depth ran past the
+                    // dim list and the lvalue fell through to width 1 — a
+                    // continuous assign then resized its RHS to one bit and
+                    // wrote the LSB (0x12 -> 0).
+                    let num_unpacked = if let Some((d, _)) = self.module.arrays_nd.get(&n) {
+                        d.len()
+                    } else if self.module.arrays_2d.contains_key(&n) {
+                        2
+                    } else if self.module.arrays.contains_key(&n) {
+                        1
+                    } else {
+                        0
+                    };
                     if let Some(dims) = self.module.packed_full_dims.get(&n) {
-                        if depth < dims.len() {
-                            let w: u64 = dims[depth..]
+                        let pdepth = depth.saturating_sub(num_unpacked);
+                        if pdepth < dims.len() {
+                            let w: u64 = dims[pdepth..]
                                 .iter()
                                 .map(|(l, r)| (l - r).unsigned_abs() + 1)
                                 .product();
@@ -43271,7 +43635,35 @@ impl Simulator {
         self.vcd_limit_hit = false;
         self.vcd_last_time = self.time;
         self.vcd_account_bytes(nbytes);
+
+        // Build the incremental-dump reverse maps (id → trace slots, and the
+        // event slots) unless the full scan is forced. When active, every
+        // signal write marks the id dirty so vcd_write_changes visits only
+        // written signals; see the field docs on `vcd_dirty`.
+        let force_full = std::env::var("XEZIM_VCD_FULL").ok().as_deref() == Some("1");
+        if force_full {
+            self.vcd_dirty_active = false;
+        } else {
+            let nsig = self.signal_table.len();
+            let mut id_to_trace: Vec<Vec<u32>> = vec![Vec::new(); nsig];
+            let mut event_indices: Vec<usize> = Vec::new();
+            for (idx, &(sid, _)) in self.vcd_trace.iter().enumerate() {
+                if self.vcd_var_kinds[idx] == VcdVarKind::Event {
+                    event_indices.push(idx);
+                }
+                if sid < nsig {
+                    id_to_trace[sid].push(idx as u32);
+                }
+            }
+            self.vcd_id_to_trace = id_to_trace;
+            self.vcd_event_indices = event_indices;
+            self.vcd_dirty_mark = vec![0u64; nsig];
+            self.vcd_dirty.clear();
+            self.vcd_dirty_epoch = 1;
+            self.vcd_dirty_active = true;
+        }
     }
+
 
     // NOTE: `Simulator::vcd_write_value` is GONE. It was a second, divergent
     // copy of `vcd_sink::write_vcd_value` (the two disagreed about `real` and
@@ -43333,40 +43725,75 @@ impl Simulator {
             return;
         }
 
-        // Walk the compact trace table directly: no name hashing, and
         // vcd_prev_signals is a parallel Vec<Value> (index == position in
         // vcd_trace), so change detection is a single indexed compare.
         let now = self.time;
         let mut changes: Vec<(Arc<str>, Value)> = Vec::new();
-        for idx in 0..self.vcd_trace.len() {
-            let id = self.vcd_trace[idx].0;
-            if self.vcd_var_kinds[idx] == VcdVarKind::Event {
-                // §21.7.2.1: an event has no level — it emits a bare `1<id>`
-                // record at EVERY trigger. Treating it as a level signal with
-                // prev!=cur dedup drops a repeat `->ev` whose 0→1→0 toggle
-                // cancels inside one time slot.
-                let fired = self
-                    .id_to_name
-                    .get(id)
-                    .and_then(|n| self.event_triggered_time.get(n.as_ref()))
-                    .copied()
-                    == Some(now);
-                if fired && self.vcd_event_last[idx] != now {
-                    self.vcd_event_last[idx] = now;
-                    changes.push((self.vcd_trace[idx].1.clone(), Value::ones(1)));
+
+        // Per-trace-slot change check, shared by the incremental and full paths.
+        // Returns the record to emit, if any, and keeps vcd_prev_signals in step.
+        macro_rules! check_slot {
+            ($idx:expr) => {{
+                let idx = $idx;
+                let id = self.vcd_trace[idx].0;
+                if self.vcd_var_kinds[idx] == VcdVarKind::Event {
+                    // §21.7.2.1: an event has no level — it emits a bare `1<id>`
+                    // record at EVERY trigger. Treating it as a level signal
+                    // with prev!=cur dedup drops a repeat `->ev` whose 0→1→0
+                    // toggle cancels inside one time slot.
+                    let fired = self
+                        .id_to_name
+                        .get(id)
+                        .and_then(|n| self.event_triggered_time.get(n.as_ref()))
+                        .copied()
+                        == Some(now);
+                    if fired && self.vcd_event_last[idx] != now {
+                        self.vcd_event_last[idx] = now;
+                        changes.push((self.vcd_trace[idx].1.clone(), Value::ones(1)));
+                    }
+                    // Keep the level mirror in step so the toggle never leaks out.
+                    self.vcd_prev_signals[idx] = self.signal_table[id].clone();
+                } else {
+                    let val = &self.signal_table[id];
+                    if self.vcd_prev_signals[idx] != *val {
+                        let mut out = val.clone();
+                        if self.signal_real.get(id).copied().unwrap_or(false) {
+                            out.is_real = true;
+                        }
+                        self.vcd_prev_signals[idx] = val.clone();
+                        changes.push((self.vcd_trace[idx].1.clone(), out));
+                    }
                 }
-                // Keep the level mirror in step so the toggle never leaks out.
-                self.vcd_prev_signals[idx] = self.signal_table[id].clone();
-                continue;
+            }};
+        }
+
+        if self.vcd_dirty_active {
+            // Incremental: only signals written since the last flush can have
+            // changed. Gather their trace slots plus the (few) event slots
+            // (events fire independently of signal writes), then emit in
+            // trace-index order so the per-timestep record order is byte-
+            // identical to the full scan. Still O(written signals), not O(all).
+            let dirty = std::mem::take(&mut self.vcd_dirty);
+            let mut slots: Vec<u32> = Vec::with_capacity(dirty.len() + self.vcd_event_indices.len());
+            for &sid in &dirty {
+                let sid = sid as usize;
+                if sid < self.vcd_id_to_trace.len() {
+                    slots.extend_from_slice(&self.vcd_id_to_trace[sid]);
+                }
             }
-            let val = &self.signal_table[id];
-            if self.vcd_prev_signals[idx] != *val {
-                let mut out = val.clone();
-                if self.signal_real.get(id).copied().unwrap_or(false) {
-                    out.is_real = true;
-                }
-                self.vcd_prev_signals[idx] = val.clone();
-                changes.push((self.vcd_trace[idx].1.clone(), out));
+            slots.extend(self.vcd_event_indices.iter().map(|&i| i as u32));
+            slots.sort_unstable();
+            slots.dedup();
+            for &idx in &slots {
+                check_slot!(idx as usize);
+            }
+            self.vcd_dirty = dirty;
+            self.vcd_dirty.clear();
+            self.vcd_dirty_epoch = self.vcd_dirty_epoch.wrapping_add(1);
+        } else {
+            // Full scan: walk every dumped trace slot.
+            for idx in 0..self.vcd_trace.len() {
+                check_slot!(idx);
             }
         }
 
