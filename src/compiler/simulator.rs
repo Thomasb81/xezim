@@ -19145,6 +19145,37 @@ impl Simulator {
                         eprintln!("{}", line);
                     }
                 }
+                // Live PROF breakdown: the end-of-run [PROF] summary never
+                // prints for a run that doesn't finish (the exact case we need
+                // to profile), so emit the cumulative phase split with each
+                // PROGRESS tick. The percentages localize the hot phase —
+                // edge_exec (bytecode) vs settle (combinational) vs process
+                // (procedural/waiter) vs sched/nba — without a profiler build.
+                // Only meaningful when the phase timers are armed, so gate on
+                // XEZIM_PROFILE_TIMING (else the numbers would all read 0).
+                if self.profile_timing {
+                    let wall_ns = sim_start.elapsed().as_nanos().max(1) as f64;
+                    let pct = |ns: u64| 100.0 * ns as f64 / wall_ns;
+                    let ms = |ns: u64| ns as f64 / 1e6;
+                    eprintln!(
+                        "[PROGRESS][PROF] settle={:.0}ms({:.0}%) edges={:.0}ms({:.0}%) nba={:.0}ms({:.0}%) process={:.0}ms({:.0}%) sched={:.0}ms({:.0}%) snap={:.0}ms({:.0}%)",
+                        ms(accum.t_settle), pct(accum.t_settle),
+                        ms(accum.t_edges), pct(accum.t_edges),
+                        ms(accum.t_nba), pct(accum.t_nba),
+                        ms(accum.t_process), pct(accum.t_process),
+                        ms(accum.t_sched), pct(accum.t_sched),
+                        ms(accum.t_snap), pct(accum.t_snap),
+                    );
+                    eprintln!(
+                        "[PROGRESS][PROF] edge_exec={:.0}ms({:.0}%) edge_detect={:.0}ms({:.0}%) waiters={:.0}ms({:.0}%) insns={} ns/insn={:.1} edges_fired={}",
+                        ms(self.prof_edge_exec), pct(self.prof_edge_exec),
+                        ms(self.prof_edge_detect), pct(self.prof_edge_detect),
+                        ms(self.prof_edge_waiters), pct(self.prof_edge_waiters),
+                        self.prof_insns_executed,
+                        if self.prof_insns_executed > 0 { self.prof_edge_exec as f64 / self.prof_insns_executed as f64 } else { 0.0 },
+                        self.prof_edges_fired,
+                    );
+                }
                 next_progress += std::time::Duration::from_secs(progress_interval);
             }
 
