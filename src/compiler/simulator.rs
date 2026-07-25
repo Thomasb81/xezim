@@ -60232,7 +60232,8 @@ impl Simulator {
                     let frags: Vec<String> =
                         ta.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect();
                     if frags.len() == ta.len() {
-                        let sig = frags.join(",");
+                        let raw_sig = frags.join(",");
+                        let sig = self.canonicalize_spec_sig(&class_name_owned, &raw_sig);
                         computed_spec = Some((class_name_owned.clone(), sig.clone()));
                         let saved = self.current_spec.take();
                         self.current_spec = Some((class_name_owned.clone(), sig.clone()));
@@ -60247,7 +60248,7 @@ impl Simulator {
             class_name: class_def.name.clone(),
             properties: HashMap::default(),
             type_bindings: HashMap::default(),
-            spec: None,
+            spec: computed_spec.clone(),
         };
         // §8.25: map the specialization's `#(...)` args onto the leaf
         // class's parameters BY NAME (type and value params interleave in
@@ -60445,7 +60446,7 @@ impl Simulator {
         // — `static this_type m_inst; m_inst = new()` inside a static method
         // dispatched on `typedef Common#(int,"alpha") AliasT;` — answer
         // value-parameter lookups in later virtual calls.
-        let active_spec = self.current_spec.clone().or(computed_spec);
+        let active_spec = self.current_spec.clone().or(computed_spec.clone());
         if let Some((b, sig)) = active_spec {
             if b == class_def.name {
                 instance.spec = Some((b, sig));
@@ -60600,7 +60601,12 @@ impl Simulator {
                 self.this_stack.pop();
             }
         }
+        let saved_spec = self.current_spec.clone();
+        if computed_spec.is_some() {
+            self.current_spec = computed_spec.clone();
+        }
         self.exec_method_call(handle, "new", args);
+        self.current_spec = saved_spec;
         Value::from_u64(handle as u64, 32)
     }
 
