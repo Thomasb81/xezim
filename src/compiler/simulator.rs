@@ -17438,6 +17438,22 @@ impl Simulator {
                 Self::collect_expr_reads(right, module, reads);
             }
             ExprKind::Unary { operand, .. } => Self::collect_expr_reads(operand, module, reads),
+            // Streaming concat (`{<<{src}}`): the operands are ordinary reads.
+            // With no arm here a continuous `assign dst = {<<{src}};` had an
+            // EMPTY read set — it sampled X at the time-0 settle and never
+            // re-fired when `src` changed, so the target stayed X forever
+            // (procedural streaming was always fine; only the dependency
+            // collection was blind to it).
+            ExprKind::StreamOp {
+                slice_size, exprs, ..
+            } => {
+                if let Some(sz) = slice_size {
+                    Self::collect_expr_reads(sz, module, reads);
+                }
+                for e in exprs {
+                    Self::collect_expr_reads(e, module, reads);
+                }
+            }
             ExprKind::Binary { left, right, .. } => {
                 Self::collect_expr_reads(left, module, reads);
                 Self::collect_expr_reads(right, module, reads);
