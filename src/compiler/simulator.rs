@@ -1925,6 +1925,7 @@ struct TaskCleanup {
     /// `this`/class-context for an `obj.method()` call; pop them on unwind.
     /// Default false (free-task/same-`this` inlines don't touch those stacks).
     pushed_method_this: bool,
+    saved_spec: Option<(String, String)>,
 }
 
 /// Scalar kind of a DPI-EXPORT subroutine's port or return, for the generated
@@ -5501,6 +5502,25 @@ impl Drop for Simulator {
         self.dpi_reset_cbs.clear();
         self.dpi_start_sim_cbs.clear();
         self.dpi_end_sim_cbs.clear();
+    }
+}
+
+/// Per-thread path of value-parameter names currently being resolved by
+/// `Simulator::resolve_value_param_from_spec`. Used to break cyclic value-param
+/// references (a specialization argument that names a value param of the same
+/// class, which would otherwise recurse infinitely and overflow the stack).
+thread_local! {
+    static VALPARAM_RESOLVING: std::cell::RefCell<Vec<String>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Drop guard that pops the last entry from `VALPARAM_RESOLVING` when it goes
+/// out of scope, ensuring the path is unwound on every return path (including
+/// `?` early returns) from `resolve_value_param_from_spec`.
+struct ValparamResolveGuard;
+impl Drop for ValparamResolveGuard {
+    fn drop(&mut self) {
+        VALPARAM_RESOLVING.with(|r| r.borrow_mut().pop());
     }
 }
 
@@ -21361,9 +21381,7 @@ impl Simulator {
                                         .filter(|h| *h != 0);
                                     if let Some(rh) = root_h {
                                         let mut cleanup = self.bind_task_frame(&td, args);
-                                        self.this_stack.push(Some(rh));
-                                        self.class_context_stack.push(Some("uvm_root".to_string()));
-                                        cleanup.pushed_method_this = true;
+                                        self.push_task_method_this(Some(rh), "uvm_root".to_string(), &mut cleanup);
                                         self.task_cleanup.push(cleanup);
                                         let mut cont: Vec<Statement> = td.items.clone();
                                         cont.push(Statement::new(
@@ -21417,13 +21435,26 @@ impl Simulator {
                             .map(|hh| (hh, member.name.clone(), true)),
                         _ => None,
                     };
-                    if let Some((rh, mn, this_changes)) = resolved {
+                    if let Some((rh, mn, mut this_changes)) = resolved {
                         if rh != 0 {
-                            let cls = self
-                                .heap
-                                .get(rh)
-                                .and_then(|o| o.as_ref())
-                                .map(|inst| inst.class_name.clone());
+                            let is_super = matches!(&func.kind, ExprKind::MemberAccess { expr: recv, .. }
+                                if matches!(&recv.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "super"));
+                            if is_super {
+                                this_changes = false;
+                            }
+                            let cls = if is_super {
+                                self.class_context_stack
+                                    .last()
+                                    .cloned()
+                                    .flatten()
+                                    .and_then(|c| self.module.classes.get(&c))
+                                    .and_then(|cd| cd.extends.clone())
+                            } else {
+                                self.heap
+                                    .get(rh)
+                                    .and_then(|o| o.as_ref())
+                                    .map(|inst| inst.class_name.clone())
+                            };
                             if let Some(cls) = cls {
                                 if let Some((td, mclass)) = self.resolve_class_task(&cls, &mn) {
                                     if self.stmts_have_blocking(&td.items) {
@@ -29621,16 +29652,12 @@ impl Simulator {
             // class-local typedef args (e.g. `special_comp_type`) through
             // `resolve_typedef_spec`, which reads `self.current_spec`.
             let saved = self.current_spec.clone();
-            if self.pure_sv_lrm {
-                let extracted =
-                    self.resolve_call_spec_params(Self::extract_call_spec(expr), &saved);
-                if let Some((ref base, ref sig)) = extracted {
-                    self.ensure_spec_statics(base, sig);
-                }
-                self.current_spec = extracted.or(saved.clone());
-            } else {
-                self.current_spec = None;
+            let extracted =
+                self.resolve_call_spec_params(Self::extract_call_spec(expr), &saved);
+            if let Some((ref base, ref sig)) = extracted {
+                self.ensure_spec_statics(base, sig);
             }
+            self.current_spec = extracted.or(saved.clone());
             let v = self.eval_expr_ctx(&Self::strip_spec_shape(expr), ctx_width);
             self.current_spec = saved;
             return v;
@@ -45587,8 +45614,28 @@ impl Simulator {
             ExprKind::Number(NumberLiteral::Integer { value, .. }) => Some(value.clone()),
             ExprKind::Number(NumberLiteral::Real(r)) => Some(format!("{}", r)),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) => Some(c.to_string()),
-            ExprKind::Ident(hier) if hier.path.len() == 1 => {
-                let nm = &hier.path[0].name.name;
+            ExprKind::Specialization { base, type_args_text } => {
+                let (b_name, b_sig) = self
+                    .resolve_call_spec_params(
+                        Self::extract_call_spec(e),
+                        &self.current_spec.clone(),
+                    )
+                    .unwrap_or_else(|| {
+                        let name = if let ExprKind::Ident(h) = &base.kind {
+                            h.path.last().map(|s| s.name.name.clone()).unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        (name, type_args_text.clone())
+                    });
+                if !b_name.is_empty() {
+                    Some(format!("{}#({})", b_name, b_sig))
+                } else {
+                    None
+                }
+            }
+            ExprKind::Ident(hier) => {
+                let nm = &hier.path.last()?.name.name;
                 // Resolve a type/class alias (e.g. `this_type`) to the
                 // concrete class name in the enclosing context.
                 let synth = crate::ast::types::TypeName {
@@ -55378,7 +55425,7 @@ impl Simulator {
         // active across the whole call (so the method body's static accesses
         // key per-spec) — a wrapper here covers all of eval_call_inner's early
         // returns. No spec → call inner directly (zero overhead).
-        if !self.pure_sv_lrm || !Self::expr_has_specialization(func) {
+        if !Self::expr_has_specialization(func) {
             return self.eval_call_inner(func, args);
         }
         // Keep `current_spec` set while resolving the call's specialization so
@@ -58513,6 +58560,7 @@ impl Simulator {
         if c.pushed_method_this {
             self.this_stack.pop();
             self.class_context_stack.pop();
+            self.current_spec = c.saved_spec;
         }
         self.ref_binding_stack.pop();
         self.local_iface_aliases.pop();
@@ -58749,6 +58797,59 @@ impl Simulator {
             saved_return,
             prev_static,
             pushed_method_this: false,
+            saved_spec: None,
+        }
+    }
+
+    fn push_task_method_this(&mut self, handle_opt: Option<usize>, mclass: String, cleanup: &mut TaskCleanup) {
+        cleanup.saved_spec = self.current_spec.clone();
+        cleanup.pushed_method_this = true;
+        self.this_stack.push(handle_opt);
+        self.class_context_stack.push(Some(mclass.clone()));
+        if let Some(h) = handle_opt {
+            if self.pure_sv_lrm {
+                if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
+                    let cn = inst.class_name.clone();
+                    let bindings = inst.type_bindings.clone();
+                    let differs = match self.current_spec.as_ref() {
+                        None => true,
+                        Some((b, s)) => {
+                            *b != cn
+                                || inst
+                                    .spec
+                                    .as_ref()
+                                    .is_some_and(|(ib, is)| ib != b || is != s)
+                        }
+                    };
+                    if differs {
+                        if inst.spec.is_some() {
+                            self.current_spec = inst.spec.clone();
+                        } else if let Some(cd) = self.module.classes.get(&cn) {
+                            let mut param_names = cd.param_order.clone();
+                            if param_names.is_empty() {
+                                param_names = cd.type_param_names.clone();
+                            }
+                            if !param_names.is_empty() {
+                                let sig_frags: Vec<String> = param_names
+                                    .iter()
+                                    .filter_map(|p| {
+                                        if let Some(b) = bindings.get(p) {
+                                            Some(b.clone())
+                                        } else if let Some(v) = inst.properties.get(p) {
+                                            Some(v.to_string())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+                                if sig_frags.len() == param_names.len() {
+                                    self.current_spec = Some((cn, sig_frags.join(",")));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -59567,6 +59668,20 @@ impl Simulator {
     /// Returns None when no specialization is active or `name` is not a value
     /// parameter (type parameters are handled by `resolve_type_param_with`).
     fn resolve_value_param_from_spec(&mut self, name: &str) -> Option<Value> {
+        // Cycle guard: a value param's specialization argument can itself
+        // be a bare name that resolves back into value-param resolution for
+        // the same class/specialization (e.g. UVM's factory, where a
+        // registry class specializes its base by passing its own `Tname`
+        // param through, kept symbolic through parameterized-inheritance
+        // chains). Without a guard the resolution recurses infinitely and
+        // blows the stack (several tests hit this through such chains).
+        // A cyclic value param cannot be concretely resolved at this site —
+        // fall back to its declared default.
+        if VALPARAM_RESOLVING.with(|r| r.borrow().iter().any(|n| n == name)) {
+            return None;
+        }
+        VALPARAM_RESOLVING.with(|r| r.borrow_mut().push(name.to_string()));
+        let _guard = ValparamResolveGuard;
         let (base, sig) = self.current_spec.clone()?;
         let cd = self.module.classes.get(&base)?.clone();
         // Type parameters are resolved elsewhere — don't shadow them.
@@ -59869,6 +59984,25 @@ impl Simulator {
                 if let Some(r) = self.resolve_type_param_with(p, enclosing) {
                     return Self::normalize_spec_ws(&r);
                 }
+                // Top-level VALUE parameter of the enclosing class — resolve
+                // to the enclosing specialization's argument at that param's
+                // position. E.g. inside `Mid#(int,"hello")`, the static call
+                // `Inner#(Name)::get()` must specialize Inner with "hello",
+                // not the symbolic bare name `Name` (which, left symbolic,
+                // loops forever in `resolve_value_param_from_spec` when
+                // Inner's static method reads `Name`, or falls back to the
+                // wrong default). Mirrors the value-param substitution the
+                // nested-`Class#(args)` branch below already performs.
+                if let Some((eb, es)) = enclosing {
+                    if let Some(ecd) = self.module.classes.get(eb) {
+                        if let Some(idx) = ecd.param_order.iter().position(|x| x == p) {
+                            let frags = Self::split_spec_args(es);
+                            if let Some(v) = frags.get(idx) {
+                                return v.trim().to_string();
+                            }
+                        }
+                    }
+                }
                 // Resolve a class-local TYPEDEF name (e.g. `special_comp_type`,
                 // a `typedef special_comp#(N) special_comp_type;` inside
                 // `special_comp#(N)`) to its concrete specialization through
@@ -60071,6 +60205,7 @@ impl Simulator {
         // (a specialization's statics initialize before first use) and
         // runs before any `add`/query that needs the registration.
         let class_name_owned = class_def.name.clone();
+        let mut computed_spec = None;
         if self.class_is_parameterized(&class_name_owned) {
             if let Some(ta) = type_args {
                 if !ta.is_empty() {
@@ -60078,6 +60213,7 @@ impl Simulator {
                         ta.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect();
                     if frags.len() == ta.len() {
                         let sig = frags.join(",");
+                        computed_spec = Some((class_name_owned.clone(), sig.clone()));
                         let saved = self.current_spec.take();
                         self.current_spec = Some((class_name_owned.clone(), sig.clone()));
                         self.ensure_spec_statics(&class_name_owned, &sig);
@@ -60289,7 +60425,8 @@ impl Simulator {
         // — `static this_type m_inst; m_inst = new()` inside a static method
         // dispatched on `typedef Common#(int,"alpha") AliasT;` — answer
         // value-parameter lookups in later virtual calls.
-        if let Some((b, sig)) = self.current_spec.clone() {
+        let active_spec = self.current_spec.clone().or(computed_spec);
+        if let Some((b, sig)) = active_spec {
             if b == class_def.name {
                 instance.spec = Some((b, sig));
             }
@@ -67329,67 +67466,75 @@ impl Simulator {
                     // parser now captures builtin type args as Ident leaf names, so
                     // this matches extract_call_spec's type_args_text).
                     let saved_spec = self.current_spec.clone();
-                    if self.pure_sv_lrm {
-                        if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
-                            let cn = inst.class_name.clone();
-                            let bindings = inst.type_bindings.clone();
-                            // Override the active spec with THIS instance's own
-                            // specialization when it differs from the active
-                            // spec's class. Prefer the instance's captured full
-                            // specialization (`spec`), which carries BOTH type
-                            // and value params as a complete sig (unlike the
-                            // type_bindings-only rebuild below). The full `spec`
-                            // is what restores the specialization a
-                            // typedef-specialization singleton was constructed
-                            // under, so a later virtual call can answer
-                            // value-param lookups (the UVM factory
-                            // get_type_name chain). The type_bindings rebuild is
-                            // the legacy fallback: an instance method of
-                            // `uvm_resource#(int)` must key uvm_resource's
-                            // per-spec cell even when called while an UNRELATED
-                            // spec is active (e.g. the enclosing
-                            // `uvm_config_db#(int)`, whose base `uvm_config_db`
-                            // wouldn't match `uvm_resource` in static_prop_key
-                            // and would fall back to the shared unspec'd cell →
-                            // the get_type/get_type_handle mismatch).
-                            let differs = match self.current_spec.as_ref() {
-                                None => true,
-                                // Switch when the base class differs OR the
-                                // instance's own specialization (same base,
-                                // different sig) differs. The latter is the
-                                // UVM callback typewide-recursion case:
-                                // `base_comp.m_add_tw_cbs` calls
-                                // `cb_pair.m_add_tw_cbs(cb)` where cb_pair is a
-                                // DIFFERENT specialization's instance (e.g.
-                                // uvm_callbacks#(b_comp)). Without restoring
-                                // the instance's spec, the recursed method's
-                                // `m_t_inst.m_tw_cb_q` static access keys off
-                                // the caller's (base_comp) cell, so typewide
-                                // callbacks never propagate to derived types.
-                                Some((b, s)) => {
-                                    *b != cn
-                                        || inst
-                                            .spec
-                                            .as_ref()
-                                            .is_some_and(|(ib, is)| {
-                                                ib != b || is != s
-                                            })
+                    if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
+                        let cn = inst.class_name.clone();
+                        let bindings = inst.type_bindings.clone();
+                        // Override the active spec with THIS instance's own
+                        // specialization when it differs from the active
+                        // spec's class. Prefer the instance's captured full
+                        // specialization (`spec`), which carries BOTH type
+                        // and value params as a complete sig (unlike the
+                        // type_bindings-only rebuild below). The full `spec`
+                        // is what restores the specialization a
+                        // typedef-specialization singleton was constructed
+                        // under, so a later virtual call can answer
+                        // value-param lookups (the UVM factory
+                        // get_type_name chain). The type_bindings rebuild is
+                        // the legacy fallback: an instance method of
+                        // `uvm_resource#(int)` must key uvm_resource's
+                        // per-spec cell even when called while an UNRELATED
+                        // spec is active (e.g. the enclosing
+                        // `uvm_config_db#(int)`, whose base `uvm_config_db`
+                        // wouldn't match `uvm_resource` in static_prop_key
+                        // and would fall back to the shared unspec'd cell →
+                        // the get_type/get_type_handle mismatch).
+                        let differs = match self.current_spec.as_ref() {
+                            None => true,
+                            // Switch when the base class differs OR the
+                            // instance's own specialization (same base,
+                            // different sig) differs. The latter is the
+                            // UVM callback typewide-recursion case:
+                            // `base_comp.m_add_tw_cbs` calls
+                            // `cb_pair.m_add_tw_cbs(cb)` where cb_pair is a
+                            // DIFFERENT specialization's instance (e.g.
+                            // uvm_callbacks#(b_comp)). Without restoring
+                            // the instance's spec, the recursed method's
+                            // `m_t_inst.m_tw_cb_q` static access keys off
+                            // the caller's (base_comp) cell, so typewide
+                            // callbacks never propagate to derived types.
+                            Some((b, s)) => {
+                                *b != cn
+                                    || inst
+                                        .spec
+                                        .as_ref()
+                                        .is_some_and(|(ib, is)| {
+                                            ib != b || is != s
+                                        })
+                            }
+                        };
+                        if differs {
+                            if inst.spec.is_some() {
+                                self.current_spec = inst.spec.clone();
+                            } else if let Some(cd) = self.module.classes.get(&cn) {
+                                let mut param_names = cd.param_order.clone();
+                                if param_names.is_empty() {
+                                    param_names = cd.type_param_names.clone();
                                 }
-                            };
-                            if differs {
-                                if inst.spec.is_some() {
-                                    self.current_spec = inst.spec.clone();
-                                } else if let Some(cd) = self.module.classes.get(&cn) {
-                                    if !cd.type_param_names.is_empty() && !bindings.is_empty() {
-                                        let sig = cd
-                                            .type_param_names
-                                            .iter()
-                                            .filter_map(|tp| bindings.get(tp).cloned())
-                                            .collect::<Vec<_>>()
-                                            .join(",");
-                                        if !sig.is_empty() {
-                                            self.current_spec = Some((cn, sig));
-                                        }
+                                if !param_names.is_empty() {
+                                    let sig_frags: Vec<String> = param_names
+                                        .iter()
+                                        .filter_map(|p| {
+                                            if let Some(b) = bindings.get(p) {
+                                                Some(b.clone())
+                                            } else if let Some(v) = inst.properties.get(p) {
+                                                Some(v.to_string())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    if sig_frags.len() == param_names.len() {
+                                        self.current_spec = Some((cn.clone(), sig_frags.join(",")));
                                     }
                                 }
                             }
