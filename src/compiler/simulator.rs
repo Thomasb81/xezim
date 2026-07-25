@@ -23354,7 +23354,7 @@ impl Simulator {
                 };
                 let Some(n) = name else { return false };
                 // Resolve against both the leaf name and the instance-scoped
-                // key the elaborator bakes in (`ZKK.the_task`).
+                // key the elaborator bakes in (`u_inst.the_task`).
                 let items = self.module.tasks.get(n).map(|t| &t.items).or_else(|| {
                     self.module
                         .tasks
