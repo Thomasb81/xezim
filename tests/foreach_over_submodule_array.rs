@@ -15,11 +15,15 @@
 //! way, so this can never choose between same-named arrays in sibling
 //! instances.
 //!
-//! STILL OPEN (deliberately not asserted): the same `foreach` inside an
-//! `always_comb`, and the 1-D element-write path, both still drop their writes
-//! in a submodule. They are evaluated from the settle path, where the per-node
-//! resolved-name cache can already hold the unscoped form. Reference-verified
-//! as wrong; tracked separately.
+//! The `always_comb` variant needed two more pieces:
+//!   * scope inference (`infer_scope_from_rw_sets`) only scanned
+//!     `signal_name_to_id`, and an unpacked ARRAY has no entry there (only
+//!     per-element names), so an entry whose anchor was an array base got NO
+//!     scope hint at all — the array registries are now scanned alongside;
+//!   * a compiled always block runs `StmtFallback` insns through the AST
+//!     interpreter with no hint installed; blocks that carry a fallback insn
+//!     (precomputed `CompiledBlock::has_fallback`) now install the entry's
+//!     scope hint around `exec_insns`.
 
 use xezim::simulate;
 
@@ -56,4 +60,38 @@ fn foreach_over_a_two_dim_submodule_array_writes_every_element() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(get(&sim, "seen_a") & 0xFFFF, 0xBEEF);
     assert_eq!(get(&sim, "seen_b") & 0xFFFF, 0xBEEF);
+}
+
+/// The settle-path variant: the same foreach inside an `always_comb`, plus a
+/// plain 1-D foreach. Both dropped their writes before the scope-inference and
+/// fallback-hint fixes.
+const COMB_SRC: &str = r#"
+module holder (input [15:0] seed, output [15:0] res_1d, res_2d);
+  logic [15:0] lane [0:3];
+  logic [15:0] grid [0:1][0:1];
+  always_comb foreach (lane[i])    lane[i]    = seed;
+  always_comb foreach (grid[i, j]) grid[i][j] = seed;
+  assign res_1d = lane[2];
+  assign res_2d = grid[1][0];
+endmodule
+
+module tb;
+  logic [15:0] seed;
+  wire  [15:0] res_1d, res_2d;
+  logic [15:0] seen_1d, seen_2d;
+  holder dut (.seed(seed), .res_1d(res_1d), .res_2d(res_2d));
+  initial begin
+    seed = 16'hBEEF;
+    #3;
+    seen_1d = res_1d;
+    seen_2d = res_2d;
+  end
+endmodule
+"#;
+
+#[test]
+fn foreach_in_always_comb_inside_a_submodule_writes_its_array() {
+    let sim = simulate(COMB_SRC, 100).expect("simulate failed");
+    assert_eq!(get(&sim, "seen_1d") & 0xFFFF, 0xBEEF);
+    assert_eq!(get(&sim, "seen_2d") & 0xFFFF, 0xBEEF);
 }

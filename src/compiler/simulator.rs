@@ -15895,6 +15895,10 @@ impl Simulator {
                     None
                 };
                 let scope_hint = self.infer_scope_from_rw_sets(&writes, &reads);
+                if std::env::var("XEZIM_AB_DBG").is_ok() {
+                    eprintln!("[ABDBG] always-block writes={:?} reads={:?} -> scope={:?}",
+                        writes, reads, scope_hint);
+                }
                 let wids: Vec<usize> = writes
                     .iter()
                     .filter_map(|w| resolve_one(w.as_str()))
@@ -17229,14 +17233,34 @@ impl Simulator {
         let mut best_parent: Option<String> = None;
         let mut best_score = 0usize;
         let mut best_depth = 0usize;
-        for full_name in self.signal_name_to_id.keys() {
+        // An unpacked ARRAY has no entry of its own in `signal_name_to_id`
+        // (only per-element `scope.m[0]` names), so an entry whose anchor is an
+        // array base — `always_comb foreach (m[i]) m[i] = seed;` in a submodule
+        // — matched nothing here and got NO scope hint. Its foreach then looked
+        // the bare name up, found no dims, and every body write was dropped.
+        // Scan the array registries alongside the signal table, for both the
+        // parent candidates and the leaf scoring.
+        let leaf_declared = |candidate: &str| -> bool {
+            self.signal_name_to_id.contains_key(candidate)
+                || self.module.arrays.contains_key(candidate)
+                || self.module.arrays_2d.contains_key(candidate)
+                || self.module.arrays_nd.contains_key(candidate)
+        };
+        for full_name in self
+            .signal_name_to_id
+            .keys()
+            .map(|k| k.as_ref())
+            .chain(self.module.arrays.keys().map(|k| k.as_str()))
+            .chain(self.module.arrays_2d.keys().map(|k| k.as_str()))
+            .chain(self.module.arrays_nd.keys().map(|k| k.as_str()))
+        {
             let Some(parent) = full_name.strip_suffix(&suffix) else {
                 continue;
             };
             let mut score = 0usize;
             for leaf in &leaves {
                 let candidate = format!("{}.{}", parent, leaf);
-                if self.signal_name_to_id.contains_key(candidate.as_str()) {
+                if leaf_declared(candidate.as_str()) {
                     score += 1;
                 }
             }
@@ -27924,7 +27948,25 @@ impl Simulator {
                         // module timescale (mirrors the edge-block dispatch).
                         let saved_ts = self.timescale_scope_override.take();
                         self.timescale_scope_override = entries[eidx].scope_hint.clone();
+                        // A StmtFallback insn re-enters the AST interpreter,
+                        // which resolves bare names through the hint — without
+                        // it a `foreach (m[i]) m[i] = v;` in a SUBMODULE
+                        // resolved the bare array name, found nothing, and
+                        // dropped every write. Pure-bytecode blocks pre-resolve
+                        // their ids, so this costs them one bool test.
+                        let saved_hint = if compiled.has_fallback {
+                            let prev = self.name_resolve_hint.borrow().clone();
+                            if let Some(sc) = entries[eidx].scope_hint.as_ref() {
+                                *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
+                            }
+                            Some(prev)
+                        } else {
+                            None
+                        };
                         self.exec_insns(insns);
+                        if let Some(prev) = saved_hint {
+                            *self.name_resolve_hint.borrow_mut() = prev;
+                        }
                         self.timescale_scope_override = saved_ts;
                         self.prof_settle_ab_count += 1;
                     }
@@ -28804,6 +28846,11 @@ impl Simulator {
 
                 // If this is an array or queue, and we are assigning a packed value,
                 // we might want to split it into elements.
+                if std::env::var("XEZIM_A1_DBG").is_ok() && name.contains('m') {
+                    eprintln!("[A1DBG] whole-name write name={:?} in_arrays={} hint={:?}",
+                        name, self.module.arrays.contains_key(&name),
+                        self.name_resolve_hint.borrow().clone());
+                }
                 if let Some((lo, hi, elem_width)) = self.module.arrays.get(&name).cloned() {
                     let num_elements = (resized.width / elem_width) as usize;
                     // For queues/dynamic arrays, we update the size
@@ -29166,6 +29213,12 @@ impl Simulator {
                     _ => (None, None),
                 };
                 if let Some(mut name) = base_name {
+                    if std::env::var("XEZIM_A1_DBG").is_ok() {
+                        eprintln!("[A1DBG] idx-write base={:?} hint={:?} in_arrays={} scoped_in_arrays={:?}",
+                            name, self.name_resolve_hint.borrow().clone(),
+                            self.module.arrays.contains_key(&name),
+                            self.name_resolve_hint.borrow().as_ref().map(|h| self.module.arrays.contains_key(&format!("{}.{}", h, name))));
+                    }
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
                     }
