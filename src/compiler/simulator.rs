@@ -2754,6 +2754,15 @@ pub struct Simulator {
     local_stack: Vec<HashMap<String, Value>>,
     /// Context for 'super' resolution: stack of (current_class_name).
     class_context_stack: Vec<Option<String>>,
+    /// For each class-method call entered via `exec_method_in_class_hierarchy`,
+    /// the `local_stack` depth at entry (before the method's own frame is
+    /// pushed). Used by `get_expr_type_name` to decide whether a bare name is
+    /// a local of the CURRENT method vs a stale flat-map entry leaked from a
+    /// caller's scope — without this, `var_class_types` (never cleared on
+    /// method exit) lets a caller's same-named local shadow a class property's
+    /// declared type, so `prop = new(...)` constructs the wrong class (and can
+    /// recurse infinitely when the wrong class is the enclosing class itself).
+    method_local_base: Vec<usize>,
     /// Current covergroup instance if in sampling context.
     cg_this: Option<usize>,
     /// Processes waiting for join
@@ -5011,6 +5020,7 @@ impl Simulator {
             this_stack: vec![],
             local_stack: vec![],
             class_context_stack: vec![],
+            method_local_base: vec![],
             cg_this: None,
             join_waiters: Vec::new(),
             process_parents: HashMap::default(),
@@ -67542,6 +67552,12 @@ impl Simulator {
                     }
                     self.this_stack.push(Some(handle));
                     self.local_stack.push(locals);
+                    // Record the `local_stack` depth BEFORE this method's own
+                    // frame (i.e. the count of caller frames) so that
+                    // `get_expr_type_name`'s `in_any_frame` check only considers
+                    // the current method's locals — not a caller's same-named
+                    // local that leaked into the flat `var_class_types` map.
+                    self.method_local_base.push(self.local_stack.len() - 1);
                     self.class_context_stack.push(Some(cname.clone()));
                     self.local_iface_aliases.push(iface_alias_frame);
                     // §6.21: open a static-local sync frame so a `static`
@@ -67574,6 +67590,7 @@ impl Simulator {
                         self.return_flag = saved_return;
                     }
                     self.class_context_stack.pop();
+                    self.method_local_base.pop();
                     let implicit = fn_ret_name.as_ref().and_then(|rn| {
                         let lv = self.local_stack.last().and_then(|m| m.get(rn).cloned());
                         // A `funcname = {a, b, ...}` string-concat assignment is
@@ -67876,10 +67893,26 @@ impl Simulator {
                 // `class_prop_type_named`, ignoring any stale entry.
                 let in_any_frame = hier.path.len() == 1
                     && self
-                        .local_stack
-                        .iter()
-                        .rev()
-                        .any(|m| m.contains_key(&name));
+                        .method_local_base
+                        .last()
+                        .map(|&base| {
+                            self.local_stack
+                                .get(base..)
+                                .unwrap_or(&[])
+                                .iter()
+                                .rev()
+                                .any(|m| m.contains_key(&name))
+                        })
+                        // Outside any class method (initial/always blocks):
+                        // locals live as signals/flat-map entries with no
+                        // method base recorded, so any frame counts (there
+                        // is no class property they could shadow).
+                        .unwrap_or_else(|| {
+                            self.local_stack
+                                .iter()
+                                .rev()
+                                .any(|m| m.contains_key(&name))
+                        });
                 let in_class_method = self.class_context_stack.last().is_some();
                 let trust_flat_maps = in_any_frame || !in_class_method;
                 if trust_flat_maps {
