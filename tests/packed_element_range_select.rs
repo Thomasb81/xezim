@@ -90,3 +90,53 @@ fn constant_range_on_packed_multi_dim_selects_elements() {
     assert_eq!(get(&sim, "v_low"), 0x1111_2222_3333_4444);
     assert_eq!(get(&sim, "v_high"), 0xAAAA_BBBB_CCCC_DDDD);
 }
+
+/// Sibling forms of the same §7.4.1 rule, found by a follow-up oracle audit:
+/// the WRITE side (blocking, NBA, ascending declarations, and a continuous
+/// assign inside a submodule targeting a multi-D packed PORT), plus the
+/// indexed `[i +: c]` / `[i -: c]` read forms. Every one treated the range as
+/// bits. The submodule case additionally needed the inlined PORT to register
+/// its packed element width — net/variable declarations did, ports did not.
+const SIBLINGS: &str = r#"
+module feeder (output [3:0][7:0] opv);
+  assign opv[2:1] = 16'hBEEF;      // cont-assign onto a multi-D packed PORT
+endmodule
+
+module tb;
+  logic [3:0][7:0] wv, nv;
+  logic [0:3][7:0] av;
+  logic [3:0][7:0] pv;
+  wire  [3:0][7:0] opv;
+  logic [15:0] r_up, r_dn;
+  logic [31:0] seen_w, seen_n, seen_a, seen_o;
+
+  feeder u_f (.opv(opv));
+
+  initial begin
+    pv = 32'h44_33_22_11;
+    wv = '0; wv[2:1] = 16'hBEEF;    // blocking element-range write
+    nv = '0; nv[2:1] <= 16'hCAFE;   // NBA element-range write
+    av = '0; av[1:2] = 16'hBEEF;    // ascending declaration
+    #1;
+    r_up   = pv[1 +: 2];
+    r_dn   = pv[2 -: 2];
+    seen_w = wv;
+    seen_n = nv;
+    seen_a = av;
+    seen_o = opv;
+  end
+endmodule
+"#;
+
+#[test]
+fn element_range_siblings_write_nba_indexed_and_port() {
+    let sim = simulate(SIBLINGS, 100).expect("simulate failed");
+    assert_eq!(get(&sim, "seen_w") & 0xFFFF_FFFF, 0x00BE_EF00);
+    assert_eq!(get(&sim, "seen_n") & 0xFFFF_FFFF, 0x00CA_FE00);
+    assert_eq!(get(&sim, "seen_a") & 0xFFFF_FFFF, 0x00BE_EF00);
+    assert_eq!(get(&sim, "r_up") & 0xFFFF, 0x3322);
+    assert_eq!(get(&sim, "r_dn") & 0xFFFF, 0x3322);
+    // The driven elements of the port carry the value (undriven fill is the
+    // pre-existing x-vs-z difference, so mask to the driven lanes).
+    assert_eq!((get(&sim, "seen_o") >> 8) & 0xFFFF, 0xBEEF);
+}
