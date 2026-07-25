@@ -3441,6 +3441,20 @@ pub struct Simulator {
     /// follow-up delta pass instead of silently coalescing them away.
     edge_exec_wrote: Vec<usize>,
     edge_exec_seen: Vec<bool>,
+    /// Nesting depth of a scheduled PROCESS activation. §4.5: a blocking write
+    /// schedules the blocks sensitive to it in the ACTIVE region; the writing
+    /// process keeps running until it suspends, and only then do they execute.
+    /// The blocking-assign arm used to settle INLINE, so an `always @(*)` ran
+    /// in the middle of another process's statement sequence — and if that
+    /// process later wrote the comb block's target, the comb result was
+    /// clobbered and never recomputed (`initial begin a=0; b=1; g=0; end`
+    /// against `always @(*) if (a^b) g=…` left g at 0 instead of the value).
+    /// While this is non-zero, procedural comb entries triggered mid-process
+    /// are parked in `deferred_comb` and run at the process's exit instead.
+    proc_depth: u32,
+    /// (comb entry index, outputs it produced) for procedural entries that ran
+    /// while a process was mid-flight. Checked for clobbering at process exit.
+    deferred_comb: Vec<(usize, Vec<(usize, Value)>)>,
     /// True while `drain_edge_exec_rescan` is re-running check_edges for
     /// exec-written positions; makes check_edges_inner count block
     /// executions into `edge_rescan_block_hits` for stall attribution.
@@ -5305,6 +5319,8 @@ impl Simulator {
             edge_pos_seen: Vec::new(),
             edge_exec_wrote: Vec::new(),
             edge_exec_seen: Vec::new(),
+            proc_depth: 0,
+            deferred_comb: Vec::new(),
             in_edge_rescan: false,
             edge_rescan_block_hits: HashMap::default(),
             stall_edge_block_hits: HashMap::default(),
@@ -21360,7 +21376,104 @@ impl Simulator {
         *self.name_resolve_hint.borrow_mut() = h;
     }
 
+    /// Remember that a procedural comb entry ran while a process was mid-flight,
+    /// together with the outputs it produced. §4.5 puts such a block in the
+    /// ACTIVE region — it should observe the process's FINAL state, not an
+    /// intermediate one. xezim settles inline after every blocking assign (a
+    /// deep, load-bearing behaviour: nets and primitives must propagate right
+    /// away), so instead of reordering anything we simply detect the one case
+    /// that inline evaluation gets wrong — the process later overwrote what the
+    /// block computed — and re-run the block once the process suspends.
+    fn note_comb_ran_in_process(&mut self, eidx: usize, entry: &CombEntry) {
+        if entry.write_signal_ids.is_empty() {
+            return;
+        }
+        let snap: Vec<(usize, Value)> = entry
+            .write_signal_ids
+            .iter()
+            .filter(|id| **id < self.signal_table.len())
+            .map(|id| (*id, self.signal_table[*id].clone()))
+            .collect();
+        if snap.is_empty() {
+            return;
+        }
+        // Last write wins: a block that runs several times in one process only
+        // needs its most recent output compared.
+        if let Some(slot) = self.deferred_comb.iter_mut().find(|(e, _)| *e == eidx) {
+            slot.1 = snap;
+        } else {
+            self.deferred_comb.push((eidx, snap));
+        }
+    }
+
+    /// Re-run the comb entries whose outputs the just-finished process
+    /// clobbered. Nothing is re-run when the values still stand, so blocks with
+    /// side effects (`$display`) are not duplicated in the common case.
+    fn drain_deferred_comb(&mut self) {
+        if self.deferred_comb.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.deferred_comb);
+        let entries = std::mem::take(&mut self.comb_entries);
+        for (eidx, snap) in pending {
+            let Some(entry) = entries.get(eidx) else { continue };
+            let clobbered = snap.iter().any(|(id, v)| {
+                self.signal_table.get(*id).is_some_and(|cur| cur != v)
+            });
+            if !clobbered {
+                continue;
+            }
+            match &entry.item {
+                CombItem::AlwaysBlock { .. } => self.eval_ast_comb_entry(entry),
+                CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                    if self.vm_regs.len() < compiled.num_regs as usize {
+                        self.vm_regs
+                            .resize(compiled.num_regs as usize, Value::zero(1));
+                    }
+                    let insns = unsafe {
+                        std::slice::from_raw_parts(
+                            compiled.instructions.as_ptr(),
+                            compiled.instructions.len(),
+                        )
+                    };
+                    let saved_ts = self.timescale_scope_override.take();
+                    self.timescale_scope_override = entry.scope_hint.clone();
+                    let saved_hint = if compiled.has_fallback {
+                        let prev = self.name_resolve_hint.borrow().clone();
+                        if let Some(sc) = entry.scope_hint.as_ref() {
+                            *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
+                        }
+                        Some(prev)
+                    } else {
+                        None
+                    };
+                    self.exec_insns(insns);
+                    if let Some(prev) = saved_hint {
+                        *self.name_resolve_hint.borrow_mut() = prev;
+                    }
+                    self.timescale_scope_override = saved_ts;
+                }
+                _ => {}
+            }
+        }
+        self.comb_entries = entries;
+    }
+
+    /// §4.5 boundary: run the process, then let the ACTIVE-region work its
+    /// blocking writes scheduled actually execute. Deferring the settle to
+    /// here (rather than firing it inline after every blocking assign) is what
+    /// keeps a triggered `always @(*)` from running in the middle of another
+    /// process's statement sequence.
     fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
+        self.proc_depth += 1;
+        self.run_scheduled_process_inner(pid, stmts);
+        self.proc_depth -= 1;
+        if self.proc_depth == 0 {
+            self.drain_deferred_comb();
+        }
+    }
+
+    fn run_scheduled_process_inner(&mut self, pid: usize, stmts: &[Statement]) {
         // Flags from a prior process must not leak into this one.
         self.break_flag = false;
         self.return_flag = false;
@@ -28079,6 +28192,11 @@ impl Simulator {
                     CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
                         // Factored AST eval (shared with the BSP settle driver).
                         self.eval_ast_comb_entry(&entries[eidx]);
+                        if self.proc_depth > 0
+                            && matches!(entries[eidx].item, CombItem::AlwaysBlock { .. })
+                        {
+                            self.note_comb_ran_in_process(eidx, &entries[eidx]);
+                        }
                     }
                     CombItem::CompiledAlwaysBlock { compiled, .. } => {
                         // Bytecode path: BlockingAssign/NbaAssign insns mark
@@ -28118,6 +28236,9 @@ impl Simulator {
                         }
                         self.timescale_scope_override = saved_ts;
                         self.prof_settle_ab_count += 1;
+                        if self.proc_depth > 0 {
+                            self.note_comb_ran_in_process(eidx, &entries[eidx]);
+                        }
                     }
                     CombItem::FusedGate { op } => {
                         let op = *op;
