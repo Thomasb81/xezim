@@ -17565,6 +17565,33 @@ impl Simulator {
     }
 
     /// Collect signal names written by an LHS expression.
+    /// Targets written by an expression used as a STATEMENT: increment and
+    /// decrement operators and an embedded assignment expression. Walks
+    /// through parens and into both arms of a comma/concat so a compound
+    /// statement expression records every target.
+    fn collect_expr_stmt_writes(
+        e: &Expression,
+        module: &ElaboratedModule,
+        writes: &mut HashSet<String>,
+    ) {
+        match &e.kind {
+            ExprKind::Paren(inner) => Self::collect_expr_stmt_writes(inner, module, writes),
+            ExprKind::Unary { op, operand }
+                if matches!(
+                    op,
+                    UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
+                ) =>
+            {
+                Self::collect_lhs_writes(operand, module, writes);
+            }
+            ExprKind::AssignExpr { lvalue, rvalue } => {
+                Self::collect_lhs_writes(lvalue, module, writes);
+                Self::collect_expr_stmt_writes(rvalue, module, writes);
+            }
+            _ => {}
+        }
+    }
+
     fn collect_lhs_writes(
         lhs: &Expression,
         module: &ElaboratedModule,
@@ -17706,6 +17733,14 @@ impl Simulator {
             }
             StatementKind::Expr(e) => {
                 Self::collect_expr_reads(e, module, reads);
+                // An expression STATEMENT can also write: `cnt++`, `--cnt`,
+                // and `(x = y)` all assign their target. Only reads were
+                // recorded here, so the target survived the implicit
+                // sensitivity list (`reads - writes`) and an `always @(*)`
+                // that incremented a counter re-triggered itself forever
+                // (§9.4.2.2 — a variable assigned by the block is not part of
+                // its own inferred sensitivity).
+                Self::collect_expr_stmt_writes(e, module, writes);
             }
             StatementKind::While { condition, body }
             | StatementKind::DoWhile { body, condition } => {
@@ -17985,7 +18020,15 @@ impl Simulator {
                 stmt: body,
             } => {
                 if let TimingControl::Event(event) = control {
-                    return Some((self.event_to_sens(event), *body.clone()));
+                    let sens = if matches!(
+                        event,
+                        EventControl::Star | EventControl::ParenStar
+                    ) {
+                        self.star_sens_from_body(body)
+                    } else {
+                        self.event_to_sens(event)
+                    };
+                    return Some((sens, *body.clone()));
                 }
                 None
             }
@@ -17997,7 +18040,27 @@ impl Simulator {
                     } = &first.kind
                     {
                         if let TimingControl::Event(event) = control {
-                            let sens = self.event_to_sens(event);
+                            let sens = if matches!(
+                                event,
+                                EventControl::Star | EventControl::ParenStar
+                            ) {
+                                // §9.4.2.2: infer from everything the block
+                                // guards, not just the first statement.
+                                let rest = Statement::new(
+                                    StatementKind::SeqBlock {
+                                        name: name.clone(),
+                                        stmts: {
+                                            let mut v = vec![*body.clone()];
+                                            v.extend_from_slice(&stmts[1..]);
+                                            v
+                                        },
+                                    },
+                                    stmt.span,
+                                );
+                                self.star_sens_from_body(&rest)
+                            } else {
+                                self.event_to_sens(event)
+                            };
                             let mut new_stmts = vec![*body.clone()];
                             new_stmts.extend_from_slice(&stmts[1..]);
                             return Some((
@@ -18017,6 +18080,44 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// §9.4.2.2 — the inferred sensitivity of `@*` / `@(*)`: every signal READ
+    /// by the statement it guards, minus the ones that statement writes (a
+    /// variable assigned by the block is not part of its own sensitivity).
+    ///
+    /// `event_to_sens` yields an EMPTY list for Star, and the process path
+    /// then took the "just execute body" fallthrough — so an `always @(*)`
+    /// never suspended and behaved like `forever`. Harmless for a pure
+    /// combinational body (it re-runs and settles), but with any timing
+    /// control in the body (`always @(*) begin #0; ... end`) it became an
+    /// infinite delta-cycle loop that never let time advance.
+    fn star_sens_from_body(&self, body: &Statement) -> Vec<Sensitivity> {
+        let mut reads: HashSet<String> = HashSet::default();
+        let mut writes: HashSet<String> = HashSet::default();
+        Self::collect_stmt_reads(body, &self.module, &mut reads, &mut writes);
+        let hint = self.name_resolve_hint.borrow().clone();
+        let mut out: Vec<Sensitivity> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::default();
+        for r in reads.difference(&writes) {
+            // Prefer the instance-scoped name when one exists, mirroring the
+            // scope-first resolution the rest of the runtime performs.
+            let resolved = hint
+                .as_ref()
+                .map(|sc| format!("{}.{}", sc, r))
+                .filter(|q| self.signal_name_to_id.contains_key(q.as_str()))
+                .unwrap_or_else(|| r.clone());
+            if self.signal_name_to_id.contains_key(resolved.as_str())
+                && seen.insert(resolved.clone())
+            {
+                out.push(Sensitivity {
+                    signal_name: resolved,
+                    edge: EdgeKind::AnyEdge,
+                    iff: None,
+                });
+            }
+        }
+        out
     }
 
     fn event_to_sens(&self, event: &EventControl) -> Vec<Sensitivity> {
@@ -21751,7 +21852,7 @@ impl Simulator {
                 // current time and ask the outer event loop to defer-and-advance
                 // to the next scheduled event — a commercial simulator lets time
                 // move past a #0 spinner once its driving value recovers (here,
-                // once an `irefclk` edge updates the measured period). The outer
+                // once a reference-clock edge updates the measured period). The outer
                 // loop declares it fatal only if nothing is scheduled ahead.
                 self.event_queue.schedule(self.time, pid, stmts.to_vec());
                 self.zero_delay_defer_pending = true;
@@ -22524,8 +22625,21 @@ impl Simulator {
                     }
                     TimingControl::Event(event) => {
                         // Suspend process until the event fires
-                        let sens = self.event_to_sens(event);
+                        let is_star = matches!(
+                            event,
+                            EventControl::Star | EventControl::ParenStar
+                        );
+                        let sens = if is_star {
+                            self.star_sens_from_body(body)
+                        } else {
+                            self.event_to_sens(event)
+                        };
                         let is_clk_ev = self.is_clocking_event(event);
+                        // `@(*)` over a body that reads NOTHING can never
+                        // trigger again — park the process instead of looping.
+                        if is_star && sens.is_empty() {
+                            return;
+                        }
                         if !sens.is_empty() {
                             let mut cont = vec![*body.clone()];
                             cont.extend_from_slice(&stmts[i + 1..]);
