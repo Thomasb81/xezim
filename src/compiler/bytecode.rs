@@ -195,6 +195,12 @@ impl ArrayOperand {
 pub struct CompiledBlock {
     pub instructions: Vec<Insn>,
     pub num_regs: u32,
+    /// True when any instruction is a `StmtFallback` (AST-interpreted). Those
+    /// resolve bare names through `resolve_hier_name`, which needs the owning
+    /// entry's scope hint installed — the pure-bytecode insns pre-resolve their
+    /// signal ids and don't. Precomputed here so the settle hot loop pays one
+    /// bool test instead of scanning the insn stream.
+    pub has_fallback: bool,
 }
 
 /// Compiler state for converting AST → bytecode.
@@ -2962,9 +2968,14 @@ impl<'a> BytecodeCompiler<'a> {
         // c910, that slack stacks into double-digit MB; one
         // `shrink_to_fit` per finish reclaims it.
         self.insns.shrink_to_fit();
+        let has_fallback = self
+            .insns
+            .iter()
+            .any(|i| matches!(i, Insn::StmtFallback(..)));
         CompiledBlock {
             num_regs: self.next_reg,
             instructions: self.insns,
+            has_fallback,
         }
     }
 
