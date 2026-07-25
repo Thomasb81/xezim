@@ -1771,6 +1771,24 @@ impl<'a> BytecodeCompiler<'a> {
                     if let (Some(l), Some(r)) =
                         (self.eval_const_expr(left), self.eval_const_expr(right))
                     {
+                        // §7.4.1: on a packed MULTI-D base (`logic [1:0][63:0]`
+                        // or a packed array of a struct typedef), a constant
+                        // range selects ELEMENTS — `pv[1:0]` is BOTH 64-bit
+                        // slices (128 bits), not bits 1..0. Scale the bounds by
+                        // the registered element width; a plain vector has no
+                        // entry and keeps the historical bit-range meaning.
+                        if let ExprKind::Ident(h) = &expr.kind {
+                            if let Some(ew) = self.packed_elem_width_of(h).filter(|&w| w > 1) {
+                                let dim = self.packed_outer_dim(h);
+                                let lsb_l = Self::packed_elem_lsb(dim, l as i64, ew);
+                                let lsb_r = Self::packed_elem_lsb(dim, r as i64, ew);
+                                let lo = lsb_l.min(lsb_r).max(0) as u32;
+                                let hi = (lsb_l.max(lsb_r) + ew as i64 - 1).max(0) as u32;
+                                let dest = self.alloc_reg();
+                                self.emit(Insn::RangeSelectConst(dest, base, hi, lo));
+                                return Some(dest);
+                            }
+                        }
                         let dest = self.alloc_reg();
                         self.emit(Insn::RangeSelectConst(dest, base, l, r));
                         return Some(dest);

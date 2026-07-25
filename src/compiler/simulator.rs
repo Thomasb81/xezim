@@ -31945,6 +31945,51 @@ impl Simulator {
                         return acc;
                     }
                 }
+                // Packed multi-D ELEMENT range select (LRM §7.4.1): for
+                // `logic [1:0][63:0] pv;` or a packed array of a struct typedef
+                // (`bundle_t [1:0] arr;`), a constant `arr[1:0]` selects BOTH
+                // elements — 2×elem_w bits — not bits 1..0. This mirrors the
+                // single-element select above; without it a port actual written
+                // as `.p(arr[1:0])` carried 2 bits into a 256-bit port.
+                if matches!(kind, RangeKind::Constant) {
+                    if let ExprKind::Ident(h) = &expr.kind {
+                        let nm = self.resolve_hier_name(h);
+                        if let Some(&elem_w) =
+                            self.module.packed_signal_elem_widths.get(&nm).filter(|&&w| w > 1)
+                        {
+                            let l = self.eval_expr(left).to_i64().unwrap_or(0);
+                            let r = self.eval_expr(right).to_i64().unwrap_or(0);
+                            // LSB offset of a labeled element under the DECLARED
+                            // outer range: `[N-1:0]` reduces to idx*elem_w, an
+                            // ascending `[0:1]` reverses slot order.
+                            let dim = self
+                                .module
+                                .packed_full_dims
+                                .get(&nm)
+                                .and_then(|d| d.first())
+                                .copied();
+                            let lsb_of = |idx: i64| -> i64 {
+                                match dim {
+                                    None => idx * elem_w as i64,
+                                    Some((dl, dr)) => {
+                                        let (lo_b, hi_b) = (dl.min(dr), dl.max(dr));
+                                        let count = hi_b - lo_b + 1;
+                                        let off = idx - lo_b;
+                                        let slot =
+                                            if dl >= dr { off } else { count - 1 - off };
+                                        slot * elem_w as i64
+                                    }
+                                }
+                            };
+                            let lsb_l = lsb_of(l);
+                            let lsb_r = lsb_of(r);
+                            let lo = lsb_l.min(lsb_r).max(0) as usize;
+                            let hi = (lsb_l.max(lsb_r) + elem_w as i64 - 1).max(0) as usize;
+                            let base_v = self.eval_expr(expr);
+                            return base_v.range_select(hi, lo);
+                        }
+                    }
+                }
                 // Ascending packed vector part-select (`logic [0:7] pa; pa[0:3]`):
                 // labels index from the MSB end, so map [a:b] to internal
                 // [(W-1)-a : (W-1)-b] (LRM §7.4.1, §11.5.1).
