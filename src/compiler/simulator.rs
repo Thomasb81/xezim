@@ -60248,7 +60248,7 @@ impl Simulator {
             class_name: class_def.name.clone(),
             properties: HashMap::default(),
             type_bindings: HashMap::default(),
-            spec: computed_spec.clone(),
+            spec: None,
         };
         // §8.25: map the specialization's `#(...)` args onto the leaf
         // class's parameters BY NAME (type and value params interleave in
