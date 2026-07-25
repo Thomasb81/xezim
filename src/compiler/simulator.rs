@@ -29520,10 +29520,54 @@ impl Simulator {
                     RangeKind::IndexedUp => (l + r.saturating_sub(1), l),
                     RangeKind::IndexedDown => (l, l.saturating_sub(r.saturating_sub(1))),
                 };
+                // §7.4.1 element-range WRITE on a packed multi-D base:
+                // `wv[2:1] = 16'hBEEF` / `wv[1 +: 2] = …` targets whole
+                // ELEMENTS. The bit-based msb/lsb above wrote a 2-bit sliver
+                // instead. Scale by the registered element width, normalized
+                // against the declared outer dimension (mirrors the read side).
+                let mut elem_scaled = false;
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let nm = self.resolve_hier_name(h);
+                    if let Some(&elem_w) = self
+                        .module
+                        .packed_signal_elem_widths
+                        .get(&nm)
+                        .filter(|&&w| w > 1)
+                    {
+                        let (lab_a, lab_b): (i64, i64) = match kind {
+                            RangeKind::Constant => (l as i64, r as i64),
+                            RangeKind::IndexedUp => (l as i64, l as i64 + r as i64 - 1),
+                            RangeKind::IndexedDown => (l as i64, l as i64 - (r as i64 - 1)),
+                        };
+                        let dim = self
+                            .module
+                            .packed_full_dims
+                            .get(&nm)
+                            .and_then(|d| d.first())
+                            .copied();
+                        let lsb_of = |idx: i64| -> i64 {
+                            match dim {
+                                None => idx * elem_w as i64,
+                                Some((dl, dr)) => {
+                                    let (lo_b, hi_b) = (dl.min(dr), dl.max(dr));
+                                    let count = hi_b - lo_b + 1;
+                                    let off = idx - lo_b;
+                                    let slot = if dl >= dr { off } else { count - 1 - off };
+                                    slot * elem_w as i64
+                                }
+                            }
+                        };
+                        let la = lsb_of(lab_a);
+                        let lb = lsb_of(lab_b);
+                        lsb = la.min(lb).max(0) as usize;
+                        msb = (la.max(lb) + elem_w as i64 - 1).max(0) as usize;
+                        elem_scaled = true;
+                    }
+                }
                 // Ascending packed vector part-write (`logic [0:7] pa; pa[0:3]=v`):
                 // labels index from the MSB end → internal [(W-1)-lsb : (W-1)-msb]
                 // (LRM §7.4.1, §11.5.1).
-                if matches!(kind, RangeKind::Constant) {
+                if !elem_scaled && matches!(kind, RangeKind::Constant) {
                     if let ExprKind::Ident(h) = &expr.kind {
                         let nm = self.resolve_hier_name(h);
                         if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
@@ -31951,14 +31995,22 @@ impl Simulator {
                 // elements — 2×elem_w bits — not bits 1..0. This mirrors the
                 // single-element select above; without it a port actual written
                 // as `.p(arr[1:0])` carried 2 bits into a 256-bit port.
-                if matches!(kind, RangeKind::Constant) {
+                {
                     if let ExprKind::Ident(h) = &expr.kind {
                         let nm = self.resolve_hier_name(h);
                         if let Some(&elem_w) =
                             self.module.packed_signal_elem_widths.get(&nm).filter(|&&w| w > 1)
                         {
-                            let l = self.eval_expr(left).to_i64().unwrap_or(0);
-                            let r = self.eval_expr(right).to_i64().unwrap_or(0);
+                            let li = self.eval_expr(left).to_i64().unwrap_or(0);
+                            let ri = self.eval_expr(right).to_i64().unwrap_or(0);
+                            // Label bounds per select kind; `[i +: c]` covers
+                            // elements i..i+c-1, `[i -: c]` covers i-c+1..i
+                            // (§7.4.1 + §11.5.1 element semantics).
+                            let (l, r): (i64, i64) = match kind {
+                                RangeKind::Constant => (li, ri),
+                                RangeKind::IndexedUp => (li, li + ri - 1),
+                                RangeKind::IndexedDown => (li, li - (ri - 1)),
+                            };
                             // LSB offset of a labeled element under the DECLARED
                             // outer range: `[N-1:0]` reduces to idx*elem_w, an
                             // ascending `[0:1]` reverses slot order.
@@ -43876,11 +43928,14 @@ impl Simulator {
                     .unwrap_or(32)
             }
             ExprKind::RangeSelect {
-                left, right, kind, ..
+                expr: rs_base,
+                left,
+                right,
+                kind,
             } => {
                 let l = self.eval_expr(left).to_u64().unwrap_or(0);
                 let r = self.eval_expr(right).to_u64().unwrap_or(0);
-                match kind {
+                let count = match kind {
                     RangeKind::IndexedUp | RangeKind::IndexedDown => r as u32,
                     RangeKind::Constant => {
                         if l >= r {
@@ -43889,7 +43944,22 @@ impl Simulator {
                             (r - l + 1) as u32
                         }
                     }
+                };
+                // §7.4.1: an element range on a packed multi-D lvalue is
+                // count × elem_w bits wide, not count bits — the RHS was
+                // resized to the raw label count and truncated.
+                if let ExprKind::Ident(h) = &rs_base.kind {
+                    let nm = self.resolve_hier_name(h);
+                    if let Some(&ew) = self
+                        .module
+                        .packed_signal_elem_widths
+                        .get(&nm)
+                        .filter(|&&w| w > 1)
+                    {
+                        return count * ew;
+                    }
                 }
+                count
             }
             ExprKind::Index { expr: e, index: _ } => {
                 // Walk chained Index nodes to the root identifier, counting
