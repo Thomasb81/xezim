@@ -28961,6 +28961,39 @@ impl Simulator {
                                 name = s;
                             }
                         }
+                        // A bare name written from inside a SUBMODULE — e.g. the
+                        // body of a `foreach` in an `always_comb`, evaluated from
+                        // the settle path where no scope hint is installed and the
+                        // per-node name cache may already hold the unscoped form.
+                        // Try the hint, then a UNIQUE suffix match, so the write
+                        // lands instead of being silently dropped.
+                        if !self.module.arrays_2d.contains_key(&name) && !name.contains('.') {
+                            let hinted = self
+                                .name_resolve_hint
+                                .borrow()
+                                .as_ref()
+                                .map(|h| format!("{}.{}", h, name));
+                            if let Some(h) = hinted.filter(|h| self.module.arrays_2d.contains_key(h))
+                            {
+                                name = h;
+                            } else {
+                                let suffix = format!(".{}", name);
+                                let mut hit: Option<String> = None;
+                                let mut many = false;
+                                for k in self.module.arrays_2d.keys() {
+                                    if k.ends_with(&suffix) {
+                                        if hit.is_some() {
+                                            many = true;
+                                            break;
+                                        }
+                                        hit = Some(k.clone());
+                                    }
+                                }
+                                if let (Some(k), false) = (hit, many) {
+                                    name = k;
+                                }
+                            }
+                        }
                         if self.module.arrays_2d.contains_key(&name) {
                             let i = self.eval_expr(inner_idx).to_u64().unwrap_or(0) as i64;
                             let j = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
@@ -36876,6 +36909,43 @@ impl Simulator {
                             {
                                 name = scoped;
                             }
+                        }
+                    }
+                    // The hint above is only installed while a PROCESS runs. A
+                    // `foreach` inside an `always_comb` is evaluated from the
+                    // settle path with NO hint, so a bare name in a submodule
+                    // stayed unscoped, `foreach_dims` returned None and the loop
+                    // body never ran — the array kept its X. Fall back to a
+                    // UNIQUE suffix match: accept `<scope>.m` only when exactly
+                    // one registered array ends that way, so this can never pick
+                    // between same-named arrays in sibling instances.
+                    if !self.module.arrays.contains_key(&name)
+                        && !self.module.arrays_2d.contains_key(&name)
+                        && !self.module.arrays_nd.contains_key(&name)
+                        && !self.module.dynamic_arrays.contains(&name)
+                        && !self.is_associative_array(&name)
+                        && !name.contains('.')
+                    {
+                        let suffix = format!(".{}", name);
+                        let mut hit: Option<String> = None;
+                        let mut many = false;
+                        for k in self
+                            .module
+                            .arrays
+                            .keys()
+                            .chain(self.module.arrays_2d.keys())
+                            .chain(self.module.arrays_nd.keys())
+                        {
+                            if k.ends_with(&suffix) {
+                                if hit.is_some() {
+                                    many = true;
+                                    break;
+                                }
+                                hit = Some(k.clone());
+                            }
+                        }
+                        if let (Some(k), false) = (hit, many) {
+                            name = k;
                         }
                     }
                     // The array's instance prefix ("u_s" from "u_s.mem") —
@@ -48546,8 +48616,23 @@ impl Simulator {
         }
         let n = dims.len();
         let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+        // Resolve the BODY's bare names under the array's instance too. The
+        // loop bounds are found by scoping the array name, but the body then
+        // wrote through an unscoped `m[i][j]` — in a submodule that resolved to
+        // nothing and every write was dropped while the loop itself ran fine.
+        // Only installed when the array is instance-scoped; restored on exit.
+        let saved_fe_hint = self.name_resolve_hint.borrow().clone();
+        if let Some(sc) = scope.filter(|s| !s.is_empty()) {
+            *self.name_resolve_hint.borrow_mut() = Some(sc.to_string());
+        }
+        macro_rules! fe_done {
+            () => {{
+                *self.name_resolve_hint.borrow_mut() = saved_fe_hint.clone();
+            }};
+        }
         loop {
             if self.finished {
+                fe_done!();
                 return;
             }
             for (k, (_, id)) in iterated.iter().enumerate() {
@@ -48556,6 +48641,7 @@ impl Simulator {
             self.continue_flag = false;
             self.exec_statement(body);
             if self.break_flag {
+                fe_done!();
                 return;
             }
             self.continue_flag = false;
@@ -48563,6 +48649,7 @@ impl Simulator {
             let mut k = n;
             loop {
                 if k == 0 {
+                    fe_done!();
                     return;
                 }
                 k -= 1;
