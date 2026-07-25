@@ -15434,11 +15434,30 @@ impl Simulator {
             // otherwise scope a multi-driven net's folded
             // `b = $__wres(u1.b, u2.b)` into one INSTANCE, writing u2.b
             // instead of b and leaving the net z forever).
-            let lhs_is_absolute = matches!(&ca.lhs.kind,
-                ExprKind::Ident(h) if h.path.len() == 1
+            // The base ident of the LHS, looking through ONE select layer —
+            // `t[1:0] = …` and `t[i] = …` anchor on `t` just as `t = …` does.
+            let lhs_base_hier: Option<&crate::ast::expr::HierarchicalIdentifier> =
+                match &ca.lhs.kind {
+                    ExprKind::Ident(h) => Some(h),
+                    ExprKind::Index { expr: b, .. } | ExprKind::RangeSelect { expr: b, .. } => {
+                        match &b.kind {
+                            ExprKind::Ident(h) => Some(h),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+            // Applies to select-form LHS too: a port hop whose actual shares
+            // the SUBMODULE PORT's name (`.t(t[1:0])` in the testbench, tb
+            // signal also `t`) built `t[1:0] = u_t.t` with scope hint `u_t`,
+            // so the write resolved scope-first to `u_t.t` — a self-assign —
+            // and the testbench signal stayed X forever.
+            let lhs_is_absolute = lhs_base_hier.is_some_and(|h| {
+                h.path.len() == 1
                     && h.path[0].selects.is_empty()
                     && !h.path[0].name.name.contains('.')
-                    && self.signal_name_to_id.contains_key(h.path[0].name.name.as_str()));
+                    && self.signal_name_to_id.contains_key(h.path[0].name.name.as_str())
+            });
             let scope_hint = if lhs_is_absolute {
                 None
             } else {
