@@ -15758,6 +15758,26 @@ impl Simulator {
                 }
                 if let Some(&id) = self.signal_name_to_id.get(r.as_str()) {
                     rids.push(id);
+                    // An AST-evaluated entry resolves a bare name SCOPE-FIRST at
+                    // run time (`resolve_hier_name`), so depending only on the
+                    // top-level match is wrong: the entry evaluates `<scope>.r`
+                    // but is woken by a change to `r`. It then latched whatever
+                    // the scoped signal held on the first settle — X — and never
+                    // re-fired when the port copy actually arrived. Register the
+                    // scoped id too; a superset sensitivity only costs an extra
+                    // evaluation, while missing one loses the value entirely.
+                    if !entry_is_bytecode && !r.contains('.') {
+                        if let Some(scope) = &scope_hint {
+                            if let Some(&sid) = self
+                                .signal_name_to_id
+                                .get(format!("{}.{}", scope, r).as_str())
+                            {
+                                if sid != id {
+                                    rids.push(sid);
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 // Bytecode lookup also qualifies unresolved multi-segment
@@ -17267,6 +17287,28 @@ impl Simulator {
         });
     }
 
+    /// Every element name of a 2-D unpacked array addressed as `m[i][j]`,
+    /// given the INNER `m[i]` expression. `None` when `base` is not an index
+    /// into a registered 2-D array. Used to give a reader of one element a real
+    /// dependency: the array base carries no signal id of its own.
+    fn multi_dim_elem_names(base: &Expression, module: &ElaboratedModule) -> Option<Vec<String>> {
+        let ExprKind::Index { expr: inner, .. } = &base.kind else {
+            return None;
+        };
+        let ExprKind::Ident(h) = &inner.kind else {
+            return None;
+        };
+        let name = Self::resolve_hier_name_static(h, module);
+        let ((a0, a1), (b0, b1), _) = *module.arrays_2d.get(&name)?;
+        let mut out = Vec::new();
+        for a in a0.min(a1)..=a0.max(a1) {
+            for b in b0.min(b1)..=b0.max(b1) {
+                out.push(format!("{}[{}][{}]", name, a, b));
+            }
+        }
+        Some(out)
+    }
+
     fn collect_expr_reads(
         expr: &Expression,
         module: &ElaboratedModule,
@@ -17321,6 +17363,16 @@ impl Simulator {
                         }
                     } else {
                         reads.insert(name);
+                    }
+                } else if let Some(elems) = Self::multi_dim_elem_names(base, module) {
+                    // 2-D element read (`m[i][j]`): the base is itself an Index,
+                    // so the 1-D expansion above never fires and only the array
+                    // BASE name was registered — a name with no signal id, so the
+                    // reader had no dependency at all and kept the X it sampled
+                    // on the first settle. Expand every element, exactly as the
+                    // 1-D case does.
+                    for e in elems {
+                        reads.insert(e);
                     }
                 } else {
                     // Non-Ident base (e.g. nested Index, RangeSelect from inlining
