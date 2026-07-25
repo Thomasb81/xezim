@@ -55306,6 +55306,16 @@ impl Simulator {
         method_name: &str,
         args: &[Expression],
     ) -> Option<Value> {
+        // Constructors (`new`) are never static — they always require an
+        // instance to be allocated first. If we dispatch them through the
+        // static path, the constructor body executes with `this`=0 (null),
+        // writing `m_leaf_name`, `m_inst_id` etc. to the null handle so the
+        // object is never properly initialised. All call-sites that need
+        // constructor dispatch have an explicit `if m == "new" { instantiate }`
+        // fallback, so returning None here lets them reach it.
+        if method_name == "new" {
+            return None;
+        }
         let mut cur = Some(class_name.to_string());
         while let Some(cname) = cur {
             if let Some(cd) = self.module.classes.get(&cname).cloned() {
