@@ -34090,7 +34090,19 @@ impl Simulator {
                 value,
                 cached_val,
             } => {
-                let w = size.unwrap_or(32);
+                let r_for_w = match base {
+                    NumberBase::Binary => 2,
+                    NumberBase::Octal => 8,
+                    NumberBase::Hex => 16,
+                    NumberBase::Decimal => 10,
+                };
+                // §5.7.1: an UNSIZED literal is at least 32 bits, but must not
+                // drop digits the source wrote — `'h123456789ABCDEF0` is 64 bits
+                // of value and a flat 32 kept only the low half, silently.
+                let w = match size {
+                    Some(sz) => *sz,
+                    None => Value::unsized_literal_width(value, r_for_w),
+                };
                 // Fast path: return cached value (avoids re-parsing string)
                 if let Some((vb, xz, cw)) = cached_val.get() {
                     if cw == w {

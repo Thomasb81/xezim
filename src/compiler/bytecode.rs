@@ -2740,7 +2740,19 @@ impl<'a> BytecodeCompiler<'a> {
                 value,
                 cached_val,
             } => {
-                let w = size.unwrap_or(32);
+                // §5.7.1 — see `Value::unsized_literal_width`.
+                let w = match size {
+                    Some(sz) => *sz,
+                    None => Value::unsized_literal_width(
+                        value,
+                        match base {
+                            NumberBase::Binary => 2,
+                            NumberBase::Octal => 8,
+                            NumberBase::Hex => 16,
+                            NumberBase::Decimal => 10,
+                        },
+                    ),
+                };
                 if let Some((vb, xz, cw)) = cached_val.get() {
                     if cw == w {
                         let mut v = Value::from_inline(vb, xz, w);
