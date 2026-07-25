@@ -135,3 +135,46 @@ endmodule
     );
     assert!(!out.contains("FAIL"), "unexpected FAIL:\n{out}");
 }
+
+#[test]
+fn class_local_typedef_in_spec_params_static_field_read() {
+    let src = r#"class Registry #(type T = int);
+  static string name = "unnamed";
+  static function string get_name();
+    return name;
+  endfunction
+  static function void set_name(string s);
+    name = s;
+  endfunction
+endclass
+
+class Component #(type T = int);
+  typedef Component#(T) this_type;
+  typedef Registry#(this_type) reg_type;
+
+  static function void init(string s);
+    reg_type::set_name(s);
+  endfunction
+
+  static function string check();
+    return reg_type::get_name();
+  endfunction
+endclass
+
+module top;
+  initial begin
+    Component#(int)::init("comp_int");
+    Component#(bit)::init("comp_bit");
+
+    if (Component#(int)::check() == "comp_int" && Component#(bit)::check() == "comp_bit")
+      $display("PASS static_field");
+    else
+      $display("FAIL static_field int='%s' bit='%s'", Component#(int)::check(), Component#(bit)::check());
+  end
+endmodule
+"#;
+    let out = run_xezim(src, "static_field");
+    assert!(out.contains("PASS static_field"), "static field access failed:\n{out}");
+    assert!(!out.contains("FAIL"), "unexpected FAIL:\n{out}");
+}
+
