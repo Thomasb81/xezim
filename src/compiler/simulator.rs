@@ -32782,7 +32782,19 @@ impl Simulator {
                             }
                         }
                     }
-                    if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
+                    if self.module.arrays.contains_key(&name) || self.module.dynamic_arrays.contains(&name) || self.is_associative_array(&name) {
+                        // Check if `name` is a queue/dynamic array. This
+                        // handles struct-field sub-paths (`info.addr`) and
+                        // class-property paths (`c.addr`) that aren't in
+                        // `arrays` or `associative_arrays` but ARE in
+                        // `dynamic_arrays` (registered by assignment-pattern
+                        // handling on first write). Without this check, an
+                        // element read like `info.addr[0]` returns X because
+                        // the enum arm exits before reaching the dynamic-array
+                        // signal lookup below.
+                        if self.module.dynamic_arrays.contains(&name) {
+                            // fall through to the element lookup below
+                        }
                         // Per-spec storage key for STATIC collection properties
                         // of parameterized classes: membership stays on the
                         // bare `name` (registered globally), but element/size
@@ -36599,13 +36611,48 @@ impl Simulator {
                         iw
                     }
                 };
-                // Handle bare `x = new;` (no parens) as class instantiation
-                let bare_new = if let ExprKind::Ident(hier) = &rvalue.kind {
-                    hier.path.len() == 1 && hier.path[0].name.name == "new"
-                } else {
-                    false
+                // §8.7 / §8.8: `c = new;` (bare, no parens) or `c = new(args)` (with
+                // constructor arguments).  Resolve the class type from the
+                // lvalue's declared type, then construct via
+                // `instantiate_class_with_type_args`.  The bare `new` expression
+                // is `Ident([new])`; `new(args)` is `Call(func=Ident([new]), args=...)`.
+                // §8.7 / §8.8: `c = new;` (bare, no parens) or `c = new()`/`c = new(args)`
+                // (with constructor arguments).  When args are non-empty AND the
+                // lvalue is typed as a class handle (not a dynamic array), route
+                // through instantiation so the constructor dispatches correctly
+                // (the heartbeat fix: `new(name, cntxt, objection)` with a class
+                // handle arg).  The `sized_new` handler above catches dynamic
+                // array allocation; the shallow-copy case (`h = new src`) has
+                // a single arg that is a class handle — skip instantiation and
+                // let the existing copy-construction path handle it.
+                let (is_new_call, ctor_args): (bool, &[Expression]) = match &rvalue.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new" => (true, &[]),
+                    ExprKind::Call { func, args } if matches!(
+                        &func.kind,
+                        ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new"
+                    ) && (args.is_empty() || {
+                        // Non-empty args: only treat as class instantiation when
+                        // the lvalue's type is a class AND it's NOT a single-arg
+                        // class-handle (shallow copy).
+                        let is_class = self.get_expr_type_name(lvalue)
+                            .and_then(|tn| self.resolve_type_param_binding(&tn).or(Some(tn)))
+                            .map(|tn| {
+                                self.module.classes.contains_key(&tn)
+                                    || self.module.covergroups.contains_key(&tn)
+                            })
+                            .unwrap_or(false);
+                        if !is_class {
+                            false
+                        } else if args.len() == 1 && self.expr_is_class_handle(&args[0]) {
+                            // Single class-handle arg = shallow copy, not construction
+                            false
+                        } else {
+                            true
+                        }
+                    }) => (true, args.as_slice()),
+                    _ => (false, &[]),
                 };
-                if bare_new {
+                if is_new_call {
                     let type_name = self.get_expr_type_name(lvalue);
                     // §6.20.3 type-parameter construction: if the declared
                     // type is a class type parameter (e.g. `T obj = new;`),
@@ -36615,7 +36662,14 @@ impl Simulator {
                     let type_name =
                         type_name.map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn));
                     if let Some(tname) = type_name {
-                        if let Some(class_def) = self.module.classes.get(&tname).cloned() {
+                        let cls = if self.module.classes.contains_key(&tname) {
+                            tname.clone()
+                        } else if let Some(resolved) = self.resolve_simple_typedef_class(&tname) {
+                            resolved
+                        } else {
+                            tname.clone()
+                        };
+                        if let Some(class_def) = self.module.classes.get(&cls).cloned() {
                             let lname_opt = if let ExprKind::Ident(lh) = &lvalue.kind {
                                 Some(self.resolve_hier_name(lh))
                             } else {
@@ -36624,7 +36678,7 @@ impl Simulator {
                             let ta_cloned = self.resolve_ctor_type_args(lvalue, lname_opt.as_deref());
                             let handle = self.instantiate_class_with_type_args(
                                 &class_def,
-                                &[],
+                                ctor_args,
                                 ta_cloned.as_deref(),
                             );
                             self.assign_value(lvalue, &handle.resize(w));
@@ -36633,11 +36687,12 @@ impl Simulator {
                             }
                             return;
                         }
-                        // Bare `cg c1 = new;` — same handle-as-u32 form as
-                        // classes, just routed through the covergroup heap so
-                        // sample_covergroup / instantiate_covergroup wire up.
+                        // Bare `cg c1 = new;` / `cg c1 = new();` —
+                        // same handle-as-u32 form as classes, just routed
+                        // through the covergroup heap so sample_covergroup /
+                        // instantiate_covergroup wire up.
                         if let Some(cg_def) = self.module.covergroups.get(&tname).cloned() {
-                            let handle = self.instantiate_covergroup(&cg_def, &[]);
+                            let handle = self.instantiate_covergroup(&cg_def, ctor_args);
                             self.assign_value(lvalue, &handle.resize(w));
                             if !self.in_edge_block {
                                 self.settle_combinatorial();
@@ -39456,7 +39511,7 @@ impl Simulator {
                                 // mishandles). Re-enable by replacing `true`
                                 // with `false` below once that path is fixed.
                                 let bare = d.name.name.clone();
-                                let name = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) || true {
+                                let name = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) || false {
                                     bare.clone()
                                 } else {
                                     self.declare_local_dyn(&bare)
@@ -53392,7 +53447,11 @@ impl Simulator {
             return false;
         }
         // For an array this is the ELEMENT type; for a scalar, its own type.
-        let Some(dt) = self.module.var_decl_types.get(base).cloned() else {
+        let Some(dt) = self.module.var_decl_types.get(base).cloned().or_else(|| {
+            // Struct-field sub-path (e.g. `info.addr`): resolve through the
+            // type system via `flat_path_type`.
+            self.flat_path_type(base).map(|(d, _)| d)
+        }) else {
             return false;
         };
 
@@ -53423,6 +53482,26 @@ impl Simulator {
             }
             self.set_queue_size(base, exprs.len() as u64);
             return true;
+        }
+
+        // Struct-field sub-path queue that is NOT yet registered in
+        // `dynamic_arrays` (first write): detect via the type system.
+        if !self.module.dynamic_arrays.contains(base) {
+            // Only register SUB-PATHS (dotted, like `info.addr`) in
+            // `dynamic_arrays` — a bare variable like `src` is NOT a queue
+            // even if `p_elem_type` finds an element type for it.
+            if base.contains('.') && { let pet = self.p_elem_type(base); pet.is_some() } {
+                self.module.dynamic_arrays.insert(base.to_string());
+                let exprs = self.pattern_ordered(items);
+                if exprs.is_empty() {
+                    return false;
+                }
+                for (i, e) in exprs.iter().enumerate() {
+                    self.assign_pattern_or_leaf(&format!("{}[{}]", base, i), &dt, e);
+                }
+                self.set_queue_size(base, exprs.len() as u64);
+                return true;
+            }
         }
 
         // Fixed unpacked array of any rank (§10.9.1): positional items,
