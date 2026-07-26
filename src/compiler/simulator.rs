@@ -17873,8 +17873,19 @@ impl Simulator {
     /// given the INNER `m[i]` expression. `None` when `base` is not an index
     /// into a registered 2-D array. Used to give a reader of one element a real
     /// dependency: the array base carries no signal id of its own.
-    fn multi_dim_elem_names(base: &Expression, module: &ElaboratedModule) -> Option<Vec<String>> {
-        let ExprKind::Index { expr: inner, .. } = &base.kind else {
+    /// Element names a `m[i][j]` read depends on. With CONSTANT subscripts that
+    /// is a single element; only a dynamic subscript needs the whole array.
+    /// `outer_index` is the subscript applied to `base` by the caller.
+    fn multi_dim_elem_names(
+        base: &Expression,
+        module: &ElaboratedModule,
+        outer_index: Option<&Expression>,
+    ) -> Option<Vec<String>> {
+        let ExprKind::Index {
+            expr: inner,
+            index: inner_index,
+        } = &base.kind
+        else {
             return None;
         };
         let ExprKind::Ident(h) = &inner.kind else {
@@ -17882,9 +17893,26 @@ impl Simulator {
         };
         let name = Self::resolve_hier_name_static(h, module);
         let ((a0, a1), (b0, b1), _) = *module.arrays_2d.get(&name)?;
+        let (alo, ahi) = (a0.min(a1), a0.max(a1));
+        let (blo, bhi) = (b0.min(b1), b0.max(b1));
+        // Fold both subscripts when possible. Expanding every element is
+        // correct but makes each element carry the whole array's readers, so a
+        // single-bit change drags the entire array's dependents into the settle
+        // worklist (measured: 1536 dependents where the design connects ~2).
+        let fold = |e: &Expression, lo: i64, hi: i64| -> Option<i64> {
+            Self::const_expr_u64(e, &module.parameters)
+                .map(|v| v as i64)
+                .filter(|i| *i >= lo && *i <= hi)
+        };
+        if let (Some(a), Some(b)) = (
+            fold(inner_index, alo, ahi),
+            outer_index.and_then(|e| fold(e, blo, bhi)),
+        ) {
+            return Some(vec![format!("{}[{}][{}]", name, a, b)]);
+        }
         let mut out = Vec::new();
-        for a in a0.min(a1)..=a0.max(a1) {
-            for b in b0.min(b1)..=b0.max(b1) {
+        for a in alo..=ahi {
+            for b in blo..=bhi {
                 out.push(format!("{}[{}][{}]", name, a, b));
             }
         }
@@ -17936,17 +17964,39 @@ impl Simulator {
                 reads.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
-                // For array[idx]: conservatively add all array elements
                 if let ExprKind::Ident(hier) = &base.kind {
                     let name = Self::resolve_hier_name_static(hier, module);
                     if let Some((lo, hi, _)) = module.arrays.get(&name) {
-                        for i in *lo..=*hi {
-                            reads.insert(format!("{}[{}]", name, i));
+                        // A CONSTANT index depends on exactly one element.
+                        // Registering the whole array here (the old
+                        // unconditional behaviour) is correct but quadratically
+                        // expensive: after generate unrolling an index like
+                        // `q[(c + d) % N]` folds to a literal, yet every such
+                        // reader was recorded against all N elements. On a
+                        // 128-column fabric each 1-bit element ended up with
+                        // 1664 dependents instead of ~13, so one bit changing
+                        // dragged 128x more entries into the settle worklist
+                        // than the design actually connects.
+                        let folded = Self::const_expr_u64(index, &module.parameters)
+                            .map(|v| v as i64)
+                            .filter(|i| *i >= *lo && *i <= *hi);
+                        match folded {
+                            Some(i) => {
+                                reads.insert(format!("{}[{}]", name, i));
+                            }
+                            // Genuinely dynamic index: any element may be read.
+                            None => {
+                                for i in *lo..=*hi {
+                                    reads.insert(format!("{}[{}]", name, i));
+                                }
+                            }
                         }
                     } else {
                         reads.insert(name);
                     }
-                } else if let Some(elems) = Self::multi_dim_elem_names(base, module) {
+                } else if let Some(elems) =
+                    Self::multi_dim_elem_names(base, module, Some(index))
+                {
                     // 2-D element read (`m[i][j]`): the base is itself an Index,
                     // so the 1-D expansion above never fires and only the array
                     // BASE name was registered — a name with no signal id, so the
