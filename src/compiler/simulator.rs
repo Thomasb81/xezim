@@ -36637,8 +36637,13 @@ impl Simulator {
                         let is_class = self.get_expr_type_name(lvalue)
                             .and_then(|tn| self.resolve_type_param_binding(&tn).or(Some(tn)))
                             .map(|tn| {
-                                self.module.classes.contains_key(&tn)
-                                    || self.module.covergroups.contains_key(&tn)
+                                self.resolve_simple_typedef_class(&tn)
+                                    .as_ref()
+                                    .map(|r| self.module.classes.contains_key(r) || self.module.covergroups.contains_key(r))
+                                    .unwrap_or_else(|| {
+                                        self.module.classes.contains_key(&tn)
+                                            || self.module.covergroups.contains_key(&tn)
+                                    })
                             })
                             .unwrap_or(false);
                         if !is_class {
