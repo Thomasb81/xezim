@@ -17934,12 +17934,14 @@ impl Simulator {
         };
         let name = Self::resolve_hier_name_static(h, module);
         let ((a0, a1), (b0, b1), _) = *module.arrays_2d.get(&name)?;
+        let (alo, ahi) = (a0.min(a1), a0.max(a1));
+        let (blo, bhi) = (b0.min(b1), b0.max(b1));
         if let (Some(a), Some(b)) = (
             Self::constant_array_index(inner_index, module),
             Self::constant_array_index(outer_index, module),
         ) {
-            let in_a = (a0.min(a1)..=a0.max(a1)).contains(&a);
-            let in_b = (b0.min(b1)..=b0.max(b1)).contains(&b);
+            let in_a = (alo..=ahi).contains(&a);
+            let in_b = (blo..=bhi).contains(&b);
             return Some(if in_a && in_b {
                 vec![format!("{}[{}][{}]", name, a, b)]
             } else {
@@ -17947,8 +17949,8 @@ impl Simulator {
             });
         }
         let mut out = Vec::new();
-        for a in a0.min(a1)..=a0.max(a1) {
-            for b in b0.min(b1)..=b0.max(b1) {
+        for a in alo..=ahi {
+            for b in blo..=bhi {
                 out.push(format!("{}[{}][{}]", name, a, b));
             }
         }
@@ -19101,12 +19103,17 @@ impl Simulator {
                 .map(|(_, kind)| *kind)
                 .unwrap_or("process");
             eprintln!(
-                "[xezim][hang-report]   pid {} ({}) waiting {} tick(s) (since t={}) on @({}) — resumes at {}",
+                "[xezim][hang-report]   pid {} ({}) waiting {} tick(s) (since t={}) on @({}){} — resumes at {}",
                 w.pid,
                 origin,
                 age,
                 w.parked_time,
                 sens_desc.join(" or "),
+                if w.remaining_events > 1 {
+                    format!(" ({} qualifying events remaining)", w.remaining_events)
+                } else {
+                    String::new()
+                },
                 loc
             );
             // For signals that never moved, walk the driver cone to the root.
@@ -20658,10 +20665,11 @@ impl Simulator {
                         .map(|sid| self.name_for_id(sid.signal_id).to_string())
                         .unwrap_or_else(|| "?".to_string());
                     eprintln!(
-                        "[PROGRESS] oldest waiter: pid {} on '{}' for {} tick(s){}",
+                        "[PROGRESS] oldest waiter: pid {} on '{}' for {} tick(s), remaining_events={}{}",
                         w.pid,
                         first_sig,
                         age,
+                        w.remaining_events,
                         if all_dead { " — awaited signal(s) UNCHANGED since parked" } else { "" }
                     );
                 }
