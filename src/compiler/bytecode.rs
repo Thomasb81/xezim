@@ -778,6 +778,70 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Resolve a fully-indexed 2D/ND unpacked-array element whose indices are
+    /// compile-time constants. Elaboration materializes these cells as scalar
+    /// signals named `base[i][j]...`, so generated flop arrays can use the
+    /// ordinary scalar bytecode paths instead of falling back to the AST.
+    fn const_multi_dim_array_elem_signal_id(&self, expr: &Expression) -> Option<usize> {
+        if !matches!(expr.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+
+        fn collect<'e>(
+            compiler: &BytecodeCompiler<'_>,
+            expr: &'e Expression,
+            indices: &mut Vec<u32>,
+        ) -> Option<&'e HierarchicalIdentifier> {
+            match &expr.kind {
+                ExprKind::Index { expr, index } => {
+                    let hier = collect(compiler, expr, indices)?;
+                    indices.push(compiler.eval_const_expr(index)?);
+                    Some(hier)
+                }
+                ExprKind::Paren(inner) => collect(compiler, inner, indices),
+                ExprKind::Ident(hier) => Some(hier),
+                _ => None,
+            }
+        }
+
+        let mut indices = Vec::new();
+        let hier = collect(self, expr, &mut indices)?;
+        if indices.len() < 2 || !self.is_multi_dim_array(hier) {
+            return None;
+        }
+
+        let raw = Self::hier_raw_name(hier);
+        let mut indexed = raw.clone();
+        for index in indices {
+            indexed.push('[');
+            indexed.push_str(&index.to_string());
+            indexed.push(']');
+        }
+
+        if !raw.contains('.') {
+            if let Some(scope) = &self.scope_hint {
+                if let Some(&id) = self
+                    .signal_name_to_id
+                    .get(format!("{}.{}", scope, indexed).as_str())
+                {
+                    return Some(id);
+                }
+            }
+        }
+        if let Some(&id) = self.signal_name_to_id.get(indexed.as_str()) {
+            return Some(id);
+        }
+        if let Some(scope) = &self.scope_hint {
+            if let Some(&id) = self
+                .signal_name_to_id
+                .get(format!("{}.{}", scope, indexed).as_str())
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     fn flattened_outer_const_signal_id(&self, expr: &Expression) -> Option<usize> {
         let ExprKind::Index { expr: base, index } = &expr.kind else {
             return None;
@@ -1473,6 +1537,15 @@ impl<'a> BytecodeCompiler<'a> {
     /// Compile an expression, returning the register holding the result.
     /// Returns None if the expression can't be compiled to bytecode.
     fn compile_expr(&mut self, expr: &Expression, ctx_width: u32) -> Option<RegId> {
+        if let Some(id) = self.const_multi_dim_array_elem_signal_id(expr) {
+            let dest = self.alloc_reg();
+            if self.signal_signed[id] {
+                self.emit(Insn::LoadSignalSigned(dest, id));
+            } else {
+                self.emit(Insn::LoadSignal(dest, id));
+            }
+            return Some(dest);
+        }
         match &expr.kind {
             ExprKind::Number(num) => {
                 let val = self.eval_number_static(num)?;
@@ -1996,6 +2069,10 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
             ExprKind::Index { expr, index } => {
+                if let Some(id) = self.const_multi_dim_array_elem_signal_id(lhs) {
+                    self.emit(Insn::NbaAssign(id, val_reg, width));
+                    return true;
+                }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
@@ -2281,6 +2358,10 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
             ExprKind::Index { expr, index } => {
+                if let Some(id) = self.const_multi_dim_array_elem_signal_id(lhs) {
+                    self.emit(Insn::BlockingAssign(id, val_reg, width));
+                    return true;
+                }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
@@ -3287,6 +3368,20 @@ mod tests {
         )
     }
 
+    fn nested_indexed_expr(name: &str, outer: char, inner: char) -> Expression {
+        let span = crate::ast::Span::dummy();
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(indexed_expr(name, outer)),
+                index: Box::new(Expression::new(
+                    ExprKind::Number(NumberLiteral::UnbasedUnsized(inner)),
+                    span,
+                )),
+            },
+            span,
+        )
+    }
+
     #[test]
     fn generated_nonzero_outer_index_resolves_to_flattened_signal() {
         let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
@@ -3325,6 +3420,39 @@ mod tests {
         let mut compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
         compiler.set_multi_dim_arrays(&multi_dim_arrays);
         assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
+    }
+
+    #[test]
+    fn constant_multi_dim_array_element_uses_scalar_bytecode() {
+        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        signals.insert(Arc::from("m[1][0]"), 0);
+        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
+        let widths: HashMap<String, u32> = HashMap::default();
+        let mut multi_dim_arrays: HashSet<String> = HashSet::default();
+        multi_dim_arrays.insert("m".to_owned());
+        let lhs = nested_indexed_expr("m", '1', '0');
+
+        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[8], &arrays, &widths);
+        compiler.set_multi_dim_arrays(&multi_dim_arrays);
+        assert_eq!(
+            compiler.const_multi_dim_array_elem_signal_id(&lhs),
+            Some(0)
+        );
+        assert!(compiler.compile_nba_target(&lhs, 0, 8));
+        let block = compiler.finish();
+        assert!(matches!(
+            block.instructions.as_slice(),
+            [Insn::NbaAssign(0, 0, 8)]
+        ));
+
+        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[8], &arrays, &widths);
+        compiler.set_multi_dim_arrays(&multi_dim_arrays);
+        assert!(compiler.compile_expr(&lhs, 0).is_some());
+        let block = compiler.finish();
+        assert!(matches!(
+            block.instructions.as_slice(),
+            [Insn::LoadSignal(0, 0)]
+        ));
     }
 
     #[test]
