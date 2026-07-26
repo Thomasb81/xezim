@@ -1259,6 +1259,11 @@ struct EventWaiter {
     /// Full captured value for >64-bit sensitivity signals (parallel to
     /// `captured_prev`); `None` for ≤64-bit signals.
     captured_prev_wide: Vec<Option<Value>>,
+    /// Number of qualifying events still required before the continuation
+    /// resumes. This collapses action-free `repeat (N) @(event);` loops into
+    /// one parked waiter instead of rebuilding their AST continuation after
+    /// every edge.
+    remaining_events: u64,
     /// LRM §14.13: this waiter is parked on a CLOCKING event (`@(cb)` / `##N`),
     /// not a raw `@(posedge clk)`. Its continuation must resume in the Reactive
     /// region — AFTER the same-edge NBA updates commit and the clocking input
@@ -19120,6 +19125,7 @@ impl Simulator {
             continuation,
             captured_prev,
             captured_prev_wide,
+            remaining_events: 1,
             is_clocking,
         }
     }
@@ -23419,6 +23425,36 @@ impl Simulator {
                         i += 1;
                         continue;
                     }
+                    // `repeat (N) @(event);` has no per-iteration action. Keep
+                    // one counted waiter parked across the N events rather
+                    // than cloning/evaluating a Repeat tail and resolving the
+                    // same sensitivity after every edge. Clocking-block events
+                    // retain the general path because their intermediate
+                    // Reactive-region scheduling is observable.
+                    if let StatementKind::TimingControl {
+                        control: TimingControl::Event(event),
+                        stmt: event_body,
+                    } = &body.kind
+                    {
+                        if matches!(event_body.kind, StatementKind::Null)
+                            && !self.is_clocking_event(event)
+                        {
+                            let sens = self.event_to_sens(event);
+                            let has_real = sens.iter().any(|s| {
+                                self.signal_name_to_id.contains_key(s.signal_name.as_str())
+                            });
+                            if !sens.is_empty() && has_real {
+                                let mut waiter = self.make_event_waiter(
+                                    pid,
+                                    sens,
+                                    stmts[i + 1..].to_vec(),
+                                );
+                                waiter.remaining_events = n;
+                                self.event_waiters.push(waiter);
+                                return;
+                            }
+                        }
+                    }
                     // Unroll: execute body once, then schedule rest
                     let remaining_n = n - 1;
                     let mut cont = Vec::new();
@@ -25492,6 +25528,10 @@ impl Simulator {
                     triggered = true;
                     break;
                 }
+            }
+            if triggered && waiter.remaining_events > 1 {
+                waiter.remaining_events -= 1;
+                triggered = false;
             }
             if triggered {
                 sim_dbg_eprintln!(
