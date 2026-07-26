@@ -449,17 +449,16 @@ macro_rules! write_sig {
                 $self.sig_last_change[__wsig_id] = $self.event_phase;
             }
             // Arm only gateable edge blocks that actually read this signal.
-            // The dense bitmap makes unrelated writes a single cheap branch;
-            // positive hits use the sparse CSR fanout built after compilation.
+            // The dense bitmap keeps unrelated writes a single cheap branch;
+            // positive hits use the sparse CSR fanout built after compile.
             if $self.armed_edge
                 && __wsig_id < $self.armed_input_bitmap.len()
                 && $self.armed_input_bitmap[__wsig_id]
             {
-                if let Some(&(lo, hi)) = $self.armed_input_ranges.get(&(__wsig_id as u32)) {
-                    for __k in lo as usize..hi as usize {
-                        let __bi = $self.armed_input_blocks[__k] as usize;
-                        $self.edge_block_armed[__bi] = 1;
-                    }
+                let (lo, hi) = $self.armed_input_ranges[__wsig_id];
+                for __k in lo as usize..hi as usize {
+                    let __bi = $self.armed_input_blocks[__k] as usize;
+                    $self.edge_block_armed[__bi] = 1;
                 }
             }
             // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
@@ -3658,7 +3657,7 @@ pub struct Simulator {
     armed_edge: bool,
     armed_edge_shadow: bool,
     armed_input_bitmap: Vec<bool>,
-    armed_input_ranges: HashMap<u32, (u32, u32)>,
+    armed_input_ranges: Vec<(u32, u32)>,
     armed_input_blocks: Vec<u32>,
     edge_block_armed: Vec<u8>,
     armed_fast_skips: u64,
@@ -5500,7 +5499,7 @@ impl Simulator {
                 || std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
             armed_edge_shadow: std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
             armed_input_bitmap: Vec::new(),
-            armed_input_ranges: HashMap::default(),
+            armed_input_ranges: Vec::new(),
             armed_input_blocks: Vec::new(),
             edge_block_armed: Vec::new(),
             armed_fast_skips: 0,
@@ -44273,9 +44272,7 @@ impl Simulator {
         {
             return;
         }
-        let Some(&(lo, hi)) = self.armed_input_ranges.get(&(id as u32)) else {
-            return;
-        };
+        let (lo, hi) = self.armed_input_ranges[id];
         for k in lo as usize..hi as usize {
             let bi = self.armed_input_blocks[k] as usize;
             self.edge_block_armed[bi] = 1;
@@ -44501,8 +44498,10 @@ impl Simulator {
             .last()
             .map_or(0, |(sid, _)| *sid as usize + 1);
         self.armed_input_bitmap = vec![false; bitmap_len];
+        self.armed_input_ranges = vec![(0, 0); bitmap_len];
         self.armed_input_blocks.reserve(pairs.len());
         let mut cursor = 0usize;
+        let mut input_count = 0usize;
         while cursor < pairs.len() {
             let sid = pairs[cursor].0;
             let lo = self.armed_input_blocks.len() as u32;
@@ -44512,7 +44511,8 @@ impl Simulator {
             }
             let hi = self.armed_input_blocks.len() as u32;
             self.armed_input_bitmap[sid as usize] = true;
-            self.armed_input_ranges.insert(sid, (lo, hi));
+            self.armed_input_ranges[sid as usize] = (lo, hi);
+            input_count += 1;
         }
         self.edge_block_armed = self
             .edge_block_gateable
@@ -44521,7 +44521,7 @@ impl Simulator {
             .collect();
         eprintln!(
             "[EVENT-EDGE] ARMED mode ON: {} input signals, {} fanout edges{}",
-            self.armed_input_ranges.len(),
+            input_count,
             self.armed_input_blocks.len(),
             if self.armed_edge_shadow {
                 " (shadow validation)"
