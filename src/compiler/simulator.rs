@@ -20889,13 +20889,14 @@ impl Simulator {
                 b.wait();
             }
             // UVM objection-driven run-phase end (after the drain elapses).
-            // In PURE_SV_LRM the genuine library normally completes via
-            // `$finish`; end_run_phase checks genuine_uvm_finished to avoid
-            // double-firing cleanup. It still must run for tests whose
-            // run_phase forever-loops aren't killed by m_phase_proc.kill()
-            // (not yet wired) — objections dropping is the only termination
-            // signal, so keep driving it.
-            self.maybe_end_run_phase();
+            // In PURE_SV_LRM the genuine library owns the full phase schedule
+            // (run_phase + pre_reset→reset→...→post_shutdown). The shim's
+            // end_run_phase would prematurely set finished=true, killing the
+            // event loop before sequential phases can advance through UVM's
+            // phase hopper. Only use the shim in non-pure mode (route-B phaser).
+            if !self.pure_sv_lrm {
+                self.maybe_end_run_phase();
+            }
             // Periodic invariant check — every 1000 iters; bail on
             // mismatch to surface bugs early.
             if verify_inline_bits && iters % 1000 == 0 {
@@ -39526,7 +39527,7 @@ impl Simulator {
                                 // mishandles). Re-enable by replacing `true`
                                 // with `false` below once that path is fixed.
                                 let bare = d.name.name.clone();
-                                let name = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) || false {
+                                let name = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) || true {
                                     bare.clone()
                                 } else {
                                     self.declare_local_dyn(&bare)
@@ -57076,6 +57077,21 @@ impl Simulator {
                 ExprKind::Index { .. } => {
                     let h = self.eval_expr(base).to_u64().unwrap_or(0) as usize;
                     self.handle_collection_name(h, &member.name)
+                }
+                // Nested member access: `a.b.c` where `a.b` is itself a
+                // MemberAccess (e.g. `ctxt.objection.m_forked_list`). Evaluate
+                // the base to get the intermediate object handle, then resolve
+                // the instance-scoped collection on it. This is critical for
+                // UVM's objection drain mechanism
+                // (`c.objection.m_forked_list.push_back(c)`) — without it,
+                // push_back on a nested queue property silently fails.
+                ExprKind::MemberAccess { .. } => {
+                    let h = self.eval_expr(base).to_u64().unwrap_or(0) as usize;
+                    if h != 0 {
+                        self.handle_collection_name(h, &member.name)
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             },
