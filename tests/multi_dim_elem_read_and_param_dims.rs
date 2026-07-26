@@ -38,16 +38,22 @@ module tb;
   logic [7:0] grid [2][3];
   logic [7:0] lin  [3];          // 1-D control: this path always worked
   wire  [7:0] ca_2d, ca_1d;
+  logic       idx_1d = 1'b0;
+  wire  [7:0] dyn_1d;
   wire        bit_2d;
   logic [7:0] comb_2d;
   assign ca_2d  = grid[1][2];
   assign ca_1d  = lin[2];
+  assign dyn_1d = lin[idx_1d];
   assign bit_2d = grid[1][2][0];
   always @(*) comb_2d = grid[1][2];
   logic [7:0] seen_ca, seen_comb, seen_1d;
   logic       seen_bit;
   logic [7:0] seen_ca2;
+  logic [7:0] seen_dyn_1d;
   initial begin
+    lin[0]     = 8'h11;
+    lin[1]     = 8'h22;
     grid[1][2] = 8'hA5;
     lin[2]     = 8'hA5;
     #1;
@@ -56,8 +62,10 @@ module tb;
     seen_1d   = ca_1d;
     seen_bit  = bit_2d;
     grid[1][2] = 8'h5A;          // must re-propagate, not latch
+    idx_1d = 1'b1;
     #1;
     seen_ca2  = ca_2d;
+    seen_dyn_1d = dyn_1d;
   end
 endmodule
 "#;
@@ -70,6 +78,7 @@ fn multi_dim_element_read_in_a_continuous_assign() {
     assert_eq!(get(&sim, "seen_1d") & 0xFF, 0xA5);
     assert_eq!(get(&sim, "seen_bit") & 1, 1);
     assert_eq!(get(&sim, "seen_ca2") & 0xFF, 0x5A);
+    assert_eq!(get(&sim, "seen_dyn_1d") & 0xFF, 0x22);
 }
 
 /// (2) parameter-named unpacked dimensions, and instances bound to elements of

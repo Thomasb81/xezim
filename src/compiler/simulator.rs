@@ -1313,7 +1313,7 @@ const CB_SAMPLE_PREFIX: &str = "__xz_cbsample.";
 /// Number of u64 words needed for the occupancy bitmap (256 / 64 = 4).
 const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
 
-type EventList = Vec<(usize, Vec<Statement>)>;
+type EventList = VecDeque<(usize, Vec<Statement>)>;
 
 /// Built-in clock generator: replaces `always #N clk = ~clk` with O(1) toggle.
 /// Eliminates AST cloning and traversal for the most common simulation pattern.
@@ -1434,7 +1434,7 @@ impl NbaFastIndex {
 
 #[cfg(test)]
 mod nba_fast_index_tests {
-    use super::{CombEntry, CombItem, Expression, NbaFastIndex, Statement};
+    use super::{CombEntry, CombItem, Expression, NbaFastIndex, Statement, TimingWheel};
 
     #[test]
     fn dense_prefix_and_sparse_tail_track_and_clear_entries() {
@@ -1466,6 +1466,24 @@ mod nba_fast_index_tests {
         assert!(std::mem::size_of::<CombEntry>() <= 160);
         assert!(std::mem::size_of::<Expression>() > std::mem::size_of::<Box<Expression>>());
         assert!(std::mem::size_of::<Statement>() > std::mem::size_of::<Box<Statement>>());
+    }
+
+    #[test]
+    fn timing_wheel_pop_front_preserves_fifo_and_pending_pids() {
+        let mut wheel = TimingWheel::new();
+        wheel.schedule(10, 1, Vec::new());
+        wheel.schedule(10, 2, Vec::new());
+        wheel.schedule(10, 1, Vec::new());
+
+        assert_eq!(wheel.pop_front(10).map(|event| event.0), Some(1));
+        assert!(wheel.has_pid(1));
+        wheel.schedule(10, 3, Vec::new());
+
+        assert_eq!(wheel.pop_front(10).map(|event| event.0), Some(2));
+        assert_eq!(wheel.pop_front(10).map(|event| event.0), Some(1));
+        assert!(!wheel.has_pid(1));
+        assert_eq!(wheel.pop_front(10).map(|event| event.0), Some(3));
+        assert_eq!(wheel.next_time(), None);
     }
 }
 
@@ -1502,7 +1520,7 @@ impl TimingWheel {
     fn new() -> Self {
         let mut wheel = Vec::with_capacity(WHEEL_SIZE);
         for _ in 0..WHEEL_SIZE {
-            wheel.push(Vec::new());
+            wheel.push(VecDeque::new());
         }
         TimingWheel {
             wheel,
@@ -1536,10 +1554,13 @@ impl TimingWheel {
         *self.pid_counts.entry(pid).or_insert(0) += 1;
         if time < self.current_time + WHEEL_SIZE as u64 {
             let s = Self::slot(time);
-            self.wheel[s].push((pid, stmts));
+            self.wheel[s].push_back((pid, stmts));
             self.bitmap_set(s);
         } else {
-            self.overflow.entry(time).or_default().push((pid, stmts));
+            self.overflow
+                .entry(time)
+                .or_default()
+                .push_back((pid, stmts));
         }
     }
 
@@ -1638,9 +1659,7 @@ impl TimingWheel {
         best
     }
 
-    /// Remove and return all events at the given time.
-    fn remove(&mut self, time: u64) -> EventList {
-        self.current_time = time;
+    fn move_overflow_into_wheel(&mut self, time: u64) {
         // Drain overflow events that now fit in the wheel (rare)
         if !self.overflow.is_empty() {
             let cutoff = time + WHEEL_SIZE as u64;
@@ -1656,7 +1675,39 @@ impl TimingWheel {
                 }
             }
         }
+    }
 
+    #[inline]
+    fn decrement_pid_count(&mut self, pid: usize) {
+        if let Some(c) = self.pid_counts.get_mut(&pid) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.pid_counts.remove(&pid);
+            }
+        }
+    }
+
+    /// Remove and return the next FIFO event at `time`, leaving the remaining
+    /// same-time events in the wheel. This avoids repeatedly draining and
+    /// reinserting a large active-region batch for every process activation.
+    fn pop_front(&mut self, time: u64) -> Option<(usize, Vec<Statement>)> {
+        self.current_time = time;
+        self.move_overflow_into_wheel(time);
+        let s = Self::slot(time);
+        let event = self.wheel[s].pop_front();
+        if self.wheel[s].is_empty() {
+            self.bitmap_clear(s);
+        }
+        if let Some((pid, _)) = event.as_ref() {
+            self.decrement_pid_count(*pid);
+        }
+        event
+    }
+
+    /// Remove and return all events at the given time.
+    fn remove(&mut self, time: u64) -> EventList {
+        self.current_time = time;
+        self.move_overflow_into_wheel(time);
         let s = Self::slot(time);
         let events = std::mem::take(&mut self.wheel[s]);
         if !events.is_empty() {
@@ -1664,12 +1715,7 @@ impl TimingWheel {
             self.bitmap_clear(s);
             // Decrement pid_counts for each removed event.
             for (p, _) in &events {
-                if let Some(c) = self.pid_counts.get_mut(p) {
-                    *c = c.saturating_sub(1);
-                    if *c == 0 {
-                        self.pid_counts.remove(p);
-                    }
-                }
+                self.decrement_pid_count(*p);
             }
         }
         events
@@ -1748,7 +1794,7 @@ impl TimingWheel {
             }
             let delta = ((s + WHEEL_SIZE - cur_slot) % WHEEL_SIZE) as u64;
             let abs_time = self.current_time + delta;
-            let mut kept = Vec::new();
+            let mut kept = VecDeque::new();
             for (p, stmts) in v {
                 if p == pid {
                     // Capture the earliest match.
@@ -1756,7 +1802,7 @@ impl TimingWheel {
                         found = Some((abs_time, stmts));
                     }
                 } else {
-                    kept.push((p, stmts));
+                    kept.push_back((p, stmts));
                 }
             }
             if kept.is_empty() {
@@ -1772,7 +1818,7 @@ impl TimingWheel {
             for t in times {
                 if let Some(v) = self.overflow.get_mut(&t) {
                     if let Some(idx) = v.iter().position(|(p, _)| *p == pid) {
-                        let stmts = v.remove(idx).1;
+                        let stmts = v.remove(idx).expect("matching event disappeared").1;
                         found = Some((t, stmts));
                         if v.is_empty() {
                             self.overflow.remove(&t);
@@ -19489,25 +19535,15 @@ impl Simulator {
     /// loop until quiescent.
     fn drain_active_processes_at_current_time(&mut self) {
         while self.event_queue.next_time() == Some(self.time) {
-            let mut batch = self.event_queue.remove(self.time);
-            while !batch.is_empty() {
-                if self.finished {
-                    return;
-                }
-                let (pid, stmts) = batch.remove(0);
-                let t_now = self.time;
-                for (p, s) in batch.drain(..) {
-                    self.event_queue.schedule(t_now, p, s);
-                }
-                self.run_scheduled_process(pid, &stmts);
-                if !self.is_pid_suspended(pid) {
-                    self.child_finished(pid);
-                }
-                if self.event_queue.next_time() == Some(self.time) {
-                    batch = self.event_queue.remove(self.time);
-                } else {
-                    batch.clear();
-                }
+            if self.finished {
+                return;
+            }
+            let Some((pid, stmts)) = self.event_queue.pop_front(self.time) else {
+                break;
+            };
+            self.run_scheduled_process(pid, &stmts);
+            if !self.is_pid_suspended(pid) {
+                self.child_finished(pid);
             }
         }
     }
@@ -20310,32 +20346,28 @@ impl Simulator {
         self.fire_clock_generators();
 
         let _t = profile_timing.then(std::time::Instant::now);
-        let mut batch = self.event_queue.remove(self.time);
+        let has_active = self.event_queue.next_time() == Some(self.time);
         if let Some(t) = _t {
             accum.t_sched += t.elapsed().as_nanos() as u64;
         }
-        if !batch.is_empty() {
+        if has_active {
             non_clock_change = true;
         }
         let _t = profile_timing.then(std::time::Instant::now);
         if trace_loop {
             eprintln!(
-                "[xezim] iter={} time={} batch.len={}",
-                iters,
-                self.time,
-                batch.len()
+                "[xezim] iter={} time={} active={}",
+                iters, self.time, has_active
             );
         }
         loop {
-            while !batch.is_empty() {
+            while self.event_queue.next_time() == Some(self.time) {
                 if self.finished || self.zero_delay_defer_pending {
                     break;
                 }
-                let (pid, stmts) = batch.remove(0);
-                let t_now = self.time;
-                for (p, s) in batch.drain(..) {
-                    self.event_queue.schedule(t_now, p, s);
-                }
+                let Some((pid, stmts)) = self.event_queue.pop_front(self.time) else {
+                    break;
+                };
                 if trace_loop {
                     eprintln!("[xezim]   running pid={} stmts={}", pid, stmts.len());
                     for (idx, s) in stmts.iter().enumerate() {
@@ -20350,22 +20382,9 @@ impl Simulator {
                 if !self.is_pid_suspended(pid) {
                     self.child_finished(pid);
                 }
-                if self.event_queue.next_time() == Some(self.time) {
-                    batch = self.event_queue.remove(self.time);
-                } else {
-                    batch.clear();
-                }
             }
             if self.finished || self.zero_delay_defer_pending {
-                // A defer-requested break can leave not-yet-run activations in
-                // the local batch — requeue them (dropping them would silently
-                // KILL those processes; the deferred spinner would vanish and
-                // the outer loop would "advance on its own" past the livelock
-                // without ever reporting or re-arming it).
-                for (p, c) in batch.drain(..) {
-                    let t_now = self.time;
-                    self.event_queue.schedule(t_now, p, c);
-                }
+                // Pending same-time activations remain in the timing wheel.
                 break;
             }
             // IEEE 1800-2017 §4.5: once the ACTIVE region empties, the
@@ -20386,7 +20405,6 @@ impl Simulator {
                     self.settle_combinatorial();
                 }
                 self.check_edges();
-                batch = self.event_queue.remove(self.time);
                 continue;
             }
             break;
@@ -20517,21 +20535,16 @@ impl Simulator {
             for (cpid, cont) in parked {
                 self.event_queue.schedule(self.time, cpid, cont);
             }
-            let mut batch = self.event_queue.remove(self.time);
-            while !batch.is_empty() && !self.finished && !self.zero_delay_defer_pending {
-                let (bpid, stmts) = batch.remove(0);
-                let t_now = self.time;
-                for (p, s) in batch.drain(..) {
-                    self.event_queue.schedule(t_now, p, s);
-                }
+            while self.event_queue.next_time() == Some(self.time)
+                && !self.finished
+                && !self.zero_delay_defer_pending
+            {
+                let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
+                    break;
+                };
                 self.run_scheduled_process(bpid, &stmts);
                 if !self.is_pid_suspended(bpid) {
                     self.child_finished(bpid);
-                }
-                if self.event_queue.next_time() == Some(self.time) {
-                    batch = self.event_queue.remove(self.time);
-                } else {
-                    batch.clear();
                 }
             }
             if !self.nba_fast.is_empty()
