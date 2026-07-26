@@ -98,6 +98,73 @@ endmodule
     assert_eq!(out(src, "NEGEDGE_DONE"), "NEGEDGE_DONE t=40");
 }
 
+/// Reconstructed from dump.vcd in xezim.logs.and.vcd.0725.02.zip.
+///
+/// The VCD's long idle prefix is removed, but its 1 ps timescale, coincident
+/// 20 ps AXI/DRAM clocks, 256-word burst, final `{7,6,5,4}` word, and the
+/// subsequent 128-edge DRAM delay are preserved.
+#[test]
+fn vcd_reconstructed_dram_response_starts_after_128_edges() {
+    let src = r#"
+`timescale 1ps/1ps
+module tb;
+  bit gclk_axi = 0;
+  bit gclk_dram = 0;
+  logic [3:0] smem_dram_wr_wdata_vld_p1 = 'x;
+  logic [255:0] smem_dram_wr_wdata = 'x;
+  logic [1:0] ddrc_dram_resp_vld = 'x;
+  logic [11:0] ddrc_dram_resp = 'x;
+
+  initial begin
+    ddrc_dram_resp_vld = 0;
+    ddrc_dram_resp = 0;
+
+    @(posedge gclk_axi);
+    smem_dram_wr_wdata_vld_p1 <= 4'hf; // VCD t=156210
+
+    // VCD t=156230..161330: {3,2,1,0} through
+    // {1023,1022,1021,1020}, one word per AXI posedge.
+    for (int sample = 0; sample < 256; sample++) begin
+      @(posedge gclk_axi);
+      smem_dram_wr_wdata <= {
+        64'(sample * 4 + 3),
+        64'(sample * 4 + 2),
+        64'(sample * 4 + 1),
+        64'(sample * 4)
+      };
+    end
+
+    @(posedge gclk_axi);
+    smem_dram_wr_wdata <= {64'(7), 64'(6), 64'(5), 64'(4)};
+    smem_dram_wr_wdata_vld_p1 <= 4'h0;
+
+    // This is the sequence around the reported source lines 516..522.
+    @(posedge gclk_axi);
+    repeat (128) @(posedge gclk_dram);
+
+    ddrc_dram_resp_vld[0] = 1'b1;
+    ddrc_dram_resp[0] = 1'b1;
+    $display("VCD_REPLAY_DONE t=%0t vld=%0h resp_vld=%0h last=%0d,%0d,%0d,%0d",
+             $time,
+             smem_dram_wr_wdata_vld_p1,
+             ddrc_dram_resp_vld,
+             smem_dram_wr_wdata[255:192],
+             smem_dram_wr_wdata[191:128],
+             smem_dram_wr_wdata[127:64],
+             smem_dram_wr_wdata[63:0]);
+    $finish;
+  end
+
+  always #10 gclk_axi = ~gclk_axi;
+  always #10 gclk_dram = ~gclk_dram;
+endmodule
+"#;
+    assert_eq!(
+        out(src, "VCD_REPLAY_DONE"),
+        "VCD_REPLAY_DONE t=7730 vld=0 resp_vld=1 last=7,6,5,4"
+    );
+}
+
 #[test]
 fn counted_repeat_event_wait_honors_iff_guard() {
     let src = r#"
