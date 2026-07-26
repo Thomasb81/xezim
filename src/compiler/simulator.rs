@@ -63929,9 +63929,10 @@ impl Simulator {
         }
         self.uvm_post_run_done = true;
         if self.pure_sv_lrm {
-            // Legacy shim mode is the only path that runs cleanup here. In
-            // pure mode the genuine library + exit backstop own cleanup.
-            self.finished = true;
+            // In PURE_SV_LRM mode, UVM's phase scheduler drives the full
+            // run_phase + pre_reset→...→post_shutdown schedule. When all
+            // phases complete, UVM calls $finish which sets genuine_uvm_finished.
+            // Don't set finished here - let the $finish handler do it.
             return;
         }
         self.run_uvm_cleanup_phases();
