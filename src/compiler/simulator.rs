@@ -1237,6 +1237,23 @@ struct EventWaiter {
     is_clocking: bool,
 }
 
+/// A process parked on a CLASS-FIELD named event (`event m_event` inside a
+/// class, awaited/triggered as `@m_event` / `->m_event` from a method on
+/// `this`). Unlike a module-scope named event, a class `event` field has no
+/// backing signal in `signal_table`, so it cannot flow through the edge-
+/// sensitive `event_waiters` path. Each (owning instance handle, field name)
+/// pair is a distinct synchronization object — `uvm_event#(T)` is exactly this
+/// pattern (`trigger()` does `->m_event`, `wait_trigger()` does `@m_event`),
+/// and `uvm_heartbeat` drives its whole callback loop off it. The key is the
+/// raw `(this_handle, field_name)`; `->`/`@` inside a method both resolve to
+/// the same `this`, so a trigger and a wait on the same object match.
+#[derive(Clone)]
+struct InstanceEventWaiter {
+    key: (usize, String),
+    pid: usize,
+    continuation: Vec<Statement>,
+}
+
 /// Pad a string to a given width with spaces (or zeros if zero_pad).
 fn pad_string(s: &str, width: usize, zero_pad: bool) -> String {
     if width == 0 || s.len() >= width {
@@ -2864,6 +2881,10 @@ pub struct Simulator {
     /// flushes, not in the active region (a same-slot `.triggered` read in an
     /// active/inactive process must still see 0).
     pending_nba_triggers: Vec<String>,
+    /// NBA-deferred `->>m_event` triggers on class-field events, captured as
+    /// the resolved `(this_handle, field_name)` key at trigger time (the NBA
+    /// drain runs outside the method, with no `this` to reconstruct it).
+    pending_nba_instance_triggers: Vec<(usize, String)>,
     /// §9.6.2 `disable <task_name>`: which processes are currently executing
     /// an invocation of each named task. Filled by bind_task_frame, cleared
     /// by unwind_task_frame; a cross-process disable kills the listed pids.
@@ -3125,6 +3146,10 @@ pub struct Simulator {
     event_triggered_time: HashMap<String, u64>,
     /// Processes waiting for signal edge events (@(posedge clk), etc.)
     event_waiters: Vec<EventWaiter>,
+    /// Processes parked on a class-field named event (`@m_event` inside a
+    /// method on `this`). Woken directly by `fire_instance_event` when the
+    /// matching `->m_event` runs; see `InstanceEventWaiter`.
+    instance_event_waiters: Vec<InstanceEventWaiter>,
     /// Covergroups waiting for sampling events
     cg_event_waiters: Vec<(usize, Vec<SensitivityId>)>,
     /// Swap buffer for event_waiters filtering (avoids allocation per cycle)
@@ -5050,6 +5075,7 @@ impl Simulator {
             edge_sequential_work: Vec::new(),
             nba_queue: Vec::new(),
             pending_nba_triggers: Vec::new(),
+            pending_nba_instance_triggers: Vec::new(),
             active_task_pids: HashMap::default(),
             finish_deferred: false,
             event_aliases: HashMap::default(),
@@ -5115,6 +5141,7 @@ impl Simulator {
             intra_saved_next: 0,
             event_triggered_time: HashMap::default(),
             event_waiters: Vec::new(),
+            instance_event_waiters: Vec::new(),
             cg_event_waiters: Vec::new(),
             event_waiters_swap: Vec::new(),
             vcd_file: None,
@@ -21914,6 +21941,30 @@ impl Simulator {
                     }
                     TimingControl::Event(event) => {
                         // Suspend process until the event fires
+                        // Class-field named event (`@m_event` inside a method
+                        // on `this`): park on the per-instance event identity.
+                        // A class `event` field has no backing signal, so
+                        // without this it fell through to the delta-yield
+                        // (NBA) branch below and `@m_event` returned
+                        // immediately — breaking uvm_event / uvm_heartbeat
+                        // synchronization (a `start()`ed heartbeat died at t=0
+                        // after one spurious check). Module-scope named events
+                        // are backed by real signals and take the event_waiters
+                        // path further below. Inside a class method the
+                        // elaborator rewrites `@field` to a `HierIdentifier`,
+                        // so accept both shapes.
+                        if let Some(fname) = self.event_control_field_name(event) {
+                            if let Some(key) = self.resolve_this_event_field(&fname) {
+                                let mut cont = vec![*body.clone()];
+                                cont.extend_from_slice(&stmts[i + 1..]);
+                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                    key,
+                                    pid,
+                                    continuation: cont,
+                                });
+                                return;
+                            }
+                        }
                         let sens = self.event_to_sens(event);
                         let is_clk_ev = self.is_clocking_event(event);
                         if !sens.is_empty() {
@@ -23482,6 +23533,12 @@ impl Simulator {
             let evs = std::mem::take(&mut self.pending_nba_triggers);
             for ev in evs {
                 self.fire_named_event(&ev);
+            }
+        }
+        if !self.pending_nba_instance_triggers.is_empty() {
+            let ievs = std::mem::take(&mut self.pending_nba_instance_triggers);
+            for key in ievs {
+                self.fire_instance_event(key);
             }
         }
     }
@@ -36576,6 +36633,25 @@ impl Simulator {
                         *self.name_resolve_hint.borrow_mut() = saved_hint_nested;
                     }
                     TimingControl::Event(e) => {
+                        // Class-field named event parked from the synchronous
+                        // executor (a `fork ... join_none` body executing
+                        // inline, e.g. uvm_heartbeat::start which is a
+                        // function): route to the per-instance waiter list so
+                        // `->m_event` can wake it. Same rationale as the
+                        // run_process_stmts arm.
+                        if let Some(fname) = self.event_control_field_name(e) {
+                            if let Some(key) = self.resolve_this_event_field(&fname) {
+                                let cont = vec![*stmt.clone()];
+                                let pid = self.current_pid;
+                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                    key,
+                                    pid,
+                                    continuation: cont,
+                                });
+                                self.break_flag = true;
+                                return;
+                            }
+                        }
                         let sens = self.event_to_sens(e);
                         let is_clk_ev = self.is_clocking_event(e);
                         sim_dbg_eprintln!(
@@ -36659,6 +36735,7 @@ impl Simulator {
                             self.process_contexts.remove(&pid);
                         }
                         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
                         }
@@ -36677,6 +36754,7 @@ impl Simulator {
                         self.process_parents.remove(&pid);
                         self.process_contexts.remove(&pid);
                         self.event_waiters.retain(|w| w.pid != pid);
+                        self.instance_event_waiters.retain(|w| w.pid != pid);
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| w.pid != pid);
                         }
@@ -36706,6 +36784,7 @@ impl Simulator {
                             self.process_contexts.remove(&pid);
                         }
                         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
                         }
@@ -36743,6 +36822,7 @@ impl Simulator {
                     self.process_contexts.remove(&pid);
                 }
                 self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
                 for q in self.mailbox_get_waiters.values_mut() {
                     q.retain(|w| !to_kill.contains(&w.pid));
                 }
@@ -38045,7 +38125,17 @@ impl Simulator {
             StatementKind::EventTrigger { name, nonblocking, .. } => {
                 if *nonblocking {
                     // §15.5.2: defer to the NBA region of the current slot.
-                    self.pending_nba_triggers.push(name.name.clone());
+                    // Resolve a class-field instance key NOW (while `this` is
+                    // live); the NBA drain cannot reconstruct it later.
+                    if let Some(key) = self.resolve_this_event_field(&name.name) {
+                        self.pending_nba_instance_triggers.push(key);
+                    } else {
+                        self.pending_nba_triggers.push(name.name.clone());
+                    }
+                    return;
+                }
+                if let Some(key) = self.resolve_this_event_field(&name.name) {
+                    self.fire_instance_event(key);
                     return;
                 }
                 self.fire_named_event(&name.name);
@@ -38217,6 +38307,79 @@ impl Simulator {
             Some(false)
         } else {
             None
+        }
+    }
+
+    /// If `name` (used in `->name` / `@name`) denotes a CLASS-FIELD event
+    /// of the current `this`, return the per-instance synchronization key
+    /// `(this_handle, field_name)`. Returns `None` when execution is not
+    /// inside a class method (`this` unset) or when `name` is not a property
+    /// of the current instance — in which case the caller falls back to the
+    /// module-scope named-event path (`signal_table`-backed). Per SV §8.16 a
+    /// class member name shadows a same-named module signal inside a method,
+    /// so the this-relative field wins when present.
+    fn resolve_this_event_field(&self, name: &str) -> Option<(usize, String)> {
+        let handle = self.this_stack.last().copied().flatten()?;
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
+        if inst.properties.contains_key(name) {
+            Some((handle, name.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// Extract the field name from an `@name` event control, whether it
+    /// parsed as a bare `Identifier` (`@ev`) or a `HierIdentifier`
+    /// (`@this.ev`, which the elaborator rewrites a class-method `@ev` into).
+    /// Returns the leaf name when the control targets a single unqualified
+    /// name, else `None` (multi-segment paths, event expressions, `*`).
+    fn event_control_field_name(&self, event: &EventControl) -> Option<String> {
+        match event {
+            EventControl::Identifier(id) => Some(id.name.clone()),
+            EventControl::HierIdentifier(expr) => {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        return Some(h.path[0].name.name.clone());
+                    }
+                }
+                None
+            }
+            // `@(field)` — parenthesized form parses as a single-term
+            // EventExpr with no edge. Inside a class method this is the
+            // same this-relative named-event wait as the bare `@field` above.
+            EventControl::EventExpr(terms) if terms.len() == 1 => {
+                let te = &terms[0];
+                if te.edge.is_none() {
+                    if let ExprKind::Ident(h) = &te.expr.kind {
+                        if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                            return Some(h.path[0].name.name.clone());
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Wake every process parked on `@<field>` for instance `key` (an edge
+    /// trigger: only processes already waiting when `-><field>` fires resume).
+    /// Each woken continuation is scheduled for the current time so it runs in
+    /// the same slot's remaining active region — mirroring how a blocking
+    /// `->e` resumes an `@e` waiter for a module-scope named event.
+    fn fire_instance_event(&mut self, key: (usize, String)) {
+        let now = self.time;
+        let mut woken = Vec::new();
+        self.instance_event_waiters.retain(|w| {
+            if w.key == key {
+                woken.push((w.pid, w.continuation.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        for (pid, cont) in woken {
+            self.event_queue.schedule(now, pid, cont);
         }
     }
 
@@ -44135,6 +44298,14 @@ impl Simulator {
         {
             return true;
         }
+        // A process parked on a class-field named event (`@m_event` inside a
+        // method on `this`) is suspended, not finished — see
+        // `InstanceEventWaiter`. Without this a `fork...join_any` whose child
+        // is the `@m_event` waiter (e.g. uvm_heartbeat's abort branch) fired
+        // the join prematurely, killing the loop branch.
+        if self.instance_event_waiters.iter().any(|w| w.pid == pid) {
+            return true;
+        }
         false
     }
 
@@ -44221,6 +44392,7 @@ impl Simulator {
         // Purge from every scheduling structure.
         self.event_queue.remove_pid(pid);
         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+        self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
         self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
         self.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
         for q in self.mailbox_get_waiters.values_mut() {
