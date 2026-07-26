@@ -277,10 +277,13 @@ fn undriven_nets_dump_as_z_not_x_at_top_and_in_instances() {
 module child;
   wire floating_child;
   wire [3:0] floating_child_bus;
+  wire [1:0] floating_child_arr [0:1];
   initial begin
     #0;
     if (floating_child !== 1'bz) $display("FAIL child scalar is %b", floating_child);
     if (floating_child_bus !== 4'bzzzz) $display("FAIL child bus is %b", floating_child_bus);
+    if (floating_child_arr[0] !== 2'bzz) $display("FAIL child array[0] is %b", floating_child_arr[0]);
+    if (floating_child_arr[1] !== 2'bzz) $display("FAIL child array[1] is %b", floating_child_arr[1]);
   end
 endmodule
 
@@ -292,6 +295,7 @@ endinterface
 module tb;
   wire floating_top;
   wire [2:0] floating_top_bus;
+  wire [1:0] floating_top_arr [0:1];
   child u_child();
   abdram_if abdram();
   initial begin
@@ -300,6 +304,8 @@ module tb;
     #0;
     if (floating_top !== 1'bz) $display("FAIL top scalar is %b", floating_top);
     if (floating_top_bus !== 3'bzzz) $display("FAIL top bus is %b", floating_top_bus);
+    if (floating_top_arr[0] !== 2'bzz) $display("FAIL top array[0] is %b", floating_top_arr[0]);
+    if (floating_top_arr[1] !== 2'bzz) $display("FAIL top array[1] is %b", floating_top_arr[1]);
     if (abdram.por_l !== 1'bz) $display("FAIL interface por_l is %b", abdram.por_l);
     if (abdram.por_l_c !== 1'bz) $display("FAIL interface por_l_c is %b", abdram.por_l_c);
     #1 $finish;
@@ -310,10 +316,69 @@ endmodule
 
     assert_eq!(records(&vcd, "floating_top"), vec!["z"], "{}", vcd);
     assert_eq!(records(&vcd, "floating_top_bus"), vec!["bz"], "{}", vcd);
+    assert_eq!(records(&vcd, "floating_top_arr[0]"), vec!["bz"], "{}", vcd);
+    assert_eq!(records(&vcd, "floating_top_arr[1]"), vec!["bz"], "{}", vcd);
     assert_eq!(records(&vcd, "floating_child"), vec!["z"], "{}", vcd);
     assert_eq!(records(&vcd, "floating_child_bus"), vec!["bz"], "{}", vcd);
+    assert_eq!(records(&vcd, "floating_child_arr[0]"), vec!["bz"], "{}", vcd);
+    assert_eq!(records(&vcd, "floating_child_arr[1]"), vec!["bz"], "{}", vcd);
     assert_eq!(records(&vcd, "por_l"), vec!["z"], "{}", vcd);
     assert_eq!(records(&vcd, "por_l_c"), vec!["z"], "{}", vcd);
+}
+
+#[test]
+fn unconnected_input_ports_dump_as_z_not_x() {
+    let vcd = dump(
+        "unconnected_input_z",
+        r#"
+module child(input a, input wire [3:0] bus, input logic typed,
+             input wire [2:0] arr [0:1], output logic seen);
+  assign seen = a;
+  initial begin
+    #0;
+    if (a !== 1'bz) $display("FAIL input scalar is %b", a);
+    if (bus !== 4'bzzzz) $display("FAIL input bus is %b", bus);
+    if (typed !== 1'bz) $display("FAIL input logic is %b", typed);
+    if (arr[0] !== 3'bzzz) $display("FAIL input array[0] is %b", arr[0]);
+    if (arr[1] !== 3'bzzz) $display("FAIL input array[1] is %b", arr[1]);
+  end
+endmodule
+
+module child_nonansi(na, nbus, nl);
+  input na;
+  input [3:0] nbus;
+  input nl;
+  wire na;
+  wire [3:0] nbus;
+  logic nl;
+  initial begin
+    #0;
+    if (na !== 1'bz) $display("FAIL non-ANSI input scalar is %b", na);
+    if (nbus !== 4'bzzzz) $display("FAIL non-ANSI input bus is %b", nbus);
+    if (nl !== 1'bz) $display("FAIL non-ANSI input logic is %b", nl);
+  end
+endmodule
+
+module tb;
+  child u_child();
+  child_nonansi u_nonansi();
+  initial begin
+    $dumpfile("{VCD}");
+    $dumpvars(0, tb);
+    #1 $finish;
+  end
+endmodule
+"#,
+    );
+
+    assert_eq!(records(&vcd, "a"), vec!["z"], "{}", vcd);
+    assert_eq!(records(&vcd, "bus"), vec!["bz"], "{}", vcd);
+    assert_eq!(records(&vcd, "typed"), vec!["z"], "{}", vcd);
+    assert_eq!(records(&vcd, "arr[0]"), vec!["bz"], "{}", vcd);
+    assert_eq!(records(&vcd, "arr[1]"), vec!["bz"], "{}", vcd);
+    assert_eq!(records(&vcd, "na"), vec!["z"], "{}", vcd);
+    assert_eq!(records(&vcd, "nbus"), vec!["bz"], "{}", vcd);
+    assert_eq!(records(&vcd, "nl"), vec!["z"], "{}", vcd);
 }
 
 /// §21.7.2.1: the `var_type` of each declaration, and the optional bit range on

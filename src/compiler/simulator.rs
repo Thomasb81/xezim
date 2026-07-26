@@ -4936,6 +4936,14 @@ impl Simulator {
                 }
             }
         }
+        for base in module.z_init_signals.iter() {
+            if let Some(&(first_id, lo, hi)) = array_first_id.get(base.as_str()) {
+                let n = (hi - lo + 1).max(0) as usize;
+                for id in first_id..first_id + n {
+                    signal_table[id] = Value::all_z(signal_widths_vec[id]);
+                }
+            }
+        }
         for (nm, v) in array_elem_inits {
             if let Some(&id) = signal_name_to_id.get(nm.as_str()) {
                 signal_table[id] = v;
@@ -5000,6 +5008,17 @@ impl Simulator {
             for (name, &id) in signal_name_to_id.iter() {
                 if name.starts_with(prefix.as_str()) {
                     signal_table[id] = Value::zero(signal_widths_vec[id]);
+                }
+            }
+        }
+        for base in module.z_init_signals.iter() {
+            if !module.arrays_2d.contains_key(base) && !module.arrays_nd.contains_key(base) {
+                continue;
+            }
+            let prefix = format!("{}[", base);
+            for (name, &id) in signal_name_to_id.iter() {
+                if name.starts_with(prefix.as_str()) {
+                    signal_table[id] = Value::all_z(signal_widths_vec[id]);
                 }
             }
         }
