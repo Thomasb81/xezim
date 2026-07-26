@@ -16121,6 +16121,23 @@ impl Simulator {
             }
         }
 
+        // Add UDPs before ordering so library-cell chains participate in the
+        // same writer-before-reader schedule as continuous assignments.
+        self.build_udp_entries(&mut entries);
+        // Stateful and generic UDP runtimes have observable initialization and
+        // event ordering. Keep their established post-combinational position;
+        // only proven-pure fused gates participate in the topological pass.
+        let mut deferred_udp_entries = Vec::new();
+        let mut orderable_entries = Vec::with_capacity(entries.len());
+        for entry in entries.drain(..) {
+            if matches!(entry.item, CombItem::Udp { .. } | CombItem::UdpBatch { .. }) {
+                deferred_udp_entries.push(entry);
+            } else {
+                orderable_entries.push(entry);
+            }
+        }
+        entries = orderable_entries;
+
         // Topologically reorder `entries` so that writers come before readers
         // where possible. This collapses feedforward chains to 1 settle iter.
         // Cycles are broken arbitrarily; feedback still needs multi-iter.
@@ -16304,10 +16321,7 @@ impl Simulator {
                 );
             }
         }
-
-        // §29: append User-Defined Primitive instances as comb entries so
-        // their input nets participate in the reverse-dependency index below.
-        self.build_udp_entries(&mut entries);
+        entries.extend(deferred_udp_entries);
 
         // Collapse replicated exact-width copies with a common source into a
         // single worklist entry. Only single-writer destinations qualify: a
@@ -17869,12 +17883,50 @@ impl Simulator {
         });
     }
 
-    /// Every element name of a 2-D unpacked array addressed as `m[i][j]`,
-    /// given the INNER `m[i]` expression. `None` when `base` is not an index
-    /// into a registered 2-D array. Used to give a reader of one element a real
-    /// dependency: the array base carries no signal id of its own.
-    fn multi_dim_elem_names(base: &Expression, module: &ElaboratedModule) -> Option<Vec<String>> {
-        let ExprKind::Index { expr: inner, .. } = &base.kind else {
+    fn constant_array_index(expr: &Expression, module: &ElaboratedModule) -> Option<i64> {
+        fn is_constant(expr: &Expression, module: &ElaboratedModule) -> bool {
+            match &expr.kind {
+                ExprKind::Number(_) => true,
+                ExprKind::Ident(hier) => hier
+                    .path
+                    .last()
+                    .is_some_and(|seg| module.parameters.contains_key(seg.name.name.as_str())),
+                ExprKind::Paren(inner) => is_constant(inner, module),
+                ExprKind::Unary { operand, .. } => is_constant(operand, module),
+                ExprKind::Binary { left, right, .. } => {
+                    is_constant(left, module) && is_constant(right, module)
+                }
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => {
+                    is_constant(condition, module)
+                        && is_constant(then_expr, module)
+                        && is_constant(else_expr, module)
+                }
+                _ => false,
+            }
+        }
+
+        is_constant(expr, module).then(|| {
+            super::elaborate::const_eval_i64_with_params(expr, Some(&module.parameters))
+        })?
+    }
+
+    /// Dependency names for a 2-D unpacked-array read `m[i][j]`. Constant
+    /// indices select one element; genuinely dynamic indices retain the
+    /// conservative whole-array dependency required for correctness.
+    fn multi_dim_elem_names(
+        base: &Expression,
+        outer_index: &Expression,
+        module: &ElaboratedModule,
+    ) -> Option<Vec<String>> {
+        let ExprKind::Index {
+            expr: inner,
+            index: inner_index,
+        } = &base.kind
+        else {
             return None;
         };
         let ExprKind::Ident(h) = &inner.kind else {
@@ -17882,6 +17934,18 @@ impl Simulator {
         };
         let name = Self::resolve_hier_name_static(h, module);
         let ((a0, a1), (b0, b1), _) = *module.arrays_2d.get(&name)?;
+        if let (Some(a), Some(b)) = (
+            Self::constant_array_index(inner_index, module),
+            Self::constant_array_index(outer_index, module),
+        ) {
+            let in_a = (a0.min(a1)..=a0.max(a1)).contains(&a);
+            let in_b = (b0.min(b1)..=b0.max(b1)).contains(&b);
+            return Some(if in_a && in_b {
+                vec![format!("{}[{}][{}]", name, a, b)]
+            } else {
+                Vec::new()
+            });
+        }
         let mut out = Vec::new();
         for a in a0.min(a1)..=a0.max(a1) {
             for b in b0.min(b1)..=b0.max(b1) {
@@ -17936,25 +18000,33 @@ impl Simulator {
                 reads.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
-                // For array[idx]: conservatively add all array elements
                 if let ExprKind::Ident(hier) = &base.kind {
                     let name = Self::resolve_hier_name_static(hier, module);
                     if let Some((lo, hi, _)) = module.arrays.get(&name) {
-                        for i in *lo..=*hi {
-                            reads.insert(format!("{}[{}]", name, i));
+                        if let Some(i) = Self::constant_array_index(index, module) {
+                            if (*lo..=*hi).contains(&i) {
+                                reads.insert(format!("{}[{}]", name, i));
+                            }
+                        } else {
+                            for i in *lo..=*hi {
+                                reads.insert(format!("{}[{}]", name, i));
+                            }
                         }
                     } else {
                         reads.insert(name);
                     }
-                } else if let Some(elems) = Self::multi_dim_elem_names(base, module) {
-                    // 2-D element read (`m[i][j]`): the base is itself an Index,
-                    // so the 1-D expansion above never fires and only the array
-                    // BASE name was registered — a name with no signal id, so the
-                    // reader had no dependency at all and kept the X it sampled
-                    // on the first settle. Expand every element, exactly as the
-                    // 1-D case does.
+                } else if let Some(elems) = Self::multi_dim_elem_names(base, index, module) {
                     for e in elems {
                         reads.insert(e);
+                    }
+                    if let ExprKind::Index {
+                        index: inner_index,
+                        ..
+                    } = &base.kind
+                    {
+                        if Self::constant_array_index(inner_index, module).is_none() {
+                            Self::collect_expr_reads(inner_index, module, reads);
+                        }
                     }
                 } else {
                     // Non-Ident base (e.g. nested Index, RangeSelect from inlining
@@ -17964,7 +18036,9 @@ impl Simulator {
                     // the comb-entry never re-evaluates when it changes.
                     Self::collect_expr_reads(base, module, reads);
                 }
-                Self::collect_expr_reads(index, module, reads);
+                if Self::constant_array_index(index, module).is_none() {
+                    Self::collect_expr_reads(index, module, reads);
+                }
             }
             ExprKind::RangeSelect {
                 expr: base,
