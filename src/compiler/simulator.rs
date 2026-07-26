@@ -552,6 +552,15 @@ enum CombItem {
         dsts: Box<[BitRef]>,
         invert: bool,
     },
+    /// Batched one-bit AND/NAND gates sharing one input. Clock trees commonly
+    /// instantiate many `gclk = parent_clk & enable` cells; one dependency
+    /// entry avoids repeated worklist dispatch while every enable remains a
+    /// sensitivity and every destination remains independent.
+    FusedAndFanout {
+        common: BitRef,
+        branches: Box<[FusedAndBranch]>,
+        invert: bool,
+    },
     /// Bytecode-compiled cont_assign: RHS compiled to VM instructions,
     /// result written to pre-resolved dst_id via BlockingAssign insn.
     CompiledContAssign {
@@ -631,6 +640,12 @@ pub struct BitRef {
     bit: u32,
 }
 
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FusedAndBranch {
+    dst: BitRef,
+    other: BitRef,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum GateBin {
     And,
@@ -707,7 +722,7 @@ struct CombEntry {
     span: crate::ast::Span,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB004";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB005";
 
 #[derive(serde::Serialize)]
 struct PreparedCombCacheRef<'a> {
@@ -9480,7 +9495,8 @@ impl Simulator {
                 | CombItem::FastDirectFanout { .. }
                 | CombItem::DirectCopy { .. }
                 | CombItem::FusedGate { .. }
-                | CombItem::FusedBufFanout { .. } => {
+                | CombItem::FusedBufFanout { .. }
+                | CombItem::FusedAndFanout { .. } => {
                     self.comb_par_safe[i] = single_writer;
                 }
                 CombItem::CompiledContAssign { compiled, .. }
@@ -10091,6 +10107,42 @@ impl Simulator {
         }
     }
 
+    #[inline]
+    fn exec_fused_and_fanout_isolated(
+        common: BitRef,
+        branches: &[FusedAndBranch],
+        invert: bool,
+        view: &mut [Value],
+        dirtied: &mut Vec<u32>,
+    ) {
+        let common_code =
+            view[common.sig_id as usize].get_bit_code(common.bit as usize);
+        for branch in branches {
+            let other =
+                view[branch.other.sig_id as usize].get_bit_code(branch.other.bit as usize);
+            let and = if common_code == 0 || other == 0 {
+                0
+            } else if common_code == 1 && other == 1 {
+                1
+            } else {
+                2
+            };
+            let result = if invert {
+                match and {
+                    0 => 1,
+                    1 => 0,
+                    _ => 2,
+                }
+            } else {
+                and
+            };
+            let id = branch.dst.sig_id as usize;
+            if view[id].set_bit_code(branch.dst.bit as usize, result) {
+                dirtied.push(id as u32);
+            }
+        }
+    }
+
     /// Evaluate one comb entry against a mutable signal `view`, appending
     /// the ids of any signals it changes to `dirtied`. Returns false if the
     /// entry is an AST-fallback variant the isolated path can't handle (the
@@ -10223,6 +10275,20 @@ impl Simulator {
                         dirtied,
                     );
                 }
+                true
+            }
+            CombItem::FusedAndFanout {
+                common,
+                branches,
+                invert,
+            } => {
+                Self::exec_fused_and_fanout_isolated(
+                    *common,
+                    branches,
+                    *invert,
+                    view,
+                    dirtied,
+                );
                 true
             }
             // AST fallback (ContAssign / AlwaysBlock) — needs the full
@@ -10358,6 +10424,20 @@ impl Simulator {
                         dirtied,
                     );
                 }
+                true
+            }
+            CombItem::FusedAndFanout {
+                common,
+                branches,
+                invert,
+            } => {
+                Self::exec_fused_and_fanout_isolated(
+                    *common,
+                    branches,
+                    *invert,
+                    view,
+                    dirtied,
+                );
                 true
             }
             CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => false,
@@ -11310,6 +11390,15 @@ impl Simulator {
                         invert: *invert,
                     }
                 }
+                CombItem::FusedAndFanout {
+                    common,
+                    branches,
+                    invert,
+                } => SendCombItem::FusedAndFanout {
+                    common: *common,
+                    branches: branches.clone(),
+                    invert: *invert,
+                },
                 CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
                     SendCombItem::AstFallback
                 }
@@ -16458,6 +16547,126 @@ impl Simulator {
             );
         }
 
+        // Batch AND/NAND gates with a frequently shared operand. This is the
+        // structural form of a clock-gate bank (`gclk_i = clk & enable_i`),
+        // but the transformation is valid for arbitrary one-bit logic and
+        // therefore needs no hierarchy or signal-name heuristic.
+        let mut and_operand_uses: HashMap<BitRef, usize> = HashMap::default();
+        for entry in &entries {
+            if let CombItem::FusedGate {
+                op:
+                    FusedGate::Bin2 {
+                        dst,
+                        a,
+                        b,
+                        op: GateBin::And,
+                        ..
+                    },
+            } = &entry.item
+            {
+                if dst != a
+                    && dst != b
+                    && a != b
+                    && writer_counts.get(dst.sig_id as usize).copied() == Some(1)
+                {
+                    *and_operand_uses.entry(*a).or_default() += 1;
+                    *and_operand_uses.entry(*b).or_default() += 1;
+                }
+            }
+        }
+        let mut and_groups: HashMap<(BitRef, bool), Vec<(usize, FusedAndBranch)>> =
+            HashMap::default();
+        for (eidx, entry) in entries.iter().enumerate() {
+            if let CombItem::FusedGate {
+                op:
+                    FusedGate::Bin2 {
+                        dst,
+                        a,
+                        b,
+                        op: GateBin::And,
+                        invert,
+                    },
+            } = &entry.item
+            {
+                if dst == a
+                    || dst == b
+                    || a == b
+                    || writer_counts.get(dst.sig_id as usize).copied() != Some(1)
+                {
+                    continue;
+                }
+                let a_uses = and_operand_uses.get(a).copied().unwrap_or(0);
+                let b_uses = and_operand_uses.get(b).copied().unwrap_or(0);
+                let (common, other) = if a_uses >= b_uses { (*a, *b) } else { (*b, *a) };
+                and_groups
+                    .entry((common, *invert))
+                    .or_default()
+                    .push((
+                        eidx,
+                        FusedAndBranch {
+                            dst: *dst,
+                            other,
+                        },
+                    ));
+            }
+        }
+        let mut and_replacement: Vec<Option<(BitRef, Box<[FusedAndBranch]>, bool)>> =
+            vec![None; entries.len()];
+        let mut and_skip = vec![false; entries.len()];
+        let mut and_batch_count = 0usize;
+        let mut and_gate_count = 0usize;
+        for ((common, invert), branches) in and_groups {
+            if branches.len() < 4 {
+                continue;
+            }
+            let first = branches[0].0;
+            let packed: Vec<FusedAndBranch> =
+                branches.iter().map(|(_, branch)| *branch).collect();
+            for &(eidx, _) in branches.iter().skip(1) {
+                and_skip[eidx] = true;
+            }
+            and_batch_count += 1;
+            and_gate_count += packed.len();
+            and_replacement[first] = Some((common, packed.into_boxed_slice(), invert));
+        }
+        if and_batch_count != 0 {
+            let mut grouped =
+                Vec::with_capacity(entries.len() - and_gate_count + and_batch_count);
+            for (eidx, mut entry) in entries.into_iter().enumerate() {
+                if and_skip[eidx] {
+                    continue;
+                }
+                if let Some((common, branches, invert)) = and_replacement[eidx].take() {
+                    entry.read_signal_ids.clear();
+                    entry.read_signal_ids.push(common.sig_id as usize);
+                    for branch in branches.iter() {
+                        let id = branch.other.sig_id as usize;
+                        if !entry.read_signal_ids.contains(&id) {
+                            entry.read_signal_ids.push(id);
+                        }
+                    }
+                    entry.write_signal_ids.clear();
+                    entry
+                        .write_signal_ids
+                        .extend(branches.iter().map(|branch| branch.dst.sig_id as usize));
+                    entry.has_unresolved_reads = false;
+                    entry.scope_hint = None;
+                    entry.item = CombItem::FusedAndFanout {
+                        common,
+                        branches,
+                        invert,
+                    };
+                }
+                grouped.push(entry);
+            }
+            entries = grouped;
+            sim_dbg_eprintln!(
+                "[OPT] grouped {} fused AND/NAND gates into {} shared-input batches",
+                and_gate_count,
+                and_batch_count
+            );
+        }
+
         // Build reverse dependency index by signal ID using final entry
         // order. CSR layout: counts → prefix-sum → fill, all in flat
         // u32 Vecs. Avoids 585K × 24 B of empty Vec headers and 585K
@@ -21586,6 +21795,12 @@ impl Simulator {
                             continue;
                         };
                         self.name_for_id(dst.sig_id as usize)
+                    }
+                    CombItem::FusedAndFanout { branches, .. } => {
+                        let Some(branch) = branches.first() else {
+                            continue;
+                        };
+                        self.name_for_id(branch.dst.sig_id as usize)
                     }
                     CombItem::ContAssign { .. } | CombItem::CompiledContAssign { .. } => {
                         if let Some(&id) = entry.write_signal_ids.first() {
@@ -28414,6 +28629,13 @@ impl Simulator {
             CombItem::FusedBufFanout { src, dsts, invert } => {
                 self.exec_fused_buf_fanout(*src, dsts, *invert);
             }
+            CombItem::FusedAndFanout {
+                common,
+                branches,
+                invert,
+            } => {
+                self.exec_fused_and_fanout(*common, branches, *invert);
+            }
             CombItem::Udp { idx } => {
                 let idx = *idx;
                 self.eval_udp(idx);
@@ -28897,6 +29119,14 @@ impl Simulator {
                     CombItem::FusedBufFanout { src, dsts, invert } => {
                         self.exec_fused_buf_fanout(*src, dsts, *invert);
                         self.prof_settle_dc_count += dsts.len() as u64;
+                    }
+                    CombItem::FusedAndFanout {
+                        common,
+                        branches,
+                        invert,
+                    } => {
+                        self.exec_fused_and_fanout(*common, branches, *invert);
+                        self.prof_settle_dc_count += branches.len() as u64;
                     }
                     CombItem::Udp { idx } => {
                         let idx = *idx;
@@ -43741,6 +43971,56 @@ impl Simulator {
             }
         };
         for &dst in dsts {
+            let id = dst.sig_id as usize;
+            if !self.sdf_delays.is_empty()
+                && self.sdf_delays.get(id).copied().unwrap_or(0) > 0
+                && self.time > 0
+            {
+                if self.signal_table[id].get_bit_code(dst.bit as usize) != new_bit {
+                    let mut v = self.signal_table[id].clone();
+                    v.set_bit_code(dst.bit as usize, new_bit);
+                    self.schedule_delayed(id, v);
+                }
+                continue;
+            }
+            if self.signal_table[id].set_bit_code(dst.bit as usize, new_bit) {
+                self.table_modified = true;
+                self.after_signal_write(id);
+                self.mark_dirty_id(id);
+            }
+        }
+    }
+
+    /// Execute fused one-bit AND/NAND gates that share one operand.
+    #[inline]
+    fn exec_fused_and_fanout(
+        &mut self,
+        common: BitRef,
+        branches: &[FusedAndBranch],
+        invert: bool,
+    ) {
+        let common_code =
+            self.signal_table[common.sig_id as usize].get_bit_code(common.bit as usize);
+        for branch in branches {
+            let other = self.signal_table[branch.other.sig_id as usize]
+                .get_bit_code(branch.other.bit as usize);
+            let and = if common_code == 0 || other == 0 {
+                0
+            } else if common_code == 1 && other == 1 {
+                1
+            } else {
+                2
+            };
+            let new_bit = if invert {
+                match and {
+                    0 => 1,
+                    1 => 0,
+                    _ => 2,
+                }
+            } else {
+                and
+            };
+            let dst = branch.dst;
             let id = dst.sig_id as usize;
             if !self.sdf_delays.is_empty()
                 && self.sdf_delays.get(id).copied().unwrap_or(0) > 0
@@ -70069,6 +70349,11 @@ pub enum SendCombItem {
         dsts: Box<[BitRef]>,
         invert: bool,
     },
+    FusedAndFanout {
+        common: BitRef,
+        branches: Box<[FusedAndBranch]>,
+        invert: bool,
+    },
     AstFallback,
 }
 
@@ -70213,6 +70498,20 @@ impl CombSettleCtx {
                         dirtied,
                     );
                 }
+                true
+            }
+            SendCombItem::FusedAndFanout {
+                common,
+                branches,
+                invert,
+            } => {
+                Simulator::exec_fused_and_fanout_isolated(
+                    *common,
+                    branches,
+                    *invert,
+                    view,
+                    dirtied,
+                );
                 true
             }
             SendCombItem::AstFallback => false,
