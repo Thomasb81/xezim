@@ -28,6 +28,11 @@ pub const INTRA_DELAY_MARKER: &str = "$__xz_intra_delay";
 /// discard behavior.
 pub const INTRA_EVENT_MARKER: &str = "$__xz_intra_ev";
 
+/// Marker for §14.16 intra-assignment CYCLE delay on a clocking-block drive:
+/// `cb.out <= ##N rhs;` becomes `$__xz_intra_cycle(N, rhs)`. The simulator
+/// defers the drive by N clocking events of that block.
+pub const INTRA_CYCLE_MARKER: &str = "$__xz_intra_cycle";
+
 /// Skip whitespace and comments starting at `i`; returns the next index of
 /// significant text.
 fn skip_ws_comments(b: &[u8], mut i: usize) -> usize {
@@ -326,6 +331,31 @@ pub fn rewrite_intra_assignment_delays(src: &str) -> String {
                             i = semi; // main loop copies the `;`
                             continue;
                         }
+                    }
+                }
+            }
+        }
+        if c == b'#' && i + 1 < n && b[i + 1] == b'#' {
+            // §14.16 cycle-delay intra-assignment `lhs <= ##N rhs;` — same
+            // trigger rule as the `#delay` form below (directly after `=`/`<=`).
+            let blocking_c = p1 == b'='
+                && !matches!(
+                    p2,
+                    b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&'
+                        | b'|' | b'^' | b'~'
+                );
+            let nba_c = p1 == b'=' && p2 == b'<' && p3 != b'<';
+            if blocking_c || nba_c {
+                if let Some((cnt_end, semi)) = extract_delay_and_rhs(b, i + 1) {
+                    if define_end.is_none_or(|e| semi < e) {
+                        out.push_str(INTRA_CYCLE_MARKER);
+                        out.push('(');
+                        out.push_str(&src[i + 2..cnt_end]);
+                        out.push(',');
+                        out.push_str(&src[cnt_end..semi]);
+                        out.push(')');
+                        i = semi;
+                        continue;
                     }
                 }
             }

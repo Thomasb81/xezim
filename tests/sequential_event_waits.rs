@@ -76,6 +76,48 @@ endmodule
     assert_eq!(out(src, "NEGS"), "NEGS=3");
 }
 
+/// An action-free repeat event control can stay parked across all qualifying
+/// edges, but must resume at exactly the same edge as the general loop path.
+#[test]
+fn counted_repeat_event_wait_resumes_on_final_edge() {
+    let src = r#"
+`timescale 1ns/1ns
+module tb;
+  bit clk = 0;
+  initial begin
+    repeat (3) @(posedge clk);
+    $display("POSEDGE_DONE t=%0t", $time);
+    repeat (2) @(negedge clk);
+    $display("NEGEDGE_DONE t=%0t", $time);
+    $finish;
+  end
+  always #5 clk = ~clk;
+endmodule
+"#;
+    assert_eq!(out(src, "POSEDGE_DONE"), "POSEDGE_DONE t=25");
+    assert_eq!(out(src, "NEGEDGE_DONE"), "NEGEDGE_DONE t=40");
+}
+
+#[test]
+fn counted_repeat_event_wait_honors_iff_guard() {
+    let src = r#"
+`timescale 1ns/1ns
+module tb;
+  bit clk = 0;
+  bit enable = 0;
+  initial begin
+    repeat (2) @(posedge clk iff enable);
+    $display("GUARDED_DONE t=%0t", $time);
+    $finish;
+  end
+  initial #12 enable = 1;
+  always #5 clk = ~clk;
+endmodule
+"#;
+    // The disabled t=5 posedge does not count; t=15 and t=25 do.
+    assert_eq!(out(src, "GUARDED_DONE"), "GUARDED_DONE t=25");
+}
+
 /// A `bind`-monitor style process: an `initial` with interleaved
 /// `@(posedge clk)` and `assert` statements. Pre-fix only the first assert
 /// ran (the process stalled after the first `@`); post-fix all three run.

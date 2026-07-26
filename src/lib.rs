@@ -722,6 +722,9 @@ pub fn simulate_multi(
         if cache.is_some() {
             xezim_core::elab_diag_capture_begin();
         }
+        // Fresh per-kind duplicate counters for this elaboration, so a second
+        // run in the same process/thread reports its own first five.
+        xezim_core::elab_diag_reset_counts();
         let (definitions, mut elab) = parse_and_elaborate_multi(
             &sources,
             top_module_name,
