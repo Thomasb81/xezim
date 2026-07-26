@@ -580,6 +580,13 @@ enum CombItem {
     Udp {
         idx: usize,
     },
+    /// Edge-filtered sequential UDPs sharing one event terminal. Their data
+    /// terminals are proven state-holding, so one dependency dispatch can
+    /// evaluate the whole clock-domain batch.
+    UdpBatch {
+        event_ref: BitRef,
+        indices: Box<[usize]>,
+    },
 }
 
 /// Per-instance runtime state for a §29 UDP. Terminals are resolved to single
@@ -592,7 +599,23 @@ struct UdpRuntime {
     in_refs: Vec<BitRef>,
     is_sequential: bool,
     delay: u64,
-    rows: Vec<crate::ast::decl::UdpTableRow>,
+    /// Shared by every instance of the same UDP definition. The elaborator
+    /// attaches rows to each flattened instance, but retaining those clones
+    /// wastes substantial memory on cell fabrics.
+    rows: Arc<[crate::ast::decl::UdpTableRow]>,
+    /// Precomputed `(state, previous inputs, current inputs) -> next state`
+    /// table for small UDPs. Values are 0, 1, or 2 (=x).
+    transition_lut: Option<Arc<[u8]>>,
+    /// Number of ternary input vectors (`3 ^ input_count`) in the LUT.
+    lut_input_states: usize,
+    /// Cached ternary encoding of the last input vector. The LUT path can
+    /// compare and index this directly instead of rebuilding previous inputs.
+    input_state_idx: usize,
+    /// When only one input can cause a state transition, identify that port
+    /// and the previous/current trit pairs worth evaluating. Other pairs can
+    /// update the cached trit and return without reading the remaining ports.
+    event_input: Option<u8>,
+    event_transition_mask: u16,
     /// Current output/state level: 0,1,2(=x).
     state: u8,
     /// Previous input levels (0,1,2); 255 = uninitialised (first eval).
@@ -602,7 +625,7 @@ struct UdpRuntime {
     warned: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BitRef {
     sig_id: u32,
     bit: u32,
@@ -637,6 +660,15 @@ enum FusedGate {
         s: BitRef,
         t: BitRef,
         e: BitRef,
+    },
+    /// Zero-delay combinational UDP lowered to a compact current-input LUT.
+    /// Three ternary inputs fit in 54 packed bits, and the immutable node can use
+    /// the same direct dependency dispatch as built-in fused gates.
+    UdpLut3 {
+        dst: BitRef,
+        inputs: [BitRef; 3],
+        input_count: u8,
+        table: u64,
     },
 }
 
@@ -675,7 +707,7 @@ struct CombEntry {
     span: crate::ast::Span,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB001";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB004";
 
 #[derive(serde::Serialize)]
 struct PreparedCombCacheRef<'a> {
@@ -1227,6 +1259,11 @@ struct EventWaiter {
     /// Full captured value for >64-bit sensitivity signals (parallel to
     /// `captured_prev`); `None` for ≤64-bit signals.
     captured_prev_wide: Vec<Option<Value>>,
+    /// Number of qualifying events still required before the continuation
+    /// resumes. This collapses action-free `repeat (N) @(event);` loops into
+    /// one parked waiter instead of rebuilding their AST continuation after
+    /// every edge.
+    remaining_events: u64,
     /// LRM §14.13: this waiter is parked on a CLOCKING event (`@(cb)` / `##N`),
     /// not a raw `@(posedge clk)`. Its continuation must resume in the Reactive
     /// region — AFTER the same-edge NBA updates commit and the clocking input
@@ -1271,6 +1308,10 @@ fn pad_string(s: &str, width: usize, zero_pad: bool) -> String {
 /// Events within WHEEL_SIZE ticks of current time use a circular array.
 /// Events further out fall back to a BTreeMap.
 const WHEEL_SIZE: usize = 256;
+
+/// Prefix of the hidden per-clocking-input sample mirror signals (§14.13).
+/// Not expressible in SV source, so it can never collide with a user name.
+const CB_SAMPLE_PREFIX: &str = "__xz_cbsample.";
 /// Number of u64 words needed for the occupancy bitmap (256 / 64 = 4).
 const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
 
@@ -2283,6 +2324,10 @@ pub struct Simulator {
     /// Borrow<str>` lets `.get(&str)` lookups work zero-alloc; call sites
     /// that previously had a `&String` use `.as_str()` to convert.
     signal_name_to_id: HashMap<Arc<str>, usize>,
+    /// Compile-time scope resolver: bare leaf name -> enclosing scopes that
+    /// declare that leaf. Avoids rescanning the complete flattened namespace
+    /// for every continuous assignment and combinational block.
+    scope_parents_by_leaf: HashMap<Arc<str>, Vec<Arc<str>>>,
     /// Lazy per-array element-ID cache: array_name → Vec where index is the
     /// element index and the value is the flat signal_id (None if missing).
     /// Populated on first miss in the hot write/read path; avoids per-access
@@ -2465,6 +2510,27 @@ pub struct Simulator {
     /// `@(negedge clk)` block samples/advances on the negedge, not the posedge.
     /// Absent ⇒ posedge (the default and by far the common case).
     clocking_edge: HashMap<String, EdgeKind>,
+    /// Set when `tick_clocking_blocks` published a changed sample mirror, so
+    /// the caller runs one more edge pass — the publish happens after this
+    /// slot's edge detection, and the next iteration's snapshot would
+    /// otherwise absorb the change and swallow the `@(cb.sig)` event.
+    clocking_mirror_dirty: bool,
+    /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
+    /// cb → [(remaining_cycles, net, value)]. Decremented at each edge of that
+    /// block; applied (with output skew) when it reaches zero.
+    clocking_cycle_pending: HashMap<String, Vec<(u64, String, Value)>>,
+    /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
+    /// resolved net). The snapshot/meta store the NET; reads and drives use
+    /// the clocking name, so they translate through this first.
+    clocking_sig_alias: HashMap<String, HashMap<String, String>>,
+    /// §14.4 per-cb default OUTPUT skew in ticks (absent = #0).
+    clocking_out_skew: HashMap<String, u64>,
+    /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
+    clocking_sig_out_skew: HashMap<String, HashMap<String, u64>>,
+    /// Sim time of each cb's most recent clock edge — a `cb.out <= v` executed
+    /// AT the edge time drives at edge+skew (§14.16.1); between edges it waits
+    /// for the next edge.
+    clocking_last_edge: HashMap<String, u64>,
     /// LRM §14.4 `#1step` input skew — Preponed (slot-entry) value of every
     /// clocking-block INPUT signal, keyed by signal name. Captured at the top
     /// of each time slot BEFORE the active/NBA regions run (same point as
@@ -2861,6 +2927,21 @@ pub struct Simulator {
     obj_rng_stack: Vec<usize>,
     settling: bool,
     in_edge_block: bool,
+    /// Nesting depth of `check_edges_inner`. A `#delay` inside an edge block's
+    /// body re-enters the edge machinery through the synchronous
+    /// `TimingControl::Delay` arm; now that a nested pass sees the real block
+    /// list (see `edge_blocks`) it can genuinely fire blocks, so a block that
+    /// re-triggers itself through its own delay could recurse without bound.
+    /// Bounded by `EDGE_PASS_DEPTH_LIMIT`.
+    edge_pass_depth: u32,
+    /// §9.4.2 bit-select event terms: `(signal_id, block_idx) -> bit`, for
+    /// `always @(v[3])` / `@(posedge v[3])`. Edge sensitivity is otherwise
+    /// tracked per SIGNAL, so a block watching `v[0]` also woke on a change to
+    /// `v[3]`. Kept as a sparse side map rather than a field on `SensitivityId`
+    /// because bit-select terms are rare and the dispatch loop is the hottest
+    /// path in the simulator: when this map is empty the extra work is a single
+    /// already-hot bool test.
+    bitsel_edge_sens: HashMap<(usize, usize), u32>,
     /// Reusable bitmap for `check_edges`. Hoisted out of the per-iteration
     /// `vec![false; blocks.len()]` to avoid ~10 K-byte alloc/drop on every
     /// settle iter (8938 iters × ~10 K blocks = 89 MB churn on c910 hello).
@@ -2911,7 +2992,13 @@ pub struct Simulator {
     /// many partial-range NBAs (c910 testbench wrappers — thousands per
     /// posedge clk). Cleared by `apply_nba` once the entries are drained.
     nba_fast_index: NbaFastIndex,
-    edge_blocks: Vec<EdgeSensitiveBlock>,
+    /// Edge-sensitive always blocks. Behind an `Arc` so an edge pass can hold a
+    /// cheap handle to the list while `self` stays fully usable: the pass used
+    /// to `mem::take` this Vec, which left it EMPTY for the duration. Any
+    /// re-entrant lookup — a nested `check_edges` from a `#delay` in an edge
+    /// block's body, or the `self.edge_blocks.get(bi)` probes elsewhere — then
+    /// saw nothing and silently dropped every block (see `check_edges_inner`).
+    edge_blocks: Arc<Vec<EdgeSensitiveBlock>>,
     /// Bytecode-compiled edge blocks (for blocks that compiled successfully).
     /// Index matches edge_blocks. None = fallback to AST interpreter.
     compiled_edge_blocks: Vec<Option<super::bytecode::CompiledBlock>>,
@@ -3430,6 +3517,20 @@ pub struct Simulator {
     /// follow-up delta pass instead of silently coalescing them away.
     edge_exec_wrote: Vec<usize>,
     edge_exec_seen: Vec<bool>,
+    /// Nesting depth of a scheduled PROCESS activation. §4.5: a blocking write
+    /// schedules the blocks sensitive to it in the ACTIVE region; the writing
+    /// process keeps running until it suspends, and only then do they execute.
+    /// The blocking-assign arm used to settle INLINE, so an `always @(*)` ran
+    /// in the middle of another process's statement sequence — and if that
+    /// process later wrote the comb block's target, the comb result was
+    /// clobbered and never recomputed (`initial begin a=0; b=1; g=0; end`
+    /// against `always @(*) if (a^b) g=…` left g at 0 instead of the value).
+    /// While this is non-zero, procedural comb entries triggered mid-process
+    /// are parked in `deferred_comb` and run at the process's exit instead.
+    proc_depth: u32,
+    /// (comb entry index, outputs it produced) for procedural entries that ran
+    /// while a process was mid-flight. Checked for clobbering at process exit.
+    deferred_comb: Vec<(usize, Vec<(usize, Value)>)>,
     /// True while `drain_edge_exec_rescan` is re-running check_edges for
     /// exec-written positions; makes check_edges_inner count block
     /// executions into `edge_rescan_block_hits` for stall attribution.
@@ -3511,6 +3612,20 @@ pub struct Simulator {
     // execution; every skip is still verified against the value snapshot.
     edge_block_change_streak: Vec<u8>,
     edge_block_epoch_probe_left: Vec<u8>,
+    /// Self-heal for the flop-fire skip: consecutive SKIPPED clock edges per
+    /// gateable block. After XEZIM_EVENT_EDGE_HEAL consecutive skips (default
+    /// 16, 0 disables) the block is force-executed once and its snapshot
+    /// rebuilt. For a correctly-idle flop the forced execution changes nothing
+    /// (inputs unchanged ⇒ same outputs, NBA elided), so this is semantically
+    /// invisible — but it BOUNDS the damage of any skip-bookkeeping wedge
+    /// (e.g. a divider flop frozen for a dozen cycles while its clock toggles,
+    /// as seen on a customer PLL model) to at most HEAL clock edges.
+    edge_block_skip_streak: Vec<u16>,
+    /// Heal threshold (consecutive skipped edges before a forced execution).
+    event_heal: u16,
+    /// Count of forced heal executions — nonzero means a skip streak hit the
+    /// threshold; a LARGE count with wrong waveforms points at a skip bug.
+    event_healed: u64,
     /// ARMED event-edge prefilter. Writes first test a compact signal bitmap;
     /// only data-input hits walk the sparse signal -> gateable-block fanout.
     /// An unarmed block can skip without reading its operand snapshots.
@@ -4210,16 +4325,16 @@ impl Simulator {
         fn best_scope_for_leaves(
             leaves: &HashSet<String>,
             existing: &HashSet<String>,
+            parents_by_leaf: &HashMap<String, Vec<String>>,
         ) -> Option<String> {
             let mut best_parent: Option<String> = None;
             let mut best_score = 0usize;
             let mut best_depth = 0usize;
             for leaf in leaves {
-                let suffix = format!(".{}", leaf);
-                for full_name in existing {
-                    let Some(parent) = full_name.strip_suffix(&suffix) else {
-                        continue;
-                    };
+                let Some(parents) = parents_by_leaf.get(leaf) else {
+                    continue;
+                };
+                for parent in parents {
                     let mut score = 0usize;
                     for candidate_leaf in leaves {
                         let candidate = format!("{}.{}", parent, candidate_leaf);
@@ -4273,6 +4388,15 @@ impl Simulator {
 
         let mut existing: HashSet<String> = module.signals.keys().cloned().collect();
         existing.extend(module.parameters.keys().cloned());
+        let mut parents_by_leaf: HashMap<String, Vec<String>> = HashMap::default();
+        for full_name in &existing {
+            if let Some((parent, leaf)) = full_name.rsplit_once('.') {
+                parents_by_leaf
+                    .entry(leaf.to_string())
+                    .or_default()
+                    .push(parent.to_string());
+            }
+        }
 
         let mut to_create: HashSet<String> = HashSet::default();
         for ca in &module.continuous_assigns {
@@ -4297,7 +4421,7 @@ impl Simulator {
             } else if lhs_leaf.is_some() && rhs_leaf.is_none() {
                 rhs_raw.as_deref().and_then(|raw| parent_n(raw, 1))
             } else {
-                best_scope_for_leaves(&leaves, &existing)
+                best_scope_for_leaves(&leaves, &existing, &parents_by_leaf)
             };
 
             let Some(scope) = scope else {
@@ -4490,6 +4614,48 @@ impl Simulator {
                 // Should not happen — name came from one of the two maps.
                 signal_table.push(Value::new(1));
                 signal_widths_vec.push(1);
+                signal_signed_vec.push(false);
+                signal_real_vec.push(false);
+            }
+        }
+        // §14.13 clocking-sample event signals. `always @(cb.sig)` /
+        // `@(cb.sig)` must fire AT the clocking edge and ONLY when the newly
+        // sampled value differs from the previous sample — neither the net's
+        // own edges (which can occur between clock events) nor the clock
+        // itself expresses that. Give every clocking INPUT a hidden mirror
+        // signal that `tick_clocking_blocks` writes with each fresh sample;
+        // the ordinary edge machinery then delivers exactly the right events.
+        // Name is unreachable from SV source, so it cannot collide.
+        for (cb_name, cd) in module.clocking_blocks.iter() {
+            for csig in cd.signals.iter() {
+                let is_input = matches!(
+                    csig.direction,
+                    crate::ast::types::PortDirection::Input
+                        | crate::ast::types::PortDirection::Inout
+                );
+                if !is_input {
+                    continue;
+                }
+                let net = csig
+                    .bound_to
+                    .as_ref()
+                    .and_then(Self::flatten_member_path)
+                    .map(|segs| segs.join("."))
+                    .unwrap_or_else(|| csig.name.name.clone());
+                let width = signal_name_to_id
+                    .get(net.as_str())
+                    .map(|&id| signal_widths_vec[id])
+                    .unwrap_or(1);
+                let hidden = format!("{}{}.{}", CB_SAMPLE_PREFIX, cb_name, csig.name.name);
+                if signal_name_to_id.contains_key(hidden.as_str()) {
+                    continue;
+                }
+                let id = signal_table.len();
+                let arc_name: Arc<str> = Arc::from(hidden.as_str());
+                signal_name_to_id.insert(arc_name.clone(), id);
+                id_to_name.push(arc_name);
+                signal_table.push(Value::new(width));
+                signal_widths_vec.push(width);
                 signal_signed_vec.push(false);
                 signal_real_vec.push(false);
             }
@@ -4906,6 +5072,25 @@ impl Simulator {
         instance_path_order.sort_unstable_by(|&a, &b| {
             module.instances[a].path.cmp(&module.instances[b].path)
         });
+        let mut scope_parents_by_leaf: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::default();
+        for full_name in signal_name_to_id
+            .keys()
+            .map(|name| name.as_ref())
+            .chain(module.arrays.keys().map(String::as_str))
+            .chain(module.arrays_2d.keys().map(String::as_str))
+            .chain(module.arrays_nd.keys().map(String::as_str))
+        {
+            if let Some((parent, leaf)) = full_name.rsplit_once('.') {
+                scope_parents_by_leaf
+                    .entry(Arc::from(leaf))
+                    .or_default()
+                    .push(Arc::from(parent));
+            }
+        }
+        for parents in scope_parents_by_leaf.values_mut() {
+            parents.sort_unstable();
+            parents.dedup();
+        }
 
         let mut sim = Self {
             prev_val,
@@ -4930,6 +5115,7 @@ impl Simulator {
             jit_nba_side_len: 0,
             signal_table,
             signal_name_to_id,
+            scope_parents_by_leaf,
             array_elem_ids: HashMap::default(),
             array_first_id,
             leaf_name_to_ids,
@@ -4962,6 +5148,12 @@ impl Simulator {
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
             clocking_edge: HashMap::default(),
+            clocking_mirror_dirty: false,
+            clocking_cycle_pending: HashMap::default(),
+            clocking_sig_alias: HashMap::default(),
+            clocking_out_skew: HashMap::default(),
+            clocking_sig_out_skew: HashMap::default(),
+            clocking_last_edge: HashMap::default(),
             clocking_preponed: HashMap::default(),
             deferred_clocking_conts: Vec::new(),
             pending_reactive: Vec::new(),
@@ -5067,6 +5259,8 @@ impl Simulator {
             obj_rng_stack: Vec::new(),
             settling: false,
             in_edge_block: false,
+            edge_pass_depth: 0,
+            bitsel_edge_sens: HashMap::default(),
             edge_triggered_bitmap: Vec::new(),
             edge_triggered_list: Vec::new(),
             edge_prefilter_seen: Vec::new(),
@@ -5083,7 +5277,7 @@ impl Simulator {
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.
             nba_fast_index: NbaFastIndex::with_dense_prefix(named_count),
-            edge_blocks: Vec::new(),
+            edge_blocks: Arc::new(Vec::new()),
             compiled_edge_blocks: Vec::new(),
             jit_fns: Vec::new(),
             jit_module: None,
@@ -5233,6 +5427,8 @@ impl Simulator {
             edge_pos_seen: Vec::new(),
             edge_exec_wrote: Vec::new(),
             edge_exec_seen: Vec::new(),
+            proc_depth: 0,
+            deferred_comb: Vec::new(),
             in_edge_rescan: false,
             edge_rescan_block_hits: HashMap::default(),
             stall_edge_block_hits: HashMap::default(),
@@ -5254,6 +5450,9 @@ impl Simulator {
             edge_block_off: Vec::new(),
             edge_block_snap_valid: Vec::new(),
             edge_block_change_streak: Vec::new(),
+            edge_block_skip_streak: Vec::new(),
+            event_heal: 16,
+            event_healed: 0,
             edge_block_epoch_probe_left: Vec::new(),
             armed_edge: std::env::var("XEZIM_ARMED_EDGE").ok().as_deref() != Some("0")
                 || std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
@@ -8469,6 +8668,9 @@ impl Simulator {
                 _ => EdgeKind::Posedge,
             };
             if let Some(clk) = clk {
+                // §14.3 renaming: the meta/snapshot key on the RESOLVED NET;
+                // `alias_map` translates the clocking-visible name to it.
+                let mut alias_map: HashMap<String, String> = HashMap::default();
                 let sigs: Vec<(String, bool)> = cd
                     .signals
                     .iter()
@@ -8478,9 +8680,24 @@ impl Simulator {
                             crate::ast::types::PortDirection::Input
                                 | crate::ast::types::PortDirection::Inout
                         );
-                        (s.name.name.clone(), is_input)
+                        let net = match s.bound_to.as_ref().and_then(Self::flatten_member_path) {
+                            Some(segs) if !segs.is_empty() => {
+                                let n = segs.join(".");
+                                alias_map.insert(s.name.name.clone(), n.clone());
+                                n
+                            }
+                            _ => s.name.name.clone(),
+                        };
+                        (net, is_input)
                     })
                     .collect();
+                if !alias_map.is_empty() {
+                    if cd.is_default {
+                        self.clocking_sig_alias
+                            .insert("__xz_default_clocking".to_string(), alias_map.clone());
+                    }
+                    self.clocking_sig_alias.insert(cb_name.clone(), alias_map);
+                }
                 // §14.11: alias the parser's reserved `##N` marker to the
                 // `default clocking` block, so the desugared
                 // `repeat (N) @(__xz_default_clocking)` resolves through the
@@ -8496,6 +8713,58 @@ impl Simulator {
                 self.clocking_prev_clock.insert(cb_name.clone(), 2);
                 self.clocking_snapshots
                     .insert(cb_name.clone(), HashMap::default());
+            }
+        }
+        // §14.4 output skews: evaluate the per-cb default and per-signal
+        // output-skew expressions to ticks. Collected first (clones) because
+        // eval_delay_ticks needs &mut self.
+        let skew_specs: Vec<(String, bool, Option<Expression>, Vec<(String, Expression)>)> = self
+            .module
+            .clocking_blocks
+            .iter()
+            .map(|(n, cd)| {
+                let per_sig: Vec<(String, Expression)> = cd
+                    .signals
+                    .iter()
+                    .filter(|s| {
+                        !matches!(
+                            s.direction,
+                            crate::ast::types::PortDirection::Input
+                                | crate::ast::types::PortDirection::Inout
+                        )
+                    })
+                    .filter_map(|s| s.skew.clone().map(|e| (s.name.name.clone(), e)))
+                    .collect();
+                (n.clone(), cd.is_default, cd.default_output_skew.clone(), per_sig)
+            })
+            .collect();
+        let skew_ticks = |slf: &mut Self, e: &Expression| -> u64 {
+            // A `#1ns` skew is an ABSOLUTE time literal (stored in seconds);
+            // convert against the global tick directly — eval_delay_ticks'
+            // module-timescale context isn't established at compile time.
+            if let ExprKind::Number(crate::ast::expr::NumberLiteral::Time(secs)) = &e.kind {
+                return (secs / slf.tick_s).round() as u64;
+            }
+            slf.eval_delay_ticks(e)
+        };
+        for (cb, is_default, dskew, per_sig) in skew_specs {
+            if let Some(e) = dskew {
+                let t = skew_ticks(self, &e);
+                if t > 0 {
+                    self.clocking_out_skew.insert(cb.clone(), t);
+                    if is_default {
+                        self.clocking_out_skew
+                            .insert("__xz_default_clocking".to_string(), t);
+                    }
+                }
+            }
+            let mut m: HashMap<String, u64> = HashMap::default();
+            for (net, e) in per_sig {
+                let t = skew_ticks(self, &e);
+                m.insert(net, t);
+            }
+            if !m.is_empty() {
+                self.clocking_sig_out_skew.insert(cb, m);
             }
         }
         // Friendly fallback: `##N` with a single clocking block and no
@@ -8738,7 +9007,7 @@ impl Simulator {
         // local Vec first so we can release the &self.id_to_name borrow
         // before mutating self.edge_signal_names.
         let mut edge_sens: Vec<(String, usize)> = Vec::new();
-        for block in &self.edge_blocks {
+        for block in self.edge_blocks.iter() {
             for sens in &block.resolved_sensitivities {
                 if sens.signal_id < self.id_to_name.len() {
                     edge_sens.push((self.name_for_id(sens.signal_id).to_string(), sens.signal_id));
@@ -8748,6 +9017,48 @@ impl Simulator {
         for (name, sig_id) in edge_sens {
             self.edge_signal_names.insert(name);
             self.edge_signal_ids.push(sig_id);
+        }
+        // Dropped-cell early warning: a flop clock/reset that is an IMPLICIT
+        // (undeclared) net means the driver instance was dropped — almost
+        // always an unresolved vendor cell (see the '-v resolution summary'
+        // notes). The X clock/reset then silently corrupts everything
+        // downstream (dead clocks, dividers stuck in reset), which shows up
+        // hours later as a hang or an oracle mismatch. Say it up front, once,
+        // with the offending nets, so the missing library is fixed instead of
+        // debugged. (Same family as the UDP-terminal IMPLICIT-NET note, but
+        // for RTL edge blocks and always-on rather than --primitive-verbose.)
+        if !self.module.implicit_nets.is_empty() {
+            let mut hit: HashMap<String, usize> = HashMap::default();
+            for block in self.edge_blocks.iter() {
+                for sens in &block.resolved_sensitivities {
+                    let name = self.name_for_id(sens.signal_id);
+                    if self.module.implicit_nets.contains(name) {
+                        *hit.entry(name.to_string()).or_default() += 1;
+                    }
+                }
+            }
+            if !hit.is_empty() {
+                let mut names: Vec<(&String, &usize)> = hit.iter().collect();
+                names.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                let shown: Vec<String> = names
+                    .iter()
+                    .take(8)
+                    .map(|(n, c)| format!("'{}' ({} block(s))", n, c))
+                    .collect();
+                eprintln!(
+                    "[xezim][warning] {} edge-block clock/reset input(s) are IMPLICIT \
+                     (undeclared) nets — the driving instance was likely DROPPED as an \
+                     unresolved cell (see 'unresolved definition' notes above). These \
+                     clocks/resets stay X and everything they clock is dead: {}{}",
+                    hit.len(),
+                    shown.join(", "),
+                    if names.len() > 8 {
+                        format!(", … and {} more", names.len() - 8)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
         }
         // Also collect from event waiters that are registered at time 0
         self.edge_signal_ids.sort_unstable();
@@ -9261,7 +9572,7 @@ impl Simulator {
                 // AST entries always need &mut self.
                 CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {}
                 // §29 UDPs mutate per-instance state — never parallel-safe.
-                CombItem::Udp { .. } => {}
+                CombItem::Udp { .. } | CombItem::UdpBatch { .. } => {}
             }
             if e.has_unresolved_reads {
                 unresolved += 1;
@@ -9815,6 +10126,21 @@ impl Simulator {
                 };
                 (dst, v)
             }
+            FusedGate::UdpLut3 {
+                dst,
+                inputs,
+                input_count,
+                table,
+            } => {
+                let mut lut_idx = 0usize;
+                let mut place = 1usize;
+                for input in inputs.iter().take(*input_count as usize) {
+                    let code = view[input.sig_id as usize].get_bit_code(input.bit as usize);
+                    lut_idx += usize::from(code.min(2)) * place;
+                    place *= 3;
+                }
+                (dst, ((table >> (lut_idx * 2)) & 3) as u8)
+            }
         };
         let id = dst.sig_id as usize;
         if view[id].set_bit_code(dst.bit as usize, new_bit) {
@@ -9838,7 +10164,7 @@ impl Simulator {
             CombItem::Noop => true,
             // §29 UDPs are never evaluated on this isolated (parallel) path —
             // `has_udp` forces the serial settle. Present only for exhaustiveness.
-            CombItem::Udp { .. } => true,
+            CombItem::Udp { .. } | CombItem::UdpBatch { .. } => true,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 // LRM §9.3.1: skip if the destination is forced
                 if !self.forced_signals.contains_key(dst_id) {
@@ -9984,7 +10310,7 @@ impl Simulator {
         match item {
             CombItem::Noop => true,
             // §29 UDPs never run on this isolated path (serial forced).
-            CombItem::Udp { .. } => true,
+            CombItem::Udp { .. } | CombItem::UdpBatch { .. } => true,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 let (mut sv, mut sx) = view[*src_id].raw_bits();
                 // §6.11.1/§10.7: a 2-state destination drops X/Z (X/Z -> 0).
@@ -11001,7 +11327,7 @@ impl Simulator {
                 CombItem::Noop => SendCombItem::Noop,
                 // §29 UDPs disable parallel settle (has_udp forces serial), so a
                 // UDP never reaches a worker; represent it inertly here.
-                CombItem::Udp { .. } => SendCombItem::Noop,
+                CombItem::Udp { .. } | CombItem::UdpBatch { .. } => SendCombItem::Noop,
                 CombItem::FastDirectCopy { dst_id, src_id } => SendCombItem::FastDirectCopy {
                     dst_id: *dst_id,
                     src_id: *src_id,
@@ -12193,6 +12519,99 @@ impl Simulator {
         walk(stmt)
     }
 
+    /// True when every term of an explicit event control is a PLAIN identifier
+    /// (edge qualifier allowed). A term carrying a select or an expression —
+    /// `@(vco_tap[c_ph_val[0]])`, `@(sig[5:0])`, `@({a,b})` — collapses to just
+    /// its base identifier in `event_to_sens`, which drops the signals that
+    /// appear in the INDEX. Such a block genuinely needs the comb path's
+    /// read-set sensitivity so it re-evaluates when the index changes
+    /// (tests/prtest/pr2011429.v: `c_ph_val[0]` selects which tap is watched).
+    /// Only for all-plain lists is the explicit list a complete description of
+    /// what may trigger the block, and only then may we require the read set to
+    /// stay within it.
+    fn event_terms_all_plain_idents(stmt: &Statement) -> bool {
+        fn check(control: &TimingControl) -> bool {
+            let TimingControl::Event(EventControl::EventExpr(exprs)) = control else {
+                // `@*`, a named event, or any other form: leave the existing
+                // routing untouched.
+                return false;
+            };
+            exprs.iter().all(|ee| {
+                let mut e = &ee.expr;
+                while let ExprKind::Paren(inner) = &e.kind {
+                    e = inner;
+                }
+                matches!(&e.kind, ExprKind::Ident(_))
+            })
+        }
+        match &stmt.kind {
+            StatementKind::TimingControl { control, .. } => check(control),
+            StatementKind::SeqBlock { stmts, .. } => match stmts.first().map(|s| &s.kind) {
+                Some(StatementKind::TimingControl { control, .. }) => check(control),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Constant bit-select event terms of an explicit event control, as
+    /// `(signal_id, bit)`. `@(v[3])`, `@(posedge v[3])` and `@(v[3] or w)` all
+    /// yield the pair for `v`; a non-constant index (`@(v[i])`) yields nothing,
+    /// so those keep whole-signal sensitivity — that block also needs to wake
+    /// when the INDEX moves.
+    fn const_bitselect_event_terms(&self, stmt: &Statement) -> Vec<(usize, u32)> {
+        let mut out: Vec<(usize, u32)> = Vec::new();
+        let control = match &stmt.kind {
+            StatementKind::TimingControl { control, .. } => Some(control),
+            StatementKind::SeqBlock { stmts, .. } => match stmts.first().map(|s| &s.kind) {
+                Some(StatementKind::TimingControl { control, .. }) => Some(control),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(TimingControl::Event(EventControl::EventExpr(exprs))) = control else {
+            return out;
+        };
+        let top_prefix = format!("{}.", self.module.name);
+        for ee in exprs {
+            let mut e = &ee.expr;
+            while let ExprKind::Paren(inner) = &e.kind {
+                e = inner;
+            }
+            let ExprKind::Index { expr: base, index } = &e.kind else {
+                continue;
+            };
+            let ExprKind::Ident(h) = &base.kind else {
+                continue;
+            };
+            // A select on an ARRAY picks an element, not a bit — leave it.
+            if self.module.arrays.contains_key(Self::resolve_hier_name_static(h, &self.module).as_str()) {
+                continue;
+            }
+            let Some(bit) = Self::try_const_u64(index).and_then(|b| u32::try_from(b).ok())
+            else {
+                continue;
+            };
+            let raw = Self::resolve_hier_name_static(h, &self.module);
+            let sid = self
+                .signal_name_to_id
+                .get(raw.as_str())
+                .copied()
+                .or_else(|| {
+                    raw.strip_prefix(&top_prefix)
+                        .and_then(|b| self.signal_name_to_id.get(b).copied())
+                });
+            if let Some(sid) = sid {
+                // Only bits the u64 fast path can test; wider selects keep the
+                // whole-signal superset.
+                if bit < 64 && (self.signal_widths.get(sid).copied().unwrap_or(0) as u32) > bit {
+                    out.push((sid, bit));
+                }
+            }
+        }
+        out
+    }
+
     fn classify_one_always_block(&mut self, ab: AlwaysBlock) -> Option<AlwaysBlock> {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
@@ -12227,7 +12646,71 @@ impl Simulator {
                 // spins/starves the rest of the schedule. The edge path DOES
                 // honor a delayed body (same as `always @(posedge clk) #1 q=d`),
                 // so route a blocking-bodied level block there instead.
-                if all_level && !has_named_event && !self_ref && !self.stmt_is_blocking(&body) {
+                // §9.4.2: an explicit event control fires ONLY on the signals it
+                // lists. The comb-settle path DISCARDS the `@()` list (it takes
+                // `body`, not `ab.stmt`) and re-derives sensitivity from the
+                // body's READ SET, so it is faithful only when the body reads
+                // nothing beyond what the list already covers. A vendor
+                // timing-check notifier block breaks that assumption:
+                //     always @(notifier)
+                //        if (se && !bypass) cell.q <= 1'bx;
+                //        else if (wclk_seen == 0) corrupt_memory;
+                // reads se/bypass/wclk_seen — none of them listed — so the comb
+                // path re-fired it on every change of those and corrupted the
+                // memory model (a whole register-file testbench read back X).
+                // Compare RESOLVED signal ids, the same way the comb path
+                // resolves them, and keep the fast path only when the read set
+                // adds nothing. Unresolvable reads (parameters, genvars, loop
+                // locals) can never trigger anything, so they don't count.
+                let comb_sensitivity_is_faithful = if !Self::event_terms_all_plain_idents(&ab.stmt)
+                {
+                    // Index-dependent / select / concat sensitivity: the list
+                    // does not name everything that may trigger the block, so
+                    // the read-set superset is the intended behaviour.
+                    true
+                } else {
+                    let mut b_reads: HashSet<String> = HashSet::default();
+                    let mut b_writes: HashSet<String> = HashSet::default();
+                    Self::collect_stmt_reads(&body, &self.module, &mut b_reads, &mut b_writes);
+                    let scope_hint = self.infer_scope_from_rw_sets(&b_writes, &b_reads);
+                    let name_to_id = &self.signal_name_to_id;
+                    let resolve_ids = |name: &str| -> Vec<usize> {
+                        let mut out: Vec<usize> = Vec::new();
+                        if let Some(scope) = &scope_hint {
+                            if let Some(&id) =
+                                name_to_id.get(format!("{}.{}", scope, name).as_str())
+                            {
+                                out.push(id);
+                            }
+                        }
+                        if let Some(&id) = name_to_id.get(name) {
+                            out.push(id);
+                        } else if let Some(stripped) = name.strip_prefix(&top_prefix) {
+                            if let Some(&id) = name_to_id.get(stripped) {
+                                out.push(id);
+                            }
+                        }
+                        out
+                    };
+                    let mut sens_ids: Vec<usize> = Vec::new();
+                    for s in &sens {
+                        for id in resolve_ids(s.signal_name.as_str()) {
+                            if !sens_ids.contains(&id) {
+                                sens_ids.push(id);
+                            }
+                        }
+                    }
+                    // Mirror the comb path's `sens_reads = reads - writes`.
+                    b_reads
+                        .difference(&b_writes)
+                        .all(|r| resolve_ids(r.as_str()).iter().all(|id| sens_ids.contains(id)))
+                };
+                if all_level
+                    && !has_named_event
+                    && !self_ref
+                    && !self.stmt_is_blocking(&body)
+                    && comb_sensitivity_is_faithful
+                {
                     return Some(AlwaysBlock {
                         kind: ab.kind,
                         stmt: body,
@@ -12256,7 +12739,17 @@ impl Simulator {
                         None
                     })
                     .collect();
-                self.edge_blocks.push(EdgeSensitiveBlock {
+                let block_idx = self.edge_blocks.len();
+                // §9.4.2: record constant bit-select event terms (`@(v[3])`).
+                // `event_to_sens` walks past the select and yields the BASE
+                // signal, so without this the block would wake on a change to
+                // any bit of `v`. `check_edges_inner` narrows the wake to this
+                // bit; terms whose index is not a constant keep the (safe,
+                // superset) whole-signal behaviour.
+                for (sid, bit) in self.const_bitselect_event_terms(&ab.stmt) {
+                    self.bitsel_edge_sens.insert((sid, block_idx), bit);
+                }
+                Arc::make_mut(&mut self.edge_blocks).push(EdgeSensitiveBlock {
                     resolved_sensitivities: resolved,
                     stmt: body,
                     kind: ab.kind,
@@ -12400,7 +12893,7 @@ impl Simulator {
         let mut compiled = Vec::with_capacity(self.edge_blocks.len());
         let mut bc_count = 0;
         let mut max_regs: u32 = 0;
-        for block in &self.edge_blocks {
+        for block in self.edge_blocks.iter() {
             // Scope hint for unqualified idents inside the block: the
             // block's own inlining scope when it has one, else derived from
             // the first sensitivity signal. (Sensitivity-only derivation
@@ -15099,11 +15592,30 @@ impl Simulator {
             // otherwise scope a multi-driven net's folded
             // `b = $__wres(u1.b, u2.b)` into one INSTANCE, writing u2.b
             // instead of b and leaving the net z forever).
-            let lhs_is_absolute = matches!(&ca.lhs.kind,
-                ExprKind::Ident(h) if h.path.len() == 1
+            // The base ident of the LHS, looking through ONE select layer —
+            // `t[1:0] = …` and `t[i] = …` anchor on `t` just as `t = …` does.
+            let lhs_base_hier: Option<&crate::ast::expr::HierarchicalIdentifier> =
+                match &ca.lhs.kind {
+                    ExprKind::Ident(h) => Some(h),
+                    ExprKind::Index { expr: b, .. } | ExprKind::RangeSelect { expr: b, .. } => {
+                        match &b.kind {
+                            ExprKind::Ident(h) => Some(h),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+            // Applies to select-form LHS too: a port hop whose actual shares
+            // the SUBMODULE PORT's name (`.t(t[1:0])` in the testbench, tb
+            // signal also `t`) built `t[1:0] = u_t.t` with scope hint `u_t`,
+            // so the write resolved scope-first to `u_t.t` — a self-assign —
+            // and the testbench signal stayed X forever.
+            let lhs_is_absolute = lhs_base_hier.is_some_and(|h| {
+                h.path.len() == 1
                     && h.path[0].selects.is_empty()
                     && !h.path[0].name.name.contains('.')
-                    && self.signal_name_to_id.contains_key(h.path[0].name.name.as_str()));
+                    && self.signal_name_to_id.contains_key(h.path[0].name.name.as_str())
+            });
             let scope_hint = if lhs_is_absolute {
                 None
             } else {
@@ -15184,6 +15696,69 @@ impl Simulator {
             // gate-level netlists whose per-bit assigns `assign d[0] = expr;`
             // would otherwise clobber the whole vector wire.
             let lhs_is_bare_ident = matches!(ca.lhs.kind, ExprKind::Ident(_));
+            // A packed-struct member LHS (`assign s.m0 = …`) parses as a 2+-
+            // segment `Ident` whose base names a container with a registered
+            // field layout (after submodule inlining the scope is baked into
+            // the first segment, e.g. `Ident(["d1.s", "m0"])`). It resolves to
+            // no leaf signal, so `wids` is empty and it would fall to the AST
+            // interpreter — where its read dependency mis-resolves bare-first
+            // to the wrong (top-scope) input and never re-triggers when the
+            // real scoped input changes. Detect it here so it is routed through
+            // the bytecode sub-range path (which splices into the container),
+            // and record the container id as the write target so downstream
+            // readers re-fire when the member changes.
+            let struct_member_base_id: Option<usize> =
+                if let ExprKind::Ident(h) = &ca.lhs.kind {
+                    if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) {
+                        let member = h.path.last().unwrap().name.name.as_str();
+                        let base: String = h.path[..h.path.len() - 1]
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        let base_id = self
+                            .signal_name_to_id
+                            .get(base.as_str())
+                            .copied()
+                            .or_else(|| {
+                                scope_hint.as_ref().and_then(|sc| {
+                                    self.signal_name_to_id
+                                        .get(format!("{}.{}", sc, base).as_str())
+                                        .copied()
+                                })
+                            });
+                        let has_field = self
+                            .module
+                            .packed_struct_fields
+                            .get(base.as_str())
+                            .or_else(|| {
+                                scope_hint.as_ref().and_then(|sc| {
+                                    self.module
+                                        .packed_struct_fields
+                                        .get(&format!("{}.{}", sc, base))
+                                })
+                            })
+                            .is_some_and(|f| f.iter().any(|(m, _, _)| m == member));
+                        base_id.filter(|_| has_field)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            // Ensure the container is in the write set so the settle DAG links
+            // this entry to downstream readers of the whole struct.
+            let wids: Vec<usize> = if let Some(bid) = struct_member_base_id {
+                if wids.contains(&bid) {
+                    wids
+                } else {
+                    let mut w = wids;
+                    w.push(bid);
+                    w
+                }
+            } else {
+                wids
+            };
             // Try fused-gate fast path first: recognizes yosys patterns like
             // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
             // without VM dispatch, just bit reads + 4-state combinator + set_bit.
@@ -15202,7 +15777,7 @@ impl Simulator {
                 CombItem::FusedGate { op }
             } else if let Some(dc_val) = direct_copy {
                 dc_val
-            } else if wids.len() == 1 && lhs_is_bare_ident {
+            } else if wids.len() == 1 && lhs_is_bare_ident && struct_member_base_id.is_none() {
                 let dst_id = wids[0];
                 let width = self.signal_widths[dst_id];
                 let mut compiler = super::bytecode::BytecodeCompiler::new(
@@ -15256,9 +15831,11 @@ impl Simulator {
                         }
                     }
                 }
-            } else if !lhs_is_bare_ident {
+            } else if !lhs_is_bare_ident || struct_member_base_id.is_some() {
                 // Sub-range LHS: try bytecode compile so bit/range writes run
                 // at VM speed instead of through the interpreted assign_value.
+                // Packed-struct member LHS (`s.m0`) also routes here — the
+                // compiler splices it into the container's bit range.
                 let mut compiler = super::bytecode::BytecodeCompiler::new(
                     &self.signal_name_to_id,
                     &self.signal_signed,
@@ -15271,6 +15848,7 @@ impl Simulator {
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.top_module_name = Some(self.module.name.clone());
                 let lhs_w = compiler.infer_lhs_width_pub(&ca.lhs);
@@ -15357,6 +15935,26 @@ impl Simulator {
                 }
                 if let Some(&id) = self.signal_name_to_id.get(r.as_str()) {
                     rids.push(id);
+                    // An AST-evaluated entry resolves a bare name SCOPE-FIRST at
+                    // run time (`resolve_hier_name`), so depending only on the
+                    // top-level match is wrong: the entry evaluates `<scope>.r`
+                    // but is woken by a change to `r`. It then latched whatever
+                    // the scoped signal held on the first settle — X — and never
+                    // re-fired when the port copy actually arrived. Register the
+                    // scoped id too; a superset sensitivity only costs an extra
+                    // evaluation, while missing one loses the value entirely.
+                    if !entry_is_bytecode && !r.contains('.') {
+                        if let Some(scope) = &scope_hint {
+                            if let Some(&sid) = self
+                                .signal_name_to_id
+                                .get(format!("{}.{}", scope, r).as_str())
+                            {
+                                if sid != id {
+                                    rids.push(sid);
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 // Bytecode lookup also qualifies unresolved multi-segment
@@ -15474,6 +16072,10 @@ impl Simulator {
                     None
                 };
                 let scope_hint = self.infer_scope_from_rw_sets(&writes, &reads);
+                if std::env::var("XEZIM_AB_DBG").is_ok() {
+                    eprintln!("[ABDBG] always-block writes={:?} reads={:?} -> scope={:?}",
+                        writes, reads, scope_hint);
+                }
                 let wids: Vec<usize> = writes
                     .iter()
                     .filter_map(|w| resolve_one(w.as_str()))
@@ -16124,6 +16726,68 @@ impl Simulator {
         let mut pv_dropped = 0usize;
         let mut pv_const_terms = 0usize;
         let mut pv_implicit_terms = 0usize;
+        let mut programs: HashMap<
+            String,
+            (
+                Arc<[crate::ast::decl::UdpTableRow]>,
+                Option<Arc<[u8]>>,
+                usize,
+            ),
+        > = HashMap::default();
+        let mut pv_lut = 0usize;
+        let mut pv_event_filtered = 0usize;
+        // Flattened module ports are represented as zero-delay copies. Follow
+        // those aliases so UDPs clocked through separate wrapper-port nets can
+        // share one upstream event dispatch, as net/functor simulators do.
+        let mut event_aliases: HashMap<BitRef, BitRef> = HashMap::default();
+        for entry in entries.iter() {
+            match &entry.item {
+                CombItem::FastDirectCopy { dst_id, src_id }
+                    if self.signal_widths.get(*dst_id) == Some(&1)
+                        && self.signal_widths.get(*src_id) == Some(&1) =>
+                {
+                    event_aliases.insert(
+                        BitRef {
+                            sig_id: *dst_id as u32,
+                            bit: 0,
+                        },
+                        BitRef {
+                            sig_id: *src_id as u32,
+                            bit: 0,
+                        },
+                    );
+                }
+                CombItem::DirectCopy {
+                    dst_id,
+                    src_id,
+                    width: 1,
+                } => {
+                    event_aliases.insert(
+                        BitRef {
+                            sig_id: *dst_id as u32,
+                            bit: 0,
+                        },
+                        BitRef {
+                            sig_id: *src_id as u32,
+                            bit: 0,
+                        },
+                    );
+                }
+                CombItem::FusedGate {
+                    op:
+                        FusedGate::Buf1 {
+                            dst,
+                            src,
+                            invert: false,
+                        },
+                } => {
+                    event_aliases.insert(*dst, *src);
+                }
+                _ => {}
+            }
+        }
+        let mut event_batch_index: HashMap<BitRef, usize> = HashMap::default();
+        let mut event_batches: Vec<(BitRef, Vec<usize>)> = Vec::new();
         // `--primitive-verbose`: print every UDP instance with its source
         // location and each terminal's resolution (net + bit, constant, or
         // failure), so a dropped vendor cell can be diagnosed from the log
@@ -16273,6 +16937,70 @@ impl Simulator {
                 .map(|b| b.sig_id as usize)
                 .collect();
             let write_ids: Vec<usize> = vec![out_ref.sig_id as usize];
+            let (rows, transition_lut, lut_input_states) =
+                if let Some(program) = programs.get(&inst.udp_name) {
+                    program.clone()
+                } else {
+                    let rows: Arc<[crate::ast::decl::UdpTableRow]> =
+                        Arc::from(inst.rows.into_boxed_slice());
+                    let (transition_lut, lut_input_states) =
+                        Self::compile_udp_transition_lut(&rows, n, inst.is_sequential)
+                            .map_or((None, 0), |(lut, states)| (Some(Arc::from(lut)), states));
+                    let program = (rows, transition_lut, lut_input_states);
+                    programs.insert(inst.udp_name.clone(), program.clone());
+                    program
+                };
+            if transition_lut.is_some() {
+                pv_lut += 1;
+            }
+            let (event_input, event_transition_mask) = if inst.is_sequential {
+                transition_lut
+                    .as_ref()
+                    .and_then(|lut| Self::compile_udp_event_filter(lut, lut_input_states, n))
+                    .map_or((None, 0), |(input, mask)| (Some(input as u8), mask))
+            } else {
+                (None, 0)
+            };
+            if event_input.is_some() {
+                pv_event_filtered += 1;
+            }
+            if !inst.is_sequential
+                && inst.delay == 0
+                && n <= 3
+                && in_refs.iter().all(|input| input.sig_id != u32::MAX)
+            {
+                if let Some(lut) = transition_lut.as_ref() {
+                    let mut inputs = [out_ref; 3];
+                    inputs[..n].copy_from_slice(&in_refs);
+                    let mut table = 0u64;
+                    // For a combinational UDP, previous inputs and state do
+                    // not participate in row matching. Extract one current-
+                    // input plane from the general transition table.
+                    let prev_x = lut_input_states.saturating_sub(1);
+                    for cur_idx in 0..lut_input_states {
+                        let idx =
+                            ((2 * lut_input_states + prev_x) * lut_input_states) + cur_idx;
+                        table |= u64::from(lut[idx]) << (cur_idx * 2);
+                    }
+                    entries.push(CombEntry {
+                        item: CombItem::FusedGate {
+                            op: FusedGate::UdpLut3 {
+                                dst: out_ref,
+                                inputs,
+                                input_count: n as u8,
+                                table,
+                            },
+                        },
+                        scope_hint: None,
+                        read_signal_ids: read_ids,
+                        write_signal_ids: write_ids,
+                        has_unresolved_reads: false,
+                        defer_at_time0: false,
+                        span: inst.span,
+                    });
+                    continue;
+                }
+            }
             self.udp_runtime.push(UdpRuntime {
                 udp_name: inst.udp_name.clone(),
                 inst_path: inst.inst_path.clone(),
@@ -16280,12 +17008,39 @@ impl Simulator {
                 in_refs,
                 is_sequential: inst.is_sequential,
                 delay: inst.delay,
-                rows: inst.rows,
+                rows,
+                transition_lut,
+                lut_input_states,
+                input_state_idx: lut_input_states.saturating_sub(1),
+                event_input,
+                event_transition_mask,
                 state: init_state,
                 prev_inputs: vec![255u8; n],
                 initialized: false,
                 warned: false,
             });
+            if let Some(event_input) = event_input {
+                let mut event_ref = self.udp_runtime[idx].in_refs[event_input as usize];
+                if event_ref.sig_id != u32::MAX {
+                    for _ in 0..64 {
+                        let Some(&upstream) = event_aliases.get(&event_ref) else {
+                            break;
+                        };
+                        if upstream == event_ref {
+                            break;
+                        }
+                        event_ref = upstream;
+                    }
+                    let batch_idx = *event_batch_index.entry(event_ref).or_insert_with(|| {
+                        let batch_idx = event_batches.len();
+                        event_batches.push((event_ref, Vec::new()));
+                        batch_idx
+                    });
+                    event_batches[batch_idx].1.push(idx);
+                    self.has_udp = true;
+                    continue;
+                }
+            }
             entries.push(CombEntry {
                 item: CombItem::Udp { idx },
                 scope_hint: None,
@@ -16296,6 +17051,26 @@ impl Simulator {
                 span: inst.span,
             });
             self.has_udp = true;
+        }
+        let pv_batched_instances: usize = event_batches.iter().map(|(_, batch)| batch.len()).sum();
+        let pv_batches = event_batches.len();
+        for (event_ref, indices) in event_batches {
+            let write_signal_ids = indices
+                .iter()
+                .map(|&idx| self.udp_runtime[idx].out_ref.sig_id as usize)
+                .collect();
+            entries.push(CombEntry {
+                item: CombItem::UdpBatch {
+                    event_ref,
+                    indices: indices.into_boxed_slice(),
+                },
+                scope_hint: None,
+                read_signal_ids: vec![event_ref.sig_id as usize],
+                write_signal_ids,
+                has_unresolved_reads: false,
+                defer_at_time0: false,
+                span: crate::ast::Span::dummy(),
+            });
         }
         if pv && pv_total > 0 {
             eprintln!(
@@ -16316,6 +17091,18 @@ impl Simulator {
                 }
             );
         }
+        if std::env::var("XEZIM_DEP_STATS").is_ok() && pv_total > 0 {
+            eprintln!(
+                "[UDP_STATS] instances={} transition_lut={} row_fallback={} event_filtered={} batched_instances={} batches={} shared_definitions={}",
+                pv_total,
+                pv_lut,
+                pv_total.saturating_sub(pv_lut),
+                pv_event_filtered,
+                pv_batched_instances,
+                pv_batches,
+                programs.len()
+            );
+        }
         // A UDP output initializes to x (a reference simulator), not the undriven-wire z — a
         // sequential UDP to its `initial` start state (default x), a
         // combinational UDP to x until its first evaluation drives it. This is
@@ -16327,6 +17114,117 @@ impl Simulator {
                 self.table_modified = true;
             }
         }
+    }
+
+    /// Compile a small UDP definition into a dense ternary transition table.
+    /// The table is shared by all flattened instances of that definition.
+    fn compile_udp_transition_lut(
+        rows: &[crate::ast::decl::UdpTableRow],
+        input_count: usize,
+        is_sequential: bool,
+    ) -> Option<(Box<[u8]>, usize)> {
+        const MAX_LUT_ENTRIES: usize = 200_000;
+        let input_states = 3usize.checked_pow(input_count as u32)?;
+        let entries = input_states
+            .checked_mul(input_states)?
+            .checked_mul(3)?;
+        if entries > MAX_LUT_ENTRIES {
+            return None;
+        }
+
+        #[inline]
+        fn decode_ternary(mut encoded: usize, values: &mut [u8]) {
+            for value in values {
+                *value = (encoded % 3) as u8;
+                encoded /= 3;
+            }
+        }
+
+        let mut lut = vec![2u8; entries];
+        let mut cur = vec![0u8; input_count];
+        let mut prev = vec![0u8; input_count];
+        for state in 0..3u8 {
+            for prev_idx in 0..input_states {
+                decode_ternary(prev_idx, &mut prev);
+                for cur_idx in 0..input_states {
+                    decode_ternary(cur_idx, &mut cur);
+                    let mut next = 2u8;
+                    for row in rows {
+                        if let Some(output) =
+                            Self::udp_match_row(row, &cur, &prev, state, is_sequential)
+                        {
+                            next = output.unwrap_or(state);
+                            break;
+                        }
+                    }
+                    let idx = ((state as usize * input_states + prev_idx) * input_states)
+                        + cur_idx;
+                    lut[idx] = next;
+                }
+            }
+        }
+        Some((lut.into_boxed_slice(), input_states))
+    }
+
+    /// Find a single event-bearing input for an edge-triggered sequential UDP.
+    /// If changing any combination of the other inputs while this port is
+    /// stable always holds state, those inputs are data terminals. The returned
+    /// mask identifies event-port transitions that can possibly change state.
+    fn compile_udp_event_filter(
+        lut: &[u8],
+        input_states: usize,
+        input_count: usize,
+    ) -> Option<(usize, u16)> {
+        for event_input in 0..input_count {
+            let place = 3usize.pow(event_input as u32);
+            let digit = |encoded: usize| (encoded / place) % 3;
+            let mut passive_holds = true;
+            for state in 0..3usize {
+                for prev_idx in 0..input_states {
+                    for cur_idx in 0..input_states {
+                        if prev_idx != cur_idx
+                            && digit(prev_idx) == digit(cur_idx)
+                            && lut[(state * input_states + prev_idx) * input_states + cur_idx]
+                                != state as u8
+                        {
+                            passive_holds = false;
+                            break;
+                        }
+                    }
+                    if !passive_holds {
+                        break;
+                    }
+                }
+                if !passive_holds {
+                    break;
+                }
+            }
+            if !passive_holds {
+                continue;
+            }
+
+            let mut mask = 0u16;
+            for state in 0..3usize {
+                for cur_idx in 0..input_states {
+                    let cur_digit = digit(cur_idx);
+                    for prev_digit in 0..3usize {
+                        if prev_digit == cur_digit {
+                            continue;
+                        }
+                        let prev_idx = cur_idx - cur_digit * place + prev_digit * place;
+                        let next =
+                            lut[(state * input_states + prev_idx) * input_states + cur_idx];
+                        if next != state as u8 {
+                            mask |= 1u16 << (prev_digit * 3 + cur_digit);
+                        }
+                    }
+                }
+            }
+            if mask != 0 {
+                return Some((event_input, mask));
+            }
+        }
+        None
     }
 
     /// IEEE 1800-2017 §29: evaluate one UDP instance on an input change.
@@ -16349,6 +17247,87 @@ impl Simulator {
             }
             return;
         }
+        if self.udp_runtime[idx].initialized {
+            if let Some(event_input) = self.udp_runtime[idx].event_input {
+                let event_input = event_input as usize;
+                let input = self.udp_runtime[idx].in_refs[event_input];
+                let code = if input.sig_id == u32::MAX {
+                    input.bit as u8
+                } else {
+                    self.signal_table[input.sig_id as usize]
+                        .get_bit_code(input.bit as usize)
+                        .min(2)
+                };
+                let place = 3usize.pow(event_input as u32);
+                let prev = (self.udp_runtime[idx].input_state_idx / place) % 3;
+                let transition = prev * 3 + code as usize;
+                if prev == code as usize {
+                    // This entry was triggered by a data-terminal change.
+                    // Such changes were proven state-holding by the compiled
+                    // filter; refresh their cached trits without a LUT lookup.
+                    let mut encoded = self.udp_runtime[idx].input_state_idx;
+                    let mut data_place = 1usize;
+                    for i in 0..n {
+                        if i != event_input {
+                            let input = self.udp_runtime[idx].in_refs[i];
+                            let input_code = if input.sig_id == u32::MAX {
+                                input.bit as u8
+                            } else {
+                                self.signal_table[input.sig_id as usize]
+                                    .get_bit_code(input.bit as usize)
+                                    .min(2)
+                            };
+                            let old = (encoded / data_place) % 3;
+                            encoded =
+                                encoded - old * data_place + input_code as usize * data_place;
+                        }
+                        data_place *= 3;
+                    }
+                    self.udp_runtime[idx].input_state_idx = encoded;
+                    return;
+                }
+                if prev != code as usize
+                    && self.udp_runtime[idx].event_transition_mask & (1u16 << transition) == 0
+                {
+                    let rt = &mut self.udp_runtime[idx];
+                    rt.input_state_idx =
+                        rt.input_state_idx - prev * place + code as usize * place;
+                    return;
+                }
+                if prev != code as usize {
+                    let mut cur_idx = 0usize;
+                    let mut input_place = 1usize;
+                    for input in &self.udp_runtime[idx].in_refs {
+                        let input_code = if input.sig_id == u32::MAX {
+                            input.bit as u8
+                        } else {
+                            self.signal_table[input.sig_id as usize]
+                                .get_bit_code(input.bit as usize)
+                                .min(2)
+                        };
+                        cur_idx += input_code as usize * input_place;
+                        input_place *= 3;
+                    }
+                    let prev_idx =
+                        cur_idx - code as usize * place + prev * place;
+                    let rt = &self.udp_runtime[idx];
+                    let lut = rt.transition_lut.as_ref().expect("filtered UDP has LUT");
+                    let lut_idx = ((rt.state as usize * rt.lut_input_states + prev_idx)
+                        * rt.lut_input_states)
+                        + cur_idx;
+                    let new_code = lut[lut_idx];
+                    {
+                        let rt = &mut self.udp_runtime[idx];
+                        rt.state = new_code;
+                        rt.input_state_idx = cur_idx;
+                    }
+                    self.drive_udp_output(idx, new_code);
+                    return;
+                }
+            }
+        }
+        let mut cur_idx = 0usize;
+        let mut place = 1usize;
         for i in 0..n {
             let b = self.udp_runtime[idx].in_refs[i];
             let code = if b.sig_id == u32::MAX {
@@ -16358,66 +17337,103 @@ impl Simulator {
                 self.signal_table[b.sig_id as usize].get_bit_code(b.bit as usize)
             };
             cur[i] = if code >= 2 { 2 } else { code }; // 0,1,x (z->x)
+            cur_idx += cur[i] as usize * place;
+            place *= 3;
         }
 
         let rt = &self.udp_runtime[idx];
         let first = !rt.initialized;
         let cur_state = rt.state;
+        let has_lut = rt.transition_lut.is_some();
 
         // Previous input levels. Before the first evaluation each input's prior
         // value is x (its pre-time-0 state), so a t=0 x→value transition is a
         // real edge — matching a reference simulator.
         let mut prev = [2u8; 32];
-        for i in 0..n {
-            prev[i] = if first { 2 } else { rt.prev_inputs[i] };
+        if !has_lut {
+            for i in 0..n {
+                prev[i] = if first { 2 } else { rt.prev_inputs[i] };
+            }
         }
 
         // A UDP is event-driven: it evaluates only when an input actually
         // changes. A spurious re-trigger with no input change must NOT alter the
         // output (a reference simulator never re-evaluates without an event). The very first
         // evaluation always runs so combinational level rows establish t=0.
-        let any_change = first || (0..n).any(|i| cur[i] != prev[i]);
+        let any_change = first
+            || if has_lut {
+                cur_idx != rt.input_state_idx
+            } else {
+                (0..n).any(|i| cur[i] != prev[i])
+            };
         if !any_change {
             return;
         }
 
-        // Select the first matching row (top-down).
-        let mut next: Option<u8> = None; // Some(level) or None(=`-` hold)
-        let mut matched = false;
-        for row in &rt.rows {
-            if let Some(out) =
-                Self::udp_match_row(row, &cur[..n], &prev[..n], cur_state, rt.is_sequential)
-            {
-                next = out;
-                matched = true;
-                break;
+        let new_code = if let Some(lut) = &rt.transition_lut {
+            let mut prev_idx = if first {
+                rt.lut_input_states.saturating_sub(1)
+            } else {
+                rt.input_state_idx
+            };
+            if let Some(event_input) = rt.event_input {
+                // Data-terminal changes were intentionally not dispatched.
+                // Treat their previous values as already current so this LUT
+                // lookup represents only the event-bearing input transition.
+                let event_input = event_input as usize;
+                let mut place = 1usize;
+                for i in 0..n {
+                    if i != event_input {
+                        let old = (prev_idx / place) % 3;
+                        prev_idx = prev_idx - old * place + cur[i] as usize * place;
+                    }
+                    place *= 3;
+                }
             }
-        }
-
-        // Resolve the driven value. Per a reference simulator (empirically): on ANY input
-        // change with no matching row the output becomes x — for both
-        // combinational (§29.3) and sequential UDPs. Holding happens only via an
-        // explicit `-` output row (or when no input changed, handled above).
-        let new_code: u8 = if matched {
-            match next {
-                Some(c) => c,      // explicit 0/1/x
-                None => cur_state, // `-` no-change (sequential hold)
-            }
+            let idx = ((cur_state as usize * rt.lut_input_states + prev_idx)
+                * rt.lut_input_states)
+                + cur_idx;
+            lut[idx]
         } else {
-            2 // no matching row ⇒ x
+            // Select the first matching row (top-down).
+            let mut next: Option<u8> = None;
+            let mut matched = false;
+            for row in rt.rows.iter() {
+                if let Some(out) =
+                    Self::udp_match_row(row, &cur[..n], &prev[..n], cur_state, rt.is_sequential)
+                {
+                    next = out;
+                    matched = true;
+                    break;
+                }
+            }
+
+            // On an input change with no matching row the output becomes x.
+            if matched {
+                next.unwrap_or(cur_state)
+            } else {
+                2
+            }
         };
 
         // Commit state + previous-input vector.
         {
             let rt = &mut self.udp_runtime[idx];
             rt.state = new_code;
+            rt.input_state_idx = cur_idx;
             for i in 0..n {
                 rt.prev_inputs[i] = cur[i];
             }
             rt.initialized = true;
         }
 
-        // Drive the output net.
+        self.drive_udp_output(idx, new_code);
+    }
+
+    /// Commit a UDP result using delayed, sequential-NBA, or immediate
+    /// combinational semantics as appropriate for the instance.
+    #[inline(always)]
+    fn drive_udp_output(&mut self, idx: usize, new_code: u8) {
         let out_ref = self.udp_runtime[idx].out_ref;
         let delay = self.udp_runtime[idx].delay;
         let is_seq = self.udp_runtime[idx].is_sequential;
@@ -16454,6 +17470,81 @@ impl Simulator {
             self.table_modified = true;
             self.after_signal_write(id);
             self.mark_dirty_id(id);
+        }
+    }
+
+    /// Direct event dispatch for sequential UDPs sharing an upstream event
+    /// terminal. The event value is read once; inactive edges only update each
+    /// instance's cached event trit, while active edges read data terminals and
+    /// perform one encoded LUT lookup.
+    #[inline(always)]
+    fn eval_udp_batch(&mut self, event_ref: BitRef, indices: &[usize]) {
+        let event_code = self.signal_table[event_ref.sig_id as usize]
+            .get_bit_code(event_ref.bit as usize)
+            .min(2);
+        for &idx in indices {
+            if !self.udp_runtime[idx].initialized {
+                self.eval_udp(idx);
+                continue;
+            }
+            let event_input = self.udp_runtime[idx]
+                .event_input
+                .expect("batched UDP has event input") as usize;
+            let instance_event_ref = self.udp_runtime[idx].in_refs[event_input];
+            let event_code = if !self.forced_signals.is_empty()
+                && self
+                    .forced_signals
+                    .contains_key(&(instance_event_ref.sig_id as usize))
+            {
+                self.signal_table[instance_event_ref.sig_id as usize]
+                    .get_bit_code(instance_event_ref.bit as usize)
+                    .min(2)
+            } else {
+                event_code
+            };
+            let event_place = 3usize.pow(event_input as u32);
+            let prev_event =
+                (self.udp_runtime[idx].input_state_idx / event_place) % 3;
+            if prev_event == event_code as usize {
+                continue;
+            }
+            let transition = prev_event * 3 + event_code as usize;
+            if self.udp_runtime[idx].event_transition_mask & (1u16 << transition) == 0 {
+                let rt = &mut self.udp_runtime[idx];
+                rt.input_state_idx = rt.input_state_idx - prev_event * event_place
+                    + event_code as usize * event_place;
+                continue;
+            }
+
+            let mut cur_idx = 0usize;
+            let mut place = 1usize;
+            for (input_idx, input) in self.udp_runtime[idx].in_refs.iter().enumerate() {
+                let code = if input_idx == event_input {
+                    event_code
+                } else if input.sig_id == u32::MAX {
+                    input.bit as u8
+                } else {
+                    self.signal_table[input.sig_id as usize]
+                        .get_bit_code(input.bit as usize)
+                        .min(2)
+                };
+                cur_idx += code as usize * place;
+                place *= 3;
+            }
+            let prev_idx =
+                cur_idx - event_code as usize * event_place + prev_event * event_place;
+            let rt = &self.udp_runtime[idx];
+            let lut = rt.transition_lut.as_ref().expect("batched UDP has LUT");
+            let lut_idx =
+                ((rt.state as usize * rt.lut_input_states + prev_idx) * rt.lut_input_states)
+                    + cur_idx;
+            let new_code = lut[lut_idx];
+            {
+                let rt = &mut self.udp_runtime[idx];
+                rt.state = new_code;
+                rt.input_state_idx = cur_idx;
+            }
+            self.drive_udp_output(idx, new_code);
         }
     }
 
@@ -16739,25 +17830,30 @@ impl Simulator {
         if self.signal_name_to_id.contains_key(lhs_leaf.as_str()) {
             return None;
         }
-        let suffix = format!(".{}", lhs_leaf);
         let mut leaves = HashSet::default();
         Self::collect_leaf_idents(lhs, &mut leaves);
         Self::collect_leaf_idents(rhs, &mut leaves);
         if leaves.is_empty() {
             return None;
         }
+        self.best_scope_from_leaf_index(lhs_leaf.as_str(), &leaves)
+    }
 
-        let mut best_parent: Option<String> = None;
+    fn best_scope_from_leaf_index(
+        &self,
+        anchor: &str,
+        leaves: &HashSet<String>,
+    ) -> Option<String> {
+        let parents = self.scope_parents_by_leaf.get(anchor)?;
+        let mut best_parent: Option<&str> = None;
         let mut best_score = 0usize;
         let mut best_depth = 0usize;
-        for full_name in self.signal_name_to_id.keys() {
-            let Some(parent) = full_name.strip_suffix(&suffix) else {
-                continue;
-            };
+        for parent in parents {
             let mut score = 0usize;
-            for leaf in &leaves {
-                let candidate = format!("{}.{}", parent, leaf);
-                if self.signal_name_to_id.contains_key(candidate.as_str()) {
+            for leaf in leaves {
+                if self.scope_parents_by_leaf.get(leaf.as_str()).is_some_and(
+                    |leaf_parents| leaf_parents.iter().any(|candidate| candidate == parent),
+                ) {
                     score += 1;
                 }
             }
@@ -16766,18 +17862,14 @@ impl Simulator {
                 || (score == best_score && depth > best_depth)
                 || (score == best_score
                     && depth == best_depth
-                    && best_parent.as_ref().is_none_or(|p| parent.len() > p.len()))
+                    && best_parent.is_none_or(|best| parent.len() > best.len()))
             {
-                best_parent = Some(parent.to_string());
+                best_parent = Some(parent.as_ref());
                 best_score = score;
                 best_depth = depth;
             }
         }
-        if best_score == 0 {
-            None
-        } else {
-            best_parent
-        }
+        (best_score != 0).then(|| best_parent.expect("positive score has parent").to_string())
     }
 
     fn infer_scope_from_rw_sets(
@@ -16803,39 +17895,7 @@ impl Simulator {
                 leaves.insert(name.clone());
             }
         }
-        let anchor = anchor?;
-        let suffix = format!(".{}", anchor);
-        let mut best_parent: Option<String> = None;
-        let mut best_score = 0usize;
-        let mut best_depth = 0usize;
-        for full_name in self.signal_name_to_id.keys() {
-            let Some(parent) = full_name.strip_suffix(&suffix) else {
-                continue;
-            };
-            let mut score = 0usize;
-            for leaf in &leaves {
-                let candidate = format!("{}.{}", parent, leaf);
-                if self.signal_name_to_id.contains_key(candidate.as_str()) {
-                    score += 1;
-                }
-            }
-            let depth = parent.split('.').count();
-            if score > best_score
-                || (score == best_score && depth > best_depth)
-                || (score == best_score
-                    && depth == best_depth
-                    && best_parent.as_ref().is_none_or(|p| parent.len() > p.len()))
-            {
-                best_parent = Some(parent.to_string());
-                best_score = score;
-                best_depth = depth;
-            }
-        }
-        if best_score == 0 {
-            None
-        } else {
-            best_parent
-        }
+        self.best_scope_from_leaf_index(anchor?.as_str(), &leaves)
     }
 
     /// Collect all signal names read by an expression.
@@ -16866,11 +17926,80 @@ impl Simulator {
         });
     }
 
+    /// Every element name of a 2-D unpacked array addressed as `m[i][j]`,
+    /// given the INNER `m[i]` expression. `None` when `base` is not an index
+    /// into a registered 2-D array. Used to give a reader of one element a real
+    /// dependency: the array base carries no signal id of its own.
+    /// Element names a `m[i][j]` read depends on. With CONSTANT subscripts that
+    /// is a single element; only a dynamic subscript needs the whole array.
+    /// `outer_index` is the subscript applied to `base` by the caller.
+    fn multi_dim_elem_names(
+        base: &Expression,
+        module: &ElaboratedModule,
+        outer_index: Option<&Expression>,
+    ) -> Option<Vec<String>> {
+        let ExprKind::Index {
+            expr: inner,
+            index: inner_index,
+        } = &base.kind
+        else {
+            return None;
+        };
+        let ExprKind::Ident(h) = &inner.kind else {
+            return None;
+        };
+        let name = Self::resolve_hier_name_static(h, module);
+        let ((a0, a1), (b0, b1), _) = *module.arrays_2d.get(&name)?;
+        let (alo, ahi) = (a0.min(a1), a0.max(a1));
+        let (blo, bhi) = (b0.min(b1), b0.max(b1));
+        // Fold both subscripts when possible. Expanding every element is
+        // correct but makes each element carry the whole array's readers, so a
+        // single-bit change drags the entire array's dependents into the settle
+        // worklist (measured: 1536 dependents where the design connects ~2).
+        let fold = |e: &Expression, lo: i64, hi: i64| -> Option<i64> {
+            Self::const_expr_u64(e, &module.parameters)
+                .map(|v| v as i64)
+                .filter(|i| *i >= lo && *i <= hi)
+        };
+        if let (Some(a), Some(b)) = (
+            fold(inner_index, alo, ahi),
+            outer_index.and_then(|e| fold(e, blo, bhi)),
+        ) {
+            return Some(vec![format!("{}[{}][{}]", name, a, b)]);
+        }
+        let mut out = Vec::new();
+        for a in alo..=ahi {
+            for b in blo..=bhi {
+                out.push(format!("{}[{}][{}]", name, a, b));
+            }
+        }
+        Some(out)
+    }
+
     fn collect_expr_reads(
         expr: &Expression,
         module: &ElaboratedModule,
         reads: &mut HashSet<String>,
     ) {
+        // §14.13: a clocking-signal read (`cb.sig`, `iface.cb.sig`, either the
+        // flat-Ident or MemberAccess shape) depends on the hidden sample mirror,
+        // NOT on the underlying net — the sample only moves at the block's clock
+        // edge. Registering the net instead made `always @(cb.sig)` re-fire on
+        // the net's own (possibly mid-cycle) changes.
+        if let Some(segs) = Self::flatten_member_path(expr) {
+            if segs.len() >= 2 {
+                let cb = segs[..segs.len() - 1].join(".");
+                if module.clocking_blocks.contains_key(&cb) {
+                    reads.insert(format!(
+                        "{}{}.{}",
+                        CB_SAMPLE_PREFIX,
+                        cb,
+                        segs[segs.len() - 1]
+                    ));
+                    return;
+                }
+            }
+        }
         match &expr.kind {
             ExprKind::Ident(hier) => {
                 let name = Self::resolve_hier_name_static(hier, module);
@@ -16892,15 +18021,47 @@ impl Simulator {
                 reads.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
-                // For array[idx]: conservatively add all array elements
                 if let ExprKind::Ident(hier) = &base.kind {
                     let name = Self::resolve_hier_name_static(hier, module);
                     if let Some((lo, hi, _)) = module.arrays.get(&name) {
-                        for i in *lo..=*hi {
-                            reads.insert(format!("{}[{}]", name, i));
+                        // A CONSTANT index depends on exactly one element.
+                        // Registering the whole array here (the old
+                        // unconditional behaviour) is correct but quadratically
+                        // expensive: after generate unrolling an index like
+                        // `q[(c + d) % N]` folds to a literal, yet every such
+                        // reader was recorded against all N elements. On a
+                        // 128-column fabric each 1-bit element ended up with
+                        // 1664 dependents instead of ~13, so one bit changing
+                        // dragged 128x more entries into the settle worklist
+                        // than the design actually connects.
+                        let folded = Self::const_expr_u64(index, &module.parameters)
+                            .map(|v| v as i64)
+                            .filter(|i| *i >= *lo && *i <= *hi);
+                        match folded {
+                            Some(i) => {
+                                reads.insert(format!("{}[{}]", name, i));
+                            }
+                            // Genuinely dynamic index: any element may be read.
+                            None => {
+                                for i in *lo..=*hi {
+                                    reads.insert(format!("{}[{}]", name, i));
+                                }
+                            }
                         }
                     } else {
                         reads.insert(name);
+                    }
+                } else if let Some(elems) =
+                    Self::multi_dim_elem_names(base, module, Some(index))
+                {
+                    // 2-D element read (`m[i][j]`): the base is itself an Index,
+                    // so the 1-D expansion above never fires and only the array
+                    // BASE name was registered — a name with no signal id, so the
+                    // reader had no dependency at all and kept the X it sampled
+                    // on the first settle. Expand every element, exactly as the
+                    // 1-D case does.
+                    for e in elems {
+                        reads.insert(e);
                     }
                 } else {
                     // Non-Ident base (e.g. nested Index, RangeSelect from inlining
@@ -16923,6 +18084,22 @@ impl Simulator {
                 Self::collect_expr_reads(right, module, reads);
             }
             ExprKind::Unary { operand, .. } => Self::collect_expr_reads(operand, module, reads),
+            // Streaming concat (`{<<{src}}`): the operands are ordinary reads.
+            // With no arm here a continuous `assign dst = {<<{src}};` had an
+            // EMPTY read set — it sampled X at the time-0 settle and never
+            // re-fired when `src` changed, so the target stayed X forever
+            // (procedural streaming was always fine; only the dependency
+            // collection was blind to it).
+            ExprKind::StreamOp {
+                slice_size, exprs, ..
+            } => {
+                if let Some(sz) = slice_size {
+                    Self::collect_expr_reads(sz, module, reads);
+                }
+                for e in exprs {
+                    Self::collect_expr_reads(e, module, reads);
+                }
+            }
             ExprKind::Binary { left, right, .. } => {
                 Self::collect_expr_reads(left, module, reads);
                 Self::collect_expr_reads(right, module, reads);
@@ -17034,6 +18211,33 @@ impl Simulator {
     }
 
     /// Collect signal names written by an LHS expression.
+    /// Targets written by an expression used as a STATEMENT: increment and
+    /// decrement operators and an embedded assignment expression. Walks
+    /// through parens and into both arms of a comma/concat so a compound
+    /// statement expression records every target.
+    fn collect_expr_stmt_writes(
+        e: &Expression,
+        module: &ElaboratedModule,
+        writes: &mut HashSet<String>,
+    ) {
+        match &e.kind {
+            ExprKind::Paren(inner) => Self::collect_expr_stmt_writes(inner, module, writes),
+            ExprKind::Unary { op, operand }
+                if matches!(
+                    op,
+                    UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
+                ) =>
+            {
+                Self::collect_lhs_writes(operand, module, writes);
+            }
+            ExprKind::AssignExpr { lvalue, rvalue } => {
+                Self::collect_lhs_writes(lvalue, module, writes);
+                Self::collect_expr_stmt_writes(rvalue, module, writes);
+            }
+            _ => {}
+        }
+    }
+
     fn collect_lhs_writes(
         lhs: &Expression,
         module: &ElaboratedModule,
@@ -17175,6 +18379,14 @@ impl Simulator {
             }
             StatementKind::Expr(e) => {
                 Self::collect_expr_reads(e, module, reads);
+                // An expression STATEMENT can also write: `cnt++`, `--cnt`,
+                // and `(x = y)` all assign their target. Only reads were
+                // recorded here, so the target survived the implicit
+                // sensitivity list (`reads - writes`) and an `always @(*)`
+                // that incremented a counter re-triggered itself forever
+                // (§9.4.2.2 — a variable assigned by the block is not part of
+                // its own inferred sensitivity).
+                Self::collect_expr_stmt_writes(e, module, writes);
             }
             StatementKind::While { condition, body }
             | StatementKind::DoWhile { body, condition } => {
@@ -17454,7 +18666,15 @@ impl Simulator {
                 stmt: body,
             } => {
                 if let TimingControl::Event(event) = control {
-                    return Some((self.event_to_sens(event), *body.clone()));
+                    let sens = if matches!(
+                        event,
+                        EventControl::Star | EventControl::ParenStar
+                    ) {
+                        self.star_sens_from_body(body)
+                    } else {
+                        self.event_to_sens(event)
+                    };
+                    return Some((sens, *body.clone()));
                 }
                 None
             }
@@ -17466,7 +18686,27 @@ impl Simulator {
                     } = &first.kind
                     {
                         if let TimingControl::Event(event) = control {
-                            let sens = self.event_to_sens(event);
+                            let sens = if matches!(
+                                event,
+                                EventControl::Star | EventControl::ParenStar
+                            ) {
+                                // §9.4.2.2: infer from everything the block
+                                // guards, not just the first statement.
+                                let rest = Statement::new(
+                                    StatementKind::SeqBlock {
+                                        name: name.clone(),
+                                        stmts: {
+                                            let mut v = vec![*body.clone()];
+                                            v.extend_from_slice(&stmts[1..]);
+                                            v
+                                        },
+                                    },
+                                    stmt.span,
+                                );
+                                self.star_sens_from_body(&rest)
+                            } else {
+                                self.event_to_sens(event)
+                            };
                             let mut new_stmts = vec![*body.clone()];
                             new_stmts.extend_from_slice(&stmts[1..]);
                             return Some((
@@ -17486,6 +18726,44 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// §9.4.2.2 — the inferred sensitivity of `@*` / `@(*)`: every signal READ
+    /// by the statement it guards, minus the ones that statement writes (a
+    /// variable assigned by the block is not part of its own sensitivity).
+    ///
+    /// `event_to_sens` yields an EMPTY list for Star, and the process path
+    /// then took the "just execute body" fallthrough — so an `always @(*)`
+    /// never suspended and behaved like `forever`. Harmless for a pure
+    /// combinational body (it re-runs and settles), but with any timing
+    /// control in the body (`always @(*) begin #0; ... end`) it became an
+    /// infinite delta-cycle loop that never let time advance.
+    fn star_sens_from_body(&self, body: &Statement) -> Vec<Sensitivity> {
+        let mut reads: HashSet<String> = HashSet::default();
+        let mut writes: HashSet<String> = HashSet::default();
+        Self::collect_stmt_reads(body, &self.module, &mut reads, &mut writes);
+        let hint = self.name_resolve_hint.borrow().clone();
+        let mut out: Vec<Sensitivity> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::default();
+        for r in reads.difference(&writes) {
+            // Prefer the instance-scoped name when one exists, mirroring the
+            // scope-first resolution the rest of the runtime performs.
+            let resolved = hint
+                .as_ref()
+                .map(|sc| format!("{}.{}", sc, r))
+                .filter(|q| self.signal_name_to_id.contains_key(q.as_str()))
+                .unwrap_or_else(|| r.clone());
+            if self.signal_name_to_id.contains_key(resolved.as_str())
+                && seen.insert(resolved.clone())
+            {
+                out.push(Sensitivity {
+                    signal_name: resolved,
+                    edge: EdgeKind::AnyEdge,
+                    iff: None,
+                });
+            }
+        }
+        out
     }
 
     fn event_to_sens(&self, event: &EventControl) -> Vec<Sensitivity> {
@@ -17532,18 +18810,33 @@ impl Simulator {
                         // is the RAW dotted path (`iface.cb`); `resolve_hier_name`
                         // strips the instance prefix to `cb`, so try the raw path
                         // first, then the resolved name.
-                        let raw = h
-                            .path
-                            .iter()
-                            .map(|s| s.name.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(".");
+                        let segs: Vec<&str> =
+                            h.path.iter().map(|s| s.name.name.as_str()).collect();
+                        // §14.13 `@(cb.sig)` — sensitize to the hidden sample
+                        // mirror so the event lands at the clocking edge and
+                        // only when the sample actually changed.
+                        if segs.len() >= 2 {
+                            if let Some(cbk) = self.resolve_clocking_key(&segs[..segs.len() - 1]) {
+                                let hidden = format!(
+                                    "{}{}.{}",
+                                    CB_SAMPLE_PREFIX,
+                                    cbk,
+                                    segs[segs.len() - 1]
+                                );
+                                if self.signal_name_to_id.contains_key(hidden.as_str()) {
+                                    out.push(Sensitivity {
+                                        signal_name: hidden,
+                                        edge: EdgeKind::AnyEdge,
+                                        iff: ee.iff.clone(),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
                         let sig = self.resolve_hier_name(h);
-                        let cb_key = if self.clocking_meta.contains_key(&raw) {
-                            raw.clone()
-                        } else {
-                            sig.clone()
-                        };
+                        let cb_key = self
+                            .resolve_clocking_key(&segs)
+                            .unwrap_or_else(|| sig.clone());
                         if ee.edge.is_none() {
                             if let Some((clk, _)) = self.clocking_meta.get(&cb_key) {
                                 out.push(Sensitivity {
@@ -17570,6 +18863,38 @@ impl Simulator {
                     // virtual-interface binding (`<bound>.member`) so the driver/
                     // monitor suspend on the real interface clock/reset instead
                     // of spinning on an empty sensitivity.
+                    // §14.13 `@(cb.sig)` written as a MemberAccess (the shape
+                    // the parser produces for a sensitivity list, and inside
+                    // subroutines): sensitize to the hidden sample mirror so
+                    // the event lands at the clocking edge, only on a change.
+                    // Without this the sensitivity came out EMPTY and the
+                    // always block fired once at t=0 and never again.
+                    if idents.is_empty() && ee.edge.is_none() {
+                        if let Some(segs) = Self::flatten_member_path(&ee.expr) {
+                            if segs.len() >= 2 {
+                                let refs: Vec<&str> =
+                                    segs.iter().map(|x| x.as_str()).collect();
+                                if let Some(cbk) =
+                                    self.resolve_clocking_key(&refs[..refs.len() - 1])
+                                {
+                                    let hidden = format!(
+                                        "{}{}.{}",
+                                        CB_SAMPLE_PREFIX,
+                                        cbk,
+                                        refs[refs.len() - 1]
+                                    );
+                                    if self.signal_name_to_id.contains_key(hidden.as_str()) {
+                                        out.push(Sensitivity {
+                                            signal_name: hidden,
+                                            edge: EdgeKind::AnyEdge,
+                                            iff: ee.iff.clone(),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if idents.is_empty() {
                         if let ExprKind::MemberAccess { expr: base, member } = &ee.expr.kind {
                             if let ExprKind::Ident(bh) = &base.kind {
@@ -17907,6 +19232,7 @@ impl Simulator {
             continuation,
             captured_prev,
             captured_prev_wide,
+            remaining_events: 1,
             is_clocking,
         }
     }
@@ -17928,15 +19254,12 @@ impl Simulator {
                     return false;
                 }
                 if let ExprKind::Ident(h) = &ee.expr.kind {
-                    // Interface-scoped `@(iface.cb)` keys on the raw dotted path;
-                    // resolve_hier_name strips it to `cb`. Try both.
-                    let raw = h
-                        .path
-                        .iter()
-                        .map(|s| s.name.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    if self.clocking_meta.contains_key(&raw) {
+                    // Interface-scoped `@(iface.cb)` / vif-aliased `@(vif.cb)`
+                    // key on the (alias-resolved) dotted path; resolve_hier_name
+                    // strips it to `cb`. Try both.
+                    let segs: Vec<&str> =
+                        h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    if self.resolve_clocking_key(&segs).is_some() {
                         return true;
                     }
                     let sig = self.resolve_hier_name(h);
@@ -18963,6 +20286,13 @@ impl Simulator {
         // sample state so subsequent `cb.<sig>` reads see the pre-edge
         // value (`#1step` input skew).
         self.tick_clocking_blocks();
+        // §14.13: deliver `@(cb.sig)` events for samples just published. The
+        // publish happens after this slot's edge pass, so run one more.
+        if self.clocking_mirror_dirty {
+            self.clocking_mirror_dirty = false;
+            self.check_edges();
+            let _ = self.drain_edge_cascade(cascade_limit);
+        }
         // §14.13: now that this edge's NBA updates have committed and the
         // clocking input snapshots are refreshed, resume the clocking-event
         // waiters (`@(cb)` / `##N`) that fired this slot — in the Reactive
@@ -19694,8 +21024,8 @@ impl Simulator {
             );
             if self.event_skip {
                 eprintln!(
-                    "[EVENT-EDGE] adaptive epoch-fast-exec={} snapshot-checks={}",
-                    self.event_epoch_fast_exec, self.event_snapshot_checks
+                    "[EVENT-EDGE] adaptive epoch-fast-exec={} snapshot-checks={} healed={}",
+                    self.event_epoch_fast_exec, self.event_snapshot_checks, self.event_healed
                 );
                 if self.armed_edge {
                     eprintln!(
@@ -20252,6 +21582,13 @@ impl Simulator {
                         let id = self.udp_runtime[*idx].out_ref.sig_id as usize;
                         self.name_for_id(id)
                     }
+                    CombItem::UdpBatch { indices, .. } => {
+                        let Some(&idx) = indices.first() else {
+                            continue;
+                        };
+                        let id = self.udp_runtime[idx].out_ref.sig_id as usize;
+                        self.name_for_id(id)
+                    }
                     CombItem::DirectCopy { dst_id, .. }
                     | CombItem::FastDirectCopy { dst_id, .. } => self.name_for_id(*dst_id),
                     CombItem::FastDirectFanout { dst_ids, .. } => {
@@ -20264,7 +21601,8 @@ impl Simulator {
                         let id = match op {
                             FusedGate::Buf1 { dst, .. }
                             | FusedGate::Bin2 { dst, .. }
-                            | FusedGate::Mux2 { dst, .. } => dst.sig_id as usize,
+                            | FusedGate::Mux2 { dst, .. }
+                            | FusedGate::UdpLut3 { dst, .. } => dst.sig_id as usize,
                         };
                         self.name_for_id(id)
                     }
@@ -20677,7 +22015,104 @@ impl Simulator {
         *self.name_resolve_hint.borrow_mut() = h;
     }
 
+    /// Remember that a procedural comb entry ran while a process was mid-flight,
+    /// together with the outputs it produced. §4.5 puts such a block in the
+    /// ACTIVE region — it should observe the process's FINAL state, not an
+    /// intermediate one. xezim settles inline after every blocking assign (a
+    /// deep, load-bearing behaviour: nets and primitives must propagate right
+    /// away), so instead of reordering anything we simply detect the one case
+    /// that inline evaluation gets wrong — the process later overwrote what the
+    /// block computed — and re-run the block once the process suspends.
+    fn note_comb_ran_in_process(&mut self, eidx: usize, entry: &CombEntry) {
+        if entry.write_signal_ids.is_empty() {
+            return;
+        }
+        let snap: Vec<(usize, Value)> = entry
+            .write_signal_ids
+            .iter()
+            .filter(|id| **id < self.signal_table.len())
+            .map(|id| (*id, self.signal_table[*id].clone()))
+            .collect();
+        if snap.is_empty() {
+            return;
+        }
+        // Last write wins: a block that runs several times in one process only
+        // needs its most recent output compared.
+        if let Some(slot) = self.deferred_comb.iter_mut().find(|(e, _)| *e == eidx) {
+            slot.1 = snap;
+        } else {
+            self.deferred_comb.push((eidx, snap));
+        }
+    }
+
+    /// Re-run the comb entries whose outputs the just-finished process
+    /// clobbered. Nothing is re-run when the values still stand, so blocks with
+    /// side effects (`$display`) are not duplicated in the common case.
+    fn drain_deferred_comb(&mut self) {
+        if self.deferred_comb.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.deferred_comb);
+        let entries = std::mem::take(&mut self.comb_entries);
+        for (eidx, snap) in pending {
+            let Some(entry) = entries.get(eidx) else { continue };
+            let clobbered = snap.iter().any(|(id, v)| {
+                self.signal_table.get(*id).is_some_and(|cur| cur != v)
+            });
+            if !clobbered {
+                continue;
+            }
+            match &entry.item {
+                CombItem::AlwaysBlock { .. } => self.eval_ast_comb_entry(entry),
+                CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                    if self.vm_regs.len() < compiled.num_regs as usize {
+                        self.vm_regs
+                            .resize(compiled.num_regs as usize, Value::zero(1));
+                    }
+                    let insns = unsafe {
+                        std::slice::from_raw_parts(
+                            compiled.instructions.as_ptr(),
+                            compiled.instructions.len(),
+                        )
+                    };
+                    let saved_ts = self.timescale_scope_override.take();
+                    self.timescale_scope_override = entry.scope_hint.clone();
+                    let saved_hint = if compiled.has_fallback {
+                        let prev = self.name_resolve_hint.borrow().clone();
+                        if let Some(sc) = entry.scope_hint.as_ref() {
+                            *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
+                        }
+                        Some(prev)
+                    } else {
+                        None
+                    };
+                    self.exec_insns(insns);
+                    if let Some(prev) = saved_hint {
+                        *self.name_resolve_hint.borrow_mut() = prev;
+                    }
+                    self.timescale_scope_override = saved_ts;
+                }
+                _ => {}
+            }
+        }
+        self.comb_entries = entries;
+    }
+
+    /// §4.5 boundary: run the process, then let the ACTIVE-region work its
+    /// blocking writes scheduled actually execute. Deferring the settle to
+    /// here (rather than firing it inline after every blocking assign) is what
+    /// keeps a triggered `always @(*)` from running in the middle of another
+    /// process's statement sequence.
     fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
+        self.proc_depth += 1;
+        self.run_scheduled_process_inner(pid, stmts);
+        self.proc_depth -= 1;
+        if self.proc_depth == 0 {
+            self.drain_deferred_comb();
+        }
+    }
+
+    fn run_scheduled_process_inner(&mut self, pid: usize, stmts: &[Statement]) {
         // Flags from a prior process must not leak into this one.
         self.break_flag = false;
         self.return_flag = false;
@@ -21035,6 +22470,18 @@ impl Simulator {
     /// `lhs <= #d rhs` is canonicalized at source level (see
     /// `crate::intra_delay`) into `lhs = $__xz_intra_delay(d, rhs)`.
     /// Returns `(delay_expr, rhs_expr)` when `rvalue` is that marker.
+    /// §14.16 `cb.out <= ##N rhs` marker: returns (count_expr, rhs).
+    fn intra_cycle_marker(rvalue: &Expression) -> Option<(&Expression, &Expression)> {
+        match &rvalue.kind {
+            ExprKind::SystemCall { name, args }
+                if name == crate::intra_delay::INTRA_CYCLE_MARKER && args.len() == 2 =>
+            {
+                Some((&args[0], &args[1]))
+            }
+            _ => None,
+        }
+    }
+
     fn intra_delay_marker(rvalue: &Expression) -> Option<(&Expression, &Expression)> {
         match &rvalue.kind {
             ExprKind::SystemCall { name, args }
@@ -21157,7 +22604,7 @@ impl Simulator {
                 // current time and ask the outer event loop to defer-and-advance
                 // to the next scheduled event — a commercial simulator lets time
                 // move past a #0 spinner once its driving value recovers (here,
-                // once an `irefclk` edge updates the measured period). The outer
+                // once a reference-clock edge updates the measured period). The outer
                 // loop declares it fatal only if nothing is scheduled ahead.
                 self.event_queue.schedule(self.time, pid, stmts.to_vec());
                 self.zero_delay_defer_pending = true;
@@ -21965,8 +23412,21 @@ impl Simulator {
                                 return;
                             }
                         }
-                        let sens = self.event_to_sens(event);
+                        let is_star = matches!(
+                            event,
+                            EventControl::Star | EventControl::ParenStar
+                        );
+                        let sens = if is_star {
+                            self.star_sens_from_body(body)
+                        } else {
+                            self.event_to_sens(event)
+                        };
                         let is_clk_ev = self.is_clocking_event(event);
+                        // `@(*)` over a body that reads NOTHING can never
+                        // trigger again — park the process instead of looping.
+                        if is_star && sens.is_empty() {
+                            return;
+                        }
                         if !sens.is_empty() {
                             let mut cont = vec![*body.clone()];
                             cont.extend_from_slice(&stmts[i + 1..]);
@@ -22106,6 +23566,36 @@ impl Simulator {
                     if self.blocking_loop_flag_gate() {
                         i += 1;
                         continue;
+                    }
+                    // `repeat (N) @(event);` has no per-iteration action. Keep
+                    // one counted waiter parked across the N events rather
+                    // than cloning/evaluating a Repeat tail and resolving the
+                    // same sensitivity after every edge. Clocking-block events
+                    // retain the general path because their intermediate
+                    // Reactive-region scheduling is observable.
+                    if let StatementKind::TimingControl {
+                        control: TimingControl::Event(event),
+                        stmt: event_body,
+                    } = &body.kind
+                    {
+                        if matches!(event_body.kind, StatementKind::Null)
+                            && !self.is_clocking_event(event)
+                        {
+                            let sens = self.event_to_sens(event);
+                            let has_real = sens.iter().any(|s| {
+                                self.signal_name_to_id.contains_key(s.signal_name.as_str())
+                            });
+                            if !sens.is_empty() && has_real {
+                                let mut waiter = self.make_event_waiter(
+                                    pid,
+                                    sens,
+                                    stmts[i + 1..].to_vec(),
+                                );
+                                waiter.remaining_events = n;
+                                self.event_waiters.push(waiter);
+                                return;
+                            }
+                        }
                     }
                     // Unroll: execute body once, then schedule rest
                     let remaining_n = n - 1;
@@ -22813,6 +24303,114 @@ impl Simulator {
                 Self::call_is_blocking_task(e) || self.callee_transitively_blocks(e)
             }
             StatementKind::Repeat { body, .. } => self.stmt_is_blocking(body),
+            _ => false,
+        }
+    }
+
+    /// Does this statement need a real *process* context (the ability to
+    /// suspend and resume) — as opposed to merely containing a `#delay`?
+    ///
+    /// `stmt_is_blocking` answers the broader question "must this run through
+    /// the suspend-aware runner", and says YES for a plain `#delay` too. But
+    /// the synchronous `exec_statement` path DOES implement `TimingControl::
+    /// Delay`: it flushes NBA, settles, advances time and runs the intervening
+    /// event regions. Only genuinely suspending constructs — event controls,
+    /// `wait`, `fork…join`, `forever` — cannot run there.
+    ///
+    /// `exec_expr_stmt` uses this instead of `stmt_is_blocking` so that a
+    /// parenless enable of a delay-only task still RUNS. It previously used the
+    /// broad predicate and silently DROPPED the whole call: a vendor
+    /// register-file cell enabled its write task from an `always @(wclk)`
+    /// block, that task reached a `#0` two levels down, and so every write was
+    /// discarded — the memory read back all-X. Tasks that truly need
+    /// suspension keep the old (skip) behaviour, which this does not change.
+    fn stmt_needs_process_context(&self, stmt: &Statement, depth: u32) -> bool {
+        // Guard against deep/cyclic call chains; treat an over-deep chain as
+        // needing a process (conservative = preserves the old skip).
+        if depth > 8 {
+            return true;
+        }
+        match &stmt.kind {
+            StatementKind::TimingControl { control, stmt: inner } => match control {
+                // A pure delay is executable synchronously.
+                TimingControl::Delay(_) => self.stmt_needs_process_context(inner, depth),
+                // Event control / repeat-event genuinely suspend.
+                _ => true,
+            },
+            StatementKind::Wait { .. }
+            | StatementKind::WaitOrder { .. }
+            | StatementKind::WaitFork => true,
+            // `forever` in a synchronous context would spin without ever
+            // yielding to the scheduler.
+            StatementKind::Forever { .. } => true,
+            StatementKind::ParBlock { join_type, .. } => !matches!(join_type, JoinType::JoinNone),
+            // Intra-assignment delay: keep the conservative old behaviour.
+            StatementKind::BlockingAssign { rvalue, .. } => {
+                Self::intra_delay_marker(rvalue).is_some()
+            }
+            StatementKind::RandCase { items } => items
+                .iter()
+                .any(|(_, s)| self.stmt_needs_process_context(s, depth)),
+            StatementKind::SeqBlock { stmts, .. } => stmts
+                .iter()
+                .any(|s| self.stmt_needs_process_context(s, depth)),
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.stmt_needs_process_context(then_stmt, depth)
+                    || else_stmt
+                        .as_ref()
+                        .is_some_and(|e| self.stmt_needs_process_context(e, depth))
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::Repeat { body, .. } => {
+                self.stmt_needs_process_context(body, depth)
+            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| self.stmt_needs_process_context(&it.stmt, depth)),
+            StatementKind::Expr(e) => {
+                if Self::expr_is_proc_await(e) {
+                    return true;
+                }
+                // A call whose name matches the built-in/UVM blocking
+                // whitelist has no visible body — assume it suspends.
+                if Self::call_is_blocking_task(e) {
+                    return true;
+                }
+                // Follow user task/function calls into their bodies.
+                let callee = match &e.kind {
+                    ExprKind::Call { func, .. } => &**func,
+                    ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => e,
+                    _ => return false,
+                };
+                let name = match &callee.kind {
+                    ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                    ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                    _ => None,
+                };
+                let Some(n) = name else { return false };
+                // Resolve against both the leaf name and the instance-scoped
+                // key the elaborator bakes in (`u_inst.the_task`).
+                let items = self.module.tasks.get(n).map(|t| &t.items).or_else(|| {
+                    self.module
+                        .tasks
+                        .iter()
+                        .find(|(k, _)| k.rsplit('.').next() == Some(n))
+                        .map(|(_, t)| &t.items)
+                });
+                match items {
+                    Some(its) => its
+                        .iter()
+                        .any(|s| self.stmt_needs_process_context(s, depth + 1)),
+                    None => false,
+                }
+            }
             _ => false,
         }
     }
@@ -24079,6 +25677,10 @@ impl Simulator {
                     break;
                 }
             }
+            if triggered && waiter.remaining_events > 1 {
+                waiter.remaining_events -= 1;
+                triggered = false;
+            }
             if triggered {
                 sim_dbg_eprintln!(
                     "[DEBUG] waiter for process {} triggered at time {}",
@@ -24371,6 +25973,18 @@ impl Simulator {
     }
 
     fn check_edges_inner(&mut self, detect_subset: Option<&[usize]>, validate_coverage: bool) {
+        // A `#delay` in an edge block's body re-enters here through the
+        // synchronous `TimingControl::Delay` arm. That is legitimate — the
+        // delay's own region flush must deliver edges made before it — but a
+        // block that keeps re-triggering itself across its delay would recurse
+        // forever, so bound the nesting. At the cap we stop descending; the
+        // outer pass's post-exec rescan still delivers what is pending.
+        const EDGE_PASS_DEPTH_LIMIT: u32 = 8;
+        if self.edge_pass_depth >= EDGE_PASS_DEPTH_LIMIT {
+            return;
+        }
+        self.edge_pass_depth += 1;
+        let outermost_pass = !self.in_edge_block;
         if self.event_measure {
             self.event_phase += 1; // flop SAMPLE phase
         }
@@ -24447,7 +26061,9 @@ impl Simulator {
                 self.finished = false;
             }
         }
-        let blocks = std::mem::take(&mut self.edge_blocks);
+        // Cheap handle; `self.edge_blocks` stays populated so nested passes and
+        // `edge_blocks.get(bi)` probes still see the real list.
+        let blocks = Arc::clone(&self.edge_blocks);
         self.in_edge_block = true;
 
         // Honor `iff` guards on edge-sensitive always blocks (LRM §9.4.2.3).
@@ -24512,6 +26128,7 @@ impl Simulator {
         let mut triggered = std::mem::take(&mut self.edge_triggered_list);
         triggered.clear();
         let triggered_bitmap = &mut self.edge_triggered_bitmap[..blocks.len()];
+        let bitsel_active = !self.bitsel_edge_sens.is_empty();
         let armed_prefilter = self.armed_edge
             && !self.armed_edge_shadow
             && self.event_skip
@@ -24619,6 +26236,8 @@ impl Simulator {
                     self.time, pos, sid
                 );
                 self.finished = true;
+                self.edge_pass_depth -= 1;
+                self.in_edge_block = !outermost_pass;
                 return;
             }
             // Phase-2 toggle counter: any edge means this signal
@@ -24637,9 +26256,36 @@ impl Simulator {
             // which is symmetric for hyperedge weight purposes.
             let mut woke_any = false;
             macro_rules! dispatch_block {
-                ($block_idx:expr) => {{
+                ($block_idx:expr, $kind:expr) => {{
                     let block_idx = $block_idx;
-                    if block_idx < triggered_bitmap.len()
+                    // §9.4.2 bit-select term (`@(v[3])`): detection above is per
+                    // SIGNAL, so re-test the one bit this block actually watches
+                    // and drop the wake when only a sibling bit moved. Mirrors
+                    // the whole-signal formulas, on bit `b` instead of bit 0.
+                    let bitsel_ok = !bitsel_active
+                        || match self.bitsel_edge_sens.get(&(sid, block_idx)) {
+                            None => true,
+                            Some(&b) => {
+                                let cb = (cur_v >> b) & 1;
+                                let cx = (cur_x >> b) & 1;
+                                let pb = (prev_v >> b) & 1;
+                                let px = (prev_x >> b) & 1;
+                                let cur_one = cb == 1 && cx == 0;
+                                let cur_zero = cb == 0 && cx == 0;
+                                let prev_one = pb == 1 && px == 0;
+                                let prev_zero = pb == 0 && px == 0;
+                                match $kind {
+                                    EdgeKind::Posedge => !prev_one && cur_one,
+                                    EdgeKind::Negedge => !prev_zero && cur_zero,
+                                    EdgeKind::AnyEdge => cb != pb || cx != px,
+                                    EdgeKind::LsbEdge => {
+                                        (!prev_one && cur_one) || (!prev_zero && cur_zero)
+                                    }
+                                }
+                            }
+                        };
+                    if bitsel_ok
+                        && block_idx < triggered_bitmap.len()
                         && !(iff_active && iff_denied[block_idx])
                     {
                         let skip_early = armed_prefilter
@@ -24675,23 +26321,23 @@ impl Simulator {
             }
             if fires_pos {
                 for &block_idx in &fanout.posedge {
-                    dispatch_block!(block_idx);
+                    dispatch_block!(block_idx, EdgeKind::Posedge);
                 }
             }
             if fires_neg {
                 for &block_idx in &fanout.negedge {
-                    dispatch_block!(block_idx);
+                    dispatch_block!(block_idx, EdgeKind::Negedge);
                 }
             }
             if fires_any {
                 for &block_idx in &fanout.anyedge {
-                    dispatch_block!(block_idx);
+                    dispatch_block!(block_idx, EdgeKind::AnyEdge);
                 }
             }
             // §9.4.2 `@(edge x)`: an LSB posedge OR negedge (not any change).
             if fires_pos || fires_neg {
                 for &block_idx in &fanout.lsbedge {
-                    dispatch_block!(block_idx);
+                    dispatch_block!(block_idx, EdgeKind::LsbEdge);
                 }
             }
             if woke_any
@@ -24839,6 +26485,30 @@ impl Simulator {
                         None => {}
                     }
                 }
+                // Skip self-heal (see `edge_block_skip_streak`): after
+                // `event_heal` consecutive skipped edges, force one real
+                // execution + snapshot rebuild. Invisible for correctly-idle
+                // flops; bounds any skip-bookkeeping wedge.
+                let keep = if !keep && gate && self.event_heal != 0 {
+                    let streak = self.edge_block_skip_streak[bi].saturating_add(1);
+                    if streak >= self.event_heal {
+                        self.edge_block_skip_streak[bi] = 0;
+                        self.event_healed += 1;
+                        // Invalidate the snapshot so the keep path below
+                        // rebuilds it from current values after this forced
+                        // execution.
+                        self.edge_block_snap_valid[bi] = false;
+                        true
+                    } else {
+                        self.edge_block_skip_streak[bi] = streak;
+                        false
+                    }
+                } else {
+                    if keep && gate {
+                        self.edge_block_skip_streak[bi] = 0;
+                    }
+                    keep
+                };
                 if keep {
                     if gate {
                         if epoch_fast {
@@ -25595,8 +27265,10 @@ impl Simulator {
                 *p = val;
             }
         }
-        self.edge_blocks = blocks;
-        self.in_edge_block = false;
+        drop(blocks);
+        self.edge_pass_depth -= 1;
+        // A nested pass must not clear the flag out from under its caller.
+        self.in_edge_block = !outermost_pass;
 
         // Run the triggered waiter continuations IMMEDIATELY (active
         // region of current time-step, before apply_nba commits) so
@@ -26803,7 +28475,6 @@ impl Simulator {
                 self.exec_insns(insns);
             }
             CombItem::FusedGate { op } => {
-                let op = *op;
                 self.exec_fused_gate(op);
             }
             CombItem::FusedBufFanout { src, dsts, invert } => {
@@ -26812,6 +28483,9 @@ impl Simulator {
             CombItem::Udp { idx } => {
                 let idx = *idx;
                 self.eval_udp(idx);
+            }
+            CombItem::UdpBatch { event_ref, indices } => {
+                self.eval_udp_batch(*event_ref, indices);
             }
             // Copies are always handled by the isolated path; reaching here for
             // them would be a logic error, but eval them correctly regardless.
@@ -27234,6 +28908,11 @@ impl Simulator {
                     CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
                         // Factored AST eval (shared with the BSP settle driver).
                         self.eval_ast_comb_entry(&entries[eidx]);
+                        if self.proc_depth > 0
+                            && matches!(entries[eidx].item, CombItem::AlwaysBlock { .. })
+                        {
+                            self.note_comb_ran_in_process(eidx, &entries[eidx]);
+                        }
                     }
                     CombItem::CompiledAlwaysBlock { compiled, .. } => {
                         // Bytecode path: BlockingAssign/NbaAssign insns mark
@@ -27252,12 +28931,32 @@ impl Simulator {
                         // module timescale (mirrors the edge-block dispatch).
                         let saved_ts = self.timescale_scope_override.take();
                         self.timescale_scope_override = entries[eidx].scope_hint.clone();
+                        // A StmtFallback insn re-enters the AST interpreter,
+                        // which resolves bare names through the hint — without
+                        // it a `foreach (m[i]) m[i] = v;` in a SUBMODULE
+                        // resolved the bare array name, found nothing, and
+                        // dropped every write. Pure-bytecode blocks pre-resolve
+                        // their ids, so this costs them one bool test.
+                        let saved_hint = if compiled.has_fallback {
+                            let prev = self.name_resolve_hint.borrow().clone();
+                            if let Some(sc) = entries[eidx].scope_hint.as_ref() {
+                                *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
+                            }
+                            Some(prev)
+                        } else {
+                            None
+                        };
                         self.exec_insns(insns);
+                        if let Some(prev) = saved_hint {
+                            *self.name_resolve_hint.borrow_mut() = prev;
+                        }
                         self.timescale_scope_override = saved_ts;
                         self.prof_settle_ab_count += 1;
+                        if self.proc_depth > 0 {
+                            self.note_comb_ran_in_process(eidx, &entries[eidx]);
+                        }
                     }
                     CombItem::FusedGate { op } => {
-                        let op = *op;
                         self.exec_fused_gate(op);
                         self.prof_settle_dc_count += 1;
                     }
@@ -27269,6 +28968,10 @@ impl Simulator {
                         let idx = *idx;
                         self.eval_udp(idx);
                         self.prof_settle_dc_count += 1;
+                    }
+                    CombItem::UdpBatch { event_ref, indices } => {
+                        self.eval_udp_batch(*event_ref, indices);
+                        self.prof_settle_dc_count += indices.len() as u64;
                     }
                 }
 
@@ -28132,6 +29835,11 @@ impl Simulator {
 
                 // If this is an array or queue, and we are assigning a packed value,
                 // we might want to split it into elements.
+                if std::env::var("XEZIM_A1_DBG").is_ok() && name.contains('m') {
+                    eprintln!("[A1DBG] whole-name write name={:?} in_arrays={} hint={:?}",
+                        name, self.module.arrays.contains_key(&name),
+                        self.name_resolve_hint.borrow().clone());
+                }
                 if let Some((lo, hi, elem_width)) = self.module.arrays.get(&name).cloned() {
                     let num_elements = (resized.width / elem_width) as usize;
                     // For queues/dynamic arrays, we update the size
@@ -28287,6 +29995,39 @@ impl Simulator {
                         if !self.module.arrays_2d.contains_key(&name) {
                             if let Some(s) = self.instance_assoc_member(&name) {
                                 name = s;
+                            }
+                        }
+                        // A bare name written from inside a SUBMODULE — e.g. the
+                        // body of a `foreach` in an `always_comb`, evaluated from
+                        // the settle path where no scope hint is installed and the
+                        // per-node name cache may already hold the unscoped form.
+                        // Try the hint, then a UNIQUE suffix match, so the write
+                        // lands instead of being silently dropped.
+                        if !self.module.arrays_2d.contains_key(&name) && !name.contains('.') {
+                            let hinted = self
+                                .name_resolve_hint
+                                .borrow()
+                                .as_ref()
+                                .map(|h| format!("{}.{}", h, name));
+                            if let Some(h) = hinted.filter(|h| self.module.arrays_2d.contains_key(h))
+                            {
+                                name = h;
+                            } else {
+                                let suffix = format!(".{}", name);
+                                let mut hit: Option<String> = None;
+                                let mut many = false;
+                                for k in self.module.arrays_2d.keys() {
+                                    if k.ends_with(&suffix) {
+                                        if hit.is_some() {
+                                            many = true;
+                                            break;
+                                        }
+                                        hit = Some(k.clone());
+                                    }
+                                }
+                                if let (Some(k), false) = (hit, many) {
+                                    name = k;
+                                }
                             }
                         }
                         if self.module.arrays_2d.contains_key(&name) {
@@ -28461,6 +30202,12 @@ impl Simulator {
                     _ => (None, None),
                 };
                 if let Some(mut name) = base_name {
+                    if std::env::var("XEZIM_A1_DBG").is_ok() {
+                        eprintln!("[A1DBG] idx-write base={:?} hint={:?} in_arrays={} scoped_in_arrays={:?}",
+                            name, self.name_resolve_hint.borrow().clone(),
+                            self.module.arrays.contains_key(&name),
+                            self.name_resolve_hint.borrow().as_ref().map(|h| self.module.arrays.contains_key(&format!("{}.{}", h, name))));
+                    }
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
                     }
@@ -28762,10 +30509,54 @@ impl Simulator {
                     RangeKind::IndexedUp => (l + r.saturating_sub(1), l),
                     RangeKind::IndexedDown => (l, l.saturating_sub(r.saturating_sub(1))),
                 };
+                // §7.4.1 element-range WRITE on a packed multi-D base:
+                // `wv[2:1] = 16'hBEEF` / `wv[1 +: 2] = …` targets whole
+                // ELEMENTS. The bit-based msb/lsb above wrote a 2-bit sliver
+                // instead. Scale by the registered element width, normalized
+                // against the declared outer dimension (mirrors the read side).
+                let mut elem_scaled = false;
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let nm = self.resolve_hier_name(h);
+                    if let Some(&elem_w) = self
+                        .module
+                        .packed_signal_elem_widths
+                        .get(&nm)
+                        .filter(|&&w| w > 1)
+                    {
+                        let (lab_a, lab_b): (i64, i64) = match kind {
+                            RangeKind::Constant => (l as i64, r as i64),
+                            RangeKind::IndexedUp => (l as i64, l as i64 + r as i64 - 1),
+                            RangeKind::IndexedDown => (l as i64, l as i64 - (r as i64 - 1)),
+                        };
+                        let dim = self
+                            .module
+                            .packed_full_dims
+                            .get(&nm)
+                            .and_then(|d| d.first())
+                            .copied();
+                        let lsb_of = |idx: i64| -> i64 {
+                            match dim {
+                                None => idx * elem_w as i64,
+                                Some((dl, dr)) => {
+                                    let (lo_b, hi_b) = (dl.min(dr), dl.max(dr));
+                                    let count = hi_b - lo_b + 1;
+                                    let off = idx - lo_b;
+                                    let slot = if dl >= dr { off } else { count - 1 - off };
+                                    slot * elem_w as i64
+                                }
+                            }
+                        };
+                        let la = lsb_of(lab_a);
+                        let lb = lsb_of(lab_b);
+                        lsb = la.min(lb).max(0) as usize;
+                        msb = (la.max(lb) + elem_w as i64 - 1).max(0) as usize;
+                        elem_scaled = true;
+                    }
+                }
                 // Ascending packed vector part-write (`logic [0:7] pa; pa[0:3]=v`):
                 // labels index from the MSB end → internal [(W-1)-lsb : (W-1)-msb]
                 // (LRM §7.4.1, §11.5.1).
-                if matches!(kind, RangeKind::Constant) {
+                if !elem_scaled && matches!(kind, RangeKind::Constant) {
                     if let ExprKind::Ident(h) = &expr.kind {
                         let nm = self.resolve_hier_name(h);
                         if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
@@ -29791,45 +31582,13 @@ impl Simulator {
                         return v;
                     }
                 }
-                // LRM §14.3 clocking-block input read — `cb.<sig>`
-                // returns the snapshot taken at the most recent posedge
-                // of the cb's clock (`#1step` input skew). Falls through
-                // to generic lookup when the cb is unknown or the
-                // signal isn't an input. Handles both a module-scoped
-                // `cb.sig` (2 segments) and an interface-scoped
-                // `iface_inst.cb.sig` (≥3): the clocking block key is every
-                // segment but the last, and its snapshot/meta signals are the
-                // RESOLVED nets (`iface_inst.sig`), so match the trailing
-                // `sig` by exact name or `.sig` suffix.
+                // LRM §14.3 clocking-block input read — `cb.<sig>` returns
+                // the snapshot taken at the block's most recent clock edge.
                 if hier.path.len() >= 2 {
-                    let cb = hier
-                        .path
-                        .iter()
-                        .take(hier.path.len() - 1)
-                        .map(|s| s.name.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    let sig = hier.path.last().unwrap().name.name.as_str();
-                    let matches_sig =
-                        |k: &str| k == sig || k.rsplit('.').next() == Some(sig);
-                    if let Some(snap) = self.clocking_snapshots.get(&cb) {
-                        if let Some(v) = snap.get(sig) {
-                            return v.clone();
-                        }
-                        if let Some((_, v)) = snap.iter().find(|(k, _)| matches_sig(k)) {
-                            return v.clone();
-                        }
-                        // Known cb but signal not in snapshot yet (first read
-                        // before any posedge) — return the current net value.
-                        if let Some((_, sigs)) = self.clocking_meta.get(&cb) {
-                            if let Some((net, _)) =
-                                sigs.iter().find(|(n, is_in)| *is_in && matches_sig(n))
-                            {
-                                if let Some(v) = self.get_signal_value_by_name(net) {
-                                    return v;
-                                }
-                            }
-                        }
+                    let segs: Vec<&str> =
+                        hier.path.iter().map(|s| s.name.name.as_str()).collect();
+                    if let Some(v) = self.try_clocking_signal_read(&segs) {
+                        return v;
                     }
                 }
                 // LRM §15.5.3: `e.triggered` on a named event.
@@ -31246,6 +33005,59 @@ impl Simulator {
                             }
                         }
                         return acc;
+                    }
+                }
+                // Packed multi-D ELEMENT range select (LRM §7.4.1): for
+                // `logic [1:0][63:0] pv;` or a packed array of a struct typedef
+                // (`bundle_t [1:0] arr;`), a constant `arr[1:0]` selects BOTH
+                // elements — 2×elem_w bits — not bits 1..0. This mirrors the
+                // single-element select above; without it a port actual written
+                // as `.p(arr[1:0])` carried 2 bits into a 256-bit port.
+                {
+                    if let ExprKind::Ident(h) = &expr.kind {
+                        let nm = self.resolve_hier_name(h);
+                        if let Some(&elem_w) =
+                            self.module.packed_signal_elem_widths.get(&nm).filter(|&&w| w > 1)
+                        {
+                            let li = self.eval_expr(left).to_i64().unwrap_or(0);
+                            let ri = self.eval_expr(right).to_i64().unwrap_or(0);
+                            // Label bounds per select kind; `[i +: c]` covers
+                            // elements i..i+c-1, `[i -: c]` covers i-c+1..i
+                            // (§7.4.1 + §11.5.1 element semantics).
+                            let (l, r): (i64, i64) = match kind {
+                                RangeKind::Constant => (li, ri),
+                                RangeKind::IndexedUp => (li, li + ri - 1),
+                                RangeKind::IndexedDown => (li, li - (ri - 1)),
+                            };
+                            // LSB offset of a labeled element under the DECLARED
+                            // outer range: `[N-1:0]` reduces to idx*elem_w, an
+                            // ascending `[0:1]` reverses slot order.
+                            let dim = self
+                                .module
+                                .packed_full_dims
+                                .get(&nm)
+                                .and_then(|d| d.first())
+                                .copied();
+                            let lsb_of = |idx: i64| -> i64 {
+                                match dim {
+                                    None => idx * elem_w as i64,
+                                    Some((dl, dr)) => {
+                                        let (lo_b, hi_b) = (dl.min(dr), dl.max(dr));
+                                        let count = hi_b - lo_b + 1;
+                                        let off = idx - lo_b;
+                                        let slot =
+                                            if dl >= dr { off } else { count - 1 - off };
+                                        slot * elem_w as i64
+                                    }
+                                }
+                            };
+                            let lsb_l = lsb_of(l);
+                            let lsb_r = lsb_of(r);
+                            let lo = lsb_l.min(lsb_r).max(0) as usize;
+                            let hi = (lsb_l.max(lsb_r) + elem_w as i64 - 1).max(0) as usize;
+                            let base_v = self.eval_expr(expr);
+                            return base_v.range_select(hi, lo);
+                        }
                     }
                 }
                 // Ascending packed vector part-select (`logic [0:7] pa; pa[0:3]`):
@@ -32790,6 +34602,16 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §14.3 clocking-block signal read. Inside a task/function the
+                // parser yields MemberAccess for `cb.sig` (module scope yields
+                // a flat hier Ident), so this arm needs the same handling.
+                if let Some(mut segs) = Self::flatten_member_path(expr) {
+                    segs.push(member.name.clone());
+                    let refs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
+                    if let Some(v) = self.try_clocking_signal_read(&refs) {
+                        return v;
+                    }
+                }
                 // §25.10: member access through an indexed plain virtual-
                 // interface array (`vifs[i].data`). Resolve the element alias
                 // before generic flattened aggregate handling creates/reads a
@@ -33521,7 +35343,19 @@ impl Simulator {
                 value,
                 cached_val,
             } => {
-                let w = size.unwrap_or(32);
+                let r_for_w = match base {
+                    NumberBase::Binary => 2,
+                    NumberBase::Octal => 8,
+                    NumberBase::Hex => 16,
+                    NumberBase::Decimal => 10,
+                };
+                // §5.7.1: an UNSIZED literal is at least 32 bits, but must not
+                // drop digits the source wrote — `'h123456789ABCDEF0` is 64 bits
+                // of value and a flat 32 kept only the low half, silently.
+                let w = match size {
+                    Some(sz) => *sz,
+                    None => Value::unsized_literal_width(value, r_for_w),
+                };
                 // Fast path: return cached value (avoids re-parsing string)
                 if let Some((vb, xz, cw)) = cached_val.get() {
                     if cw == w {
@@ -33547,11 +35381,20 @@ impl Simulator {
                 v
             }
             NumberLiteral::Real(f) => Value::from_f64(*f),
-            // A time literal in a value context evaluates to its magnitude in the
-            // simulation tick unit (1 ns) — `10ns` → 10.0 — matching the prior
-            // behaviour. (Delay contexts route through eval_delay_ticks, which
-            // applies the timescale/precision conversion.)
-            NumberLiteral::Time(s) => Value::from_f64(*s * 1e9),
+            // §5.8: a time literal in a value context scales to the MODULE's
+            // timeunit, snapped to the precision so the result is exact —
+            // `30000ps` under `timescale 1ns/1ps` must compare EQUAL to a
+            // `$time` delta of 30, not 29.999999999999996 (the raw
+            // secs/unit_s float residue). Computed as
+            // round(secs/prec) / 10^(unit−prec): both operands are integral
+            // f64s, so the division is exact for real timescale ratios.
+            // (Delay contexts route through eval_delay_ticks instead.)
+            NumberLiteral::Time(s) => {
+                let (unit_exp, prec_exp) = self.current_timescale_exp();
+                let prec_s = 10f64.powi(prec_exp);
+                let ratio = 10f64.powi(unit_exp - prec_exp);
+                Value::from_f64((*s / prec_s).round() / ratio)
+            }
             // §5.7.1: unbased-unsized literal — a 1-bit FILL value; binary ops
             // and resize replicate it to the consuming context's width.
             NumberLiteral::UnbasedUnsized(c) => Value::fill_of(*c),
@@ -35574,6 +37417,16 @@ impl Simulator {
                 // canonicalized to `$__xz_intra_delay(d, rhs)`): the RHS is
                 // evaluated now; the update is scheduled d ticks out.
                 let mut intra_d: Option<u64> = None;
+                // §14.16 `cb.out <= ##N rhs`: strip the cycle marker and keep
+                // N; the clocking-drive path below defers by N clock events.
+                let mut intra_cycles: Option<u64> = None;
+                let rvalue: &Expression = match Self::intra_cycle_marker(rvalue) {
+                    Some((n_expr, rhs)) => {
+                        intra_cycles = Some(self.eval_expr(n_expr).to_u64().unwrap_or(0));
+                        rhs
+                    }
+                    None => rvalue,
+                };
                 let rvalue: &Expression = match Self::intra_delay_marker(rvalue) {
                     Some((d_expr, rhs)) => {
                         intra_d = Some(self.eval_delay_ticks(d_expr));
@@ -35600,20 +37453,65 @@ impl Simulator {
                 // name or `.sig` suffix) so `tick_clocking_blocks` drives it.
                 if let ExprKind::Ident(hier) = &lvalue.kind {
                     if hier.path.len() >= 2 {
-                        let cb = hier
+                        let cb_segs: Vec<&str> = hier
                             .path
                             .iter()
                             .take(hier.path.len() - 1)
                             .map(|s| s.name.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(".");
-                        let sig = hier.path.last().unwrap().name.name.as_str();
+                            .collect();
+                        let cb = self
+                            .resolve_clocking_key(&cb_segs)
+                            .unwrap_or_else(|| cb_segs.join("."));
+                        let raw_sig = hier.path.last().unwrap().name.name.as_str();
+                        let sig: &str = self
+                            .clocking_sig_alias
+                            .get(&cb)
+                            .and_then(|m| m.get(raw_sig))
+                            .map(|s| s.as_str())
+                            .unwrap_or(raw_sig);
                         if let Some((_, sigs)) = self.clocking_meta.get(&cb) {
                             let out_net = sigs.iter().find(|(n, is_in)| {
                                 !*is_in && (n == sig || n.rsplit('.').next() == Some(sig))
                             });
                             if let Some((net, _)) = out_net {
                                 let net = net.clone();
+                                // §14.16 `##N`: wait N further clocking events.
+                                if let Some(n) = intra_cycles {
+                                    if n > 0 {
+                                        self.clocking_cycle_pending
+                                            .entry(cb)
+                                            .or_default()
+                                            .push((n, net, val));
+                                        return;
+                                    }
+                                }
+                                // §14.16.1: a drive executed AT the clocking
+                                // event matures at edge + OUTPUT SKEW (per-sig
+                                // override, else block default, else #0 =
+                                // Re-NBA of this timestep). Only a drive issued
+                                // BETWEEN events waits for the next edge.
+                                let skew = self
+                                    .clocking_sig_out_skew
+                                    .get(&cb)
+                                    .and_then(|m| m.get(&net))
+                                    .copied()
+                                    .or_else(|| self.clocking_out_skew.get(&cb).copied())
+                                    .unwrap_or(0);
+                                if self.clocking_last_edge.get(&cb).copied()
+                                    == Some(self.time)
+                                {
+                                    if let Some(&id) =
+                                        self.signal_name_to_id.get(net.as_str())
+                                    {
+                                        let w = self.signal_widths[id];
+                                        self.schedule_delayed_with_delay(
+                                            id,
+                                            val.resize(w),
+                                            skew,
+                                        );
+                                        return;
+                                    }
+                                }
                                 self.clocking_output_pending
                                     .entry(cb)
                                     .or_default()
@@ -36179,6 +38077,43 @@ impl Simulator {
                             {
                                 name = scoped;
                             }
+                        }
+                    }
+                    // The hint above is only installed while a PROCESS runs. A
+                    // `foreach` inside an `always_comb` is evaluated from the
+                    // settle path with NO hint, so a bare name in a submodule
+                    // stayed unscoped, `foreach_dims` returned None and the loop
+                    // body never ran — the array kept its X. Fall back to a
+                    // UNIQUE suffix match: accept `<scope>.m` only when exactly
+                    // one registered array ends that way, so this can never pick
+                    // between same-named arrays in sibling instances.
+                    if !self.module.arrays.contains_key(&name)
+                        && !self.module.arrays_2d.contains_key(&name)
+                        && !self.module.arrays_nd.contains_key(&name)
+                        && !self.module.dynamic_arrays.contains(&name)
+                        && !self.is_associative_array(&name)
+                        && !name.contains('.')
+                    {
+                        let suffix = format!(".{}", name);
+                        let mut hit: Option<String> = None;
+                        let mut many = false;
+                        for k in self
+                            .module
+                            .arrays
+                            .keys()
+                            .chain(self.module.arrays_2d.keys())
+                            .chain(self.module.arrays_nd.keys())
+                        {
+                            if k.ends_with(&suffix) {
+                                if hit.is_some() {
+                                    many = true;
+                                    break;
+                                }
+                                hit = Some(k.clone());
+                            }
+                        }
+                        if let (Some(k), false) = (hit, many) {
+                            name = k;
                         }
                     }
                     // The array's instance prefix ("u_s" from "u_s.mem") —
@@ -38574,10 +40509,20 @@ impl Simulator {
             ExprKind::Ident(hier) => {
                 let name = self.resolve_hier_name(hier);
                 if let Some(td) = self.module.tasks.get(&name).cloned() {
-                    // Execute bare task-enable only for zero-time tasks.
-                    // Blocking tasks (with delay/event/wait/forever blocking) require
-                    // process suspension semantics that expr-stmt fast path does not model.
-                    if !td.items.iter().any(|s| self.stmt_is_blocking(s)) {
+                    // Execute a bare task-enable unless the body genuinely needs
+                    // a suspendable process (event control, `wait`, `fork…join`,
+                    // `forever`) — those need semantics this synchronous path
+                    // cannot model. A body that merely contains a `#delay` IS
+                    // executable here: the `TimingControl::Delay` arm of
+                    // `exec_statement` flushes NBA, settles and advances time.
+                    // Testing the broader `stmt_is_blocking` here silently
+                    // DROPPED such calls entirely (see
+                    // `stmt_needs_process_context`).
+                    if !td
+                        .items
+                        .iter()
+                        .any(|s| self.stmt_needs_process_context(s, 0))
+                    {
                         self.exec_task_call(&td, &[]);
                     }
                 } else {
@@ -41256,6 +43201,34 @@ impl Simulator {
             if !fired {
                 continue;
             }
+            // §14.16.1: record the edge time — a drive executed AT this time
+            // matures at edge + output skew instead of waiting a full cycle.
+            self.clocking_last_edge.insert(cb.clone(), self.time);
+            // §14.16 `##N` drives: one clocking event elapsed — mature any
+            // whose countdown hits zero (honoring output skew), keep the rest.
+            if let Some(mut pend) = self.clocking_cycle_pending.remove(&cb) {
+                let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
+                let mut keep: Vec<(u64, String, Value)> = Vec::new();
+                for (n, net, val) in pend.drain(..) {
+                    if n <= 1 {
+                        let skew = self
+                            .clocking_sig_out_skew
+                            .get(&cb)
+                            .and_then(|m| m.get(&net))
+                            .copied()
+                            .unwrap_or(dskew);
+                        if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
+                            let w = self.signal_widths[id];
+                            self.schedule_delayed_with_delay(id, val.resize(w), skew);
+                        }
+                    } else {
+                        keep.push((n - 1, net, val));
+                    }
+                }
+                if !keep.is_empty() {
+                    self.clocking_cycle_pending.insert(cb.clone(), keep);
+                }
+            }
             // Posedge: refresh input snapshots from the Preponed samples
             // captured at slot-entry (`refresh_clocking_preponed`), so `cb.<in>`
             // reads the value from BEFORE this edge (`#1step` input skew,
@@ -41274,6 +43247,36 @@ impl Simulator {
                     }
                 }
             }
+            // §14.13: publish each fresh sample to its hidden mirror signal so
+            // `@(cb.sig)` fires at THIS edge, and only on an actual change.
+            let mirror: Vec<(String, Value)> = snap
+                .iter()
+                .map(|(net, v)| (net.clone(), v.clone()))
+                .collect();
+            for (net, v) in mirror {
+                // meta stores resolved nets; the mirror is keyed by the
+                // clocking-visible name, so translate back through the alias.
+                let vis = self
+                    .clocking_sig_alias
+                    .get(&cb)
+                    .and_then(|m| {
+                        m.iter()
+                            .find(|(_, n)| **n == net)
+                            .map(|(vis, _)| vis.clone())
+                    })
+                    .unwrap_or_else(|| net.clone());
+                let hidden = format!("{}{}.{}", CB_SAMPLE_PREFIX, cb, vis);
+                if let Some(&id) = self.signal_name_to_id.get(hidden.as_str()) {
+                    let w = self.signal_widths[id];
+                    let nv = v.resize(w);
+                    if self.signal_table[id] != nv {
+                        write_sig!(self, id, nv);
+                        self.mark_dirty_id(id);
+                        self.table_modified = true;
+                        self.clocking_mirror_dirty = true;
+                    }
+                }
+            }
             self.clocking_snapshots.insert(cb.clone(), snap);
             // LRM §14.4 output skew: apply any pending output drives
             // queued by `cb.<out_sig> <= val` since the last edge.
@@ -41281,7 +43284,26 @@ impl Simulator {
             // lvalue) so width/signedness handling matches a normal
             // procedural assignment.
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
+                let dskew = self
+                    .clocking_out_skew
+                    .get(&cb)
+                    .copied()
+                    .unwrap_or(0);
                 for (sig, val) in pending {
+                    // §14.4 output skew for drives maturing at THIS edge.
+                    let skew = self
+                        .clocking_sig_out_skew
+                        .get(&cb)
+                        .and_then(|m| m.get(&sig))
+                        .copied()
+                        .unwrap_or(dskew);
+                    if skew > 0 {
+                        if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
+                            let w = self.signal_widths[id];
+                            self.schedule_delayed_with_delay(id, val.resize(w), skew);
+                            continue;
+                        }
+                    }
                     let lval = Expression::new(
                         ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
                             root: None,
@@ -41943,7 +43965,7 @@ impl Simulator {
     /// Execute a fused 1-bit gate. Reads operand bits from signal_table,
     /// computes 4-state result, writes single bit back if changed.
     #[inline(always)]
-    fn exec_fused_gate(&mut self, op: FusedGate) {
+    fn exec_fused_gate(&mut self, op: &FusedGate) {
         #[inline(always)]
         fn and4(a: u8, b: u8) -> u8 {
             if a == 0 || b == 0 {
@@ -41983,7 +44005,7 @@ impl Simulator {
         let (dst, new_bit) = match op {
             FusedGate::Buf1 { dst, src, invert } => {
                 let s = self.signal_table[src.sig_id as usize].get_bit_code(src.bit as usize);
-                let v = if invert {
+                let v = if *invert {
                     not4(s)
                 } else {
                     // Z treated as X when used as a wire value
@@ -42008,7 +44030,7 @@ impl Simulator {
                     GateBin::Or => or4(va, vb),
                     GateBin::Xor => xor4(va, vb),
                 };
-                (dst, if invert { not4(r) } else { r })
+                (dst, if *invert { not4(r) } else { r })
             }
             FusedGate::Mux2 { dst, s, t, e } => {
                 let vs = self.signal_table[s.sig_id as usize].get_bit_code(s.bit as usize);
@@ -42029,6 +44051,22 @@ impl Simulator {
                     }
                 };
                 (dst, v)
+            }
+            FusedGate::UdpLut3 {
+                dst,
+                inputs,
+                input_count,
+                table,
+            } => {
+                let mut lut_idx = 0usize;
+                let mut place = 1usize;
+                for input in inputs.iter().take(*input_count as usize) {
+                    let code = self.signal_table[input.sig_id as usize]
+                        .get_bit_code(input.bit as usize);
+                    lut_idx += usize::from(code.min(2)) * place;
+                    place *= 3;
+                }
+                (dst, ((table >> (lut_idx * 2)) & 3) as u8)
             }
         };
         let id = dst.sig_id as usize;
@@ -42298,6 +44336,11 @@ impl Simulator {
             self.edge_block_snap_valid = vec![false; nb];
             self.edge_block_change_streak = vec![0; nb];
             self.edge_block_epoch_probe_left = vec![0; nb];
+            self.edge_block_skip_streak = vec![0; nb];
+            self.event_heal = std::env::var("XEZIM_EVENT_EDGE_HEAL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(16);
             // The timestamp-only measurement path needs the nested read sets;
             // normal skip mode uses only the compact CSR above.
             self.edge_block_data_reads = Vec::new();
@@ -42309,6 +44352,7 @@ impl Simulator {
             self.edge_block_snap_valid = Vec::new();
             self.edge_block_change_streak = Vec::new();
             self.edge_block_epoch_probe_left = Vec::new();
+            self.edge_block_skip_streak = Vec::new();
         }
         self.build_armed_edge_state();
         eprintln!(
@@ -43024,11 +45068,14 @@ impl Simulator {
                     .unwrap_or(32)
             }
             ExprKind::RangeSelect {
-                left, right, kind, ..
+                expr: rs_base,
+                left,
+                right,
+                kind,
             } => {
                 let l = self.eval_expr(left).to_u64().unwrap_or(0);
                 let r = self.eval_expr(right).to_u64().unwrap_or(0);
-                match kind {
+                let count = match kind {
                     RangeKind::IndexedUp | RangeKind::IndexedDown => r as u32,
                     RangeKind::Constant => {
                         if l >= r {
@@ -43037,7 +45084,22 @@ impl Simulator {
                             (r - l + 1) as u32
                         }
                     }
+                };
+                // §7.4.1: an element range on a packed multi-D lvalue is
+                // count × elem_w bits wide, not count bits — the RHS was
+                // resized to the raw label count and truncated.
+                if let ExprKind::Ident(h) = &rs_base.kind {
+                    let nm = self.resolve_hier_name(h);
+                    if let Some(&ew) = self
+                        .module
+                        .packed_signal_elem_widths
+                        .get(&nm)
+                        .filter(|&&w| w > 1)
+                    {
+                        return count * ew;
+                    }
                 }
+                count
             }
             ExprKind::Index { expr: e, index: _ } => {
                 // Walk chained Index nodes to the root identifier, counting
@@ -47891,8 +49953,23 @@ impl Simulator {
         }
         let n = dims.len();
         let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+        // Resolve the BODY's bare names under the array's instance too. The
+        // loop bounds are found by scoping the array name, but the body then
+        // wrote through an unscoped `m[i][j]` — in a submodule that resolved to
+        // nothing and every write was dropped while the loop itself ran fine.
+        // Only installed when the array is instance-scoped; restored on exit.
+        let saved_fe_hint = self.name_resolve_hint.borrow().clone();
+        if let Some(sc) = scope.filter(|s| !s.is_empty()) {
+            *self.name_resolve_hint.borrow_mut() = Some(sc.to_string());
+        }
+        macro_rules! fe_done {
+            () => {{
+                *self.name_resolve_hint.borrow_mut() = saved_fe_hint.clone();
+            }};
+        }
         loop {
             if self.finished {
+                fe_done!();
                 return;
             }
             for (k, (_, id)) in iterated.iter().enumerate() {
@@ -47901,6 +49978,7 @@ impl Simulator {
             self.continue_flag = false;
             self.exec_statement(body);
             if self.break_flag {
+                fe_done!();
                 return;
             }
             self.continue_flag = false;
@@ -47908,6 +49986,7 @@ impl Simulator {
             let mut k = n;
             loop {
                 if k == 0 {
+                    fe_done!();
                     return;
                 }
                 k -= 1;
@@ -54549,6 +56628,88 @@ impl Simulator {
     /// frame (vif FORMALS) wins; a plain `virtual <iface>` VARIABLE
     /// alias (`vif = bus;` — see `viface_var_aliases`) is the
     /// fallback. Returns the bound interface instance name.
+    /// Resolve a dotted clocking-block reference (`cb`, `iface.cb`, or
+    /// `vif.cb` through a virtual-interface alias) to its `clocking_meta`
+    /// key. `segs` is the dotted path WITHOUT the trailing signal segment
+    /// (for `cb.sig` forms) or the full path (for `@(cb)` forms).
+    fn resolve_clocking_key(&self, segs: &[&str]) -> Option<String> {
+        if segs.is_empty() {
+            return None;
+        }
+        let raw = segs.join(".");
+        if self.clocking_meta.contains_key(&raw) {
+            return Some(raw);
+        }
+        // §25.9 virtual interface: rewrite the head through the vif alias
+        // (`vif.cb_main` → `master_if.cb_main`).
+        if let Some(bound) = self.iface_alias_for(segs[0]) {
+            let mut aliased = bound;
+            for seg in &segs[1..] {
+                aliased.push('.');
+                aliased.push_str(seg);
+            }
+            if self.clocking_meta.contains_key(&aliased) {
+                return Some(aliased);
+            }
+        }
+        None
+    }
+
+    /// §14.3 clocking-block input read for a dotted path whose LAST segment is
+    /// the signal: `cb.sig`, `iface.cb.sig`, `vif.cb.sig`. Returns the value
+    /// sampled at the block's most recent clock edge (`#1step` input skew), or
+    /// the live net before the first edge. `None` when the path doesn't name a
+    /// clocking block, so callers fall through to generic resolution.
+    ///
+    /// Shared by the flat-hier-Ident and the MemberAccess shapes — inside a
+    /// task/function body the parser emits `MemberAccess`, so without the
+    /// second call site `cb.sig` read 0 in every subroutine (and in `wait()`
+    /// conditions), while the same read worked at module scope.
+    /// Flatten a plain dotted MemberAccess/Ident chain to its segments.
+    /// `None` for any shape with indexing/calls (not a simple hierarchical
+    /// name), so callers don't misread `a[i].b` as a clocking path.
+    fn flatten_member_path(expr: &Expression) -> Option<Vec<String>> {
+        match &expr.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                Some(h.path.iter().map(|s| s.name.name.clone()).collect())
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                let mut v = Self::flatten_member_path(base)?;
+                v.push(member.name.clone());
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    fn try_clocking_signal_read(&self, segs: &[&str]) -> Option<Value> {
+        if segs.len() < 2 {
+            return None;
+        }
+        let cb = self.resolve_clocking_key(&segs[..segs.len() - 1])?;
+        let raw_sig = segs[segs.len() - 1];
+        // §14.3 renaming: `cb.alias` samples the bound net.
+        let sig: &str = self
+            .clocking_sig_alias
+            .get(&cb)
+            .and_then(|m| m.get(raw_sig))
+            .map(|s| s.as_str())
+            .unwrap_or(raw_sig);
+        let matches_sig = |k: &str| k == sig || k.rsplit('.').next() == Some(sig);
+        let snap = self.clocking_snapshots.get(&cb)?;
+        if let Some(v) = snap.get(sig) {
+            return Some(v.clone());
+        }
+        if let Some((_, v)) = snap.iter().find(|(k, _)| matches_sig(k)) {
+            return Some(v.clone());
+        }
+        // Known cb but not sampled yet (read before the first edge) — the
+        // live net value is the sensible answer.
+        let (_, sigs) = self.clocking_meta.get(&cb)?;
+        let (net, _) = sigs.iter().find(|(n, is_in)| *is_in && matches_sig(n))?;
+        self.get_signal_value_by_name(net)
+    }
+
     fn iface_alias_for(&self, name: &str) -> Option<String> {
         if let Some(b) = self
             .local_iface_aliases

@@ -195,6 +195,12 @@ impl ArrayOperand {
 pub struct CompiledBlock {
     pub instructions: Vec<Insn>,
     pub num_regs: u32,
+    /// True when any instruction is a `StmtFallback` (AST-interpreted). Those
+    /// resolve bare names through `resolve_hier_name`, which needs the owning
+    /// entry's scope hint installed — the pure-bytecode insns pre-resolve their
+    /// signal ids and don't. Precomputed here so the settle hot loop pays one
+    /// bool test instead of scanning the insn stream.
+    pub has_fallback: bool,
 }
 
 /// Compiler state for converting AST → bytecode.
@@ -278,6 +284,15 @@ pub struct BytecodeCompiler<'a> {
     /// then only excludes 1D/packed bases as before. Set via
     /// `set_multi_dim_arrays`.
     multi_dim_arrays: Option<&'a HashSet<String>>,
+    /// Packed-struct field layout: container name → ordered
+    /// `(member, lsb_offset, width)`. Lets a member-write LHS like
+    /// `s.m0` (parsed as a 2-segment `Ident(["<scope>.s", "m0"])` after
+    /// submodule inlining) compile to a constant bit-range write into the
+    /// container signal, instead of bailing to the AST interpreter — where
+    /// its read dependency would resolve bare-first to the wrong (top-scope)
+    /// input and never re-trigger when the real scoped input changes. Set via
+    /// `set_packed_struct_fields`.
+    packed_struct_fields: Option<&'a HashMap<String, Vec<(String, u32, u32)>>>,
 }
 
 impl<'a> BytecodeCompiler<'a> {
@@ -313,7 +328,51 @@ impl<'a> BytecodeCompiler<'a> {
             loop_continue_patches: Vec::new(),
             string_signals: None,
             multi_dim_arrays: None,
+            packed_struct_fields: None,
         }
+    }
+
+    pub fn set_packed_struct_fields(
+        &mut self,
+        f: &'a HashMap<String, Vec<(String, u32, u32)>>,
+    ) {
+        self.packed_struct_fields = Some(f);
+    }
+
+    /// If `hier` names a packed-struct member (`base.member`, where the base
+    /// resolves to a container signal with a registered field layout), return
+    /// `(container_signal_id, lsb_offset, member_width)`. The base may be a
+    /// single segment (`s`) or already scope-qualified with a dot inside the
+    /// first path segment (`d1.s`) after submodule inlining; the member is the
+    /// final path segment.
+    fn packed_struct_member_target(
+        &self,
+        hier: &HierarchicalIdentifier,
+    ) -> Option<(usize, u32, u32)> {
+        let fields_map = self.packed_struct_fields?;
+        if hier.path.len() < 2 || hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let member = hier.path.last()?.name.name.as_str();
+        let base: String = hier.path[..hier.path.len() - 1]
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        // Resolve the container signal id, honoring scope_hint for a bare base.
+        let base_id = self.lookup_signal_id_by_name(&base).or_else(|| {
+            self.scope_hint
+                .as_ref()
+                .and_then(|sc| self.lookup_signal_id_by_name(&format!("{}.{}", sc, base)))
+        })?;
+        // Field layout is keyed by both the bare and scope-qualified base name.
+        let fields = fields_map.get(base.as_str()).or_else(|| {
+            self.scope_hint
+                .as_ref()
+                .and_then(|sc| fields_map.get(&format!("{}.{}", sc, base)))
+        })?;
+        let (_, off, w) = fields.iter().find(|(m, _, _)| m == member)?;
+        Some((base_id, *off, *w))
     }
 
     pub fn set_string_signals(&mut self, s: &'a HashSet<String>) {
@@ -719,6 +778,70 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Resolve a fully-indexed 2D/ND unpacked-array element whose indices are
+    /// compile-time constants. Elaboration materializes these cells as scalar
+    /// signals named `base[i][j]...`, so generated flop arrays can use the
+    /// ordinary scalar bytecode paths instead of falling back to the AST.
+    fn const_multi_dim_array_elem_signal_id(&self, expr: &Expression) -> Option<usize> {
+        if !matches!(expr.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+
+        fn collect<'e>(
+            compiler: &BytecodeCompiler<'_>,
+            expr: &'e Expression,
+            indices: &mut Vec<u32>,
+        ) -> Option<&'e HierarchicalIdentifier> {
+            match &expr.kind {
+                ExprKind::Index { expr, index } => {
+                    let hier = collect(compiler, expr, indices)?;
+                    indices.push(compiler.eval_const_expr(index)?);
+                    Some(hier)
+                }
+                ExprKind::Paren(inner) => collect(compiler, inner, indices),
+                ExprKind::Ident(hier) => Some(hier),
+                _ => None,
+            }
+        }
+
+        let mut indices = Vec::new();
+        let hier = collect(self, expr, &mut indices)?;
+        if indices.len() < 2 || !self.is_multi_dim_array(hier) {
+            return None;
+        }
+
+        let raw = Self::hier_raw_name(hier);
+        let mut indexed = raw.clone();
+        for index in indices {
+            indexed.push('[');
+            indexed.push_str(&index.to_string());
+            indexed.push(']');
+        }
+
+        if !raw.contains('.') {
+            if let Some(scope) = &self.scope_hint {
+                if let Some(&id) = self
+                    .signal_name_to_id
+                    .get(format!("{}.{}", scope, indexed).as_str())
+                {
+                    return Some(id);
+                }
+            }
+        }
+        if let Some(&id) = self.signal_name_to_id.get(indexed.as_str()) {
+            return Some(id);
+        }
+        if let Some(scope) = &self.scope_hint {
+            if let Some(&id) = self
+                .signal_name_to_id
+                .get(format!("{}.{}", scope, indexed).as_str())
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     fn flattened_outer_const_signal_id(&self, expr: &Expression) -> Option<usize> {
         let ExprKind::Index { expr: base, index } = &expr.kind else {
             return None;
@@ -818,6 +941,47 @@ impl<'a> BytecodeCompiler<'a> {
         } else {
             None
         }
+    }
+
+    /// Signal id of a multi-dimensional unpacked array element addressed as
+    /// `base[i][j]…` with CONSTANT indices. `outer_base` is the expression to
+    /// the left of the final index (itself one or more Index nodes over an
+    /// Ident); `last_index` is the final subscript. Returns None for a dynamic
+    /// index or when no such element is registered.
+    fn multi_dim_elem_signal_id(
+        &self,
+        outer_base: &Expression,
+        last_index: &Expression,
+    ) -> Option<usize> {
+        // Only nested indexing can name a multi-dim element.
+        if !matches!(outer_base.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let mut subs: Vec<u32> = vec![self.eval_const_expr(last_index)?];
+        let mut cur = outer_base;
+        let hier = loop {
+            match &cur.kind {
+                ExprKind::Index { expr: b, index: i } => {
+                    subs.push(self.eval_const_expr(i)?);
+                    cur = b;
+                }
+                ExprKind::Ident(h) => break h,
+                _ => return None,
+            }
+        };
+        subs.reverse();
+        let raw = Self::hier_raw_name(hier);
+        let suffix: String = subs.iter().map(|i| format!("[{}]", i)).collect();
+        let mut candidates = vec![format!("{}{}", raw, suffix)];
+        if let Some(scope) = &self.scope_hint {
+            candidates.push(format!("{}.{}{}", scope, raw, suffix));
+        }
+        if let Some(leaf) = hier.path.last() {
+            candidates.push(format!("{}{}", leaf.name.name, suffix));
+        }
+        candidates
+            .iter()
+            .find_map(|n| self.lookup_signal_id_by_name(n.as_str()))
     }
 
     fn lookup_array_name(&self, hier: &HierarchicalIdentifier) -> Option<String> {
@@ -1373,6 +1537,15 @@ impl<'a> BytecodeCompiler<'a> {
     /// Compile an expression, returning the register holding the result.
     /// Returns None if the expression can't be compiled to bytecode.
     fn compile_expr(&mut self, expr: &Expression, ctx_width: u32) -> Option<RegId> {
+        if let Some(id) = self.const_multi_dim_array_elem_signal_id(expr) {
+            let dest = self.alloc_reg();
+            if self.signal_signed[id] {
+                self.emit(Insn::LoadSignalSigned(dest, id));
+            } else {
+                self.emit(Insn::LoadSignal(dest, id));
+            }
+            return Some(dest);
+        }
         match &expr.kind {
             ExprKind::Number(num) => {
                 let val = self.eval_number_static(num)?;
@@ -1619,6 +1792,20 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Paren(inner) => self.compile_expr(inner, ctx_width),
             ExprKind::Index { expr, index } => {
+                // Element of a MULTI-dimensional unpacked array (`grid[i][j]`).
+                // The base of the outer Index is itself an Index, so none of
+                // the arms below match and the whole thing fell through to the
+                // plain BIT-SELECT path: `grid[1][2]` compiled to bit 2 of bit
+                // 1 of the array's base signal, and the read came back x.
+                // Elements are stored under their flat name, so with constant
+                // indices the element resolves directly. A dynamic index has no
+                // flat name — leave those to the AST fallback, which handles
+                // them.
+                if let Some(id) = self.multi_dim_elem_signal_id(expr, index) {
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::LoadSignal(dest, id));
+                    return Some(dest);
+                }
                 // Array element access
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(name) = self.lookup_array_name(hier) {
@@ -1712,6 +1899,24 @@ impl<'a> BytecodeCompiler<'a> {
                     if let (Some(l), Some(r)) =
                         (self.eval_const_expr(left), self.eval_const_expr(right))
                     {
+                        // §7.4.1: on a packed MULTI-D base (`logic [1:0][63:0]`
+                        // or a packed array of a struct typedef), a constant
+                        // range selects ELEMENTS — `pv[1:0]` is BOTH 64-bit
+                        // slices (128 bits), not bits 1..0. Scale the bounds by
+                        // the registered element width; a plain vector has no
+                        // entry and keeps the historical bit-range meaning.
+                        if let ExprKind::Ident(h) = &expr.kind {
+                            if let Some(ew) = self.packed_elem_width_of(h).filter(|&w| w > 1) {
+                                let dim = self.packed_outer_dim(h);
+                                let lsb_l = Self::packed_elem_lsb(dim, l as i64, ew);
+                                let lsb_r = Self::packed_elem_lsb(dim, r as i64, ew);
+                                let lo = lsb_l.min(lsb_r).max(0) as u32;
+                                let hi = (lsb_l.max(lsb_r) + ew as i64 - 1).max(0) as u32;
+                                let dest = self.alloc_reg();
+                                self.emit(Insn::RangeSelectConst(dest, base, hi, lo));
+                                return Some(dest);
+                            }
+                        }
                         let dest = self.alloc_reg();
                         self.emit(Insn::RangeSelectConst(dest, base, l, r));
                         return Some(dest);
@@ -1864,6 +2069,10 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
             ExprKind::Index { expr, index } => {
+                if let Some(id) = self.const_multi_dim_array_elem_signal_id(lhs) {
+                    self.emit(Insn::NbaAssign(id, val_reg, width));
+                    return true;
+                }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
@@ -2130,12 +2339,29 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.emit(Insn::BlockingAssign(id, val_reg, width));
                     true
+                } else if let Some((base_id, off, mw)) = self.packed_struct_member_target(hier) {
+                    // Packed-struct member write (`s.m0 = …`): splice the value
+                    // into `[off + mw - 1 : off]` of the container signal.
+                    let resized = self.alloc_reg();
+                    self.emit(Insn::Move(resized, val_reg));
+                    self.emit(Insn::Resize(resized, mw));
+                    self.emit(Insn::BlockingAssignRange(
+                        base_id,
+                        off + mw - 1,
+                        off,
+                        resized,
+                    ));
+                    true
                 } else {
                     self.bail("blocking_target");
                     false
                 }
             }
             ExprKind::Index { expr, index } => {
+                if let Some(id) = self.const_multi_dim_array_elem_signal_id(lhs) {
+                    self.emit(Insn::BlockingAssign(id, val_reg, width));
+                    return true;
+                }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
@@ -2427,6 +2653,8 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Ident(hier) => {
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.signal_widths[id]
+                } else if let Some((_, _, mw)) = self.packed_struct_member_target(hier) {
+                    mw
                 } else {
                     let raw = Self::hier_raw_name(hier);
                     self.widths.get(&raw).copied().unwrap_or(32)
@@ -2672,7 +2900,19 @@ impl<'a> BytecodeCompiler<'a> {
                 value,
                 cached_val,
             } => {
-                let w = size.unwrap_or(32);
+                // §5.7.1 — see `Value::unsized_literal_width`.
+                let w = match size {
+                    Some(sz) => *sz,
+                    None => Value::unsized_literal_width(
+                        value,
+                        match base {
+                            NumberBase::Binary => 2,
+                            NumberBase::Octal => 8,
+                            NumberBase::Hex => 16,
+                            NumberBase::Decimal => 10,
+                        },
+                    ),
+                };
                 if let Some((vb, xz, cw)) = cached_val.get() {
                     if cw == w {
                         let mut v = Value::from_inline(vb, xz, w);
@@ -2882,9 +3122,14 @@ impl<'a> BytecodeCompiler<'a> {
         // c910, that slack stacks into double-digit MB; one
         // `shrink_to_fit` per finish reclaims it.
         self.insns.shrink_to_fit();
+        let has_fallback = self
+            .insns
+            .iter()
+            .any(|i| matches!(i, Insn::StmtFallback(..)));
         CompiledBlock {
             num_regs: self.next_reg,
             instructions: self.insns,
+            has_fallback,
         }
     }
 
@@ -3123,6 +3368,20 @@ mod tests {
         )
     }
 
+    fn nested_indexed_expr(name: &str, outer: char, inner: char) -> Expression {
+        let span = crate::ast::Span::dummy();
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(indexed_expr(name, outer)),
+                index: Box::new(Expression::new(
+                    ExprKind::Number(NumberLiteral::UnbasedUnsized(inner)),
+                    span,
+                )),
+            },
+            span,
+        )
+    }
+
     #[test]
     fn generated_nonzero_outer_index_resolves_to_flattened_signal() {
         let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
@@ -3161,6 +3420,39 @@ mod tests {
         let mut compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
         compiler.set_multi_dim_arrays(&multi_dim_arrays);
         assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
+    }
+
+    #[test]
+    fn constant_multi_dim_array_element_uses_scalar_bytecode() {
+        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        signals.insert(Arc::from("m[1][0]"), 0);
+        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
+        let widths: HashMap<String, u32> = HashMap::default();
+        let mut multi_dim_arrays: HashSet<String> = HashSet::default();
+        multi_dim_arrays.insert("m".to_owned());
+        let lhs = nested_indexed_expr("m", '1', '0');
+
+        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[8], &arrays, &widths);
+        compiler.set_multi_dim_arrays(&multi_dim_arrays);
+        assert_eq!(
+            compiler.const_multi_dim_array_elem_signal_id(&lhs),
+            Some(0)
+        );
+        assert!(compiler.compile_nba_target(&lhs, 0, 8));
+        let block = compiler.finish();
+        assert!(matches!(
+            block.instructions.as_slice(),
+            [Insn::NbaAssign(0, 0, 8)]
+        ));
+
+        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[8], &arrays, &widths);
+        compiler.set_multi_dim_arrays(&multi_dim_arrays);
+        assert!(compiler.compile_expr(&lhs, 0).is_some());
+        let block = compiler.finish();
+        assert!(matches!(
+            block.instructions.as_slice(),
+            [Insn::LoadSignal(0, 0)]
+        ));
     }
 
     #[test]
