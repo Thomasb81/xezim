@@ -269,6 +269,53 @@ endmodule
     assert_eq!(records(&vcd, "d").last().unwrap(), "b0");
 }
 
+#[test]
+fn undriven_nets_dump_as_z_not_x_at_top_and_in_instances() {
+    let vcd = dump(
+        "undriven_z",
+        r#"
+module child;
+  wire floating_child;
+  wire [3:0] floating_child_bus;
+  initial begin
+    #0;
+    if (floating_child !== 1'bz) $display("FAIL child scalar is %b", floating_child);
+    if (floating_child_bus !== 4'bzzzz) $display("FAIL child bus is %b", floating_child_bus);
+  end
+endmodule
+
+interface abdram_if;
+  wire por_l;
+  wire por_l_c;
+endinterface
+
+module tb;
+  wire floating_top;
+  wire [2:0] floating_top_bus;
+  child u_child();
+  abdram_if abdram();
+  initial begin
+    $dumpfile("{VCD}");
+    $dumpvars(0, tb);
+    #0;
+    if (floating_top !== 1'bz) $display("FAIL top scalar is %b", floating_top);
+    if (floating_top_bus !== 3'bzzz) $display("FAIL top bus is %b", floating_top_bus);
+    if (abdram.por_l !== 1'bz) $display("FAIL interface por_l is %b", abdram.por_l);
+    if (abdram.por_l_c !== 1'bz) $display("FAIL interface por_l_c is %b", abdram.por_l_c);
+    #1 $finish;
+  end
+endmodule
+"#,
+    );
+
+    assert_eq!(records(&vcd, "floating_top"), vec!["z"], "{}", vcd);
+    assert_eq!(records(&vcd, "floating_top_bus"), vec!["bz"], "{}", vcd);
+    assert_eq!(records(&vcd, "floating_child"), vec!["z"], "{}", vcd);
+    assert_eq!(records(&vcd, "floating_child_bus"), vec!["bz"], "{}", vcd);
+    assert_eq!(records(&vcd, "por_l"), vec!["z"], "{}", vcd);
+    assert_eq!(records(&vcd, "por_l_c"), vec!["z"], "{}", vcd);
+}
+
 /// §21.7.2.1: the `var_type` of each declaration, and the optional bit range on
 /// the reference. Everything used to be `$var wire <w> <id> <name> $end`.
 #[test]
