@@ -31523,17 +31523,27 @@ impl Simulator {
         match &expr.kind {
             ExprKind::Number(num) => self.eval_number(num),
             ExprKind::StringLiteral(s) => {
+                // IEEE 1800-2017 §6.16: A string literal is a packed array of
+                // bytes (8 bits per character).  An empty string "" has width
+                // 0 (zero characters), *not* 8.  Using width 8 for "" caused
+                // `is_equal` to widen a width-0 class-property string to 8 bits
+                // and then return X because the widened bits have X in the
+                // class-property storage.
                 let w = (s.len() * 8) as u32;
-                let mut val = Value::zero(w.max(8));
-                for (i, byte) in s.bytes().rev().enumerate() {
-                    for bit in 0..8 {
-                        if (byte >> bit) & 1 == 1
-                            && i * 8 + bit < val.width as usize {
-                                val.set_bit(i * 8 + bit, LogicBit::One);
-                            }
+                if w == 0 {
+                    Value::zero(0)
+                } else {
+                    let mut val = Value::zero(w.max(8));
+                    for (i, byte) in s.bytes().rev().enumerate() {
+                        for bit in 0..8 {
+                            if (byte >> bit) & 1 == 1
+                                && i * 8 + bit < val.width as usize {
+                                    val.set_bit(i * 8 + bit, LogicBit::One);
+                                }
+                        }
                     }
+                    val
                 }
-                val
             }
             ExprKind::Ident(hier) => {
                 // §18.4: `<obj>.<agg_prop>.<member>` / `<agg_prop>.<member>`
