@@ -879,6 +879,47 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Signal id of a multi-dimensional unpacked array element addressed as
+    /// `base[i][j]…` with CONSTANT indices. `outer_base` is the expression to
+    /// the left of the final index (itself one or more Index nodes over an
+    /// Ident); `last_index` is the final subscript. Returns None for a dynamic
+    /// index or when no such element is registered.
+    fn multi_dim_elem_signal_id(
+        &self,
+        outer_base: &Expression,
+        last_index: &Expression,
+    ) -> Option<usize> {
+        // Only nested indexing can name a multi-dim element.
+        if !matches!(outer_base.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let mut subs: Vec<u32> = vec![self.eval_const_expr(last_index)?];
+        let mut cur = outer_base;
+        let hier = loop {
+            match &cur.kind {
+                ExprKind::Index { expr: b, index: i } => {
+                    subs.push(self.eval_const_expr(i)?);
+                    cur = b;
+                }
+                ExprKind::Ident(h) => break h,
+                _ => return None,
+            }
+        };
+        subs.reverse();
+        let raw = Self::hier_raw_name(hier);
+        let suffix: String = subs.iter().map(|i| format!("[{}]", i)).collect();
+        let mut candidates = vec![format!("{}{}", raw, suffix)];
+        if let Some(scope) = &self.scope_hint {
+            candidates.push(format!("{}.{}{}", scope, raw, suffix));
+        }
+        if let Some(leaf) = hier.path.last() {
+            candidates.push(format!("{}{}", leaf.name.name, suffix));
+        }
+        candidates
+            .iter()
+            .find_map(|n| self.lookup_signal_id_by_name(n.as_str()))
+    }
+
     fn lookup_array_name(&self, hier: &HierarchicalIdentifier) -> Option<String> {
         let raw = Self::hier_raw_name(hier);
         if self.arrays.contains_key(&raw) {
@@ -1678,6 +1719,20 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Paren(inner) => self.compile_expr(inner, ctx_width),
             ExprKind::Index { expr, index } => {
+                // Element of a MULTI-dimensional unpacked array (`grid[i][j]`).
+                // The base of the outer Index is itself an Index, so none of
+                // the arms below match and the whole thing fell through to the
+                // plain BIT-SELECT path: `grid[1][2]` compiled to bit 2 of bit
+                // 1 of the array's base signal, and the read came back x.
+                // Elements are stored under their flat name, so with constant
+                // indices the element resolves directly. A dynamic index has no
+                // flat name — leave those to the AST fallback, which handles
+                // them.
+                if let Some(id) = self.multi_dim_elem_signal_id(expr, index) {
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::LoadSignal(dest, id));
+                    return Some(dest);
+                }
                 // Array element access
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(name) = self.lookup_array_name(hier) {
