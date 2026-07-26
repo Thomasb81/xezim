@@ -580,6 +580,13 @@ enum CombItem {
     Udp {
         idx: usize,
     },
+    /// Edge-filtered sequential UDPs sharing one event terminal. Their data
+    /// terminals are proven state-holding, so one dependency dispatch can
+    /// evaluate the whole clock-domain batch.
+    UdpBatch {
+        event_ref: BitRef,
+        indices: Box<[usize]>,
+    },
 }
 
 /// Per-instance runtime state for a §29 UDP. Terminals are resolved to single
@@ -592,7 +599,23 @@ struct UdpRuntime {
     in_refs: Vec<BitRef>,
     is_sequential: bool,
     delay: u64,
-    rows: Vec<crate::ast::decl::UdpTableRow>,
+    /// Shared by every instance of the same UDP definition. The elaborator
+    /// attaches rows to each flattened instance, but retaining those clones
+    /// wastes substantial memory on cell fabrics.
+    rows: Arc<[crate::ast::decl::UdpTableRow]>,
+    /// Precomputed `(state, previous inputs, current inputs) -> next state`
+    /// table for small UDPs. Values are 0, 1, or 2 (=x).
+    transition_lut: Option<Arc<[u8]>>,
+    /// Number of ternary input vectors (`3 ^ input_count`) in the LUT.
+    lut_input_states: usize,
+    /// Cached ternary encoding of the last input vector. The LUT path can
+    /// compare and index this directly instead of rebuilding previous inputs.
+    input_state_idx: usize,
+    /// When only one input can cause a state transition, identify that port
+    /// and the previous/current trit pairs worth evaluating. Other pairs can
+    /// update the cached trit and return without reading the remaining ports.
+    event_input: Option<u8>,
+    event_transition_mask: u16,
     /// Current output/state level: 0,1,2(=x).
     state: u8,
     /// Previous input levels (0,1,2); 255 = uninitialised (first eval).
@@ -602,7 +625,7 @@ struct UdpRuntime {
     warned: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BitRef {
     sig_id: u32,
     bit: u32,
@@ -637,6 +660,15 @@ enum FusedGate {
         s: BitRef,
         t: BitRef,
         e: BitRef,
+    },
+    /// Zero-delay combinational UDP lowered to a compact current-input LUT.
+    /// Three ternary inputs fit in 54 packed bits, and the immutable node can use
+    /// the same direct dependency dispatch as built-in fused gates.
+    UdpLut3 {
+        dst: BitRef,
+        inputs: [BitRef; 3],
+        input_count: u8,
+        table: u64,
     },
 }
 
@@ -675,7 +707,7 @@ struct CombEntry {
     span: crate::ast::Span,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB001";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB004";
 
 #[derive(serde::Serialize)]
 struct PreparedCombCacheRef<'a> {
@@ -2269,6 +2301,10 @@ pub struct Simulator {
     /// Borrow<str>` lets `.get(&str)` lookups work zero-alloc; call sites
     /// that previously had a `&String` use `.as_str()` to convert.
     signal_name_to_id: HashMap<Arc<str>, usize>,
+    /// Compile-time scope resolver: bare leaf name -> enclosing scopes that
+    /// declare that leaf. Avoids rescanning the complete flattened namespace
+    /// for every continuous assignment and combinational block.
+    scope_parents_by_leaf: HashMap<Arc<str>, Vec<Arc<str>>>,
     /// Lazy per-array element-ID cache: array_name → Vec where index is the
     /// element index and the value is the flat signal_id (None if missing).
     /// Populated on first miss in the hot write/read path; avoids per-access
@@ -4249,16 +4285,16 @@ impl Simulator {
         fn best_scope_for_leaves(
             leaves: &HashSet<String>,
             existing: &HashSet<String>,
+            parents_by_leaf: &HashMap<String, Vec<String>>,
         ) -> Option<String> {
             let mut best_parent: Option<String> = None;
             let mut best_score = 0usize;
             let mut best_depth = 0usize;
             for leaf in leaves {
-                let suffix = format!(".{}", leaf);
-                for full_name in existing {
-                    let Some(parent) = full_name.strip_suffix(&suffix) else {
-                        continue;
-                    };
+                let Some(parents) = parents_by_leaf.get(leaf) else {
+                    continue;
+                };
+                for parent in parents {
                     let mut score = 0usize;
                     for candidate_leaf in leaves {
                         let candidate = format!("{}.{}", parent, candidate_leaf);
@@ -4312,6 +4348,15 @@ impl Simulator {
 
         let mut existing: HashSet<String> = module.signals.keys().cloned().collect();
         existing.extend(module.parameters.keys().cloned());
+        let mut parents_by_leaf: HashMap<String, Vec<String>> = HashMap::default();
+        for full_name in &existing {
+            if let Some((parent, leaf)) = full_name.rsplit_once('.') {
+                parents_by_leaf
+                    .entry(leaf.to_string())
+                    .or_default()
+                    .push(parent.to_string());
+            }
+        }
 
         let mut to_create: HashSet<String> = HashSet::default();
         for ca in &module.continuous_assigns {
@@ -4336,7 +4381,7 @@ impl Simulator {
             } else if lhs_leaf.is_some() && rhs_leaf.is_none() {
                 rhs_raw.as_deref().and_then(|raw| parent_n(raw, 1))
             } else {
-                best_scope_for_leaves(&leaves, &existing)
+                best_scope_for_leaves(&leaves, &existing, &parents_by_leaf)
             };
 
             let Some(scope) = scope else {
@@ -4987,6 +5032,25 @@ impl Simulator {
         instance_path_order.sort_unstable_by(|&a, &b| {
             module.instances[a].path.cmp(&module.instances[b].path)
         });
+        let mut scope_parents_by_leaf: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::default();
+        for full_name in signal_name_to_id
+            .keys()
+            .map(|name| name.as_ref())
+            .chain(module.arrays.keys().map(String::as_str))
+            .chain(module.arrays_2d.keys().map(String::as_str))
+            .chain(module.arrays_nd.keys().map(String::as_str))
+        {
+            if let Some((parent, leaf)) = full_name.rsplit_once('.') {
+                scope_parents_by_leaf
+                    .entry(Arc::from(leaf))
+                    .or_default()
+                    .push(Arc::from(parent));
+            }
+        }
+        for parents in scope_parents_by_leaf.values_mut() {
+            parents.sort_unstable();
+            parents.dedup();
+        }
 
         let mut sim = Self {
             prev_val,
@@ -5011,6 +5075,7 @@ impl Simulator {
             jit_nba_side_len: 0,
             signal_table,
             signal_name_to_id,
+            scope_parents_by_leaf,
             array_elem_ids: HashMap::default(),
             array_first_id,
             leaf_name_to_ids,
@@ -9445,7 +9510,7 @@ impl Simulator {
                 // AST entries always need &mut self.
                 CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {}
                 // §29 UDPs mutate per-instance state — never parallel-safe.
-                CombItem::Udp { .. } => {}
+                CombItem::Udp { .. } | CombItem::UdpBatch { .. } => {}
             }
             if e.has_unresolved_reads {
                 unresolved += 1;
@@ -9999,6 +10064,21 @@ impl Simulator {
                 };
                 (dst, v)
             }
+            FusedGate::UdpLut3 {
+                dst,
+                inputs,
+                input_count,
+                table,
+            } => {
+                let mut lut_idx = 0usize;
+                let mut place = 1usize;
+                for input in inputs.iter().take(*input_count as usize) {
+                    let code = view[input.sig_id as usize].get_bit_code(input.bit as usize);
+                    lut_idx += usize::from(code.min(2)) * place;
+                    place *= 3;
+                }
+                (dst, ((table >> (lut_idx * 2)) & 3) as u8)
+            }
         };
         let id = dst.sig_id as usize;
         if view[id].set_bit_code(dst.bit as usize, new_bit) {
@@ -10022,7 +10102,7 @@ impl Simulator {
             CombItem::Noop => true,
             // §29 UDPs are never evaluated on this isolated (parallel) path —
             // `has_udp` forces the serial settle. Present only for exhaustiveness.
-            CombItem::Udp { .. } => true,
+            CombItem::Udp { .. } | CombItem::UdpBatch { .. } => true,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 // LRM §9.3.1: skip if the destination is forced
                 if !self.forced_signals.contains_key(dst_id) {
@@ -10168,7 +10248,7 @@ impl Simulator {
         match item {
             CombItem::Noop => true,
             // §29 UDPs never run on this isolated path (serial forced).
-            CombItem::Udp { .. } => true,
+            CombItem::Udp { .. } | CombItem::UdpBatch { .. } => true,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 let (mut sv, mut sx) = view[*src_id].raw_bits();
                 // §6.11.1/§10.7: a 2-state destination drops X/Z (X/Z -> 0).
@@ -11185,7 +11265,7 @@ impl Simulator {
                 CombItem::Noop => SendCombItem::Noop,
                 // §29 UDPs disable parallel settle (has_udp forces serial), so a
                 // UDP never reaches a worker; represent it inertly here.
-                CombItem::Udp { .. } => SendCombItem::Noop,
+                CombItem::Udp { .. } | CombItem::UdpBatch { .. } => SendCombItem::Noop,
                 CombItem::FastDirectCopy { dst_id, src_id } => SendCombItem::FastDirectCopy {
                     dst_id: *dst_id,
                     src_id: *src_id,
@@ -16584,6 +16664,68 @@ impl Simulator {
         let mut pv_dropped = 0usize;
         let mut pv_const_terms = 0usize;
         let mut pv_implicit_terms = 0usize;
+        let mut programs: HashMap<
+            String,
+            (
+                Arc<[crate::ast::decl::UdpTableRow]>,
+                Option<Arc<[u8]>>,
+                usize,
+            ),
+        > = HashMap::default();
+        let mut pv_lut = 0usize;
+        let mut pv_event_filtered = 0usize;
+        // Flattened module ports are represented as zero-delay copies. Follow
+        // those aliases so UDPs clocked through separate wrapper-port nets can
+        // share one upstream event dispatch, as net/functor simulators do.
+        let mut event_aliases: HashMap<BitRef, BitRef> = HashMap::default();
+        for entry in entries.iter() {
+            match &entry.item {
+                CombItem::FastDirectCopy { dst_id, src_id }
+                    if self.signal_widths.get(*dst_id) == Some(&1)
+                        && self.signal_widths.get(*src_id) == Some(&1) =>
+                {
+                    event_aliases.insert(
+                        BitRef {
+                            sig_id: *dst_id as u32,
+                            bit: 0,
+                        },
+                        BitRef {
+                            sig_id: *src_id as u32,
+                            bit: 0,
+                        },
+                    );
+                }
+                CombItem::DirectCopy {
+                    dst_id,
+                    src_id,
+                    width: 1,
+                } => {
+                    event_aliases.insert(
+                        BitRef {
+                            sig_id: *dst_id as u32,
+                            bit: 0,
+                        },
+                        BitRef {
+                            sig_id: *src_id as u32,
+                            bit: 0,
+                        },
+                    );
+                }
+                CombItem::FusedGate {
+                    op:
+                        FusedGate::Buf1 {
+                            dst,
+                            src,
+                            invert: false,
+                        },
+                } => {
+                    event_aliases.insert(*dst, *src);
+                }
+                _ => {}
+            }
+        }
+        let mut event_batch_index: HashMap<BitRef, usize> = HashMap::default();
+        let mut event_batches: Vec<(BitRef, Vec<usize>)> = Vec::new();
         // `--primitive-verbose`: print every UDP instance with its source
         // location and each terminal's resolution (net + bit, constant, or
         // failure), so a dropped vendor cell can be diagnosed from the log
@@ -16733,6 +16875,70 @@ impl Simulator {
                 .map(|b| b.sig_id as usize)
                 .collect();
             let write_ids: Vec<usize> = vec![out_ref.sig_id as usize];
+            let (rows, transition_lut, lut_input_states) =
+                if let Some(program) = programs.get(&inst.udp_name) {
+                    program.clone()
+                } else {
+                    let rows: Arc<[crate::ast::decl::UdpTableRow]> =
+                        Arc::from(inst.rows.into_boxed_slice());
+                    let (transition_lut, lut_input_states) =
+                        Self::compile_udp_transition_lut(&rows, n, inst.is_sequential)
+                            .map_or((None, 0), |(lut, states)| (Some(Arc::from(lut)), states));
+                    let program = (rows, transition_lut, lut_input_states);
+                    programs.insert(inst.udp_name.clone(), program.clone());
+                    program
+                };
+            if transition_lut.is_some() {
+                pv_lut += 1;
+            }
+            let (event_input, event_transition_mask) = if inst.is_sequential {
+                transition_lut
+                    .as_ref()
+                    .and_then(|lut| Self::compile_udp_event_filter(lut, lut_input_states, n))
+                    .map_or((None, 0), |(input, mask)| (Some(input as u8), mask))
+            } else {
+                (None, 0)
+            };
+            if event_input.is_some() {
+                pv_event_filtered += 1;
+            }
+            if !inst.is_sequential
+                && inst.delay == 0
+                && n <= 3
+                && in_refs.iter().all(|input| input.sig_id != u32::MAX)
+            {
+                if let Some(lut) = transition_lut.as_ref() {
+                    let mut inputs = [out_ref; 3];
+                    inputs[..n].copy_from_slice(&in_refs);
+                    let mut table = 0u64;
+                    // For a combinational UDP, previous inputs and state do
+                    // not participate in row matching. Extract one current-
+                    // input plane from the general transition table.
+                    let prev_x = lut_input_states.saturating_sub(1);
+                    for cur_idx in 0..lut_input_states {
+                        let idx =
+                            ((2 * lut_input_states + prev_x) * lut_input_states) + cur_idx;
+                        table |= u64::from(lut[idx]) << (cur_idx * 2);
+                    }
+                    entries.push(CombEntry {
+                        item: CombItem::FusedGate {
+                            op: FusedGate::UdpLut3 {
+                                dst: out_ref,
+                                inputs,
+                                input_count: n as u8,
+                                table,
+                            },
+                        },
+                        scope_hint: None,
+                        read_signal_ids: read_ids,
+                        write_signal_ids: write_ids,
+                        has_unresolved_reads: false,
+                        defer_at_time0: false,
+                        span: inst.span,
+                    });
+                    continue;
+                }
+            }
             self.udp_runtime.push(UdpRuntime {
                 udp_name: inst.udp_name.clone(),
                 inst_path: inst.inst_path.clone(),
@@ -16740,12 +16946,39 @@ impl Simulator {
                 in_refs,
                 is_sequential: inst.is_sequential,
                 delay: inst.delay,
-                rows: inst.rows,
+                rows,
+                transition_lut,
+                lut_input_states,
+                input_state_idx: lut_input_states.saturating_sub(1),
+                event_input,
+                event_transition_mask,
                 state: init_state,
                 prev_inputs: vec![255u8; n],
                 initialized: false,
                 warned: false,
             });
+            if let Some(event_input) = event_input {
+                let mut event_ref = self.udp_runtime[idx].in_refs[event_input as usize];
+                if event_ref.sig_id != u32::MAX {
+                    for _ in 0..64 {
+                        let Some(&upstream) = event_aliases.get(&event_ref) else {
+                            break;
+                        };
+                        if upstream == event_ref {
+                            break;
+                        }
+                        event_ref = upstream;
+                    }
+                    let batch_idx = *event_batch_index.entry(event_ref).or_insert_with(|| {
+                        let batch_idx = event_batches.len();
+                        event_batches.push((event_ref, Vec::new()));
+                        batch_idx
+                    });
+                    event_batches[batch_idx].1.push(idx);
+                    self.has_udp = true;
+                    continue;
+                }
+            }
             entries.push(CombEntry {
                 item: CombItem::Udp { idx },
                 scope_hint: None,
@@ -16756,6 +16989,26 @@ impl Simulator {
                 span: inst.span,
             });
             self.has_udp = true;
+        }
+        let pv_batched_instances: usize = event_batches.iter().map(|(_, batch)| batch.len()).sum();
+        let pv_batches = event_batches.len();
+        for (event_ref, indices) in event_batches {
+            let write_signal_ids = indices
+                .iter()
+                .map(|&idx| self.udp_runtime[idx].out_ref.sig_id as usize)
+                .collect();
+            entries.push(CombEntry {
+                item: CombItem::UdpBatch {
+                    event_ref,
+                    indices: indices.into_boxed_slice(),
+                },
+                scope_hint: None,
+                read_signal_ids: vec![event_ref.sig_id as usize],
+                write_signal_ids,
+                has_unresolved_reads: false,
+                defer_at_time0: false,
+                span: crate::ast::Span::dummy(),
+            });
         }
         if pv && pv_total > 0 {
             eprintln!(
@@ -16776,6 +17029,18 @@ impl Simulator {
                 }
             );
         }
+        if std::env::var("XEZIM_DEP_STATS").is_ok() && pv_total > 0 {
+            eprintln!(
+                "[UDP_STATS] instances={} transition_lut={} row_fallback={} event_filtered={} batched_instances={} batches={} shared_definitions={}",
+                pv_total,
+                pv_lut,
+                pv_total.saturating_sub(pv_lut),
+                pv_event_filtered,
+                pv_batched_instances,
+                pv_batches,
+                programs.len()
+            );
+        }
         // A UDP output initializes to x (a reference simulator), not the undriven-wire z — a
         // sequential UDP to its `initial` start state (default x), a
         // combinational UDP to x until its first evaluation drives it. This is
@@ -16787,6 +17052,117 @@ impl Simulator {
                 self.table_modified = true;
             }
         }
+    }
+
+    /// Compile a small UDP definition into a dense ternary transition table.
+    /// The table is shared by all flattened instances of that definition.
+    fn compile_udp_transition_lut(
+        rows: &[crate::ast::decl::UdpTableRow],
+        input_count: usize,
+        is_sequential: bool,
+    ) -> Option<(Box<[u8]>, usize)> {
+        const MAX_LUT_ENTRIES: usize = 200_000;
+        let input_states = 3usize.checked_pow(input_count as u32)?;
+        let entries = input_states
+            .checked_mul(input_states)?
+            .checked_mul(3)?;
+        if entries > MAX_LUT_ENTRIES {
+            return None;
+        }
+
+        #[inline]
+        fn decode_ternary(mut encoded: usize, values: &mut [u8]) {
+            for value in values {
+                *value = (encoded % 3) as u8;
+                encoded /= 3;
+            }
+        }
+
+        let mut lut = vec![2u8; entries];
+        let mut cur = vec![0u8; input_count];
+        let mut prev = vec![0u8; input_count];
+        for state in 0..3u8 {
+            for prev_idx in 0..input_states {
+                decode_ternary(prev_idx, &mut prev);
+                for cur_idx in 0..input_states {
+                    decode_ternary(cur_idx, &mut cur);
+                    let mut next = 2u8;
+                    for row in rows {
+                        if let Some(output) =
+                            Self::udp_match_row(row, &cur, &prev, state, is_sequential)
+                        {
+                            next = output.unwrap_or(state);
+                            break;
+                        }
+                    }
+                    let idx = ((state as usize * input_states + prev_idx) * input_states)
+                        + cur_idx;
+                    lut[idx] = next;
+                }
+            }
+        }
+        Some((lut.into_boxed_slice(), input_states))
+    }
+
+    /// Find a single event-bearing input for an edge-triggered sequential UDP.
+    /// If changing any combination of the other inputs while this port is
+    /// stable always holds state, those inputs are data terminals. The returned
+    /// mask identifies event-port transitions that can possibly change state.
+    fn compile_udp_event_filter(
+        lut: &[u8],
+        input_states: usize,
+        input_count: usize,
+    ) -> Option<(usize, u16)> {
+        for event_input in 0..input_count {
+            let place = 3usize.pow(event_input as u32);
+            let digit = |encoded: usize| (encoded / place) % 3;
+            let mut passive_holds = true;
+            for state in 0..3usize {
+                for prev_idx in 0..input_states {
+                    for cur_idx in 0..input_states {
+                        if prev_idx != cur_idx
+                            && digit(prev_idx) == digit(cur_idx)
+                            && lut[(state * input_states + prev_idx) * input_states + cur_idx]
+                                != state as u8
+                        {
+                            passive_holds = false;
+                            break;
+                        }
+                    }
+                    if !passive_holds {
+                        break;
+                    }
+                }
+                if !passive_holds {
+                    break;
+                }
+            }
+            if !passive_holds {
+                continue;
+            }
+
+            let mut mask = 0u16;
+            for state in 0..3usize {
+                for cur_idx in 0..input_states {
+                    let cur_digit = digit(cur_idx);
+                    for prev_digit in 0..3usize {
+                        if prev_digit == cur_digit {
+                            continue;
+                        }
+                        let prev_idx = cur_idx - cur_digit * place + prev_digit * place;
+                        let next =
+                            lut[(state * input_states + prev_idx) * input_states + cur_idx];
+                        if next != state as u8 {
+                            mask |= 1u16 << (prev_digit * 3 + cur_digit);
+                        }
+                    }
+                }
+            }
+            if mask != 0 {
+                return Some((event_input, mask));
+            }
+        }
+        None
     }
 
     /// IEEE 1800-2017 §29: evaluate one UDP instance on an input change.
@@ -16809,6 +17185,87 @@ impl Simulator {
             }
             return;
         }
+        if self.udp_runtime[idx].initialized {
+            if let Some(event_input) = self.udp_runtime[idx].event_input {
+                let event_input = event_input as usize;
+                let input = self.udp_runtime[idx].in_refs[event_input];
+                let code = if input.sig_id == u32::MAX {
+                    input.bit as u8
+                } else {
+                    self.signal_table[input.sig_id as usize]
+                        .get_bit_code(input.bit as usize)
+                        .min(2)
+                };
+                let place = 3usize.pow(event_input as u32);
+                let prev = (self.udp_runtime[idx].input_state_idx / place) % 3;
+                let transition = prev * 3 + code as usize;
+                if prev == code as usize {
+                    // This entry was triggered by a data-terminal change.
+                    // Such changes were proven state-holding by the compiled
+                    // filter; refresh their cached trits without a LUT lookup.
+                    let mut encoded = self.udp_runtime[idx].input_state_idx;
+                    let mut data_place = 1usize;
+                    for i in 0..n {
+                        if i != event_input {
+                            let input = self.udp_runtime[idx].in_refs[i];
+                            let input_code = if input.sig_id == u32::MAX {
+                                input.bit as u8
+                            } else {
+                                self.signal_table[input.sig_id as usize]
+                                    .get_bit_code(input.bit as usize)
+                                    .min(2)
+                            };
+                            let old = (encoded / data_place) % 3;
+                            encoded =
+                                encoded - old * data_place + input_code as usize * data_place;
+                        }
+                        data_place *= 3;
+                    }
+                    self.udp_runtime[idx].input_state_idx = encoded;
+                    return;
+                }
+                if prev != code as usize
+                    && self.udp_runtime[idx].event_transition_mask & (1u16 << transition) == 0
+                {
+                    let rt = &mut self.udp_runtime[idx];
+                    rt.input_state_idx =
+                        rt.input_state_idx - prev * place + code as usize * place;
+                    return;
+                }
+                if prev != code as usize {
+                    let mut cur_idx = 0usize;
+                    let mut input_place = 1usize;
+                    for input in &self.udp_runtime[idx].in_refs {
+                        let input_code = if input.sig_id == u32::MAX {
+                            input.bit as u8
+                        } else {
+                            self.signal_table[input.sig_id as usize]
+                                .get_bit_code(input.bit as usize)
+                                .min(2)
+                        };
+                        cur_idx += input_code as usize * input_place;
+                        input_place *= 3;
+                    }
+                    let prev_idx =
+                        cur_idx - code as usize * place + prev * place;
+                    let rt = &self.udp_runtime[idx];
+                    let lut = rt.transition_lut.as_ref().expect("filtered UDP has LUT");
+                    let lut_idx = ((rt.state as usize * rt.lut_input_states + prev_idx)
+                        * rt.lut_input_states)
+                        + cur_idx;
+                    let new_code = lut[lut_idx];
+                    {
+                        let rt = &mut self.udp_runtime[idx];
+                        rt.state = new_code;
+                        rt.input_state_idx = cur_idx;
+                    }
+                    self.drive_udp_output(idx, new_code);
+                    return;
+                }
+            }
+        }
+        let mut cur_idx = 0usize;
+        let mut place = 1usize;
         for i in 0..n {
             let b = self.udp_runtime[idx].in_refs[i];
             let code = if b.sig_id == u32::MAX {
@@ -16818,66 +17275,103 @@ impl Simulator {
                 self.signal_table[b.sig_id as usize].get_bit_code(b.bit as usize)
             };
             cur[i] = if code >= 2 { 2 } else { code }; // 0,1,x (z->x)
+            cur_idx += cur[i] as usize * place;
+            place *= 3;
         }
 
         let rt = &self.udp_runtime[idx];
         let first = !rt.initialized;
         let cur_state = rt.state;
+        let has_lut = rt.transition_lut.is_some();
 
         // Previous input levels. Before the first evaluation each input's prior
         // value is x (its pre-time-0 state), so a t=0 x→value transition is a
         // real edge — matching a reference simulator.
         let mut prev = [2u8; 32];
-        for i in 0..n {
-            prev[i] = if first { 2 } else { rt.prev_inputs[i] };
+        if !has_lut {
+            for i in 0..n {
+                prev[i] = if first { 2 } else { rt.prev_inputs[i] };
+            }
         }
 
         // A UDP is event-driven: it evaluates only when an input actually
         // changes. A spurious re-trigger with no input change must NOT alter the
         // output (a reference simulator never re-evaluates without an event). The very first
         // evaluation always runs so combinational level rows establish t=0.
-        let any_change = first || (0..n).any(|i| cur[i] != prev[i]);
+        let any_change = first
+            || if has_lut {
+                cur_idx != rt.input_state_idx
+            } else {
+                (0..n).any(|i| cur[i] != prev[i])
+            };
         if !any_change {
             return;
         }
 
-        // Select the first matching row (top-down).
-        let mut next: Option<u8> = None; // Some(level) or None(=`-` hold)
-        let mut matched = false;
-        for row in &rt.rows {
-            if let Some(out) =
-                Self::udp_match_row(row, &cur[..n], &prev[..n], cur_state, rt.is_sequential)
-            {
-                next = out;
-                matched = true;
-                break;
+        let new_code = if let Some(lut) = &rt.transition_lut {
+            let mut prev_idx = if first {
+                rt.lut_input_states.saturating_sub(1)
+            } else {
+                rt.input_state_idx
+            };
+            if let Some(event_input) = rt.event_input {
+                // Data-terminal changes were intentionally not dispatched.
+                // Treat their previous values as already current so this LUT
+                // lookup represents only the event-bearing input transition.
+                let event_input = event_input as usize;
+                let mut place = 1usize;
+                for i in 0..n {
+                    if i != event_input {
+                        let old = (prev_idx / place) % 3;
+                        prev_idx = prev_idx - old * place + cur[i] as usize * place;
+                    }
+                    place *= 3;
+                }
             }
-        }
-
-        // Resolve the driven value. Per a reference simulator (empirically): on ANY input
-        // change with no matching row the output becomes x — for both
-        // combinational (§29.3) and sequential UDPs. Holding happens only via an
-        // explicit `-` output row (or when no input changed, handled above).
-        let new_code: u8 = if matched {
-            match next {
-                Some(c) => c,      // explicit 0/1/x
-                None => cur_state, // `-` no-change (sequential hold)
-            }
+            let idx = ((cur_state as usize * rt.lut_input_states + prev_idx)
+                * rt.lut_input_states)
+                + cur_idx;
+            lut[idx]
         } else {
-            2 // no matching row ⇒ x
+            // Select the first matching row (top-down).
+            let mut next: Option<u8> = None;
+            let mut matched = false;
+            for row in rt.rows.iter() {
+                if let Some(out) =
+                    Self::udp_match_row(row, &cur[..n], &prev[..n], cur_state, rt.is_sequential)
+                {
+                    next = out;
+                    matched = true;
+                    break;
+                }
+            }
+
+            // On an input change with no matching row the output becomes x.
+            if matched {
+                next.unwrap_or(cur_state)
+            } else {
+                2
+            }
         };
 
         // Commit state + previous-input vector.
         {
             let rt = &mut self.udp_runtime[idx];
             rt.state = new_code;
+            rt.input_state_idx = cur_idx;
             for i in 0..n {
                 rt.prev_inputs[i] = cur[i];
             }
             rt.initialized = true;
         }
 
-        // Drive the output net.
+        self.drive_udp_output(idx, new_code);
+    }
+
+    /// Commit a UDP result using delayed, sequential-NBA, or immediate
+    /// combinational semantics as appropriate for the instance.
+    #[inline(always)]
+    fn drive_udp_output(&mut self, idx: usize, new_code: u8) {
         let out_ref = self.udp_runtime[idx].out_ref;
         let delay = self.udp_runtime[idx].delay;
         let is_seq = self.udp_runtime[idx].is_sequential;
@@ -16914,6 +17408,81 @@ impl Simulator {
             self.table_modified = true;
             self.after_signal_write(id);
             self.mark_dirty_id(id);
+        }
+    }
+
+    /// Direct event dispatch for sequential UDPs sharing an upstream event
+    /// terminal. The event value is read once; inactive edges only update each
+    /// instance's cached event trit, while active edges read data terminals and
+    /// perform one encoded LUT lookup.
+    #[inline(always)]
+    fn eval_udp_batch(&mut self, event_ref: BitRef, indices: &[usize]) {
+        let event_code = self.signal_table[event_ref.sig_id as usize]
+            .get_bit_code(event_ref.bit as usize)
+            .min(2);
+        for &idx in indices {
+            if !self.udp_runtime[idx].initialized {
+                self.eval_udp(idx);
+                continue;
+            }
+            let event_input = self.udp_runtime[idx]
+                .event_input
+                .expect("batched UDP has event input") as usize;
+            let instance_event_ref = self.udp_runtime[idx].in_refs[event_input];
+            let event_code = if !self.forced_signals.is_empty()
+                && self
+                    .forced_signals
+                    .contains_key(&(instance_event_ref.sig_id as usize))
+            {
+                self.signal_table[instance_event_ref.sig_id as usize]
+                    .get_bit_code(instance_event_ref.bit as usize)
+                    .min(2)
+            } else {
+                event_code
+            };
+            let event_place = 3usize.pow(event_input as u32);
+            let prev_event =
+                (self.udp_runtime[idx].input_state_idx / event_place) % 3;
+            if prev_event == event_code as usize {
+                continue;
+            }
+            let transition = prev_event * 3 + event_code as usize;
+            if self.udp_runtime[idx].event_transition_mask & (1u16 << transition) == 0 {
+                let rt = &mut self.udp_runtime[idx];
+                rt.input_state_idx = rt.input_state_idx - prev_event * event_place
+                    + event_code as usize * event_place;
+                continue;
+            }
+
+            let mut cur_idx = 0usize;
+            let mut place = 1usize;
+            for (input_idx, input) in self.udp_runtime[idx].in_refs.iter().enumerate() {
+                let code = if input_idx == event_input {
+                    event_code
+                } else if input.sig_id == u32::MAX {
+                    input.bit as u8
+                } else {
+                    self.signal_table[input.sig_id as usize]
+                        .get_bit_code(input.bit as usize)
+                        .min(2)
+                };
+                cur_idx += code as usize * place;
+                place *= 3;
+            }
+            let prev_idx =
+                cur_idx - event_code as usize * event_place + prev_event * event_place;
+            let rt = &self.udp_runtime[idx];
+            let lut = rt.transition_lut.as_ref().expect("batched UDP has LUT");
+            let lut_idx =
+                ((rt.state as usize * rt.lut_input_states + prev_idx) * rt.lut_input_states)
+                    + cur_idx;
+            let new_code = lut[lut_idx];
+            {
+                let rt = &mut self.udp_runtime[idx];
+                rt.state = new_code;
+                rt.input_state_idx = cur_idx;
+            }
+            self.drive_udp_output(idx, new_code);
         }
     }
 
@@ -17199,25 +17768,30 @@ impl Simulator {
         if self.signal_name_to_id.contains_key(lhs_leaf.as_str()) {
             return None;
         }
-        let suffix = format!(".{}", lhs_leaf);
         let mut leaves = HashSet::default();
         Self::collect_leaf_idents(lhs, &mut leaves);
         Self::collect_leaf_idents(rhs, &mut leaves);
         if leaves.is_empty() {
             return None;
         }
+        self.best_scope_from_leaf_index(lhs_leaf.as_str(), &leaves)
+    }
 
-        let mut best_parent: Option<String> = None;
+    fn best_scope_from_leaf_index(
+        &self,
+        anchor: &str,
+        leaves: &HashSet<String>,
+    ) -> Option<String> {
+        let parents = self.scope_parents_by_leaf.get(anchor)?;
+        let mut best_parent: Option<&str> = None;
         let mut best_score = 0usize;
         let mut best_depth = 0usize;
-        for full_name in self.signal_name_to_id.keys() {
-            let Some(parent) = full_name.strip_suffix(&suffix) else {
-                continue;
-            };
+        for parent in parents {
             let mut score = 0usize;
-            for leaf in &leaves {
-                let candidate = format!("{}.{}", parent, leaf);
-                if self.signal_name_to_id.contains_key(candidate.as_str()) {
+            for leaf in leaves {
+                if self.scope_parents_by_leaf.get(leaf.as_str()).is_some_and(
+                    |leaf_parents| leaf_parents.iter().any(|candidate| candidate == parent),
+                ) {
                     score += 1;
                 }
             }
@@ -17226,18 +17800,14 @@ impl Simulator {
                 || (score == best_score && depth > best_depth)
                 || (score == best_score
                     && depth == best_depth
-                    && best_parent.as_ref().is_none_or(|p| parent.len() > p.len()))
+                    && best_parent.is_none_or(|best| parent.len() > best.len()))
             {
-                best_parent = Some(parent.to_string());
+                best_parent = Some(parent.as_ref());
                 best_score = score;
                 best_depth = depth;
             }
         }
-        if best_score == 0 {
-            None
-        } else {
-            best_parent
-        }
+        (best_score != 0).then(|| best_parent.expect("positive score has parent").to_string())
     }
 
     fn infer_scope_from_rw_sets(
@@ -17263,59 +17833,7 @@ impl Simulator {
                 leaves.insert(name.clone());
             }
         }
-        let anchor = anchor?;
-        let suffix = format!(".{}", anchor);
-        let mut best_parent: Option<String> = None;
-        let mut best_score = 0usize;
-        let mut best_depth = 0usize;
-        // An unpacked ARRAY has no entry of its own in `signal_name_to_id`
-        // (only per-element `scope.m[0]` names), so an entry whose anchor is an
-        // array base — `always_comb foreach (m[i]) m[i] = seed;` in a submodule
-        // — matched nothing here and got NO scope hint. Its foreach then looked
-        // the bare name up, found no dims, and every body write was dropped.
-        // Scan the array registries alongside the signal table, for both the
-        // parent candidates and the leaf scoring.
-        let leaf_declared = |candidate: &str| -> bool {
-            self.signal_name_to_id.contains_key(candidate)
-                || self.module.arrays.contains_key(candidate)
-                || self.module.arrays_2d.contains_key(candidate)
-                || self.module.arrays_nd.contains_key(candidate)
-        };
-        for full_name in self
-            .signal_name_to_id
-            .keys()
-            .map(|k| k.as_ref())
-            .chain(self.module.arrays.keys().map(|k| k.as_str()))
-            .chain(self.module.arrays_2d.keys().map(|k| k.as_str()))
-            .chain(self.module.arrays_nd.keys().map(|k| k.as_str()))
-        {
-            let Some(parent) = full_name.strip_suffix(&suffix) else {
-                continue;
-            };
-            let mut score = 0usize;
-            for leaf in &leaves {
-                let candidate = format!("{}.{}", parent, leaf);
-                if leaf_declared(candidate.as_str()) {
-                    score += 1;
-                }
-            }
-            let depth = parent.split('.').count();
-            if score > best_score
-                || (score == best_score && depth > best_depth)
-                || (score == best_score
-                    && depth == best_depth
-                    && best_parent.as_ref().is_none_or(|p| parent.len() > p.len()))
-            {
-                best_parent = Some(parent.to_string());
-                best_score = score;
-                best_depth = depth;
-            }
-        }
-        if best_score == 0 {
-            None
-        } else {
-            best_parent
-        }
+        self.best_scope_from_leaf_index(anchor?.as_str(), &leaves)
     }
 
     /// Collect all signal names read by an expression.
@@ -20951,6 +21469,13 @@ impl Simulator {
                         let id = self.udp_runtime[*idx].out_ref.sig_id as usize;
                         self.name_for_id(id)
                     }
+                    CombItem::UdpBatch { indices, .. } => {
+                        let Some(&idx) = indices.first() else {
+                            continue;
+                        };
+                        let id = self.udp_runtime[idx].out_ref.sig_id as usize;
+                        self.name_for_id(id)
+                    }
                     CombItem::DirectCopy { dst_id, .. }
                     | CombItem::FastDirectCopy { dst_id, .. } => self.name_for_id(*dst_id),
                     CombItem::FastDirectFanout { dst_ids, .. } => {
@@ -20963,7 +21488,8 @@ impl Simulator {
                         let id = match op {
                             FusedGate::Buf1 { dst, .. }
                             | FusedGate::Bin2 { dst, .. }
-                            | FusedGate::Mux2 { dst, .. } => dst.sig_id as usize,
+                            | FusedGate::Mux2 { dst, .. }
+                            | FusedGate::UdpLut3 { dst, .. } => dst.sig_id as usize,
                         };
                         self.name_for_id(id)
                     }
@@ -27761,7 +28287,6 @@ impl Simulator {
                 self.exec_insns(insns);
             }
             CombItem::FusedGate { op } => {
-                let op = *op;
                 self.exec_fused_gate(op);
             }
             CombItem::FusedBufFanout { src, dsts, invert } => {
@@ -27770,6 +28295,9 @@ impl Simulator {
             CombItem::Udp { idx } => {
                 let idx = *idx;
                 self.eval_udp(idx);
+            }
+            CombItem::UdpBatch { event_ref, indices } => {
+                self.eval_udp_batch(*event_ref, indices);
             }
             // Copies are always handled by the isolated path; reaching here for
             // them would be a logic error, but eval them correctly regardless.
@@ -28241,7 +28769,6 @@ impl Simulator {
                         }
                     }
                     CombItem::FusedGate { op } => {
-                        let op = *op;
                         self.exec_fused_gate(op);
                         self.prof_settle_dc_count += 1;
                     }
@@ -28253,6 +28780,10 @@ impl Simulator {
                         let idx = *idx;
                         self.eval_udp(idx);
                         self.prof_settle_dc_count += 1;
+                    }
+                    CombItem::UdpBatch { event_ref, indices } => {
+                        self.eval_udp_batch(*event_ref, indices);
+                        self.prof_settle_dc_count += indices.len() as u64;
                     }
                 }
 
@@ -43111,7 +43642,7 @@ impl Simulator {
     /// Execute a fused 1-bit gate. Reads operand bits from signal_table,
     /// computes 4-state result, writes single bit back if changed.
     #[inline(always)]
-    fn exec_fused_gate(&mut self, op: FusedGate) {
+    fn exec_fused_gate(&mut self, op: &FusedGate) {
         #[inline(always)]
         fn and4(a: u8, b: u8) -> u8 {
             if a == 0 || b == 0 {
@@ -43151,7 +43682,7 @@ impl Simulator {
         let (dst, new_bit) = match op {
             FusedGate::Buf1 { dst, src, invert } => {
                 let s = self.signal_table[src.sig_id as usize].get_bit_code(src.bit as usize);
-                let v = if invert {
+                let v = if *invert {
                     not4(s)
                 } else {
                     // Z treated as X when used as a wire value
@@ -43176,7 +43707,7 @@ impl Simulator {
                     GateBin::Or => or4(va, vb),
                     GateBin::Xor => xor4(va, vb),
                 };
-                (dst, if invert { not4(r) } else { r })
+                (dst, if *invert { not4(r) } else { r })
             }
             FusedGate::Mux2 { dst, s, t, e } => {
                 let vs = self.signal_table[s.sig_id as usize].get_bit_code(s.bit as usize);
@@ -43197,6 +43728,22 @@ impl Simulator {
                     }
                 };
                 (dst, v)
+            }
+            FusedGate::UdpLut3 {
+                dst,
+                inputs,
+                input_count,
+                table,
+            } => {
+                let mut lut_idx = 0usize;
+                let mut place = 1usize;
+                for input in inputs.iter().take(*input_count as usize) {
+                    let code = self.signal_table[input.sig_id as usize]
+                        .get_bit_code(input.bit as usize);
+                    lut_idx += usize::from(code.min(2)) * place;
+                    place *= 3;
+                }
+                (dst, ((table >> (lut_idx * 2)) & 3) as u8)
             }
         };
         let id = dst.sig_id as usize;
