@@ -449,17 +449,16 @@ macro_rules! write_sig {
                 $self.sig_last_change[__wsig_id] = $self.event_phase;
             }
             // Arm only gateable edge blocks that actually read this signal.
-            // The dense bitmap makes unrelated writes a single cheap branch;
-            // positive hits use the sparse CSR fanout built after compilation.
+            // The dense bitmap keeps unrelated writes a single cheap branch;
+            // positive hits use the sparse CSR fanout built after compile.
             if $self.armed_edge
                 && __wsig_id < $self.armed_input_bitmap.len()
                 && $self.armed_input_bitmap[__wsig_id]
             {
-                if let Some(&(lo, hi)) = $self.armed_input_ranges.get(&(__wsig_id as u32)) {
-                    for __k in lo as usize..hi as usize {
-                        let __bi = $self.armed_input_blocks[__k] as usize;
-                        $self.edge_block_armed[__bi] = 1;
-                    }
+                let (lo, hi) = $self.armed_input_ranges[__wsig_id];
+                for __k in lo as usize..hi as usize {
+                    let __bi = $self.armed_input_blocks[__k] as usize;
+                    $self.edge_block_armed[__bi] = 1;
                 }
             }
             // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
@@ -552,6 +551,15 @@ enum CombItem {
         dsts: Box<[BitRef]>,
         invert: bool,
     },
+    /// Batched one-bit AND/NAND gates sharing one input. Clock trees commonly
+    /// instantiate many `gclk = parent_clk & enable` cells; one dependency
+    /// entry avoids repeated worklist dispatch while every enable remains a
+    /// sensitivity and every destination remains independent.
+    FusedAndFanout {
+        common: BitRef,
+        branches: Box<[FusedAndBranch]>,
+        invert: bool,
+    },
     /// Bytecode-compiled cont_assign: RHS compiled to VM instructions,
     /// result written to pre-resolved dst_id via BlockingAssign insn.
     CompiledContAssign {
@@ -631,6 +639,12 @@ pub struct BitRef {
     bit: u32,
 }
 
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FusedAndBranch {
+    dst: BitRef,
+    other: BitRef,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum GateBin {
     And,
@@ -707,7 +721,7 @@ struct CombEntry {
     span: crate::ast::Span,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB004";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB005";
 
 #[derive(serde::Serialize)]
 struct PreparedCombCacheRef<'a> {
@@ -1315,7 +1329,7 @@ const CB_SAMPLE_PREFIX: &str = "__xz_cbsample.";
 /// Number of u64 words needed for the occupancy bitmap (256 / 64 = 4).
 const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
 
-type EventList = Vec<(usize, Vec<Statement>)>;
+type EventList = VecDeque<(usize, Vec<Statement>)>;
 
 /// Built-in clock generator: replaces `always #N clk = ~clk` with O(1) toggle.
 /// Eliminates AST cloning and traversal for the most common simulation pattern.
@@ -1436,7 +1450,7 @@ impl NbaFastIndex {
 
 #[cfg(test)]
 mod nba_fast_index_tests {
-    use super::{CombEntry, CombItem, Expression, NbaFastIndex, Statement};
+    use super::{CombEntry, CombItem, Expression, NbaFastIndex, Statement, TimingWheel};
 
     #[test]
     fn dense_prefix_and_sparse_tail_track_and_clear_entries() {
@@ -1468,6 +1482,24 @@ mod nba_fast_index_tests {
         assert!(std::mem::size_of::<CombEntry>() <= 160);
         assert!(std::mem::size_of::<Expression>() > std::mem::size_of::<Box<Expression>>());
         assert!(std::mem::size_of::<Statement>() > std::mem::size_of::<Box<Statement>>());
+    }
+
+    #[test]
+    fn timing_wheel_pop_front_preserves_fifo_and_pending_pids() {
+        let mut wheel = TimingWheel::new();
+        wheel.schedule(10, 1, Vec::new());
+        wheel.schedule(10, 2, Vec::new());
+        wheel.schedule(10, 1, Vec::new());
+
+        assert_eq!(wheel.pop_front(10).map(|event| event.0), Some(1));
+        assert!(wheel.has_pid(1));
+        wheel.schedule(10, 3, Vec::new());
+
+        assert_eq!(wheel.pop_front(10).map(|event| event.0), Some(2));
+        assert_eq!(wheel.pop_front(10).map(|event| event.0), Some(1));
+        assert!(!wheel.has_pid(1));
+        assert_eq!(wheel.pop_front(10).map(|event| event.0), Some(3));
+        assert_eq!(wheel.next_time(), None);
     }
 }
 
@@ -1504,7 +1536,7 @@ impl TimingWheel {
     fn new() -> Self {
         let mut wheel = Vec::with_capacity(WHEEL_SIZE);
         for _ in 0..WHEEL_SIZE {
-            wheel.push(Vec::new());
+            wheel.push(VecDeque::new());
         }
         TimingWheel {
             wheel,
@@ -1538,10 +1570,13 @@ impl TimingWheel {
         *self.pid_counts.entry(pid).or_insert(0) += 1;
         if time < self.current_time + WHEEL_SIZE as u64 {
             let s = Self::slot(time);
-            self.wheel[s].push((pid, stmts));
+            self.wheel[s].push_back((pid, stmts));
             self.bitmap_set(s);
         } else {
-            self.overflow.entry(time).or_default().push((pid, stmts));
+            self.overflow
+                .entry(time)
+                .or_default()
+                .push_back((pid, stmts));
         }
     }
 
@@ -1640,9 +1675,7 @@ impl TimingWheel {
         best
     }
 
-    /// Remove and return all events at the given time.
-    fn remove(&mut self, time: u64) -> EventList {
-        self.current_time = time;
+    fn move_overflow_into_wheel(&mut self, time: u64) {
         // Drain overflow events that now fit in the wheel (rare)
         if !self.overflow.is_empty() {
             let cutoff = time + WHEEL_SIZE as u64;
@@ -1658,7 +1691,39 @@ impl TimingWheel {
                 }
             }
         }
+    }
 
+    #[inline]
+    fn decrement_pid_count(&mut self, pid: usize) {
+        if let Some(c) = self.pid_counts.get_mut(&pid) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.pid_counts.remove(&pid);
+            }
+        }
+    }
+
+    /// Remove and return the next FIFO event at `time`, leaving the remaining
+    /// same-time events in the wheel. This avoids repeatedly draining and
+    /// reinserting a large active-region batch for every process activation.
+    fn pop_front(&mut self, time: u64) -> Option<(usize, Vec<Statement>)> {
+        self.current_time = time;
+        self.move_overflow_into_wheel(time);
+        let s = Self::slot(time);
+        let event = self.wheel[s].pop_front();
+        if self.wheel[s].is_empty() {
+            self.bitmap_clear(s);
+        }
+        if let Some((pid, _)) = event.as_ref() {
+            self.decrement_pid_count(*pid);
+        }
+        event
+    }
+
+    /// Remove and return all events at the given time.
+    fn remove(&mut self, time: u64) -> EventList {
+        self.current_time = time;
+        self.move_overflow_into_wheel(time);
         let s = Self::slot(time);
         let events = std::mem::take(&mut self.wheel[s]);
         if !events.is_empty() {
@@ -1666,12 +1731,7 @@ impl TimingWheel {
             self.bitmap_clear(s);
             // Decrement pid_counts for each removed event.
             for (p, _) in &events {
-                if let Some(c) = self.pid_counts.get_mut(p) {
-                    *c = c.saturating_sub(1);
-                    if *c == 0 {
-                        self.pid_counts.remove(p);
-                    }
-                }
+                self.decrement_pid_count(*p);
             }
         }
         events
@@ -1750,7 +1810,7 @@ impl TimingWheel {
             }
             let delta = ((s + WHEEL_SIZE - cur_slot) % WHEEL_SIZE) as u64;
             let abs_time = self.current_time + delta;
-            let mut kept = Vec::new();
+            let mut kept = VecDeque::new();
             for (p, stmts) in v {
                 if p == pid {
                     // Capture the earliest match.
@@ -1758,7 +1818,7 @@ impl TimingWheel {
                         found = Some((abs_time, stmts));
                     }
                 } else {
-                    kept.push((p, stmts));
+                    kept.push_back((p, stmts));
                 }
             }
             if kept.is_empty() {
@@ -1774,7 +1834,7 @@ impl TimingWheel {
             for t in times {
                 if let Some(v) = self.overflow.get_mut(&t) {
                     if let Some(idx) = v.iter().position(|(p, _)| *p == pid) {
-                        let stmts = v.remove(idx).1;
+                        let stmts = v.remove(idx).expect("matching event disappeared").1;
                         found = Some((t, stmts));
                         if v.is_empty() {
                             self.overflow.remove(&t);
@@ -3632,7 +3692,7 @@ pub struct Simulator {
     armed_edge: bool,
     armed_edge_shadow: bool,
     armed_input_bitmap: Vec<bool>,
-    armed_input_ranges: HashMap<u32, (u32, u32)>,
+    armed_input_ranges: Vec<(u32, u32)>,
     armed_input_blocks: Vec<u32>,
     edge_block_armed: Vec<u8>,
     armed_fast_skips: u64,
@@ -4910,6 +4970,14 @@ impl Simulator {
                 }
             }
         }
+        for base in module.z_init_signals.iter() {
+            if let Some(&(first_id, lo, hi)) = array_first_id.get(base.as_str()) {
+                let n = (hi - lo + 1).max(0) as usize;
+                for id in first_id..first_id + n {
+                    signal_table[id] = Value::all_z(signal_widths_vec[id]);
+                }
+            }
+        }
         for (nm, v) in array_elem_inits {
             if let Some(&id) = signal_name_to_id.get(nm.as_str()) {
                 signal_table[id] = v;
@@ -4974,6 +5042,17 @@ impl Simulator {
             for (name, &id) in signal_name_to_id.iter() {
                 if name.starts_with(prefix.as_str()) {
                     signal_table[id] = Value::zero(signal_widths_vec[id]);
+                }
+            }
+        }
+        for base in module.z_init_signals.iter() {
+            if !module.arrays_2d.contains_key(base) && !module.arrays_nd.contains_key(base) {
+                continue;
+            }
+            let prefix = format!("{}[", base);
+            for (name, &id) in signal_name_to_id.iter() {
+                if name.starts_with(prefix.as_str()) {
+                    signal_table[id] = Value::all_z(signal_widths_vec[id]);
                 }
             }
         }
@@ -5458,7 +5537,7 @@ impl Simulator {
                 || std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
             armed_edge_shadow: std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
             armed_input_bitmap: Vec::new(),
-            armed_input_ranges: HashMap::default(),
+            armed_input_ranges: Vec::new(),
             armed_input_blocks: Vec::new(),
             edge_block_armed: Vec::new(),
             armed_fast_skips: 0,
@@ -9537,7 +9616,8 @@ impl Simulator {
                 | CombItem::FastDirectFanout { .. }
                 | CombItem::DirectCopy { .. }
                 | CombItem::FusedGate { .. }
-                | CombItem::FusedBufFanout { .. } => {
+                | CombItem::FusedBufFanout { .. }
+                | CombItem::FusedAndFanout { .. } => {
                     self.comb_par_safe[i] = single_writer;
                 }
                 CombItem::CompiledContAssign { compiled, .. }
@@ -10148,6 +10228,42 @@ impl Simulator {
         }
     }
 
+    #[inline]
+    fn exec_fused_and_fanout_isolated(
+        common: BitRef,
+        branches: &[FusedAndBranch],
+        invert: bool,
+        view: &mut [Value],
+        dirtied: &mut Vec<u32>,
+    ) {
+        let common_code =
+            view[common.sig_id as usize].get_bit_code(common.bit as usize);
+        for branch in branches {
+            let other =
+                view[branch.other.sig_id as usize].get_bit_code(branch.other.bit as usize);
+            let and = if common_code == 0 || other == 0 {
+                0
+            } else if common_code == 1 && other == 1 {
+                1
+            } else {
+                2
+            };
+            let result = if invert {
+                match and {
+                    0 => 1,
+                    1 => 0,
+                    _ => 2,
+                }
+            } else {
+                and
+            };
+            let id = branch.dst.sig_id as usize;
+            if view[id].set_bit_code(branch.dst.bit as usize, result) {
+                dirtied.push(id as u32);
+            }
+        }
+    }
+
     /// Evaluate one comb entry against a mutable signal `view`, appending
     /// the ids of any signals it changes to `dirtied`. Returns false if the
     /// entry is an AST-fallback variant the isolated path can't handle (the
@@ -10280,6 +10396,20 @@ impl Simulator {
                         dirtied,
                     );
                 }
+                true
+            }
+            CombItem::FusedAndFanout {
+                common,
+                branches,
+                invert,
+            } => {
+                Self::exec_fused_and_fanout_isolated(
+                    *common,
+                    branches,
+                    *invert,
+                    view,
+                    dirtied,
+                );
                 true
             }
             // AST fallback (ContAssign / AlwaysBlock) — needs the full
@@ -10415,6 +10545,20 @@ impl Simulator {
                         dirtied,
                     );
                 }
+                true
+            }
+            CombItem::FusedAndFanout {
+                common,
+                branches,
+                invert,
+            } => {
+                Self::exec_fused_and_fanout_isolated(
+                    *common,
+                    branches,
+                    *invert,
+                    view,
+                    dirtied,
+                );
                 true
             }
             CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => false,
@@ -11367,6 +11511,15 @@ impl Simulator {
                         invert: *invert,
                     }
                 }
+                CombItem::FusedAndFanout {
+                    common,
+                    branches,
+                    invert,
+                } => SendCombItem::FusedAndFanout {
+                    common: *common,
+                    branches: branches.clone(),
+                    invert: *invert,
+                },
                 CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
                     SendCombItem::AstFallback
                 }
@@ -16178,6 +16331,23 @@ impl Simulator {
             }
         }
 
+        // Add UDPs before ordering so library-cell chains participate in the
+        // same writer-before-reader schedule as continuous assignments.
+        self.build_udp_entries(&mut entries);
+        // Stateful and generic UDP runtimes have observable initialization and
+        // event ordering. Keep their established post-combinational position;
+        // only proven-pure fused gates participate in the topological pass.
+        let mut deferred_udp_entries = Vec::new();
+        let mut orderable_entries = Vec::with_capacity(entries.len());
+        for entry in entries.drain(..) {
+            if matches!(entry.item, CombItem::Udp { .. } | CombItem::UdpBatch { .. }) {
+                deferred_udp_entries.push(entry);
+            } else {
+                orderable_entries.push(entry);
+            }
+        }
+        entries = orderable_entries;
+
         // Topologically reorder `entries` so that writers come before readers
         // where possible. This collapses feedforward chains to 1 settle iter.
         // Cycles are broken arbitrarily; feedback still needs multi-iter.
@@ -16361,10 +16531,7 @@ impl Simulator {
                 );
             }
         }
-
-        // §29: append User-Defined Primitive instances as comb entries so
-        // their input nets participate in the reverse-dependency index below.
-        self.build_udp_entries(&mut entries);
+        entries.extend(deferred_udp_entries);
 
         // Collapse replicated exact-width copies with a common source into a
         // single worklist entry. Only single-writer destinations qualify: a
@@ -16498,6 +16665,126 @@ impl Simulator {
                 "[OPT] grouped {} fused buffers into {} fanout entries",
                 buf_copies,
                 buf_groups
+            );
+        }
+
+        // Batch AND/NAND gates with a frequently shared operand. This is the
+        // structural form of a clock-gate bank (`gclk_i = clk & enable_i`),
+        // but the transformation is valid for arbitrary one-bit logic and
+        // therefore needs no hierarchy or signal-name heuristic.
+        let mut and_operand_uses: HashMap<BitRef, usize> = HashMap::default();
+        for entry in &entries {
+            if let CombItem::FusedGate {
+                op:
+                    FusedGate::Bin2 {
+                        dst,
+                        a,
+                        b,
+                        op: GateBin::And,
+                        ..
+                    },
+            } = &entry.item
+            {
+                if dst != a
+                    && dst != b
+                    && a != b
+                    && writer_counts.get(dst.sig_id as usize).copied() == Some(1)
+                {
+                    *and_operand_uses.entry(*a).or_default() += 1;
+                    *and_operand_uses.entry(*b).or_default() += 1;
+                }
+            }
+        }
+        let mut and_groups: HashMap<(BitRef, bool), Vec<(usize, FusedAndBranch)>> =
+            HashMap::default();
+        for (eidx, entry) in entries.iter().enumerate() {
+            if let CombItem::FusedGate {
+                op:
+                    FusedGate::Bin2 {
+                        dst,
+                        a,
+                        b,
+                        op: GateBin::And,
+                        invert,
+                    },
+            } = &entry.item
+            {
+                if dst == a
+                    || dst == b
+                    || a == b
+                    || writer_counts.get(dst.sig_id as usize).copied() != Some(1)
+                {
+                    continue;
+                }
+                let a_uses = and_operand_uses.get(a).copied().unwrap_or(0);
+                let b_uses = and_operand_uses.get(b).copied().unwrap_or(0);
+                let (common, other) = if a_uses >= b_uses { (*a, *b) } else { (*b, *a) };
+                and_groups
+                    .entry((common, *invert))
+                    .or_default()
+                    .push((
+                        eidx,
+                        FusedAndBranch {
+                            dst: *dst,
+                            other,
+                        },
+                    ));
+            }
+        }
+        let mut and_replacement: Vec<Option<(BitRef, Box<[FusedAndBranch]>, bool)>> =
+            vec![None; entries.len()];
+        let mut and_skip = vec![false; entries.len()];
+        let mut and_batch_count = 0usize;
+        let mut and_gate_count = 0usize;
+        for ((common, invert), branches) in and_groups {
+            if branches.len() < 4 {
+                continue;
+            }
+            let first = branches[0].0;
+            let packed: Vec<FusedAndBranch> =
+                branches.iter().map(|(_, branch)| *branch).collect();
+            for &(eidx, _) in branches.iter().skip(1) {
+                and_skip[eidx] = true;
+            }
+            and_batch_count += 1;
+            and_gate_count += packed.len();
+            and_replacement[first] = Some((common, packed.into_boxed_slice(), invert));
+        }
+        if and_batch_count != 0 {
+            let mut grouped =
+                Vec::with_capacity(entries.len() - and_gate_count + and_batch_count);
+            for (eidx, mut entry) in entries.into_iter().enumerate() {
+                if and_skip[eidx] {
+                    continue;
+                }
+                if let Some((common, branches, invert)) = and_replacement[eidx].take() {
+                    entry.read_signal_ids.clear();
+                    entry.read_signal_ids.push(common.sig_id as usize);
+                    for branch in branches.iter() {
+                        let id = branch.other.sig_id as usize;
+                        if !entry.read_signal_ids.contains(&id) {
+                            entry.read_signal_ids.push(id);
+                        }
+                    }
+                    entry.write_signal_ids.clear();
+                    entry
+                        .write_signal_ids
+                        .extend(branches.iter().map(|branch| branch.dst.sig_id as usize));
+                    entry.has_unresolved_reads = false;
+                    entry.scope_hint = None;
+                    entry.item = CombItem::FusedAndFanout {
+                        common,
+                        branches,
+                        invert,
+                    };
+                }
+                grouped.push(entry);
+            }
+            entries = grouped;
+            sim_dbg_eprintln!(
+                "[OPT] grouped {} fused AND/NAND gates into {} shared-input batches",
+                and_gate_count,
+                and_batch_count
             );
         }
 
@@ -17926,17 +18213,44 @@ impl Simulator {
         });
     }
 
-    /// Every element name of a 2-D unpacked array addressed as `m[i][j]`,
-    /// given the INNER `m[i]` expression. `None` when `base` is not an index
-    /// into a registered 2-D array. Used to give a reader of one element a real
-    /// dependency: the array base carries no signal id of its own.
-    /// Element names a `m[i][j]` read depends on. With CONSTANT subscripts that
-    /// is a single element; only a dynamic subscript needs the whole array.
-    /// `outer_index` is the subscript applied to `base` by the caller.
+    fn constant_array_index(expr: &Expression, module: &ElaboratedModule) -> Option<i64> {
+        fn is_constant(expr: &Expression, module: &ElaboratedModule) -> bool {
+            match &expr.kind {
+                ExprKind::Number(_) => true,
+                ExprKind::Ident(hier) => hier
+                    .path
+                    .last()
+                    .is_some_and(|seg| module.parameters.contains_key(seg.name.name.as_str())),
+                ExprKind::Paren(inner) => is_constant(inner, module),
+                ExprKind::Unary { operand, .. } => is_constant(operand, module),
+                ExprKind::Binary { left, right, .. } => {
+                    is_constant(left, module) && is_constant(right, module)
+                }
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => {
+                    is_constant(condition, module)
+                        && is_constant(then_expr, module)
+                        && is_constant(else_expr, module)
+                }
+                _ => false,
+            }
+        }
+
+        is_constant(expr, module).then(|| {
+            super::elaborate::const_eval_i64_with_params(expr, Some(&module.parameters))
+        })?
+    }
+
+    /// Dependency names for a 2-D unpacked-array read `m[i][j]`. Constant
+    /// indices select one element; genuinely dynamic indices retain the
+    /// conservative whole-array dependency required for correctness.
     fn multi_dim_elem_names(
         base: &Expression,
+        outer_index: &Expression,
         module: &ElaboratedModule,
-        outer_index: Option<&Expression>,
     ) -> Option<Vec<String>> {
         let ExprKind::Index {
             expr: inner,
@@ -17952,20 +18266,17 @@ impl Simulator {
         let ((a0, a1), (b0, b1), _) = *module.arrays_2d.get(&name)?;
         let (alo, ahi) = (a0.min(a1), a0.max(a1));
         let (blo, bhi) = (b0.min(b1), b0.max(b1));
-        // Fold both subscripts when possible. Expanding every element is
-        // correct but makes each element carry the whole array's readers, so a
-        // single-bit change drags the entire array's dependents into the settle
-        // worklist (measured: 1536 dependents where the design connects ~2).
-        let fold = |e: &Expression, lo: i64, hi: i64| -> Option<i64> {
-            Self::const_expr_u64(e, &module.parameters)
-                .map(|v| v as i64)
-                .filter(|i| *i >= lo && *i <= hi)
-        };
         if let (Some(a), Some(b)) = (
-            fold(inner_index, alo, ahi),
-            outer_index.and_then(|e| fold(e, blo, bhi)),
+            Self::constant_array_index(inner_index, module),
+            Self::constant_array_index(outer_index, module),
         ) {
-            return Some(vec![format!("{}[{}][{}]", name, a, b)]);
+            let in_a = (alo..=ahi).contains(&a);
+            let in_b = (blo..=bhi).contains(&b);
+            return Some(if in_a && in_b {
+                vec![format!("{}[{}][{}]", name, a, b)]
+            } else {
+                Vec::new()
+            });
         }
         let mut out = Vec::new();
         for a in alo..=ahi {
@@ -18024,44 +18335,30 @@ impl Simulator {
                 if let ExprKind::Ident(hier) = &base.kind {
                     let name = Self::resolve_hier_name_static(hier, module);
                     if let Some((lo, hi, _)) = module.arrays.get(&name) {
-                        // A CONSTANT index depends on exactly one element.
-                        // Registering the whole array here (the old
-                        // unconditional behaviour) is correct but quadratically
-                        // expensive: after generate unrolling an index like
-                        // `q[(c + d) % N]` folds to a literal, yet every such
-                        // reader was recorded against all N elements. On a
-                        // 128-column fabric each 1-bit element ended up with
-                        // 1664 dependents instead of ~13, so one bit changing
-                        // dragged 128x more entries into the settle worklist
-                        // than the design actually connects.
-                        let folded = Self::const_expr_u64(index, &module.parameters)
-                            .map(|v| v as i64)
-                            .filter(|i| *i >= *lo && *i <= *hi);
-                        match folded {
-                            Some(i) => {
+                        if let Some(i) = Self::constant_array_index(index, module) {
+                            if (*lo..=*hi).contains(&i) {
                                 reads.insert(format!("{}[{}]", name, i));
                             }
-                            // Genuinely dynamic index: any element may be read.
-                            None => {
-                                for i in *lo..=*hi {
-                                    reads.insert(format!("{}[{}]", name, i));
-                                }
+                        } else {
+                            for i in *lo..=*hi {
+                                reads.insert(format!("{}[{}]", name, i));
                             }
                         }
                     } else {
                         reads.insert(name);
                     }
-                } else if let Some(elems) =
-                    Self::multi_dim_elem_names(base, module, Some(index))
-                {
-                    // 2-D element read (`m[i][j]`): the base is itself an Index,
-                    // so the 1-D expansion above never fires and only the array
-                    // BASE name was registered — a name with no signal id, so the
-                    // reader had no dependency at all and kept the X it sampled
-                    // on the first settle. Expand every element, exactly as the
-                    // 1-D case does.
+                } else if let Some(elems) = Self::multi_dim_elem_names(base, index, module) {
                     for e in elems {
                         reads.insert(e);
+                    }
+                    if let ExprKind::Index {
+                        index: inner_index,
+                        ..
+                    } = &base.kind
+                    {
+                        if Self::constant_array_index(inner_index, module).is_none() {
+                            Self::collect_expr_reads(inner_index, module, reads);
+                        }
                     }
                 } else {
                     // Non-Ident base (e.g. nested Index, RangeSelect from inlining
@@ -18071,7 +18368,9 @@ impl Simulator {
                     // the comb-entry never re-evaluates when it changes.
                     Self::collect_expr_reads(base, module, reads);
                 }
-                Self::collect_expr_reads(index, module, reads);
+                if Self::constant_array_index(index, module).is_none() {
+                    Self::collect_expr_reads(index, module, reads);
+                }
             }
             ExprKind::RangeSelect {
                 expr: base,
@@ -19134,12 +19433,17 @@ impl Simulator {
                 .map(|(_, kind)| *kind)
                 .unwrap_or("process");
             eprintln!(
-                "[xezim][hang-report]   pid {} ({}) waiting {} tick(s) (since t={}) on @({}) — resumes at {}",
+                "[xezim][hang-report]   pid {} ({}) waiting {} tick(s) (since t={}) on @({}){} — resumes at {}",
                 w.pid,
                 origin,
                 age,
                 w.parked_time,
                 sens_desc.join(" or "),
+                if w.remaining_events > 1 {
+                    format!(" ({} qualifying events remaining)", w.remaining_events)
+                } else {
+                    String::new()
+                },
                 loc
             );
             // For signals that never moved, walk the driver cone to the root.
@@ -19306,25 +19610,15 @@ impl Simulator {
     /// loop until quiescent.
     fn drain_active_processes_at_current_time(&mut self) {
         while self.event_queue.next_time() == Some(self.time) {
-            let mut batch = self.event_queue.remove(self.time);
-            while !batch.is_empty() {
-                if self.finished {
-                    return;
-                }
-                let (pid, stmts) = batch.remove(0);
-                let t_now = self.time;
-                for (p, s) in batch.drain(..) {
-                    self.event_queue.schedule(t_now, p, s);
-                }
-                self.run_scheduled_process(pid, &stmts);
-                if !self.is_pid_suspended(pid) {
-                    self.child_finished(pid);
-                }
-                if self.event_queue.next_time() == Some(self.time) {
-                    batch = self.event_queue.remove(self.time);
-                } else {
-                    batch.clear();
-                }
+            if self.finished {
+                return;
+            }
+            let Some((pid, stmts)) = self.event_queue.pop_front(self.time) else {
+                break;
+            };
+            self.run_scheduled_process(pid, &stmts);
+            if !self.is_pid_suspended(pid) {
+                self.child_finished(pid);
             }
         }
     }
@@ -20127,32 +20421,28 @@ impl Simulator {
         self.fire_clock_generators();
 
         let _t = profile_timing.then(std::time::Instant::now);
-        let mut batch = self.event_queue.remove(self.time);
+        let has_active = self.event_queue.next_time() == Some(self.time);
         if let Some(t) = _t {
             accum.t_sched += t.elapsed().as_nanos() as u64;
         }
-        if !batch.is_empty() {
+        if has_active {
             non_clock_change = true;
         }
         let _t = profile_timing.then(std::time::Instant::now);
         if trace_loop {
             eprintln!(
-                "[xezim] iter={} time={} batch.len={}",
-                iters,
-                self.time,
-                batch.len()
+                "[xezim] iter={} time={} active={}",
+                iters, self.time, has_active
             );
         }
         loop {
-            while !batch.is_empty() {
+            while self.event_queue.next_time() == Some(self.time) {
                 if self.finished || self.zero_delay_defer_pending {
                     break;
                 }
-                let (pid, stmts) = batch.remove(0);
-                let t_now = self.time;
-                for (p, s) in batch.drain(..) {
-                    self.event_queue.schedule(t_now, p, s);
-                }
+                let Some((pid, stmts)) = self.event_queue.pop_front(self.time) else {
+                    break;
+                };
                 if trace_loop {
                     eprintln!("[xezim]   running pid={} stmts={}", pid, stmts.len());
                     for (idx, s) in stmts.iter().enumerate() {
@@ -20167,22 +20457,9 @@ impl Simulator {
                 if !self.is_pid_suspended(pid) {
                     self.child_finished(pid);
                 }
-                if self.event_queue.next_time() == Some(self.time) {
-                    batch = self.event_queue.remove(self.time);
-                } else {
-                    batch.clear();
-                }
             }
             if self.finished || self.zero_delay_defer_pending {
-                // A defer-requested break can leave not-yet-run activations in
-                // the local batch — requeue them (dropping them would silently
-                // KILL those processes; the deferred spinner would vanish and
-                // the outer loop would "advance on its own" past the livelock
-                // without ever reporting or re-arming it).
-                for (p, c) in batch.drain(..) {
-                    let t_now = self.time;
-                    self.event_queue.schedule(t_now, p, c);
-                }
+                // Pending same-time activations remain in the timing wheel.
                 break;
             }
             // IEEE 1800-2017 §4.5: once the ACTIVE region empties, the
@@ -20203,7 +20480,6 @@ impl Simulator {
                     self.settle_combinatorial();
                 }
                 self.check_edges();
-                batch = self.event_queue.remove(self.time);
                 continue;
             }
             break;
@@ -20334,21 +20610,16 @@ impl Simulator {
             for (cpid, cont) in parked {
                 self.event_queue.schedule(self.time, cpid, cont);
             }
-            let mut batch = self.event_queue.remove(self.time);
-            while !batch.is_empty() && !self.finished && !self.zero_delay_defer_pending {
-                let (bpid, stmts) = batch.remove(0);
-                let t_now = self.time;
-                for (p, s) in batch.drain(..) {
-                    self.event_queue.schedule(t_now, p, s);
-                }
+            while self.event_queue.next_time() == Some(self.time)
+                && !self.finished
+                && !self.zero_delay_defer_pending
+            {
+                let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
+                    break;
+                };
                 self.run_scheduled_process(bpid, &stmts);
                 if !self.is_pid_suspended(bpid) {
                     self.child_finished(bpid);
-                }
-                if self.event_queue.next_time() == Some(self.time) {
-                    batch = self.event_queue.remove(self.time);
-                } else {
-                    batch.clear();
                 }
             }
             if !self.nba_fast.is_empty()
@@ -20691,10 +20962,11 @@ impl Simulator {
                         .map(|sid| self.name_for_id(sid.signal_id).to_string())
                         .unwrap_or_else(|| "?".to_string());
                     eprintln!(
-                        "[PROGRESS] oldest waiter: pid {} on '{}' for {} tick(s){}",
+                        "[PROGRESS] oldest waiter: pid {} on '{}' for {} tick(s), remaining_events={}{}",
                         w.pid,
                         first_sig,
                         age,
+                        w.remaining_events,
                         if all_dead { " — awaited signal(s) UNCHANGED since parked" } else { "" }
                     );
                 }
@@ -21612,6 +21884,12 @@ impl Simulator {
                             continue;
                         };
                         self.name_for_id(dst.sig_id as usize)
+                    }
+                    CombItem::FusedAndFanout { branches, .. } => {
+                        let Some(branch) = branches.first() else {
+                            continue;
+                        };
+                        self.name_for_id(branch.dst.sig_id as usize)
                     }
                     CombItem::ContAssign { .. } | CombItem::CompiledContAssign { .. } => {
                         if let Some(&id) = entry.write_signal_ids.first() {
@@ -28481,6 +28759,13 @@ impl Simulator {
             CombItem::FusedBufFanout { src, dsts, invert } => {
                 self.exec_fused_buf_fanout(*src, dsts, *invert);
             }
+            CombItem::FusedAndFanout {
+                common,
+                branches,
+                invert,
+            } => {
+                self.exec_fused_and_fanout(*common, branches, *invert);
+            }
             CombItem::Udp { idx } => {
                 let idx = *idx;
                 self.eval_udp(idx);
@@ -28964,6 +29249,14 @@ impl Simulator {
                     CombItem::FusedBufFanout { src, dsts, invert } => {
                         self.exec_fused_buf_fanout(*src, dsts, *invert);
                         self.prof_settle_dc_count += dsts.len() as u64;
+                    }
+                    CombItem::FusedAndFanout {
+                        common,
+                        branches,
+                        invert,
+                    } => {
+                        self.exec_fused_and_fanout(*common, branches, *invert);
+                        self.prof_settle_dc_count += branches.len() as u64;
                     }
                     CombItem::Udp { idx } => {
                         let idx = *idx;
@@ -44033,6 +44326,56 @@ impl Simulator {
         }
     }
 
+    /// Execute fused one-bit AND/NAND gates that share one operand.
+    #[inline]
+    fn exec_fused_and_fanout(
+        &mut self,
+        common: BitRef,
+        branches: &[FusedAndBranch],
+        invert: bool,
+    ) {
+        let common_code =
+            self.signal_table[common.sig_id as usize].get_bit_code(common.bit as usize);
+        for branch in branches {
+            let other = self.signal_table[branch.other.sig_id as usize]
+                .get_bit_code(branch.other.bit as usize);
+            let and = if common_code == 0 || other == 0 {
+                0
+            } else if common_code == 1 && other == 1 {
+                1
+            } else {
+                2
+            };
+            let new_bit = if invert {
+                match and {
+                    0 => 1,
+                    1 => 0,
+                    _ => 2,
+                }
+            } else {
+                and
+            };
+            let dst = branch.dst;
+            let id = dst.sig_id as usize;
+            if !self.sdf_delays.is_empty()
+                && self.sdf_delays.get(id).copied().unwrap_or(0) > 0
+                && self.time > 0
+            {
+                if self.signal_table[id].get_bit_code(dst.bit as usize) != new_bit {
+                    let mut v = self.signal_table[id].clone();
+                    v.set_bit_code(dst.bit as usize, new_bit);
+                    self.schedule_delayed(id, v);
+                }
+                continue;
+            }
+            if self.signal_table[id].set_bit_code(dst.bit as usize, new_bit) {
+                self.table_modified = true;
+                self.after_signal_write(id);
+                self.mark_dirty_id(id);
+            }
+        }
+    }
+
     /// Execute a fused 1-bit gate. Reads operand bits from signal_table,
     /// computes 4-state result, writes single bit back if changed.
     #[inline(always)]
@@ -44233,9 +44576,7 @@ impl Simulator {
         {
             return;
         }
-        let Some(&(lo, hi)) = self.armed_input_ranges.get(&(id as u32)) else {
-            return;
-        };
+        let (lo, hi) = self.armed_input_ranges[id];
         for k in lo as usize..hi as usize {
             let bi = self.armed_input_blocks[k] as usize;
             self.edge_block_armed[bi] = 1;
@@ -44461,8 +44802,10 @@ impl Simulator {
             .last()
             .map_or(0, |(sid, _)| *sid as usize + 1);
         self.armed_input_bitmap = vec![false; bitmap_len];
+        self.armed_input_ranges = vec![(0, 0); bitmap_len];
         self.armed_input_blocks.reserve(pairs.len());
         let mut cursor = 0usize;
+        let mut input_count = 0usize;
         while cursor < pairs.len() {
             let sid = pairs[cursor].0;
             let lo = self.armed_input_blocks.len() as u32;
@@ -44472,7 +44815,8 @@ impl Simulator {
             }
             let hi = self.armed_input_blocks.len() as u32;
             self.armed_input_bitmap[sid as usize] = true;
-            self.armed_input_ranges.insert(sid, (lo, hi));
+            self.armed_input_ranges[sid as usize] = (lo, hi);
+            input_count += 1;
         }
         self.edge_block_armed = self
             .edge_block_gateable
@@ -44481,7 +44825,7 @@ impl Simulator {
             .collect();
         eprintln!(
             "[EVENT-EDGE] ARMED mode ON: {} input signals, {} fanout edges{}",
-            self.armed_input_ranges.len(),
+            input_count,
             self.armed_input_blocks.len(),
             if self.armed_edge_shadow {
                 " (shadow validation)"
@@ -70643,6 +70987,11 @@ pub enum SendCombItem {
         dsts: Box<[BitRef]>,
         invert: bool,
     },
+    FusedAndFanout {
+        common: BitRef,
+        branches: Box<[FusedAndBranch]>,
+        invert: bool,
+    },
     AstFallback,
 }
 
@@ -70787,6 +71136,20 @@ impl CombSettleCtx {
                         dirtied,
                     );
                 }
+                true
+            }
+            SendCombItem::FusedAndFanout {
+                common,
+                branches,
+                invert,
+            } => {
+                Simulator::exec_fused_and_fanout_isolated(
+                    *common,
+                    branches,
+                    *invert,
+                    view,
+                    dirtied,
+                );
                 true
             }
             SendCombItem::AstFallback => false,
