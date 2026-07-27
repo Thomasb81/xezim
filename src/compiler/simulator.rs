@@ -2569,6 +2569,10 @@ pub struct Simulator {
     clocking_out_skew: HashMap<String, u64>,
     /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
     clocking_sig_out_skew: HashMap<String, HashMap<String, u64>>,
+    /// §14.4 per-cb default INPUT skew in ticks (absent = #0).
+    clocking_in_skew: HashMap<String, u64>,
+    /// §14.4 per-signal input-skew overrides: cb → (resolved net → ticks).
+    clocking_sig_in_skew: HashMap<String, HashMap<String, u64>>,
     /// Sim time of each cb's most recent clock edge — a `cb.out <= v` executed
     /// AT the edge time drives at edge+skew (§14.16.1); between edges it waits
     /// for the next edge.
@@ -5197,6 +5201,8 @@ impl Simulator {
             clocking_sig_alias: HashMap::default(),
             clocking_out_skew: HashMap::default(),
             clocking_sig_out_skew: HashMap::default(),
+            clocking_in_skew: HashMap::default(),
+            clocking_sig_in_skew: HashMap::default(),
             clocking_last_edge: HashMap::default(),
             clocking_preponed: HashMap::default(),
             deferred_clocking_conts: Vec::new(),
@@ -8740,12 +8746,12 @@ impl Simulator {
         // §14.4 output skews: evaluate the per-cb default and per-signal
         // output-skew expressions to ticks. Collected first (clones) because
         // eval_delay_ticks needs &mut self.
-        let skew_specs: Vec<(String, bool, Option<Expression>, Vec<(String, Expression)>)> = self
+        let skew_specs: Vec<(String, bool, Option<Expression>, Vec<(String, Expression)>, Option<Expression>, Vec<(String, Expression)>)> = self
             .module
             .clocking_blocks
             .iter()
             .map(|(n, cd)| {
-                let per_sig: Vec<(String, Expression)> = cd
+                let out_per_sig: Vec<(String, Expression)> = cd
                     .signals
                     .iter()
                     .filter(|s| {
@@ -8757,7 +8763,19 @@ impl Simulator {
                     })
                     .filter_map(|s| s.skew.clone().map(|e| (s.name.name.clone(), e)))
                     .collect();
-                (n.clone(), cd.is_default, cd.default_output_skew.clone(), per_sig)
+                let in_per_sig: Vec<(String, Expression)> = cd
+                    .signals
+                    .iter()
+                    .filter(|s| {
+                        matches!(
+                            s.direction,
+                            crate::ast::types::PortDirection::Input
+                                | crate::ast::types::PortDirection::Inout
+                        )
+                    })
+                    .filter_map(|s| s.skew.clone().map(|e| (s.name.name.clone(), e)))
+                    .collect();
+                (n.clone(), cd.is_default, cd.default_output_skew.clone(), out_per_sig, cd.default_input_skew.clone(), in_per_sig)
             })
             .collect();
         let skew_ticks = |slf: &mut Self, e: &Expression| -> u64 {
@@ -8769,8 +8787,9 @@ impl Simulator {
             }
             slf.eval_delay_ticks(e)
         };
-        for (cb, is_default, dskew, per_sig) in skew_specs {
-            if let Some(e) = dskew {
+        for (cb, is_default, out_dskew, out_per_sig, in_dskew, in_per_sig) in skew_specs {
+            // Process output skew
+            if let Some(e) = out_dskew {
                 let t = skew_ticks(self, &e);
                 if t > 0 {
                     self.clocking_out_skew.insert(cb.clone(), t);
@@ -8780,13 +8799,32 @@ impl Simulator {
                     }
                 }
             }
-            let mut m: HashMap<String, u64> = HashMap::default();
-            for (net, e) in per_sig {
+            let mut out_m: HashMap<String, u64> = HashMap::default();
+            for (net, e) in out_per_sig {
                 let t = skew_ticks(self, &e);
-                m.insert(net, t);
+                out_m.insert(net, t);
             }
-            if !m.is_empty() {
-                self.clocking_sig_out_skew.insert(cb, m);
+            if !out_m.is_empty() {
+                self.clocking_sig_out_skew.insert(cb.clone(), out_m);
+            }
+            // Process input skew
+            if let Some(e) = in_dskew {
+                let t = skew_ticks(self, &e);
+                if t > 0 {
+                    self.clocking_in_skew.insert(cb.clone(), t);
+                    if is_default {
+                        self.clocking_in_skew
+                            .insert("__xz_default_clocking".to_string(), t);
+                    }
+                }
+            }
+            let mut in_m: HashMap<String, u64> = HashMap::default();
+            for (net, e) in in_per_sig {
+                let t = skew_ticks(self, &e);
+                in_m.insert(net, t);
+            }
+            if !in_m.is_empty() {
+                self.clocking_sig_in_skew.insert(cb, in_m);
             }
         }
         // Friendly fallback: `##N` with a single clocking block and no
@@ -43289,60 +43327,13 @@ impl Simulator {
                     self.clocking_cycle_pending.insert(cb.clone(), keep);
                 }
             }
-            // Posedge: refresh input snapshots from the Preponed samples
-            // captured at slot-entry (`refresh_clocking_preponed`), so `cb.<in>`
-            // reads the value from BEFORE this edge (`#1step` input skew,
-            // §14.4), not the same-edge NBA update. Fall back to the current
-            // value if no preponed sample was captured (e.g. first slot).
-            let mut snap = HashMap::default();
-            for (sig, is_input) in &sigs {
-                if *is_input {
-                    if let Some(v) = self
-                        .clocking_preponed
-                        .get(sig)
-                        .cloned()
-                        .or_else(|| self.get_signal_value_by_name(sig))
-                    {
-                        snap.insert(sig.clone(), v);
-                    }
-                }
-            }
-            // §14.13: publish each fresh sample to its hidden mirror signal so
-            // `@(cb.sig)` fires at THIS edge, and only on an actual change.
-            let mirror: Vec<(String, Value)> = snap
-                .iter()
-                .map(|(net, v)| (net.clone(), v.clone()))
-                .collect();
-            for (net, v) in mirror {
-                // meta stores resolved nets; the mirror is keyed by the
-                // clocking-visible name, so translate back through the alias.
-                let vis = self
-                    .clocking_sig_alias
-                    .get(&cb)
-                    .and_then(|m| {
-                        m.iter()
-                            .find(|(_, n)| **n == net)
-                            .map(|(vis, _)| vis.clone())
-                    })
-                    .unwrap_or_else(|| net.clone());
-                let hidden = format!("{}{}.{}", CB_SAMPLE_PREFIX, cb, vis);
-                if let Some(&id) = self.signal_name_to_id.get(hidden.as_str()) {
-                    let w = self.signal_widths[id];
-                    let nv = v.resize(w);
-                    if self.signal_table[id] != nv {
-                        write_sig!(self, id, nv);
-                        self.mark_dirty_id(id);
-                        self.table_modified = true;
-                        self.clocking_mirror_dirty = true;
-                    }
-                }
-            }
-            self.clocking_snapshots.insert(cb.clone(), snap);
             // LRM §14.4 output skew: apply any pending output drives
             // queued by `cb.<out_sig> <= val` since the last edge.
             // Route through `assign_value` (with a synthesised Ident
             // lvalue) so width/signedness handling matches a normal
             // procedural assignment.
+            // NOTE: Drive outputs BEFORE sampling inputs so that @(cb) waiters
+            // see the new output values when they run in the Reactive region.
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
                 let dskew = self
                     .clocking_out_skew
@@ -43383,6 +43374,69 @@ impl Simulator {
                     self.assign_value(&lval, &val);
                 }
             }
+            // Posedge: refresh input snapshots. §14.4 input skew:
+            // - #0 (default): sample from preponed (before this edge)
+            // - #1step or more: sample from current state (after NBA updates at this edge)
+            // For each signal, check per-signal skew first, then default skew.
+            let in_dskew = self.clocking_in_skew.get(&cb).copied().unwrap_or(0);
+            let mut snap = HashMap::default();
+            for (sig, is_input) in &sigs {
+                if *is_input {
+                    // Determine the skew for this signal: per-signal override or default
+                    let skew = self
+                        .clocking_sig_in_skew
+                        .get(&cb)
+                        .and_then(|m| m.get(sig))
+                        .copied()
+                        .unwrap_or(in_dskew);
+                    // §14.4: skew > 0 means sample AFTER the edge (current value, post-NBA)
+                    // skew == 0 means sample AT the edge (preponed value, pre-NBA)
+                    let v = if skew > 0 {
+                        // Use current (post-NBA) value
+                        self.get_signal_value_by_name(sig)
+                    } else {
+                        // Use preponed (pre-NBA) value, fall back to current if not available
+                        self.clocking_preponed
+                            .get(sig)
+                            .cloned()
+                            .or_else(|| self.get_signal_value_by_name(sig))
+                    };
+                    if let Some(v) = v {
+                        snap.insert(sig.clone(), v);
+                    }
+                }
+            }
+            // §14.13: publish each fresh sample to its hidden mirror signal so
+            // `@(cb.sig)` fires at THIS edge, and only on an actual change.
+            let mirror: Vec<(String, Value)> = snap
+                .iter()
+                .map(|(net, v)| (net.clone(), v.clone()))
+                .collect();
+            for (net, v) in mirror {
+                // meta stores resolved nets; the mirror is keyed by the
+                // clocking-visible name, so translate back through the alias.
+                let vis = self
+                    .clocking_sig_alias
+                    .get(&cb)
+                    .and_then(|m| {
+                        m.iter()
+                            .find(|(_, n)| **n == net)
+                            .map(|(vis, _)| vis.clone())
+                    })
+                    .unwrap_or_else(|| net.clone());
+                let hidden = format!("{}{}.{}", CB_SAMPLE_PREFIX, cb, vis);
+                if let Some(&id) = self.signal_name_to_id.get(hidden.as_str()) {
+                    let w = self.signal_widths[id];
+                    let nv = v.resize(w);
+                    if self.signal_table[id] != nv {
+                        write_sig!(self, id, nv);
+                        self.mark_dirty_id(id);
+                        self.table_modified = true;
+                        self.clocking_mirror_dirty = true;
+                    }
+                }
+            }
+            self.clocking_snapshots.insert(cb.clone(), snap);
         }
     }
 
