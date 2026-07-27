@@ -125,6 +125,11 @@ fn print_usage() {
     eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)");
     eprintln!("                    (default: $XEZIM_CACHE_DIR or $XDG_CACHE_HOME/xezim/designs).");
     eprintln!("  --no-cache       Force-disable the design cache (default; XEZIM_NO_CACHE=1 too).");
+    eprintln!("  --cache-compression-level <1-22>  Set zstd compression level for cache files");
+    eprintln!("                   (default: 3). Higher = better compression but slower.");
+    eprintln!("                   Can also be set via XEZIM_CACHE_COMPRESSION_LEVEL=N.");
+    eprintln!("  --cache-stats    Print compression statistics when reading/writing cache files.");
+    eprintln!("                   Can also be set via XEZIM_CACHE_STATS=1.");
     eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
   -v <file>        Library file: modules compiled only to resolve instantiations
   --primitive-verbose  Show parse/adoption diagnostics for explicit -v files
@@ -784,6 +789,19 @@ fn main() {
     let mut design_cache_enabled = env::var("XEZIM_ENABLE_CACHE").ok().as_deref() == Some("1")
         && env::var("XEZIM_NO_CACHE").ok().as_deref() != Some("1");
     let mut design_cache_dir: Option<PathBuf> = None;
+    // Cache compression settings
+    let mut cache_compression_level: Option<i32> = None;
+    let mut cache_stats = false;
+    
+    // Check environment variables for cache compression settings
+    if let Ok(level_str) = env::var("XEZIM_CACHE_COMPRESSION_LEVEL") {
+        if let Ok(level) = level_str.parse::<i32>() {
+            cache_compression_level = Some(level);
+        }
+    }
+    if env::var("XEZIM_CACHE_STATS").ok().as_deref() == Some("1") {
+        cache_stats = true;
+    }
     let mut verbose = false;
     let mut _output_file: Option<String> = None;
     let mut lib_dirs: Vec<String> = Vec::new();
@@ -1259,6 +1277,31 @@ fn main() {
                 // Explicit opt-in to the experimental warm-start cache.
                 design_cache_enabled = true;
             }
+            "--cache-compression-level" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(level) = args[i].parse::<i32>() {
+                        cache_compression_level = Some(level);
+                    } else {
+                        eprintln!("Error: --cache-compression-level requires a number between 1 and 22");
+                        std::process::exit(1);
+                    }
+                } else {
+                    eprintln!("Error: --cache-compression-level requires a number");
+                    std::process::exit(1);
+                }
+            }
+            _ if arg.starts_with("--cache-compression-level=") => {
+                if let Ok(level) = arg["--cache-compression-level=".len()..].parse::<i32>() {
+                    cache_compression_level = Some(level);
+                } else {
+                    eprintln!("Error: --cache-compression-level requires a number between 1 and 22");
+                    std::process::exit(1);
+                }
+            }
+            "--cache-stats" => {
+                cache_stats = true;
+            }
             "--emit-hypergraph" => {
                 i += 1;
                 if i < args.len() {
@@ -1461,6 +1504,14 @@ suppressed but the explicit SDF annotation still applies."
             sv2023_mode, strict_checks, source_delay_select, module_timescale_args,
             lib_dirs, lib_files, lib_exts, nospecify,
         );
+        // Set cache compression settings before cache is used
+        if let Some(level) = cache_compression_level {
+            xezim_core::set_zstd_level(level);
+        }
+        if cache_stats {
+            xezim_core::set_compression_stats(true);
+        }
+        
         xezim::set_design_cache(Some(xezim::DesignCacheConfig {
             directory,
             semantic_salt,
