@@ -4,12 +4,18 @@
 //! here for backwards compatibility so existing `xezim::compiler::...`
 //! paths keep resolving.
 
+pub mod arena;
 pub mod bytecode;
+pub mod dispatch;
 pub mod jit;
 pub mod simulator;
+pub mod soa;
 
+pub use arena::{Arena, ArenaGuard, ArenaVec};
+pub use dispatch::{DispatchTable, Opcode, NUM_OPCODES, get_dispatch_table};
 pub use simulator::Simulator;
 pub use xezim_core::elaborate;
+pub use xezim_core::packed_value;
 pub use xezim_core::elaborate::{elaborate_module, ElaboratedModule};
 pub use xezim_core::sdf;
 pub use xezim_core::stdout_sink;
