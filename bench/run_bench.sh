@@ -9,9 +9,11 @@ set -uo pipefail
 
 REPS=5
 OUT="bench_$(hostname -s)_$(uname -m).csv"
-BENCHES="B2,B3,B5"          # B1 (c910) is opt-in: needs the external RTL
-XEZIM="./target/release/xezim"
-GEN="$(dirname "$0")/gen"
+BENCHES="B1,B2,B3,B5"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null && pwd -P)"
+REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." >/dev/null && pwd -P)"
+XEZIM="${REPO_DIR}/target/release/xezim"
+GEN="${SCRIPT_DIR}/gen"
 
 while getopts "r:o:b:x:h" o; do
   case "$o" in
@@ -23,6 +25,10 @@ while getopts "r:o:b:x:h" o; do
   esac
 done
 
+# The C910 helper changes into its work directory before launching xezim.
+if [[ "${XEZIM}" == */* && "${XEZIM}" != /* ]]; then
+  XEZIM="$(cd -- "$(dirname -- "${XEZIM}")" >/dev/null && pwd -P)/$(basename -- "${XEZIM}")"
+fi
 have() { [[ ",$BENCHES," == *",$1,"* ]]; }
 
 # ---- host identification (goes in every row, so CSVs from different
@@ -180,20 +186,51 @@ fi
 # ---------------------------------------------------------------- B1
 if have B1; then
   echo "== B1 c910-hello (real RTL; requires simtest/xuantie_c910 setup)"
-  if [[ -x simtest/xuantie_c910/run_c910_hello.sh ]]; then
+  c910_dir="${REPO_DIR}/simtest/xuantie_c910"
+  c910_runner="${c910_dir}/run_c910_hello.sh"
+  c910_design="${DESIGN_DIR:-${REPO_DIR}/../rtlmeter/designs/XuanTie-C910}"
+  c910_work="${WORK_DIR:-${c910_dir}/work}"
+
+  # A standalone simtest setup keeps rtlmeter below deps/. In a workspace
+  # checkout, prefer the sibling rtlmeter tree so setup.sh is not required.
+  if [[ ! -d "${c910_design}/tests/hello" && -z "${DESIGN_DIR:-}" ]]; then
+    c910_design="${c910_dir}/deps/rtlmeter/designs/XuanTie-C910"
+  fi
+
+  if [[ -x "${c910_runner}" && -d "${c910_design}/tests/hello" ]]; then
     for rep in $(seq 1 "$REPS"); do
-      t0=$(date +%s%N)
-      log=$(simtest/xuantie_c910/run_c910_hello.sh 2>&1)
-      t1=$(date +%s%N)
-      wall=$(( (t1 - t0) / 1000000 ))
-      nspi=$(grep -oE 'ns_per_insn=[0-9.]+' <<<"$log" | head -1 | cut -d= -f2)
-      insns=$(grep -oE 'insns=[0-9]+' <<<"$log" | head -1 | cut -d= -f2)
-      printf '%s,%s,"%s",%s,"%s",B1,c910_hello,1,%s,%s,%s,%s,0,0,0,0,0,0,"c910",1\n' \
-        "$HOST" "$ARCH" "$CPU" "$NCORE" "$XVER" "$rep" "$wall" "${insns:-0}" "${nspi:-0}" >> "$OUT"
-      printf '  %-16s %-12s rep%-2s %6s ms  ns/insn=%s\n' B1 c910_hello "$rep" "$wall" "${nspi:-n/a}"
+      t0=${EPOCHREALTIME/[.,]/}
+      if ! runner_log=$(XEZIM="${XEZIM}" DESIGN_DIR="${c910_design}" WORK_DIR="${c910_work}" \
+          "${c910_runner}" 2>&1); then
+        echo "  !! B1/c910_hello rep$rep failed — skipping row" >&2
+        echo "${runner_log}" | tail -5 >&2
+        continue
+      fi
+      t1=${EPOCHREALTIME/[.,]/}
+      wall=$(( (t1 - t0) / 1000 ))
+      (( wall < 0 )) && wall=0
+
+      prof_log="${c910_work}/c910_hello_cpu0.log"
+      insns=$(grep -oE 'insns=[0-9]+'        "${prof_log}" | tail -1 | cut -d= -f2)
+      nspi=$( grep -oE 'ns_per_insn=[0-9.]+' "${prof_log}" | tail -1 | cut -d= -f2)
+      edges=$(grep -oE 'edges_fired=[0-9]+'  "${prof_log}" | tail -1 | cut -d= -f2)
+      fb=$(   grep -oE 'fallbacks=[0-9]+'    "${prof_log}" | tail -1 | cut -d= -f2)
+      settle=$(grep -oE 'settle=[0-9.]+ms'   "${prof_log}" | tail -1 | tr -dc '0-9.')
+      edg=$(  grep -oE ' edges=[0-9.]+ms'    "${prof_log}" | tail -1 | tr -dc '0-9.')
+      nba=$(  grep -oE ' nba=[0-9.]+ms'      "${prof_log}" | tail -1 | tr -dc '0-9.')
+      proc=$( grep -oE ' process=[0-9.]+ms'  "${prof_log}" | tail -1 | tr -dc '0-9.')
+
+      rate=0
+      (( wall > 0 )) && rate=$(awk -v ms="$wall" 'BEGIN { printf "%.6f", 1000 / ms }')
+      printf '%s,%s,"%s",%s,"%s",B1,c910_hello,1,%s,%s,1,%s,0,0,0,0,0,%s,%s,%s,%s,%s,%s,%s,%s,"TEST PASSED",1\n' \
+        "$HOST" "$ARCH" "$CPU" "$NCORE" "$XVER" "$rep" "$wall" "$rate" \
+        "${insns:-0}" "${nspi:-0}" "${edges:-0}" \
+        "${settle:-0}" "${edg:-0}" "${nba:-0}" "${proc:-0}" "${fb:-0}" >> "$OUT"
+      printf '  %-16s %-12s rep%-2s %6s ms  ns/insn=%s\n' \
+        B1 c910_hello "$rep" "$wall" "${nspi:-n/a}"
     done
   else
-    echo "  (skipped: simtest/xuantie_c910 not set up on this host)"
+    echo "  (skipped: C910 hello inputs not found; run ${c910_dir}/setup.sh)"
   fi
 fi
 
