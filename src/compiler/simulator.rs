@@ -2787,6 +2787,10 @@ pub struct Simulator {
     /// declared in `base_class` (so unrelated/inherited statics stay shared),
     /// giving each specialization its own cell (§8.25). None = shared cell.
     current_spec: Option<(String, String)>,
+    /// §28.11 gate FALL delays by signal id, from
+    /// `ElaboratedModule::gate_fall_delays`. Empty unless some gate used the
+    /// two-delay `#(rise, fall)` form with differing values.
+    gate_fall_delay_by_id: HashMap<usize, u64>,
     /// `(declaring_class, property)` → does this property's packed range
     /// depend on a parameter? `fit_class_prop` runs on every property store,
     /// so the common answer (`false`) is memoized to one hash lookup.
@@ -5302,6 +5306,7 @@ impl Simulator {
             rand_ranges: HashMap::default(),
             class_statics: HashMap::default(),
             current_spec: None,
+            gate_fall_delay_by_id: HashMap::default(),
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
@@ -9116,6 +9121,22 @@ impl Simulator {
                     self.sdf_delays[id] = self.sdf_delays[id].max(apply_delay_mode(delay));
                 }
             }
+        }
+        // §28.11 gate fall delays: resolve names to ids once. Honours the same
+        // delay-mode overrides as the rise delay (`+delay_mode_zero` etc.), so
+        // a zero-delay GLS run stays zero-delay on both edges.
+        if !self.module.gate_fall_delays.is_empty() && dmode != 1 {
+            let pairs: Vec<(usize, u64)> = self
+                .module
+                .gate_fall_delays
+                .iter()
+                .filter_map(|(n, &d)| {
+                    self.signal_name_to_id
+                        .get(n.as_str())
+                        .map(|&id| (id, apply_delay_mode(d)))
+                })
+                .collect();
+            self.gate_fall_delay_by_id.extend(pairs);
         }
         mark_compile_phase("structural delay setup", &mut compile_phase_start);
         self.build_comb_entries();
@@ -16246,6 +16267,34 @@ impl Simulator {
                 defer_at_time0: false,
                 span: ca_span,
             });
+        }
+
+        // §6.6.1 vs a DRIVEN net: an undriven net reads z, but a net that has a
+        // continuous driver is not undriven — its value is whatever that driver
+        // produces, and until the driver first resolves that is UNKNOWN, not
+        // high-impedance. The distinction is invisible for a zero-delay driver
+        // (the time-0 settle overwrites it immediately) but shows through the
+        // whole delay window of a DELAYED one, which is exactly a gate-level
+        // netlist: `and #(2,5) g(o, a, b);` leaves `o` readable for 5 ticks
+        // before it first resolves, and it should read x there.
+        //
+        // Only all-z signals are touched, so a net given a real initial value
+        // (supply0/1, and the tri0/tri1 pull) keeps it.
+        for &id in &self.cont_driven {
+            if self.signal_real[id] {
+                continue;
+            }
+            let w = self.signal_widths[id];
+            if w == 0 {
+                continue;
+            }
+            let cur = &self.signal_table[id];
+            let all_z = (0..w as usize).all(|i| cur.get_bit(i) == LogicBit::Z);
+            if all_z {
+                let mut v = Value::new(w); // all-x
+                v.is_signed = self.signal_signed[id];
+                self.signal_table[id] = v;
+            }
         }
 
         // Always @* and always_comb blocks. Reuse `reads`/`writes` from the
@@ -25637,6 +25686,28 @@ impl Simulator {
 
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
     fn schedule_delayed_with_delay(&mut self, id: usize, val: Value, delay: u64) {
+        // §28.11: a gate declared `#(rise, fall)` uses the FALL value for a
+        // transition to 0. The lowered cont-assign only carries the rise
+        // delay, so consult the per-net fall map here — this is the single
+        // choke point where both the target and the new value are known.
+        // Scalar gate outputs are the case that matters; "to 0" is judged on
+        // the whole value so a vector net keeps using the rise delay unless it
+        // goes fully zero.
+        let delay = if self.gate_fall_delay_by_id.is_empty() {
+            delay
+        } else {
+            // NB: `to_u64()` MASKS x/z to 0 rather than returning None, so it
+            // cannot distinguish a genuine 0 from z — use an explicit bit test.
+            // The initial x/z -> 0 settle counts as a fall as well, so the
+            // test is "the new value is a real 0 and the old one was not".
+            let all_zero = |v: &Value| -> bool {
+                !v.has_xz() && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Zero)
+            };
+            match self.gate_fall_delay_by_id.get(&id) {
+                Some(&fall) if all_zero(&val) && !all_zero(&self.signal_table[id]) => fall,
+                _ => delay,
+            }
+        };
         let target_time = self.time + delay;
         // Inertial delay: remove any pending update for this signal
         self.delayed_updates.retain(|(_, sid, _)| *sid != id);
@@ -33917,6 +33988,25 @@ impl Simulator {
                 // `$__wres(a, b)` — wired-net resolution, bit by bit: a `z`
                 // yields to a driven value, equal values pass through, and
                 // anything else (a 0/1 conflict, or an `x`) gives `x`.
+                // §6.6.2 wired-AND / wired-OR net resolution, bit by bit. A
+                // `z` driver yields to a driven value (as with a plain wire);
+                // otherwise the two driven bits are ANDed / ORed. `x` on
+                // either side gives `x` unless the other side is the
+                // controlling value (0 for AND, 1 for OR), which dominates.
+                "$__wand" | "$__wor" => {
+                    if args.len() < 2 {
+                        return Value::new(1);
+                    }
+                    let is_and = name == "$__wand";
+                    let a = self.eval_expr(&args[0]);
+                    let b = self.eval_expr(&args[1]);
+                    let w = a.width.max(b.width).max(1);
+                    let mut out = Value::zero(w);
+                    for i in 0..w as usize {
+                        out.set_bit(i, Self::wired_logic_bit(a.get_bit(i), b.get_bit(i), is_and));
+                    }
+                    out
+                }
                 "$__wres" => {
                     if args.len() < 2 {
                         return Value::new(1);
@@ -48766,6 +48856,25 @@ impl Simulator {
 
     /// IEEE 1800-2017 Table 28-1 wired-net resolution for one bit: `z` yields
     /// to a driven value, equal values pass, everything else is `x`.
+    /// §6.6.2 one-bit wired-AND (`is_and`) / wired-OR resolution. A `z`
+    /// driver contributes nothing, so the other side passes through. The
+    /// CONTROLLING value dominates even against `x` — 0 wins for AND, 1 for
+    /// OR — which is what makes a wired-AND bus with one asserting driver
+    /// resolve cleanly.
+    fn wired_logic_bit(a: LogicBit, b: LogicBit, is_and: bool) -> LogicBit {
+        let ctrl = if is_and { LogicBit::Zero } else { LogicBit::One };
+        if a == ctrl || b == ctrl {
+            return ctrl;
+        }
+        match (a, b) {
+            (LogicBit::Z, x) => x,
+            (x, LogicBit::Z) => x,
+            (LogicBit::X, _) | (_, LogicBit::X) => LogicBit::X,
+            (x, y) if x == y => x,
+            _ => LogicBit::X,
+        }
+    }
+
     fn wire_resolve_bit(a: LogicBit, b: LogicBit) -> LogicBit {
         match (a, b) {
             (LogicBit::Z, x) => x,
