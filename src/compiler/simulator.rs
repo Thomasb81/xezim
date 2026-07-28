@@ -3894,7 +3894,11 @@ pub struct Simulator {
     dpi_pending_reset_fired: bool,
     dpi_pending_start_sim_fired: bool,
     dpi_pending_end_sim_fired: bool,
-    /// Open file handles for $fopen/$fwrite/$fclose.
+    /// Open file handles for $fopen/$fwrite/$fclose, keyed by an internal
+    /// channel id derived from the MCD/FD value (see `resolve_channel_key`):
+    /// MCD channels use their bit number (1..=30), FD channels use the raw FD
+    /// value (0x8000_0000+). FD STDOUT/STDERR/STDIN and MCD bit 0 are never
+    /// inserted — they are handled inline at write time.
     file_handles: HashMap<i32, std::fs::File>,
     /// Per-fd ungetc pushback buffer (LIFO).
     ungetc_buf: HashMap<i32, Vec<u8>>,
@@ -3904,7 +3908,6 @@ pub struct Simulator {
     queues: HashMap<i64, StochasticQueue>,
     static_task_init: HashSet<String>,
     current_static_task: Option<String>,
-    next_file_handle: i32,
     /// Best-effort hierarchical context for resolving ambiguous leaf identifiers.
     name_resolve_hint: RefCell<Option<String>>,
     /// §16.9.3 sampled-value function watches: per call site, a history of
@@ -5656,7 +5659,6 @@ impl Simulator {
             queues: HashMap::default(),
             static_task_init: HashSet::default(),
             current_static_task: None,
-            next_file_handle: 3,
             name_resolve_hint: RefCell::new(None),
             sampled_watches: Vec::new(),
             sampled_watch_site: HashMap::default(),
@@ -7090,7 +7092,61 @@ impl Simulator {
     }
 
     fn eval_file_handle_arg(&mut self, expr: &Expression) -> i32 {
-        self.eval_expr(expr).to_i64().unwrap_or(0) as i32
+        let raw = self.eval_expr(expr).to_i64().unwrap_or(0) as i32;
+        self.resolve_channel_key(raw)
+    }
+
+    /// Map a user-visible file value (MCD or FD) to an internal `file_handles`
+    /// table key. Single-channel operations (read, seek, tell, ungetc, …) all
+    /// route through here, so resolving once centralizes the MCD/FD split.
+    ///
+    /// IEEE 1800-2023 §21.3.1 splits the 32-bit value by bit 31:
+    ///   * MCD (multichannel descriptor): bit 31 CLEAR. Each set bit selects a
+    ///     channel; bit 0 is always stdout. `$fopen(filename)` returns an MCD.
+    ///   * FD  (file descriptor):         bit 31 SET. Lower bits are the index;
+    ///     STDIN=0x8000_0000, STDOUT=0x8000_0001, STDERR=0x8000_0002.
+    ///     `$fopen(filename, type)` returns an FD.
+    ///
+    /// Internal keying (disjoint ranges, one HashMap):
+    ///   * MCD channel  → key = bit number (1..=30). Bit 0 (stdout) → key 0, a
+    ///     sentinel absent from the table so reads/seeks on stdout no-op.
+    ///   * FD  channel  → key = the raw FD value (0x8000_0000+), a large negative
+    ///     i32 disjoint from the MCD range. Pre-opened STDIN/STDOUT/STDERR are
+    ///     never inserted, so they naturally miss.
+    fn resolve_channel_key(&self, raw: i32) -> i32 {
+        let rawu = raw as u32;
+        if rawu & 0x8000_0000 != 0 {
+            raw // FD: the value itself is the table key
+        } else if rawu == 0 {
+            0 // $fopen-failure / explicit 0 → stdout sentinel
+        } else {
+            rawu.trailing_zeros() as i32 // MCD: lowest set bit selects a channel
+        }
+    }
+
+    /// Resolve an output value (MCD or FD) into the list of internal channel
+    /// keys that a write/close/flush must touch. MCD bit 0 (stdout) and FD
+    /// STDOUT (0x8000_0001) both surface as the stdout sentinel key 0; FD
+    /// STDERR (0x8000_0002) surfaces as its own value.
+    fn resolve_output_keys(&self, raw: i32) -> Vec<i32> {
+        let rawu = raw as u32;
+        let mut keys = Vec::new();
+        if rawu & 0x8000_0000 != 0 {
+            keys.push(raw); // FD: single channel
+        } else if rawu == 0 {
+            keys.push(0); // legacy: mirror to stdout
+        } else {
+            for b in 0..31u32 {
+                if rawu & (1 << b) != 0 {
+                    if b == 0 {
+                        keys.push(0); // stdout
+                    } else {
+                        keys.push(b as i32);
+                    }
+                }
+            }
+        }
+        keys
     }
 
     fn open_file_handle(&mut self, args: &[Expression]) -> Value {
@@ -7101,16 +7157,15 @@ impl Simulator {
         if path.is_empty() {
             return Value::zero(32);
         }
-        // IEEE 1800 §21.2.1: single-arg `$fopen(filename)` opens for
-        // WRITE (creates/truncates). The 2-arg form is the only way to
-        // ask for read. Defaulting to "r" silently broke designs that
-        // open log files via the single-arg form (e.g. E902 mnt.v's
-        // `$fopen("GPR.log")` which fails when the file is absent and
-        // triggers an immediate `$finish`).
-        let mode = if args.len() >= 2 {
-            self.system_string_arg(&args[1])
-        } else {
+        // IEEE 1800 §21.3.1: the presence of the `type` argument selects the
+        // addressing mode. No type → multichannel descriptor (MCD, bit 31
+        // clear, opened for write). With type → file descriptor (FD, bit 31
+        // set), opened per the mode string. A failed open returns 0.
+        let mcd_mode = args.len() < 2;
+        let mode = if mcd_mode {
             "w".to_string()
+        } else {
+            self.system_string_arg(&args[1])
         };
         let mut opts = OpenOptions::new();
         let has_plus = mode.contains('+');
@@ -7129,14 +7184,36 @@ impl Simulator {
         if !mode.contains('r') && !mode.contains('w') && !mode.contains('a') {
             opts.read(true);
         }
-        match opts.open(&path) {
-            Ok(file) => {
-                let fd = self.next_file_handle;
-                self.next_file_handle += 1;
-                self.file_handles.insert(fd, file);
-                Value::from_u64(fd as u64, 32)
+        let file = match opts.open(&path) {
+            Ok(f) => f,
+            Err(_) => return Value::zero(32),
+        };
+        if mcd_mode {
+            // Allocate the lowest free bit in 1..=30 (bit 31 reserved/clear,
+            // bit 0 is stdout). Return an MCD with that single bit set.
+            let bit = (1u32..=30).find(|&b| !self.file_handles.contains_key(&(b as i32)));
+            match bit {
+                Some(b) => {
+                    self.file_handles.insert(b as i32, file);
+                    Value::from_u64(1u64 << b, 32)
+                }
+                None => Value::zero(32), // too many open MCD channels
             }
-            Err(_) => Value::zero(32),
+        } else {
+            // Allocate the lowest free FD index >= 3 (0/1/2 are STDIN/STDOUT/
+            // STDERR). The table key is the raw FD value (0x8000_0000 | idx).
+            let idx = (3u32..).find(|&i| {
+                let key = (0x8000_0000u32 | i) as i32;
+                !self.file_handles.contains_key(&key)
+            });
+            match idx {
+                Some(i) => {
+                    let key = (0x8000_0000u32 | i) as i32;
+                    self.file_handles.insert(key, file);
+                    Value::from_u64(0x8000_0000u64 | i as u64, 32)
+                }
+                None => Value::zero(32),
+            }
         }
     }
 
@@ -7144,9 +7221,17 @@ impl Simulator {
         if args.is_empty() {
             return Value::zero(32);
         }
-        let fd = self.eval_file_handle_arg(&args[0]);
-        if let Some(mut f) = self.file_handles.remove(&fd) {
-            let _ = f.flush();
+        let raw = self.eval_expr(&args[0]).to_i64().unwrap_or(0) as i32;
+        for k in self.resolve_output_keys(raw) {
+            let ku = k as u32;
+            // Never close the pre-opened STDIN/STDOUT/STDERR streams.
+            if ku == 0 || ku == 0x8000_0000 || ku == 0x8000_0001 || ku == 0x8000_0002 {
+                continue;
+            }
+            if let Some(mut f) = self.file_handles.remove(&k) {
+                let _ = f.flush();
+            }
+            self.ungetc_buf.remove(&k);
         }
         Value::zero(32)
     }
@@ -7159,7 +7244,7 @@ impl Simulator {
         if args.is_empty() {
             return Value::zero(32);
         }
-        let fd = self.eval_file_handle_arg(&args[0]);
+        let raw = self.eval_expr(&args[0]).to_i64().unwrap_or(0) as i32;
         let mut payload = if args.len() > 1 {
             self.format_args(&args[1..], tn)
         } else {
@@ -7169,17 +7254,23 @@ impl Simulator {
             payload.push('\n');
         }
         let nbytes = payload.len() as u64;
-        if fd <= 0 {
-            if newline {
-                print!("{}", payload);
-            } else {
-                print!("{}", payload);
+        for k in self.resolve_output_keys(raw) {
+            let ku = k as u32;
+            if ku == 0 || ku == 0x8000_0001 {
+                // stdout (MCD bit 0 sentinel, or FD STDOUT). Mirror
+                // $write/$display: record for the test harness too.
+                self.record_output(payload.clone());
+                self.stdout_write(&payload);
+            } else if ku == 0x8000_0002 {
+                // FD STDERR
+                let mut e = std::io::stderr();
+                let _ = e.write_all(payload.as_bytes());
+                let _ = e.flush();
+            } else if let Some(f) = self.file_handles.get_mut(&k) {
+                let _ = f.write_all(payload.as_bytes());
+                let _ = f.flush();
             }
-            return Value::from_u64(nbytes, 32);
-        }
-        if let Some(f) = self.file_handles.get_mut(&fd) {
-            let _ = f.write_all(payload.as_bytes());
-            let _ = f.flush();
+            // else: closed/unknown fd (e.g. STDIN) → silently drop.
         }
         Value::from_u64(nbytes, 32)
     }
@@ -41673,17 +41764,28 @@ impl Simulator {
                 let _ = self.write_file_handle_named(args, true, "$displayo");
             }
             "$fflush" => {
-                let fd = args
+                let raw = args
                     .first()
-                    .map(|a| self.eval_file_handle_arg(a))
+                    .map(|a| self.eval_expr(a).to_i64().unwrap_or(0) as i32)
                     .unwrap_or(0);
-                if fd == 0 {
-                    // Flush ALL open file handles
+                if raw == 0 {
+                    // $fflush() / $fflush(0): flush every open file and stdout.
                     for f in self.file_handles.values_mut() {
                         let _ = f.flush();
                     }
-                } else if let Some(f) = self.file_handles.get_mut(&fd) {
-                    let _ = f.flush();
+                    self.flush_stdout();
+                } else {
+                    for k in self.resolve_output_keys(raw) {
+                        let ku = k as u32;
+                        if ku == 0 || ku == 0x8000_0001 {
+                            self.flush_stdout();
+                        } else if ku == 0x8000_0002 {
+                            let mut err = std::io::stderr();
+                            let _ = err.flush();
+                        } else if let Some(f) = self.file_handles.get_mut(&k) {
+                            let _ = f.flush();
+                        }
+                    }
                 }
             }
             "$fseek" => {
