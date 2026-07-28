@@ -60215,8 +60215,30 @@ impl Simulator {
             // `obj.m().inc()`, where `obj.m()` runs once here and again at
             // the generic dispatch below), producing 2^n-1 executions for an
             // n-deep call chain.
+            //
+            // A receiver that evaluates to a CLASS HANDLE (e.g. a function
+            // call `obj.get_container().size()`) must dispatch to the
+            // object's real `size`/`len` method, not be misread as a string
+            // — the handle's bit pattern reinterpreted as bytes gives a
+            // garbage length (handle 2 → 1 byte → size()==1). Route such a
+            // handle through `exec_method_call` when its class defines the
+            // method; only genuine non-handle values (strings, literals)
+            // take the byte-length fallback.
             if mname == "len" || mname == "size" {
                 let base = self.eval_expr(expr);
+                let h = base.to_u64().unwrap_or(0) as usize;
+                if h != 0 {
+                    if let Some(cn) = self
+                        .heap
+                        .get(h)
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone())
+                    {
+                        if self.class_has_method(&cn, mname) {
+                            return self.exec_method_call(h, mname, args);
+                        }
+                    }
+                }
                 return Value::from_u64(base.sv_string_bytes().len() as u64, 32);
             }
 

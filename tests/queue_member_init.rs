@@ -163,3 +163,82 @@ endmodule
     let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
     assert!(outs.iter().any(|s| s.contains("first 10 second 20")), "outs: {:?}", outs);
 }
+
+/// Calling `.size()` / `.len()` as a chained method call on a class handle
+/// RETURNED by a function must dispatch to the object's real user-defined
+/// method, not be misread as a string byte-length. This mirrors UVM's
+/// `uvm_report_message::get_element_container().size()` pattern.
+/// Bug: the `.size()`/`.len()` string-byte fallback fired for ANY receiver,
+/// so `obj.get_container().size()` evaluated the call to a handle and
+/// returned the handle value's byte length (handle 2 → 1 byte → size()==1).
+#[test]
+fn chained_size_on_returned_handle() {
+    let src = r#"
+module top;
+  class container;
+    int data[$];
+    function void add(int v); data.push_back(v); endfunction
+    function int size(); return data.size(); endfunction
+  endclass
+  class message;
+    container _ec;
+    function new(); _ec = new(); endfunction
+    function container get_ec(); return _ec; endfunction
+    function void add(int v); _ec.add(v); endfunction
+  endclass
+  initial begin
+    message msg = new();
+    msg.add(10);
+    msg.add(20);
+    msg.add(30);
+    $display("chained %0d", msg.get_ec().size());
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert!(outs.iter().any(|s| s.contains("chained 3")), "outs: {:?}", outs);
+}
+
+/// Same chained-call pattern but with `.len()` instead of `.size()`, and a
+/// `protected` member queue (mirrors UVM's `protected elements[$]`).
+#[test]
+fn chained_len_on_returned_handle_protected() {
+    let src = r#"
+module top;
+  class elem_base;
+    string _name;
+    function new(string n = ""); _name = n; endfunction
+  endclass
+  class container;
+    protected elem_base elements[$];
+    function void add();
+      elem_base e = new("x");
+      elements.push_back(e);
+    endfunction
+    function int len(); return elements.size(); endfunction
+  endclass
+  class message;
+    protected container _ec;
+    function new(); _ec = new(); endfunction
+    function container get_ec(); return _ec; endfunction
+    function void add(); _ec.add(); endfunction
+  endclass
+  initial begin
+    message msg = new();
+    msg.add();
+    msg.add();
+    // Both captured and chained reads must agree.
+    container c = msg.get_ec();
+    $display("captured %0d", c.len());
+    $display("chained %0d", msg.get_ec().len());
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert!(outs.iter().any(|s| s.contains("captured 2")), "outs: {:?}", outs);
+    assert!(outs.iter().any(|s| s.contains("chained 2")), "outs: {:?}", outs);
+}
