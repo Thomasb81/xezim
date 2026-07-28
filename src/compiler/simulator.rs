@@ -29789,7 +29789,40 @@ impl Simulator {
                     if !self.local_stack.is_empty() {
                         let last_idx = self.local_stack.len() - 1;
                         if self.local_stack[last_idx].contains_key(name) {
-                            self.local_stack[last_idx].insert(name.clone(), val.clone());
+                            // §10.7: on assignment to a sized local, resize
+                            // the RHS to the local's DECLARED width so a
+                            // narrow signed literal sign-extends (e.g.
+                            // `logic [63:0] mask = -1` must yield all-ones).
+                            // The declared width is read from the `widths`
+                            // table (populated at VarDecl time), NOT from the
+                            // currently-stored value — the stored width drifts
+                            // as differently-sized RHS values flow through and
+                            // would corrupt string/handle locals. If no
+                            // declared width is recorded (method formals,
+                            // pattern bindings), leave the value untouched.
+                            //
+                            // NARROW-ONLY: a value already WIDER than the
+                            // declared width is left as-is rather than
+                            // truncated. xezim models a `string` local as
+                            // 1024 bits and reuses locals for different-width
+                            // reads (e.g. a register read into a sized local),
+                            // so truncation would silently drop data; only the
+                            // sign/w zero-extension case (the actual bug) is
+                            // applied.
+                            let fitted = if !val.is_real {
+                                if let Some(&target_w) = self.widths.get(name) {
+                                    if val.width < target_w {
+                                        val.resize_for_assign(target_w)
+                                    } else {
+                                        val.clone()
+                                    }
+                                } else {
+                                    val.clone()
+                                }
+                            } else {
+                                val.clone()
+                            };
+                            self.local_stack[last_idx].insert(name.clone(), fitted);
                             return true;
                         }
                     }
@@ -32626,6 +32659,35 @@ impl Simulator {
                 };
                 let mut l = self.eval_expr_ctx(left, self_det_w);
                 let mut r = self.eval_expr_ctx(right, self_det_w);
+                // IEEE 1800-2023 §6.16 / Table 6-9: the `==`/`!=` operators
+                // are 2-STATE when applied to the `string` data type — they
+                // compare the textual content and always yield a definite
+                // 0 or 1, never X/Z.  xezim stores a `string` value as a
+                // fixed-width 1024-bit packed vector (128-char capacity)
+                // whose unused high bits are X when the string is shorter
+                // than the capacity; routing a string `==`/`!=` through
+                // the integral 4-state equality path would therefore
+                // wrongly return X whenever either side has X padding
+                // (e.g. comparing an empty string to a non-empty one).
+                // Apply the 2-state text comparison ONLY when BOTH
+                // operands are string-typed (a string literal counts as
+                // string type): a mixed `byte != "."` comparison is an
+                // INTEGRAL comparison per §11.4 (the literal is treated
+                // as a packed value), and forcing string semantics on it
+                // corrupts code such as UVM's scope-string walk.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
+                    && self.expr_is_string_valued(left)
+                    && self.expr_is_string_valued(right)
+                {
+                    let ls = l.to_sv_string();
+                    let rs = r.to_sv_string();
+                    let res = match op {
+                        BinaryOp::Eq => ls == rs,
+                        BinaryOp::Neq => ls != rs,
+                        _ => unreachable!(),
+                    };
+                    return Value::from_u64(res as u64, 1);
+                }
                 // IEEE 1800-2017 §11.8.1/§11.8.2: an expression is UNSIGNED as
                 // soon as ANY operand is unsigned, and §11.8.2 step 2 converts
                 // every operand to the EXPRESSION's signedness BEFORE it is
@@ -42236,6 +42298,7 @@ impl Simulator {
             // element of a string-typed queue/array.
             ExprKind::Ident(h) => {
                 self.string_signals.contains(&self.resolve_hier_name(h))
+                    || self.class_member_is_string(expr)
                     || self
                         .get_expr_type_name(expr)
                         .is_some_and(|t| t == "string")
@@ -42250,8 +42313,9 @@ impl Simulator {
                     .is_some_and(|t| t == "string")
             }
             ExprKind::MemberAccess { .. } => {
-                // String methods (substr/getc-as-string-rare). Keep narrow.
-                false
+                // A `this.<prop>` / `obj.<prop>` access where the property is
+                // declared `string` in the class definition.
+                self.class_member_is_string(expr)
             }
             // A method/function call whose return type is `string`
             // (e.g. `obj.sprint()`, `this.convert2string()`). Without
@@ -42262,6 +42326,77 @@ impl Simulator {
             ExprKind::Call { func, .. } => self.call_returns_string(func),
             _ => false,
         }
+    }
+
+    /// Determine whether `expr` denotes a CLASS PROPERTY whose declared type
+    /// is `string`.  xezim models class properties by walking the heap
+    /// handle in `this_stack` (for `this.<prop>` and bare `<prop>` inside a
+    /// method) or by reading the receiver's runtime class (for
+    /// `obj.<prop>`), then consulting `class_def.string_properties`.
+    /// Used so that string equality/relational operators follow the 2-state
+    /// §6.16 / Table 6-9 semantics rather than treating the underlying
+    /// 1024-bit packed storage as a 4-state integral value.
+    fn class_member_is_string(&self, expr: &Expression) -> bool {
+        // Resolve to `(handle, prop_name)`. We prefer to evaluate the
+        // receiver to obtain the runtime handle, but `class_member_is_string`
+        // takes `&self` (no mutation); instead, use the `this_stack` for
+        // `this.<prop>` / bare `<prop>`, and for `obj.<prop>` read the
+        // already-stored handle value out of `signals`/`local_stack`.
+        let (handle_opt, prop): (Option<usize>, String) = match &expr.kind {
+            // `this.prop` / `obj.prop` via MemberAccess.
+            ExprKind::MemberAccess { expr: recv, member } => {
+                let h = match &recv.kind {
+                    ExprKind::This => self.this_stack.last().copied().flatten(),
+                    ExprKind::Ident(hier) if hier.path.len() == 1 => {
+                        self.peek_local_handle(&hier.path[0].name.name)
+                    }
+                    _ => None,
+                };
+                (h, member.name.clone())
+            }
+            // A bare `<prop>` inside a class method resolves to
+            // `this.<prop>`.
+            ExprKind::Ident(hier) if hier.path.len() == 1 => {
+                (self.this_stack.last().copied().flatten(), hier.path[0].name.name.clone())
+            }
+            _ => return false,
+        };
+        let handle = match handle_opt {
+            Some(h) => h,
+            None => return false,
+        };
+        let inst = match self.heap.get(handle).and_then(|c| c.as_ref()) {
+            Some(i) => i,
+            None => return false,
+        };
+        // Walk the inheritance chain looking for a class that declares
+        // `prop` as a string property.
+        let mut cur = Some(inst.class_name.clone());
+        while let Some(cn) = cur {
+            if let Some(cd) = self.module.classes.get(&cn) {
+                if cd.string_properties.contains(&prop) {
+                    return true;
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Peek a class-typed procedural local's heap handle WITHOUT mutating
+    /// state.  Used by `class_member_is_string` (a `&self` method) to resolve
+    /// `obj.<prop>` where `obj` is a local whose stored `Value` is the handle.
+    fn peek_local_handle(&self, name: &str) -> Option<usize> {
+        // Innermost-out search of the call frames.
+        for m in self.local_stack.iter().rev() {
+            if let Some(v) = m.get(name) {
+                return v.to_u64().map(|h| h as usize);
+            }
+        }
+        // Fallback to the signal map (initial/always-block locals).
+        self.signals.get(name).and_then(|v| v.to_u64().map(|h| h as usize))
     }
 
     /// Determine whether a call's `func` expression resolves to a method
