@@ -53071,6 +53071,27 @@ impl Simulator {
         handle: usize,
         prop: &str,
     ) -> Option<crate::ast::types::StructUnionType> {
+        // An ANONYMOUS inline struct property (`struct packed {..} s;`) has no
+        // typedef name to look up, but its declared type is retained verbatim
+        // in `property_types` — use it directly; whole-value access worked
+        // while `s.f` read x without this.
+        if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
+            let mut cur = Some(inst.class_name.clone());
+            let mut seen: HashSet<String> = HashSet::default();
+            while let Some(cn) = cur {
+                if !seen.insert(cn.clone()) {
+                    break;
+                }
+                let cd = self.module.classes.get(&cn)?;
+                if let Some(DataType::Struct(su)) = cd.property_types.get(prop) {
+                    return Some(su.clone());
+                }
+                if cd.properties.contains_key(prop) {
+                    break;
+                }
+                cur = cd.extends.clone();
+            }
+        }
         let tn = self.class_prop_type_name(handle, prop)?;
         let dt = self.module.typedef_types.get(tn.as_str())?;
         match Self::resolve_type_ref(dt, &self.module.typedef_types) {
@@ -53206,9 +53227,13 @@ impl Simulator {
                 )
             }
             ExprKind::MemberAccess { expr: recv, member } => {
-                // Only side-effect-free receivers — re-evaluating a call
-                // would run it twice.
-                if !matches!(&recv.kind, ExprKind::Ident(_) | ExprKind::This) {
+                // Ident/This receivers are re-evaluated (side-effect-free) to
+                // find the instance; a CALL receiver is resolved statically
+                // from its declared return type below.
+                if !matches!(
+                    &recv.kind,
+                    ExprKind::Ident(_) | ExprKind::This | ExprKind::Call { .. }
+                ) {
                     return None;
                 }
                 (Some((**recv).clone()), member.name.clone())
@@ -53223,12 +53248,30 @@ impl Simulator {
                 .return_type
                 .clone(),
             Some(recv) => {
-                let handle = self.eval_expr(&recv).to_u64()? as usize;
-                if handle == 0 {
-                    return None;
-                }
+                // A CALL receiver (`o.get().rd()`) cannot be re-evaluated to
+                // find its instance without running it twice — resolve the
+                // receiver's DECLARED return class statically instead. No
+                // instance means no type-parameter bindings, so a type-param
+                // return type bails below (handle == 0 guard) rather than
+                // guess.
+                let (handle, class_name) = if let ExprKind::Call { func: rf, .. } = &recv.kind {
+                    let rt = self.call_return_type(rf)?;
+                    let DataType::TypeReference { name, .. } = rt else {
+                        return None;
+                    };
+                    let cn = name.name.name.clone();
+                    if !self.module.classes.contains_key(&cn) {
+                        return None;
+                    }
+                    (0usize, cn)
+                } else {
+                    let h = self.eval_expr(&recv).to_u64()? as usize;
+                    if h == 0 {
+                        return None;
+                    }
+                    (h, self.heap.get(h)?.as_ref()?.class_name.clone())
+                };
                 let member = &method_name;
-                let class_name = self.heap.get(handle)?.as_ref()?.class_name.clone();
                 // Find the method's declaring class along the extends chain.
                 let mut cur = Some(class_name);
                 let mut seen: HashSet<String> = HashSet::default();
@@ -53260,6 +53303,11 @@ impl Simulator {
                         let tn = name.name.name.clone();
                         let cd = self.module.classes.get(&decl_cn)?;
                         if cd.type_param_names.iter().any(|t| t == &tn) {
+                            if handle == 0 {
+                                // Statically-typed receiver: no instance, no
+                                // type-parameter bindings.
+                                return None;
+                            }
                             let bound = self
                                 .heap
                                 .get(handle)?
@@ -53318,6 +53366,17 @@ impl Simulator {
         &self,
         su: &crate::ast::types::StructUnionType,
     ) -> (Vec<(String, u32, u32)>, u32) {
+        self.packed_agg_layout_with(su, &self.module.parameters)
+    }
+
+    /// [`packed_agg_layout`] against an explicit parameter scope — pass
+    /// [`instance_param_scope`] output so member widths that reference CLASS
+    /// parameters (`bit [W-1:0] f;` in an inline-struct property) resolve.
+    fn packed_agg_layout_with(
+        &self,
+        su: &crate::ast::types::StructUnionType,
+        params: &HashMap<String, Value>,
+    ) -> (Vec<(String, u32, u32)>, u32) {
         use crate::ast::types::StructUnionKind;
         let is_union = matches!(su.kind, StructUnionKind::Union);
         let mut fields: Vec<(String, u32, u32)> = Vec::new();
@@ -53331,7 +53390,7 @@ impl Simulator {
         for m in members {
             let fw = resolve_type_width(
                 &m.data_type,
-                Some(&self.module.parameters),
+                Some(params),
                 Some(&self.module.typedefs),
             )
             .max(1);
@@ -53481,6 +53540,34 @@ impl Simulator {
         Some((elem_w, elem_w.checked_mul(outer)?, left, right))
     }
 
+    /// Module parameters overlaid with the class-parameter values bound on
+    /// `handle` (leaf class first, §8.25), for sizing declarations that
+    /// reference either scope — e.g. a struct member `bit [W-1:0] f;` inside
+    /// an inline-struct property of `box #(W)`.
+    fn instance_param_scope(&self, handle: usize) -> HashMap<String, Value> {
+        let mut params = self.module.parameters.clone();
+        let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) else {
+            return params;
+        };
+        let mut cur = Some(inst.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            for (pname, _) in &cd.param_defaults {
+                if let Some(v) = inst.properties.get(pname) {
+                    params.entry(pname.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            cur = cd.extends.clone();
+        }
+        params
+    }
+
     /// `class_agg_member` for an already-split `<base>.<field>`.
     fn class_agg_member_parts(&mut self, base: &Expression, field: &str) -> Option<ClassAggRef> {
         if self.heap.is_empty() {
@@ -53509,7 +53596,8 @@ impl Simulator {
                 w,
             });
         }
-        let (fields, total) = self.packed_agg_layout(&su);
+        let inst_params = self.instance_param_scope(handle);
+        let (fields, total) = self.packed_agg_layout_with(&su, &inst_params);
         let (_, off, w) = fields.iter().find(|(n, _, _)| *n == field).cloned()?;
         Some(ClassAggRef::Packed {
             handle,
@@ -70233,6 +70321,29 @@ impl Simulator {
                     };
                     let ret_is_string = matches!(&method.kind,
                         ClassMethodKind::Function(f) if Self::is_string_data_type(&f.return_type));
+                    // A packed return type whose range references a CLASS
+                    // parameter (`function bit [W-1:0] mk();`) can only be
+                    // sized per instance — capture it for the clamp at the
+                    // return point below. Literal ranges resolve here (params
+                    // = None succeeds) and stay un-clamped as before.
+                    let dyn_ret_type: Option<DataType> = match &method.kind {
+                        ClassMethodKind::Function(f) => {
+                            let dims = match &f.return_type {
+                                DataType::IntegerVector { dimensions, .. } => Some(dimensions),
+                                DataType::Implicit { dimensions, .. } => Some(dimensions),
+                                _ => None,
+                            };
+                            dims.filter(|ds| {
+                                ds.iter().any(|d| {
+                                    matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                                        if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
+                                            || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
+                                })
+                            })
+                            .map(|_| f.return_type.clone())
+                        }
+                        _ => None,
+                    };
                     self.push_queue_frame();
                     // `output`/`inout`/`ref` formals copy back to the caller's
                     // actual on return (e.g. `randomize_instr(output riscv_instr
@@ -70582,11 +70693,24 @@ impl Simulator {
                             lv
                         }
                     });
-                    let ret = self
+                    let mut ret = self
                         .return_value
                         .take()
                         .or(implicit)
                         .unwrap_or(Value::zero(32));
+                    // Per-instance return clamp for a class-parameter-sized
+                    // return type: `box#(4)` with `function bit [W-1:0] mk()`
+                    // must hand back 4 bits, not whatever width the body's
+                    // last assignment happened to carry.
+                    if let Some(rt) = &dyn_ret_type {
+                        if !ret.is_real {
+                            let scope = self.instance_param_scope(handle);
+                            let w = resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs));
+                            if w > 0 && w != ret.width {
+                                ret = ret.resize_for_assign(w);
+                            }
+                        }
+                    }
                     // Snapshot output/ref formal values before dropping locals.
                     let writebacks: Vec<(Value, Expression)> = output_bindings
                         .iter()
