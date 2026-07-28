@@ -15248,7 +15248,16 @@ impl Simulator {
                             self.dirty_any = true;
                             self.table_modified = true;
                         }
-                    } else if sig_w <= 64 && !self.signal_real[id] {
+                    } else if sig_w <= 64 && !self.signal_real[id] && low <= high_eff {
+                        // `low > high_eff` means the select lies entirely
+                        // ABOVE the signal's width — `high_eff` is clamped to
+                        // `sig_w-1` but `low` is not. That happens when a
+                        // declared width was itself clamped (a `[N*W-1:0]` wire
+                        // over SANE_MAX_PACKED_WIDTH collapses to 1 bit) while
+                        // the select still asks for high bits. Writing nothing
+                        // is correct; computing `high_eff - low` underflows,
+                        // panicking in debug and silently corrupting
+                        // neighbouring bits in release.
                         let (src_v, src_x) = val.raw_bits();
                         let (base_v, base_x) = self.signal_table[id].raw_bits();
                         let (new_v, new_x) = Self::compose_inline_range_bits(
@@ -15314,7 +15323,16 @@ impl Simulator {
                             self.dirty_any = true;
                             self.table_modified = true;
                         }
-                    } else if sig_w <= 64 && !self.signal_real[id] {
+                    } else if sig_w <= 64 && !self.signal_real[id] && low <= high_eff {
+                        // `low > high_eff` means the select lies entirely
+                        // ABOVE the signal's width — `high_eff` is clamped to
+                        // `sig_w-1` but `low` is not. That happens when a
+                        // declared width was itself clamped (a `[N*W-1:0]` wire
+                        // over SANE_MAX_PACKED_WIDTH collapses to 1 bit) while
+                        // the select still asks for high bits. Writing nothing
+                        // is correct; computing `high_eff - low` underflows,
+                        // panicking in debug and silently corrupting
+                        // neighbouring bits in release.
                         let (src_v, src_x) = val.raw_bits();
                         let (base_v, base_x) = self.signal_table[id].raw_bits();
                         let (new_v, new_x) = Self::compose_inline_range_bits(
@@ -21833,6 +21851,16 @@ impl Simulator {
         low: u32,
         high: u32,
     ) -> (u64, u64) {
+        // A DEGENERATE range (`high < low`) reaches here when a declared width
+        // was clamped below the range a select uses — e.g. a `[N*W-1:0]` wire
+        // wider than SANE_MAX_PACKED_WIDTH is collapsed to 1 bit, then
+        // `flat[i*W +: W]` still asks for high bits. `high - low` then
+        // underflows: a debug build panics, and a release build wraps to a
+        // huge width and silently corrupts neighbouring bits. Treat it as a
+        // no-op write instead — callers elide when the value is unchanged.
+        if high < low {
+            return (base_v, base_x);
+        }
         let width = high - low + 1;
         let src_mask = if width >= 64 {
             u64::MAX
