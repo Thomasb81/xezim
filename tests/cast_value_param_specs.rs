@@ -2,7 +2,7 @@
 // Without the fix, cast_type_ok checked only class NAME compatibility
 // (class_is_a), so $cast(me[special_comp#(2)], a1[special_comp#(1)]) wrongly
 // succeeded — leaking a special_comp#(2) typewide callback onto a
-// special_comp#(1) instance (UVM 09callbacks/25params).
+// special_comp#(1) instance (a UVM callbacks specialization case).
 
 use xezim::simulate;
 
