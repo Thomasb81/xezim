@@ -15339,7 +15339,16 @@ impl Simulator {
                             self.dirty_any = true;
                             self.table_modified = true;
                         }
-                    } else if sig_w <= 64 && !self.signal_real[id] {
+                    } else if sig_w <= 64 && !self.signal_real[id] && low <= high_eff {
+                        // `low > high_eff` means the select lies entirely
+                        // ABOVE the signal's width — `high_eff` is clamped to
+                        // `sig_w-1` but `low` is not. That happens when a
+                        // declared width was itself clamped (a `[N*W-1:0]` wire
+                        // over SANE_MAX_PACKED_WIDTH collapses to 1 bit) while
+                        // the select still asks for high bits. Writing nothing
+                        // is correct; computing `high_eff - low` underflows,
+                        // panicking in debug and silently corrupting
+                        // neighbouring bits in release.
                         let (src_v, src_x) = val.raw_bits();
                         let (base_v, base_x) = self.signal_table[id].raw_bits();
                         let (new_v, new_x) = Self::compose_inline_range_bits(
@@ -15405,7 +15414,16 @@ impl Simulator {
                             self.dirty_any = true;
                             self.table_modified = true;
                         }
-                    } else if sig_w <= 64 && !self.signal_real[id] {
+                    } else if sig_w <= 64 && !self.signal_real[id] && low <= high_eff {
+                        // `low > high_eff` means the select lies entirely
+                        // ABOVE the signal's width — `high_eff` is clamped to
+                        // `sig_w-1` but `low` is not. That happens when a
+                        // declared width was itself clamped (a `[N*W-1:0]` wire
+                        // over SANE_MAX_PACKED_WIDTH collapses to 1 bit) while
+                        // the select still asks for high bits. Writing nothing
+                        // is correct; computing `high_eff - low` underflows,
+                        // panicking in debug and silently corrupting
+                        // neighbouring bits in release.
                         let (src_v, src_x) = val.raw_bits();
                         let (base_v, base_x) = self.signal_table[id].raw_bits();
                         let (new_v, new_x) = Self::compose_inline_range_bits(
@@ -21924,6 +21942,16 @@ impl Simulator {
         low: u32,
         high: u32,
     ) -> (u64, u64) {
+        // A DEGENERATE range (`high < low`) reaches here when a declared width
+        // was clamped below the range a select uses — e.g. a `[N*W-1:0]` wire
+        // wider than SANE_MAX_PACKED_WIDTH is collapsed to 1 bit, then
+        // `flat[i*W +: W]` still asks for high bits. `high - low` then
+        // underflows: a debug build panics, and a release build wraps to a
+        // huge width and silently corrupts neighbouring bits. Treat it as a
+        // no-op write instead — callers elide when the value is unchanged.
+        if high < low {
+            return (base_v, base_x);
+        }
         let width = high - low + 1;
         let src_mask = if width >= 64 {
             u64::MAX
@@ -25328,9 +25356,25 @@ impl Simulator {
             // to a fast-path signal ID so the NBA commits to the right signal
             // without needing `this_stack` at apply time.
             ExprKind::MemberAccess { expr, member } => {
-                if let ExprKind::Ident(hier) = &expr.kind {
-                    if hier.path.len() == 1 {
-                        let prop = hier.path[0].name.name.as_str();
+                // `vif.member` and `this.vif.member` name the same property;
+                // the latter parses as MemberAccess(This, vif) and must resolve
+                // identically. Without the `this.` form a NONBLOCKING write
+                // (`this.vif.addr <= …`, the usual shape in a constructor)
+                // missed the redirect and landed on a phantom signal, so the
+                // real interface member stayed x.
+                let vif_prop_name: Option<&str> = match &expr.kind {
+                    ExprKind::Ident(hier) if hier.path.len() == 1 => {
+                        Some(hier.path[0].name.name.as_str())
+                    }
+                    ExprKind::MemberAccess { expr: inner, member: vprop }
+                        if matches!(&inner.kind, ExprKind::This) =>
+                    {
+                        Some(vprop.name.as_str())
+                    }
+                    _ => None,
+                };
+                if let Some(prop) = vif_prop_name {
+                    {
                         // Check `local_iface_aliases` first (task formal arg vif).
                         if let Some(frame) = self.local_iface_aliases.last() {
                             if let Some(bound) = frame.get(prop).cloned() {
@@ -31662,9 +31706,26 @@ impl Simulator {
                 // interface property of the current `this`'s class. Look
                 // up the binding, redirect the write to
                 // `<bound>.<member>`.
-                if let ExprKind::Ident(hier) = &expr.kind {
-                    if hier.path.len() == 1 {
-                        let prop = hier.path[0].name.name.as_str();
+                //
+                // `this.vif.member = ...` is the same write with an explicit
+                // `this.` and must resolve identically: it parses as
+                // MemberAccess(MemberAccess(This, vif), member), so match the
+                // inner `this.vif` here too. Without this the write missed the
+                // redirect entirely and landed on a phantom signal, leaving the
+                // real interface member reading x.
+                let vif_prop_name: Option<&str> = match &expr.kind {
+                    ExprKind::Ident(hier) if hier.path.len() == 1 => {
+                        Some(hier.path[0].name.name.as_str())
+                    }
+                    ExprKind::MemberAccess { expr: inner, member: vprop }
+                        if matches!(&inner.kind, ExprKind::This) =>
+                    {
+                        Some(vprop.name.as_str())
+                    }
+                    _ => None,
+                };
+                if let Some(prop) = vif_prop_name {
+                    {
                         if let Some(Some(this_h)) = self.this_stack.last() {
                             let cls_name = if let Some(Some(inst)) = self.heap.get(*this_h) {
                                 Some(inst.class_name.clone())
@@ -57773,8 +57834,8 @@ impl Simulator {
                 (handle, prop)
             }
             ExprKind::MemberAccess { expr, member } => {
-                let obj_handle = if let ExprKind::Ident(h) = &expr.kind {
-                    if h.path.len() == 1 {
+                let obj_handle = match &expr.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 => {
                         let obj = &h.path[0].name.name;
                         let v = if let Some(locals) = self.local_stack.last() {
                             locals.get(obj).cloned()
@@ -57783,11 +57844,16 @@ impl Simulator {
                         }
                             .or_else(|| self.get_signal_value_by_name(obj));
                         v.and_then(|x| x.to_u64()).unwrap_or(0) as usize
-                    } else {
-                        0
                     }
-                } else {
-                    0
+                    // `this.vif = bus;` — the explicit-`this` spelling of the
+                    // bare `vif = bus;` handled above. Resolving only an Ident
+                    // object left the handle 0, so the binding was silently
+                    // dropped: every later `vif.<member>` access (bare ones
+                    // too) then missed the redirect and read x. This is the
+                    // usual shape in a constructor that takes the interface as
+                    // an argument.
+                    ExprKind::This => self.this_stack.last().copied().flatten().unwrap_or(0),
+                    _ => 0,
                 };
                 (obj_handle, member.name.clone())
             }
@@ -64221,19 +64287,37 @@ impl Simulator {
         let class_name_owned = class_def.name.clone();
         let mut computed_spec = None;
         if self.class_is_parameterized(&class_name_owned) {
-            if let Some(ta) = type_args {
-                if !ta.is_empty() {
+            // §8.25.1: two specializations are the SAME when their parameter
+            // values are the same — so an unspecialized `C c = new();` and an
+            // explicit `C #(<the defaults>) c = new();` are one specialization
+            // and must share one set of `static` members.
+            //
+            // Only an explicit `#(...)` list used to produce a spec; a bare
+            // `new()` left `spec = None` and fell back to the shared
+            // UNspecialized static cell, so the two spellings keyed different
+            // cells. `canonicalize_spec_sig` already pads absent trailing
+            // positions with their declared defaults, so handing it an empty
+            // sig yields exactly the all-defaults form the explicit spelling
+            // canonicalizes to.
+            let raw_sig: Option<String> = match type_args {
+                Some(ta) if !ta.is_empty() => {
                     let frags: Vec<String> =
                         ta.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect();
-                    if frags.len() == ta.len() {
-                        let raw_sig = frags.join(",");
-                        let sig = self.canonicalize_spec_sig(&class_name_owned, &raw_sig);
-                        computed_spec = Some((class_name_owned.clone(), sig.clone()));
-                        let saved = self.current_spec.take();
-                        self.current_spec = Some((class_name_owned.clone(), sig.clone()));
-                        self.ensure_spec_statics(&class_name_owned, &sig);
-                        self.current_spec = saved;
-                    }
+                    (frags.len() == ta.len()).then(|| frags.join(","))
+                }
+                _ => Some(String::new()),
+            };
+            if let Some(raw_sig) = raw_sig {
+                let sig = self.canonicalize_spec_sig(&class_name_owned, &raw_sig);
+                // An all-default class whose defaults are unrenderable yields
+                // an empty sig; keep the previous unspecialized behavior then
+                // rather than key an empty specialization.
+                if !sig.is_empty() {
+                    computed_spec = Some((class_name_owned.clone(), sig.clone()));
+                    let saved = self.current_spec.take();
+                    self.current_spec = Some((class_name_owned.clone(), sig.clone()));
+                    self.ensure_spec_statics(&class_name_owned, &sig);
+                    self.current_spec = saved;
                 }
             }
         }
