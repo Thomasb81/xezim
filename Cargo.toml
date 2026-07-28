@@ -27,6 +27,17 @@ cranelift-module = { version = "0.109", optional = true }
 cranelift-native = { version = "0.109", optional = true }
 fst-writer = "0.3"
 
+# macOS: link the SDK's libffi instead of building libffi-sys's vendored copy.
+# The vendored autoconf build breaks on aarch64 with modern clang two ways —
+# `configure` hands clang the GCC-only `-print-multi-os-directory`, and clang's
+# integrated assembler rejects the CFI expressions in `src/aarch64/sysv.S`.
+# Feature-gated per target (not on the base dependency above) so Linux and
+# Windows keep the self-contained vendored build and need no system libffi;
+# cargo unions features, so this only adds `system` when building for macOS.
+# See issue #56.
+[target.'cfg(target_os = "macos")'.dependencies]
+libffi = { version = "3", features = ["system"] }
+
 [dev-dependencies]
 # `tests/xtrace_conformance.rs` reads a zstd-compressed XTrace dump back to
 # check that its header declares the compression (XTrace §6.8). Same version
