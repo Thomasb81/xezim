@@ -33551,6 +33551,18 @@ impl Simulator {
                     }
                 }
                 // Fall back to bit select
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let nm = self.resolve_hier_name(h);
+                    if let Some(dims) = self.module.packed_full_dims.get(&nm) {
+                        if let Some(&(dl, dr)) = dims.first() {
+                            let lo_b = dl.min(dr);
+                            if lo_b != 0 {
+                                let idx = self.eval_expr(index).to_i64().unwrap_or(0) - lo_b;
+                                return self.eval_expr(expr).bit_select(idx.max(0) as usize);
+                            }
+                        }
+                    }
+                }
                 self.eval_expr(expr)
                     .bit_select(self.eval_expr(index).to_u64().unwrap_or(0) as usize)
             }
@@ -33677,8 +33689,22 @@ impl Simulator {
                     }
                 }
                 let base = self.eval_expr(expr);
-                let l = self.eval_expr(left).to_u64().unwrap_or(0) as usize;
-                let r = self.eval_expr(right).to_u64().unwrap_or(0) as usize;
+                let mut l_val = self.eval_expr(left).to_i64().unwrap_or(0);
+                let mut r_val = self.eval_expr(right).to_i64().unwrap_or(0);
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let nm = self.resolve_hier_name(h);
+                    if let Some(dims) = self.module.packed_full_dims.get(&nm) {
+                        if let Some(&(dl, dr)) = dims.first() {
+                            let lo_b = dl.min(dr);
+                            if lo_b != 0 {
+                                l_val -= lo_b;
+                                r_val -= lo_b;
+                            }
+                        }
+                    }
+                }
+                let l = l_val.max(0) as usize;
+                let r = r_val.max(0) as usize;
 
                 match kind {
                     RangeKind::Constant => base.range_select(l, r),
