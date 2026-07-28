@@ -78,7 +78,6 @@ endmodule
 }
 
 #[test]
-#[ignore = "queue-local isolation deferred (see concurrent_fork_queues_do_not_clobber)"]
 fn sequential_calls_keep_independent_queues() {
     // Two SEQUENTIAL calls (not concurrent) must also each see a fresh queue,
     // and neither leaks elements into the other.
