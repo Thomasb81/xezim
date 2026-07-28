@@ -34756,11 +34756,36 @@ impl Simulator {
                                     return Value::from_string(kw);
                                 }
                             }
+                        }
+                        // A Specialization expression given directly, e.g.
+                        // $typename(foo#(bar#(xyz),88)) — IEEE 1800-2017 §21.7.
+                        if let ExprKind::Specialization { base, type_args_text } = &arg.kind {
+                            let bn = self.expr_type_leaf_name(base);
+                            return Value::from_string(&format!(
+                                "class {} #({})",
+                                bn,
+                                self.format_typename_args_text(type_args_text)
+                            ));
+                        }
+                        // A class-typed variable: "class <name> #(<args>)".
+                        if let Some((base, ta)) = self.class_declared_type_of(arg) {
+                            return Value::from_string(
+                                &self.format_class_typename(&base, &ta),
+                            );
+                        }
+                        // A bare class/covergroup type name, or a scalar signal.
+                        if let ExprKind::Ident(hier) = &arg.kind {
+                            if hier.path.len() == 1 {
+                                let n = &hier.path[0].name.name;
+                                if self.module.classes.contains_key(n)
+                                    || self.module.covergroups.contains_key(n.as_str())
+                                {
+                                    return Value::from_string(&format!("class {}", n));
+                                }
+                            }
                             let name = self.resolve_hier_name(hier);
-                            if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
-                                let w = self.signal_widths[id];
-                                let s = if w == 1 { "logic" } else { "logic" };
-                                return Value::from_string(s);
+                            if self.signal_name_to_id.contains_key(name.as_str()) {
+                                return Value::from_string("logic");
                             }
                         }
                     }
@@ -70867,6 +70892,144 @@ impl Simulator {
                 None
             }
             _ => None,
+        }
+    }
+
+    /// Return the declared class base name and specialization type-args for a
+    /// class-typed expression (a procedural local or a hier-resolved name),
+    /// for `$typename`. `None` if the expression is not a class-typed
+    /// variable.
+    fn class_declared_type_of(
+        &self,
+        expr: &Expression,
+    ) -> Option<(String, Vec<Expression>)> {
+        if let ExprKind::Ident(hier) = &expr.kind {
+            let name = self.resolve_hier_name(hier);
+            if let Some(base) = self.var_class_types.get(&name) {
+                let ta = self.var_type_args.get(&name).cloned().unwrap_or_default();
+                return Some((base.clone(), ta));
+            }
+            let bname = &hier.path[0].name.name;
+            if let Some(base) = self.var_class_types.get(bname) {
+                let ta = self.var_type_args.get(bname).cloned().unwrap_or_default();
+                return Some((base.clone(), ta));
+            }
+        }
+        None
+    }
+
+    /// Format the `$typename` string for a class type (IEEE 1800-2017 §21.7):
+    /// `class <name>` with any specialization as `#(<args>)`, where a type
+    /// argument renders as `class <name>` (recursive) and a value argument
+    /// as its literal.
+    fn format_class_typename(&mut self, base: &str, type_args: &[Expression]) -> String {
+        if type_args.is_empty() {
+            return format!("class {}", base);
+        }
+        let parts: Vec<String> = type_args
+            .iter()
+            .map(|a| self.format_typename_arg(a))
+            .collect();
+        format!("class {} #({})", base, parts.join(", "))
+    }
+
+    /// Format a single specialization argument (a type or a value).
+    fn format_typename_arg(&mut self, arg: &Expression) -> String {
+        match &arg.kind {
+            ExprKind::Specialization { base, type_args_text } => {
+                let bn = self.expr_type_leaf_name(base);
+                format!(
+                    "class {} #({})",
+                    bn,
+                    self.format_typename_args_text(type_args_text)
+                )
+            }
+            ExprKind::Ident(hier)
+                if hier.path.len() == 1 && hier.path[0].selects.is_empty() =>
+            {
+                let n = &hier.path[0].name.name;
+                if self.module.classes.contains_key(n)
+                    || self.module.covergroups.contains_key(n.as_str())
+                {
+                    format!("class {}", n)
+                } else {
+                    n.clone()
+                }
+            }
+            ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.clone(),
+            _ => {
+                let v = self.eval_expr(arg);
+                match v.to_u64() {
+                    Some(n) => n.to_string(),
+                    None => "logic".to_string(),
+                }
+            }
+        }
+    }
+
+    /// Recursively format the raw `#(...)` text of a `Specialization` node
+    /// (space-joined source tokens) into typename arguments.
+    fn format_typename_args_text(&self, text: &str) -> String {
+        let norm: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if norm.is_empty() {
+            return String::new();
+        }
+        // Split on top-level commas (respecting ()/[] nesting).
+        let mut parts = Vec::new();
+        let mut depth = 0i32;
+        let mut cur = String::new();
+        for ch in norm.chars() {
+            match ch {
+                '(' | '[' => {
+                    depth += 1;
+                    cur.push(ch);
+                }
+                ')' | ']' => {
+                    depth -= 1;
+                    cur.push(ch);
+                }
+                ',' if depth == 0 => parts.push(std::mem::take(&mut cur)),
+                _ => cur.push(ch),
+            }
+        }
+        if !cur.is_empty() {
+            parts.push(cur);
+        }
+        parts
+            .iter()
+            .map(|p| self.format_typename_text_one(p))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Format one raw-text type argument (after whitespace removal).
+    fn format_typename_text_one(&self, s: &str) -> String {
+        if let Some(pos) = s.find("#(") {
+            let base = &s[..pos];
+            if s.ends_with(')') {
+                let inner = &s[pos + 2..s.len() - 1];
+                return format!(
+                    "class {} #({})",
+                    base,
+                    self.format_typename_args_text(inner)
+                );
+            }
+        }
+        if self.module.classes.contains_key(s) || self.module.covergroups.contains_key(s) {
+            format!("class {}", s)
+        } else {
+            s.to_string()
+        }
+    }
+
+    /// Extract the leaf identifier name from an expression's type base.
+    fn expr_type_leaf_name(&self, e: &Expression) -> String {
+        match &e.kind {
+            ExprKind::Ident(hier) => {
+                hier.path.last().map(|s| s.name.name.clone()).unwrap_or_default()
+            }
+            ExprKind::Specialization { base, .. } => self.expr_type_leaf_name(base),
+            _ => String::new(),
         }
     }
 
