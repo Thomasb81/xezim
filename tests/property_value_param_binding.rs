@@ -3,7 +3,7 @@
 // Without the fix, class properties had no recorded `#(...)` type-args (only
 // module-level decls and locals did), so `this.a1 = new(...)` constructed with
 // NO type-args and N defaulted to 0 — collapsing `#(1)`/`#(2)` to `#(0)`
-// (UVM 09callbacks/25params: callbacks printed special#(0) instead of #(1)).
+// (a UVM callbacks specialization case: callbacks printed special#(0) instead of #(1)).
 
 use xezim::simulate;
 
