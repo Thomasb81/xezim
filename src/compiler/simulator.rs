@@ -59468,6 +59468,42 @@ impl Simulator {
                                         );
                                     }
                                 }
+                                // A TYPE-PARAMETER receiver: `T::type_id::create(...)`
+                                // where `T` is a type parameter of the enclosing
+                                // parameterized class (e.g. UVM's
+                                // `uvm_reg_predictor#(BUSTYPE)::type_name()` calls
+                                // `BUSTYPE::type_id::create("t")`). The nested
+                                // `type_id` class is never elaborated (nested
+                                // classes are not registered in `module.classes`),
+                                // so without resolving `T` to its concrete
+                                // specialization argument here, `create` returns
+                                // null and the constructed object's
+                                // `get_type_name()` is empty — which silently
+                                // breaks the factory's `m_type_name` cache.
+                                if let Some(resolved) =
+                                    self.resolve_type_param_binding(class_name)
+                                {
+                                    if let Some((base, sig)) =
+                                        self.extract_spec_from_string(&resolved)
+                                    {
+                                        self.ensure_spec_statics(&base, &sig);
+                                        let saved = self.current_spec.clone();
+                                        self.current_spec =
+                                            Some((base.clone(), sig));
+                                        if let Some(class_def) =
+                                            self.module.classes.get(&base).cloned()
+                                        {
+                                            let r = self.instantiate_class(&class_def, args);
+                                            self.current_spec = saved;
+                                            return r;
+                                        }
+                                        self.current_spec = saved;
+                                    } else if let Some(class_def) =
+                                        self.module.classes.get(&resolved).cloned()
+                                    {
+                                        return self.instantiate_class(&class_def, args);
+                                    }
+                                }
                             }
                         }
                     }
@@ -59529,6 +59565,48 @@ impl Simulator {
                                     };
                                     return self
                                         .instantiate_class_with_type_args(&class_def, args, ta);
+                                }
+                            }
+                            // A TYPE-PARAMETER receiver: `T::type_id::create(...)`
+                            // where `T` is a type parameter of the enclosing
+                            // parameterized class (e.g. UVM's
+                            // `uvm_reg_predictor#(BUSTYPE)::type_name()` calls
+                            // `BUSTYPE::type_id::create("t")`). The nested
+                            // `type_id` class is never elaborated (nested
+                            // classes are not registered in `module.classes`),
+                            // so without resolving `T` to its concrete
+                            // specialization argument here, `create` returns
+                            // null and the constructed object's
+                            // `get_type_name()` is empty — which silently
+                            // breaks the factory's `m_type_name` cache.
+                            if let Some(resolved) =
+                                self.resolve_type_param_binding(&class_name)
+                            {
+                                if let Some((base, sig)) =
+                                    self.extract_spec_from_string(&resolved)
+                                {
+                                    self.ensure_spec_statics(&base, &sig);
+                                    let saved = self.current_spec.clone();
+                                    self.current_spec = Some((base.clone(), sig));
+                                    if let Some(class_def) =
+                                        self.module.classes.get(&base).cloned()
+                                    {
+                                        self.type_id_create_in_progress
+                                            .insert(class_name.clone());
+                                        let r = self.instantiate_class(&class_def, args);
+                                        self.type_id_create_in_progress
+                                            .remove(&class_name);
+                                        self.current_spec = saved;
+                                        return r;
+                                    }
+                                    self.current_spec = saved;
+                                } else if let Some(class_def) =
+                                    self.module.classes.get(&resolved).cloned()
+                                {
+                                    self.type_id_create_in_progress.insert(class_name.clone());
+                                    let r = self.instantiate_class(&class_def, args);
+                                    self.type_id_create_in_progress.remove(&class_name);
+                                    return r;
                                 }
                             }
                         }
