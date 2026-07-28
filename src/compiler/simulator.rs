@@ -39324,7 +39324,15 @@ impl Simulator {
                     // (a packed Value cannot carry them).
                     self.pending_ret_collection = None;
                     if let ExprKind::Ident(h) = &e.kind {
-                        let n = self.resolve_hier_name(h);
+                        let bare = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                        // A queue / dynamic-array member lives at `<handle>#member`,
+                        // not under the bare name that `resolve_hier_name`
+                        // returns (its per-node cache doesn't consult
+                        // `instance_assoc_member`). Resolve the instance-scoped
+                        // name explicitly so `pending_ret_collection` captures
+                        // the real storage.
+                        let n = self.instance_assoc_member(bare)
+                            .unwrap_or_else(|| self.resolve_hier_name(h));
                         if self.module.dynamic_arrays.contains(&n) {
                             self.pending_ret_collection = Some(n);
                         }
@@ -54513,6 +54521,30 @@ impl Simulator {
         self.set_queue_size(dst, n);
     }
 
+    /// Populate a per-instance queue / dynamic-array member from an inline
+    /// class-property initializer (`int q[$] = '{1,2,3}`). The initializer is
+    /// an ordered `AssignmentPattern`; each item is evaluated in the
+    /// instance context and written to `<queue>[i]`, then the queue size is
+    /// set to the number of items. Mirrors the AssignmentPattern assignment
+    /// path in `assign_value`.
+    fn populate_queue_from_init(&mut self, scoped_q: &str, init: &Expression) {
+        if let ExprKind::AssignmentPattern(items) = &init.kind {
+            let (_lo, _hi, w) = self
+                .module
+                .arrays
+                .get(scoped_q)
+                .copied()
+                .unwrap_or((0, 63, 32));
+            for (i, item) in items.iter().enumerate() {
+                let v = self.eval_expr(item.expr());
+                self.set_signal_value_by_name(&format!("{}[{}]", scoped_q, i), v);
+                self.widths
+                    .insert(format!("{}[{}]", scoped_q, i), w);
+            }
+            self.set_queue_size(scoped_q, items.len() as u64);
+        }
+    }
+
     /// Relative leaf paths of an unpacked struct (`a`, `inner.b`, `arr[0]`).
     fn struct_leaf_suffixes(&self, su: &crate::ast::types::StructUnionType) -> Vec<String> {
         let mut out = Vec::new();
@@ -64567,6 +64599,17 @@ impl Simulator {
                 // mutate state and are the constructor's job; leave their
                 // elaborate-time value in place.
                 if Self::expr_contains_call(&init) {
+                    continue;
+                }
+                // Queue / dynamic-array member initializer (`int q[$] =
+                // '{1,2,3}`): the per-instance storage lives at
+                // `<handle>#member`, NOT in the scalar `properties` map.
+                // Evaluate the initializer and populate the queue namespace.
+                let scoped_q = format!("{}#{}", handle, pname);
+                if cdef.queue_properties.contains_key(&pname)
+                    || self.module.dynamic_arrays.contains(&scoped_q)
+                {
+                    self.populate_queue_from_init(&scoped_q, &init);
                     continue;
                 }
                 let val = self.eval_expr(&init);
