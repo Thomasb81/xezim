@@ -2587,6 +2587,10 @@ pub struct Simulator {
     clocking_out_skew: HashMap<String, u64>,
     /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
     clocking_sig_out_skew: HashMap<String, HashMap<String, u64>>,
+    /// §14.4 per-cb default INPUT skew in ticks (absent = #0).
+    clocking_in_skew: HashMap<String, u64>,
+    /// §14.4 per-signal input-skew overrides: cb → (resolved net → ticks).
+    clocking_sig_in_skew: HashMap<String, HashMap<String, u64>>,
     /// Sim time of each cb's most recent clock edge — a `cb.out <= v` executed
     /// AT the edge time drives at edge+skew (§14.16.1); between edges it waits
     /// for the next edge.
@@ -2783,6 +2787,14 @@ pub struct Simulator {
     /// declared in `base_class` (so unrelated/inherited statics stay shared),
     /// giving each specialization its own cell (§8.25). None = shared cell.
     current_spec: Option<(String, String)>,
+    /// `(declaring_class, property)` → does this property's packed range
+    /// depend on a parameter? `fit_class_prop` runs on every property store,
+    /// so the common answer (`false`) is memoized to one hash lookup.
+    spec_prop_is_dyn: std::cell::RefCell<HashMap<(String, String), bool>>,
+    /// Memo for `respec_packed_width`: `(declaring_class, property,
+    /// parameter-binding fingerprint)` → re-resolved width, so the packed
+    /// range is const-eval'd once per specialization instead of per store.
+    spec_prop_width_cache: std::cell::RefCell<HashMap<(String, String, String), Option<u32>>>,
     /// Tracks class names currently being constructed via the `type_id::create()`
     /// PURE-mode shortcut, to prevent infinite recursion when a parameterized
     /// class's constructor or static initializers re-enter `type_id::create()`
@@ -5232,6 +5244,8 @@ impl Simulator {
             clocking_sig_alias: HashMap::default(),
             clocking_out_skew: HashMap::default(),
             clocking_sig_out_skew: HashMap::default(),
+            clocking_in_skew: HashMap::default(),
+            clocking_sig_in_skew: HashMap::default(),
             clocking_last_edge: HashMap::default(),
             clocking_preponed: HashMap::default(),
             deferred_clocking_conts: Vec::new(),
@@ -5288,6 +5302,8 @@ impl Simulator {
             rand_ranges: HashMap::default(),
             class_statics: HashMap::default(),
             current_spec: None,
+            spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
+            spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
             initialized_spec_statics: std::collections::HashSet::default(),
             pending_spec_inits: Vec::new(),
@@ -8797,12 +8813,12 @@ impl Simulator {
         // §14.4 output skews: evaluate the per-cb default and per-signal
         // output-skew expressions to ticks. Collected first (clones) because
         // eval_delay_ticks needs &mut self.
-        let skew_specs: Vec<(String, bool, Option<Expression>, Vec<(String, Expression)>)> = self
+        let skew_specs: Vec<(String, bool, Option<Expression>, Vec<(String, Expression)>, Option<Expression>, Vec<(String, Expression)>)> = self
             .module
             .clocking_blocks
             .iter()
             .map(|(n, cd)| {
-                let per_sig: Vec<(String, Expression)> = cd
+                let out_per_sig: Vec<(String, Expression)> = cd
                     .signals
                     .iter()
                     .filter(|s| {
@@ -8814,7 +8830,19 @@ impl Simulator {
                     })
                     .filter_map(|s| s.skew.clone().map(|e| (s.name.name.clone(), e)))
                     .collect();
-                (n.clone(), cd.is_default, cd.default_output_skew.clone(), per_sig)
+                let in_per_sig: Vec<(String, Expression)> = cd
+                    .signals
+                    .iter()
+                    .filter(|s| {
+                        matches!(
+                            s.direction,
+                            crate::ast::types::PortDirection::Input
+                                | crate::ast::types::PortDirection::Inout
+                        )
+                    })
+                    .filter_map(|s| s.skew.clone().map(|e| (s.name.name.clone(), e)))
+                    .collect();
+                (n.clone(), cd.is_default, cd.default_output_skew.clone(), out_per_sig, cd.default_input_skew.clone(), in_per_sig)
             })
             .collect();
         let skew_ticks = |slf: &mut Self, e: &Expression| -> u64 {
@@ -8826,8 +8854,9 @@ impl Simulator {
             }
             slf.eval_delay_ticks(e)
         };
-        for (cb, is_default, dskew, per_sig) in skew_specs {
-            if let Some(e) = dskew {
+        for (cb, is_default, out_dskew, out_per_sig, in_dskew, in_per_sig) in skew_specs {
+            // Process output skew
+            if let Some(e) = out_dskew {
                 let t = skew_ticks(self, &e);
                 if t > 0 {
                     self.clocking_out_skew.insert(cb.clone(), t);
@@ -8837,13 +8866,32 @@ impl Simulator {
                     }
                 }
             }
-            let mut m: HashMap<String, u64> = HashMap::default();
-            for (net, e) in per_sig {
+            let mut out_m: HashMap<String, u64> = HashMap::default();
+            for (net, e) in out_per_sig {
                 let t = skew_ticks(self, &e);
-                m.insert(net, t);
+                out_m.insert(net, t);
             }
-            if !m.is_empty() {
-                self.clocking_sig_out_skew.insert(cb, m);
+            if !out_m.is_empty() {
+                self.clocking_sig_out_skew.insert(cb.clone(), out_m);
+            }
+            // Process input skew
+            if let Some(e) = in_dskew {
+                let t = skew_ticks(self, &e);
+                if t > 0 {
+                    self.clocking_in_skew.insert(cb.clone(), t);
+                    if is_default {
+                        self.clocking_in_skew
+                            .insert("__xz_default_clocking".to_string(), t);
+                    }
+                }
+            }
+            let mut in_m: HashMap<String, u64> = HashMap::default();
+            for (net, e) in in_per_sig {
+                let t = skew_ticks(self, &e);
+                in_m.insert(net, t);
+            }
+            if !in_m.is_empty() {
+                self.clocking_sig_in_skew.insert(cb, in_m);
             }
         }
         // Friendly fallback: `##N` with a single clocking block and no
@@ -29711,6 +29759,19 @@ impl Simulator {
                 return self.write_class_agg(&r, val);
             }
         }
+        // §7.4.1: `<obj>.<prop>[i] = ...` on a multi-dimensional PACKED array
+        // property splices the element's bits. Without this the write fell
+        // through to a bit-select path that dropped it entirely.
+        if let ExprKind::Index { expr, index } = &lhs.kind {
+            if matches!(&expr.kind,
+                ExprKind::MemberAccess { .. } | ExprKind::Ident(_) | ExprKind::This)
+            {
+                let (base, idx) = (expr.clone(), index.clone());
+                if let Some(r) = self.class_packed_elem_ref(&base, &idx) {
+                    return self.write_class_agg(&r, val);
+                }
+            }
+        }
         // §8.9: assignment to a STATIC class property (`obj.static_prop = ...`,
         // `this.static_prop = ...`) writes the single shared cell, not per-
         // instance storage. static_prop_key is None for a non-static member, so
@@ -32933,6 +32994,76 @@ impl Simulator {
                         self.nested_index_name(expr)
                     );
                 }
+                // §7.4.1: `<obj>.<prop>[i]` on a multi-dimensional PACKED array
+                // class property selects an ELEMENT, not a bit. Gated on the
+                // receiver's shape so nothing else re-evaluates `expr`.
+                if !self.heap.is_empty()
+                    && matches!(&expr.kind,
+                        ExprKind::MemberAccess { .. }
+                            | ExprKind::Ident(_)
+                            | ExprKind::This)
+                {
+                    if let Some(r) = self.class_packed_elem_ref(expr, index) {
+                        return self.read_class_agg(&r);
+                    }
+                }
+                // §7.4.1 on a CALL result: `mk_vec()[1]` where the return type
+                // is a multi-dim packed vector selects an ELEMENT. Without the
+                // return type in hand this fell through to a bit-select.
+                if let ExprKind::Call { func, .. } = &expr.kind {
+                    let shape = self.call_return_type(func).and_then(|ret| {
+                        let resolved = Self::resolve_type_ref(&ret, &self.module.typedef_types);
+                        let dims = match &resolved {
+                            DataType::IntegerVector { dimensions, .. } => dimensions,
+                            DataType::Implicit { dimensions, .. } => dimensions,
+                            _ => return None,
+                        };
+                        if dims.len() < 2 {
+                            return None;
+                        }
+                        let b = |d: &crate::ast::types::PackedDimension| {
+                            let crate::ast::types::PackedDimension::Range { left, right, .. } = d
+                            else {
+                                return None;
+                            };
+                            Some((
+                                crate::elaborate::const_eval_i64_with_params(
+                                    left,
+                                    Some(&self.module.parameters),
+                                )?,
+                                crate::elaborate::const_eval_i64_with_params(
+                                    right,
+                                    Some(&self.module.parameters),
+                                )?,
+                            ))
+                        };
+                        let (l, r) = b(&dims[0])?;
+                        let mut elem_w: u32 = 1;
+                        for d in &dims[1..] {
+                            let (il, ir) = b(d)?;
+                            elem_w = elem_w.checked_mul(((il - ir).unsigned_abs() + 1) as u32)?;
+                        }
+                        Some((elem_w, l, r))
+                    });
+                    if let Some((elem_w, l, r)) = shape {
+                        // Evaluate the call ONCE, then the index.
+                        let base_val = self.eval_expr(expr);
+                        if let Some(idx) = self.eval_expr(index).to_i64() {
+                            if idx >= l.min(r) && idx <= l.max(r) {
+                                let slot =
+                                    if l >= r { (l - idx) as u32 } else { (idx - l) as u32 };
+                                let n = ((l - r).unsigned_abs() + 1) as u32;
+                                let off = (n - 1 - slot) * elem_w;
+                                if off + elem_w <= base_val.width {
+                                    return base_val.range_select(
+                                        (off + elem_w - 1) as usize,
+                                        off as usize,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 // §7.12.2: a locator method (`min`/`max`/`unique`/`find*`)
                 // returns a QUEUE, so `a.max()[k]` / `(a.find with (..))[k]`
                 // must index that result queue — not bit-select the scalar the
@@ -35132,6 +35263,32 @@ impl Simulator {
                 // functions, which have no flattened leaf signal.)
                 {
                     let base_val = self.eval_expr(expr);
+                    // §8.24 / §7.2.1: member select on a CALL result —
+                    // directly (`make().tag`, `obj.read_payload().tag`) or
+                    // through nested members (`mk().n.hi`) — projects the
+                    // field from the callee's declared return type. The paths
+                    // below cannot serve this: `struct_field_layout` only
+                    // describes UNPACKED structs, and a method callee is a
+                    // MemberAccess the Ident-only lookups never match — so the
+                    // member read fell through and returned 0 even though the
+                    // call's whole value was correct. `base_val` is already
+                    // the inner chain's projected slice (this arm recursed to
+                    // produce it), so only the base's TYPE is resolved here.
+                    if matches!(&expr.kind, ExprKind::Call { .. } | ExprKind::MemberAccess { .. }) {
+                        if let Some(su) = self.chain_base_packed_struct(expr) {
+                            let (fields, total) = self.packed_agg_layout(&su);
+                            if total == base_val.width {
+                                if let Some((_, off, w)) = fields
+                                    .iter()
+                                    .find(|(m, _, _)| m == &member.name)
+                                    .cloned()
+                                {
+                                    return base_val
+                                        .range_select((off + w - 1) as usize, off as usize);
+                                }
+                            }
+                        }
+                    }
                     // Try to find struct layout for the base.
                     // For `Ident.field`: look up packed_struct_fields[Ident]
                     // For `Index.field`: look up packed_struct_fields[base_arr_name]
@@ -43753,60 +43910,13 @@ impl Simulator {
                     self.clocking_cycle_pending.insert(cb.clone(), keep);
                 }
             }
-            // Posedge: refresh input snapshots from the Preponed samples
-            // captured at slot-entry (`refresh_clocking_preponed`), so `cb.<in>`
-            // reads the value from BEFORE this edge (`#1step` input skew,
-            // §14.4), not the same-edge NBA update. Fall back to the current
-            // value if no preponed sample was captured (e.g. first slot).
-            let mut snap = HashMap::default();
-            for (sig, is_input) in &sigs {
-                if *is_input {
-                    if let Some(v) = self
-                        .clocking_preponed
-                        .get(sig)
-                        .cloned()
-                        .or_else(|| self.get_signal_value_by_name(sig))
-                    {
-                        snap.insert(sig.clone(), v);
-                    }
-                }
-            }
-            // §14.13: publish each fresh sample to its hidden mirror signal so
-            // `@(cb.sig)` fires at THIS edge, and only on an actual change.
-            let mirror: Vec<(String, Value)> = snap
-                .iter()
-                .map(|(net, v)| (net.clone(), v.clone()))
-                .collect();
-            for (net, v) in mirror {
-                // meta stores resolved nets; the mirror is keyed by the
-                // clocking-visible name, so translate back through the alias.
-                let vis = self
-                    .clocking_sig_alias
-                    .get(&cb)
-                    .and_then(|m| {
-                        m.iter()
-                            .find(|(_, n)| **n == net)
-                            .map(|(vis, _)| vis.clone())
-                    })
-                    .unwrap_or_else(|| net.clone());
-                let hidden = format!("{}{}.{}", CB_SAMPLE_PREFIX, cb, vis);
-                if let Some(&id) = self.signal_name_to_id.get(hidden.as_str()) {
-                    let w = self.signal_widths[id];
-                    let nv = v.resize(w);
-                    if self.signal_table[id] != nv {
-                        write_sig!(self, id, nv);
-                        self.mark_dirty_id(id);
-                        self.table_modified = true;
-                        self.clocking_mirror_dirty = true;
-                    }
-                }
-            }
-            self.clocking_snapshots.insert(cb.clone(), snap);
             // LRM §14.4 output skew: apply any pending output drives
             // queued by `cb.<out_sig> <= val` since the last edge.
             // Route through `assign_value` (with a synthesised Ident
             // lvalue) so width/signedness handling matches a normal
             // procedural assignment.
+            // NOTE: Drive outputs BEFORE sampling inputs so that @(cb) waiters
+            // see the new output values when they run in the Reactive region.
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
                 let dskew = self
                     .clocking_out_skew
@@ -43847,6 +43957,69 @@ impl Simulator {
                     self.assign_value(&lval, &val);
                 }
             }
+            // Posedge: refresh input snapshots. §14.4 input skew:
+            // - #0 (default): sample from preponed (before this edge)
+            // - #1step or more: sample from current state (after NBA updates at this edge)
+            // For each signal, check per-signal skew first, then default skew.
+            let in_dskew = self.clocking_in_skew.get(&cb).copied().unwrap_or(0);
+            let mut snap = HashMap::default();
+            for (sig, is_input) in &sigs {
+                if *is_input {
+                    // Determine the skew for this signal: per-signal override or default
+                    let skew = self
+                        .clocking_sig_in_skew
+                        .get(&cb)
+                        .and_then(|m| m.get(sig))
+                        .copied()
+                        .unwrap_or(in_dskew);
+                    // §14.4: skew > 0 means sample AFTER the edge (current value, post-NBA)
+                    // skew == 0 means sample AT the edge (preponed value, pre-NBA)
+                    let v = if skew > 0 {
+                        // Use current (post-NBA) value
+                        self.get_signal_value_by_name(sig)
+                    } else {
+                        // Use preponed (pre-NBA) value, fall back to current if not available
+                        self.clocking_preponed
+                            .get(sig)
+                            .cloned()
+                            .or_else(|| self.get_signal_value_by_name(sig))
+                    };
+                    if let Some(v) = v {
+                        snap.insert(sig.clone(), v);
+                    }
+                }
+            }
+            // §14.13: publish each fresh sample to its hidden mirror signal so
+            // `@(cb.sig)` fires at THIS edge, and only on an actual change.
+            let mirror: Vec<(String, Value)> = snap
+                .iter()
+                .map(|(net, v)| (net.clone(), v.clone()))
+                .collect();
+            for (net, v) in mirror {
+                // meta stores resolved nets; the mirror is keyed by the
+                // clocking-visible name, so translate back through the alias.
+                let vis = self
+                    .clocking_sig_alias
+                    .get(&cb)
+                    .and_then(|m| {
+                        m.iter()
+                            .find(|(_, n)| **n == net)
+                            .map(|(vis, _)| vis.clone())
+                    })
+                    .unwrap_or_else(|| net.clone());
+                let hidden = format!("{}{}.{}", CB_SAMPLE_PREFIX, cb, vis);
+                if let Some(&id) = self.signal_name_to_id.get(hidden.as_str()) {
+                    let w = self.signal_widths[id];
+                    let nv = v.resize(w);
+                    if self.signal_table[id] != nv {
+                        write_sig!(self, id, nv);
+                        self.mark_dirty_id(id);
+                        self.table_modified = true;
+                        self.clocking_mirror_dirty = true;
+                    }
+                }
+            }
+            self.clocking_snapshots.insert(cb.clone(), snap);
         }
     }
 
@@ -52959,7 +53132,132 @@ impl Simulator {
         }
     }
 
+    /// Re-resolve `prop`'s packed width against the class parameters bound
+    /// on the instance `handle` points at.
+    ///
+    /// Elaboration records ONE width per class — the width under the class's
+    /// default parameter values — because `ElaboratedClass` is keyed by
+    /// base-class name. For `class box #(parameter int W = 8); bit [W-1:0]
+    /// data;` that made `box#(16)` report 8 bits and truncate every store
+    /// through `fit_class_prop`. Class value parameters are bound as
+    /// INSTANCE PROPERTIES at construction (§8.25, see
+    /// `instantiate_class_with_type_args`), so the instance already carries
+    /// this specialization's `W` — read the width back off the retained
+    /// declared type using those bindings.
+    ///
+    /// Deliberately narrow: only packed integer-vector declarations whose
+    /// range is not already all-literal are re-resolved. Typedef'd, struct,
+    /// enum and union properties would need the elaboration-time typedef
+    /// table, which is not reachable here, so they keep the elaborated width
+    /// rather than risk a wrong one.
+    fn respec_packed_width(&self, decl_class: &str, handle: usize, prop: &str) -> Option<u32> {
+        let dyn_key = (decl_class.to_string(), prop.to_string());
+        // Fast reject for the overwhelmingly common case (no dimensions, or a
+        // literal range that already elaborated correctly): one hash lookup.
+        let known = self.spec_prop_is_dyn.borrow().get(&dyn_key).copied();
+        if known == Some(false) {
+            return None;
+        }
+        let cd = self.module.classes.get(decl_class)?;
+        let dt = cd.property_types.get(prop);
+        let dims = match dt {
+            Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => dimensions,
+            Some(DataType::Implicit { dimensions, .. }) if !dimensions.is_empty() => dimensions,
+            _ => {
+                self.spec_prop_is_dyn.borrow_mut().insert(dyn_key, false);
+                return None;
+            }
+        };
+        // Classify once: const-eval'ing the range on every store would defeat
+        // the point of caching the width.
+        let is_dyn = match known {
+            Some(v) => v,
+            None => {
+                let v = dims.iter().any(|d| {
+                    matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                        if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
+                            || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
+                });
+                self.spec_prop_is_dyn.borrow_mut().insert(dyn_key, v);
+                v
+            }
+        };
+        if !is_dyn {
+            return None;
+        }
+        let dt = dt?;
+        let inst = self.heap.get(handle)?.as_ref()?;
+        // Gather the parameter bindings this instance carries, leaf class
+        // first so a derived class's parameter shadows an ancestor's.
+        let mut params: HashMap<String, Value> = HashMap::default();
+        let mut fingerprint = String::new();
+        let mut cur = Some(decl_class.to_string());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let Some(c) = self.module.classes.get(&cn) else {
+                break;
+            };
+            for (pname, _) in &c.param_defaults {
+                if params.contains_key(pname) {
+                    continue;
+                }
+                if let Some(v) = inst.properties.get(pname) {
+                    fingerprint.push_str(pname);
+                    fingerprint.push('=');
+                    fingerprint.push_str(&v.to_dec_string());
+                    fingerprint.push(';');
+                    params.insert(pname.clone(), v.clone());
+                }
+            }
+            cur = c.extends.clone();
+        }
+        if params.is_empty() {
+            return None;
+        }
+        let key = (decl_class.to_string(), prop.to_string(), fingerprint);
+        if let Some(hit) = self.spec_prop_width_cache.borrow().get(&key) {
+            return *hit;
+        }
+        // The instance carries only the CLASS parameters. A range that also
+        // references an enclosing-scope parameter (`bit [W+MW-1:0]`) cannot be
+        // fully evaluated here, and `resolve_type_width` SKIPS a dimension it
+        // cannot evaluate rather than failing — which would silently hand back
+        // 1 and undo the elaboration-time width. Only override when every
+        // range bound actually resolves against these bindings.
+        let all_resolved = dims.iter().all(|d| match d {
+            crate::ast::types::PackedDimension::Range { left, right, .. } => {
+                crate::elaborate::const_eval_i64_with_params(left, Some(&params)).is_some()
+                    && crate::elaborate::const_eval_i64_with_params(right, Some(&params)).is_some()
+            }
+            _ => true,
+        });
+        let out = if all_resolved {
+            let w = crate::elaborate::resolve_type_width(dt, Some(&params), None);
+            Some(w).filter(|w| *w > 0)
+        } else {
+            None
+        };
+        self.spec_prop_width_cache.borrow_mut().insert(key, out);
+        out
+    }
+
     fn class_prop_width(&self, class_name: &str, prop: &str) -> Option<u32> {
+        self.class_prop_width_impl(class_name, None, prop)
+    }
+
+    /// Declared width of `prop`, walking the `extends` chain to the class that
+    /// declares it. When `handle` is given, a property whose packed range
+    /// depends on a class parameter is re-resolved against THAT instance's
+    /// parameter bindings — see `respec_packed_width`.
+    fn class_prop_width_impl(
+        &self,
+        class_name: &str,
+        handle: Option<usize>,
+        prop: &str,
+    ) -> Option<u32> {
         let mut cur = Some(class_name.to_string());
         while let Some(cn) = cur {
             let cd = self.module.classes.get(&cn)?;
@@ -52976,16 +53274,29 @@ impl Simulator {
                     return None;
                 }
                 // A property whose type is a TYPE PARAMETER (`class C#(type T);
-                // T value;`) has no fixed width — the concrete bound type may be
-                // `string`, a struct, etc. Truncating to the default-type width
-                // would corrupt a `string` value (dropping leading chars). Leave
-                // such values unclamped.
+                // T value;`) has no width of its own — the width is whatever
+                // the parameter is BOUND to on this object. Resolve the binding
+                // and clamp to the concrete type; `concrete_type_width` returns
+                // None for the cases that must stay unclamped (a `string`,
+                // whose leading chars truncation would drop; a class handle; a
+                // real; an unresolvable binding), preserving the previous
+                // behavior exactly for those.
+                //
+                // Without a handle there is no instance to read the binding
+                // from, so the static path keeps the old conservative answer.
                 if sig
                     .type_name
                     .as_ref()
                     .is_some_and(|t| cd.type_param_names.contains(t))
                 {
-                    return None;
+                    let h = handle?;
+                    let concrete = self.class_prop_type_name(h, prop)?;
+                    return self.concrete_type_width(&concrete);
+                }
+                if let Some(h) = handle {
+                    if let Some(w) = self.respec_packed_width(&cn, h, prop) {
+                        return Some(w);
+                    }
                 }
                 return Some(sig.width).filter(|w| *w > 0);
             }
@@ -52994,10 +53305,13 @@ impl Simulator {
         None
     }
 
-    /// Declared width of `prop` on the object `handle` points at.
+    /// Declared width of `prop` on the object `handle` points at, resolved
+    /// against the parameters bound on that instance so `box#(16)` and
+    /// `box#(8)` each report their own width.
     fn heap_prop_width(&self, handle: usize, prop: &str) -> Option<u32> {
         let inst = self.heap.get(handle)?.as_ref()?;
-        self.class_prop_width(&inst.class_name, prop)
+        let cn = inst.class_name.clone();
+        self.class_prop_width_impl(&cn, Some(handle), prop)
     }
 
     /// Clamp `val` to a class property's declared width. Values that already
@@ -53263,21 +53577,291 @@ impl Simulator {
         handle: usize,
         prop: &str,
     ) -> Option<crate::ast::types::StructUnionType> {
+        // An ANONYMOUS inline struct property (`struct packed {..} s;`) has no
+        // typedef name to look up, but its declared type is retained verbatim
+        // in `property_types` — use it directly; whole-value access worked
+        // while `s.f` read x without this.
+        if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
+            let mut cur = Some(inst.class_name.clone());
+            let mut seen: HashSet<String> = HashSet::default();
+            while let Some(cn) = cur {
+                if !seen.insert(cn.clone()) {
+                    break;
+                }
+                let cd = self.module.classes.get(&cn)?;
+                if let Some(DataType::Struct(su)) = cd.property_types.get(prop) {
+                    return Some(su.clone());
+                }
+                if cd.properties.contains_key(prop) {
+                    break;
+                }
+                cur = cd.extends.clone();
+            }
+        }
+        let tn = self.class_prop_type_name(handle, prop)?;
+        let dt = self.module.typedef_types.get(tn.as_str())?;
+        match Self::resolve_type_ref(dt, &self.module.typedef_types) {
+            DataType::Struct(su) => Some(su),
+            _ => None,
+        }
+    }
+
+    /// The CONCRETE type name a property's declared type denotes on this
+    /// instance.
+    ///
+    /// For an ordinary property that is just its declared type name. For one
+    /// typed by a class TYPE PARAMETER (`class C #(type T); T val;`) the
+    /// declared name is the parameter, so resolve it through the bindings the
+    /// object was constructed with (§8.25). Without this step a property
+    /// declared `STRUCT_T st;` looked up the literal name `STRUCT_T` in the
+    /// typedef table, missed, and read back x for every field even though the
+    /// raw storage was correct.
+    fn class_prop_type_name(&self, handle: usize, prop: &str) -> Option<String> {
         let inst = self.heap.get(handle)?.as_ref()?;
         let mut cur = Some(inst.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
         while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
             let cd = self.module.classes.get(&cn)?;
             if let Some(sig) = cd.properties.get(prop) {
                 let tn = sig.type_name.as_ref()?;
-                let dt = self.module.typedef_types.get(tn.as_str())?;
-                return match Self::resolve_type_ref(dt, &self.module.typedef_types) {
-                    DataType::Struct(su) => Some(su),
-                    _ => None,
-                };
+                if cd.type_param_names.iter().any(|t| t == tn) {
+                    return inst.type_bindings.get(tn).cloned();
+                }
+                return Some(tn.clone());
             }
             cur = cd.extends.clone();
         }
         None
+    }
+
+    /// Width to clamp a value to when a property's concrete type is `name`.
+    ///
+    /// `None` means "do not clamp": a `string` is variable-length, a class
+    /// handle is not an integral, a real is not bit-truncated, and a type we
+    /// cannot resolve must keep the previous unclamped behavior rather than be
+    /// truncated to a guess.
+    fn concrete_type_width(&self, name: &str) -> Option<u32> {
+        if name == "string"
+            || matches!(name, "real" | "realtime" | "shortreal")
+            || self.module.classes.contains_key(name)
+        {
+            return None;
+        }
+        // The parser drops the packed range of a type ARGUMENT: `#(logic
+        // [63:0])` reaches here as the bare name `logic`, indistinguishable
+        // from a 1-bit `#(logic)`. Clamping to 1 would silently destroy 63
+        // bits, so the vector keywords stay unclamped (exactly the old
+        // behavior) while the self-describing atoms below are clamped.
+        if matches!(name, "bit" | "logic" | "reg") {
+            return None;
+        }
+        if let Some(w) = atom_type_keyword_width(name) {
+            return Some(w);
+        }
+        if let Some(&w) = self.module.typedefs.get(name) {
+            return Some(w).filter(|w| *w > 0);
+        }
+        if let Some(dt) = self.module.typedef_types.get(name) {
+            let dt = Self::resolve_type_ref(dt, &self.module.typedef_types);
+            if matches!(dt, DataType::Real { .. }) {
+                return None;
+            }
+            let w = resolve_type_width(
+                &dt,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            );
+            return Some(w).filter(|w| *w > 0);
+        }
+        None
+    }
+
+    /// Packed-aggregate field layout of a CALL's declared return type:
+    /// `(fields, total_width)`, fields as `(name, offset, width)`.
+    ///
+    /// `func` is the callee expression of the `Call` node. A free function
+    /// resolves through `module.functions`; a method (`obj.rd()`) walks the
+    /// receiver instance's class chain. A method return type that names a
+    /// TYPE PARAMETER of its class resolves through the instance's bindings,
+    /// so `drv#(msg_t)` (declared `T read_payload();`) projects `msg_t`'s
+    /// fields. The receiver is re-evaluated to find the instance, so only
+    /// side-effect-free receiver shapes (a name or `this`) are accepted.
+    fn call_return_packed_layout(
+        &mut self,
+        func: &Expression,
+    ) -> Option<(Vec<(String, u32, u32)>, u32)> {
+        let ret = self.call_return_type(func)?;
+        let resolved = Self::resolve_type_ref(&ret, &self.module.typedef_types);
+        let DataType::Struct(su) = resolved else {
+            return None;
+        };
+        // An unpacked struct spreads member-wise; there is no bit slice to
+        // take from the call's single packed value.
+        if Self::spreads_member_wise(&su) {
+            return None;
+        }
+        Some(self.packed_agg_layout(&su))
+    }
+
+    /// Declared (post-type-parameter-resolution) return type of a call's
+    /// callee — see [`call_return_packed_layout`] for the receiver rules.
+    fn call_return_type(&mut self, func: &Expression) -> Option<DataType> {
+        // Split the callee into (receiver expression, method name). A method
+        // call parses as EITHER `MemberAccess(recv, m)` OR a flat hier ident
+        // `Ident([c, rd])`, depending on context — handle both. A single
+        // bare name is a free function.
+        let (recv_expr, method_name): (Option<Expression>, String) = match &func.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                (None, h.path[0].name.name.clone())
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let mut base = h.clone();
+                let last = base.path.pop()?;
+                base.cached_signal_id = std::cell::Cell::new(None);
+                base.cached_resolved_name = std::cell::OnceCell::new();
+                (
+                    Some(Expression {
+                        kind: ExprKind::Ident(base),
+                        span: func.span,
+                    }),
+                    last.name.name,
+                )
+            }
+            ExprKind::MemberAccess { expr: recv, member } => {
+                // Ident/This receivers are re-evaluated (side-effect-free) to
+                // find the instance; a CALL receiver is resolved statically
+                // from its declared return type below.
+                if !matches!(
+                    &recv.kind,
+                    ExprKind::Ident(_) | ExprKind::This | ExprKind::Call { .. }
+                ) {
+                    return None;
+                }
+                (Some((**recv).clone()), member.name.clone())
+            }
+            _ => return None,
+        };
+        let ret: DataType = match recv_expr {
+            None => self
+                .module
+                .functions
+                .get(method_name.as_str())?
+                .return_type
+                .clone(),
+            Some(recv) => {
+                // A CALL receiver (`o.get().rd()`) cannot be re-evaluated to
+                // find its instance without running it twice — resolve the
+                // receiver's DECLARED return class statically instead. No
+                // instance means no type-parameter bindings, so a type-param
+                // return type bails below (handle == 0 guard) rather than
+                // guess.
+                let (handle, class_name) = if let ExprKind::Call { func: rf, .. } = &recv.kind {
+                    let rt = self.call_return_type(rf)?;
+                    let DataType::TypeReference { name, .. } = rt else {
+                        return None;
+                    };
+                    let cn = name.name.name.clone();
+                    if !self.module.classes.contains_key(&cn) {
+                        return None;
+                    }
+                    (0usize, cn)
+                } else {
+                    let h = self.eval_expr(&recv).to_u64()? as usize;
+                    if h == 0 {
+                        return None;
+                    }
+                    (h, self.heap.get(h)?.as_ref()?.class_name.clone())
+                };
+                let member = &method_name;
+                // Find the method's declaring class along the extends chain.
+                let mut cur = Some(class_name);
+                let mut seen: HashSet<String> = HashSet::default();
+                let mut found: Option<(String, DataType)> = None;
+                while let Some(cn) = cur {
+                    if !seen.insert(cn.clone()) {
+                        break;
+                    }
+                    let cd = self.module.classes.get(&cn)?;
+                    if let Some(m) = cd.methods.get(member.as_str()) {
+                        use crate::ast::decl::ClassMethodKind;
+                        let f = match &m.kind {
+                            ClassMethodKind::Function(f)
+                            | ClassMethodKind::PureVirtual(f)
+                            | ClassMethodKind::Extern(f) => f,
+                            ClassMethodKind::Task(_) => return None,
+                        };
+                        found = Some((cn.clone(), f.return_type.clone()));
+                        break;
+                    }
+                    cur = cd.extends.clone();
+                }
+                let (decl_cn, mut ret) = found?;
+                if let DataType::TypeReference {
+                    name, dimensions, ..
+                } = &ret
+                {
+                    if dimensions.is_empty() {
+                        let tn = name.name.name.clone();
+                        let cd = self.module.classes.get(&decl_cn)?;
+                        if cd.type_param_names.iter().any(|t| t == &tn) {
+                            if handle == 0 {
+                                // Statically-typed receiver: no instance, no
+                                // type-parameter bindings.
+                                return None;
+                            }
+                            let bound = self
+                                .heap
+                                .get(handle)?
+                                .as_ref()?
+                                .type_bindings
+                                .get(&tn)?
+                                .clone();
+                            ret = self.module.typedef_types.get(bound.as_str())?.clone();
+                        }
+                    }
+                }
+                ret
+            }
+        };
+        Some(ret)
+    }
+
+    /// Resolved PACKED struct type denoted by a member-access chain rooted in
+    /// a CALL (`mk().n`, `mk().n.hi`): the call's return struct, descended
+    /// through each named member. `None` when the root is not a call or any
+    /// step is not a packed struct — callers fall through unchanged.
+    fn chain_base_packed_struct(
+        &mut self,
+        e: &Expression,
+    ) -> Option<crate::ast::types::StructUnionType> {
+        let resolved = match &e.kind {
+            ExprKind::Call { func, .. } => {
+                let ret = self.call_return_type(func)?;
+                Self::resolve_type_ref(&ret, &self.module.typedef_types)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let su = self.chain_base_packed_struct(expr)?;
+                let m_dt = su
+                    .members
+                    .iter()
+                    .find(|m| m.declarators.iter().any(|d| d.name.name == member.name))
+                    .map(|m| m.data_type.clone())?;
+                Self::resolve_type_ref(&m_dt, &self.module.typedef_types)
+            }
+            _ => return None,
+        };
+        let DataType::Struct(su) = resolved else {
+            return None;
+        };
+        if Self::spreads_member_wise(&su) {
+            return None;
+        }
+        Some(su)
     }
 
     /// §18.4 / §7.2.1: bit layout of a PACKED aggregate — `(member, offset,
@@ -53287,6 +53871,17 @@ impl Simulator {
     fn packed_agg_layout(
         &self,
         su: &crate::ast::types::StructUnionType,
+    ) -> (Vec<(String, u32, u32)>, u32) {
+        self.packed_agg_layout_with(su, &self.module.parameters)
+    }
+
+    /// [`packed_agg_layout`] against an explicit parameter scope — pass
+    /// [`instance_param_scope`] output so member widths that reference CLASS
+    /// parameters (`bit [W-1:0] f;` in an inline-struct property) resolve.
+    fn packed_agg_layout_with(
+        &self,
+        su: &crate::ast::types::StructUnionType,
+        params: &HashMap<String, Value>,
     ) -> (Vec<(String, u32, u32)>, u32) {
         use crate::ast::types::StructUnionKind;
         let is_union = matches!(su.kind, StructUnionKind::Union);
@@ -53301,7 +53896,7 @@ impl Simulator {
         for m in members {
             let fw = resolve_type_width(
                 &m.data_type,
-                Some(&self.module.parameters),
+                Some(params),
                 Some(&self.module.typedefs),
             )
             .max(1);
@@ -53336,6 +53931,149 @@ impl Simulator {
         self.class_agg_member_parts(&base, &field)
     }
 
+    /// `<obj>.<prop>[i]` where `prop` is a MULTI-DIMENSIONAL packed array
+    /// (`bit [1:0][7:0] arr;`) — resolve the element to its bit slice of the
+    /// property's raw integral value.
+    ///
+    /// A class property carries no per-element width at run time (the module
+    /// scope equivalent comes from `packed_signal_elem_widths`, which only
+    /// covers signals), so an index on one fell through to a plain BIT select:
+    /// `arr[1]` on `16'hAABB` read back `1` instead of `8'hAA`, and an indexed
+    /// WRITE was dropped entirely. The declared type retained in
+    /// `ElaboratedClass::property_types` supplies the shape.
+    ///
+    /// Returns `None` — leaving the previous behavior in place — for anything
+    /// not a resolvable multi-dimensional packed range, including an
+    /// out-of-bounds index.
+    fn class_packed_elem_ref(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<ClassAggRef> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let (handle, prop) = self.class_prop_receiver(base)?;
+        let (elem_w, total, left, right) = self.class_prop_packed_shape(handle, &prop)?;
+        let idx = self.eval_expr(index).to_i64()?;
+        if idx < left.min(right) || idx > left.max(right) {
+            return None;
+        }
+        // `[1:0]` puts index 1 at the MS end; an ascending `[0:1]` puts index 0
+        // there instead (§7.4.1).
+        let slot = if left >= right { idx - right } else { right - idx };
+        let off = (slot as u32).checked_mul(elem_w)?;
+        if off.checked_add(elem_w)? > total {
+            return None;
+        }
+        Some(ClassAggRef::Packed {
+            handle,
+            prop,
+            off,
+            w: elem_w,
+            total,
+        })
+    }
+
+    /// Shape of a multi-dimensional packed-array class property as
+    /// `(element_width, total_width, outer_left, outer_right)`. `None` unless
+    /// the declared type is a packed vector with at least two dimensions whose
+    /// bounds all resolve.
+    fn class_prop_packed_shape(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<(u32, u32, i64, i64)> {
+        use crate::ast::types::PackedDimension;
+        let inst = self.heap.get(handle)?.as_ref()?;
+        // Class value parameters are instance properties (§8.25), so they can
+        // size the range; fall back to module scope for everything else.
+        let mut params: HashMap<String, Value> = self.module.parameters.clone();
+        let mut cur = Some(inst.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
+        let mut decl: Option<&crate::ast::types::DataType> = None;
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let cd = self.module.classes.get(&cn)?;
+            // A property that ALSO has unpacked dimensions (`bit [1:0][7:0]
+            // arr [4];`, a queue, an associative array) indexes its unpacked
+            // dimension first (§7.4.2) — that is not this select, so leave
+            // those to the collection paths.
+            if cd.array_properties.contains_key(prop)
+                || cd.array_nd_properties.contains_key(prop)
+                || cd.queue_properties.contains_key(prop)
+                || cd.assoc_properties.contains_key(prop)
+            {
+                return None;
+            }
+            for (pname, _) in &cd.param_defaults {
+                if let Some(v) = inst.properties.get(pname) {
+                    params.insert(pname.clone(), v.clone());
+                }
+            }
+            if let Some(dt) = cd.property_types.get(prop) {
+                decl = Some(dt);
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        let dims = match decl? {
+            crate::ast::types::DataType::IntegerVector { dimensions, .. } => dimensions,
+            crate::ast::types::DataType::Implicit { dimensions, .. } => dimensions,
+            _ => return None,
+        };
+        if dims.len() < 2 {
+            return None;
+        }
+        let bounds = |d: &PackedDimension| -> Option<(i64, i64)> {
+            let PackedDimension::Range { left, right, .. } = d else {
+                return None;
+            };
+            Some((
+                crate::elaborate::const_eval_i64_with_params(left, Some(&params))?,
+                crate::elaborate::const_eval_i64_with_params(right, Some(&params))?,
+            ))
+        };
+        let (left, right) = bounds(&dims[0])?;
+        let mut elem_w: u32 = 1;
+        for d in &dims[1..] {
+            let (l, r) = bounds(d)?;
+            elem_w = elem_w.checked_mul(((l - r).abs() + 1) as u32)?;
+        }
+        let outer = ((left - right).abs() + 1) as u32;
+        Some((elem_w, elem_w.checked_mul(outer)?, left, right))
+    }
+
+    /// Module parameters overlaid with the class-parameter values bound on
+    /// `handle` (leaf class first, §8.25), for sizing declarations that
+    /// reference either scope — e.g. a struct member `bit [W-1:0] f;` inside
+    /// an inline-struct property of `box #(W)`.
+    fn instance_param_scope(&self, handle: usize) -> HashMap<String, Value> {
+        let mut params = self.module.parameters.clone();
+        let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) else {
+            return params;
+        };
+        let mut cur = Some(inst.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            for (pname, _) in &cd.param_defaults {
+                if let Some(v) = inst.properties.get(pname) {
+                    params.entry(pname.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            cur = cd.extends.clone();
+        }
+        params
+    }
+
     /// `class_agg_member` for an already-split `<base>.<field>`.
     fn class_agg_member_parts(&mut self, base: &Expression, field: &str) -> Option<ClassAggRef> {
         if self.heap.is_empty() {
@@ -53364,7 +54102,8 @@ impl Simulator {
                 w,
             });
         }
-        let (fields, total) = self.packed_agg_layout(&su);
+        let inst_params = self.instance_param_scope(handle);
+        let (fields, total) = self.packed_agg_layout_with(&su, &inst_params);
         let (_, off, w) = fields.iter().find(|(n, _, _)| *n == field).cloned()?;
         Some(ClassAggRef::Packed {
             handle,
@@ -62582,10 +63321,18 @@ impl Simulator {
     /// (e.g. `Base` from the `#(Base)` specialization arg). Returns None for
     /// non-identifier type args (literals, complex type exprs, etc.).
     fn leaf_ident_name(e: &Expression) -> Option<String> {
-        if let ExprKind::Ident(h) = &e.kind {
-            h.path.last().map(|s| s.name.name.clone())
-        } else {
-            None
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+            // A package-scoped name (`pk::pkt_t`, `pkg::MyClass`) parses as a
+            // MemberAccess, not a multi-segment Ident. Types and classes are
+            // registered under their bare name, so the member IS the leaf.
+            ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+            // A NAMED type connection carries its argument as a TypeLiteral
+            // (`.T(int)`, `.T(logic [63:0])`). Render it to the same textual
+            // form a type-parameter DEFAULT uses, so both routes name the type
+            // identically.
+            ExprKind::TypeLiteral(dt) => crate::elaborate::data_type_to_spec_fragment(dt),
+            _ => None,
         }
     }
 
@@ -62595,17 +63342,53 @@ impl Simulator {
     /// expression / call is never a type; a bare identifier that names a
     /// variable or constant is a value.
     fn is_definite_type_arg(&self, e: &Expression) -> bool {
+        // A NAMED type connection parses its builtin-type argument as a
+        // TypeLiteral (`.T(int)` -> TypeLiteral), where the positional form
+        // yields a bare Ident. Without this arm the literal counted as a VALUE
+        // arg, so every later type arg shifted one type-parameter slot to the
+        // left — `#(.T(int), .C(other))` bound `T <- other` and left `C`
+        // unbound entirely.
+        if matches!(&e.kind, ExprKind::TypeLiteral(_)) {
+            return true;
+        }
         if let ExprKind::Ident(h) = &e.kind {
-            if h.path.len() == 1 && h.path[0].selects.is_empty() {
-                let n = h.path[0].name.name.as_str();
+            if h.path.is_empty() || h.path.iter().any(|s| !s.selects.is_empty()) {
+                return false;
+            }
+            let n = h.path[h.path.len() - 1].name.name.as_str();
+            if h.path.len() == 1 {
                 return atom_type_keyword_width(n).is_some()
                     || n == "string"
                     || self.module.classes.contains_key(n)
                     || self.module.typedefs.contains_key(n)
                     || self.resolve_type_param_binding(n).is_some();
             }
+            // A PACKAGE-SCOPED type name (`pk::pkt_t`) is still a type
+            // argument. Only the leaf is checked, and only against declared
+            // classes/typedefs — a scoped CONSTANT (`pk::WIDTH`) resolves to
+            // neither and stays a value argument. Without this a scoped type
+            // arg was classified as a value, so it was matched against the
+            // value parameters and dropped, leaving the type parameter unbound.
+            return self.is_known_type_leaf(n);
+        }
+        // `pk::pkt_t` parses as a MemberAccess over the package name, so the
+        // multi-segment Ident arm above never sees it.
+        if let ExprKind::MemberAccess { expr, member } = &e.kind {
+            if matches!(&expr.kind, ExprKind::Ident(h)
+                if h.path.len() == 1 && h.path[0].selects.is_empty())
+            {
+                return self.is_known_type_leaf(&member.name);
+            }
         }
         false
+    }
+
+    /// True when `n` names a declared class or typedef — the leaf test shared
+    /// by the scoped-type-argument arms of `is_definite_type_arg`.
+    fn is_known_type_leaf(&self, n: &str) -> bool {
+        self.module.classes.contains_key(n)
+            || self.module.typedefs.contains_key(n)
+            || self.module.typedef_types.contains_key(n)
     }
 
     /// Map a specialization's `#(...)` argument list onto the class's
@@ -62652,8 +63435,12 @@ impl Simulator {
             if is_type_param(pname) {
                 // A type arg is always a bare identifier (possibly a class
                 // not yet checked as definite); anything else is a value.
+                // A package-scoped name counts too, but only when it really
+                // resolves to a type — `pk::pkt_t` is a type argument while
+                // `pk::WIDTH` is a value.
                 let ident_ok = matches!(&arg.kind, ExprKind::Ident(h)
-                    if h.path.len() == 1 && h.path[0].selects.is_empty());
+                    if h.path.len() == 1 && h.path[0].selects.is_empty())
+                    || self.is_definite_type_arg(arg);
                 if !ident_ok {
                     positional = false;
                     break;
@@ -63300,6 +64087,61 @@ impl Simulator {
                 break;
             }
         }
+        // §8.25 / §8.13: `class D extends B #(8);` supplies B's VALUE
+        // parameters. `classes_to_init` is leaf-first, so entry `i`'s
+        // `extends_type_args` binds entry `i+1`'s parameters. Without this an
+        // inherited property (and any method return) sized by a base parameter
+        // used the base's DEFAULT — `extends base #(8)` still reported 4 bits.
+        //
+        // Fragments are the textual `#(...)` args: a numeric literal binds
+        // directly; a bare identifier is resolved against the LEAF's own
+        // parameters (`class D #(int N) extends B #(N);`), which are known
+        // here from `arg_map`/defaults even though the leaf is bound last.
+        let ancestor_value_args: HashMap<String, HashMap<String, Value>> = {
+            let mut leaf_params: HashMap<String, Value> = HashMap::default();
+            for (pname, pdefault) in class_def.param_defaults.iter() {
+                if let Some(e) = arg_map.get(pname).cloned().or_else(|| pdefault.clone()) {
+                    if let Some(v) = crate::elaborate::const_eval_i64_with_params(&e, None) {
+                        leaf_params.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                    }
+                }
+            }
+            let mut out: HashMap<String, HashMap<String, Value>> = HashMap::default();
+            for pair in classes_to_init.windows(2) {
+                let (child, parent) = (&pair[0], &pair[1]);
+                if child.extends_type_args.is_empty() {
+                    continue;
+                }
+                let mut binds: HashMap<String, Value> = HashMap::default();
+                for (i, pname) in parent.param_order.iter().enumerate() {
+                    if parent.type_param_names.iter().any(|t| t == pname) {
+                        continue;
+                    }
+                    let Some(frag) = child.extends_type_args.get(i) else {
+                        continue;
+                    };
+                    let frag = frag.trim();
+                    if frag.is_empty() {
+                        continue;
+                    }
+                    if let Some(lit) = Self::parse_spec_number(frag) {
+                        let e = Expression::new(
+                            ExprKind::Number(lit),
+                            crate::ast::Span::dummy(),
+                        );
+                        if let Some(v) = crate::elaborate::const_eval_i64_with_params(&e, None) {
+                            binds.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                        }
+                    } else if let Some(v) = leaf_params.get(frag) {
+                        binds.insert(pname.clone(), v.clone());
+                    }
+                }
+                if !binds.is_empty() {
+                    out.insert(parent.name.clone(), binds);
+                }
+            }
+            out
+        };
         for cdef in classes_to_init.iter().rev() {
             for (prop_name, prop_sig) in &cdef.properties {
                 // Static properties live in the shared `class_statics`
@@ -63341,6 +64183,17 @@ impl Simulator {
                             instance.properties.insert(pname.clone(), v);
                             continue;
                         }
+                    }
+                }
+                // An ancestor's parameter supplied by the `extends B#(..)`
+                // clause wins over its declared default.
+                if !is_leaf {
+                    if let Some(v) = ancestor_value_args
+                        .get(&cdef.name)
+                        .and_then(|m| m.get(pname))
+                    {
+                        instance.properties.insert(pname.clone(), v.clone());
+                        continue;
                     }
                 }
                 let expr_opt: Option<Expression> = if is_leaf {
@@ -63437,19 +64290,24 @@ impl Simulator {
         // (e.g. `uvm_component_registry#(type T, string Tname)` — type first),
         // so look each type param up by NAME in `arg_map` (which maps args by
         // `param_order` slot, or by kind for the recovered named form §8.26).
+        let spec_targets_this = self
+            .current_spec
+            .as_ref()
+            .is_some_and(|(b, _)| *b == class_def.name);
         for tp_name in class_def.type_param_names.iter() {
+            let mut bound: Option<String> = None;
             if let Some(ta) = arg_map.get(tp_name) {
                 if let Some(concrete) = Self::leaf_ident_name(ta) {
                     // The type arg may itself be a type PARAMETER of the enclosing
                     // parameterized context (`uvm_resource#(T)` where `T` is
                     // config_db's own param) — resolve it to the concrete type so
                     // the instance's binding is `T -> int`, not `T -> T`.
-                    let resolved = self
-                        .resolve_type_param_binding(&concrete)
-                        .unwrap_or(concrete);
-                    instance.type_bindings.insert(tp_name.clone(), resolved);
+                    bound = Some(
+                        self.resolve_type_param_binding(&concrete)
+                            .unwrap_or(concrete),
+                    );
                 }
-            } else if let Some((b, _)) = &self.current_spec {
+            } else if spec_targets_this {
                 // No explicit type_args carried this param, but the active
                 // specialization (`current_spec`) targets THIS class —
                 // resolve the type param from it. This covers
@@ -63457,11 +64315,38 @@ impl Simulator {
                 // constructs `C` without forwarding the `#(int)` args: the
                 // outer `eval_call` already set `current_spec = (C, "int")`,
                 // so `resolve_type_param_binding("T")` yields `int`.
-                if *b == class_def.name {
-                    if let Some(resolved) = self.resolve_type_param_binding(tp_name) {
-                        instance.type_bindings.insert(tp_name.clone(), resolved);
+                bound = self.resolve_type_param_binding(tp_name);
+            }
+            // Only when the specialization SUPPLIED nothing for this parameter.
+            // If an argument was given but could not be reduced to a type name,
+            // the parameter is still explicitly specialized — substituting the
+            // declared default there would bind the wrong type outright (and
+            // then clamp values to it), which is worse than leaving it unbound.
+            if bound.is_none() && !arg_map.contains_key(tp_name) {
+                // §8.25: a type parameter the specialization does not supply
+                // takes its DECLARED DEFAULT — `class box #(type CLASS_T =
+                // simple_payload)` instantiated as `box#(.PAYLOAD_T(int))`
+                // still binds `CLASS_T -> simple_payload`. Without this the
+                // parameter stayed unbound and a property declared `CLASS_T o;`
+                // was never constructed by `o = new()`, reading back x; the
+                // same class only worked when the default was written out
+                // explicitly in the `#(...)` list.
+                if let Some((_, dflt)) = class_def
+                    .type_param_defaults
+                    .iter()
+                    .find(|(n, _)| n == tp_name)
+                {
+                    let dflt = dflt.trim();
+                    if !dflt.is_empty() {
+                        bound = Some(
+                            self.resolve_type_param_binding(dflt)
+                                .unwrap_or_else(|| dflt.to_string()),
+                        );
                     }
                 }
+            }
+            if let Some(resolved) = bound {
+                instance.type_bindings.insert(tp_name.clone(), resolved);
             }
         }
         // Capture the active specialization on the instance when it targets
@@ -70286,6 +71171,29 @@ impl Simulator {
                     };
                     let ret_is_string = matches!(&method.kind,
                         ClassMethodKind::Function(f) if Self::is_string_data_type(&f.return_type));
+                    // A packed return type whose range references a CLASS
+                    // parameter (`function bit [W-1:0] mk();`) can only be
+                    // sized per instance — capture it for the clamp at the
+                    // return point below. Literal ranges resolve here (params
+                    // = None succeeds) and stay un-clamped as before.
+                    let dyn_ret_type: Option<DataType> = match &method.kind {
+                        ClassMethodKind::Function(f) => {
+                            let dims = match &f.return_type {
+                                DataType::IntegerVector { dimensions, .. } => Some(dimensions),
+                                DataType::Implicit { dimensions, .. } => Some(dimensions),
+                                _ => None,
+                            };
+                            dims.filter(|ds| {
+                                ds.iter().any(|d| {
+                                    matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                                        if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
+                                            || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
+                                })
+                            })
+                            .map(|_| f.return_type.clone())
+                        }
+                        _ => None,
+                    };
                     self.push_queue_frame();
                     // `output`/`inout`/`ref` formals copy back to the caller's
                     // actual on return (e.g. `randomize_instr(output riscv_instr
@@ -70650,11 +71558,24 @@ impl Simulator {
                             lv
                         }
                     });
-                    let ret = self
+                    let mut ret = self
                         .return_value
                         .take()
                         .or(implicit)
                         .unwrap_or(Value::zero(32));
+                    // Per-instance return clamp for a class-parameter-sized
+                    // return type: `box#(4)` with `function bit [W-1:0] mk()`
+                    // must hand back 4 bits, not whatever width the body's
+                    // last assignment happened to carry.
+                    if let Some(rt) = &dyn_ret_type {
+                        if !ret.is_real {
+                            let scope = self.instance_param_scope(handle);
+                            let w = resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs));
+                            if w > 0 && w != ret.width {
+                                ret = ret.resize_for_assign(w);
+                            }
+                        }
+                    }
                     // Snapshot output/ref formal values before dropping locals.
                     let writebacks: Vec<(Value, Expression)> = output_bindings
                         .iter()
