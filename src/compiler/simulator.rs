@@ -63346,6 +63346,61 @@ impl Simulator {
                 break;
             }
         }
+        // §8.25 / §8.13: `class D extends B #(8);` supplies B's VALUE
+        // parameters. `classes_to_init` is leaf-first, so entry `i`'s
+        // `extends_type_args` binds entry `i+1`'s parameters. Without this an
+        // inherited property (and any method return) sized by a base parameter
+        // used the base's DEFAULT — `extends base #(8)` still reported 4 bits.
+        //
+        // Fragments are the textual `#(...)` args: a numeric literal binds
+        // directly; a bare identifier is resolved against the LEAF's own
+        // parameters (`class D #(int N) extends B #(N);`), which are known
+        // here from `arg_map`/defaults even though the leaf is bound last.
+        let ancestor_value_args: HashMap<String, HashMap<String, Value>> = {
+            let mut leaf_params: HashMap<String, Value> = HashMap::default();
+            for (pname, pdefault) in class_def.param_defaults.iter() {
+                if let Some(e) = arg_map.get(pname).cloned().or_else(|| pdefault.clone()) {
+                    if let Some(v) = crate::elaborate::const_eval_i64_with_params(&e, None) {
+                        leaf_params.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                    }
+                }
+            }
+            let mut out: HashMap<String, HashMap<String, Value>> = HashMap::default();
+            for pair in classes_to_init.windows(2) {
+                let (child, parent) = (&pair[0], &pair[1]);
+                if child.extends_type_args.is_empty() {
+                    continue;
+                }
+                let mut binds: HashMap<String, Value> = HashMap::default();
+                for (i, pname) in parent.param_order.iter().enumerate() {
+                    if parent.type_param_names.iter().any(|t| t == pname) {
+                        continue;
+                    }
+                    let Some(frag) = child.extends_type_args.get(i) else {
+                        continue;
+                    };
+                    let frag = frag.trim();
+                    if frag.is_empty() {
+                        continue;
+                    }
+                    if let Some(lit) = Self::parse_spec_number(frag) {
+                        let e = Expression::new(
+                            ExprKind::Number(lit),
+                            crate::ast::Span::dummy(),
+                        );
+                        if let Some(v) = crate::elaborate::const_eval_i64_with_params(&e, None) {
+                            binds.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                        }
+                    } else if let Some(v) = leaf_params.get(frag) {
+                        binds.insert(pname.clone(), v.clone());
+                    }
+                }
+                if !binds.is_empty() {
+                    out.insert(parent.name.clone(), binds);
+                }
+            }
+            out
+        };
         for cdef in classes_to_init.iter().rev() {
             for (prop_name, prop_sig) in &cdef.properties {
                 // Static properties live in the shared `class_statics`
@@ -63387,6 +63442,17 @@ impl Simulator {
                             instance.properties.insert(pname.clone(), v);
                             continue;
                         }
+                    }
+                }
+                // An ancestor's parameter supplied by the `extends B#(..)`
+                // clause wins over its declared default.
+                if !is_leaf {
+                    if let Some(v) = ancestor_value_args
+                        .get(&cdef.name)
+                        .and_then(|m| m.get(pname))
+                    {
+                        instance.properties.insert(pname.clone(), v.clone());
+                        continue;
                     }
                 }
                 let expr_opt: Option<Expression> = if is_leaf {
