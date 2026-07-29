@@ -36704,6 +36704,51 @@ impl Simulator {
                         }
                         return Value::zero(32);
                     }
+                    // `.size`/`.num` as a no-parens member access on a class
+                    // queue / dynamic-array / associative-array property — e.g.
+                    // `return q.size` inside a method, or a constraint operand
+                    // `q.size inside {…}`. `resolve_hier_name` yields the bare
+                    // member name for a class property, so the assoc block above
+                    // (and the module-level queue/dynamic-array checks) miss it;
+                    // resolve the instance-scoped `<h>#<name>` storage first.
+                    // §7.5.2 (dynamic), §7.9.1 (assoc `.num`/`.size`),
+                    // §7.10.2.1 (queue).
+                    {
+                        let mname = member.name.as_str();
+                        if mname == "size" || mname == "num" {
+                            if let Some(scoped) = self.instance_assoc_member(&name) {
+                                // Associative array: count live keys
+                                // (`<h>#<name>[<key>` prefix).
+                                if self.is_associative_array(&scoped) {
+                                    let prefix = format!("{}[", scoped);
+                                    let count = self
+                                        .signals
+                                        .keys()
+                                        .filter(|k| k.starts_with(&prefix))
+                                        .count();
+                                    return Value::from_u64(count as u64, 32);
+                                }
+                                // Queue / dynamic array: read `.size` signal.
+                                if self.module.dynamic_arrays.contains(&scoped)
+                                    || self
+                                        .signals
+                                        .contains_key(&format!("{}.size", scoped))
+                                {
+                                    return Value::from_u64(
+                                        self.get_queue_size(&scoped),
+                                        32,
+                                    );
+                                }
+                            }
+                            // Module-level queue/dynamic/fixed array.
+                            if self.module.arrays.contains_key(&name)
+                                || self.module.dynamic_arrays.contains(&name)
+                                || self.signals.contains_key(&format!("{}.size", name))
+                            {
+                                return Value::from_u64(self.get_queue_size(&name), 32);
+                            }
+                        }
+                    }
                 }
                 // LRM §25.8: virtual-interface member VALUE read `vif.member`
                 // (MemberAccess shape, base is `this.vif`). eval(vif) returns the
@@ -67719,18 +67764,19 @@ impl Simulator {
 
     /// `m.size()` (row=false) / `m[i].size()` (row=true) receiver test.
     fn is_size_call(e: &Expression, prop: &str, row: bool) -> bool {
-        let ExprKind::Call { func, args } = &e.kind else {
-            return false;
+        // The built-in array `size` method (§7.4.2) may be written either as a
+        // no-argument call (`q.size()`) or as a bare member access (`q.size`).
+        // Both denote the same method; a constraint like `q.size inside
+        // {[1:11]}` parses to the member-access form, so the matcher must
+        // accept both shapes.
+        let recv = match &e.kind {
+            ExprKind::Call { func, args } if args.is_empty() => match &func.kind {
+                ExprKind::MemberAccess { expr, member } if member.name == "size" => expr,
+                _ => return false,
+            },
+            ExprKind::MemberAccess { expr, member } if member.name == "size" => expr,
+            _ => return false,
         };
-        if !args.is_empty() {
-            return false;
-        }
-        let ExprKind::MemberAccess { expr: recv, member } = &func.kind else {
-            return false;
-        };
-        if member.name != "size" {
-            return false;
-        }
         match (&recv.kind, row) {
             (ExprKind::Ident(h), false) => h.path.last().is_some_and(|s| s.name.name == prop),
             (ExprKind::Index { expr: b, .. }, true) => match &b.kind {
