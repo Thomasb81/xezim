@@ -40013,7 +40013,25 @@ impl Simulator {
                         // hint across the whole nested-delay window.
                         let saved_hint_nested = self.name_resolve_hint.borrow().clone();
                         let delay = self.eval_delay_ticks(d);
-                        self.apply_nba();
+                        // §4.4/§4.5: the NBA region of the CURRENT timestamp
+                        // runs after every active-region process at that
+                        // timestamp has evaluated its RHS. Flushing here is
+                        // premature when this delay is inside an EDGE block:
+                        // the remaining blocks on the same edge have not
+                        // sampled yet, and committing now lets them read the
+                        // post-edge value. A `always @(posedge clk) begin #1;
+                        // … end` observer anywhere in a testbench therefore
+                        // broke every OTHER clocked block that sampled a
+                        // signal written by a sibling block on that edge —
+                        // `d <= dut.if.sig;` recorded the new value, so a
+                        // one-cycle pipeline check saw no delay at all.
+                        // Outside an edge block (a plain initial/task `#d`)
+                        // keep flushing: the active region there is just this
+                        // process, and `run_events_until` below re-flushes at
+                        // the proper point either way.
+                        if !self.in_edge_block {
+                            self.apply_nba();
+                        }
                         self.settle_combinatorial();
                         self.check_edges();
                         let _ = self.drain_edge_cascade(self.cascade_limit);
