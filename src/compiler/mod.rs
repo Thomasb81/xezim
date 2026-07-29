@@ -7,6 +7,7 @@
 pub mod arena;
 pub mod bytecode;
 pub mod dispatch;
+pub mod fst_sink;
 pub mod jit;
 pub mod simulator;
 pub mod soa;

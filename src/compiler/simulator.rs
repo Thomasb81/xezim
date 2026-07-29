@@ -402,13 +402,13 @@ macro_rules! sim_dbg_eprintln {
 /// rolling epoch dedups repeat writes within a flush.
 macro_rules! vcd_mark {
     ($self:ident, $id:expr) => {{
-        if $self.vcd_dirty_active {
+        if $self.dump_dirty_active {
             let __vm_id = $id;
-            if __vm_id < $self.vcd_dirty_mark.len()
-                && $self.vcd_dirty_mark[__vm_id] != $self.vcd_dirty_epoch
+            if __vm_id < $self.dump_dirty_mark.len()
+                && $self.dump_dirty_mark[__vm_id] != $self.dump_dirty_epoch
             {
-                $self.vcd_dirty_mark[__vm_id] = $self.vcd_dirty_epoch;
-                $self.vcd_dirty.push(__vm_id as u32);
+                $self.dump_dirty_mark[__vm_id] = $self.dump_dirty_epoch;
+                $self.dump_dirty.push(__vm_id as u32);
             }
         }
     }};
@@ -1331,6 +1331,25 @@ const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
 
 type EventList = VecDeque<(usize, Vec<Statement>)>;
 
+/// One clock-tree group's edge answer for the current detect pass.
+///
+/// Members of a group are exact copies of one driver, so both the fire decision
+/// AND the raw value pair are shared: `fired_snap` (which re-baselines `prev`)
+/// and the §9.4.2 bit-select re-test both need the values, and taking them from
+/// the leader is what removes the scattered reads. `XEZIM_CLKTREE_PROBE=1`
+/// verifies that equality holds rather than assuming it.
+#[derive(Clone, Copy, Default)]
+struct EdgeGroupMemo {
+    generation: u64,
+    fires_pos: bool,
+    fires_neg: bool,
+    fires_any: bool,
+    cur_v: u64,
+    cur_x: u64,
+    prev_v: u64,
+    prev_x: u64,
+}
+
 /// Built-in clock generator: replaces `always #N clk = ~clk` with O(1) toggle.
 /// Eliminates AST cloning and traversal for the most common simulation pattern.
 struct ClockGen {
@@ -1529,6 +1548,13 @@ struct TimingWheel {
     /// which fires on every run_scheduled_process call (~115K times on c910).
     /// Count-based rather than set-based because the same pid can have
     /// multiple scheduled events at different times.
+    ///
+    /// Kept as a `HashMap` deliberately. Replacing it with a `Vec<u32>` indexed
+    /// by pid (pids are consecutive small integers, so the hashing looked like
+    /// pure overhead) measured NEUTRAL on both a 3-process and a 400-process
+    /// load — and pids are never reused, so the dense form grows to the
+    /// high-water pid and trades memory for nothing. Do not re-litigate without
+    /// a benchmark that shows this map is hot.
     pid_counts: std::collections::HashMap<usize, u32>,
 }
 
@@ -2426,6 +2452,13 @@ pub struct Simulator {
     /// §6.11.1/§10.7 an implicit conversion of a 4-state RHS into such a target
     /// maps X/Z to 0 — enforced in `fit_value_to_signal`.
     signal_two_state: Vec<bool>,
+    /// Signal ids driven by a lowered GATE PRIMITIVE. §28.4's `buf` truth table
+    /// maps a `z` input to an `x` output, but §10.3 continuous assignment passes
+    /// the value through unchanged — and a gate lowers to an ordinary continuous
+    /// assign, so by the time one-bit copies are fused into a buffer op the two
+    /// are indistinguishable. Applying the gate rule to both made every
+    /// `assign y = x;` eat `z`. This says which ids the gate rule applies to.
+    signal_gate_driven: Vec<bool>,
     /// Signal ids that carry a CONTINUOUS driver — the whole-name LHS of an
     /// `assign` (including the continuous-assigns that inlining synthesizes for
     /// instance port connections). §6.5 forbids mixing continuous and procedural
@@ -2787,6 +2820,10 @@ pub struct Simulator {
     /// declared in `base_class` (so unrelated/inherited statics stay shared),
     /// giving each specialization its own cell (§8.25). None = shared cell.
     current_spec: Option<(String, String)>,
+    /// §28.11 gate FALL delays by signal id, from
+    /// `ElaboratedModule::gate_fall_delays`. Empty unless some gate used the
+    /// two-delay `#(rise, fall)` form with differing values.
+    gate_fall_delay_by_id: HashMap<usize, u64>,
     /// `(declaring_class, property)` → does this property's packed range
     /// depend on a parameter? `fit_class_prop` runs on every property store,
     /// so the common answer (`false`) is memoized to one hash lookup.
@@ -3344,27 +3381,33 @@ pub struct Simulator {
     /// Last sim time at which each `vcd_trace` entry that is an `event` emitted
     /// its trigger pulse — dedups repeat triggers inside one time slot.
     vcd_event_last: Vec<u64>,
-    /// Incremental (dirty-set) change detection for `vcd_write_changes`. The
-    /// full scan is O(all dumped signals) per timestep; for a large dump where
-    /// few signals move per step (e.g. a 291k-signal gate-level netlist) that
-    /// dominates wall time. Instead every real signal write marks the signal
-    /// dirty (a SUPERSET of actual changes — the prev-value compare in
-    /// vcd_write_changes still guarantees only genuine changes are emitted), so
-    /// the flush visits O(written signals) not O(all). Coverage: both value
-    /// write choke points (the `write_sig!` macro and `after_signal_write`) call
-    /// `vcd_mark_written`; SVA preponed swaps deliberately do not (they restore).
-    /// `vcd_dirty` is the per-flush list of dirty signal ids; `vcd_dirty_mark`
+    /// Incremental (dirty-set) change detection, SHARED by every dump writer
+    /// (VCD, XTrace, FST). The full scan is O(all dumped signals) per timestep;
+    /// for a large dump where few signals move per step (e.g. a 1.5M-signal
+    /// flattened netlist) that dominates wall time — measured at ~19x the cost
+    /// of the simulation itself on c906. Instead every real signal write marks
+    /// the signal dirty (a SUPERSET of actual changes — each writer's
+    /// prev-value compare still guarantees only genuine changes are emitted),
+    /// so a flush visits O(written signals) not O(all). Coverage: both value
+    /// write choke points (the `write_sig!` macro and `after_signal_write`)
+    /// call `vcd_mark!`; SVA preponed swaps deliberately do not (they restore).
+    /// `dump_dirty` is the per-flush list of dirty signal ids; `dump_dirty_mark`
     /// dedups within a flush via a rolling epoch (mark==epoch ⇒ already listed).
-    /// `vcd_id_to_trace` maps a signal id to its (possibly aliased) trace slots.
+    /// The list is consumed by every active writer in `dump_write_changes` and
+    /// cleared once, after the last of them — so the writers must READ it and
+    /// never clear it themselves.
+    /// `vcd_id_to_trace` / `xtrace_id_to_trace` / `fst_id_to_trace` map a signal
+    /// id to that writer's (possibly aliased) trace slots.
     /// `vcd_event_indices` are the event trace slots, always checked (events
     /// fire via event_triggered_time, not signal writes). Disabled — falling
-    /// back to the full scan — via XEZIM_VCD_FULL=1 or when the maps are unbuilt.
-    vcd_dirty: Vec<u32>,
-    vcd_dirty_mark: Vec<u64>,
-    vcd_dirty_epoch: u64,
+    /// back to the full scan — via XEZIM_VCD_FULL=1 / XEZIM_DUMP_FULL=1 or when
+    /// the maps are unbuilt.
+    dump_dirty: Vec<u32>,
+    dump_dirty_mark: Vec<u64>,
+    dump_dirty_epoch: u64,
     vcd_id_to_trace: Vec<Vec<u32>>,
     vcd_event_indices: Vec<usize>,
-    vcd_dirty_active: bool,
+    dump_dirty_active: bool,
     /// §21.7.1.8 `$dumplimit`: byte budget for the dump, and the running
     /// (approximate) count of bytes handed to the sink. `vcd_limit_hit` latches
     /// once the budget is spent and permanently stops the dump.
@@ -3417,7 +3460,10 @@ pub struct Simulator {
     /// Per-traced-NET table: (signal_table index, XTrace signal id). One entry
     /// per backing net — an aliased name (§9.2 `alias=`) has its own id in the
     /// dictionary but emits no deltas of its own.
-    xtrace_trace: Vec<(usize, String)>,
+    xtrace_trace: Vec<(usize, Arc<str>)>,
+    /// Signal id → `xtrace_trace` slots, for the shared incremental dirty-set
+    /// change detection (see the `dump_dirty` field docs). Empty ⇒ full scan.
+    xtrace_id_to_trace: Vec<Vec<u32>>,
     /// Previous emitted value per entry in `xtrace_trace` (parallel vector).
     xtrace_prev_signals: Vec<Value>,
     /// Whether entry `i` of `xtrace_trace` is a `real` (parallel vector): its
@@ -3434,7 +3480,7 @@ pub struct Simulator {
     /// SV `event` objects (signal_table index, XTrace signal id). An event has
     /// no level, so it is NOT in `xtrace_trace`: it emits an §10.4 `X` record
     /// per trigger instead of a value delta.
-    xtrace_events: Vec<(usize, String)>,
+    xtrace_events: Vec<(usize, Arc<str>)>,
     /// Time of the last `X` record emitted for each `xtrace_events` entry, so a
     /// 0→1→0 toggle inside one time slot still counts as exactly one trigger
     /// (mirrors `vcd_event_last`).
@@ -3460,9 +3506,14 @@ pub struct Simulator {
     /// `--xtrace-scope`): keep signals whose name equals or sits under a scope.
     pub fst_scopes: Vec<String>,
     /// The FST body writer (post-header phase). `None` until `fst_start_dump`.
-    fst_writer: Option<FstBodyWriter<std::io::BufWriter<std::fs::File>>>,
+    /// Value packing, block compression and I/O run on a background thread
+    /// (`XEZIM_DUMP_INLINE=1` keeps them here); see `fst_sink::FstSink`.
+    fst_writer: Option<super::fst_sink::FstSink>,
     /// Compact per-net trace table: (signal_table index, FST signal id).
     fst_trace: Vec<(usize, FstSignalId)>,
+    /// Signal id → `fst_trace` slots, for the shared incremental dirty-set
+    /// change detection (see the `dump_dirty` field docs). Empty ⇒ full scan.
+    fst_id_to_trace: Vec<Vec<u32>>,
     /// Previous emitted value per `fst_trace` entry (parallel vector).
     fst_prev_signals: Vec<Value>,
     /// Pre-computed combinatorial entries with sensitivity sets.
@@ -3572,6 +3623,26 @@ pub struct Simulator {
     /// canonical signal_table — Stage-0 validation toward dropping the 32-byte
     /// Value array cells. signal_table stays canonical (safe).
     soa_shadow: bool,
+    /// Clock-tree dedup (see `build_edge_sig_groups`). `edge_group_of` is
+    /// parallel to `edge_signal_ids`: the group a POSITION belongs to, or
+    /// `u32::MAX` for a signal that must be checked on its own. Members of one
+    /// group are exact copies of a common driver, so the first member scanned in
+    /// a pass computes the edge and the rest read it out of `edge_group_memo`.
+    /// The memo is stamped with `edge_group_generation` (bumped once per detect
+    /// pass) so it never needs clearing.
+    edge_group_of: Vec<u32>,
+    edge_group_memo: Vec<EdgeGroupMemo>,
+    edge_group_generation: u64,
+    edge_group_count: usize,
+    /// `XEZIM_CLKTREE_PROBE=1`: instead of trusting the memo, recompute every
+    /// member and count how often the leader's answer disagreed. The dedup is
+    /// only sound if this is zero, and it is cheaper to measure than to argue.
+    clktree_probe: bool,
+    clktree_probe_hits: u64,
+    clktree_probe_mismatch: u64,
+    /// Signal ids of the first few probe mismatches, resolved to names in the
+    /// summary (the detect loop holds a mutable borrow and cannot name them).
+    clktree_probe_sids: Vec<usize>,
     /// Dirty-driven edge detect (XEZIM_DIRTY_EDGE=1). `sig_to_edge_pos[id]` =
     /// position of signal `id` in `edge_signal_ids`, or -1 if not edge-sensitive.
     /// Writes to edge-sensitive signals (via write_sig!/after_signal_write)
@@ -5108,6 +5179,68 @@ impl Simulator {
                 }
             }
         }
+        // A struct member's packed element width is registered under the
+        // DECLARATION name (`ref_pipe.wdata`), but an unpacked array of structs
+        // stores each element as its own signal (`ref_pipe[2].wdata`). Without a
+        // key for the concrete signal, `ref_pipe[i].wdata[j]` degraded from a
+        // lane slice to a 1-BIT select — silently comparing one bit against a
+        // whole lane. Alias every element name to its declaration's entry.
+        {
+            let mut aliases: Vec<(String, u32)> = Vec::new();
+            for name in signal_name_to_id.keys() {
+                let name_ref: &str = name.as_ref();
+                if module.packed_signal_elem_widths.contains_key(name_ref) {
+                    continue;
+                }
+                // `base[i].member…` -> `base.member…`
+                let Some(br) = name_ref.find(']') else { continue };
+                let Some(bl) = name_ref[..br].rfind('[') else { continue };
+                if !name_ref[br..].starts_with("].") {
+                    continue;
+                }
+                let deindexed = format!("{}{}", &name_ref[..bl], &name_ref[br + 1..]);
+                // The map is keyed by the DECLARATION name, which carries no
+                // instance scope, so try the de-indexed name and then each
+                // scope-stripped suffix of it.
+                let mut cand: &str = &deindexed;
+                let ew = loop {
+                    if let Some(&ew) = module.packed_signal_elem_widths.get(cand) {
+                        break Some(ew);
+                    }
+                    match cand.find('.') {
+                        // Stop before stripping the member itself.
+                        Some(i) if cand[i + 1..].contains('.') => cand = &cand[i + 1..],
+                        _ => break None,
+                    }
+                };
+                if let Some(ew) = ew {
+                    aliases.push((name_ref.to_string(), ew));
+                }
+            }
+            for (k, ew) in aliases {
+                module.packed_signal_elem_widths.insert(k, ew);
+            }
+        }
+        // §28.4 vs §10.3: mark ids driven by a lowered gate primitive, so only
+        // those get the `buf` truth table's z->x. Same leaf/base matching as
+        // the 2-state pass above.
+        let mut signal_gate_driven = vec![false; num_signals];
+        if !module.gate_driven_nets.is_empty() {
+            for (name, &id) in signal_name_to_id.iter() {
+                if id >= num_signals {
+                    continue;
+                }
+                let name_ref: &str = name.as_ref();
+                let leaf = name_ref.rsplit('.').next().unwrap_or(name_ref);
+                let base = leaf.split('[').next().unwrap_or(leaf);
+                if module.gate_driven_nets.contains(name_ref)
+                    || module.gate_driven_nets.contains(leaf)
+                    || module.gate_driven_nets.contains(base)
+                {
+                    signal_gate_driven[id] = true;
+                }
+            }
+        }
         // prev_{val,xz} represent "before time 0" state. Per IEEE 1800,
         // variable initializers `reg x = <v>;` are equivalent to
         // initial-block assignments, so X→<v> at t=0 must generate an edge
@@ -5219,6 +5352,7 @@ impl Simulator {
             signal_signed: signal_signed_vec,
             signal_real: signal_real_vec,
             signal_two_state,
+            signal_gate_driven,
             cont_driven: HashSet::default(),
             signal_type_names,
             time: 0,
@@ -5305,6 +5439,7 @@ impl Simulator {
             rand_ranges: HashMap::default(),
             class_statics: HashMap::default(),
             current_spec: None,
+            gate_fall_delay_by_id: HashMap::default(),
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
@@ -5439,12 +5574,12 @@ impl Simulator {
             vcd_file: None,
             vcd_writer: None,
             vcd_trace: Vec::new(),
-            vcd_dirty: Vec::new(),
-            vcd_dirty_mark: Vec::new(),
-            vcd_dirty_epoch: 1,
+            dump_dirty: Vec::new(),
+            dump_dirty_mark: Vec::new(),
+            dump_dirty_epoch: 1,
             vcd_id_to_trace: Vec::new(),
             vcd_event_indices: Vec::new(),
-            vcd_dirty_active: false,
+            dump_dirty_active: false,
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
@@ -5471,6 +5606,7 @@ impl Simulator {
             xtrace_scopes: Vec::new(),
             xtrace_writer: None,
             xtrace_trace: Vec::new(),
+            xtrace_id_to_trace: Vec::new(),
             xtrace_prev_signals: Vec::new(),
             xtrace_real: Vec::new(),
             xtrace_string: Vec::new(),
@@ -5487,6 +5623,7 @@ impl Simulator {
             fst_scopes: Vec::new(),
             fst_writer: None,
             fst_trace: Vec::new(),
+            fst_id_to_trace: Vec::new(),
             fst_prev_signals: Vec::new(),
             comb_entries: Vec::new(),
             prepared_comb_cache_path: None,
@@ -5521,6 +5658,14 @@ impl Simulator {
             edge_scan_stats: std::env::var_os("XEZIM_EDGE_SCAN_STATS").is_some(),
             soa_shadow: std::env::var_os("XEZIM_ARRAY_SOA_SHADOW").is_some(),
             sig_to_edge_pos: Vec::new(),
+            edge_group_of: Vec::new(),
+            edge_group_memo: Vec::new(),
+            edge_group_generation: 0,
+            edge_group_count: 0,
+            clktree_probe: std::env::var_os("XEZIM_CLKTREE_PROBE").is_some(),
+            clktree_probe_hits: 0,
+            clktree_probe_mismatch: 0,
+            clktree_probe_sids: Vec::new(),
             changed_edge_pos: Vec::new(),
             edge_pos_seen: Vec::new(),
             edge_exec_wrote: Vec::new(),
@@ -6787,10 +6932,27 @@ impl Simulator {
         Ok((assigned, k))
     }
 
+    /// Whether `$display`/`$write` output is handed to a background writer.
+    ///
+    /// Default ON, and deliberately decoupled from `--threads`: writing the log
+    /// is pure I/O, so even a single-threaded simulation benefits from moving
+    /// the `write`/`flush` syscalls off the thread that is running the design.
+    /// `XEZIM_DUMP_INLINE=1` (the same switch the waveform sinks honour) keeps
+    /// it on the simulation thread, which is what you want when interleaving
+    /// with stderr has to be exact — the worker writes stdout while diagnostics
+    /// still go straight to stderr, so a combined `--log` file can order two
+    /// adjacent lines differently. Every `$display` still flushes on its
+    /// newline, so the skew is bounded to one line and never reorders stdout
+    /// against itself.
+    fn stdout_threaded(&self) -> bool {
+        std::env::var_os("XEZIM_DUMP_INLINE").is_none()
+    }
+
     #[inline]
     fn stdout_write(&mut self, s: &str) {
+        let threaded = self.stdout_threaded();
         let sink = self.stdout_sink.get_or_insert_with(|| {
-            if self.threads >= 2 {
+            if threaded {
                 super::stdout_sink::StdoutSink::threaded()
             } else {
                 super::stdout_sink::StdoutSink::inline()
@@ -6801,8 +6963,9 @@ impl Simulator {
 
     #[inline]
     fn stdout_writeln(&mut self, s: &str) {
+        let threaded = self.stdout_threaded();
         let sink = self.stdout_sink.get_or_insert_with(|| {
-            if self.threads >= 2 {
+            if threaded {
                 super::stdout_sink::StdoutSink::threaded()
             } else {
                 super::stdout_sink::StdoutSink::inline()
@@ -6811,9 +6974,11 @@ impl Simulator {
         sink.writeln_str(s);
     }
 
+    /// Flush `$display`/`$write` output and WAIT for it to reach the file, so
+    /// anything the caller writes next is ordered after it.
     pub fn flush_stdout(&mut self) {
         if let Some(s) = self.stdout_sink.as_mut() {
-            s.flush();
+            s.sync();
         }
     }
 
@@ -9208,6 +9373,22 @@ impl Simulator {
                 }
             }
         }
+        // §28.11 gate fall delays: resolve names to ids once. Honours the same
+        // delay-mode overrides as the rise delay (`+delay_mode_zero` etc.), so
+        // a zero-delay GLS run stays zero-delay on both edges.
+        if !self.module.gate_fall_delays.is_empty() && dmode != 1 {
+            let pairs: Vec<(usize, u64)> = self
+                .module
+                .gate_fall_delays
+                .iter()
+                .filter_map(|(n, &d)| {
+                    self.signal_name_to_id
+                        .get(n.as_str())
+                        .map(|&id| (id, apply_delay_mode(d)))
+                })
+                .collect();
+            self.gate_fall_delay_by_id.extend(pairs);
+        }
         mark_compile_phase("structural delay setup", &mut compile_phase_start);
         self.build_comb_entries();
         mark_compile_phase("build combinational entries", &mut compile_phase_start);
@@ -9331,6 +9512,7 @@ impl Simulator {
                 self.is_edge_signal_non_clock[sid] = true;
             }
         }
+        self.build_edge_sig_groups();
         // C1 hot-signal-arena diagnostic (HOT-ARENA-NOTES.md falsification
         // check #2): compute the hot working set + how many hot signals
         // are array members.  Decides whether the arena remap can skip
@@ -10259,7 +10441,12 @@ impl Simulator {
 
     /// Isolated counterpart of `exec_fused_gate`: evaluates a fused 1-bit
     /// gate against a mutable signal `view`, recording the dirtied id.
-    fn exec_fused_gate_isolated(op: &FusedGate, view: &mut [Value], dirtied: &mut Vec<u32>) {
+    fn exec_fused_gate_isolated(
+        op: &FusedGate,
+        view: &mut [Value],
+        dirtied: &mut Vec<u32>,
+        gate_driven: &[bool],
+    ) {
         #[inline(always)]
         fn and4(a: u8, b: u8) -> u8 {
             if a == 0 || b == 0 {
@@ -10301,11 +10488,15 @@ impl Simulator {
                 let s = view[src.sig_id as usize].get_bit_code(src.bit as usize);
                 let v = if *invert {
                     not4(s)
-                } else {
+                } else if gate_driven.get(dst.sig_id as usize).copied().unwrap_or(false) {
+                    // §28.4 `buf` primitive: a z input drives x.
                     match s {
                         3 => 2,
                         other => other,
                     }
+                } else {
+                    // §10.3 continuous assign passes z through.
+                    s
                 };
                 (dst, v)
             }
@@ -10520,7 +10711,7 @@ impl Simulator {
                 !unsupported
             }
             CombItem::FusedGate { op } => {
-                Self::exec_fused_gate_isolated(op, view, dirtied);
+                Self::exec_fused_gate_isolated(op, view, dirtied, &self.signal_gate_driven);
                 true
             }
             CombItem::FusedBufFanout { src, dsts, invert } => {
@@ -10533,6 +10724,7 @@ impl Simulator {
                         },
                         view,
                         dirtied,
+                        &self.signal_gate_driven,
                     );
                 }
                 true
@@ -10570,6 +10762,7 @@ impl Simulator {
         signal_widths: &[u32],
         signal_signed: &[bool],
         signal_two_state: &[bool],
+        signal_gate_driven: &[bool],
         signal_name_to_id: &HashMap<Arc<str>, usize>,
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
         view: &mut [Value],
@@ -10669,7 +10862,7 @@ impl Simulator {
                 !unsupported
             }
             CombItem::FusedGate { op } => {
-                Self::exec_fused_gate_isolated(op, view, dirtied);
+                Self::exec_fused_gate_isolated(op, view, dirtied, signal_gate_driven);
                 true
             }
             CombItem::FusedBufFanout { src, dsts, invert } => {
@@ -10682,6 +10875,7 @@ impl Simulator {
                         },
                         view,
                         dirtied,
+                        signal_gate_driven,
                     );
                 }
                 true
@@ -11671,6 +11865,7 @@ impl Simulator {
             signal_widths: self.signal_widths.clone(),
             signal_signed: self.signal_signed.clone(),
             signal_two_state: self.signal_two_state.clone(),
+            signal_gate_driven: self.signal_gate_driven.clone(),
             signal_name_to_id: self.signal_name_to_id.clone(),
             array_first_id: self.array_first_id.clone(),
         }
@@ -12456,6 +12651,13 @@ impl Simulator {
         self.vcd_finish();
         self.xtrace_finish();
         self.fst_finish();
+        // Barrier before the caller prints its own summary. `$display` output
+        // is on a writer thread; the `[PROF]`/`[PHASE]` lines and the trailing
+        // "Simulation finished at time N" are not, and under `--log` all of them
+        // land in ONE file (stdout and stderr are dup2'd together). Without this
+        // the tail of the simulation's own output can be overtaken by the
+        // summary that is supposed to follow it.
+        self.flush_stdout();
         if std::env::var("XEZIM_RS_STATS").is_ok() {
             xezim_core::value::Value::dump_range_select_stats();
         }
@@ -16339,6 +16541,34 @@ impl Simulator {
             });
         }
 
+        // §6.6.1 vs a DRIVEN net: an undriven net reads z, but a net that has a
+        // continuous driver is not undriven — its value is whatever that driver
+        // produces, and until the driver first resolves that is UNKNOWN, not
+        // high-impedance. The distinction is invisible for a zero-delay driver
+        // (the time-0 settle overwrites it immediately) but shows through the
+        // whole delay window of a DELAYED one, which is exactly a gate-level
+        // netlist: `and #(2,5) g(o, a, b);` leaves `o` readable for 5 ticks
+        // before it first resolves, and it should read x there.
+        //
+        // Only all-z signals are touched, so a net given a real initial value
+        // (supply0/1, and the tri0/tri1 pull) keeps it.
+        for &id in &self.cont_driven {
+            if self.signal_real[id] {
+                continue;
+            }
+            let w = self.signal_widths[id];
+            if w == 0 {
+                continue;
+            }
+            let cur = &self.signal_table[id];
+            let all_z = (0..w as usize).all(|i| cur.get_bit(i) == LogicBit::Z);
+            if all_z {
+                let mut v = Value::new(w); // all-x
+                v.is_signed = self.signal_signed[id];
+                self.signal_table[id] = v;
+            }
+        }
+
         // Always @* and always_comb blocks. Reuse `reads`/`writes` from the
         // continuous_assigns loop above (clear-not-realloc). always_latch is
         // wired into the same path: the `if (cond) lhs <= rhs;` body is
@@ -19948,6 +20178,16 @@ impl Simulator {
     /// "process N — <kind> at <file:line> (<instance path>, module <m>)" — the
     /// attribution prefix shared by the spinner list and the parked-process
     /// list of the stall report.
+    /// The source text of the block `pid` originates from. The line number in
+    /// `stall_pid_identity` can be unusable when an `\`include` or a multi-line
+    /// macro has shifted the preprocessed numbering (see `span_file_line_in`),
+    /// and quoting the offending code identifies the process regardless.
+    fn stall_pid_source(&mut self, pid: usize) -> Option<String> {
+        let src_file = self.stall_pid_src_file(pid);
+        let (span, _) = *self.process_origin.get(&pid)?;
+        self.span_source_snippet_in(span, src_file)
+    }
+
     fn stall_pid_identity(&mut self, pid: usize) -> String {
         let mut line = format!("                 process {}", pid);
         let src_file = self.stall_pid_src_file(pid);
@@ -20294,6 +20534,21 @@ impl Simulator {
             .filter(|f| !f.is_empty())
             .cloned()
             .unwrap_or_else(|| format!("<source {}>", i + 1));
+        // `texts` are PREPROCESSED, with every `\`include` spliced in whole, so
+        // this line can point well past the end of the file it names — a
+        // 10-line file including 3000 lines reports line 3005. Quoting that
+        // bare sends the reader hunting for a line their file does not have.
+        // Say so, and give them the number that at least locates it in the
+        // expanded text.
+        if let Some(&orig) = self.module.source_orig_lines.get(i) {
+            if orig > 0 && line as u32 > orig {
+                return Some(format!(
+                    "{}:{} [preprocessed line; the file has {} lines, so this code came from an \
+                     `include or a multi-line macro]",
+                    file, line, orig
+                ));
+            }
+        }
         Some(format!("{}:{}", file, line))
     }
 
@@ -20740,13 +20995,7 @@ impl Simulator {
             self.finish_deferred = false;
             self.finished = true;
         }
-        self.vcd_write_changes();
-        if self.xtrace_writer.is_some() {
-            self.xtrace_write_changes();
-        }
-        if self.fst_writer.is_some() {
-            self.fst_write_changes();
-        }
+        self.dump_write_changes();
 
         // Condition-waiter fixpoint. A `wait(expr)` on non-signal state (class
         // members / locals — the UVM sequencer arbitration) parked in
@@ -21596,6 +21845,16 @@ impl Simulator {
                 pct(b[5]),
                 pct(b[3] + b[4] + b[5])
             );
+        }
+        if self.clktree_probe {
+            eprintln!(
+                "[CLKTREE-PROBE] groups={} memo-eligible visits={} MISMATCHES={} \
+                 (dedup is sound iff 0)",
+                self.edge_group_count, self.clktree_probe_hits, self.clktree_probe_mismatch
+            );
+            for &sid in &self.clktree_probe_sids {
+                eprintln!("[CLKTREE-PROBE]   mismatching signal: {}", self.name_for_id(sid));
+            }
         }
         if self.edge_scan_stats {
             let s = self.edge_scan_scanned;
@@ -23503,6 +23762,51 @@ impl Simulator {
                         if let Some(recv) = recv_expr_opt.clone() {
                             let recv_val = self.eval_expr(&recv);
                             let handle = recv_val.to_u64().unwrap_or(0) as usize;
+                            // §15.4.2: `get`/`peek` on a mailbox handle that was
+                            // never `new`ed. The parking path below is keyed on a
+                            // LIVE handle, so a null one fell through to generic
+                            // dispatch and returned immediately without blocking.
+                            // Wrapped in the usual `forever` that reads a mailbox,
+                            // that spins until the stall detector fires — which
+                            // then blames a missing timing control, sending the
+                            // user looking for a `#delay` in a loop whose real
+                            // fault is an unconstructed mailbox. Fail where the
+                            // fault actually is.
+                            if handle == 0 && self.is_declared_mailbox(&recv) {
+                                // Named from the receiver EXPRESSION, not from
+                                // its span: the `Ident([mb, get])` parse shape
+                                // is rebuilt with the whole call's span, so a
+                                // source snippet would quote `mb.get(v)` back
+                                // as if that were the handle's name.
+                                let what = match &recv.kind {
+                                    ExprKind::Ident(h) => h
+                                        .path
+                                        .iter()
+                                        .map(|s| s.name.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("."),
+                                    _ => self
+                                        .span_source_snippet_in(recv.span, None)
+                                        .unwrap_or_else(|| "<mailbox>".to_string()),
+                                };
+                                eprintln!(
+                                    "[xezim][error] null mailbox handle at time {} — `{}.{}(...)` \
+                                     on a mailbox that was never constructed.",
+                                    self.time, what, method
+                                );
+                                eprintln!(
+                                    "               A blocking `{}` cannot suspend on a null \
+                                     handle, so a `forever` loop around it would spin forever.",
+                                    method
+                                );
+                                eprintln!(
+                                    "               Construct it (`{} = new();`) before the \
+                                     first `{}`.",
+                                    what, method
+                                );
+                                self.finished = true;
+                                return;
+                            }
                             if let Some(q) = self.mailboxes.get(&handle) {
                                 if q.is_empty() {
                                     // Blocking get/peek on an empty mailbox: park
@@ -25307,6 +25611,9 @@ impl Simulator {
             );
             let id = self.stall_pid_identity(pid);
             eprintln!("{} — no `#delay`/`@event`/`wait` anywhere in its body", id);
+            if let Some(src) = self.stall_pid_source(pid) {
+                eprintln!("                 its source: {}", src);
+            }
             eprintln!(
                 "               Simulated time can never advance past this loop. Add a timing control,"
             );
@@ -25316,6 +25623,103 @@ impl Simulator {
     }
 
     /// Resolve NBA target at schedule time to capture array indices/part-selects
+    /// §10.4.2: the index/range expressions of a non-blocking assignment's
+    /// TARGET are evaluated when the assignment is SCHEDULED, not when it is
+    /// applied. An lvalue that `resolve_nba_target` cannot reduce to a signal id
+    /// — any bit- or part-select — is stored as an expression and re-evaluated
+    /// in the NBA region, by which time a `for` loop's variable is long gone:
+    /// `for (int j…) q[j] <= …;` re-read `j` as 0/x and the write landed on the
+    /// wrong bit or nowhere at all. Substituting the evaluated indices as
+    /// literals freezes them at the correct moment, and also fixes the same
+    /// staleness for a signal-valued index (`mem[addr] <= d;` where `addr`
+    /// changes before the region runs).
+    fn freeze_lvalue_indices(&mut self, e: &Expression) -> Expression {
+        let lit = |v: i64, span| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(64),
+                    signed: true,
+                    base: NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                }),
+                span,
+            )
+        };
+        // A STRING key (`aa["name"] <= v`, or a string variable) must not be
+        // folded into a decimal literal — the associative key would change.
+        // Same for wide (>64-bit) keys, which are string-keyed in disguise
+        // (uvm_pool#(string,…)). Those indices keep their expression; §10.4.2
+        // staleness only bites loop/temp variables, which are integral.
+        let freezable = |sim: &mut Self, idx: &Expression| -> Option<i64> {
+            match &idx.kind {
+                ExprKind::StringLiteral(_) => return None,
+                ExprKind::Ident(h) => {
+                    let n = sim.resolve_hier_name(h);
+                    if sim.string_signals.contains(&n) {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            let v = sim.eval_expr(idx);
+            if v.is_real || v.width > 64 {
+                return None;
+            }
+            v.to_i64()
+        };
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                let base = self.freeze_lvalue_indices(expr);
+                let Some(iv) = freezable(self, index) else {
+                    return Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: index.clone(),
+                        },
+                        e.span,
+                    );
+                };
+                Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(base),
+                        index: Box::new(lit(iv, index.span)),
+                    },
+                    e.span,
+                )
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                let base = self.freeze_lvalue_indices(expr);
+                let (Some(lv), Some(rv)) = (freezable(self, left), freezable(self, right)) else {
+                    return Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(base),
+                            kind: *kind,
+                            left: left.clone(),
+                            right: right.clone(),
+                        },
+                        e.span,
+                    );
+                };
+                Expression::new(
+                    ExprKind::RangeSelect {
+                        expr: Box::new(base),
+                        kind: *kind,
+                        left: Box::new(lit(lv, left.span)),
+                        right: Box::new(lit(rv, right.span)),
+                    },
+                    e.span,
+                )
+            }
+            _ => e.clone(),
+        }
+    }
+
     fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -25730,6 +26134,28 @@ impl Simulator {
 
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
     fn schedule_delayed_with_delay(&mut self, id: usize, val: Value, delay: u64) {
+        // §28.11: a gate declared `#(rise, fall)` uses the FALL value for a
+        // transition to 0. The lowered cont-assign only carries the rise
+        // delay, so consult the per-net fall map here — this is the single
+        // choke point where both the target and the new value are known.
+        // Scalar gate outputs are the case that matters; "to 0" is judged on
+        // the whole value so a vector net keeps using the rise delay unless it
+        // goes fully zero.
+        let delay = if self.gate_fall_delay_by_id.is_empty() {
+            delay
+        } else {
+            // NB: `to_u64()` MASKS x/z to 0 rather than returning None, so it
+            // cannot distinguish a genuine 0 from z — use an explicit bit test.
+            // The initial x/z -> 0 settle counts as a fall as well, so the
+            // test is "the new value is a real 0 and the old one was not".
+            let all_zero = |v: &Value| -> bool {
+                !v.has_xz() && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Zero)
+            };
+            match self.gate_fall_delay_by_id.get(&id) {
+                Some(&fall) if all_zero(&val) && !all_zero(&self.signal_table[id]) => fall,
+                _ => delay,
+            }
+        };
         let target_time = self.time + delay;
         // Inertial delay: remove any pending update for this signal
         self.delayed_updates.retain(|(_, sid, _)| *sid != id);
@@ -26062,6 +26488,172 @@ impl Simulator {
             return;
         }
         self.check_edges_inner(None, false);
+    }
+
+    /// Group edge-sensitive signals that are exact copies of the same driver.
+    ///
+    /// A flattened netlist replicates the clock tree into per-module buffered
+    /// copies. They all carry the same value and therefore all fire the same
+    /// edge, but the detect scan visits each one separately and pays its own
+    /// three scattered reads (`signal_table`, `prev_val`, `prev_xz`) to
+    /// recompute an identical answer. Resolving each edge signal through the
+    /// pure-copy relation to its driver lets the scan compute the edge ONCE per
+    /// group (see `edge_group_memo`).
+    ///
+    /// Only these `CombItem`s count as a copy, and only under conditions that
+    /// make the destination bit-for-bit equal to its source:
+    /// `DirectCopy` / `FastDirectCopy` / `FastDirectFanout` / non-inverting
+    /// `FusedBufFanout` / non-inverting `FusedGate::Buf1`. A computed clock
+    /// (`Bin2`, `Mux2` — a clock gate or mux) is NOT a copy, but is a perfectly
+    /// good shared ROOT for the copies hanging off it.
+    ///
+    /// Constraints, each of which would otherwise produce a wrong edge:
+    /// * **Single writer.** A multiply-driven net does not track any one source.
+    /// * **Equal width, <= 64 bits.** A resize changes the value; a wide signal
+    ///   compares through `prev_wide`, not the inline `prev_val`/`prev_xz` pair.
+    /// * **Matching 4-state-ness, not real.** A 2-state destination drops X/Z on
+    ///   every write (§6.11.1), so it is not equal to a 4-state source.
+    /// * **No SDF delay.** A delayed copy lags its source in time.
+    /// * **Bit 0 on both sides** for the bit-addressed fused forms — bit 0 is
+    ///   what posedge/negedge detection reads.
+    /// * **Reached through >= 1 copy edge.** An independently driven ROOT stays
+    ///   its own singleton. Folding it in would give it a spurious t=0 edge:
+    ///   `prev` is baselined after the source initialises but before its copies
+    ///   settle, so root and copy legitimately disagree for exactly one detect.
+    fn build_edge_sig_groups(&mut self) {
+        self.edge_group_of.clear();
+        self.edge_group_memo.clear();
+        self.edge_group_count = 0;
+        if std::env::var_os("XEZIM_NO_CLKTREE_DEDUP").is_some() || self.edge_signal_ids.is_empty() {
+            return;
+        }
+        let nsig = self.signal_table.len();
+
+        let mut writer_count: Vec<u32> = vec![0u32; nsig];
+        for entry in &self.comb_entries {
+            for &d in &entry.write_signal_ids {
+                if d < nsig {
+                    writer_count[d] = writer_count[d].saturating_add(1);
+                }
+            }
+        }
+
+        // `copy_src[d]` = the signal `d` is an exact copy of, or -1.
+        let mut copy_src: Vec<i64> = vec![-1i64; nsig];
+        let eligible = |s: &Self, dst: usize, src: usize| -> bool {
+            dst < nsig
+                && src < nsig
+                && dst != src
+                && writer_count[dst] == 1
+                && s.signal_widths[dst] <= 64
+                && s.signal_widths[dst] == s.signal_widths[src]
+                && !s.signal_real[dst]
+                && !s.signal_real[src]
+                && s.signal_two_state.get(dst).copied().unwrap_or(false)
+                    == s.signal_two_state.get(src).copied().unwrap_or(false)
+                && s.sdf_delays.get(dst).copied().unwrap_or(0) == 0
+        };
+        for entry in &self.comb_entries {
+            match &entry.item {
+                CombItem::DirectCopy { dst_id, src_id, .. }
+                | CombItem::FastDirectCopy { dst_id, src_id } => {
+                    if eligible(self, *dst_id, *src_id) {
+                        copy_src[*dst_id] = *src_id as i64;
+                    }
+                }
+                CombItem::FastDirectFanout { src_id, dst_ids } => {
+                    for &d in dst_ids.iter() {
+                        if eligible(self, d, *src_id) {
+                            copy_src[d] = *src_id as i64;
+                        }
+                    }
+                }
+                CombItem::FusedBufFanout { src, dsts, invert } => {
+                    if *invert || src.bit != 0 {
+                        continue;
+                    }
+                    for d in dsts.iter() {
+                        if d.bit == 0 && eligible(self, d.sig_id as usize, src.sig_id as usize) {
+                            copy_src[d.sig_id as usize] = src.sig_id as i64;
+                        }
+                    }
+                }
+                CombItem::FusedGate {
+                    op: FusedGate::Buf1 { dst, src, invert },
+                } => {
+                    if !*invert
+                        && src.bit == 0
+                        && dst.bit == 0
+                        && eligible(self, dst.sig_id as usize, src.sig_id as usize)
+                    {
+                        copy_src[dst.sig_id as usize] = src.sig_id as i64;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Resolve each edge signal to its root, counting copy hops. Bounded so
+        // a copy CYCLE (illegal RTL, but reachable through a mis-elaborated
+        // generate loop) cannot spin here.
+        const MAX_COPY_HOPS: usize = 64;
+        let mut root_group: HashMap<usize, u32> = HashMap::default();
+        let mut group_of: Vec<u32> = vec![u32::MAX; self.edge_signal_ids.len()];
+        let mut next_group = 0u32;
+        for (pos, &sid) in self.edge_signal_ids.iter().enumerate() {
+            let mut cur = sid;
+            let mut hops = 0usize;
+            while hops < MAX_COPY_HOPS {
+                match copy_src.get(cur).copied().unwrap_or(-1) {
+                    -1 => break,
+                    s => {
+                        cur = s as usize;
+                        hops += 1;
+                    }
+                }
+            }
+            // Reached through no copy at all -> independently driven root.
+            if hops == 0 || hops >= MAX_COPY_HOPS {
+                continue;
+            }
+            let g = *root_group.entry(cur).or_insert_with(|| {
+                let g = next_group;
+                next_group += 1;
+                g
+            });
+            group_of[pos] = g;
+        }
+
+        // A group with a single member saves nothing and costs a memo slot.
+        let mut members = vec![0u32; next_group as usize];
+        for &g in &group_of {
+            if g != u32::MAX {
+                members[g as usize] += 1;
+            }
+        }
+        for g in group_of.iter_mut() {
+            if *g != u32::MAX && members[*g as usize] < 2 {
+                *g = u32::MAX;
+            }
+        }
+
+        self.edge_group_of = group_of;
+        self.edge_group_count = next_group as usize;
+        self.edge_group_memo = vec![EdgeGroupMemo::default(); next_group as usize];
+        self.edge_group_generation = 0;
+        if std::env::var_os("XEZIM_CLKTREE_STATS").is_some() {
+            let grouped = self.edge_group_of.iter().filter(|&&g| g != u32::MAX).count();
+            let live = members.iter().filter(|&&m| m >= 2).count();
+            eprintln!(
+                "[CLKTREE] edge signals={} grouped={} ({:.1}%) into {} groups; \
+                 largest={} (probe with XEZIM_CLKTREE_PROBE=1)",
+                self.edge_signal_ids.len(),
+                grouped,
+                100.0 * grouped as f64 / self.edge_signal_ids.len().max(1) as f64,
+                live,
+                members.iter().copied().max().unwrap_or(0),
+            );
+        }
     }
 
     /// Fast-path edge-detect when the only signals that could have an edge
@@ -26640,6 +27232,11 @@ impl Simulator {
         // drain_edge_exec_rescan then delivers (§9.2).
         let mut fired_snap: Vec<(usize, u64, u64)> = Vec::new();
         let mut fired_wide: Vec<(usize, Value)> = Vec::new();
+        // One generation per detect pass: a memo slot stamped with an older
+        // generation is stale, so the table never has to be cleared.
+        self.edge_group_generation = self.edge_group_generation.wrapping_add(1);
+        let group_generation = self.edge_group_generation;
+        let group_dedup_active = !self.edge_group_of.is_empty() && self.forced_signals.is_empty();
         for pos in positions {
             let sid = match self.edge_signal_ids.get(pos) {
                 Some(&s) => s,
@@ -26656,25 +27253,94 @@ impl Simulator {
                 }
                 _ => continue,
             };
-            // Compute edge-fired booleans once for this signal using SoA
-            // u64 pairs; falls back to full Value compare for wide signals.
-            let (cur_v, cur_x) = self.signal_table[sid].raw_bits();
-            let prev_v = self.prev_val[sid];
-            let prev_x = self.prev_xz[sid];
-            let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
-            let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
-            let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
-            let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
-            let fires_pos = !pb_one && cb_one;
-            let fires_neg = !pb_zero && cb_zero;
-            let fires_any = if self.signal_widths[sid] > 64 {
-                self.prev_wide
-                    .get(&sid)
-                    .map_or(cur_v != prev_v || cur_x != prev_x, |p| {
-                        self.signal_table[sid] != *p
-                    })
+            // Clock-tree dedup: on a flattened netlist most edge signals are
+            // per-module copies of one clock net, so the first member of a
+            // group scanned this pass computes the answer and the rest read it
+            // back — trading three scattered loads for one memo slot. Disabled
+            // while anything is FORCED: §9.3.1 lets a force hold a copy away
+            // from its driver, which is exactly the case the grouping assumes
+            // cannot happen. `forced_signals` is empty in the common case.
+            let group = if group_dedup_active {
+                self.edge_group_of.get(pos).copied().unwrap_or(u32::MAX)
             } else {
-                cur_v != prev_v || cur_x != prev_x
+                u32::MAX
+            };
+            let memo_hit = group != u32::MAX
+                && self.edge_group_memo[group as usize].generation == group_generation;
+            let (cur_v, cur_x, prev_v, prev_x, fires_pos, fires_neg, fires_any) = if memo_hit
+                && !self.clktree_probe
+            {
+                let m = self.edge_group_memo[group as usize];
+                (
+                    m.cur_v, m.cur_x, m.prev_v, m.prev_x, m.fires_pos, m.fires_neg, m.fires_any,
+                )
+            } else {
+                // Compute edge-fired booleans for this signal using SoA u64
+                // pairs; falls back to full Value compare for wide signals.
+                let (cur_v, cur_x) = self.signal_table[sid].raw_bits();
+                let prev_v = self.prev_val[sid];
+                let prev_x = self.prev_xz[sid];
+                let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
+                let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
+                let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
+                let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
+                let fires_pos = !pb_one && cb_one;
+                let fires_neg = !pb_zero && cb_zero;
+                let fires_any = if self.signal_widths[sid] > 64 {
+                    self.prev_wide
+                        .get(&sid)
+                        .map_or(cur_v != prev_v || cur_x != prev_x, |p| {
+                            self.signal_table[sid] != *p
+                        })
+                } else {
+                    cur_v != prev_v || cur_x != prev_x
+                };
+                if memo_hit {
+                    // Probe mode: the memo was available but we recomputed.
+                    // Any disagreement means the grouping is unsound.
+                    let m = self.edge_group_memo[group as usize];
+                    self.clktree_probe_hits += 1;
+                    if m.cur_v != cur_v
+                        || m.cur_x != cur_x
+                        || m.prev_v != prev_v
+                        || m.prev_x != prev_x
+                        || m.fires_pos != fires_pos
+                        || m.fires_neg != fires_neg
+                        || m.fires_any != fires_any
+                    {
+                        self.clktree_probe_mismatch += 1;
+                        if self.clktree_probe_mismatch <= 8 {
+                            // No `name_for_id` here — it borrows `self`
+                            // immutably while the trigger bitmap is held
+                            // mutably. The summary resolves names afterwards.
+                            self.clktree_probe_sids.push(sid);
+                            eprintln!(
+                                "[CLKTREE-PROBE] MISMATCH t={} sid={} group={} \
+                                 leader(cur={:x}/{:x} prev={:x}/{:x} p{}n{}a{}) \
+                                 member(cur={:x}/{:x} prev={:x}/{:x} p{}n{}a{})",
+                                self.time,
+                                sid,
+                                group,
+                                m.cur_v, m.cur_x, m.prev_v, m.prev_x,
+                                m.fires_pos as u8, m.fires_neg as u8, m.fires_any as u8,
+                                cur_v, cur_x, prev_v, prev_x,
+                                fires_pos as u8, fires_neg as u8, fires_any as u8,
+                            );
+                        }
+                    }
+                } else if group != u32::MAX {
+                    self.edge_group_memo[group as usize] = EdgeGroupMemo {
+                        generation: group_generation,
+                        fires_pos,
+                        fires_neg,
+                        fires_any,
+                        cur_v,
+                        cur_x,
+                        prev_v,
+                        prev_x,
+                    };
+                }
+                (cur_v, cur_x, prev_v, prev_x, fires_pos, fires_neg, fires_any)
             };
             if self.edge_scan_stats {
                 self.edge_scan_scanned += 1;
@@ -28390,6 +29056,7 @@ impl Simulator {
                         let widths: &[u32] = &self.signal_widths;
                         let signed: &[bool] = &self.signal_signed;
                         let two_state: &[bool] = &self.signal_two_state;
+                        let gate_driven: &[bool] = &self.signal_gate_driven;
                         let n2id = &self.signal_name_to_id;
                         let afi = &self.array_first_id;
                         // comb_entries' AST variants hold Cell/OnceCell (not
@@ -28433,6 +29100,7 @@ impl Simulator {
                                             widths,
                                             signed,
                                             two_state,
+                                            gate_driven,
                                             n2id,
                                             afi,
                                             v,
@@ -30507,6 +31175,86 @@ impl Simulator {
                         }
                     }
                 }
+                // §7.4.1: bit-select of an element of a 1-D UNPACKED array
+                // (`logic [1:0] q [0:1]; q[i][j] = b`). Each element is its own
+                // signal (`q[i]`), so this is a BIT write into that signal — not
+                // a 2-D array index. The `arrays_2d` arm below never matched it
+                // and every other arm fell through, so the write was silently
+                // DROPPED: a pipeline written as `vld_q[i+1][j] <= vld_q[i][j]`
+                // never advanced and its output stayed x forever.
+                if let ExprKind::Index {
+                    expr: inner_expr,
+                    index: inner_idx,
+                } = &expr.kind
+                {
+                    if let ExprKind::Ident(hier) = &inner_expr.kind {
+                        let mut name = self.resolve_hier_name(hier);
+                        if !self.module.arrays.contains_key(&name) {
+                            if let Some(s) = self.instance_assoc_member(&name) {
+                                name = s;
+                            }
+                        }
+                        // Only a plain unpacked array: an `arrays_2d` entry is a
+                        // genuine two-dimensional index and is handled below.
+                        if self.module.arrays.contains_key(&name)
+                            && !self.module.arrays_2d.contains_key(&name)
+                            && !self.module.arrays_nd.contains_key(&name)
+                        {
+                            let i = self.eval_expr(inner_idx).to_i64().unwrap_or(0);
+                            let elem = format!("{}[{}]", name, i);
+                            if let Some(&id) = self.signal_name_to_id.get(elem.as_str()) {
+                                let w = self.signal_widths[id];
+                                let raw = self.eval_expr(index).to_i64().unwrap_or(-1);
+                                // Handle only the plain 0-based case here; a
+                                // NEGATIVE or otherwise exotic packed label
+                                // (`logic [-1:-5][31:0] d [-2:-4]`) falls
+                                // through to the pre-existing normalizing
+                                // paths below, which already resolve it.
+                                // (Casting such a label to u32 overflowed.)
+                                let pos = match self.module.ascending_packed.get(&name).copied() {
+                                    Some(aw) if raw >= 0 && (raw as u32) < aw => {
+                                        Some(aw - 1 - raw as u32)
+                                    }
+                                    Some(_) => None,
+                                    None if raw >= 0 => Some(raw as u32),
+                                    None => None,
+                                };
+                                // The element may itself be a multi-dimensional
+                                // PACKED array, in which case `[j]` selects a
+                                // whole sub-vector, not one bit — a lane of
+                                // `logic [1:0][63:0] q [0:2]` is 64 bits wide.
+                                let ew = self
+                                    .module
+                                    .packed_signal_elem_widths
+                                    .get(&name)
+                                    .copied()
+                                    .unwrap_or(1)
+                                    .max(1);
+                                let lo = pos.map(|p| p.saturating_mul(ew));
+                                if let Some(lo) = lo.filter(|&lo| lo.checked_add(ew).is_some_and(|hi| hi <= w)) {
+                                    let mut cur = self.signal_table[id].clone();
+                                    let prev = cur.clone();
+                                    for b in 0..ew {
+                                        cur.set_bit((lo + b) as usize, val.get_bit(b as usize));
+                                    }
+                                    let changed = cur != prev;
+                                    if changed {
+                                        if !self.dirty_signals[id] {
+                                            self.dirty_signals[id] = true;
+                                            self.dirty_list.push(id);
+                                        }
+                                        self.dirty_any = true;
+                                        write_sig!(self, id, cur);
+                                        self.table_modified = true;
+                                        self.after_signal_write(id);
+                                        self.mark_dirty(&elem);
+                                    }
+                                    return changed;
+                                }
+                            }
+                        }
+                    }
+                }
                 // 2D array element assignment: mem[i][j] = val
                 if let ExprKind::Index {
                     expr: inner_expr,
@@ -32291,6 +33039,17 @@ impl Simulator {
                     if let Some(v) = self.resolve_value_param_from_spec(name) {
                         return v;
                     }
+                    // §6.19: an enum member declared in THIS class (or an
+                    // ancestor) is an inner-scope constant and must beat the
+                    // design-wide fallback below. Enum members are also
+                    // registered under their bare name in one flat namespace,
+                    // so without this a same-named member of an unrelated
+                    // class — whichever elaborated last — silently won.
+                    if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                        if let Some(v) = self.class_enum_member(&ctx, name) {
+                            return v;
+                        }
+                    }
                     // Static class property referenced bare inside a method.
                     if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
                         if let Some(v) = self.class_static_get(&ctx, name) {
@@ -32656,6 +33415,18 @@ impl Simulator {
                             }
                         }
                         break;
+                    }
+                }
+                // §26.3: `pkg::MEMBER` reaching here is an enum member of a
+                // package. `fast_signal_read` would discard the package scope
+                // and look the leaf up flat, which silently reads a local
+                // declaration that shadows the member. Checked last so any
+                // genuinely hierarchical `pkg.member` signal still wins.
+                if hier.path.len() == 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    if let Some(v) = self
+                        .package_enum_member(&hier.path[0].name.name, &hier.path[1].name.name)
+                    {
+                        return v;
                     }
                 }
                 self.fast_signal_read(hier)
@@ -33574,6 +34345,26 @@ impl Simulator {
                                     member.name
                                 ));
                             }
+                            // `arr[i].field[j]` — the receiver is an ELEMENT of
+                            // an unpacked array of structs, so the base parses
+                            // as MemberAccess over an Index and neither arm
+                            // above fires. Try the flattened element name
+                            // (`arr[2].wdata`, the concrete signal) and the
+                            // DECLARATION-keyed form with the element index
+                            // stripped (`arr.wdata`) — the field's element
+                            // width is the same for every element. Without
+                            // these the select degraded to a 1-BIT read, so a
+                            // reference model comparing `ref[i].wdata[j]`
+                            // against a 64-bit lane checked one bit of it.
+                            if let Some(flat) = self.flat_member_name(expr) {
+                                if let (Some(bl), Some(br)) = (flat.find('['), flat.find(']')) {
+                                    if bl < br {
+                                        candidates
+                                            .push(format!("{}{}", &flat[..bl], &flat[br + 1..]));
+                                    }
+                                }
+                                candidates.push(flat);
+                            }
                         }
                         _ => {}
                     };
@@ -34099,6 +34890,25 @@ impl Simulator {
                 // `$__wres(a, b)` — wired-net resolution, bit by bit: a `z`
                 // yields to a driven value, equal values pass through, and
                 // anything else (a 0/1 conflict, or an `x`) gives `x`.
+                // §6.6.2 wired-AND / wired-OR net resolution, bit by bit. A
+                // `z` driver yields to a driven value (as with a plain wire);
+                // otherwise the two driven bits are ANDed / ORed. `x` on
+                // either side gives `x` unless the other side is the
+                // controlling value (0 for AND, 1 for OR), which dominates.
+                "$__wand" | "$__wor" => {
+                    if args.len() < 2 {
+                        return Value::new(1);
+                    }
+                    let is_and = name == "$__wand";
+                    let a = self.eval_expr(&args[0]);
+                    let b = self.eval_expr(&args[1]);
+                    let w = a.width.max(b.width).max(1);
+                    let mut out = Value::zero(w);
+                    for i in 0..w as usize {
+                        out.set_bit(i, Self::wired_logic_bit(a.get_bit(i), b.get_bit(i), is_and));
+                    }
+                    out
+                }
                 "$__wres" => {
                     if args.len() < 2 {
                         return Value::new(1);
@@ -35348,6 +36158,21 @@ impl Simulator {
                     {
                         if let Some(v) =
                             self.class_scoped_const(&h.path[0].name.name, &member.name)
+                        {
+                            return v;
+                        }
+                    }
+                    // §26.3: the same shape with a PACKAGE base — `pkg::MEMBER`.
+                    // The elaborator only collapses `MemberAccess` into a
+                    // two-segment `Ident` for always/initial/continuous-assign
+                    // code, so inside a function, task, or class method the
+                    // reference arrives here instead. Nothing below resolves a
+                    // package base, and the arm's terminal fallback treats it as
+                    // an object handle — so every package-qualified enum
+                    // constant read inside a subroutine returned 0.
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        if let Some(v) =
+                            self.package_enum_member(&h.path[0].name.name, &member.name)
                         {
                             return v;
                         }
@@ -38370,8 +39195,9 @@ impl Simulator {
                         // and needs the NBA region to fire the edge.)
                         self.assign_value(lvalue, &val.resize_for_assign(w));
                     } else {
+                        let frozen = self.freeze_lvalue_indices(lvalue);
                         self.nba_queue.push(NbaEntry {
-                            lhs: Some(lvalue.clone()),
+                            lhs: Some(frozen),
                             value: val.resize_for_assign(w),
                             resolved_id: None,
                         });
@@ -38382,8 +39208,9 @@ impl Simulator {
                     self.delayed_updates
                         .push((self.time + d, id, val.resize_for_assign(w)));
                 } else {
+                    let frozen = self.freeze_lvalue_indices(lvalue);
                     self.nba_queue.push(NbaEntry {
-                        lhs: Some(lvalue.clone()),
+                        lhs: Some(frozen),
                         value: val.resize_for_assign(w),
                         resolved_id: None,
                     });
@@ -44836,12 +45663,23 @@ impl Simulator {
                 _ => 2,
             }
         } else {
-            match source {
-                3 => 2,
-                other => other,
-            }
+            source
         };
         for &dst in dsts {
+            // §28.4 vs §10.3 — decided per destination: a fanout group can mix
+            // a gate-driven net with a plain assign's target.
+            let new_bit = if !invert
+                && new_bit == 3
+                && self
+                    .signal_gate_driven
+                    .get(dst.sig_id as usize)
+                    .copied()
+                    .unwrap_or(false)
+            {
+                2
+            } else {
+                new_bit
+            };
             let id = dst.sig_id as usize;
             if !self.sdf_delays.is_empty()
                 && self.sdf_delays.get(id).copied().unwrap_or(0) > 0
@@ -44957,12 +45795,20 @@ impl Simulator {
                 let s = self.signal_table[src.sig_id as usize].get_bit_code(src.bit as usize);
                 let v = if *invert {
                     not4(s)
-                } else {
-                    // Z treated as X when used as a wire value
+                } else if self
+                    .signal_gate_driven
+                    .get(dst.sig_id as usize)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    // §28.4 `buf` primitive: a z input drives x.
                     match s {
                         3 => 2,
                         other => other,
                     }
+                } else {
+                    // §10.3 continuous assign: the value passes through, z included.
+                    s
                 };
                 (dst, v)
             }
@@ -46852,10 +47698,10 @@ impl Simulator {
         // Build the incremental-dump reverse maps (id → trace slots, and the
         // event slots) unless the full scan is forced. When active, every
         // signal write marks the id dirty so vcd_write_changes visits only
-        // written signals; see the field docs on `vcd_dirty`.
+        // written signals; see the field docs on `dump_dirty`.
         let force_full = std::env::var("XEZIM_VCD_FULL").ok().as_deref() == Some("1");
         if force_full {
-            self.vcd_dirty_active = false;
+            self.dump_dirty_active = false;
         } else {
             let nsig = self.signal_table.len();
             let mut id_to_trace: Vec<Vec<u32>> = vec![Vec::new(); nsig];
@@ -46870,10 +47716,82 @@ impl Simulator {
             }
             self.vcd_id_to_trace = id_to_trace;
             self.vcd_event_indices = event_indices;
-            self.vcd_dirty_mark = vec![0u64; nsig];
-            self.vcd_dirty.clear();
-            self.vcd_dirty_epoch = 1;
-            self.vcd_dirty_active = true;
+            self.enable_dump_dirty_tracking();
+        }
+    }
+
+    /// Arm the shared dump dirty set (see the `dump_dirty` field docs). Called
+    /// by every writer that wants incremental change detection; idempotent, so
+    /// a run dumping VCD + XTrace + FST together shares one mark array and one
+    /// dirty list. `XEZIM_DUMP_FULL=1` forces every writer back to a full scan.
+    ///
+    /// A writer that starts MID-RUN is still correct: it seeds its own
+    /// `*_prev_signals` from the current signal table when it opens, so it only
+    /// needs to see writes from that point on, which is exactly what the dirty
+    /// set carries from the next flush onward.
+    fn enable_dump_dirty_tracking(&mut self) {
+        if std::env::var("XEZIM_DUMP_FULL").ok().as_deref() == Some("1") {
+            self.dump_dirty_active = false;
+            return;
+        }
+        if self.dump_dirty_active {
+            return;
+        }
+        let nsig = self.signal_table.len();
+        self.dump_dirty_mark = vec![0u64; nsig];
+        self.dump_dirty.clear();
+        self.dump_dirty_epoch = 1;
+        self.dump_dirty_active = true;
+    }
+
+    /// Build a signal-id → trace-slot reverse map for a writer's trace table.
+    /// A signal can occupy several slots (aliases dumped under more than one
+    /// hierarchical name), so slots are collected per id rather than assumed 1:1.
+    fn build_dump_id_to_trace<T>(&self, trace: &[(usize, T)]) -> Vec<Vec<u32>> {
+        let nsig = self.signal_table.len();
+        let mut id_to_trace: Vec<Vec<u32>> = vec![Vec::new(); nsig];
+        for (idx, (sid, _)) in trace.iter().enumerate() {
+            if *sid < nsig {
+                id_to_trace[*sid].push(idx as u32);
+            }
+        }
+        id_to_trace
+    }
+
+    /// The trace slots a writer must re-check this flush: the slots of every
+    /// signal written since the last flush, sorted and deduped so record order
+    /// within a timestep is byte-identical to the full scan. `None` means the
+    /// caller must fall back to scanning every slot.
+    fn dump_dirty_slots(&self, id_to_trace: &[Vec<u32>]) -> Option<Vec<u32>> {
+        if !self.dump_dirty_active || id_to_trace.is_empty() {
+            return None;
+        }
+        let mut slots: Vec<u32> = Vec::with_capacity(self.dump_dirty.len());
+        for &sid in &self.dump_dirty {
+            let sid = sid as usize;
+            if sid < id_to_trace.len() {
+                slots.extend_from_slice(&id_to_trace[sid]);
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        Some(slots)
+    }
+
+    /// Flush every active dump writer for this time slot, then retire the
+    /// shared dirty set. The writers only READ `dump_dirty` (they each need the
+    /// same list), so the clear + epoch bump happens exactly once, here.
+    fn dump_write_changes(&mut self) {
+        self.vcd_write_changes();
+        if self.xtrace_writer.is_some() {
+            self.xtrace_write_changes();
+        }
+        if self.fst_writer.is_some() {
+            self.fst_write_changes();
+        }
+        if self.dump_dirty_active {
+            self.dump_dirty.clear();
+            self.dump_dirty_epoch = self.dump_dirty_epoch.wrapping_add(1);
         }
     }
 
@@ -46980,29 +47898,22 @@ impl Simulator {
             }};
         }
 
-        if self.vcd_dirty_active {
-            // Incremental: only signals written since the last flush can have
-            // changed. Gather their trace slots plus the (few) event slots
-            // (events fire independently of signal writes), then emit in
-            // trace-index order so the per-timestep record order is byte-
-            // identical to the full scan. Still O(written signals), not O(all).
-            let dirty = std::mem::take(&mut self.vcd_dirty);
-            let mut slots: Vec<u32> = Vec::with_capacity(dirty.len() + self.vcd_event_indices.len());
-            for &sid in &dirty {
-                let sid = sid as usize;
-                if sid < self.vcd_id_to_trace.len() {
-                    slots.extend_from_slice(&self.vcd_id_to_trace[sid]);
-                }
+        // Incremental: only signals written since the last flush can have
+        // changed. Gather their trace slots plus the (few) event slots (events
+        // fire independently of signal writes), then emit in trace-index order
+        // so the per-timestep record order is byte-identical to the full scan.
+        // Still O(written signals), not O(all). The dirty list is retired by
+        // `dump_write_changes` once every writer has read it.
+        let dirty_slots = self.dump_dirty_slots(&self.vcd_id_to_trace);
+        if let Some(mut slots) = dirty_slots {
+            if !self.vcd_event_indices.is_empty() {
+                slots.extend(self.vcd_event_indices.iter().map(|&i| i as u32));
+                slots.sort_unstable();
+                slots.dedup();
             }
-            slots.extend(self.vcd_event_indices.iter().map(|&i| i as u32));
-            slots.sort_unstable();
-            slots.dedup();
             for &idx in &slots {
                 check_slot!(idx as usize);
             }
-            self.vcd_dirty = dirty;
-            self.vcd_dirty.clear();
-            self.vcd_dirty_epoch = self.vcd_dirty_epoch.wrapping_add(1);
         } else {
             // Full scan: walk every dumped trace slot.
             for idx in 0..self.vcd_trace.len() {
@@ -47768,92 +48679,14 @@ impl Simulator {
     ///   shorter than its `$var` width. XTrace defines no such rule anywhere,
     ///   so a partially collapsed vector would be unparseable (nothing tells a
     ///   consumer how many bits were dropped, or what to refill them with).
+    ///
+    /// The implementation lives in `vcd_sink` because the XTrace writer THREAD
+    /// calls it: rendering values to ASCII is the bulk of a dump's cost and the
+    /// background writer exists to absorb it. This wrapper keeps the remaining
+    /// simulator-side call sites (the `N,full` snapshot) reading naturally.
+    #[inline]
     fn xtrace_format_value(val: &Value, is_real: bool, is_string: bool) -> String {
-        if is_string {
-            // §9.3 `str` type + §15.4: a string signal is emitted as a quoted,
-            // escaped literal, not a 1024-bit hex blob. §8.5 escapes only.
-            let mut s = String::with_capacity(val.width as usize / 8 + 2);
-            s.push('"');
-            for b in val.sv_string_bytes() {
-                match b {
-                    b'\\' => s.push_str("\\\\"),
-                    b'"' => s.push_str("\\\""),
-                    b'\n' => s.push_str("\\n"),
-                    b'\t' => s.push_str("\\t"),
-                    // A raw comma inside a quoted value is spec-legal (a parser
-                    // that honours quotes handles it), but XTrace records are
-                    // comma-delimited and design goal #1 is "easy to parse", so
-                    // escape it via §8.5 `\xHH` to stay safe for naive splitters.
-                    b',' => s.push_str("\\x2c"),
-                    0x20..=0x7e => s.push(b as char),
-                    other => s.push_str(&format!("\\x{:02x}", other)),
-                }
-            }
-            s.push('"');
-            return s;
-        }
-        if is_real || val.is_real {
-            return super::vcd_sink::vcd_real_string(val.to_f64());
-        }
-        if val.has_xz() {
-            let w = val.width as usize;
-            // §15.3 compact unknowns: `X` iff EVERY bit is x, `Z` iff every bit
-            // is z. A mixed vector (or one with known bits) keeps full width.
-            let (mut all_x, mut all_z) = (true, true);
-            for i in 0..w {
-                match val.get_bit(i) {
-                    LogicBit::X => all_z = false,
-                    LogicBit::Z => all_x = false,
-                    _ => {
-                        all_x = false;
-                        all_z = false;
-                        break;
-                    }
-                }
-            }
-            if w > 0 && all_x {
-                return "X".to_string();
-            }
-            if w > 0 && all_z {
-                return "Z".to_string();
-            }
-            // Per-bit binary representation preserves X/Z exactly.
-            let mut s = String::with_capacity(w + 2);
-            s.push_str("0b");
-            for i in (0..w).rev() {
-                s.push(match val.get_bit(i) {
-                    LogicBit::Zero => '0',
-                    LogicBit::One => '1',
-                    LogicBit::X => 'X',
-                    LogicBit::Z => 'Z',
-                });
-            }
-            s
-        } else if val.width <= 64 {
-            format!("0x{:x}", val.to_u64().unwrap_or(0))
-        } else {
-            // Wide all-known: emit as hex, MSB first.
-            let mut s = String::with_capacity((val.width as usize).div_ceil(4) + 2);
-            s.push_str("0x");
-            let mut started = false;
-            let nibble_count = (val.width as usize).div_ceil(4);
-            for n in (0..nibble_count).rev() {
-                let mut nib: u32 = 0;
-                for b in 0..4 {
-                    let bit_idx = n * 4 + b;
-                    if bit_idx < val.width as usize {
-                        if let LogicBit::One = val.get_bit(bit_idx) {
-                            nib |= 1 << b;
-                        }
-                    }
-                }
-                if nib != 0 || started || n == 0 {
-                    s.push(char::from_digit(nib, 16).unwrap());
-                    started = true;
-                }
-            }
-            s
-        }
+        super::vcd_sink::xtrace_format_value(val, is_real, is_string)
     }
 
     /// Open the XTrace file and emit the §6 header + `@section dict` + the
@@ -47991,11 +48824,13 @@ impl Simulator {
         }
 
         let mut signal_records: Vec<String> = Vec::with_capacity(entries.len());
-        // The compact per-NET tables reused at t=0 and every step.
-        let mut trace: Vec<(usize, String)> = Vec::new();
+        // The compact per-NET tables reused at t=0 and every step. Dictionary
+        // ids are `Arc<str>` so posting a change to the writer thread clones a
+        // refcount, not the string — this happens millions of times per dump.
+        let mut trace: Vec<(usize, Arc<str>)> = Vec::new();
         let mut reals: Vec<bool> = Vec::new();
         let mut strings: Vec<bool> = Vec::new();
-        let mut events: Vec<(usize, String)> = Vec::new();
+        let mut events: Vec<(usize, Arc<str>)> = Vec::new();
         for (name, tbl_id, sid) in &entries {
             // Walk the parent path once, creating M records on demand; the
             // deepest path component is this signal's module.
@@ -48092,9 +48927,9 @@ impl Simulator {
             if !canonical {
                 attrs.push(format!("alias={}", canon_sid[tbl_id]));
             } else if is_event {
-                events.push((*tbl_id, sid.clone()));
+                events.push((*tbl_id, Arc::from(sid.as_str())));
             } else {
-                trace.push((*tbl_id, sid.clone()));
+                trace.push((*tbl_id, Arc::from(sid.as_str())));
                 reals.push(is_real);
                 strings.push(is_string);
             }
@@ -48184,6 +49019,12 @@ impl Simulator {
             .iter()
             .map(|(id, _)| self.signal_table[*id].clone())
             .collect();
+        // Incremental change detection: narrow each flush to the slots of
+        // signals actually written (see the `dump_dirty` field docs). Shared
+        // with the VCD and FST writers, so a run dumping several formats builds
+        // one dirty list.
+        self.xtrace_id_to_trace = self.build_dump_id_to_trace(&trace);
+        self.enable_dump_dirty_tracking();
         self.xtrace_trace = trace;
         self.xtrace_writer = Some(w);
         self.xtrace_last_time = self.time;
@@ -48277,19 +49118,41 @@ impl Simulator {
             self.xtrace_emit_pending_snapshot();
         }
 
-        // Walk the compact trace table directly; xtrace_prev_signals is a
-        // parallel Vec<Value>, so change detection is a single indexed
-        // compare with no name hashing.
-        let mut changes: Vec<(usize, String)> = Vec::new();
-        for idx in 0..self.xtrace_trace.len() {
-            let id = self.xtrace_trace[idx].0;
-            let val = &self.signal_table[id];
-            if self.xtrace_prev_signals[idx] != *val {
-                changes.push((
-                    idx,
-                    Self::xtrace_format_value(val, self.xtrace_real[idx], self.xtrace_string[idx]),
-                ));
-                self.xtrace_prev_signals[idx] = val.clone();
+        // Change detection. `xtrace_prev_signals` is parallel to `xtrace_trace`,
+        // so each check is one indexed compare with no name hashing — but the
+        // FULL scan is O(all traced signals) per time slot, and an unscoped dump
+        // traces every net in the design (1.56 M on c906), which cost ~19x the
+        // simulation itself. The shared dirty set (see `dump_dirty`) narrows the
+        // walk to the slots of signals actually written since the last flush.
+        // Values are collected UNFORMATTED: the sink's writer thread renders
+        // them (`vcd_sink::write_xtrace_timestep`).
+        let mut changes: Vec<(Arc<str>, Value, bool, bool)> = Vec::new();
+        macro_rules! check_xt_slot {
+            ($idx:expr) => {{
+                let idx = $idx;
+                let id = self.xtrace_trace[idx].0;
+                let val = &self.signal_table[id];
+                if self.xtrace_prev_signals[idx] != *val {
+                    changes.push((
+                        self.xtrace_trace[idx].1.clone(),
+                        val.clone(),
+                        self.xtrace_real[idx],
+                        self.xtrace_string[idx],
+                    ));
+                    self.xtrace_prev_signals[idx] = val.clone();
+                }
+            }};
+        }
+        match self.dump_dirty_slots(&self.xtrace_id_to_trace) {
+            Some(slots) => {
+                for &idx in &slots {
+                    check_xt_slot!(idx as usize);
+                }
+            }
+            None => {
+                for idx in 0..self.xtrace_trace.len() {
+                    check_xt_slot!(idx);
+                }
             }
         }
 
@@ -48298,9 +49161,11 @@ impl Simulator {
         // behaviour) emitted 0x1, 0x0, 0x1 — the second trigger read back as
         // "no event", and a trigger whose 0→1→0 toggle cancelled inside one
         // time slot emitted nothing at all. The trigger times are already
-        // tracked for VCD (`event_triggered_time`), so reuse them.
+        // tracked for VCD (`event_triggered_time`), so reuse them. Events fire
+        // independently of signal writes, so this list is always scanned in
+        // full — it is tiny next to the trace table.
         let now = self.time;
-        let mut fired: Vec<usize> = Vec::new();
+        let mut fired: Vec<Arc<str>> = Vec::new();
         for idx in 0..self.xtrace_events.len() {
             let id = self.xtrace_events[idx].0;
             let triggered = self
@@ -48311,7 +49176,7 @@ impl Simulator {
                 == Some(now);
             if triggered && self.xtrace_event_last[idx] != now {
                 self.xtrace_event_last[idx] = now;
-                fired.push(idx);
+                fired.push(self.xtrace_events[idx].1.clone());
             }
         }
 
@@ -48319,34 +49184,20 @@ impl Simulator {
             return;
         }
 
-        if self.time != self.xtrace_last_time {
+        let time_delta = if self.time != self.xtrace_last_time {
             let delta = self.time - self.xtrace_last_time;
             self.xtrace_last_time = self.time;
-            let w = self.xtrace_writer.as_mut().unwrap();
-            let _ = writeln!(w, "T,+{}", delta);
-        }
+            Some(delta)
+        } else {
+            None
+        };
 
         let w = self.xtrace_writer.as_mut().unwrap();
-        if changes.len() == 1 {
-            let (idx, val) = &changes[0];
-            let _ = writeln!(w, "D,{},{}", self.xtrace_trace[*idx].1, val);
-        } else if !changes.is_empty() {
-            for chunk in changes.chunks(16) {
-                let _ = write!(w, "P");
-                for (idx, val) in chunk {
-                    let _ = write!(w, ",{}={}", self.xtrace_trace[*idx].1, val);
-                }
-                let _ = writeln!(w);
-            }
-        }
-        // §10.4 `X,<event_type>[,k=v]*`. The event_type names the record family
-        // (`event` — an SV event object fired); the `sig=` attribute points at
-        // the object's own dictionary id, which is why an event keeps an `S`
-        // record even though it carries no value. `X` inherits the current time
-        // from the T record above (§19.3), so no timestamp is repeated.
-        for idx in fired {
-            let _ = writeln!(w, "X,event,sig={}", self.xtrace_events[idx].1);
-        }
+        w.post_xtrace_changes(super::vcd_sink::XtraceTimestep {
+            time_delta,
+            changes,
+            events: fired,
+        });
 
         // Periodic durable flush so a crash/SIGKILL leaves a readable partial
         // dump (Drop does not run under `panic = "abort"`). Bounds the loss to
@@ -48555,9 +49406,17 @@ impl Simulator {
             prev.push(val);
         }
 
+        // Incremental change detection, shared with the VCD and XTrace writers
+        // (see the `dump_dirty` field docs).
+        self.fst_id_to_trace = self.build_dump_id_to_trace(&trace);
+        self.enable_dump_dirty_tracking();
         self.fst_trace = trace;
         self.fst_prev_signals = prev;
-        self.fst_writer = Some(body);
+        self.fst_writer = Some(if self.dump_writer_threaded() {
+            super::fst_sink::FstSink::threaded(body)
+        } else {
+            super::fst_sink::FstSink::inline(body)
+        });
     }
 
     /// Per-timestep FST emit: `time_change` once (if anything changed), then a
@@ -48567,36 +49426,50 @@ impl Simulator {
         if self.fst_writer.is_none() {
             return;
         }
+        // Narrow the walk to the slots of signals actually written since the
+        // last flush; the full scan is O(all traced nets) per time slot, which
+        // on an unscoped dump dominates everything else (see `dump_dirty`).
         let mut changes: Vec<(FstSignalId, Vec<u8>)> = Vec::new();
-        for idx in 0..self.fst_trace.len() {
-            let tbl_id = self.fst_trace[idx].0;
-            let val = &self.signal_table[tbl_id];
-            if self.fst_prev_signals[idx] != *val {
-                changes.push((self.fst_trace[idx].1, Self::fst_format_value(val)));
-                self.fst_prev_signals[idx] = val.clone();
+        macro_rules! check_fst_slot {
+            ($idx:expr) => {{
+                let idx = $idx;
+                let tbl_id = self.fst_trace[idx].0;
+                let val = &self.signal_table[tbl_id];
+                if self.fst_prev_signals[idx] != *val {
+                    changes.push((self.fst_trace[idx].1, Self::fst_format_value(val)));
+                    self.fst_prev_signals[idx] = val.clone();
+                }
+            }};
+        }
+        match self.dump_dirty_slots(&self.fst_id_to_trace) {
+            Some(slots) => {
+                for &idx in &slots {
+                    check_fst_slot!(idx as usize);
+                }
+            }
+            None => {
+                for idx in 0..self.fst_trace.len() {
+                    check_fst_slot!(idx);
+                }
             }
         }
         if changes.is_empty() {
             return;
         }
-        let body = self.fst_writer.as_mut().unwrap();
-        let _ = body.time_change(self.time);
-        for (fid, bits) in &changes {
-            let _ = body.signal_change(*fid, bits);
-        }
-        // Crash-safe periodic flush once the in-memory block grows large
-        // (matches the fst-writer example's FLUSH_AT); leaves a readable
-        // partial FST on panic=abort / SIGKILL.
-        const FST_FLUSH_AT: usize = 64 * 1024 * 1024;
-        if body.size() >= FST_FLUSH_AT {
-            let _ = body.flush();
-        }
+        // Packing, block compression and the periodic crash-safe block flush
+        // all happen inside the sink — on its writer thread by default.
+        let time = self.time;
+        self.fst_writer
+            .as_mut()
+            .unwrap()
+            .post(super::fst_sink::FstTimestep { time, changes });
     }
 
-    /// Finalize and close the FST file.
+    /// Finalize and close the FST file. Blocks until the writer thread has
+    /// written the trailer, so the dump is complete when this returns.
     fn fst_finish(&mut self) {
-        if let Some(body) = self.fst_writer.take() {
-            let _ = body.finish();
+        if let Some(sink) = self.fst_writer.take() {
+            sink.finish();
         }
     }
 
@@ -49071,6 +49944,25 @@ impl Simulator {
 
     /// IEEE 1800-2017 Table 28-1 wired-net resolution for one bit: `z` yields
     /// to a driven value, equal values pass, everything else is `x`.
+    /// §6.6.2 one-bit wired-AND (`is_and`) / wired-OR resolution. A `z`
+    /// driver contributes nothing, so the other side passes through. The
+    /// CONTROLLING value dominates even against `x` — 0 wins for AND, 1 for
+    /// OR — which is what makes a wired-AND bus with one asserting driver
+    /// resolve cleanly.
+    fn wired_logic_bit(a: LogicBit, b: LogicBit, is_and: bool) -> LogicBit {
+        let ctrl = if is_and { LogicBit::Zero } else { LogicBit::One };
+        if a == ctrl || b == ctrl {
+            return ctrl;
+        }
+        match (a, b) {
+            (LogicBit::Z, x) => x,
+            (x, LogicBit::Z) => x,
+            (LogicBit::X, _) | (_, LogicBit::X) => LogicBit::X,
+            (x, y) if x == y => x,
+            _ => LogicBit::X,
+        }
+    }
+
     fn wire_resolve_bit(a: LogicBit, b: LogicBit) -> LogicBit {
         match (a, b) {
             (LogicBit::Z, x) => x,
@@ -57758,6 +58650,51 @@ impl Simulator {
     /// by `hoist_class_local_typedefs`, so we walk the inheritance chain's
     /// `typedef_targets` and look each enum's members up in
     /// `module.enum_members`.
+    /// Value of an enum member declared by `start_class` or one of its
+    /// ancestors, or None when the class chain declares no such member. This
+    /// is the CLASS-SCOPED half of `class_scoped_const`, split out so a BARE
+    /// reference inside a class body can consult its own scope before the
+    /// flat design-wide map (§6.19).
+    fn class_enum_member(&self, start_class: &str, member: &str) -> Option<Value> {
+        let mut cur = Some(start_class.to_string());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let cd = self.module.classes.get(&cn)?;
+            for (td_name, dt) in &cd.typedef_targets {
+                if !matches!(dt, DataType::Enum(_)) {
+                    continue;
+                }
+                if let Some(members) = self.module.enum_members.get(td_name) {
+                    if let Some((_, val)) = members.iter().find(|(n, _)| n == member) {
+                        let w = self.module.typedefs.get(td_name).copied().unwrap_or(32).max(1);
+                        return Some(Value::from_u64(*val, w));
+                    }
+                }
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// Value of `pkg::MEMBER` for an enum member declared by package `pkg`
+    /// (§26.3), or None when `pkg` names no package or declares no such member.
+    ///
+    /// Enum members are also registered design-wide under their bare name, and
+    /// the qualified form used to be answered by discarding the scope and
+    /// looking the leaf up flat. That is wrong in both directions: a local
+    /// declaration legally shadowing the bare name captured the qualified
+    /// reference too, and inside a function body — where the elaborator leaves
+    /// the reference as a `MemberAccess` rather than collapsing it to a
+    /// two-segment `Ident` — there is no leaf fallback at all, so the read
+    /// returned 0. Consulting the package's own member list fixes both.
+    fn package_enum_member(&self, pkg: &str, member: &str) -> Option<Value> {
+        let (val, width) = *self.module.package_enum_members.get(pkg)?.get(member)?;
+        Some(Value::from_u64(val, width.max(1)))
+    }
+
     fn class_scoped_const(&mut self, start_class: &str, member: &str) -> Option<Value> {
         // Collect the inheritance chain and its enum-typedef names + widths
         // under an immutable borrow, then resolve under separate borrows so
@@ -64775,6 +65712,12 @@ impl Simulator {
             if cdef.property_inits.is_empty() {
                 continue;
             }
+            // An initializer is evaluated IN the declaring class's scope, so a
+            // bare reference to that class's own enum member must resolve
+            // there (§6.19). Only `this_stack` was pushed, leaving the class
+            // context unset, so `e_a v = DUP;` fell through to the flat
+            // design-wide map and picked up an unrelated class's `DUP`.
+            self.class_context_stack.push(Some(cdef.name.clone()));
             let inits: Vec<(String, Expression)> = cdef
                 .property_inits
                 .iter()
@@ -64885,6 +65828,7 @@ impl Simulator {
                     inst.properties.insert(pname, val);
                 }
             }
+            self.class_context_stack.pop();
         }
         self.this_stack.pop();
         // §8.7: implicit `super.new(...)` chaining. If the constructor that
@@ -72255,6 +73199,46 @@ impl Simulator {
         })
     }
 
+    /// True when `expr`'s DECLARED type is a mailbox, whatever its current
+    /// value is. Used to tell "null mailbox" apart from "not a mailbox at
+    /// all": only the former is a fault worth reporting, and a wrong guess
+    /// would abort a run over an ordinary user method named `get`.
+    /// Deliberately conservative — an undeterminable type answers false.
+    fn is_declared_mailbox(&self, expr: &Expression) -> bool {
+        let says_mailbox = |t: &str| t.starts_with("mailbox") || t == "mailbox";
+        if let ExprKind::Ident(hier) = &expr.kind {
+            let name = self.resolve_hier_name(hier);
+            if self
+                .var_container_types
+                .get(&name)
+                .is_some_and(|k| says_mailbox(k))
+            {
+                return true;
+            }
+            // A class property keeps its declared type on the class, not on
+            // any signal — `local mailbox m;` inside a driver reaches here.
+            if let Some(leaf) = hier.path.last().map(|s| s.name.name.as_str()) {
+                if let Some(Some(cur)) = self.class_context_stack.last() {
+                    if self
+                        .module
+                        .classes
+                        .get(cur)
+                        .and_then(|cd| cd.property_types.get(leaf))
+                        .and_then(|dt| match dt {
+                            DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
+                            _ => None,
+                        })
+                        .is_some_and(|t| says_mailbox(&t))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        self.get_expr_type_name(expr)
+            .is_some_and(|t| says_mailbox(&t))
+    }
+
     fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {
         match &expr.kind {
             ExprKind::Ident(hier) => {
@@ -72736,6 +73720,7 @@ pub struct CombSettleCtx {
     pub signal_widths: Vec<u32>,
     pub signal_signed: Vec<bool>,
     pub signal_two_state: Vec<bool>,
+    pub signal_gate_driven: Vec<bool>,
     pub signal_name_to_id: HashMap<Arc<str>, usize>,
     pub array_first_id: HashMap<Arc<str>, (usize, i64, i64)>,
 }
@@ -72851,7 +73836,7 @@ impl CombSettleCtx {
                 !unsupported
             }
             SendCombItem::Fused(op) => {
-                Simulator::exec_fused_gate_isolated(op, view, dirtied);
+                Simulator::exec_fused_gate_isolated(op, view, dirtied, &self.signal_gate_driven);
                 true
             }
             SendCombItem::FusedBufFanout { src, dsts, invert } => {
@@ -72864,6 +73849,7 @@ impl CombSettleCtx {
                         },
                         view,
                         dirtied,
+                        &self.signal_gate_driven,
                     );
                 }
                 true
