@@ -23020,17 +23020,19 @@ impl Simulator {
         // non-blocking start_item/finish_item recurses ~2800 deep and overflows
         // the stack cloning the continuation. The Cell/guard is always on (a few
         // ns per call); overflow-prevention is not debug-only.
+        let depth = RPS_DEPTH.with(|c| {
+            let d = c.get();
+            c.set(d + 1);
+            d
+        });
         struct DepthGuard;
         impl Drop for DepthGuard {
             fn drop(&mut self) {
                 RPS_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
             }
         }
-        let _dg = {
-            RPS_DEPTH.with(|c| c.set(c.get() + 1));
-            DepthGuard
-        };
-        if self.stall_limit > 0 {
+        let _dg = DepthGuard;
+        if self.stall_limit > 0 && depth == 0 {
             let hits = self.stall_pid_hits.entry(pid).or_insert(0);
             // One process re-activated this many times at a SINGLE timestamp is
             // not a busy design, it is a livelock: it keeps re-arming itself and
@@ -33986,7 +33988,8 @@ impl Simulator {
                     // sequence-start branch, so `uvm_do(item)` sent nothing.
                     if args.len() >= 2 {
                         let v = self.eval_expr(&args[1]);
-                        if self.cast_type_ok(&args[0], &v) {
+                        let ok = self.cast_type_ok(&args[0], &v);
+                        if ok {
                             self.assign_value(&args[0], &v);
                             Value::from_u64(1, 32)
                         } else {
@@ -38839,7 +38842,10 @@ impl Simulator {
                 }
                 if let ExprKind::Ident(hier) = &array.kind {
                     let mut name = self.resolve_hier_name(hier);
-                    if let Some(scoped) = self.instance_assoc_member(&name) {
+                    let spec_key = self.spec_static_coll_key(&name);
+                    if spec_key != name {
+                        name = spec_key;
+                    } else if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
                     }
                     // A bare array name inside a SUBMODULE process resolves
@@ -48818,7 +48824,8 @@ impl Simulator {
                         (name, type_args_text.clone())
                     });
                 if !b_name.is_empty() {
-                    Some(format!("{}#({})", b_name, b_sig))
+                    let canon_sig = self.canonicalize_spec_sig(&b_name, &b_sig);
+                    Some(format!("{}#({})", b_name, canon_sig))
                 } else {
                     None
                 }
@@ -48860,7 +48867,7 @@ impl Simulator {
     /// `expr_to_spec_fragment` to bake concrete values into a typedef-spec sig.
     fn read_value_param_literal(&self, name: &str) -> Option<String> {
         let (base, sig) = self.current_spec.as_ref()?;
-        let cd = self.module.classes.get(base)?;
+        let cd = self.get_class_def(base)?;
         if cd.type_param_names.iter().any(|t| t == name) {
             return None;
         }
@@ -48986,7 +48993,7 @@ impl Simulator {
             // code and the pre-supported library classes.
             let frags: Vec<String> = type_args
                 .iter()
-                .map(|e| {
+                .filter_map(|e| {
                     // Check for `this_type` BEFORE expr_to_spec_fragment
                     // resolves it to just the base class name (without the
                     // specialization suffix).
@@ -49009,9 +49016,10 @@ impl Simulator {
                             return Some(format!("{}#({})", b, s));
                         }
                     }
+                    let mut frag = self.substitute_spec_params(&frag);
                     // Check if frag is a type/value param of the spec base
                     if let Some((b, s)) = &self.current_spec {
-                        if let Some(cd) = self.module.classes.get(b) {
+                        if let Some(cd) = self.get_class_def(b) {
                             if cd.type_param_names.iter().any(|t| t == &frag)
                                 || cd.param_order.iter().any(|t| t == &frag)
                             {
@@ -49033,9 +49041,10 @@ impl Simulator {
                     }
                     Some(frag)
                 })
-                .collect::<Option<_>>()?;
-
-            Some((base.clone(), frags.join(",")))
+                .collect();
+            let sig = frags.join(",");
+            let canon_sig = self.canonicalize_spec_sig(&base, &sig);
+            Some((base.clone(), canon_sig))
         } else {
             None
         }
@@ -53562,6 +53571,10 @@ impl Simulator {
                 if self.module.classes.contains_key(&resolved) {
                     return Some(resolved);
                 }
+                let pkg_key = format!("uvm_pkg::{}", resolved);
+                if self.module.classes.contains_key(&pkg_key) {
+                    return Some(pkg_key);
+                }
                 // The resolved type may be a value-parameterized
                 // specialization like `special_comp#(1)` (a type param
                 // bound to a value-parameterized class). Return it WITH
@@ -57148,7 +57161,7 @@ impl Simulator {
                 if !seen.insert(cname.clone()) {
                     break;
                 }
-                let next = match self.module.classes.get(&cname) {
+                let next = match self.get_class_def(&cname) {
                     Some(cd) => cd.extends.clone(),
                     None => None,
                 };
@@ -57205,8 +57218,16 @@ impl Simulator {
             if s.ends_with(')') {
                 let base = s[..hash_idx].to_string();
                 let sig = s[hash_idx + 2..s.len() - 1].to_string();
-                if self.module.classes.contains_key(&base) {
+                if self.get_class_def(&base).is_some() {
                     return Some((base, sig));
+                }
+                let pkg_base = format!("uvm_pkg::{}", base);
+                if self.get_class_def(&pkg_base).is_some() {
+                    return Some((pkg_base, sig));
+                }
+                let base_short = base.trim_start_matches("uvm_pkg::").to_string();
+                if self.get_class_def(&base_short).is_some() {
+                    return Some((base_short, sig));
                 }
             }
         }
@@ -57220,7 +57241,7 @@ impl Simulator {
     /// is a single shared cell across every specialization of a derived
     /// parameterized class — keying it per-spec would wrongly split it.
     fn class_is_parameterized(&self, class_name: &str) -> bool {
-        let Some(cd) = self.module.classes.get(class_name) else {
+        let Some(cd) = self.get_class_def(class_name) else {
             return false;
         };
         // Only `param_order` and `type_param_names` reflect the class's
@@ -57244,9 +57265,7 @@ impl Simulator {
                 return true;
             }
             cur = self
-                .module
-                .classes
-                .get(&cname)
+                .get_class_def(&cname)
                 .and_then(|cd| cd.extends.clone());
         }
         false
@@ -57258,10 +57277,10 @@ impl Simulator {
             let mut acc = Vec::new();
             let mut cur = Some(base.to_string());
             while let Some(cname) = cur {
-                if let Some(cd) = self.module.classes.get(&cname) {
+                if let Some(cd) = self.get_class_def(&cname) {
                     for (prop, expr) in &cd.property_inits {
                         if cd.static_properties.contains(prop) && Self::expr_contains_call(expr) {
-                            acc.push((cname.clone(), prop.clone(), expr.clone()));
+                            acc.push((cd.name.clone(), prop.clone(), expr.clone()));
                         }
                     }
                     cur = cd.extends.clone();
@@ -57274,15 +57293,15 @@ impl Simulator {
         // Run each initializer with current_spec set to this specialization.
         let saved_spec = self.current_spec.clone();
         self.current_spec = Some((base.to_string(), sig.to_string()));
+        let base_short = base.trim_start_matches("uvm_pkg::");
+        let canon_sig = self.canonicalize_spec_sig(base_short, sig);
         for (cname, prop, init) in inits {
-            let spec_key = format!("{}#{}::{}", base, sig, prop);
+            let spec_key = format!("{}#{}::{}", base_short, canon_sig, prop);
             if self.class_statics.contains_key(&spec_key) {
                 continue;
             }
             let cont_kind = self
-                .module
-                .classes
-                .get(&cname)
+                .get_class_def(&cname)
                 .and_then(|cd| cd.properties.get(&prop))
                 .and_then(|s| s.type_name.as_deref())
                 .and_then(Self::container_base);
@@ -57312,7 +57331,8 @@ impl Simulator {
                 self.class_context_stack.pop();
                 v
             };
-            self.class_statics.insert(spec_key, v);
+            self.class_statics.insert(spec_key.clone(), v.clone());
+            eprintln!("[DBG_SPEC_INIT] spec_key={} val={:?}", spec_key, v);
         }
         self.current_spec = saved_spec;
     }
@@ -57450,14 +57470,116 @@ impl Simulator {
     /// `uvm_callbacks::m_typeid` was written under one key and read under
     /// another, so UVM's `register_super_type` read 0 and the derived-type
     /// callback graph stayed empty.
+    fn replace_ident_token(s: &str, target: &str, replacement: &str) -> String {
+        if !s.contains(target) || target.is_empty() {
+            return s.to_string();
+        }
+        let mut out = String::new();
+        let bytes = s.as_bytes();
+        let t_len = target.len();
+        let mut i = 0;
+        while i < bytes.len() {
+            if i + t_len <= bytes.len() && &s[i..i + t_len] == target {
+                let prev_ok = if i == 0 {
+                    true
+                } else {
+                    let b = bytes[i - 1];
+                    !(b.is_ascii_alphanumeric() || b == b'_')
+                };
+                let next_ok = if i + t_len == bytes.len() {
+                    true
+                } else {
+                    let b = bytes[i + t_len];
+                    !(b.is_ascii_alphanumeric() || b == b'_')
+                };
+                if prev_ok && next_ok {
+                    out.push_str(replacement);
+                    i += t_len;
+                    continue;
+                }
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out
+    }
+
+    fn get_class_def<'a>(&'a self, name: &str) -> Option<&'a crate::compiler::elaborate::ElaboratedClass> {
+        self.module
+            .classes
+            .get(name)
+            .or_else(|| self.module.classes.get(&format!("uvm_pkg::{}", name)))
+            .or_else(|| self.module.classes.get(name.trim_start_matches("uvm_pkg::")))
+    }
+
+    fn substitute_spec_params(&self, frag: &str) -> String {
+        let (b, s) = match &self.current_spec {
+            Some(pair) => pair,
+            None => return frag.to_string(),
+        };
+        let cd = match self.get_class_def(b) {
+            Some(cd) => cd,
+            None => return frag.to_string(),
+        };
+        if cd.param_order.is_empty() {
+            return frag.to_string();
+        }
+        let sig_frags = Self::split_spec_args(s);
+        let mut result = frag.to_string();
+        for (idx, pname) in cd.param_order.iter().enumerate() {
+            if let Some(val) = sig_frags.get(idx) {
+                let val_trimmed = val.trim();
+                result = Self::replace_ident_token(&result, pname, val_trimmed);
+            }
+        }
+        result
+    }
+
+    fn canonicalize_spec_frag(&self, frag: &str) -> String {
+        let frag_norm = frag.trim().trim_start_matches("uvm_pkg::");
+        if let Some((inner_base, inner_sig)) = self.extract_spec_from_string(frag_norm) {
+            let inner_base_short = inner_base.trim_start_matches("uvm_pkg::");
+            let canon_inner_sig = self.canonicalize_spec_sig(inner_base_short, &inner_sig);
+            if !canon_inner_sig.is_empty() {
+                format!("{}#({})", inner_base_short, canon_inner_sig)
+            } else {
+                inner_base_short.to_string()
+            }
+        } else if let Some((inner_base, inner_sig)) = self.resolve_typedef_spec(frag_norm) {
+            let inner_base_short = inner_base.trim_start_matches("uvm_pkg::");
+            let canon_inner_sig = self.canonicalize_spec_sig(inner_base_short, &inner_sig);
+            if !canon_inner_sig.is_empty() {
+                format!("{}#({})", inner_base_short, canon_inner_sig)
+            } else {
+                inner_base_short.to_string()
+            }
+        } else {
+            let short = frag_norm.to_string();
+            if let Some(cd) = self.get_class_def(&short) {
+                if !cd.param_order.is_empty() {
+                    let canon_inner_sig = self.canonicalize_spec_sig(&short, "");
+                    if !canon_inner_sig.is_empty() {
+                        return format!("{}#({})", short, canon_inner_sig);
+                    }
+                }
+            }
+            short
+        }
+    }
+
     fn canonicalize_spec_sig(&self, class_name: &str, sig: &str) -> String {
         // Clone the small vecs we need so the `&self` borrow in
         // `expr_to_spec_fragment` below doesn't conflict.
+        let class_key = if self.module.classes.contains_key(class_name) {
+            class_name.to_string()
+        } else {
+            format!("uvm_pkg::{}", class_name)
+        };
         let (order, tp_defaults, v_defaults): (
             Vec<String>,
             Vec<(String, String)>,
             Vec<(String, Option<crate::ast::expr::Expression>)>,
-        ) = match self.module.classes.get(class_name) {
+        ) = match self.module.classes.get(&class_key) {
             Some(cd) => (
                 cd.param_order.clone(),
                 cd.type_param_defaults.clone(),
@@ -57505,7 +57627,8 @@ impl Simulator {
             }
             break; // no default for this position — stop (leave partial)
         }
-        frags.join(",")
+        let canon_frags: Vec<String> = frags.iter().map(|f| self.canonicalize_spec_frag(f)).collect();
+        canon_frags.join(",")
     }
 
     /// For a STATIC queue/associative/dynamic-array property of a
@@ -57588,10 +57711,12 @@ impl Simulator {
                     // inherited by `uvm_object_registry#(T,Tname)`).
                     let key = match &self.current_spec {
                         Some((base, sig))
-                            if (*base == cname
-                                || self.class_extends(base, &cname))
-                                && self.class_is_parameterized(&cname) =>
+                            if (base.trim_start_matches("uvm_pkg::") == cname.trim_start_matches("uvm_pkg::")
+                                || self.class_extends(base.trim_start_matches("uvm_pkg::"), cname.trim_start_matches("uvm_pkg::")))
+                                && self.class_is_parameterized(cname.trim_start_matches("uvm_pkg::")) =>
                         {
+                            let base_short = base.trim_start_matches("uvm_pkg::");
+                            let cname_short = cname.trim_start_matches("uvm_pkg::");
                             // For inherited statics (cname != base), derive
                             // the DECLARING class's specialization from the
                             // leaf spec. This ensures that
@@ -57599,18 +57724,21 @@ impl Simulator {
                             // `uvm_callbacks#(T,uvm_callback)` — which both
                             // extend `uvm_typed_callbacks#(T)` — share the
                             // same `m_tw_cb_q` static cell.
-                            if *base == cname {
-                                format!("{}#{}::{}", base, self.canonicalize_spec_sig(base, sig), prop)
+                            if base_short == cname_short {
+                                format!("{}#{}::{}", cname_short, self.canonicalize_spec_sig(cname_short, sig), prop)
                             } else if let Some(ancestor_sig) =
-                                self.ancestor_spec(base, sig, &cname)
+                                self.ancestor_spec(base_short, sig, cname_short)
                             {
-                                format!("{}#{}::{}", cname, self.canonicalize_spec_sig(&cname, &ancestor_sig), prop)
+                                format!("{}#{}::{}", cname_short, self.canonicalize_spec_sig(cname_short, &ancestor_sig), prop)
                             } else {
-                                format!("{}#{}::{}", base, self.canonicalize_spec_sig(base, sig), prop)
+                                format!("{}#{}::{}", base_short, self.canonicalize_spec_sig(base_short, sig), prop)
                             }
                         }
                         _ => format!("{}::{}", cname, prop),
                     };
+                    if prop == "m_inst" || prop == "m_registered" {
+                        eprintln!("[DBG_KEY] start_class={} prop={} key={:?} current_spec={:?}", start_class, prop, key, self.current_spec);
+                    }
                     return Some(key);
                 }
                 cur = cd.extends.clone();
@@ -58908,7 +59036,10 @@ impl Simulator {
     /// `extends` chain; compares parameter-stripped names so `uvm_sequence#(T)`
     /// matches `uvm_sequence`.
     fn class_is_a(&self, derived: &str, base: &str) -> bool {
-        let strip = |s: &str| s.split('#').next().unwrap_or(s).to_string();
+        let strip = |s: &str| {
+            let s_no_pkg = s.strip_prefix("uvm_pkg::").unwrap_or(s);
+            s_no_pkg.split('#').next().unwrap_or(s_no_pkg).to_string()
+        };
         let base = strip(base);
         let mut cur = Some(derived.to_string());
         let mut guard = 0;
@@ -58925,6 +59056,7 @@ impl Simulator {
                 .classes
                 .get(&c)
                 .or_else(|| self.module.classes.get(&strip(&c)))
+                .or_else(|| self.module.classes.get(&format!("uvm_pkg::{}", strip(&c))))
                 .and_then(|cd| cd.extends.clone());
         }
         false
@@ -58968,56 +59100,28 @@ impl Simulator {
         };
         match dest_type {
             Some(dt) => {
-                // The dest may be a TYPE PARAMETER (e.g. `REQ param_t;` inside
-                // uvm_sequencer_param_base::send_request's `$cast(param_t, t)`).
-                // "REQ" is not a real class, so class_is_a would spuriously fail
-                // (SQRSNDREQCAST). Resolve it to the concrete class via the
-                // current instance's bindings; if it can't be resolved to a known
-                // class, don't enforce (stay permissive like the None case).
-                //
-                // When the resolved type is ALREADY a value-parameterized
-                // specialization form (e.g. `special_comp#(1)` — produced by
-                // class_of_var resolving a type param bound to a
-                // value-parameterized class), it is NOT a type-param name and
-                // resolve_type_param_binding returns None. Detect the `#` and
-                // pass it through directly; strip_class_specialization below
-                // extracts the base class for the hierarchy check and retains
-                // the args for the value-param comparison. Without this, the
-                // `None` fallback made `$cast` permissive and accepted an
-                // object of `special_comp#(2)` as a `special_comp#(1)`.
                 let raw = if self.module.classes.contains_key(&dt) || dt.contains('#') {
-                    dt
+                    dt.clone()
                 } else {
                     match self.resolve_type_param_binding(&dt) {
                         Some(c) => c,
                         None => return true,
                     }
                 };
-                // The resolved type may be a VALUE-PARAMETERIZED
-                // specialization like `special_comp#(2)` (a type param bound
-                // to a parameterized class). Strip the `#(args)` to get the
-                // base class for the hierarchy check, and retain the args
-                // text for the value-param comparison below. Without this,
-                // `special_comp#(2)` is not in `module.classes`, so the dest
-                // type is unknown and `$cast` falls back to permissive —
-                // leaking a `special_comp#(2)` typewide callback onto a
-                // `special_comp#(1)` instance (a UVM callbacks specialization case).
                 let (base, spec_args_from_name) = Self::strip_class_specialization(&raw);
                 let resolved = if self.module.classes.contains_key(&base) {
                     base
+                } else if self.module.classes.contains_key(&format!("uvm_pkg::{}", base)) {
+                    format!("uvm_pkg::{}", base)
                 } else {
                     return true;
                 };
-                if !self.class_is_a(&src_class, &resolved) {
+                let is_a = self.class_is_a(&src_class, &resolved);
+                if !is_a {
                     return false;
                 }
-                // Value-parameter specialization check: if the dest class
-                // has value parameters, src and dest must agree on every
-                // one (e.g. $cast(me[special_comp#(2)], a1[#1]) must fail).
-                // Dest value bindings come from the resolved name's `#(...)`
-                // (type-param-dest case) or the dest var's declared
-                // `#(...)` type_args (direct-decl case).
-                self.cast_value_params_ok(&resolved, spec_args_from_name.as_deref(), dest, h)
+                let vp_ok = self.cast_value_params_ok(&resolved, spec_args_from_name.as_deref(), dest, h);
+                vp_ok
             }
             None => true, // unknown dest type — stay permissive
         }
@@ -60125,7 +60229,16 @@ impl Simulator {
                             }
                         }
                     }
-                    if self.module.classes.contains_key(&name) {
+                    if let Some((base, sig)) = self.extract_spec_from_string(&name) {
+                        self.ensure_spec_statics(&base, &sig);
+                        let saved = self.current_spec.take();
+                        self.current_spec = Some((base.clone(), sig));
+                        let res = self.exec_static_method(&base, mname, args);
+                        self.current_spec = saved;
+                        if let Some(v) = res {
+                            return v;
+                        }
+                    } else if self.module.classes.contains_key(&name) {
                         if let Some(res) = self.exec_static_method(&name, mname, args) {
                             return res;
                         }
@@ -61487,7 +61600,17 @@ impl Simulator {
                             }
                         }
                     }
-                    if self.module.classes.contains_key(obj_name) {
+                    if let Some((base, sig)) = self.extract_spec_from_string(obj_name) {
+                        self.ensure_spec_statics(&base, &sig);
+                        let saved = self.current_spec.take();
+                        self.current_spec = Some((base.clone(), sig));
+                        let m = method_name.clone();
+                        let res = self.exec_static_method(&base, &m, args);
+                        self.current_spec = saved;
+                        if let Some(v) = res {
+                            return v;
+                        }
+                    } else if self.module.classes.contains_key(obj_name) {
                         let cls = obj_name.clone();
                         let m = method_name.clone();
                         if let Some(res) = self.exec_static_method(&cls, &m, args) {
@@ -62296,6 +62419,7 @@ impl Simulator {
             }
             return Value::from_string("");
         }
+
         // Set up local scope with parameters
         let mut locals = HashMap::default();
         self.push_queue_frame();
@@ -63952,7 +64076,7 @@ impl Simulator {
             }
         }
         if let Some((base, sig)) = spec {
-            if let Some(cd) = self.module.classes.get(base) {
+            if let Some(cd) = self.get_class_def(base) {
                 if let Some(idx) = cd.type_param_names.iter().position(|p| p == tn) {
                     let frags = Self::split_spec_args(sig);
                     if let Some(v) = frags.get(idx) {
@@ -64140,7 +64264,8 @@ impl Simulator {
             })
             .collect::<Vec<_>>()
             .join(",");
-        Some((base, resolved))
+        let canon_sig = self.canonicalize_spec_sig(&base, &resolved);
+        Some((base, canon_sig))
     }
 
     /// Remove whitespace outside of double-quoted string literals so that
@@ -64148,9 +64273,10 @@ impl Simulator {
     /// reconstruction `special_comp # ( 1 )` vs a typedef-resolved
     /// `special_comp#(1)`) key to the same per-spec static cell.
     fn normalize_spec_ws(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
+        let s_norm = s.replace("uvm_pkg::", "");
+        let mut out = String::with_capacity(s_norm.len());
         let mut in_str = false;
-        for ch in s.chars() {
+        for ch in s_norm.chars() {
             if ch == '"' {
                 in_str = !in_str;
                 out.push(ch);
@@ -64309,14 +64435,23 @@ impl Simulator {
             };
             if let Some(raw_sig) = raw_sig {
                 let sig = self.canonicalize_spec_sig(&class_name_owned, &raw_sig);
-                // An all-default class whose defaults are unrenderable yields
-                // an empty sig; keep the previous unspecialized behavior then
-                // rather than key an empty specialization.
-                if !sig.is_empty() {
-                    computed_spec = Some((class_name_owned.clone(), sig.clone()));
+                let effective_sig = if sig.is_empty() {
+                    let class_key = if self.module.classes.contains_key(&class_name_owned) {
+                        class_name_owned.clone()
+                    } else {
+                        format!("uvm_pkg::{}", class_name_owned)
+                    };
+                    self.module.classes.get(&class_key).map(|cd| {
+                        cd.type_param_defaults.iter().map(|(_, d)| d.as_str()).collect::<Vec<_>>().join(",")
+                    }).unwrap_or_default()
+                } else {
+                    sig.clone()
+                };
+                if !effective_sig.is_empty() {
+                    computed_spec = Some((class_name_owned.clone(), effective_sig.clone()));
                     let saved = self.current_spec.take();
-                    self.current_spec = Some((class_name_owned.clone(), sig.clone()));
-                    self.ensure_spec_statics(&class_name_owned, &sig);
+                    self.current_spec = Some((class_name_owned.clone(), effective_sig.clone()));
+                    self.ensure_spec_statics(&class_name_owned, &effective_sig);
                     self.current_spec = saved;
                 }
             }
@@ -64624,8 +64759,11 @@ impl Simulator {
         // value-parameter lookups in later virtual calls.
         let active_spec = self.current_spec.clone().or(computed_spec.clone());
         if let Some((b, sig)) = active_spec {
-            if b == class_def.name {
-                instance.spec = Some((b, sig));
+            let b_short = b.trim_start_matches("uvm_pkg::");
+            let c_short = class_def.name.trim_start_matches("uvm_pkg::");
+            let c_base = c_short.split('#').next().unwrap_or(c_short);
+            if b_short == c_base {
+                instance.spec = Some((b.clone(), sig));
             }
         }
         self.heap.push(Some(instance));
