@@ -57736,9 +57736,7 @@ impl Simulator {
                         }
                         _ => format!("{}::{}", cname, prop),
                     };
-                    if prop == "m_inst" || prop == "m_registered" {
-                        eprintln!("[DBG_KEY] start_class={} prop={} key={:?} current_spec={:?}", start_class, prop, key, self.current_spec);
-                    }
+
                     return Some(key);
                 }
                 cur = cd.extends.clone();
@@ -71747,6 +71745,19 @@ impl Simulator {
                         if super::elaborate::is_type_signed(&port.data_type) {
                             val.is_signed = true;
                         }
+                        if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+                            let type_name = tn.name.name.clone();
+                            if self.module.enum_members.contains_key(&type_name)
+                                || self.module.enum_members.contains_key(&format!("uvm_pkg::{}", type_name))
+                                || self.module.typedefs.contains_key(&type_name)
+                            {
+                                self.var_typedef_types.insert(port.name.name.clone(), type_name);
+                            } else if self.module.classes.contains_key(&type_name)
+                                || self.module.classes.contains_key(&format!("uvm_pkg::{}", type_name))
+                            {
+                                self.var_class_types.insert(port.name.name.clone(), type_name.clone());
+                            }
+                        }
                         locals.insert(port.name.name.clone(), val);
                     }
                     if let Some(rn) = &fn_ret_name {
@@ -72200,10 +72211,17 @@ impl Simulator {
     /// is the instruction-name enum the lookup is almost always for).
     fn enum_value_name(&self, value: u64, type_hint: Option<&str>) -> Option<String> {
         if let Some(t) = type_hint {
-            if let Some(members) = self.module.enum_members.get(t) {
-                for (n, v) in members {
-                    if *v == value {
-                        return Some(n.clone());
+            let keys = [
+                t.to_string(),
+                format!("uvm_pkg::{}", t),
+                t.trim_start_matches("uvm_pkg::").to_string(),
+            ];
+            for k in &keys {
+                if let Some(members) = self.module.enum_members.get(k) {
+                    for (n, v) in members {
+                        if *v == value {
+                            return Some(n.clone());
+                        }
                     }
                 }
             }
