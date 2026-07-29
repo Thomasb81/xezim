@@ -33581,58 +33581,53 @@ impl Simulator {
                     let r = self.eval_expr_ctx(right, ctx_width);
                     return l.logic_or(&r);
                 }
-                // Unpacked array equality/inequality
+                // Unpacked array equality/inequality (§11.4.5) on fixed-size
+                // arrays — module-level OR class-property, accessed as bare
+                // `a`, `this.a`, or `obj.a`. `rhs_.sa == lhs.sa` in a class
+                // method (UVM `do_compare`) is the common case.
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
-                    if let (ExprKind::Ident(lhier), ExprKind::Ident(rhier)) =
-                        (&left.kind, &right.kind)
+                    if let (Some((ln, llo, lhi)), Some((rn, rlo, rhi))) =
+                        (self.fixed_array_operand(left), self.fixed_array_operand(right))
                     {
-                        let ln = self.resolve_hier_name(lhier);
-                        let rn = self.resolve_hier_name(rhier);
-                        if self.module.arrays.contains_key(&ln)
-                            && self.module.arrays.contains_key(&rn)
-                        {
-                            let (llo, lhi, _) = self.module.arrays[&ln];
-                            let (rlo, rhi, _) = self.module.arrays[&rn];
-                            let lsize = (lhi - llo + 1) as usize;
-                            let rsize = (rhi - rlo + 1) as usize;
-                            if lsize != rsize {
-                                return Value::from_u64(
-                                    if matches!(op, BinaryOp::Eq) { 0 } else { 1 },
-                                    1,
-                                );
-                            }
-                            let l_desc = self.module.descending_arrays.contains(&ln);
-                            let r_desc = self.module.descending_arrays.contains(&rn);
-                            let mut equal = true;
-                            for i in 0..lsize {
-                                let lidx = if l_desc {
-                                    lhi - i as i64
-                                } else {
-                                    llo + i as i64
-                                };
-                                let ridx = if r_desc {
-                                    rhi - i as i64
-                                } else {
-                                    rlo + i as i64
-                                };
-                                let lv = self
-                                    .get_signal_value_by_name(&format!("{}[{}]", ln, lidx))
-                                    .unwrap_or(Value::zero(1));
-                                let rv = self
-                                    .get_signal_value_by_name(&format!("{}[{}]", rn, ridx))
-                                    .unwrap_or(Value::zero(1));
-                                if lv != rv {
-                                    equal = false;
-                                    break;
-                                }
-                            }
-                            let r = if matches!(op, BinaryOp::Eq) {
-                                equal
-                            } else {
-                                !equal
-                            };
-                            return Value::from_u64(if r { 1 } else { 0 }, 1);
+                        let lsize = (lhi - llo + 1) as usize;
+                        let rsize = (rhi - rlo + 1) as usize;
+                        if lsize != rsize {
+                            return Value::from_u64(
+                                if matches!(op, BinaryOp::Eq) { 0 } else { 1 },
+                                1,
+                            );
                         }
+                        let l_desc = self.module.descending_arrays.contains(&ln);
+                        let r_desc = self.module.descending_arrays.contains(&rn);
+                        let mut equal = true;
+                        for i in 0..lsize {
+                            let lidx = if l_desc {
+                                lhi - i as i64
+                            } else {
+                                llo + i as i64
+                            };
+                            let ridx = if r_desc {
+                                rhi - i as i64
+                            } else {
+                                rlo + i as i64
+                            };
+                            let lv = self
+                                .get_signal_value_by_name(&format!("{}[{}]", ln, lidx))
+                                .unwrap_or(Value::zero(1));
+                            let rv = self
+                                .get_signal_value_by_name(&format!("{}[{}]", rn, ridx))
+                                .unwrap_or(Value::zero(1));
+                            if lv != rv {
+                                equal = false;
+                                break;
+                            }
+                        }
+                        let r = if matches!(op, BinaryOp::Eq) {
+                            equal
+                        } else {
+                            !equal
+                        };
+                        return Value::from_u64(if r { 1 } else { 0 }, 1);
                     }
                 }
                 let is_arith_or_bitwise = matches!(
@@ -50486,6 +50481,50 @@ impl Simulator {
     fn set_queue_size(&mut self, obj_name: &str, size: u64) {
         self.signals
             .insert(format!("{}.size", obj_name), Value::from_u64(size, 32));
+    }
+
+    /// Resolve a whole fixed-size (unpacked) array operand — used by unpacked-
+    /// array equality (§11.4.5) — to its element storage name and inclusive
+    /// index range. Handles module-level arrays (`module.arrays`) and class-
+    /// property fixed arrays reached as a bare `member` inside a method,
+    /// `this.member`, or `obj.member` (storage is instance-scoped
+    /// `<handle>#member[<i>]`). Returns `None` for non-fixed-array operands
+    /// (dynamic/queue/assoc/scalars) so the caller can fall through.
+    fn fixed_array_operand(&mut self, expr: &Expression) -> Option<(String, i64, i64)> {
+        // Class-property fixed array via any collection-resolvable shape
+        // (bare `member`, `this.member`, `obj.member`, flattened `obj.member`).
+        if let Some(scoped) = self.expr_assoc_name(expr) {
+            if let Some((hstr, member)) = scoped.split_once('#') {
+                if let Ok(h) = hstr.parse::<usize>() {
+                    let cn = self
+                        .heap
+                        .get(h)
+                        .and_then(|o| o.as_ref())
+                        .map(|inst| inst.class_name.clone());
+                    if let Some(cn) = cn {
+                        let mut cur = Some(cn);
+                        while let Some(c) = cur {
+                            if let Some(cd) = self.module.classes.get(&c) {
+                                if let Some(&(lo, hi, _)) = cd.array_properties.get(member) {
+                                    return Some((scoped, lo, hi));
+                                }
+                                cur = cd.extends.clone();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Module-level fixed array (bare Ident).
+        if let ExprKind::Ident(h) = &expr.kind {
+            let name = self.resolve_hier_name(h);
+            if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
+                return Some((name, lo, hi));
+            }
+        }
+        None
     }
 
     /// IEEE 1800-2023 §18.14 — the stream every random draw must come from.
