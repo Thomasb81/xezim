@@ -59996,6 +59996,26 @@ impl Simulator {
         false
     }
 
+    /// Does receiver expression `recv` denote a class handle whose type — or
+    /// any ancestor via `extends` — declares a method named `mname`?
+    ///
+    /// Used to keep the §6.16 built-in *string* methods (`compare`,
+    /// `icompare`, `putc`, `itoa`, `tolower`, `atoi`, …) from shadowing a
+    /// USER-DEFINED class method of the same name. The headline case is UVM:
+    /// `uvm_object::compare(rhs)` is inherited by every UVM object, yet
+    /// without this guard `obj.compare(other)` silently ran the lexicographic
+    /// `string::compare` builtin (returning -1/0/1) instead of the user
+    /// method — so `d1.compare(d2)` looked "equal" and
+    /// `03data/10comparer/20nullobj` failed. Mirrors the per-name `name()`
+    /// guard below, but walks the inheritance chain (`class_has_method`) so
+    /// inherited methods like `uvm_object::compare` are detected.
+    fn class_expr_has_method(&self, recv: &Expression, mname: &str) -> bool {
+        self.get_expr_type_name(recv)
+            .as_deref()
+            .map(|tn| self.class_has_method(tn, mname))
+            .unwrap_or(false)
+    }
+
     /// Is class `derived` the same as, or a subclass of, `base`? Walks the
     /// `extends` chain; compares parameter-stripped names so `uvm_sequence#(T)`
     /// matches `uvm_sequence`.
@@ -61049,8 +61069,12 @@ impl Simulator {
                     }
                 }
             }
-            // String case conversion.
-            if matches!(mname, "tolower" | "toupper") && args.is_empty() {
+            // String case conversion. Guarded: a user class method named
+            // `tolower`/`toupper` must win over the string builtin.
+            if matches!(mname, "tolower" | "toupper")
+                && args.is_empty()
+                && !self.class_expr_has_method(expr, mname)
+            {
                 let s = self.eval_expr(expr).to_sv_string();
                 let r = if mname == "tolower" {
                     s.to_lowercase()
@@ -61059,13 +61083,22 @@ impl Simulator {
                 };
                 return Value::from_string(&r);
             }
-            // §6.16.4 putc / §6.16.10 itoa-family / §6.16.9 atoreal.
-            if let Some(v) = self.string_method(expr, mname, args) {
-                return v;
+            // §6.16.4 putc / §6.16.10 itoa-family / §6.16.9 atoreal. A
+            // user-defined class method of the same name (e.g. UVM's
+            // inherited `uvm_object::compare`) must NOT be shadowed by these
+            // string builtins.
+            if !self.class_expr_has_method(expr, mname) {
+                if let Some(v) = self.string_method(expr, mname, args) {
+                    return v;
+                }
             }
             // String-to-number conversions (IEEE 1800-2023 §6.16.9). Parse the
             // longest valid numeric prefix in the given radix; 0 on no match.
-            if matches!(mname, "atoi" | "atohex" | "atooct" | "atobin") && args.is_empty() {
+            // Guarded against a user class method of the same name.
+            if matches!(mname, "atoi" | "atohex" | "atooct" | "atobin")
+                && args.is_empty()
+                && !self.class_expr_has_method(expr, mname)
+            {
                 let s = self.eval_expr(expr).to_sv_string();
                 let s = s.trim();
                 let (neg, body) = if let Some(rest) = s.strip_prefix('-') {
@@ -61914,8 +61947,13 @@ impl Simulator {
                     cached_resolved_name: std::cell::OnceCell::new(),
                 };
                 let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
-                if let Some(v) = self.string_method(&base_expr, &m, args) {
-                    return v;
+                // Guarded: a user class method (e.g. UVM's inherited
+                // `uvm_object::compare`) must NOT be shadowed by the string
+                // builtins dispatched by `string_method`.
+                if !self.class_expr_has_method(&base_expr, &m) {
+                    if let Some(v) = self.string_method(&base_expr, &m, args) {
+                        return v;
+                    }
                 }
             }
             if len >= 2
@@ -62032,7 +62070,9 @@ impl Simulator {
                     }
                     // else: class with a user `name()` method — fall through
                     // to the static/virtual method dispatch below.
-                } else if m == "tolower" || m == "toupper" {
+                } else if (m == "tolower" || m == "toupper")
+                    && !self.class_expr_has_method(&base_expr, &m)
+                {
                     let s = self.eval_expr(&base_expr).to_sv_string();
                     let r = if m == "tolower" {
                         s.to_lowercase()
@@ -62040,7 +62080,9 @@ impl Simulator {
                         s.to_uppercase()
                     };
                     return Value::from_string(&r);
-                } else if matches!(m.as_str(), "atoi" | "atohex" | "atooct" | "atobin") {
+                } else if matches!(m.as_str(), "atoi" | "atohex" | "atooct" | "atobin")
+                    && !self.class_expr_has_method(&base_expr, &m)
+                {
                     // atoi / atohex / atooct / atobin only — the enum-method
                     // names (first/last/next/prev/num) that also enter this
                     // block must NOT fall through to the string-to-number
