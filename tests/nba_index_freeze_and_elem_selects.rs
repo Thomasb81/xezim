@@ -45,22 +45,31 @@ fn nba_target_indices_freeze_at_schedule_time() {
     let src = r#"
 module top;
   bit clk;
+  logic rst_n;
   always #5 clk = ~clk;
   logic [3:0] flat;
   logic [1:0] unp [0:1];
   logic [1:0][1:0] pk;
   int flat_r, unp_r, pk_r;
-  initial begin
-    flat = '0; unp[0] = 2'b11; unp[1] = 2'b00; pk = 4'b0011;
-  end
+  // Reset value driven from INSIDE the same block: every variable has exactly
+  // one driver, so the shape is legal SV (§9.2.2.4) and portable to any
+  // simulator rather than only running here.
   always_ff @(posedge clk) begin
-    for (int j = 0; j < 4; j++) flat[j] <= 1'b1;
-    for (int j = 0; j < 2; j++) unp[1][j] <= unp[0][j];
-    for (int j = 0; j < 2; j++) pk[1][j] <= pk[0][j];
+    if (!rst_n) begin
+      flat <= '0; unp[0] <= 2'b11; unp[1] <= 2'b00; pk <= 4'b0011;
+    end
+    else begin
+      for (int j = 0; j < 4; j++) flat[j] <= 1'b1;
+      for (int j = 0; j < 2; j++) unp[1][j] <= unp[0][j];
+      for (int j = 0; j < 2; j++) pk[1][j] <= pk[0][j];
+    end
   end
   initial begin
-    repeat (3) @(posedge clk);
-    flat_r = flat; unp_r = unp[1]; pk_r = pk[1];
+    rst_n = 0;
+    repeat (2) @(posedge clk);
+    #1 rst_n = 1;
+    repeat (4) @(posedge clk);
+    #1 flat_r = flat; unp_r = unp[1]; pk_r = pk[1];
     $finish;
   end
 endmodule
@@ -78,21 +87,27 @@ fn unpacked_element_bit_write_lands() {
     let src = r#"
 module top;
   bit clk;
+  logic rst_n;
   always #5 clk = ~clk;
   logic [1:0] q1 [0:1];
   logic [1:0] q2 [0:1];
   int q1_r, q2_r;
-  initial begin
-    q1[0] = 2'b11; q1[1] = 2'b00;
-    q2[0] = 2'b11; q2[1] = 2'b00;
-  end
   always_ff @(posedge clk) begin
-    q1[1][0] <= q1[0][0];  q1[1][1] <= q1[0][1];   // NBA
-    q2[1][0]  = q2[0][0];  q2[1][1]  = q2[0][1];   // blocking
+    if (!rst_n) begin
+      q1[0] <= 2'b11; q1[1] <= 2'b00;
+      q2[0] <= 2'b11; q2[1] <= 2'b00;
+    end
+    else begin
+      q1[1][0] <= q1[0][0];  q1[1][1] <= q1[0][1];   // NBA
+      q2[1][0]  = q2[0][0];  q2[1][1]  = q2[0][1];   // blocking
+    end
   end
   initial begin
-    repeat (3) @(posedge clk);
-    q1_r = q1[1]; q2_r = q2[1];
+    rst_n = 0;
+    repeat (2) @(posedge clk);
+    #1 rst_n = 1;
+    repeat (4) @(posedge clk);
+    #1 q1_r = q1[1]; q2_r = q2[1];
     $finish;
   end
 endmodule
@@ -109,19 +124,25 @@ fn unpacked_element_lane_write_uses_element_width() {
     let src = r#"
 module top;
   bit clk;
+  logic rst_n;
   always #5 clk = ~clk;
   logic [1:0][7:0] q [0:1];
   int lane0, lane1;
-  initial begin
-    q[0][0] = 8'hA5; q[0][1] = 8'h3C;
-    q[1][0] = 8'h00; q[1][1] = 8'h00;
-  end
   always_ff @(posedge clk) begin
-    for (int j = 0; j < 2; j++) q[1][j] <= q[0][j];
+    if (!rst_n) begin
+      q[0][0] <= 8'hA5; q[0][1] <= 8'h3C;
+      q[1][0] <= 8'h00; q[1][1] <= 8'h00;
+    end
+    else begin
+      for (int j = 0; j < 2; j++) q[1][j] <= q[0][j];
+    end
   end
   initial begin
-    repeat (3) @(posedge clk);
-    lane0 = q[1][0]; lane1 = q[1][1];
+    rst_n = 0;
+    repeat (2) @(posedge clk);
+    #1 rst_n = 1;
+    repeat (4) @(posedge clk);
+    #1 lane0 = q[1][0]; lane1 = q[1][1];
     $finish;
   end
 endmodule
