@@ -9654,6 +9654,15 @@ impl Simulator {
             // (~2.5ms per toggle on c910). Detect this pattern, apply
             // the seed assignment immediately, and register a ClockGen
             // so `fire_clock_generators` can toggle the signal O(1).
+            // The detection below EVALUATES the block's seed RHS, and that
+            // eval memoizes each bare name's resolution on its AST node. It
+            // must therefore run under THIS block's scope — the hint still
+            // holds whatever the previous block (or any earlier compile-time
+            // eval) left, and a bare wildcard-imported constant resolved once
+            // under a sibling's scope stays wrong for the whole run: `user`'s
+            // enum member `C` permanently read `shadower`'s local `int C`.
+            *self.name_resolve_hint.borrow_mut() =
+                (!scope.is_empty()).then(|| scope.clone());
             if let Some(cg) = self.try_extract_initial_clock_gen(&stmts) {
                 self.clock_generators.push(cg);
                 continue;
@@ -13104,9 +13113,25 @@ impl Simulator {
                         }
                     }
                     // Mirror the comb path's `sens_reads = reads - writes`.
-                    b_reads
+                    let reads_covered = b_reads
                         .difference(&b_writes)
-                        .all(|r| resolve_ids(r.as_str()).iter().all(|id| sens_ids.contains(id)))
+                        .all(|r| resolve_ids(r.as_str()).iter().all(|id| sens_ids.contains(id)));
+                    // The reverse must hold too: every LISTED signal has to be
+                    // in the derived read set, or the comb path silently drops
+                    // it from the sensitivity. `always @(a) t = $time;` reads
+                    // no signal at all, so the containment above passes
+                    // VACUOUSLY, the entry's read set came out empty, and the
+                    // block fired exactly once (at t0) — every later edge of
+                    // `a` was missed and the captured time stayed 0. Routing
+                    // the not-equal case to the edge path costs a little speed
+                    // for an unusual shape and follows §9.4.2 exactly.
+                    let read_id_union: std::collections::HashSet<usize> = b_reads
+                        .difference(&b_writes)
+                        .flat_map(|r| resolve_ids(r.as_str()))
+                        .collect();
+                    let sens_covered =
+                        sens_ids.iter().all(|id| read_id_union.contains(id));
+                    reads_covered && sens_covered
                 };
                 if all_level
                     && !has_named_event
@@ -16198,7 +16223,18 @@ impl Simulator {
                 CombItem::FusedGate { op }
             } else if let Some(dc_val) = direct_copy {
                 dc_val
-            } else if wids.len() == 1 && lhs_is_bare_ident && struct_member_base_id.is_none() {
+            } else if wids.len() == 1
+                && lhs_is_bare_ident
+                && struct_member_base_id.is_none()
+                // A specify/SDF path delay on the destination must route the
+                // write through the delayed-update scheduler. The bytecode's
+                // writeback commits immediately, so compiling here dropped the
+                // delay for any non-trivial RHS: the DirectCopy/fused-gate
+                // paths already refuse a delayed dst, but a cell whose output
+                // is `assign y = a & b;` (every behavioral gate model) took
+                // this branch and its `(a => y) = 3` specify was ignored.
+                && self.sdf_delays.get(wids[0]).copied().unwrap_or(0) == 0
+            {
                 let dst_id = wids[0];
                 let width = self.signal_widths[dst_id];
                 let mut compiler = super::bytecode::BytecodeCompiler::new(
@@ -23181,6 +23217,16 @@ impl Simulator {
 
     fn run_process_stmts(&mut self, pid: usize, stmts: &[Statement]) {
         self.current_pid = pid;
+        // Install THIS process's own instance scope as the resolution hint.
+        // The hint is transient sibling-scope state: the previous process (or
+        // a $display argument it evaluated) may have left its scope behind,
+        // and a bare name in this process would then resolve into THAT
+        // instance — `user`'s wildcard-imported enum member `C` read the
+        // sibling `shadower`'s local `int C` (truncated to the enum's width)
+        // purely because shadower's process happened to run first. The reset
+        // helper already existed for loop re-entry; a fresh activation needs
+        // it just as much.
+        self.reset_hint_to_process_scope();
         // Track run_process_stmts recursion depth so the suspend-aware loop
         // handlers (While/For/Repeat below) can trampoline through the event
         // queue instead of recursing when a synchronous loop body never
@@ -25625,6 +25671,31 @@ impl Simulator {
             }
             _ => e.clone(),
         }
+    }
+
+    /// True when an NBA's target is an ASSOCIATIVE-array element (module-level
+    /// `aa[k]`, a class member `m[k]` / `obj.m[k]`, or a static collection).
+    ///
+    /// Those lvalues have no signal id, so the NBA rode the expression queue —
+    /// where the value was first cut to `infer_lhs_width`, which knows nothing
+    /// about an assoc element and answered 1. Every `aa[key] <= v` therefore
+    /// committed the LOW BIT of v (sign-extended: 11 arrived as -1), while the
+    /// blocking form stored v at its own width. The queue now skips the resize
+    /// for these targets, restoring blocking/NBA parity.
+    fn nba_target_is_assoc_elem(&mut self, lvalue: &Expression) -> bool {
+        let ExprKind::Index { expr: base, .. } = &lvalue.kind else {
+            return false;
+        };
+        if self.expr_assoc_name(base).is_some() {
+            return true;
+        }
+        if let ExprKind::Ident(h) = &base.kind {
+            let n = self.resolve_hier_name(h);
+            if self.is_associative_array(&n) {
+                return true;
+            }
+        }
+        false
     }
 
     fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
@@ -38989,9 +39060,14 @@ impl Simulator {
                         self.assign_value(lvalue, &val.resize_for_assign(w));
                     } else {
                         let frozen = self.freeze_lvalue_indices(lvalue);
+                        let qval = if self.nba_target_is_assoc_elem(lvalue) {
+                            val.clone()
+                        } else {
+                            val.resize_for_assign(w)
+                        };
                         self.nba_queue.push(NbaEntry {
                             lhs: Some(frozen),
-                            value: val.resize_for_assign(w),
+                            value: qval,
                             resolved_id: None,
                         });
                     }
@@ -39002,9 +39078,14 @@ impl Simulator {
                         .push((self.time + d, id, val.resize_for_assign(w)));
                 } else {
                     let frozen = self.freeze_lvalue_indices(lvalue);
+                    let qval = if self.nba_target_is_assoc_elem(lvalue) {
+                        val.clone()
+                    } else {
+                        val.resize_for_assign(w)
+                    };
                     self.nba_queue.push(NbaEntry {
                         lhs: Some(frozen),
-                        value: val.resize_for_assign(w),
+                        value: qval,
                         resolved_id: None,
                     });
                 }
