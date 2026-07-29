@@ -402,13 +402,13 @@ macro_rules! sim_dbg_eprintln {
 /// rolling epoch dedups repeat writes within a flush.
 macro_rules! vcd_mark {
     ($self:ident, $id:expr) => {{
-        if $self.vcd_dirty_active {
+        if $self.dump_dirty_active {
             let __vm_id = $id;
-            if __vm_id < $self.vcd_dirty_mark.len()
-                && $self.vcd_dirty_mark[__vm_id] != $self.vcd_dirty_epoch
+            if __vm_id < $self.dump_dirty_mark.len()
+                && $self.dump_dirty_mark[__vm_id] != $self.dump_dirty_epoch
             {
-                $self.vcd_dirty_mark[__vm_id] = $self.vcd_dirty_epoch;
-                $self.vcd_dirty.push(__vm_id as u32);
+                $self.dump_dirty_mark[__vm_id] = $self.dump_dirty_epoch;
+                $self.dump_dirty.push(__vm_id as u32);
             }
         }
     }};
@@ -3348,27 +3348,33 @@ pub struct Simulator {
     /// Last sim time at which each `vcd_trace` entry that is an `event` emitted
     /// its trigger pulse — dedups repeat triggers inside one time slot.
     vcd_event_last: Vec<u64>,
-    /// Incremental (dirty-set) change detection for `vcd_write_changes`. The
-    /// full scan is O(all dumped signals) per timestep; for a large dump where
-    /// few signals move per step (e.g. a 291k-signal gate-level netlist) that
-    /// dominates wall time. Instead every real signal write marks the signal
-    /// dirty (a SUPERSET of actual changes — the prev-value compare in
-    /// vcd_write_changes still guarantees only genuine changes are emitted), so
-    /// the flush visits O(written signals) not O(all). Coverage: both value
-    /// write choke points (the `write_sig!` macro and `after_signal_write`) call
-    /// `vcd_mark_written`; SVA preponed swaps deliberately do not (they restore).
-    /// `vcd_dirty` is the per-flush list of dirty signal ids; `vcd_dirty_mark`
+    /// Incremental (dirty-set) change detection, SHARED by every dump writer
+    /// (VCD, XTrace, FST). The full scan is O(all dumped signals) per timestep;
+    /// for a large dump where few signals move per step (e.g. a 1.5M-signal
+    /// flattened netlist) that dominates wall time — measured at ~19x the cost
+    /// of the simulation itself on c906. Instead every real signal write marks
+    /// the signal dirty (a SUPERSET of actual changes — each writer's
+    /// prev-value compare still guarantees only genuine changes are emitted),
+    /// so a flush visits O(written signals) not O(all). Coverage: both value
+    /// write choke points (the `write_sig!` macro and `after_signal_write`)
+    /// call `vcd_mark!`; SVA preponed swaps deliberately do not (they restore).
+    /// `dump_dirty` is the per-flush list of dirty signal ids; `dump_dirty_mark`
     /// dedups within a flush via a rolling epoch (mark==epoch ⇒ already listed).
-    /// `vcd_id_to_trace` maps a signal id to its (possibly aliased) trace slots.
+    /// The list is consumed by every active writer in `dump_write_changes` and
+    /// cleared once, after the last of them — so the writers must READ it and
+    /// never clear it themselves.
+    /// `vcd_id_to_trace` / `xtrace_id_to_trace` / `fst_id_to_trace` map a signal
+    /// id to that writer's (possibly aliased) trace slots.
     /// `vcd_event_indices` are the event trace slots, always checked (events
     /// fire via event_triggered_time, not signal writes). Disabled — falling
-    /// back to the full scan — via XEZIM_VCD_FULL=1 or when the maps are unbuilt.
-    vcd_dirty: Vec<u32>,
-    vcd_dirty_mark: Vec<u64>,
-    vcd_dirty_epoch: u64,
+    /// back to the full scan — via XEZIM_VCD_FULL=1 / XEZIM_DUMP_FULL=1 or when
+    /// the maps are unbuilt.
+    dump_dirty: Vec<u32>,
+    dump_dirty_mark: Vec<u64>,
+    dump_dirty_epoch: u64,
     vcd_id_to_trace: Vec<Vec<u32>>,
     vcd_event_indices: Vec<usize>,
-    vcd_dirty_active: bool,
+    dump_dirty_active: bool,
     /// §21.7.1.8 `$dumplimit`: byte budget for the dump, and the running
     /// (approximate) count of bytes handed to the sink. `vcd_limit_hit` latches
     /// once the budget is spent and permanently stops the dump.
@@ -3421,7 +3427,10 @@ pub struct Simulator {
     /// Per-traced-NET table: (signal_table index, XTrace signal id). One entry
     /// per backing net — an aliased name (§9.2 `alias=`) has its own id in the
     /// dictionary but emits no deltas of its own.
-    xtrace_trace: Vec<(usize, String)>,
+    xtrace_trace: Vec<(usize, Arc<str>)>,
+    /// Signal id → `xtrace_trace` slots, for the shared incremental dirty-set
+    /// change detection (see the `dump_dirty` field docs). Empty ⇒ full scan.
+    xtrace_id_to_trace: Vec<Vec<u32>>,
     /// Previous emitted value per entry in `xtrace_trace` (parallel vector).
     xtrace_prev_signals: Vec<Value>,
     /// Whether entry `i` of `xtrace_trace` is a `real` (parallel vector): its
@@ -3438,7 +3447,7 @@ pub struct Simulator {
     /// SV `event` objects (signal_table index, XTrace signal id). An event has
     /// no level, so it is NOT in `xtrace_trace`: it emits an §10.4 `X` record
     /// per trigger instead of a value delta.
-    xtrace_events: Vec<(usize, String)>,
+    xtrace_events: Vec<(usize, Arc<str>)>,
     /// Time of the last `X` record emitted for each `xtrace_events` entry, so a
     /// 0→1→0 toggle inside one time slot still counts as exactly one trigger
     /// (mirrors `vcd_event_last`).
@@ -3464,9 +3473,14 @@ pub struct Simulator {
     /// `--xtrace-scope`): keep signals whose name equals or sits under a scope.
     pub fst_scopes: Vec<String>,
     /// The FST body writer (post-header phase). `None` until `fst_start_dump`.
-    fst_writer: Option<FstBodyWriter<std::io::BufWriter<std::fs::File>>>,
+    /// Value packing, block compression and I/O run on a background thread
+    /// (`XEZIM_DUMP_INLINE=1` keeps them here); see `fst_sink::FstSink`.
+    fst_writer: Option<super::fst_sink::FstSink>,
     /// Compact per-net trace table: (signal_table index, FST signal id).
     fst_trace: Vec<(usize, FstSignalId)>,
+    /// Signal id → `fst_trace` slots, for the shared incremental dirty-set
+    /// change detection (see the `dump_dirty` field docs). Empty ⇒ full scan.
+    fst_id_to_trace: Vec<Vec<u32>>,
     /// Previous emitted value per `fst_trace` entry (parallel vector).
     fst_prev_signals: Vec<Value>,
     /// Pre-computed combinatorial entries with sensitivity sets.
@@ -5441,12 +5455,12 @@ impl Simulator {
             vcd_file: None,
             vcd_writer: None,
             vcd_trace: Vec::new(),
-            vcd_dirty: Vec::new(),
-            vcd_dirty_mark: Vec::new(),
-            vcd_dirty_epoch: 1,
+            dump_dirty: Vec::new(),
+            dump_dirty_mark: Vec::new(),
+            dump_dirty_epoch: 1,
             vcd_id_to_trace: Vec::new(),
             vcd_event_indices: Vec::new(),
-            vcd_dirty_active: false,
+            dump_dirty_active: false,
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
@@ -5473,6 +5487,7 @@ impl Simulator {
             xtrace_scopes: Vec::new(),
             xtrace_writer: None,
             xtrace_trace: Vec::new(),
+            xtrace_id_to_trace: Vec::new(),
             xtrace_prev_signals: Vec::new(),
             xtrace_real: Vec::new(),
             xtrace_string: Vec::new(),
@@ -5489,6 +5504,7 @@ impl Simulator {
             fst_scopes: Vec::new(),
             fst_writer: None,
             fst_trace: Vec::new(),
+            fst_id_to_trace: Vec::new(),
             fst_prev_signals: Vec::new(),
             comb_entries: Vec::new(),
             prepared_comb_cache_path: None,
@@ -6790,10 +6806,27 @@ impl Simulator {
         Ok((assigned, k))
     }
 
+    /// Whether `$display`/`$write` output is handed to a background writer.
+    ///
+    /// Default ON, and deliberately decoupled from `--threads`: writing the log
+    /// is pure I/O, so even a single-threaded simulation benefits from moving
+    /// the `write`/`flush` syscalls off the thread that is running the design.
+    /// `XEZIM_DUMP_INLINE=1` (the same switch the waveform sinks honour) keeps
+    /// it on the simulation thread, which is what you want when interleaving
+    /// with stderr has to be exact — the worker writes stdout while diagnostics
+    /// still go straight to stderr, so a combined `--log` file can order two
+    /// adjacent lines differently. Every `$display` still flushes on its
+    /// newline, so the skew is bounded to one line and never reorders stdout
+    /// against itself.
+    fn stdout_threaded(&self) -> bool {
+        std::env::var_os("XEZIM_DUMP_INLINE").is_none()
+    }
+
     #[inline]
     fn stdout_write(&mut self, s: &str) {
+        let threaded = self.stdout_threaded();
         let sink = self.stdout_sink.get_or_insert_with(|| {
-            if self.threads >= 2 {
+            if threaded {
                 super::stdout_sink::StdoutSink::threaded()
             } else {
                 super::stdout_sink::StdoutSink::inline()
@@ -6804,8 +6837,9 @@ impl Simulator {
 
     #[inline]
     fn stdout_writeln(&mut self, s: &str) {
+        let threaded = self.stdout_threaded();
         let sink = self.stdout_sink.get_or_insert_with(|| {
-            if self.threads >= 2 {
+            if threaded {
                 super::stdout_sink::StdoutSink::threaded()
             } else {
                 super::stdout_sink::StdoutSink::inline()
@@ -6814,9 +6848,11 @@ impl Simulator {
         sink.writeln_str(s);
     }
 
+    /// Flush `$display`/`$write` output and WAIT for it to reach the file, so
+    /// anything the caller writes next is ordered after it.
     pub fn flush_stdout(&mut self) {
         if let Some(s) = self.stdout_sink.as_mut() {
-            s.flush();
+            s.sync();
         }
     }
 
@@ -12386,6 +12422,13 @@ impl Simulator {
         self.vcd_finish();
         self.xtrace_finish();
         self.fst_finish();
+        // Barrier before the caller prints its own summary. `$display` output
+        // is on a writer thread; the `[PROF]`/`[PHASE]` lines and the trailing
+        // "Simulation finished at time N" are not, and under `--log` all of them
+        // land in ONE file (stdout and stderr are dup2'd together). Without this
+        // the tail of the simulation's own output can be overtaken by the
+        // summary that is supposed to follow it.
+        self.flush_stdout();
         if std::env::var("XEZIM_RS_STATS").is_ok() {
             xezim_core::value::Value::dump_range_select_stats();
         }
@@ -20698,13 +20741,7 @@ impl Simulator {
             self.finish_deferred = false;
             self.finished = true;
         }
-        self.vcd_write_changes();
-        if self.xtrace_writer.is_some() {
-            self.xtrace_write_changes();
-        }
-        if self.fst_writer.is_some() {
-            self.fst_write_changes();
-        }
+        self.dump_write_changes();
 
         // Condition-waiter fixpoint. A `wait(expr)` on non-signal state (class
         // members / locals — the UVM sequencer arbitration) parked in
@@ -46651,10 +46688,10 @@ impl Simulator {
         // Build the incremental-dump reverse maps (id → trace slots, and the
         // event slots) unless the full scan is forced. When active, every
         // signal write marks the id dirty so vcd_write_changes visits only
-        // written signals; see the field docs on `vcd_dirty`.
+        // written signals; see the field docs on `dump_dirty`.
         let force_full = std::env::var("XEZIM_VCD_FULL").ok().as_deref() == Some("1");
         if force_full {
-            self.vcd_dirty_active = false;
+            self.dump_dirty_active = false;
         } else {
             let nsig = self.signal_table.len();
             let mut id_to_trace: Vec<Vec<u32>> = vec![Vec::new(); nsig];
@@ -46669,10 +46706,82 @@ impl Simulator {
             }
             self.vcd_id_to_trace = id_to_trace;
             self.vcd_event_indices = event_indices;
-            self.vcd_dirty_mark = vec![0u64; nsig];
-            self.vcd_dirty.clear();
-            self.vcd_dirty_epoch = 1;
-            self.vcd_dirty_active = true;
+            self.enable_dump_dirty_tracking();
+        }
+    }
+
+    /// Arm the shared dump dirty set (see the `dump_dirty` field docs). Called
+    /// by every writer that wants incremental change detection; idempotent, so
+    /// a run dumping VCD + XTrace + FST together shares one mark array and one
+    /// dirty list. `XEZIM_DUMP_FULL=1` forces every writer back to a full scan.
+    ///
+    /// A writer that starts MID-RUN is still correct: it seeds its own
+    /// `*_prev_signals` from the current signal table when it opens, so it only
+    /// needs to see writes from that point on, which is exactly what the dirty
+    /// set carries from the next flush onward.
+    fn enable_dump_dirty_tracking(&mut self) {
+        if std::env::var("XEZIM_DUMP_FULL").ok().as_deref() == Some("1") {
+            self.dump_dirty_active = false;
+            return;
+        }
+        if self.dump_dirty_active {
+            return;
+        }
+        let nsig = self.signal_table.len();
+        self.dump_dirty_mark = vec![0u64; nsig];
+        self.dump_dirty.clear();
+        self.dump_dirty_epoch = 1;
+        self.dump_dirty_active = true;
+    }
+
+    /// Build a signal-id → trace-slot reverse map for a writer's trace table.
+    /// A signal can occupy several slots (aliases dumped under more than one
+    /// hierarchical name), so slots are collected per id rather than assumed 1:1.
+    fn build_dump_id_to_trace<T>(&self, trace: &[(usize, T)]) -> Vec<Vec<u32>> {
+        let nsig = self.signal_table.len();
+        let mut id_to_trace: Vec<Vec<u32>> = vec![Vec::new(); nsig];
+        for (idx, (sid, _)) in trace.iter().enumerate() {
+            if *sid < nsig {
+                id_to_trace[*sid].push(idx as u32);
+            }
+        }
+        id_to_trace
+    }
+
+    /// The trace slots a writer must re-check this flush: the slots of every
+    /// signal written since the last flush, sorted and deduped so record order
+    /// within a timestep is byte-identical to the full scan. `None` means the
+    /// caller must fall back to scanning every slot.
+    fn dump_dirty_slots(&self, id_to_trace: &[Vec<u32>]) -> Option<Vec<u32>> {
+        if !self.dump_dirty_active || id_to_trace.is_empty() {
+            return None;
+        }
+        let mut slots: Vec<u32> = Vec::with_capacity(self.dump_dirty.len());
+        for &sid in &self.dump_dirty {
+            let sid = sid as usize;
+            if sid < id_to_trace.len() {
+                slots.extend_from_slice(&id_to_trace[sid]);
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        Some(slots)
+    }
+
+    /// Flush every active dump writer for this time slot, then retire the
+    /// shared dirty set. The writers only READ `dump_dirty` (they each need the
+    /// same list), so the clear + epoch bump happens exactly once, here.
+    fn dump_write_changes(&mut self) {
+        self.vcd_write_changes();
+        if self.xtrace_writer.is_some() {
+            self.xtrace_write_changes();
+        }
+        if self.fst_writer.is_some() {
+            self.fst_write_changes();
+        }
+        if self.dump_dirty_active {
+            self.dump_dirty.clear();
+            self.dump_dirty_epoch = self.dump_dirty_epoch.wrapping_add(1);
         }
     }
 
@@ -46779,29 +46888,22 @@ impl Simulator {
             }};
         }
 
-        if self.vcd_dirty_active {
-            // Incremental: only signals written since the last flush can have
-            // changed. Gather their trace slots plus the (few) event slots
-            // (events fire independently of signal writes), then emit in
-            // trace-index order so the per-timestep record order is byte-
-            // identical to the full scan. Still O(written signals), not O(all).
-            let dirty = std::mem::take(&mut self.vcd_dirty);
-            let mut slots: Vec<u32> = Vec::with_capacity(dirty.len() + self.vcd_event_indices.len());
-            for &sid in &dirty {
-                let sid = sid as usize;
-                if sid < self.vcd_id_to_trace.len() {
-                    slots.extend_from_slice(&self.vcd_id_to_trace[sid]);
-                }
+        // Incremental: only signals written since the last flush can have
+        // changed. Gather their trace slots plus the (few) event slots (events
+        // fire independently of signal writes), then emit in trace-index order
+        // so the per-timestep record order is byte-identical to the full scan.
+        // Still O(written signals), not O(all). The dirty list is retired by
+        // `dump_write_changes` once every writer has read it.
+        let dirty_slots = self.dump_dirty_slots(&self.vcd_id_to_trace);
+        if let Some(mut slots) = dirty_slots {
+            if !self.vcd_event_indices.is_empty() {
+                slots.extend(self.vcd_event_indices.iter().map(|&i| i as u32));
+                slots.sort_unstable();
+                slots.dedup();
             }
-            slots.extend(self.vcd_event_indices.iter().map(|&i| i as u32));
-            slots.sort_unstable();
-            slots.dedup();
             for &idx in &slots {
                 check_slot!(idx as usize);
             }
-            self.vcd_dirty = dirty;
-            self.vcd_dirty.clear();
-            self.vcd_dirty_epoch = self.vcd_dirty_epoch.wrapping_add(1);
         } else {
             // Full scan: walk every dumped trace slot.
             for idx in 0..self.vcd_trace.len() {
@@ -47567,92 +47669,14 @@ impl Simulator {
     ///   shorter than its `$var` width. XTrace defines no such rule anywhere,
     ///   so a partially collapsed vector would be unparseable (nothing tells a
     ///   consumer how many bits were dropped, or what to refill them with).
+    ///
+    /// The implementation lives in `vcd_sink` because the XTrace writer THREAD
+    /// calls it: rendering values to ASCII is the bulk of a dump's cost and the
+    /// background writer exists to absorb it. This wrapper keeps the remaining
+    /// simulator-side call sites (the `N,full` snapshot) reading naturally.
+    #[inline]
     fn xtrace_format_value(val: &Value, is_real: bool, is_string: bool) -> String {
-        if is_string {
-            // §9.3 `str` type + §15.4: a string signal is emitted as a quoted,
-            // escaped literal, not a 1024-bit hex blob. §8.5 escapes only.
-            let mut s = String::with_capacity(val.width as usize / 8 + 2);
-            s.push('"');
-            for b in val.sv_string_bytes() {
-                match b {
-                    b'\\' => s.push_str("\\\\"),
-                    b'"' => s.push_str("\\\""),
-                    b'\n' => s.push_str("\\n"),
-                    b'\t' => s.push_str("\\t"),
-                    // A raw comma inside a quoted value is spec-legal (a parser
-                    // that honours quotes handles it), but XTrace records are
-                    // comma-delimited and design goal #1 is "easy to parse", so
-                    // escape it via §8.5 `\xHH` to stay safe for naive splitters.
-                    b',' => s.push_str("\\x2c"),
-                    0x20..=0x7e => s.push(b as char),
-                    other => s.push_str(&format!("\\x{:02x}", other)),
-                }
-            }
-            s.push('"');
-            return s;
-        }
-        if is_real || val.is_real {
-            return super::vcd_sink::vcd_real_string(val.to_f64());
-        }
-        if val.has_xz() {
-            let w = val.width as usize;
-            // §15.3 compact unknowns: `X` iff EVERY bit is x, `Z` iff every bit
-            // is z. A mixed vector (or one with known bits) keeps full width.
-            let (mut all_x, mut all_z) = (true, true);
-            for i in 0..w {
-                match val.get_bit(i) {
-                    LogicBit::X => all_z = false,
-                    LogicBit::Z => all_x = false,
-                    _ => {
-                        all_x = false;
-                        all_z = false;
-                        break;
-                    }
-                }
-            }
-            if w > 0 && all_x {
-                return "X".to_string();
-            }
-            if w > 0 && all_z {
-                return "Z".to_string();
-            }
-            // Per-bit binary representation preserves X/Z exactly.
-            let mut s = String::with_capacity(w + 2);
-            s.push_str("0b");
-            for i in (0..w).rev() {
-                s.push(match val.get_bit(i) {
-                    LogicBit::Zero => '0',
-                    LogicBit::One => '1',
-                    LogicBit::X => 'X',
-                    LogicBit::Z => 'Z',
-                });
-            }
-            s
-        } else if val.width <= 64 {
-            format!("0x{:x}", val.to_u64().unwrap_or(0))
-        } else {
-            // Wide all-known: emit as hex, MSB first.
-            let mut s = String::with_capacity((val.width as usize).div_ceil(4) + 2);
-            s.push_str("0x");
-            let mut started = false;
-            let nibble_count = (val.width as usize).div_ceil(4);
-            for n in (0..nibble_count).rev() {
-                let mut nib: u32 = 0;
-                for b in 0..4 {
-                    let bit_idx = n * 4 + b;
-                    if bit_idx < val.width as usize {
-                        if let LogicBit::One = val.get_bit(bit_idx) {
-                            nib |= 1 << b;
-                        }
-                    }
-                }
-                if nib != 0 || started || n == 0 {
-                    s.push(char::from_digit(nib, 16).unwrap());
-                    started = true;
-                }
-            }
-            s
-        }
+        super::vcd_sink::xtrace_format_value(val, is_real, is_string)
     }
 
     /// Open the XTrace file and emit the §6 header + `@section dict` + the
@@ -47790,11 +47814,13 @@ impl Simulator {
         }
 
         let mut signal_records: Vec<String> = Vec::with_capacity(entries.len());
-        // The compact per-NET tables reused at t=0 and every step.
-        let mut trace: Vec<(usize, String)> = Vec::new();
+        // The compact per-NET tables reused at t=0 and every step. Dictionary
+        // ids are `Arc<str>` so posting a change to the writer thread clones a
+        // refcount, not the string — this happens millions of times per dump.
+        let mut trace: Vec<(usize, Arc<str>)> = Vec::new();
         let mut reals: Vec<bool> = Vec::new();
         let mut strings: Vec<bool> = Vec::new();
-        let mut events: Vec<(usize, String)> = Vec::new();
+        let mut events: Vec<(usize, Arc<str>)> = Vec::new();
         for (name, tbl_id, sid) in &entries {
             // Walk the parent path once, creating M records on demand; the
             // deepest path component is this signal's module.
@@ -47891,9 +47917,9 @@ impl Simulator {
             if !canonical {
                 attrs.push(format!("alias={}", canon_sid[tbl_id]));
             } else if is_event {
-                events.push((*tbl_id, sid.clone()));
+                events.push((*tbl_id, Arc::from(sid.as_str())));
             } else {
-                trace.push((*tbl_id, sid.clone()));
+                trace.push((*tbl_id, Arc::from(sid.as_str())));
                 reals.push(is_real);
                 strings.push(is_string);
             }
@@ -47983,6 +48009,12 @@ impl Simulator {
             .iter()
             .map(|(id, _)| self.signal_table[*id].clone())
             .collect();
+        // Incremental change detection: narrow each flush to the slots of
+        // signals actually written (see the `dump_dirty` field docs). Shared
+        // with the VCD and FST writers, so a run dumping several formats builds
+        // one dirty list.
+        self.xtrace_id_to_trace = self.build_dump_id_to_trace(&trace);
+        self.enable_dump_dirty_tracking();
         self.xtrace_trace = trace;
         self.xtrace_writer = Some(w);
         self.xtrace_last_time = self.time;
@@ -48076,19 +48108,41 @@ impl Simulator {
             self.xtrace_emit_pending_snapshot();
         }
 
-        // Walk the compact trace table directly; xtrace_prev_signals is a
-        // parallel Vec<Value>, so change detection is a single indexed
-        // compare with no name hashing.
-        let mut changes: Vec<(usize, String)> = Vec::new();
-        for idx in 0..self.xtrace_trace.len() {
-            let id = self.xtrace_trace[idx].0;
-            let val = &self.signal_table[id];
-            if self.xtrace_prev_signals[idx] != *val {
-                changes.push((
-                    idx,
-                    Self::xtrace_format_value(val, self.xtrace_real[idx], self.xtrace_string[idx]),
-                ));
-                self.xtrace_prev_signals[idx] = val.clone();
+        // Change detection. `xtrace_prev_signals` is parallel to `xtrace_trace`,
+        // so each check is one indexed compare with no name hashing — but the
+        // FULL scan is O(all traced signals) per time slot, and an unscoped dump
+        // traces every net in the design (1.56 M on c906), which cost ~19x the
+        // simulation itself. The shared dirty set (see `dump_dirty`) narrows the
+        // walk to the slots of signals actually written since the last flush.
+        // Values are collected UNFORMATTED: the sink's writer thread renders
+        // them (`vcd_sink::write_xtrace_timestep`).
+        let mut changes: Vec<(Arc<str>, Value, bool, bool)> = Vec::new();
+        macro_rules! check_xt_slot {
+            ($idx:expr) => {{
+                let idx = $idx;
+                let id = self.xtrace_trace[idx].0;
+                let val = &self.signal_table[id];
+                if self.xtrace_prev_signals[idx] != *val {
+                    changes.push((
+                        self.xtrace_trace[idx].1.clone(),
+                        val.clone(),
+                        self.xtrace_real[idx],
+                        self.xtrace_string[idx],
+                    ));
+                    self.xtrace_prev_signals[idx] = val.clone();
+                }
+            }};
+        }
+        match self.dump_dirty_slots(&self.xtrace_id_to_trace) {
+            Some(slots) => {
+                for &idx in &slots {
+                    check_xt_slot!(idx as usize);
+                }
+            }
+            None => {
+                for idx in 0..self.xtrace_trace.len() {
+                    check_xt_slot!(idx);
+                }
             }
         }
 
@@ -48097,9 +48151,11 @@ impl Simulator {
         // behaviour) emitted 0x1, 0x0, 0x1 — the second trigger read back as
         // "no event", and a trigger whose 0→1→0 toggle cancelled inside one
         // time slot emitted nothing at all. The trigger times are already
-        // tracked for VCD (`event_triggered_time`), so reuse them.
+        // tracked for VCD (`event_triggered_time`), so reuse them. Events fire
+        // independently of signal writes, so this list is always scanned in
+        // full — it is tiny next to the trace table.
         let now = self.time;
-        let mut fired: Vec<usize> = Vec::new();
+        let mut fired: Vec<Arc<str>> = Vec::new();
         for idx in 0..self.xtrace_events.len() {
             let id = self.xtrace_events[idx].0;
             let triggered = self
@@ -48110,7 +48166,7 @@ impl Simulator {
                 == Some(now);
             if triggered && self.xtrace_event_last[idx] != now {
                 self.xtrace_event_last[idx] = now;
-                fired.push(idx);
+                fired.push(self.xtrace_events[idx].1.clone());
             }
         }
 
@@ -48118,34 +48174,20 @@ impl Simulator {
             return;
         }
 
-        if self.time != self.xtrace_last_time {
+        let time_delta = if self.time != self.xtrace_last_time {
             let delta = self.time - self.xtrace_last_time;
             self.xtrace_last_time = self.time;
-            let w = self.xtrace_writer.as_mut().unwrap();
-            let _ = writeln!(w, "T,+{}", delta);
-        }
+            Some(delta)
+        } else {
+            None
+        };
 
         let w = self.xtrace_writer.as_mut().unwrap();
-        if changes.len() == 1 {
-            let (idx, val) = &changes[0];
-            let _ = writeln!(w, "D,{},{}", self.xtrace_trace[*idx].1, val);
-        } else if !changes.is_empty() {
-            for chunk in changes.chunks(16) {
-                let _ = write!(w, "P");
-                for (idx, val) in chunk {
-                    let _ = write!(w, ",{}={}", self.xtrace_trace[*idx].1, val);
-                }
-                let _ = writeln!(w);
-            }
-        }
-        // §10.4 `X,<event_type>[,k=v]*`. The event_type names the record family
-        // (`event` — an SV event object fired); the `sig=` attribute points at
-        // the object's own dictionary id, which is why an event keeps an `S`
-        // record even though it carries no value. `X` inherits the current time
-        // from the T record above (§19.3), so no timestamp is repeated.
-        for idx in fired {
-            let _ = writeln!(w, "X,event,sig={}", self.xtrace_events[idx].1);
-        }
+        w.post_xtrace_changes(super::vcd_sink::XtraceTimestep {
+            time_delta,
+            changes,
+            events: fired,
+        });
 
         // Periodic durable flush so a crash/SIGKILL leaves a readable partial
         // dump (Drop does not run under `panic = "abort"`). Bounds the loss to
@@ -48354,9 +48396,17 @@ impl Simulator {
             prev.push(val);
         }
 
+        // Incremental change detection, shared with the VCD and XTrace writers
+        // (see the `dump_dirty` field docs).
+        self.fst_id_to_trace = self.build_dump_id_to_trace(&trace);
+        self.enable_dump_dirty_tracking();
         self.fst_trace = trace;
         self.fst_prev_signals = prev;
-        self.fst_writer = Some(body);
+        self.fst_writer = Some(if self.dump_writer_threaded() {
+            super::fst_sink::FstSink::threaded(body)
+        } else {
+            super::fst_sink::FstSink::inline(body)
+        });
     }
 
     /// Per-timestep FST emit: `time_change` once (if anything changed), then a
@@ -48366,36 +48416,50 @@ impl Simulator {
         if self.fst_writer.is_none() {
             return;
         }
+        // Narrow the walk to the slots of signals actually written since the
+        // last flush; the full scan is O(all traced nets) per time slot, which
+        // on an unscoped dump dominates everything else (see `dump_dirty`).
         let mut changes: Vec<(FstSignalId, Vec<u8>)> = Vec::new();
-        for idx in 0..self.fst_trace.len() {
-            let tbl_id = self.fst_trace[idx].0;
-            let val = &self.signal_table[tbl_id];
-            if self.fst_prev_signals[idx] != *val {
-                changes.push((self.fst_trace[idx].1, Self::fst_format_value(val)));
-                self.fst_prev_signals[idx] = val.clone();
+        macro_rules! check_fst_slot {
+            ($idx:expr) => {{
+                let idx = $idx;
+                let tbl_id = self.fst_trace[idx].0;
+                let val = &self.signal_table[tbl_id];
+                if self.fst_prev_signals[idx] != *val {
+                    changes.push((self.fst_trace[idx].1, Self::fst_format_value(val)));
+                    self.fst_prev_signals[idx] = val.clone();
+                }
+            }};
+        }
+        match self.dump_dirty_slots(&self.fst_id_to_trace) {
+            Some(slots) => {
+                for &idx in &slots {
+                    check_fst_slot!(idx as usize);
+                }
+            }
+            None => {
+                for idx in 0..self.fst_trace.len() {
+                    check_fst_slot!(idx);
+                }
             }
         }
         if changes.is_empty() {
             return;
         }
-        let body = self.fst_writer.as_mut().unwrap();
-        let _ = body.time_change(self.time);
-        for (fid, bits) in &changes {
-            let _ = body.signal_change(*fid, bits);
-        }
-        // Crash-safe periodic flush once the in-memory block grows large
-        // (matches the fst-writer example's FLUSH_AT); leaves a readable
-        // partial FST on panic=abort / SIGKILL.
-        const FST_FLUSH_AT: usize = 64 * 1024 * 1024;
-        if body.size() >= FST_FLUSH_AT {
-            let _ = body.flush();
-        }
+        // Packing, block compression and the periodic crash-safe block flush
+        // all happen inside the sink — on its writer thread by default.
+        let time = self.time;
+        self.fst_writer
+            .as_mut()
+            .unwrap()
+            .post(super::fst_sink::FstTimestep { time, changes });
     }
 
-    /// Finalize and close the FST file.
+    /// Finalize and close the FST file. Blocks until the writer thread has
+    /// written the trailer, so the dump is complete when this returns.
     fn fst_finish(&mut self) {
-        if let Some(body) = self.fst_writer.take() {
-            let _ = body.finish();
+        if let Some(sink) = self.fst_writer.take() {
+            sink.finish();
         }
     }
 
