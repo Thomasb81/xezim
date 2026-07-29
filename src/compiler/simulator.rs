@@ -36766,7 +36766,13 @@ impl Simulator {
                 } else {
                     let prop = self.heap[handle]
                         .as_ref()
-                        .and_then(|i| i.properties.get(&member.name).cloned());
+                        .and_then(|i| i.properties.get(&member.name).cloned())
+                        .or_else(|| {
+                            let prefix = format!("{}.", member.name);
+                            self.heap[handle]
+                                .as_ref()
+                                .and_then(|i| i.properties.get(&format!("{}m_type", prefix)).cloned())
+                        });
                     if let Some(v) = prop {
                         return v;
                     }
@@ -54701,7 +54707,11 @@ impl Simulator {
             }
         }
         let tn = self.class_prop_type_name(handle, prop)?;
-        let dt = self.module.typedef_types.get(tn.as_str())?;
+        let dt = self
+            .module
+            .typedef_types
+            .get(tn.as_str())
+            .or_else(|| self.module.typedef_types.get(&format!("uvm_pkg::{}", tn)))?;
         match Self::resolve_type_ref(dt, &self.module.typedef_types) {
             DataType::Struct(su) => Some(su),
             _ => None,
@@ -63076,6 +63086,57 @@ impl Simulator {
         false
     }
 
+    fn bind_unpacked_struct_arg(
+        &mut self,
+        port_name: &str,
+        dt: &DataType,
+        arg: &Expression,
+        locals: &mut HashMap<String, Value>,
+    ) -> bool {
+        let dt_resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
+        let dt_resolved = match dt_resolved {
+            DataType::TypeReference { name, .. } => {
+                let tn = &name.name.name;
+                self.module
+                    .typedef_types
+                    .get(tn.as_str())
+                    .or_else(|| self.module.typedef_types.get(&format!("uvm_pkg::{}", tn)))
+                    .cloned()
+                    .unwrap_or_else(|| DataType::TypeReference {
+                        name: name.clone(),
+                        dimensions: vec![],
+                        type_args: vec![],
+                        span: name.span,
+                    })
+            }
+            other => other,
+        };
+        let DataType::Struct(su) = dt_resolved else {
+            return false;
+        };
+        if !Self::spreads_member_wise(&su) {
+            return false;
+        }
+        for m in &su.members {
+            for md in &m.declarators {
+                let fname = &md.name.name;
+                let member_expr = Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(arg.clone()),
+                        member: crate::ast::Identifier {
+                            name: fname.clone(),
+                            span: arg.span,
+                        },
+                    },
+                    arg.span,
+                );
+                let v = self.eval_expr(&member_expr);
+                locals.insert(format!("{}.{}", port_name, fname), v);
+            }
+        }
+        true
+    }
+
     fn bind_assoc_param(
         &mut self,
         port: &crate::ast::decl::FunctionPort,
@@ -63374,6 +63435,9 @@ impl Simulator {
             if i < args.len() {
                 if let Some((param, caller)) = self.bind_assoc_param(port, &args[i]) {
                     assoc_params.push((param, caller, is_out));
+                    continue;
+                }
+                if self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals) {
                     continue;
                 }
             }
@@ -72595,6 +72659,9 @@ impl Simulator {
                                         | PortDirection::Ref
                                 );
                                 assoc_params.push((param, caller, is_out));
+                                continue;
+                            }
+                            if self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals) {
                                 continue;
                             }
                             // §6.18/§6.20.3: typedef'd / type-param-bound
