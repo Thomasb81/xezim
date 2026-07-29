@@ -32236,6 +32236,17 @@ impl Simulator {
                     if let Some(v) = self.resolve_value_param_from_spec(name) {
                         return v;
                     }
+                    // §6.19: an enum member declared in THIS class (or an
+                    // ancestor) is an inner-scope constant and must beat the
+                    // design-wide fallback below. Enum members are also
+                    // registered under their bare name in one flat namespace,
+                    // so without this a same-named member of an unrelated
+                    // class — whichever elaborated last — silently won.
+                    if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                        if let Some(v) = self.class_enum_member(&ctx, name) {
+                            return v;
+                        }
+                    }
                     // Static class property referenced bare inside a method.
                     if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
                         if let Some(v) = self.class_static_get(&ctx, name) {
@@ -57421,6 +57432,35 @@ impl Simulator {
     /// by `hoist_class_local_typedefs`, so we walk the inheritance chain's
     /// `typedef_targets` and look each enum's members up in
     /// `module.enum_members`.
+    /// Value of an enum member declared by `start_class` or one of its
+    /// ancestors, or None when the class chain declares no such member. This
+    /// is the CLASS-SCOPED half of `class_scoped_const`, split out so a BARE
+    /// reference inside a class body can consult its own scope before the
+    /// flat design-wide map (§6.19).
+    fn class_enum_member(&self, start_class: &str, member: &str) -> Option<Value> {
+        let mut cur = Some(start_class.to_string());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let cd = self.module.classes.get(&cn)?;
+            for (td_name, dt) in &cd.typedef_targets {
+                if !matches!(dt, DataType::Enum(_)) {
+                    continue;
+                }
+                if let Some(members) = self.module.enum_members.get(td_name) {
+                    if let Some((_, val)) = members.iter().find(|(n, _)| n == member) {
+                        let w = self.module.typedefs.get(td_name).copied().unwrap_or(32).max(1);
+                        return Some(Value::from_u64(*val, w));
+                    }
+                }
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
     fn class_scoped_const(&mut self, start_class: &str, member: &str) -> Option<Value> {
         // Collect the inheritance chain and its enum-typedef names + widths
         // under an immutable borrow, then resolve under separate borrows so
@@ -64328,6 +64368,12 @@ impl Simulator {
             if cdef.property_inits.is_empty() {
                 continue;
             }
+            // An initializer is evaluated IN the declaring class's scope, so a
+            // bare reference to that class's own enum member must resolve
+            // there (§6.19). Only `this_stack` was pushed, leaving the class
+            // context unset, so `e_a v = DUP;` fell through to the flat
+            // design-wide map and picked up an unrelated class's `DUP`.
+            self.class_context_stack.push(Some(cdef.name.clone()));
             let inits: Vec<(String, Expression)> = cdef
                 .property_inits
                 .iter()
@@ -64427,6 +64473,7 @@ impl Simulator {
                     inst.properties.insert(pname, val);
                 }
             }
+            self.class_context_stack.pop();
         }
         self.this_stack.pop();
         // §8.7: implicit `super.new(...)` chaining. If the constructor that
