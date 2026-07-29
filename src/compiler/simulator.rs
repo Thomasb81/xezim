@@ -2426,6 +2426,13 @@ pub struct Simulator {
     /// §6.11.1/§10.7 an implicit conversion of a 4-state RHS into such a target
     /// maps X/Z to 0 — enforced in `fit_value_to_signal`.
     signal_two_state: Vec<bool>,
+    /// Signal ids driven by a lowered GATE PRIMITIVE. §28.4's `buf` truth table
+    /// maps a `z` input to an `x` output, but §10.3 continuous assignment passes
+    /// the value through unchanged — and a gate lowers to an ordinary continuous
+    /// assign, so by the time one-bit copies are fused into a buffer op the two
+    /// are indistinguishable. Applying the gate rule to both made every
+    /// `assign y = x;` eat `z`. This says which ids the gate rule applies to.
+    signal_gate_driven: Vec<bool>,
     /// Signal ids that carry a CONTINUOUS driver — the whole-name LHS of an
     /// `assign` (including the continuous-assigns that inlining synthesizes for
     /// instance port connections). §6.5 forbids mixing continuous and procedural
@@ -5109,6 +5116,68 @@ impl Simulator {
                 }
             }
         }
+        // A struct member's packed element width is registered under the
+        // DECLARATION name (`ref_pipe.wdata`), but an unpacked array of structs
+        // stores each element as its own signal (`ref_pipe[2].wdata`). Without a
+        // key for the concrete signal, `ref_pipe[i].wdata[j]` degraded from a
+        // lane slice to a 1-BIT select — silently comparing one bit against a
+        // whole lane. Alias every element name to its declaration's entry.
+        {
+            let mut aliases: Vec<(String, u32)> = Vec::new();
+            for name in signal_name_to_id.keys() {
+                let name_ref: &str = name.as_ref();
+                if module.packed_signal_elem_widths.contains_key(name_ref) {
+                    continue;
+                }
+                // `base[i].member…` -> `base.member…`
+                let Some(br) = name_ref.find(']') else { continue };
+                let Some(bl) = name_ref[..br].rfind('[') else { continue };
+                if !name_ref[br..].starts_with("].") {
+                    continue;
+                }
+                let deindexed = format!("{}{}", &name_ref[..bl], &name_ref[br + 1..]);
+                // The map is keyed by the DECLARATION name, which carries no
+                // instance scope, so try the de-indexed name and then each
+                // scope-stripped suffix of it.
+                let mut cand: &str = &deindexed;
+                let ew = loop {
+                    if let Some(&ew) = module.packed_signal_elem_widths.get(cand) {
+                        break Some(ew);
+                    }
+                    match cand.find('.') {
+                        // Stop before stripping the member itself.
+                        Some(i) if cand[i + 1..].contains('.') => cand = &cand[i + 1..],
+                        _ => break None,
+                    }
+                };
+                if let Some(ew) = ew {
+                    aliases.push((name_ref.to_string(), ew));
+                }
+            }
+            for (k, ew) in aliases {
+                module.packed_signal_elem_widths.insert(k, ew);
+            }
+        }
+        // §28.4 vs §10.3: mark ids driven by a lowered gate primitive, so only
+        // those get the `buf` truth table's z->x. Same leaf/base matching as
+        // the 2-state pass above.
+        let mut signal_gate_driven = vec![false; num_signals];
+        if !module.gate_driven_nets.is_empty() {
+            for (name, &id) in signal_name_to_id.iter() {
+                if id >= num_signals {
+                    continue;
+                }
+                let name_ref: &str = name.as_ref();
+                let leaf = name_ref.rsplit('.').next().unwrap_or(name_ref);
+                let base = leaf.split('[').next().unwrap_or(leaf);
+                if module.gate_driven_nets.contains(name_ref)
+                    || module.gate_driven_nets.contains(leaf)
+                    || module.gate_driven_nets.contains(base)
+                {
+                    signal_gate_driven[id] = true;
+                }
+            }
+        }
         // prev_{val,xz} represent "before time 0" state. Per IEEE 1800,
         // variable initializers `reg x = <v>;` are equivalent to
         // initial-block assignments, so X→<v> at t=0 must generate an edge
@@ -5220,6 +5289,7 @@ impl Simulator {
             signal_signed: signal_signed_vec,
             signal_real: signal_real_vec,
             signal_two_state,
+            signal_gate_driven,
             cont_driven: HashSet::default(),
             signal_type_names,
             time: 0,
@@ -10189,7 +10259,12 @@ impl Simulator {
 
     /// Isolated counterpart of `exec_fused_gate`: evaluates a fused 1-bit
     /// gate against a mutable signal `view`, recording the dirtied id.
-    fn exec_fused_gate_isolated(op: &FusedGate, view: &mut [Value], dirtied: &mut Vec<u32>) {
+    fn exec_fused_gate_isolated(
+        op: &FusedGate,
+        view: &mut [Value],
+        dirtied: &mut Vec<u32>,
+        gate_driven: &[bool],
+    ) {
         #[inline(always)]
         fn and4(a: u8, b: u8) -> u8 {
             if a == 0 || b == 0 {
@@ -10231,11 +10306,15 @@ impl Simulator {
                 let s = view[src.sig_id as usize].get_bit_code(src.bit as usize);
                 let v = if *invert {
                     not4(s)
-                } else {
+                } else if gate_driven.get(dst.sig_id as usize).copied().unwrap_or(false) {
+                    // §28.4 `buf` primitive: a z input drives x.
                     match s {
                         3 => 2,
                         other => other,
                     }
+                } else {
+                    // §10.3 continuous assign passes z through.
+                    s
                 };
                 (dst, v)
             }
@@ -10450,7 +10529,7 @@ impl Simulator {
                 !unsupported
             }
             CombItem::FusedGate { op } => {
-                Self::exec_fused_gate_isolated(op, view, dirtied);
+                Self::exec_fused_gate_isolated(op, view, dirtied, &self.signal_gate_driven);
                 true
             }
             CombItem::FusedBufFanout { src, dsts, invert } => {
@@ -10463,6 +10542,7 @@ impl Simulator {
                         },
                         view,
                         dirtied,
+                        &self.signal_gate_driven,
                     );
                 }
                 true
@@ -10500,6 +10580,7 @@ impl Simulator {
         signal_widths: &[u32],
         signal_signed: &[bool],
         signal_two_state: &[bool],
+        signal_gate_driven: &[bool],
         signal_name_to_id: &HashMap<Arc<str>, usize>,
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
         view: &mut [Value],
@@ -10599,7 +10680,7 @@ impl Simulator {
                 !unsupported
             }
             CombItem::FusedGate { op } => {
-                Self::exec_fused_gate_isolated(op, view, dirtied);
+                Self::exec_fused_gate_isolated(op, view, dirtied, signal_gate_driven);
                 true
             }
             CombItem::FusedBufFanout { src, dsts, invert } => {
@@ -10612,6 +10693,7 @@ impl Simulator {
                         },
                         view,
                         dirtied,
+                        signal_gate_driven,
                     );
                 }
                 true
@@ -11601,6 +11683,7 @@ impl Simulator {
             signal_widths: self.signal_widths.clone(),
             signal_signed: self.signal_signed.clone(),
             signal_two_state: self.signal_two_state.clone(),
+            signal_gate_driven: self.signal_gate_driven.clone(),
             signal_name_to_id: self.signal_name_to_id.clone(),
             array_first_id: self.array_first_id.clone(),
         }
@@ -19906,6 +19989,16 @@ impl Simulator {
     /// "process N — <kind> at <file:line> (<instance path>, module <m>)" — the
     /// attribution prefix shared by the spinner list and the parked-process
     /// list of the stall report.
+    /// The source text of the block `pid` originates from. The line number in
+    /// `stall_pid_identity` can be unusable when an `\`include` or a multi-line
+    /// macro has shifted the preprocessed numbering (see `span_file_line_in`),
+    /// and quoting the offending code identifies the process regardless.
+    fn stall_pid_source(&mut self, pid: usize) -> Option<String> {
+        let src_file = self.stall_pid_src_file(pid);
+        let (span, _) = *self.process_origin.get(&pid)?;
+        self.span_source_snippet_in(span, src_file)
+    }
+
     fn stall_pid_identity(&mut self, pid: usize) -> String {
         let mut line = format!("                 process {}", pid);
         let src_file = self.stall_pid_src_file(pid);
@@ -20252,6 +20345,21 @@ impl Simulator {
             .filter(|f| !f.is_empty())
             .cloned()
             .unwrap_or_else(|| format!("<source {}>", i + 1));
+        // `texts` are PREPROCESSED, with every `\`include` spliced in whole, so
+        // this line can point well past the end of the file it names — a
+        // 10-line file including 3000 lines reports line 3005. Quoting that
+        // bare sends the reader hunting for a line their file does not have.
+        // Say so, and give them the number that at least locates it in the
+        // expanded text.
+        if let Some(&orig) = self.module.source_orig_lines.get(i) {
+            if orig > 0 && line as u32 > orig {
+                return Some(format!(
+                    "{}:{} [preprocessed line; the file has {} lines, so this code came from an \
+                     `include or a multi-line macro]",
+                    file, line, orig
+                ));
+            }
+        }
         Some(format!("{}:{}", file, line))
     }
 
@@ -23459,6 +23567,51 @@ impl Simulator {
                         if let Some(recv) = recv_expr_opt.clone() {
                             let recv_val = self.eval_expr(&recv);
                             let handle = recv_val.to_u64().unwrap_or(0) as usize;
+                            // §15.4.2: `get`/`peek` on a mailbox handle that was
+                            // never `new`ed. The parking path below is keyed on a
+                            // LIVE handle, so a null one fell through to generic
+                            // dispatch and returned immediately without blocking.
+                            // Wrapped in the usual `forever` that reads a mailbox,
+                            // that spins until the stall detector fires — which
+                            // then blames a missing timing control, sending the
+                            // user looking for a `#delay` in a loop whose real
+                            // fault is an unconstructed mailbox. Fail where the
+                            // fault actually is.
+                            if handle == 0 && self.is_declared_mailbox(&recv) {
+                                // Named from the receiver EXPRESSION, not from
+                                // its span: the `Ident([mb, get])` parse shape
+                                // is rebuilt with the whole call's span, so a
+                                // source snippet would quote `mb.get(v)` back
+                                // as if that were the handle's name.
+                                let what = match &recv.kind {
+                                    ExprKind::Ident(h) => h
+                                        .path
+                                        .iter()
+                                        .map(|s| s.name.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("."),
+                                    _ => self
+                                        .span_source_snippet_in(recv.span, None)
+                                        .unwrap_or_else(|| "<mailbox>".to_string()),
+                                };
+                                eprintln!(
+                                    "[xezim][error] null mailbox handle at time {} — `{}.{}(...)` \
+                                     on a mailbox that was never constructed.",
+                                    self.time, what, method
+                                );
+                                eprintln!(
+                                    "               A blocking `{}` cannot suspend on a null \
+                                     handle, so a `forever` loop around it would spin forever.",
+                                    method
+                                );
+                                eprintln!(
+                                    "               Construct it (`{} = new();`) before the \
+                                     first `{}`.",
+                                    what, method
+                                );
+                                self.finished = true;
+                                return;
+                            }
                             if let Some(q) = self.mailboxes.get(&handle) {
                                 if q.is_empty() {
                                     // Blocking get/peek on an empty mailbox: park
@@ -25263,6 +25416,9 @@ impl Simulator {
             );
             let id = self.stall_pid_identity(pid);
             eprintln!("{} — no `#delay`/`@event`/`wait` anywhere in its body", id);
+            if let Some(src) = self.stall_pid_source(pid) {
+                eprintln!("                 its source: {}", src);
+            }
             eprintln!(
                 "               Simulated time can never advance past this loop. Add a timing control,"
             );
@@ -25272,6 +25428,103 @@ impl Simulator {
     }
 
     /// Resolve NBA target at schedule time to capture array indices/part-selects
+    /// §10.4.2: the index/range expressions of a non-blocking assignment's
+    /// TARGET are evaluated when the assignment is SCHEDULED, not when it is
+    /// applied. An lvalue that `resolve_nba_target` cannot reduce to a signal id
+    /// — any bit- or part-select — is stored as an expression and re-evaluated
+    /// in the NBA region, by which time a `for` loop's variable is long gone:
+    /// `for (int j…) q[j] <= …;` re-read `j` as 0/x and the write landed on the
+    /// wrong bit or nowhere at all. Substituting the evaluated indices as
+    /// literals freezes them at the correct moment, and also fixes the same
+    /// staleness for a signal-valued index (`mem[addr] <= d;` where `addr`
+    /// changes before the region runs).
+    fn freeze_lvalue_indices(&mut self, e: &Expression) -> Expression {
+        let lit = |v: i64, span| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(64),
+                    signed: true,
+                    base: NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                }),
+                span,
+            )
+        };
+        // A STRING key (`aa["name"] <= v`, or a string variable) must not be
+        // folded into a decimal literal — the associative key would change.
+        // Same for wide (>64-bit) keys, which are string-keyed in disguise
+        // (uvm_pool#(string,…)). Those indices keep their expression; §10.4.2
+        // staleness only bites loop/temp variables, which are integral.
+        let freezable = |sim: &mut Self, idx: &Expression| -> Option<i64> {
+            match &idx.kind {
+                ExprKind::StringLiteral(_) => return None,
+                ExprKind::Ident(h) => {
+                    let n = sim.resolve_hier_name(h);
+                    if sim.string_signals.contains(&n) {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            let v = sim.eval_expr(idx);
+            if v.is_real || v.width > 64 {
+                return None;
+            }
+            v.to_i64()
+        };
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                let base = self.freeze_lvalue_indices(expr);
+                let Some(iv) = freezable(self, index) else {
+                    return Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: index.clone(),
+                        },
+                        e.span,
+                    );
+                };
+                Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(base),
+                        index: Box::new(lit(iv, index.span)),
+                    },
+                    e.span,
+                )
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                let base = self.freeze_lvalue_indices(expr);
+                let (Some(lv), Some(rv)) = (freezable(self, left), freezable(self, right)) else {
+                    return Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(base),
+                            kind: *kind,
+                            left: left.clone(),
+                            right: right.clone(),
+                        },
+                        e.span,
+                    );
+                };
+                Expression::new(
+                    ExprKind::RangeSelect {
+                        expr: Box::new(base),
+                        kind: *kind,
+                        left: Box::new(lit(lv, left.span)),
+                        right: Box::new(lit(rv, right.span)),
+                    },
+                    e.span,
+                )
+            }
+            _ => e.clone(),
+        }
+    }
+
     fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -28368,6 +28621,7 @@ impl Simulator {
                         let widths: &[u32] = &self.signal_widths;
                         let signed: &[bool] = &self.signal_signed;
                         let two_state: &[bool] = &self.signal_two_state;
+                        let gate_driven: &[bool] = &self.signal_gate_driven;
                         let n2id = &self.signal_name_to_id;
                         let afi = &self.array_first_id;
                         // comb_entries' AST variants hold Cell/OnceCell (not
@@ -28411,6 +28665,7 @@ impl Simulator {
                                             widths,
                                             signed,
                                             two_state,
+                                            gate_driven,
                                             n2id,
                                             afi,
                                             v,
@@ -30448,6 +30703,86 @@ impl Simulator {
                                     self.mark_dirty(&name);
                                 }
                                 return changed;
+                            }
+                        }
+                    }
+                }
+                // §7.4.1: bit-select of an element of a 1-D UNPACKED array
+                // (`logic [1:0] q [0:1]; q[i][j] = b`). Each element is its own
+                // signal (`q[i]`), so this is a BIT write into that signal — not
+                // a 2-D array index. The `arrays_2d` arm below never matched it
+                // and every other arm fell through, so the write was silently
+                // DROPPED: a pipeline written as `vld_q[i+1][j] <= vld_q[i][j]`
+                // never advanced and its output stayed x forever.
+                if let ExprKind::Index {
+                    expr: inner_expr,
+                    index: inner_idx,
+                } = &expr.kind
+                {
+                    if let ExprKind::Ident(hier) = &inner_expr.kind {
+                        let mut name = self.resolve_hier_name(hier);
+                        if !self.module.arrays.contains_key(&name) {
+                            if let Some(s) = self.instance_assoc_member(&name) {
+                                name = s;
+                            }
+                        }
+                        // Only a plain unpacked array: an `arrays_2d` entry is a
+                        // genuine two-dimensional index and is handled below.
+                        if self.module.arrays.contains_key(&name)
+                            && !self.module.arrays_2d.contains_key(&name)
+                            && !self.module.arrays_nd.contains_key(&name)
+                        {
+                            let i = self.eval_expr(inner_idx).to_i64().unwrap_or(0);
+                            let elem = format!("{}[{}]", name, i);
+                            if let Some(&id) = self.signal_name_to_id.get(elem.as_str()) {
+                                let w = self.signal_widths[id];
+                                let raw = self.eval_expr(index).to_i64().unwrap_or(-1);
+                                // Handle only the plain 0-based case here; a
+                                // NEGATIVE or otherwise exotic packed label
+                                // (`logic [-1:-5][31:0] d [-2:-4]`) falls
+                                // through to the pre-existing normalizing
+                                // paths below, which already resolve it.
+                                // (Casting such a label to u32 overflowed.)
+                                let pos = match self.module.ascending_packed.get(&name).copied() {
+                                    Some(aw) if raw >= 0 && (raw as u32) < aw => {
+                                        Some(aw - 1 - raw as u32)
+                                    }
+                                    Some(_) => None,
+                                    None if raw >= 0 => Some(raw as u32),
+                                    None => None,
+                                };
+                                // The element may itself be a multi-dimensional
+                                // PACKED array, in which case `[j]` selects a
+                                // whole sub-vector, not one bit — a lane of
+                                // `logic [1:0][63:0] q [0:2]` is 64 bits wide.
+                                let ew = self
+                                    .module
+                                    .packed_signal_elem_widths
+                                    .get(&name)
+                                    .copied()
+                                    .unwrap_or(1)
+                                    .max(1);
+                                let lo = pos.map(|p| p.saturating_mul(ew));
+                                if let Some(lo) = lo.filter(|&lo| lo.checked_add(ew).is_some_and(|hi| hi <= w)) {
+                                    let mut cur = self.signal_table[id].clone();
+                                    let prev = cur.clone();
+                                    for b in 0..ew {
+                                        cur.set_bit((lo + b) as usize, val.get_bit(b as usize));
+                                    }
+                                    let changed = cur != prev;
+                                    if changed {
+                                        if !self.dirty_signals[id] {
+                                            self.dirty_signals[id] = true;
+                                            self.dirty_list.push(id);
+                                        }
+                                        self.dirty_any = true;
+                                        write_sig!(self, id, cur);
+                                        self.table_modified = true;
+                                        self.after_signal_write(id);
+                                        self.mark_dirty(&elem);
+                                    }
+                                    return changed;
+                                }
                             }
                         }
                     }
@@ -33512,6 +33847,26 @@ impl Simulator {
                                     self.resolve_hier_name(h),
                                     member.name
                                 ));
+                            }
+                            // `arr[i].field[j]` — the receiver is an ELEMENT of
+                            // an unpacked array of structs, so the base parses
+                            // as MemberAccess over an Index and neither arm
+                            // above fires. Try the flattened element name
+                            // (`arr[2].wdata`, the concrete signal) and the
+                            // DECLARATION-keyed form with the element index
+                            // stripped (`arr.wdata`) — the field's element
+                            // width is the same for every element. Without
+                            // these the select degraded to a 1-BIT read, so a
+                            // reference model comparing `ref[i].wdata[j]`
+                            // against a 64-bit lane checked one bit of it.
+                            if let Some(flat) = self.flat_member_name(expr) {
+                                if let (Some(bl), Some(br)) = (flat.find('['), flat.find(']')) {
+                                    if bl < br {
+                                        candidates
+                                            .push(format!("{}{}", &flat[..bl], &flat[br + 1..]));
+                                    }
+                                }
+                                candidates.push(flat);
                             }
                         }
                         _ => {}
@@ -38291,8 +38646,9 @@ impl Simulator {
                         // and needs the NBA region to fire the edge.)
                         self.assign_value(lvalue, &val.resize_for_assign(w));
                     } else {
+                        let frozen = self.freeze_lvalue_indices(lvalue);
                         self.nba_queue.push(NbaEntry {
-                            lhs: Some(lvalue.clone()),
+                            lhs: Some(frozen),
                             value: val.resize_for_assign(w),
                             resolved_id: None,
                         });
@@ -38303,8 +38659,9 @@ impl Simulator {
                     self.delayed_updates
                         .push((self.time + d, id, val.resize_for_assign(w)));
                 } else {
+                    let frozen = self.freeze_lvalue_indices(lvalue);
                     self.nba_queue.push(NbaEntry {
-                        lhs: Some(lvalue.clone()),
+                        lhs: Some(frozen),
                         value: val.resize_for_assign(w),
                         resolved_id: None,
                     });
@@ -44662,12 +45019,23 @@ impl Simulator {
                 _ => 2,
             }
         } else {
-            match source {
-                3 => 2,
-                other => other,
-            }
+            source
         };
         for &dst in dsts {
+            // §28.4 vs §10.3 — decided per destination: a fanout group can mix
+            // a gate-driven net with a plain assign's target.
+            let new_bit = if !invert
+                && new_bit == 3
+                && self
+                    .signal_gate_driven
+                    .get(dst.sig_id as usize)
+                    .copied()
+                    .unwrap_or(false)
+            {
+                2
+            } else {
+                new_bit
+            };
             let id = dst.sig_id as usize;
             if !self.sdf_delays.is_empty()
                 && self.sdf_delays.get(id).copied().unwrap_or(0) > 0
@@ -44783,12 +45151,20 @@ impl Simulator {
                 let s = self.signal_table[src.sig_id as usize].get_bit_code(src.bit as usize);
                 let v = if *invert {
                     not4(s)
-                } else {
-                    // Z treated as X when used as a wire value
+                } else if self
+                    .signal_gate_driven
+                    .get(dst.sig_id as usize)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    // §28.4 `buf` primitive: a z input drives x.
                     match s {
                         3 => 2,
                         other => other,
                     }
+                } else {
+                    // §10.3 continuous assign: the value passes through, z included.
+                    s
                 };
                 (dst, v)
             }
@@ -71867,6 +72243,46 @@ impl Simulator {
         })
     }
 
+    /// True when `expr`'s DECLARED type is a mailbox, whatever its current
+    /// value is. Used to tell "null mailbox" apart from "not a mailbox at
+    /// all": only the former is a fault worth reporting, and a wrong guess
+    /// would abort a run over an ordinary user method named `get`.
+    /// Deliberately conservative — an undeterminable type answers false.
+    fn is_declared_mailbox(&self, expr: &Expression) -> bool {
+        let says_mailbox = |t: &str| t.starts_with("mailbox") || t == "mailbox";
+        if let ExprKind::Ident(hier) = &expr.kind {
+            let name = self.resolve_hier_name(hier);
+            if self
+                .var_container_types
+                .get(&name)
+                .is_some_and(|k| says_mailbox(k))
+            {
+                return true;
+            }
+            // A class property keeps its declared type on the class, not on
+            // any signal — `local mailbox m;` inside a driver reaches here.
+            if let Some(leaf) = hier.path.last().map(|s| s.name.name.as_str()) {
+                if let Some(Some(cur)) = self.class_context_stack.last() {
+                    if self
+                        .module
+                        .classes
+                        .get(cur)
+                        .and_then(|cd| cd.property_types.get(leaf))
+                        .and_then(|dt| match dt {
+                            DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
+                            _ => None,
+                        })
+                        .is_some_and(|t| says_mailbox(&t))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        self.get_expr_type_name(expr)
+            .is_some_and(|t| says_mailbox(&t))
+    }
+
     fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {
         match &expr.kind {
             ExprKind::Ident(hier) => {
@@ -72210,6 +72626,7 @@ pub struct CombSettleCtx {
     pub signal_widths: Vec<u32>,
     pub signal_signed: Vec<bool>,
     pub signal_two_state: Vec<bool>,
+    pub signal_gate_driven: Vec<bool>,
     pub signal_name_to_id: HashMap<Arc<str>, usize>,
     pub array_first_id: HashMap<Arc<str>, (usize, i64, i64)>,
 }
@@ -72325,7 +72742,7 @@ impl CombSettleCtx {
                 !unsupported
             }
             SendCombItem::Fused(op) => {
-                Simulator::exec_fused_gate_isolated(op, view, dirtied);
+                Simulator::exec_fused_gate_isolated(op, view, dirtied, &self.signal_gate_driven);
                 true
             }
             SendCombItem::FusedBufFanout { src, dsts, invert } => {
@@ -72338,6 +72755,7 @@ impl CombSettleCtx {
                         },
                         view,
                         dirtied,
+                        &self.signal_gate_driven,
                     );
                 }
                 true
