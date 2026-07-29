@@ -32614,6 +32614,18 @@ impl Simulator {
                         break;
                     }
                 }
+                // §26.3: `pkg::MEMBER` reaching here is an enum member of a
+                // package. `fast_signal_read` would discard the package scope
+                // and look the leaf up flat, which silently reads a local
+                // declaration that shadows the member. Checked last so any
+                // genuinely hierarchical `pkg.member` signal still wins.
+                if hier.path.len() == 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    if let Some(v) = self
+                        .package_enum_member(&hier.path[0].name.name, &hier.path[1].name.name)
+                    {
+                        return v;
+                    }
+                }
                 self.fast_signal_read(hier)
             }
             ExprKind::Unary { op, operand } => {
@@ -35242,6 +35254,21 @@ impl Simulator {
                     {
                         if let Some(v) =
                             self.class_scoped_const(&h.path[0].name.name, &member.name)
+                        {
+                            return v;
+                        }
+                    }
+                    // §26.3: the same shape with a PACKAGE base — `pkg::MEMBER`.
+                    // The elaborator only collapses `MemberAccess` into a
+                    // two-segment `Ident` for always/initial/continuous-assign
+                    // code, so inside a function, task, or class method the
+                    // reference arrives here instead. Nothing below resolves a
+                    // package base, and the arm's terminal fallback treats it as
+                    // an object handle — so every package-qualified enum
+                    // constant read inside a subroutine returned 0.
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        if let Some(v) =
+                            self.package_enum_member(&h.path[0].name.name, &member.name)
                         {
                             return v;
                         }
@@ -57459,6 +57486,22 @@ impl Simulator {
             cur = cd.extends.clone();
         }
         None
+    }
+
+    /// Value of `pkg::MEMBER` for an enum member declared by package `pkg`
+    /// (§26.3), or None when `pkg` names no package or declares no such member.
+    ///
+    /// Enum members are also registered design-wide under their bare name, and
+    /// the qualified form used to be answered by discarding the scope and
+    /// looking the leaf up flat. That is wrong in both directions: a local
+    /// declaration legally shadowing the bare name captured the qualified
+    /// reference too, and inside a function body — where the elaborator leaves
+    /// the reference as a `MemberAccess` rather than collapsing it to a
+    /// two-segment `Ident` — there is no leaf fallback at all, so the read
+    /// returned 0. Consulting the package's own member list fixes both.
+    fn package_enum_member(&self, pkg: &str, member: &str) -> Option<Value> {
+        let (val, width) = *self.module.package_enum_members.get(pkg)?.get(member)?;
+        Some(Value::from_u64(val, width.max(1)))
     }
 
     fn class_scoped_const(&mut self, start_class: &str, member: &str) -> Option<Value> {
