@@ -1331,6 +1331,25 @@ const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
 
 type EventList = VecDeque<(usize, Vec<Statement>)>;
 
+/// One clock-tree group's edge answer for the current detect pass.
+///
+/// Members of a group are exact copies of one driver, so both the fire decision
+/// AND the raw value pair are shared: `fired_snap` (which re-baselines `prev`)
+/// and the §9.4.2 bit-select re-test both need the values, and taking them from
+/// the leader is what removes the scattered reads. `XEZIM_CLKTREE_PROBE=1`
+/// verifies that equality holds rather than assuming it.
+#[derive(Clone, Copy, Default)]
+struct EdgeGroupMemo {
+    generation: u64,
+    fires_pos: bool,
+    fires_neg: bool,
+    fires_any: bool,
+    cur_v: u64,
+    cur_x: u64,
+    prev_v: u64,
+    prev_x: u64,
+}
+
 /// Built-in clock generator: replaces `always #N clk = ~clk` with O(1) toggle.
 /// Eliminates AST cloning and traversal for the most common simulation pattern.
 struct ClockGen {
@@ -1529,6 +1548,13 @@ struct TimingWheel {
     /// which fires on every run_scheduled_process call (~115K times on c910).
     /// Count-based rather than set-based because the same pid can have
     /// multiple scheduled events at different times.
+    ///
+    /// Kept as a `HashMap` deliberately. Replacing it with a `Vec<u32>` indexed
+    /// by pid (pids are consecutive small integers, so the hashing looked like
+    /// pure overhead) measured NEUTRAL on both a 3-process and a 400-process
+    /// load — and pids are never reused, so the dense form grows to the
+    /// high-water pid and trades memory for nothing. Do not re-litigate without
+    /// a benchmark that shows this map is hot.
     pid_counts: std::collections::HashMap<usize, u32>,
 }
 
@@ -3590,6 +3616,26 @@ pub struct Simulator {
     /// canonical signal_table — Stage-0 validation toward dropping the 32-byte
     /// Value array cells. signal_table stays canonical (safe).
     soa_shadow: bool,
+    /// Clock-tree dedup (see `build_edge_sig_groups`). `edge_group_of` is
+    /// parallel to `edge_signal_ids`: the group a POSITION belongs to, or
+    /// `u32::MAX` for a signal that must be checked on its own. Members of one
+    /// group are exact copies of a common driver, so the first member scanned in
+    /// a pass computes the edge and the rest read it out of `edge_group_memo`.
+    /// The memo is stamped with `edge_group_generation` (bumped once per detect
+    /// pass) so it never needs clearing.
+    edge_group_of: Vec<u32>,
+    edge_group_memo: Vec<EdgeGroupMemo>,
+    edge_group_generation: u64,
+    edge_group_count: usize,
+    /// `XEZIM_CLKTREE_PROBE=1`: instead of trusting the memo, recompute every
+    /// member and count how often the leader's answer disagreed. The dedup is
+    /// only sound if this is zero, and it is cheaper to measure than to argue.
+    clktree_probe: bool,
+    clktree_probe_hits: u64,
+    clktree_probe_mismatch: u64,
+    /// Signal ids of the first few probe mismatches, resolved to names in the
+    /// summary (the detect loop holds a mutable borrow and cannot name them).
+    clktree_probe_sids: Vec<usize>,
     /// Dirty-driven edge detect (XEZIM_DIRTY_EDGE=1). `sig_to_edge_pos[id]` =
     /// position of signal `id` in `edge_signal_ids`, or -1 if not edge-sensitive.
     /// Writes to edge-sensitive signals (via write_sig!/after_signal_write)
@@ -5539,6 +5585,14 @@ impl Simulator {
             edge_scan_stats: std::env::var_os("XEZIM_EDGE_SCAN_STATS").is_some(),
             soa_shadow: std::env::var_os("XEZIM_ARRAY_SOA_SHADOW").is_some(),
             sig_to_edge_pos: Vec::new(),
+            edge_group_of: Vec::new(),
+            edge_group_memo: Vec::new(),
+            edge_group_generation: 0,
+            edge_group_count: 0,
+            clktree_probe: std::env::var_os("XEZIM_CLKTREE_PROBE").is_some(),
+            clktree_probe_hits: 0,
+            clktree_probe_mismatch: 0,
+            clktree_probe_sids: Vec::new(),
             changed_edge_pos: Vec::new(),
             edge_pos_seen: Vec::new(),
             edge_exec_wrote: Vec::new(),
@@ -9297,6 +9351,7 @@ impl Simulator {
                 self.is_edge_signal_non_clock[sid] = true;
             }
         }
+        self.build_edge_sig_groups();
         // C1 hot-signal-arena diagnostic (HOT-ARENA-NOTES.md falsification
         // check #2): compute the hot working set + how many hot signals
         // are array members.  Decides whether the arena remap can skip
@@ -21592,6 +21647,16 @@ impl Simulator {
                 pct(b[3] + b[4] + b[5])
             );
         }
+        if self.clktree_probe {
+            eprintln!(
+                "[CLKTREE-PROBE] groups={} memo-eligible visits={} MISMATCHES={} \
+                 (dedup is sound iff 0)",
+                self.edge_group_count, self.clktree_probe_hits, self.clktree_probe_mismatch
+            );
+            for &sid in &self.clktree_probe_sids {
+                eprintln!("[CLKTREE-PROBE]   mismatching signal: {}", self.name_for_id(sid));
+            }
+        }
         if self.edge_scan_stats {
             let s = self.edge_scan_scanned;
             let c = self.edge_scan_changed;
@@ -26079,6 +26144,172 @@ impl Simulator {
         self.check_edges_inner(None, false);
     }
 
+    /// Group edge-sensitive signals that are exact copies of the same driver.
+    ///
+    /// A flattened netlist replicates the clock tree into per-module buffered
+    /// copies. They all carry the same value and therefore all fire the same
+    /// edge, but the detect scan visits each one separately and pays its own
+    /// three scattered reads (`signal_table`, `prev_val`, `prev_xz`) to
+    /// recompute an identical answer. Resolving each edge signal through the
+    /// pure-copy relation to its driver lets the scan compute the edge ONCE per
+    /// group (see `edge_group_memo`).
+    ///
+    /// Only these `CombItem`s count as a copy, and only under conditions that
+    /// make the destination bit-for-bit equal to its source:
+    /// `DirectCopy` / `FastDirectCopy` / `FastDirectFanout` / non-inverting
+    /// `FusedBufFanout` / non-inverting `FusedGate::Buf1`. A computed clock
+    /// (`Bin2`, `Mux2` — a clock gate or mux) is NOT a copy, but is a perfectly
+    /// good shared ROOT for the copies hanging off it.
+    ///
+    /// Constraints, each of which would otherwise produce a wrong edge:
+    /// * **Single writer.** A multiply-driven net does not track any one source.
+    /// * **Equal width, <= 64 bits.** A resize changes the value; a wide signal
+    ///   compares through `prev_wide`, not the inline `prev_val`/`prev_xz` pair.
+    /// * **Matching 4-state-ness, not real.** A 2-state destination drops X/Z on
+    ///   every write (§6.11.1), so it is not equal to a 4-state source.
+    /// * **No SDF delay.** A delayed copy lags its source in time.
+    /// * **Bit 0 on both sides** for the bit-addressed fused forms — bit 0 is
+    ///   what posedge/negedge detection reads.
+    /// * **Reached through >= 1 copy edge.** An independently driven ROOT stays
+    ///   its own singleton. Folding it in would give it a spurious t=0 edge:
+    ///   `prev` is baselined after the source initialises but before its copies
+    ///   settle, so root and copy legitimately disagree for exactly one detect.
+    fn build_edge_sig_groups(&mut self) {
+        self.edge_group_of.clear();
+        self.edge_group_memo.clear();
+        self.edge_group_count = 0;
+        if std::env::var_os("XEZIM_NO_CLKTREE_DEDUP").is_some() || self.edge_signal_ids.is_empty() {
+            return;
+        }
+        let nsig = self.signal_table.len();
+
+        let mut writer_count: Vec<u32> = vec![0u32; nsig];
+        for entry in &self.comb_entries {
+            for &d in &entry.write_signal_ids {
+                if d < nsig {
+                    writer_count[d] = writer_count[d].saturating_add(1);
+                }
+            }
+        }
+
+        // `copy_src[d]` = the signal `d` is an exact copy of, or -1.
+        let mut copy_src: Vec<i64> = vec![-1i64; nsig];
+        let eligible = |s: &Self, dst: usize, src: usize| -> bool {
+            dst < nsig
+                && src < nsig
+                && dst != src
+                && writer_count[dst] == 1
+                && s.signal_widths[dst] <= 64
+                && s.signal_widths[dst] == s.signal_widths[src]
+                && !s.signal_real[dst]
+                && !s.signal_real[src]
+                && s.signal_two_state.get(dst).copied().unwrap_or(false)
+                    == s.signal_two_state.get(src).copied().unwrap_or(false)
+                && s.sdf_delays.get(dst).copied().unwrap_or(0) == 0
+        };
+        for entry in &self.comb_entries {
+            match &entry.item {
+                CombItem::DirectCopy { dst_id, src_id, .. }
+                | CombItem::FastDirectCopy { dst_id, src_id } => {
+                    if eligible(self, *dst_id, *src_id) {
+                        copy_src[*dst_id] = *src_id as i64;
+                    }
+                }
+                CombItem::FastDirectFanout { src_id, dst_ids } => {
+                    for &d in dst_ids.iter() {
+                        if eligible(self, d, *src_id) {
+                            copy_src[d] = *src_id as i64;
+                        }
+                    }
+                }
+                CombItem::FusedBufFanout { src, dsts, invert } => {
+                    if *invert || src.bit != 0 {
+                        continue;
+                    }
+                    for d in dsts.iter() {
+                        if d.bit == 0 && eligible(self, d.sig_id as usize, src.sig_id as usize) {
+                            copy_src[d.sig_id as usize] = src.sig_id as i64;
+                        }
+                    }
+                }
+                CombItem::FusedGate {
+                    op: FusedGate::Buf1 { dst, src, invert },
+                } => {
+                    if !*invert
+                        && src.bit == 0
+                        && dst.bit == 0
+                        && eligible(self, dst.sig_id as usize, src.sig_id as usize)
+                    {
+                        copy_src[dst.sig_id as usize] = src.sig_id as i64;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Resolve each edge signal to its root, counting copy hops. Bounded so
+        // a copy CYCLE (illegal RTL, but reachable through a mis-elaborated
+        // generate loop) cannot spin here.
+        const MAX_COPY_HOPS: usize = 64;
+        let mut root_group: HashMap<usize, u32> = HashMap::default();
+        let mut group_of: Vec<u32> = vec![u32::MAX; self.edge_signal_ids.len()];
+        let mut next_group = 0u32;
+        for (pos, &sid) in self.edge_signal_ids.iter().enumerate() {
+            let mut cur = sid;
+            let mut hops = 0usize;
+            while hops < MAX_COPY_HOPS {
+                match copy_src.get(cur).copied().unwrap_or(-1) {
+                    -1 => break,
+                    s => {
+                        cur = s as usize;
+                        hops += 1;
+                    }
+                }
+            }
+            // Reached through no copy at all -> independently driven root.
+            if hops == 0 || hops >= MAX_COPY_HOPS {
+                continue;
+            }
+            let g = *root_group.entry(cur).or_insert_with(|| {
+                let g = next_group;
+                next_group += 1;
+                g
+            });
+            group_of[pos] = g;
+        }
+
+        // A group with a single member saves nothing and costs a memo slot.
+        let mut members = vec![0u32; next_group as usize];
+        for &g in &group_of {
+            if g != u32::MAX {
+                members[g as usize] += 1;
+            }
+        }
+        for g in group_of.iter_mut() {
+            if *g != u32::MAX && members[*g as usize] < 2 {
+                *g = u32::MAX;
+            }
+        }
+
+        self.edge_group_of = group_of;
+        self.edge_group_count = next_group as usize;
+        self.edge_group_memo = vec![EdgeGroupMemo::default(); next_group as usize];
+        self.edge_group_generation = 0;
+        if std::env::var_os("XEZIM_CLKTREE_STATS").is_some() {
+            let grouped = self.edge_group_of.iter().filter(|&&g| g != u32::MAX).count();
+            let live = members.iter().filter(|&&m| m >= 2).count();
+            eprintln!(
+                "[CLKTREE] edge signals={} grouped={} ({:.1}%) into {} groups; \
+                 largest={} (probe with XEZIM_CLKTREE_PROBE=1)",
+                self.edge_signal_ids.len(),
+                grouped,
+                100.0 * grouped as f64 / self.edge_signal_ids.len().max(1) as f64,
+                live,
+                members.iter().copied().max().unwrap_or(0),
+            );
+        }
+    }
+
     /// Fast-path edge-detect when the only signals that could have an edge
     /// this iter are the clocks that just toggled in `fire_clock_generators`.
     /// The caller (event_loop) is responsible for proving this — i.e. that
@@ -26655,6 +26886,11 @@ impl Simulator {
         // drain_edge_exec_rescan then delivers (§9.2).
         let mut fired_snap: Vec<(usize, u64, u64)> = Vec::new();
         let mut fired_wide: Vec<(usize, Value)> = Vec::new();
+        // One generation per detect pass: a memo slot stamped with an older
+        // generation is stale, so the table never has to be cleared.
+        self.edge_group_generation = self.edge_group_generation.wrapping_add(1);
+        let group_generation = self.edge_group_generation;
+        let group_dedup_active = !self.edge_group_of.is_empty() && self.forced_signals.is_empty();
         for pos in positions {
             let sid = match self.edge_signal_ids.get(pos) {
                 Some(&s) => s,
@@ -26671,25 +26907,94 @@ impl Simulator {
                 }
                 _ => continue,
             };
-            // Compute edge-fired booleans once for this signal using SoA
-            // u64 pairs; falls back to full Value compare for wide signals.
-            let (cur_v, cur_x) = self.signal_table[sid].raw_bits();
-            let prev_v = self.prev_val[sid];
-            let prev_x = self.prev_xz[sid];
-            let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
-            let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
-            let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
-            let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
-            let fires_pos = !pb_one && cb_one;
-            let fires_neg = !pb_zero && cb_zero;
-            let fires_any = if self.signal_widths[sid] > 64 {
-                self.prev_wide
-                    .get(&sid)
-                    .map_or(cur_v != prev_v || cur_x != prev_x, |p| {
-                        self.signal_table[sid] != *p
-                    })
+            // Clock-tree dedup: on a flattened netlist most edge signals are
+            // per-module copies of one clock net, so the first member of a
+            // group scanned this pass computes the answer and the rest read it
+            // back — trading three scattered loads for one memo slot. Disabled
+            // while anything is FORCED: §9.3.1 lets a force hold a copy away
+            // from its driver, which is exactly the case the grouping assumes
+            // cannot happen. `forced_signals` is empty in the common case.
+            let group = if group_dedup_active {
+                self.edge_group_of.get(pos).copied().unwrap_or(u32::MAX)
             } else {
-                cur_v != prev_v || cur_x != prev_x
+                u32::MAX
+            };
+            let memo_hit = group != u32::MAX
+                && self.edge_group_memo[group as usize].generation == group_generation;
+            let (cur_v, cur_x, prev_v, prev_x, fires_pos, fires_neg, fires_any) = if memo_hit
+                && !self.clktree_probe
+            {
+                let m = self.edge_group_memo[group as usize];
+                (
+                    m.cur_v, m.cur_x, m.prev_v, m.prev_x, m.fires_pos, m.fires_neg, m.fires_any,
+                )
+            } else {
+                // Compute edge-fired booleans for this signal using SoA u64
+                // pairs; falls back to full Value compare for wide signals.
+                let (cur_v, cur_x) = self.signal_table[sid].raw_bits();
+                let prev_v = self.prev_val[sid];
+                let prev_x = self.prev_xz[sid];
+                let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
+                let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
+                let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
+                let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
+                let fires_pos = !pb_one && cb_one;
+                let fires_neg = !pb_zero && cb_zero;
+                let fires_any = if self.signal_widths[sid] > 64 {
+                    self.prev_wide
+                        .get(&sid)
+                        .map_or(cur_v != prev_v || cur_x != prev_x, |p| {
+                            self.signal_table[sid] != *p
+                        })
+                } else {
+                    cur_v != prev_v || cur_x != prev_x
+                };
+                if memo_hit {
+                    // Probe mode: the memo was available but we recomputed.
+                    // Any disagreement means the grouping is unsound.
+                    let m = self.edge_group_memo[group as usize];
+                    self.clktree_probe_hits += 1;
+                    if m.cur_v != cur_v
+                        || m.cur_x != cur_x
+                        || m.prev_v != prev_v
+                        || m.prev_x != prev_x
+                        || m.fires_pos != fires_pos
+                        || m.fires_neg != fires_neg
+                        || m.fires_any != fires_any
+                    {
+                        self.clktree_probe_mismatch += 1;
+                        if self.clktree_probe_mismatch <= 8 {
+                            // No `name_for_id` here — it borrows `self`
+                            // immutably while the trigger bitmap is held
+                            // mutably. The summary resolves names afterwards.
+                            self.clktree_probe_sids.push(sid);
+                            eprintln!(
+                                "[CLKTREE-PROBE] MISMATCH t={} sid={} group={} \
+                                 leader(cur={:x}/{:x} prev={:x}/{:x} p{}n{}a{}) \
+                                 member(cur={:x}/{:x} prev={:x}/{:x} p{}n{}a{})",
+                                self.time,
+                                sid,
+                                group,
+                                m.cur_v, m.cur_x, m.prev_v, m.prev_x,
+                                m.fires_pos as u8, m.fires_neg as u8, m.fires_any as u8,
+                                cur_v, cur_x, prev_v, prev_x,
+                                fires_pos as u8, fires_neg as u8, fires_any as u8,
+                            );
+                        }
+                    }
+                } else if group != u32::MAX {
+                    self.edge_group_memo[group as usize] = EdgeGroupMemo {
+                        generation: group_generation,
+                        fires_pos,
+                        fires_neg,
+                        fires_any,
+                        cur_v,
+                        cur_x,
+                        prev_v,
+                        prev_x,
+                    };
+                }
+                (cur_v, cur_x, prev_v, prev_x, fires_pos, fires_neg, fires_any)
             };
             if self.edge_scan_stats {
                 self.edge_scan_scanned += 1;
