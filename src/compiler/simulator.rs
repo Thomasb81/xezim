@@ -60306,6 +60306,38 @@ impl Simulator {
         method_name: &str,
         args: &[Expression],
     ) -> Option<Value> {
+        // Intercept uvm_config_db static methods to ensure config_db works correctly
+        // This is needed because the regular method call interception doesn't catch
+        // static method calls like `uvm_config_db#(int)::set(...)`
+        if class_name == "uvm_config_db" {
+            match method_name {
+                "set" => {
+                    // Store in xezim's config DB (handles scope matching correctly)
+                    let result = self.exec_config_db("set", args);
+                    // Also call UVM's implementation to populate resource pool
+                    // (bypass our interception to avoid infinite recursion)
+                    let saved = self.pure_sv_lrm;
+                    self.pure_sv_lrm = true;
+                    let _ = self.exec_static_method_internal(class_name, method_name, args);
+                    self.pure_sv_lrm = saved;
+                    return Some(result);
+                }
+                "get" | "exists" => {
+                    // Try xezim's config DB first
+                    let xezim_result = self.exec_config_db(method_name, args);
+                    if xezim_result.to_u64().unwrap_or(0) == 1 {
+                        return Some(xezim_result);
+                    }
+                    // Fall back to UVM's resource pool
+                    let saved = self.pure_sv_lrm;
+                    self.pure_sv_lrm = true;
+                    let result = self.exec_static_method_internal(class_name, method_name, args);
+                    self.pure_sv_lrm = saved;
+                    return result;
+                }
+                _ => {}
+            }
+        }
         // Constructors (`new`) are never static — they always require an
         // instance to be allocated first. If we dispatch them through the
         // static path, the constructor body executes with `this`=0 (null),
@@ -60313,6 +60345,30 @@ impl Simulator {
         // object is never properly initialised. All call-sites that need
         // constructor dispatch have an explicit `if m == "new" { instantiate }`
         // fallback, so returning None here lets them reach it.
+        if method_name == "new" {
+            return None;
+        }
+        let mut cur = Some(class_name.to_string());
+        while let Some(cname) = cur {
+            if let Some(cd) = self.module.classes.get(&cname).cloned() {
+                if cd.methods.contains_key(method_name) {
+                    return Some(self.exec_method_in_class_hierarchy(0, &cname, method_name, args));
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Internal helper: execute static method without config_db interception
+    fn exec_static_method_internal(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
         if method_name == "new" {
             return None;
         }
