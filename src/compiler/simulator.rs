@@ -33100,8 +33100,20 @@ impl Simulator {
                     }
                     // `ClassName::static_prop` — explicit static property read.
                     if hier.path.len() == 2 {
-                        let cls = &hier.path[0].name.name;
                         let prop = &hier.path[1].name.name;
+                        // §8.25: the leading segment may be a class TYPE
+                        // PARAMETER (e.g. `T::m_type_name` inside a
+                        // parameterized-class method — the UVM
+                        // `uvm_reg_predictor #(BUSTYPE)` pattern). Resolve it
+                        // to the concrete bound class via the active
+                        // specialization / `this` instance before the
+                        // class/typedef lookups below. Without this, `T::prop`
+                        // silently read as zero/empty because `T` is not in
+                        // `module.classes`.
+                        let eff_cls: String = self
+                            .resolve_type_param_binding(&hier.path[0].name.name)
+                            .unwrap_or_else(|| hier.path[0].name.name.clone());
+                        let cls = &eff_cls;
                         // §8.25.1: typedef alias to a parameterized-class
                         // specialization (e.g. `typedef Reg#("foo") FooReg;`)
                         // — resolve the specialization and key the static
@@ -36496,7 +36508,14 @@ impl Simulator {
                 // `ClassName::static_prop` — explicit static property read.
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if hier.path.len() == 1 {
-                        let cls = &hier.path[0].name.name;
+                        // §8.25: the base may be a class TYPE PARAMETER
+                        // (e.g. `T.prop` resolved from `T::prop` inside a
+                        // parameterized-class method). Resolve it to the
+                        // concrete bound class first.
+                        let eff_cls: String = self
+                            .resolve_type_param_binding(&hier.path[0].name.name)
+                            .unwrap_or_else(|| hier.path[0].name.name.clone());
+                        let cls = &eff_cls;
                         if self.module.classes.contains_key(cls)
                             && !self
                                 .local_stack
