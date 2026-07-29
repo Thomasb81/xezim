@@ -63758,9 +63758,24 @@ impl Simulator {
             }
             locals.insert(port.name.name.clone(), val);
         }
-        // Initialize return variable (function name)
+        // Initialize return variable (function name). Size it to the
+        // declared return type's width so a bit-select write
+        // `retname[i] = ...` for i >= 32 (e.g. uvm_packer::unpack_field_int
+        // filling a 64-bit uvm_integral_t) actually lands — a hardcoded
+        // 32-bit cell silently dropped the upper half. Also register the
+        // width in `self.widths` so a later `retname = <narrow>` assignment
+        // zero-extends back to the declared width (mirroring a typed
+        // VarDecl), instead of leaving a 32-bit value that drops the high
+        // bits on subsequent bit-select writes.
         let ret_name = fd.name.name.name.clone();
-        locals.insert(ret_name.clone(), Value::zero(32));
+        let ret_w = super::elaborate::resolve_type_width(
+            &fd.return_type,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        )
+        .max(1);
+        self.widths.insert(ret_name.clone(), ret_w);
+        locals.insert(ret_name.clone(), Value::zero(ret_w));
         // Mark string-typed return var / params for character indexing.
         if Self::is_string_data_type(&fd.return_type) {
             self.string_signals.insert(ret_name.clone());
@@ -72998,7 +73013,22 @@ impl Simulator {
                             if Self::is_string_data_type(&f.return_type) {
                                 Value::from_string("")
                             } else {
-                                Value::zero(32)
+                                // Size the implicit return cell to the declared
+                                // return width so a bit-select write
+                                // `retname[i] = ...` for i >= 32 (uvm_packer's
+                                // unpack_field_int filling a 64-bit
+                                // uvm_integral_t) lands; a 32-bit cell dropped
+                                // the upper half. Register the width too so a
+                                // later `retname = <narrow>` zero-extends back,
+                                // mirroring a typed VarDecl.
+                                let rw = super::elaborate::resolve_type_width(
+                                    &f.return_type,
+                                    Some(&self.module.parameters),
+                                    Some(&self.module.typedefs),
+                                )
+                                .max(1);
+                                self.widths.insert(rn.clone(), rw);
+                                Value::zero(rw)
                             }
                         } else {
                             Value::zero(32)
