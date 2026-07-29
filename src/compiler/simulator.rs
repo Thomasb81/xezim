@@ -63478,6 +63478,19 @@ impl Simulator {
                 // in the body (e.g. `x /= 2`) is done in the real domain.
                 val = Value::from_f64(val.to_f64());
             }
+            if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+                let type_name = tn.name.name.clone();
+                if self.module.enum_members.contains_key(&type_name)
+                    || self.module.enum_members.contains_key(&format!("uvm_pkg::{}", type_name))
+                    || self.module.typedefs.contains_key(&type_name)
+                {
+                    self.var_typedef_types.insert(port.name.name.clone(), type_name);
+                } else if self.module.classes.contains_key(&type_name)
+                    || self.module.classes.contains_key(&format!("uvm_pkg::{}", type_name))
+                {
+                    self.var_class_types.insert(port.name.name.clone(), type_name);
+                }
+            }
             locals.insert(port.name.name.clone(), val);
         }
         // Initialize return variable (function name)
