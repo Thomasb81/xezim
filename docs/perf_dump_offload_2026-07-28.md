@@ -334,7 +334,48 @@ pointer-keyed `Arc` cache for AST blocks was considered and rejected: the frame 
 `SeqBlock` is read from can itself be a temporary, so the address key has an ABA
 hazard that would silently execute a stale body.
 
-Do not re-attempt the frame chain before the AST change lands.
+### CORRECTION (same day): on REAL UVM the frame chain is a ~3.6% WIN
+
+The verdict above was reached on synthetics (`cont_*`, `many_procs`) because no
+UVM benchmark existed. One now does — `bench/run_uvm_bench.sh`, added precisely
+because this section had to guess. Re-judged on it (paired, interleaved, 3 reps,
+median; `verdict=ok` means end time and fatal count matched):
+
+| benchmark | before | after | delta |
+|---|---|---|---|
+| `phases/basic` | 6,421.8 ms | 6,105.3 ms | **-4.9%** |
+| `tlm1/hierarchy` | 10,371.2 ms | 9,908.5 ms | **-4.5%** |
+| `tlm1/producer_consumer` | 8,250.8 ms | 7,925.2 ms | **-3.9%** |
+| `objections` | 3,384.0 ms | 3,263.4 ms | **-3.6%** |
+| `tlm1/fifo` | 8,058.6 ms | 7,887.7 ms | **-2.1%** |
+| `interfaces` | 15,538.4 ms | 15,708.2 ms | +1.1% |
+| `hello_world` | 22,744.6 ms | 22,886.3 ms | +0.6% |
+
+Five of seven faster, the two regressions inside noise. **The synthetics were
+unrepresentative and led to the wrong call.** `cont_post_100` is a tight
+`forever` that re-splices a 100-statement block every iteration — the single
+shape where paying `Arc::from` per splice to save one suspension clone is a bad
+trade. Real UVM code splices smaller bodies through deeper task-call chains,
+where chaining the caller's tail instead of copying it wins.
+
+The +5% on `many_procs` and +9% on `cont_post_100` are still real; this is a
+trade, not a free win. DUT loads (c906, c910) were neutral either way, so
+nothing regresses there.
+
+**Status: the code was reverted before this measurement existed, and the working
+tree no longer has it.** Re-landing means re-deriving it from §6b (the design is
+described precisely enough: `ProcCont`, 25 splice sites to
+`pushed`, 9 suspension captures to `resume_at`, 8 continuation structs and
+`TimingWheel` retyped) and re-running both gates — 1,302 tests plus c906/c910
+counter identity, which it passed. Worth doing; it is also still true that the
+AST `Arc<[Statement]>` change (see `ast_shared_stmt_lists_scope.md`) removes the
+`Arc::from` this trade is paying for, and would turn the two remaining
+regressions into wins as well.
+
+**Method lesson, and it is the same one as Round 3 of this document:** the
+benchmark you lack is the conclusion you get wrong. This section confidently
+reverted a correct 3.6% improvement because the only available workloads
+exaggerated one code shape.
 
 ---
 
@@ -351,14 +392,16 @@ Tried and rejected, recorded so they are not re-run:
 * `XEZIM_DIRTY_EDGE` default-on (§5a) — sound but not counter-identical.
 * `pid_counts` -> dense `Vec` (§6.2) — neutral at 3 and at 400 live processes.
 
-Also tried and rejected:
+Also tried, reverted, and then VINDICATED by a better benchmark:
 
 * **Resume-by-cursor / frame chain** (§6b) — built in full, byte-identical,
-  measured **+5% on process-heavy loads**, reverted. Blocked on the AST holding
-  `Arc<[Statement]>`.
+  reverted on synthetic evidence, then measured **-3.6% median on real UVM** once
+  `bench/run_uvm_bench.sh` existed. Needs re-deriving and re-landing.
 
 Still open, ranked:
 
+0. **Re-land the frame chain** (§6b correction) — a measured ~3.6% on UVM that
+   was thrown away for want of a benchmark. Cheapest real win on this list.
 1. **`Arc<[Statement]>` in the AST** (`xezim-core` parser/elaborator) — the
    prerequisite §6b ran into. It would make a splice share a block body instead
    of deep-cloning it on every loop iteration, which is where the per-statement
