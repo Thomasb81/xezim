@@ -19589,6 +19589,31 @@ impl Simulator {
                         Some(Edge::Edge) => EdgeKind::LsbEdge,
                         None => EdgeKind::AnyEdge,
                     };
+                    // §15.5 an event-ARRAY element (`always @(ev[1])`).
+                    // `collect_ident_names` walks past the Index to the base,
+                    // which for an event array is the array name and not a
+                    // 1-bit signal — so the block armed on nothing and never
+                    // fired. Each element has its own backing signal, so name
+                    // it directly. Only a literal index is handled here
+                    // (`event_to_sens` cannot evaluate); a variable index
+                    // keeps the old behaviour.
+                    if let ExprKind::Index { expr: base, index } = &ee.expr.kind {
+                        if let (ExprKind::Ident(bh), ExprKind::Number(NumberLiteral::Integer { value, .. })) =
+                            (&base.kind, &index.kind)
+                        {
+                            if bh.path.len() == 1 {
+                                let key = format!("{}[{}]", bh.path[0].name.name, value);
+                                if self.module.events.contains(key.as_str()) {
+                                    out.push(Sensitivity {
+                                        signal_name: self.resolve_event_key(&key),
+                                        edge,
+                                        iff: ee.iff.clone(),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let mut idents = Vec::new();
                     collect_ident_names(&ee.expr, &mut idents);
                     for &h in &idents {
@@ -24281,6 +24306,48 @@ impl Simulator {
                                     pid,
                                     continuation: cont,
                                 });
+                                return;
+                            }
+                        }
+                        // `@(h.ce)`: a class-property event reached through a
+                        // handle from OUTSIDE the class. `resolve_this_event_field`
+                        // above only covers a bare field on `this`.
+                        if let Some(expr) = Self::event_control_single_expr(event) {
+                            if let Some(key) = self.expr_handle_event_field(&expr) {
+                                let mut cont = vec![*body.clone()];
+                                cont.extend_from_slice(&stmts[i + 1..]);
+                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                    key,
+                                    pid,
+                                    continuation: cont,
+                                });
+                                return;
+                            }
+                        }
+                        // §15.5 a DECLARED named event — including an array
+                        // element (`@ev[1]`) and one reached through an alias
+                        // (`e1 = e2; @e1`). Both need the resolved key rather
+                        // than the raw text: `event_to_sens` walks PAST an
+                        // Index to the base ident, so `@ev[1]` armed on the
+                        // array name `ev` (not a 1-bit signal) and fell into
+                        // the delta-yield below, waking instantly at t=0. And
+                        // an aliased waiter armed on its own name, so it never
+                        // saw `-> e2` — only the TRIGGER side canonicalized
+                        // (§15.5.4). Resolving here fixes both, and keeps the
+                        // delta-yield fallback for genuine non-event locals.
+                        if let Some(key) = self.event_control_event_key(event) {
+                            let canon = self.resolve_event_key(&key);
+                            if self.signal_name_to_id.contains_key(canon.as_str()) {
+                                let mut cont = vec![*body.clone()];
+                                cont.extend_from_slice(&stmts[i + 1..]);
+                                let sens = vec![Sensitivity {
+                                    signal_name: canon,
+                                    edge: EdgeKind::AnyEdge,
+                                    iff: None,
+                                }];
+                                self.event_waiters.push(
+                                    self.make_event_waiter_kind(pid, sens, cont, false),
+                                );
                                 return;
                             }
                         }
@@ -34007,6 +34074,20 @@ impl Simulator {
                 } else {
                     ctx_width
                 };
+                // §15.5.4: comparing event variables compares their IDENTITY
+                // (which synchronization object they name), not a value. An
+                // event's 1-bit backing signal holds an arbitrary toggle state,
+                // so the integral path returned x — `e1 == e2` after `e1 = e2`
+                // read x instead of 1. Null compares equal only to null.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
+                    let lk = self.event_operand_key(left);
+                    let rk = self.event_operand_key(right);
+                    if let (Some(lk), Some(rk)) = (lk, rk) {
+                        let eq = lk == rk;
+                        let res = if matches!(op, BinaryOp::Eq) { eq } else { !eq };
+                        return Value::from_u64(res as u64, 1);
+                    }
+                }
                 let mut l = self.eval_expr_ctx(left, self_det_w);
                 let mut r = self.eval_expr_ctx(right, self_det_w);
                 // IEEE 1800-2017 §11.8.1/§11.8.2: an expression is UNSIGNED as
@@ -42019,6 +42100,22 @@ impl Simulator {
                     self.fire_instance_event(key);
                     return;
                 }
+                // `-> h.ce` / `-> this.ce`: a class-property event reached
+                // through a handle (the `->` parser flattens it to a dotted
+                // name).
+                if name.name.contains('.') {
+                    if let Some(key) = self.resolve_handle_event_field(&name.name) {
+                        self.fire_instance_event(key);
+                        return;
+                    }
+                }
+                // An event bound to a `ref` formal fires the CALLER's event.
+                if !self.module.events.contains(name.name.as_str()) {
+                    if let Some(k) = self.ref_bound_event_key(&name.name) {
+                        self.fire_named_event(&k);
+                        return;
+                    }
+                }
                 self.fire_named_event(&name.name);
             }
             StatementKind::Coverpoint { .. } | StatementKind::Cross { .. } => {}
@@ -42165,6 +42262,14 @@ impl Simulator {
                 }
             }
         }
+        // `h.ce.triggered` / `this.ce.triggered` — a per-instance class event.
+        if let Some(k) = self.expr_handle_event_field(e) {
+            let stamp = Self::instance_event_stamp_key(&k);
+            if self.event_triggered_time.get(stamp.as_str()) == Some(&now) {
+                return Some(true);
+            }
+            keys.push(stamp);
+        }
         if keys.is_empty() {
             return None;
         }
@@ -42243,6 +42348,126 @@ impl Simulator {
         }
     }
 
+    /// The identity key of an event-valued operand, for `==`/`!=` (§15.5.4):
+    /// the alias-resolved storage key of a declared event, or the null key for
+    /// a `null` literal. `None` when the operand is not an event, so ordinary
+    /// comparisons are untouched.
+    fn event_operand_key(&mut self, e: &Expression) -> Option<String> {
+        if matches!(e.kind, ExprKind::Null) {
+            return Some(Self::EVENT_NULL_KEY.to_string());
+        }
+        let k = self.event_ref_key(e)?;
+        Some(self.resolve_event_key(&k))
+    }
+
+    /// `.triggered` stamp key for a per-instance class event. Instance events
+    /// have no backing signal (the handle is dynamic), so they cannot use the
+    /// name-keyed signal path; this gives them a distinct key in the same
+    /// `event_triggered_time` table. The `\x02` prefix cannot collide with a
+    /// user identifier.
+    fn instance_event_stamp_key(key: &(usize, String)) -> String {
+        format!("\u{2}inst{}#{}", key.0, key.1)
+    }
+
+    /// §15.5 an event that is a CLASS PROPERTY reached through a handle:
+    /// `h.ce`, `this.ce`, or a dotted name the `->` parser flattened. Returns
+    /// the per-instance `(handle, field)` identity. `resolve_this_event_field`
+    /// only covers a BARE field name on `this`, so `@(h.ce)` and `-> h.ce`
+    /// from outside the class had no identity at all — the waiter fell into
+    /// the delta-yield and woke at t=0, and the trigger fired a name nothing
+    /// was listening to.
+    fn resolve_handle_event_field(&mut self, dotted: &str) -> Option<(usize, String)> {
+        let (recv, field) = dotted.rsplit_once('.')?;
+        if recv.contains('.') {
+            return None; // deeper chains are not modelled
+        }
+        let handle = if recv == "this" {
+            self.this_stack.last().copied().flatten()?
+        } else {
+            self.eval_ident_handle(recv)?
+        };
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
+        if inst.properties.contains_key(field) {
+            Some((handle, field.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// The same, from an EXPRESSION (`@(h.ce)`, `h.ce.triggered`).
+    fn expr_handle_event_field(&mut self, e: &Expression) -> Option<(usize, String)> {
+        let dotted = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                let recv = match &expr.kind {
+                    ExprKind::This => "this".to_string(),
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                        h.path[0].name.name.clone()
+                    }
+                    _ => return None,
+                };
+                format!("{}.{}", recv, member.name)
+            }
+            // `h.ce` also reaches here as a two-segment HIERARCHICAL name,
+            // which is how `@(h.ce)` parses — the receiver is a class handle,
+            // not an instance path, so the hierarchical resolver finds nothing.
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                format!("{}.{}", h.path[0].name.name, h.path[1].name.name)
+            }
+            _ => return None,
+        };
+        self.resolve_handle_event_field(&dotted)
+    }
+
+    /// §15.5 / §13.5.2: an event passed as a `ref` formal. `-> x` and `@x`
+    /// inside the subroutine must act on the CALLER's event, but the formal
+    /// name is not itself a declared event, so the trigger fired a name with
+    /// no sync object and the caller's waiter hung forever. `ref_binding_stack`
+    /// already maps the formal to the caller's actual expression; resolve it
+    /// to that event's key. Innermost frame first, so nested calls resolve to
+    /// the nearest binding.
+    fn ref_bound_event_key(&mut self, name: &str) -> Option<String> {
+        let bound = self
+            .ref_binding_stack
+            .iter()
+            .rev()
+            .find_map(|m| m.get(name).cloned())?;
+        let key = self.event_ref_key(&bound)?;
+        Some(self.resolve_event_key(&key))
+    }
+
+    /// The single un-edged expression of an event control (`@e`, `@(e)`,
+    /// `@ev[1]`, `@(h.ce)`), or None for edge terms / multi-term lists / `*`.
+    fn event_control_single_expr(event: &EventControl) -> Option<Expression> {
+        match event {
+            EventControl::HierIdentifier(e) => Some((*e).clone()),
+            EventControl::EventExpr(terms) if terms.len() == 1 && terms[0].edge.is_none() => {
+                Some(terms[0].expr.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// If this event control names a single DECLARED event variable — `@ev`,
+    /// `@(ev)`, `@ev_arr[i]` — return its storage key (`ev`, `ev_arr[3]`).
+    /// `None` for edge-qualified terms, multi-term lists, `*`, and anything
+    /// that is not a declared event, all of which keep their existing paths.
+    fn event_control_event_key(&mut self, event: &EventControl) -> Option<String> {
+        let expr = Self::event_control_single_expr(event)?;
+        if let Some(k) = self.event_ref_key(&expr) {
+            return Some(k);
+        }
+        // `@x` on a `ref event` formal waits on the caller's event.
+        if let ExprKind::Ident(h) = &expr.kind {
+            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                let n = h.path[0].name.name.clone();
+                return self.ref_bound_event_key(&n);
+            }
+        }
+        None
+    }
+
     /// Wake every process parked on `@<field>` for instance `key` (an edge
     /// trigger: only processes already waiting when `-><field>` fires resume).
     /// Each woken continuation is scheduled for the current time so it runs in
@@ -42250,6 +42475,11 @@ impl Simulator {
     /// `->e` resumes an `@e` waiter for a module-scope named event.
     fn fire_instance_event(&mut self, key: (usize, String)) {
         let now = self.time;
+        // §15.5.3: `<h>.<ev>.triggered` must read 1 for the rest of this slot.
+        // Instance events have no backing signal, so stamp the same table the
+        // name-keyed path uses, under a synthetic per-instance key.
+        let stamp = Self::instance_event_stamp_key(&key);
+        self.event_triggered_time.insert(stamp, now);
         let mut woken = Vec::new();
         self.instance_event_waiters.retain(|w| {
             if w.key == key {
@@ -64238,6 +64468,22 @@ impl Simulator {
                     }
                 }
                 PortDirection::Ref => {
+                    // §15.5: a `ref event` formal is bound by IDENTITY, not by
+                    // value — `-> x` fires the caller's sync object (resolved
+                    // through `ref_binding_stack`). Copying a value back on
+                    // return would rewrite the event's 1-bit toggle signal with
+                    // the stale value captured at call time, cancelling the
+                    // edge before the main loop delivered it: the trigger
+                    // "happened" and the caller's `@e` waiter still hung.
+                    if matches!(
+                        &port.data_type,
+                        crate::ast::types::DataType::Simple {
+                            kind: crate::ast::types::SimpleType::Event,
+                            ..
+                        }
+                    ) {
+                        continue;
+                    }
                     let val = if i < args.len() {
                         self.eval_expr(&args[i])
                     } else {
