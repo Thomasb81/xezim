@@ -25706,6 +25706,114 @@ impl Simulator {
         }
     }
 
+    /// Does any INDEX or RANGE bound inside this lvalue mention `$`? Scans the
+    /// whole lvalue tree, unlike `expr_contains_dollar`, which only looks at
+    /// one index expression.
+    fn lvalue_mentions_dollar(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                Self::expr_contains_dollar(index) || Self::lvalue_mentions_dollar(expr)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::expr_contains_dollar(left)
+                    || Self::expr_contains_dollar(right)
+                    || Self::lvalue_mentions_dollar(expr)
+            }
+            ExprKind::Paren(i) => Self::lvalue_mentions_dollar(i),
+            ExprKind::MemberAccess { expr, .. } => Self::lvalue_mentions_dollar(expr),
+            _ => false,
+        }
+    }
+
+    /// Rewrite every `$`-bearing index/range bound in an lvalue into a literal,
+    /// each evaluated against ITS OWN base's bound. Returns a clone; only
+    /// called when `lvalue_mentions_dollar` says there is work to do.
+    fn resolve_dollar_in_lvalue(&mut self, e: &Expression) -> Expression {
+        let lit = |v: i64, span| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(64),
+                    signed: true,
+                    base: NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                }),
+                span,
+            )
+        };
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                let base = self.resolve_dollar_in_lvalue(expr);
+                if !Self::expr_contains_dollar(index) {
+                    return Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: index.clone(),
+                        },
+                        e.span,
+                    );
+                }
+                // The bound belongs to the base being indexed here, which is
+                // why this recurses rather than pushing one bound for the
+                // whole tree: `mem[q[$]]` takes q's bound, not mem's.
+                let idx = match self.dollar_bound_for_base(&base) {
+                    Some(b) => {
+                        self.dollar_bound.push(b);
+                        let v = self.eval_expr(index).to_i64().unwrap_or(0);
+                        self.dollar_bound.pop();
+                        lit(v, index.span)
+                    }
+                    None => (**index).clone(),
+                };
+                Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(base),
+                        index: Box::new(idx),
+                    },
+                    e.span,
+                )
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                let base = self.resolve_dollar_in_lvalue(expr);
+                // A range's `$` refers to the base being sliced.
+                let b = self.dollar_bound_for_base(&base);
+                let mut ev = |x: &Expression| -> Box<Expression> {
+                    if !Self::expr_contains_dollar(x) {
+                        return Box::new(x.clone());
+                    }
+                    match b {
+                        Some(bb) => {
+                            self.dollar_bound.push(bb);
+                            let v = self.eval_expr(x).to_i64().unwrap_or(0);
+                            self.dollar_bound.pop();
+                            Box::new(lit(v, x.span))
+                        }
+                        None => Box::new(x.clone()),
+                    }
+                };
+                let l = ev(left);
+                let r = ev(right);
+                Expression::new(
+                    ExprKind::RangeSelect {
+                        expr: Box::new(base),
+                        kind: *kind,
+                        left: l,
+                        right: r,
+                    },
+                    e.span,
+                )
+            }
+            _ => e.clone(),
+        }
+    }
+
     /// Does this expression mention `$` (§11.4.12 — the last index of the
     /// collection being indexed)? Used to decide whether an lvalue index has to
     /// be evaluated with a `dollar_bound` installed.
@@ -30712,6 +30820,22 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
+        // §11.4.12: `$` in an index is the last valid index of the collection
+        // being indexed. The READ paths install `dollar_bound` before
+        // evaluating; no lvalue path did, so `$` fell through to its
+        // `u64::MAX` default and the write went to a nonexistent element.
+        // Normalising the whole lvalue ONCE here covers every arm below —
+        // plain `q[$]`, a part-select of it (`q[$][3:0]`), and nested forms —
+        // rather than each arm having to remember to push the bound. Gated on
+        // a cheap scan, so an lvalue without `$` is untouched.
+        let dollar_free;
+        let lhs: &Expression = if Self::lvalue_mentions_dollar(lhs) {
+            dollar_free = self.resolve_dollar_in_lvalue(lhs);
+            &dollar_free
+        } else {
+            lhs
+        };
+
         // §18.4: writing a member of a struct/union CLASS property goes to the
         // aggregate's own storage — for a packed struct/union that means
         // splicing the member's bits into the property's raw integral value, so
@@ -31181,30 +31305,6 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
-                let dollar_norm;
-                let index: &Expression = if Self::expr_contains_dollar(index) {
-                    match self.dollar_bound_for_base(expr) {
-                        Some(b) => {
-                            self.dollar_bound.push(b);
-                            let v = self.eval_expr(index).to_i64().unwrap_or(0);
-                            self.dollar_bound.pop();
-                            dollar_norm = Expression::new(
-                                ExprKind::Number(NumberLiteral::Integer {
-                                    size: Some(64),
-                                    signed: true,
-                                    base: NumberBase::Decimal,
-                                    value: v.to_string(),
-                                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
-                                }),
-                                index.span,
-                            );
-                            &dollar_norm
-                        }
-                        None => index,
-                    }
-                } else {
-                    index
-                };
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k] = v` writes
                 // element k of the queue `q[i]` (§7.4.5), not a bit of a scalar.
                 if let Some(qn) = self.indexed_queue_base(expr) {
@@ -49807,19 +49907,25 @@ impl Simulator {
     }
 
     /// Declared element width of an associative array, when the elaborator
-    /// recorded one. Tries the resolved name and its leaf, mirroring how the
-    /// other per-signal maps are consulted.
+    /// recorded one.
+    ///
+    /// Deliberately conservative: the map is keyed by DECLARATION name, and
+    /// guessing wrong silently corrupts data (a too-narrow width truncates a
+    /// good value), whereas guessing nothing merely restores the older
+    /// store-as-is behaviour. So a CLASS-member collection (`<handle>#m`) is
+    /// never resolved through its bare leaf — a class's `logic [7:0] m[string]`
+    /// would otherwise pick up an unrelated module-scope `logic [3:0] m[string]`
+    /// and truncate to 4 bits. Only an exact match, or an instance-scoped
+    /// `inst.name` whose leaf is the declaration, is trusted.
     fn assoc_elem_width(&self, name: &str) -> Option<u32> {
         if let Some(&w) = self.module.assoc_elem_widths.get(name) {
             return Some(w);
         }
+        if name.contains('#') {
+            return None;
+        }
         let leaf = name.rsplit('.').next().unwrap_or(name);
-        let base = leaf.split('#').next_back().unwrap_or(leaf);
-        self.module
-            .assoc_elem_widths
-            .get(leaf)
-            .or_else(|| self.module.assoc_elem_widths.get(base))
-            .copied()
+        self.module.assoc_elem_widths.get(leaf).copied()
     }
 
     fn is_associative_array(&self, name: &str) -> bool {

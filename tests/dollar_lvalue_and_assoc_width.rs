@@ -7,16 +7,24 @@
 //!    did, so `ExprKind::Dollar` fell through to its `u64::MAX` default and
 //!    `q[$] = v` wrote element 18446744073709551615: the write silently
 //!    vanished, for blocking and non-blocking alike. The index is now
-//!    normalised once, with the bound installed, at the top of the indexed-
-//!    lvalue arm — plus in `resolve_nba_target` and `freeze_lvalue_indices`,
-//!    which each evaluate it on their own path.
+//!    normalised once, with the bound installed, over the WHOLE lvalue at the
+//!    top of `assign_value` — plus in `resolve_nba_target` and
+//!    `freeze_lvalue_indices`, which each evaluate it on their own path.
+//!    Normalising the whole lvalue rather than one arm is what makes
+//!    `q[$][3:0]` (top node is a RangeSelect) and `mem[q[$]]` (the `$` belongs
+//!    to the inner collection) come out right; each index is resolved against
+//!    its own base.
 //!
 //! 2. §10.7 — an associative-array element has no entry in the typed signal
 //!    table, and the elaborator recorded only whether the array was
 //!    string-keyed, never its ELEMENT WIDTH. So a write stored the RHS at its
 //!    own size: `logic [3:0] aa[string]; aa["k"] = 8'hEF` kept all eight bits
 //!    and `$bits` reported 8. `ElaboratedModule::assoc_elem_widths` now carries
-//!    the declared width and the store fits to it.
+//!    the declared width and the store fits to it — registered under the
+//!    instance-scoped name for submodules. The lookup is deliberately
+//!    conservative: a class member (`<handle>#m`) is never resolved through a
+//!    bare leaf, because guessing a too-narrow width silently CORRUPTS data
+//!    whereas guessing nothing merely restores the older store-as-is.
 
 use xezim::simulate;
 
@@ -144,4 +152,100 @@ endmodule
     let sim = simulate(src, 100).expect("simulate failed");
     assert_eq!(u(&sim, "rq"), 0xB, "queue element truncates");
     assert_eq!(u(&sim, "rd"), 0xD, "dynamic-array element truncates");
+}
+
+/// Sibling shapes of the `$` fix, all reference-validated:
+///
+///  * `q[$][3:0]` — a part-select whose BASE carries the `$`. The lvalue's top
+///    node is a RangeSelect, so an Index-arm-local fix would have missed it;
+///    the normalisation runs once over the whole lvalue instead.
+///  * `mem[q[$]]` — the `$` belongs to the INNER collection. Each index is
+///    resolved against its own base, so this must not pick up `mem`'s bound.
+#[test]
+fn dollar_in_nested_and_range_select_lvalues() {
+    let src = r#"
+`timescale 1ns/1ns
+module top;
+  logic [7:0] q [$];
+  int qmem [0:7];
+  int last, first, sz, hit, untouched;
+  initial begin
+    q.push_back(8'h11); q.push_back(8'h22); q.push_back(8'h33);
+    q[$][3:0] = 4'hF;          // part-select of the last element -> 8'h3F
+
+    for (int i = 0; i < 8; i++) qmem[i] = 0;
+    qmem[q[$]] = 0;            // q[$] is 8'h3f -> out of range, must not crash
+    q.delete();
+    q.push_back(8'h03); q.push_back(8'h05);
+    qmem[q[$]] = 99;           // q[$] == 5 -> qmem[5], NOT qmem[7]
+
+    #1;
+    last = q[1]; first = q[0]; sz = q.size();
+    hit = qmem[5]; untouched = qmem[7];
+  end
+endmodule
+"#;
+    let sim = simulate(src, 40).expect("simulate failed");
+    assert_eq!(u(&sim, "first"), 0x03, "untouched element");
+    assert_eq!(u(&sim, "sz"), 2, "queue size unchanged by the writes");
+    assert_eq!(u(&sim, "hit"), 99, "inner `$` resolves against the QUEUE, not the array");
+    assert_eq!(u(&sim, "untouched"), 0, "the outer array's own bound was not used");
+}
+
+/// An assoc array declared in a CLASS must not take its width from a
+/// same-named module-scope array. The lookup is keyed by declaration name, so
+/// a bare-leaf fallback would silently truncate an 8-bit class member to the
+/// module array's 4 bits — corrupting data rather than merely missing a fit.
+#[test]
+fn class_member_assoc_does_not_inherit_a_module_arrays_width() {
+    let src = r#"
+`timescale 1ns/1ns
+package p;
+  class holder;
+    logic [7:0] m [string];
+  endclass
+endpackage
+module top;
+  import p::*;
+  logic [3:0] m [string];
+  holder h;
+  int cls_val, mod_val;
+  initial begin
+    h = new();
+    h.m["k"] = 8'hEF;
+    m["k"]   = 8'hEF;
+    #1 cls_val = h.m["k"]; mod_val = m["k"];
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "cls_val"), 0xEF, "the 8-bit class member keeps its value");
+    assert_eq!(u(&sim, "mod_val"), 0xF, "the 4-bit module array truncates");
+}
+
+/// An assoc array inside a SUBMODULE gets its width under the instance-scoped
+/// name, so the fit applies there too.
+#[test]
+fn instance_scoped_assoc_fits_its_element_width() {
+    let src = r#"
+`timescale 1ns/1ns
+module sub;
+  logic [3:0] aa [string];
+  int seen;
+  initial begin
+    aa["k"] = 8'hEF;
+    #1 seen = aa["k"];
+  end
+endmodule
+module top;
+  sub u1();
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    let v = sim
+        .get_signal("u1.seen")
+        .expect("u1.seen not found")
+        .to_u64()
+        .expect("not u64-able");
+    assert_eq!(v, 0xF, "submodule assoc element truncates to its declared width");
 }
