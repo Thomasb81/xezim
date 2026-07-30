@@ -498,7 +498,7 @@ macro_rules! write_sig {
                     $self
                         .warn_x_pending
                         .borrow_mut()
-                        .push((__wsig_id, __xt, __wsig_val.clone(), __xp));
+                        .push((__wsig_id, __xt, __wsig_val.clone(), __xp, None));
                 }
             }
             $self.signal_table[__wsig_id] = __wsig_val;
@@ -2524,6 +2524,14 @@ pub struct Simulator {
     /// are indistinguishable. Applying the gate rule to both made every
     /// `assign y = x;` eat `z`. This says which ids the gate rule applies to.
     signal_gate_driven: Vec<bool>,
+    /// Signal ids whose declared type is `string`. §6.16 makes a string a
+    /// DYNAMIC type with no length limit, but it is stored in the fixed-width
+    /// signal table like everything else — `resolve_type_width` hands it 1024
+    /// bits, i.e. 128 characters. Fitting a value to that width silently
+    /// truncated every longer string (a 130-char concat came back 128, and the
+    /// dropped end took a `{base, "TAIL"}` suffix with it). These ids skip the
+    /// width fit and keep whatever length they are given.
+    signal_is_string: Vec<bool>,
     /// `--warn-x` state. `warn_x` is a plain field (not the atomic) so the
     /// write hot path costs one bool load; everything else is touched only
     /// when a report actually fires.
@@ -2541,7 +2549,11 @@ pub struct Simulator {
     /// bodies are drained into processes at compile time, so they are not in
     /// `module.initial_blocks` any more, but `process_origin` still knows what
     /// each pid came from and where.
-    warn_x_pending: std::cell::RefCell<Vec<(usize, u64, Value, usize)>>,
+    warn_x_pending: std::cell::RefCell<Vec<(usize, u64, Value, usize, Option<String>)>>,
+    /// Dedup for entries identified by NAME rather than id — associative and
+    /// other elements that live in the untyped `signals` map and so have no
+    /// entry in the signal table.
+    warn_x_seen_named: std::cell::RefCell<HashSet<String>>,
     warn_x_count: usize,
     /// Lazily built on the first report: signal id -> one line per driver.
     /// Derived from the comb entries and edge blocks on demand, so a run
@@ -5306,6 +5318,42 @@ impl Simulator {
                 module.packed_signal_elem_widths.insert(k, ew);
             }
         }
+        // §6.16: mark string-typed ids so assignment does not clamp them to the
+        // placeholder width the elaborator assigns a dynamic type.
+        let mut signal_is_string = vec![false; num_signals];
+        if !module.string_signals.is_empty() {
+            // An ELEMENT of a string collection is a string too. `string_signals`
+            // holds the base name (`q`, `aa`), while the table holds `q[2]`, so
+            // the subscript is stripped before matching — otherwise a
+            // `string q[$]` element kept being clamped to the placeholder width
+            // while a plain `string` variable no longer was.
+            let is_str_name = |n: &str| -> bool {
+                let leaf = n.rsplit('.').next().unwrap_or(n);
+                let base = leaf.split('[').next().unwrap_or(leaf);
+                module.string_signals.contains(n)
+                    || module.string_signals.contains(leaf)
+                    || module.string_signals.contains(base)
+            };
+            for (name, &id) in signal_name_to_id.iter() {
+                if id >= num_signals {
+                    continue;
+                }
+                if is_str_name(name.as_ref()) {
+                    signal_is_string[id] = true;
+                }
+            }
+            // Compact-allocated array elements have no per-element name entry;
+            // mark their whole id range from the base.
+            for (base_name, &(first_id, lo, hi)) in array_first_id.iter() {
+                if !is_str_name(base_name.as_ref()) {
+                    continue;
+                }
+                let n = (hi - lo + 1).max(0) as usize;
+                for id in first_id..(first_id + n).min(num_signals) {
+                    signal_is_string[id] = true;
+                }
+            }
+        }
         // §28.4 vs §10.3: mark ids driven by a lowered gate primitive, so only
         // those get the `buf` truth table's z->x. Same leaf/base matching as
         // the 2-state pass above.
@@ -5438,9 +5486,11 @@ impl Simulator {
             signal_real: signal_real_vec,
             signal_two_state,
             signal_gate_driven,
+            signal_is_string,
             warn_x: warn_x_enabled(),
             warn_x_seen: std::cell::RefCell::new(HashSet::default()),
             warn_x_pending: std::cell::RefCell::new(Vec::new()),
+            warn_x_seen_named: std::cell::RefCell::new(HashSet::default()),
             warn_x_count: 0,
             warn_x_drivers: None,
             cont_driven: HashSet::default(),
@@ -13444,6 +13494,8 @@ impl Simulator {
             compiler.set_tasks(&self.module.tasks);
             compiler.set_params(&self.module.parameters);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                    compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
             compiler.set_array_first_id(&self.array_first_id);
@@ -13487,6 +13539,8 @@ impl Simulator {
                 compiler.set_tasks(&self.module.tasks);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                    compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
@@ -13510,6 +13564,8 @@ impl Simulator {
                 delay_compiler.set_tasks(&self.module.tasks);
                 delay_compiler.set_params(&self.module.parameters);
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                delay_compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
                 delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 delay_compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 delay_compiler.set_array_first_id(&self.array_first_id);
@@ -16345,6 +16401,8 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                    compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
@@ -16401,6 +16459,8 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                    compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
@@ -16714,6 +16774,8 @@ impl Simulator {
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_params(&self.module.parameters);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                    compiler.set_assoc_arrays(&self.module.associative_arrays);
                     compiler.set_packed_full_dims(&self.module.packed_full_dims);
                     compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                     compiler.set_array_first_id(&self.array_first_id);
@@ -26297,6 +26359,12 @@ impl Simulator {
             // Untracked class-handle var — never truncate to nothing.
             return val.clone();
         }
+        // §6.16: a string has no declared length; the table width is only a
+        // placeholder. Resizing to it truncates from the TOP, which for a
+        // packed string means losing the FRONT of the text.
+        if self.signal_is_string.get(id).copied().unwrap_or(false) && !val.is_real {
+            return val.clone();
+        }
         let mut v = if val.is_real {
             Self::real_to_int(val.to_f64(), width)
         } else {
@@ -31788,7 +31856,14 @@ impl Simulator {
                             if idx >= lo && idx <= hi {
                                 let id = first_id + (idx - lo) as usize;
                                 let width = self.signal_widths[id];
-                                let mut resized = val.resize(width);
+                                // §6.16: a string element has no declared
+                                // length — the width is a placeholder.
+                                let mut resized =
+                                    if self.signal_is_string.get(id).copied().unwrap_or(false) {
+                                        val.clone()
+                                    } else {
+                                        val.resize(width)
+                                    };
                                 // Adopt the element's declared signedness — a
                                 // signed RHS (e.g. an `integer`) stored verbatim
                                 // made `reg [15:0] a[]` elements read as signed.
@@ -31809,7 +31884,12 @@ impl Simulator {
                         let elem_name = format!("{}[{}]", name, idx_str);
                         if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
                             let width = self.signal_widths[id];
-                            let mut resized = val.resize(width);
+                            let mut resized =
+                                if self.signal_is_string.get(id).copied().unwrap_or(false) {
+                                    val.clone()
+                                } else {
+                                    val.resize(width)
+                                };
                             resized.is_signed = self.signal_signed[id];
                             let changed = self.signal_table[id] != resized;
                             if changed {
@@ -31830,12 +31910,20 @@ impl Simulator {
                         // `logic [3:0] aa[string]; aa["k"] = 8'hEF` kept all
                         // eight bits, and `$bits` reported the stored width
                         // rather than the declared one.
+                        // §6.16: a string element has no fixed length — the
+                        // recorded width is only the elaborator's placeholder,
+                        // and fitting to it would chop the text.
+                        let elem_is_string = self.is_string_collection(&name);
                         let fitted = match self.assoc_elem_width(&name) {
-                            Some(w) if w != val.width && !val.is_real => {
+                            Some(w) if w != val.width && !val.is_real && !elem_is_string => {
                                 val.resize_for_assign(w)
                             }
                             _ => val.clone(),
                         };
+                        if self.warn_x && self.time > 0 {
+                            let prev = self.signals.get(&elem_name).cloned();
+                            self.warn_x_note_named(&elem_name, prev.as_ref(), &fitted);
+                        }
                         let changed = self.signals.get(&elem_name).is_none_or(|p| *p != fitted);
                         if changed {
                             sim_dbg_eprintln!("[DEBUG] signal {} changed to {:?}", elem_name, fitted);
@@ -34652,6 +34740,22 @@ impl Simulator {
                         let lo = idx * (elem_w as usize);
                         let hi = lo + (elem_w as usize) - 1;
                         return base_v.range_select(hi, lo);
+                    }
+                }
+                // §6.16.3 `str[i]` is a CHARACTER select, not a bit select.
+                // That works for a plain `string` variable, whose name is in
+                // `string_signals` — but an ELEMENT of a string collection
+                // (`q[0][3]`, `arr[i][0]`) has an Index base, so it missed the
+                // name-keyed check and fell through to a 1-bit select, reading
+                // empty even though `len()` reported the right length.
+                if matches!(expr.kind, ExprKind::Index { .. } | ExprKind::MemberAccess { .. }) {
+                    if let Some(fname) = self.flat_member_name(expr) {
+                        if self.is_string_collection(&fname) {
+                            let text = self.eval_expr(expr).to_sv_string();
+                            let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
+                            let b = text.as_bytes().get(i).copied().unwrap_or(0);
+                            return Value::from_u64(b as u64, 8);
+                        }
                     }
                 }
                 // Fall back to bit select
@@ -46129,22 +46233,57 @@ impl Simulator {
         let _ = v.set_inline_bits(nv, nx);
         self.warn_x_pending
             .borrow_mut()
-            .push((id, self.time, v, self.current_pid));
+            .push((id, self.time, v, self.current_pid, None));
+    }
+
+    /// Record a fresh x on a value stored by NAME rather than by signal id —
+    /// an associative-array element, and anything else kept in the untyped
+    /// `signals` map. Those never pass through `write_sig!` or the raw-bit
+    /// fast paths, so without this an x landing in `aa["k"]` went unreported
+    /// while the very same x in a queue element (which does have an id) was
+    /// reported — an inconsistency more confusing than silence.
+    fn warn_x_note_named(&self, name: &str, old: Option<&Value>, new: &Value) {
+        let has_new_x = (0..new.width as usize).any(|b| {
+            new.get_bit(b) == LogicBit::X
+                && old.is_none_or(|o| {
+                    b >= o.width as usize || o.get_bit(b) != LogicBit::X
+                })
+        });
+        if !has_new_x {
+            return;
+        }
+        if !self.warn_x_seen_named.borrow_mut().insert(name.to_string()) {
+            return;
+        }
+        self.warn_x_pending.borrow_mut().push((
+            usize::MAX,
+            self.time,
+            new.clone(),
+            self.current_pid,
+            Some(name.to_string()),
+        ));
     }
 
     pub fn drain_warn_x(&mut self) {
         if !self.warn_x {
             return;
         }
-        let pending: Vec<(usize, u64, Value, usize)> =
+        let pending: Vec<(usize, u64, Value, usize, Option<String>)> =
             std::mem::take(&mut *self.warn_x_pending.borrow_mut());
-        for (id, t, val, pid) in pending {
-            self.report_x_one(id, t, &val, pid);
+        for (id, t, val, pid, named) in pending {
+            self.report_x_one(id, t, &val, pid, named);
         }
     }
 
-    fn report_x_one(&mut self, id: usize, when: u64, new_val: &Value, pid: usize) {
-        if id >= self.signal_table.len() {
+    fn report_x_one(
+        &mut self,
+        id: usize,
+        when: u64,
+        new_val: &Value,
+        pid: usize,
+        named: Option<String>,
+    ) {
+        if named.is_none() && id >= self.signal_table.len() {
             return;
         }
         let lim = warn_x_limit();
@@ -46163,9 +46302,18 @@ impl Simulator {
         }
         self.warn_x_count += 1;
 
-        let name = self.name_for_id(id).to_string();
+        let name = match &named {
+            Some(n) => n.clone(),
+            None => self.name_for_id(id).to_string(),
+        };
+        // `aa[key]` / `q[3]`: the instance path is what precedes the element
+        // name, so strip the subscript before splitting off the scope.
+        let name_for_scope = name
+            .split_once('[')
+            .map(|(base, _)| base.to_string())
+            .unwrap_or_else(|| name.clone());
         // `a.b.c.sig` -> instance path `a.b.c`; empty for a top-level signal.
-        let inst = name.rsplit_once('.').map(|(p, _)| p.to_string());
+        let inst = name_for_scope.rsplit_once('.').map(|(p, _)| p.to_string());
         let module = self
             .scope_def_module(inst.as_deref())
             .unwrap_or_else(|| self.module.name.clone());
@@ -46196,7 +46344,11 @@ impl Simulator {
             self.warn_x_bin(new_val, w)
         );
         eprintln!("                 in {}", where_);
-        let drivers = self.warn_x_driver_lines(id);
+        let drivers = if named.is_some() {
+            Vec::new()
+        } else {
+            self.warn_x_driver_lines(id)
+        };
         if drivers.is_empty() {
             // No continuous/comb/edge driver. Either a procedural process wrote
             // it — `process_origin` knows which, and that is the useful answer —
@@ -49917,6 +50069,16 @@ impl Simulator {
     /// would otherwise pick up an unrelated module-scope `logic [3:0] m[string]`
     /// and truncate to 4 bits. Only an exact match, or an instance-scoped
     /// `inst.name` whose leaf is the declaration, is trusted.
+    /// Is `name` (a collection, or one of its elements) string-typed? Used to
+    /// keep §6.16's "no declared length" rule for elements as well as scalars.
+    fn is_string_collection(&self, name: &str) -> bool {
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        let base = leaf.split('[').next().unwrap_or(leaf);
+        self.string_signals.contains(name)
+            || self.string_signals.contains(leaf)
+            || self.string_signals.contains(base)
+    }
+
     fn assoc_elem_width(&self, name: &str) -> Option<u32> {
         if let Some(&w) = self.module.assoc_elem_widths.get(name) {
             return Some(w);
@@ -50787,8 +50949,14 @@ impl Simulator {
             let w = self.signal_widths[id];
             // A width-0 signal (e.g. an untracked module-scope class handle)
             // would truncate to nothing; keep the value's natural width so a
-            // class handle (`c = factory.create_...()`) is preserved.
-            let resized = if w == 0 { val } else { val.resize(w) };
+            // class handle (`c = factory.create_...()`) is preserved. §6.16: a
+            // string (or an element of a string collection) has no declared
+            // length either — the table width is a placeholder, and resizing to
+            // it chops the text. This is the path `push_back` takes, so without
+            // it a `string q[$]` element was still clamped to 128 characters
+            // after scalar strings had been fixed.
+            let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
+            let resized = if w == 0 || is_str { val } else { val.resize(w) };
             if self.signal_table[id] != resized {
                 if !self.dirty_signals[id] {
                     self.dirty_signals[id] = true;
@@ -50803,7 +50971,8 @@ impl Simulator {
         // Array-element fallback (1D compact resolver).
         if let Some(id) = resolve_array_elem_id(name, &self.array_first_id) {
             let w = self.signal_widths[id];
-            let resized = val.resize(w);
+            let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
+            let resized = if is_str { val } else { val.resize(w) };
             if self.signal_table[id] != resized {
                 if !self.dirty_signals[id] {
                     self.dirty_signals[id] = true;
@@ -61684,6 +61853,96 @@ impl Simulator {
             if mname == "len" || mname == "size" {
                 let base = self.eval_expr(expr);
                 return Value::from_u64(base.sv_string_bytes().len() as u64, 32);
+            }
+
+            // §6.16 query methods on a receiver that is not a plain identifier
+            // — `q[0].substr(1,3)`, `arr[i].getc(0)`, a string literal, a
+            // function result. `eval_builtin_method` resolves its receiver by
+            // NAME, so those all missed it and returned empty; only `len`/`size`
+            // had the fallback above, which made a queue element look like it
+            // held a string of the right LENGTH but no CONTENT. These methods
+            // are read-only, so evaluating the receiver here is safe (`putc`
+            // mutates and is deliberately excluded — it needs an lvalue).
+            if matches!(
+                mname,
+                "substr" | "getc" | "toupper" | "tolower" | "atoi" | "atohex"
+                    | "atooct" | "atobin" | "atoreal" | "compare" | "icompare"
+            ) && !matches!(expr.kind, ExprKind::Ident(_))
+            {
+                let text = self.eval_expr(expr).to_sv_string();
+                match mname {
+                    "substr" => {
+                        let a = args
+                            .first()
+                            .map(|e| self.eval_expr(e).to_u64().unwrap_or(0) as usize)
+                            .unwrap_or(0);
+                        let b = args
+                            .get(1)
+                            .map(|e| self.eval_expr(e).to_u64().unwrap_or(0) as usize)
+                            .unwrap_or(0);
+                        let bytes = text.as_bytes();
+                        // §6.16.8: an out-of-range or inverted range yields "".
+                        if a > b || b >= bytes.len() {
+                            return Value::from_string("");
+                        }
+                        return Value::from_string(
+                            &String::from_utf8_lossy(&bytes[a..=b]).into_owned(),
+                        );
+                    }
+                    "getc" => {
+                        let i = args
+                            .first()
+                            .map(|e| self.eval_expr(e).to_u64().unwrap_or(0) as usize)
+                            .unwrap_or(0);
+                        let b = text.as_bytes().get(i).copied().unwrap_or(0);
+                        return Value::from_u64(b as u64, 8);
+                    }
+                    "toupper" => return Value::from_string(&text.to_uppercase()),
+                    "tolower" => return Value::from_string(&text.to_lowercase()),
+                    "atoi" => {
+                        let t = text.trim();
+                        let neg = t.starts_with('-');
+                        let digits: String =
+                            t.trim_start_matches(['-', '+']).chars().take_while(|c| c.is_ascii_digit()).collect();
+                        let n: i64 = digits.parse().unwrap_or(0);
+                        let mut v = Value::from_u64(if neg { (-n) as u64 } else { n as u64 }, 32);
+                        v.is_signed = true;
+                        return v;
+                    }
+                    "atohex" => {
+                        return Value::from_u64(
+                            u64::from_str_radix(text.trim(), 16).unwrap_or(0),
+                            32,
+                        )
+                    }
+                    "atooct" => {
+                        return Value::from_u64(u64::from_str_radix(text.trim(), 8).unwrap_or(0), 32)
+                    }
+                    "atobin" => {
+                        return Value::from_u64(u64::from_str_radix(text.trim(), 2).unwrap_or(0), 32)
+                    }
+                    "atoreal" => return Value::from_f64(text.trim().parse::<f64>().unwrap_or(0.0)),
+                    "compare" | "icompare" => {
+                        let other = args
+                            .first()
+                            .map(|e| self.eval_expr(e).to_sv_string())
+                            .unwrap_or_default();
+                        let (l, r) = if mname == "icompare" {
+                            (text.to_lowercase(), other.to_lowercase())
+                        } else {
+                            (text.clone(), other)
+                        };
+                        let c: i64 = match l.cmp(&r) {
+                            std::cmp::Ordering::Less => -1,
+                            std::cmp::Ordering::Equal => 0,
+                            std::cmp::Ordering::Greater => 1,
+                        };
+                        let mut v = Value::from_u64(c as u64, 32);
+                        v.is_signed = true;
+                        return v;
+                    }
+                    _ => {}
+                }
             }
 
             if mname == "get_next_item" && !real_uvm {
