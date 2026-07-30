@@ -31650,6 +31650,41 @@ impl Simulator {
                     }
                     return changed;
                 }
+                // `s.arr[i] = v` where `arr` is an UNPACKED ARRAY MEMBER of an
+                // unpacked struct. Its elements are individual signals
+                // (`s.arr[0]` …) and the BASE `s.arr` is not a signal at all,
+                // so every arm here missed and the write degraded into a
+                // bit-select of a phantom scalar — silently discarded. The
+                // member then read back x forever, which made a scoreboard
+                // built on such a struct compare x against every DUT output.
+                //
+                // Guarded on the base having no signal of its own, so an
+                // ordinary packed-vector bit-write (`v[3] = 1`, where `v` IS a
+                // signal) never takes this path.
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let base = self.resolve_hier_name(h);
+                    if !self.signal_name_to_id.contains_key(base.as_str())
+                        && !self.signals.contains_key(&base)
+                    {
+                        let i = self.eval_expr(index).to_i64().unwrap_or(0);
+                        let elem = format!("{}[{}]", base, i);
+                        // A module-level struct has its element signals
+                        // pre-registered. A PROCEDURAL-LOCAL one does not —
+                        // nothing is registered for it at all — so create the
+                        // element on first write. Restricted to a member path
+                        // (`base` contains a dot), so a plain local vector's
+                        // bit-write is never diverted here.
+                        if self.signal_name_to_id.contains_key(elem.as_str())
+                            || self.signals.contains_key(&elem)
+                            || base.contains('.')
+                        {
+                            let prev = self.get_signal_value_by_name(&elem);
+                            let changed = prev.as_ref() != Some(val);
+                            self.set_signal_value_by_name(&elem, val.clone());
+                            return changed;
+                        }
+                    }
+                }
                 // Ascending packed vector bit-write (`logic [0:7] pa; pa[i]=b`):
                 // label i targets internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
@@ -35031,6 +35066,23 @@ impl Simulator {
                             let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                             let b = text.as_bytes().get(i).copied().unwrap_or(0);
                             return Value::from_u64(b as u64, 8);
+                        }
+                    }
+                }
+                // `s.arr[i]` READ where `arr` is an UNPACKED ARRAY MEMBER of
+                // an unpacked struct — mirror of the write arm in
+                // `assign_value`. The elements are individual signals and the
+                // base is not a signal, so this otherwise bit-selected a
+                // phantom scalar and always read x.
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let base = self.resolve_hier_name(h);
+                    if !self.signal_name_to_id.contains_key(base.as_str())
+                        && !self.signals.contains_key(&base)
+                    {
+                        let i = self.eval_expr(index).to_i64().unwrap_or(0);
+                        let elem = format!("{}[{}]", base, i);
+                        if let Some(v) = self.get_signal_value_by_name(&elem) {
+                            return v;
                         }
                     }
                 }
@@ -57618,14 +57670,29 @@ impl Simulator {
                 fields.iter().map(|(f, _, _)| f.clone()).collect()
             } else {
                 let prefix = format!("{}.", vname);
+                // A member that is an UNPACKED ARRAY exists as one signal per
+                // element (`s.arr[0]` …), so its leaves legitimately contain
+                // `[`. Excluding them made array members invisible to every
+                // consumer of this function — most visibly struct ASSIGNMENT,
+                // where `b = a;` copied the scalar members and left the array
+                // ones x. Nested members (`inner.b`, `inner.b[0]`) still carry
+                // a `.` and stay excluded; they are not direct children.
                 let mut fs: Vec<String> = self
                     .signal_name_to_id
                     .keys()
                     .filter_map(|k| k.strip_prefix(&prefix))
-                    .filter(|rest| !rest.contains('.') && !rest.contains('['))
+                    .filter(|rest| !rest.contains('.'))
                     .map(|rest| rest.to_string())
                     .collect();
-                fs.sort();
+                // Natural order, so `arr[2]` precedes `arr[10]` rather than
+                // sorting lexicographically (only affects display order).
+                fs.sort_by_key(|f| match f.split_once('[') {
+                    Some((base, idx)) => (
+                        base.to_string(),
+                        idx.trim_end_matches(']').parse::<i64>().unwrap_or(0),
+                    ),
+                    None => (f.clone(), -1),
+                });
                 fs.dedup();
                 if fs.is_empty() {
                     return None;
