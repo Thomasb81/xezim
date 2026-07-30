@@ -186,6 +186,45 @@ fn sim_debug_enabled() -> bool {
 /// in xezim, so `+notimingcheck` is accepted by the CLI as a documented no-op.
 static NOSPECIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `--warn-x`: report the FIRST time each signal takes an X bit after time 0,
+/// naming the signal, its instance/module, and everything that drives it.
+/// Off by default — X during initialization is normal and would drown the log.
+static WARN_X: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `--warn-x-limit N`: stop after N reports (0 = unlimited).
+static WARN_X_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(50);
+
+pub fn set_warn_x(v: bool) {
+    WARN_X.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_warn_x_limit(n: usize) {
+    WARN_X_LIMIT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn warn_x_enabled() -> bool {
+    if WARN_X.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    // `X_WARN=1` / `X_WARN=on`: same switch, settable without editing the
+    // command line. Any value other than 0/off/no/false enables it.
+    match std::env::var("X_WARN") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "off" && v != "no" && v != "false"
+        }
+        Err(_) => false,
+    }
+}
+
+fn warn_x_limit() -> usize {
+    if let Ok(v) = std::env::var("X_WARN_LIMIT") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n;
+        }
+    }
+    WARN_X_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_nospecify(v: bool) {
     NOSPECIFY.store(v, std::sync::atomic::Ordering::Relaxed);
 }
@@ -435,6 +474,32 @@ macro_rules! write_sig {
             if __wsig_id < $self.signal_inline_bits.len() {
                 let (__wsig_v, __wsig_x) = __wsig_val.raw_bits();
                 $self.signal_inline_bits[__wsig_id] = [__wsig_v, __wsig_x];
+            }
+            // `--warn-x`: record a signal taking a NEW x bit after time 0.
+            // One bool load when disabled. Placed here because the old value is
+            // still in the table, so "became x" is distinguishable from "was
+            // already x". Written inline rather than as a call: this macro
+            // expands inside bodies that already hold a `&mut` borrow of another
+            // field, so only disjoint field access is possible here.
+            if $self.warn_x && $self.time > 0 {
+                let (__xov, __xox) = $self.signal_table[__wsig_id].raw_bits();
+                let (__xnv, __xnx) = __wsig_val.raw_bits();
+                // x is (xz & !val); z is (xz & val) and deliberately ignored —
+                // z is a legitimate steady state for a tri-state net.
+                let __fresh = (__xnx & !__xnv) & !(__xox & !__xov);
+                let __wide_new_x = __wsig_val.width > 64
+                    && __wsig_val.has_xz()
+                    && !$self.signal_table[__wsig_id].has_xz();
+                if (__fresh != 0 || __wide_new_x)
+                    && $self.warn_x_seen.borrow_mut().insert(__wsig_id)
+                {
+                    let __xt = $self.time;
+                    let __xp = $self.current_pid;
+                    $self
+                        .warn_x_pending
+                        .borrow_mut()
+                        .push((__wsig_id, __xt, __wsig_val.clone(), __xp));
+                }
             }
             $self.signal_table[__wsig_id] = __wsig_val;
             // Incremental VCD: mark this write dirty (no-op when the dump is off
@@ -2459,6 +2524,29 @@ pub struct Simulator {
     /// are indistinguishable. Applying the gate rule to both made every
     /// `assign y = x;` eat `z`. This says which ids the gate rule applies to.
     signal_gate_driven: Vec<bool>,
+    /// `--warn-x` state. `warn_x` is a plain field (not the atomic) so the
+    /// write hot path costs one bool load; everything else is touched only
+    /// when a report actually fires.
+    warn_x: bool,
+    /// Signals already recorded, so a register that re-loads an X input every
+    /// cycle is named once rather than ten thousand times. `RefCell` because
+    /// `write_sig!` expands in contexts that already hold a `&mut` borrow of
+    /// another field (the clock-generator loop), so the hook can only touch
+    /// disjoint fields — never `&mut self` as a whole.
+    warn_x_seen: std::cell::RefCell<HashSet<usize>>,
+    /// Captured at the moment of the write — id, time, and the value — and
+    /// formatted later, once a `&mut self` is available again.
+    /// id, time, value, and the process that performed the write. The pid is
+    /// the only attribution available for a procedural write: `initial`/`always`
+    /// bodies are drained into processes at compile time, so they are not in
+    /// `module.initial_blocks` any more, but `process_origin` still knows what
+    /// each pid came from and where.
+    warn_x_pending: std::cell::RefCell<Vec<(usize, u64, Value, usize)>>,
+    warn_x_count: usize,
+    /// Lazily built on the first report: signal id -> one line per driver.
+    /// Derived from the comb entries and edge blocks on demand, so a run
+    /// without `--warn-x` pays nothing for it.
+    warn_x_drivers: Option<HashMap<usize, Vec<String>>>,
     /// Signal ids that carry a CONTINUOUS driver — the whole-name LHS of an
     /// `assign` (including the continuous-assigns that inlining synthesizes for
     /// instance port connections). §6.5 forbids mixing continuous and procedural
@@ -5350,6 +5438,11 @@ impl Simulator {
             signal_real: signal_real_vec,
             signal_two_state,
             signal_gate_driven,
+            warn_x: warn_x_enabled(),
+            warn_x_seen: std::cell::RefCell::new(HashSet::default()),
+            warn_x_pending: std::cell::RefCell::new(Vec::new()),
+            warn_x_count: 0,
+            warn_x_drivers: None,
             cont_driven: HashSet::default(),
             signal_type_names,
             time: 0,
@@ -12566,6 +12659,8 @@ impl Simulator {
             }
             self.finished = was_finished;
         }
+        // Flush any `--warn-x` reports captured during the final region.
+        self.drain_warn_x();
         self.vcd_finish();
         self.xtrace_finish();
         self.fst_finish();
@@ -15400,6 +15495,9 @@ impl Simulator {
                         let src_v = src_v & mask;
                         let src_x = src_x & mask;
                         let (dst_v, dst_x) = self.signal_table[id].raw_bits();
+                        if self.warn_x && self.time > 0 {
+                            self.warn_x_note_bits(id, dst_v & mask, dst_x & mask, src_v, src_x);
+                        }
                         if src_v == (dst_v & mask) && src_x == (dst_x & mask) {
                             handled = true;
                         } else if self.signal_table[id].set_inline_bits(src_v, src_x) {
@@ -20996,6 +21094,13 @@ impl Simulator {
         // delta: promote so the outer event_loop re-enters run_one_tick,
         // where they run at the top — BEFORE that delta's NBA region (§4.5).
         self.promote_inactive_to_active();
+
+        // `--warn-x` / `X_WARN`: format anything the write hook captured this
+        // tick. Deferred to here because the hook runs under a foreign `&mut`
+        // borrow and can only record, not print.
+        if self.warn_x {
+            self.drain_warn_x();
+        }
 
         self.loop_iters += 1;
     }
@@ -29812,6 +29917,9 @@ impl Simulator {
                                 sx = 0;
                             }
                             let (dv, dx) = self.signal_table[*dst_id].raw_bits();
+                            if self.warn_x && self.time > 0 {
+                                self.warn_x_note_bits(*dst_id, dv, dx, sv, sx);
+                            }
                             if (sv != dv || sx != dx)
                                 && self.signal_table[*dst_id].set_inline_bits(sv, sx)
                             {
@@ -29863,6 +29971,9 @@ impl Simulator {
                                 sx = 0;
                             }
                             let (dv, dx) = self.signal_table[dst_id].raw_bits();
+                            if self.warn_x && self.time > 0 {
+                                self.warn_x_note_bits(dst_id, dv, dx, sv, sx);
+                            }
                             if (sv == dv && sx == dx)
                                 || !self.signal_table[dst_id].set_inline_bits(sv, sx)
                             {
@@ -29928,6 +30039,9 @@ impl Simulator {
                         {
                             let (sv, sx) = self.signal_table[*src_id].raw_bits();
                             let (dv, dx) = self.signal_table[*dst_id].raw_bits();
+                            if self.warn_x && self.time > 0 {
+                                self.warn_x_note_bits(*dst_id, dv, dx, sv, sx);
+                            }
                             if sv == dv && sx == dx {
                                 // Already equal; no work, no dirty mark.
                                 handled = true;
@@ -45765,6 +45879,308 @@ impl Simulator {
     /// Canonical post-write hook for in-place `signal_table[id]` mutations.
     /// It intentionally leaves `signal_has_xz` stale-conservative; tightening
     /// that hint can enable JIT paths that do not yet support every X/Z case.
+    /// `--warn-x`: a write is putting an x bit into `id` that was not x
+    /// before. Reports once per signal, with the instance/module it lives in
+    /// and every driver that can write it.
+    ///
+    /// X after time 0 is the classic gate-level/RTL-integration failure —
+    /// an unconnected port, a register never reset, a bus with no active
+    /// driver — and a waveform only shows WHERE it surfaced, not what drove
+    /// it there. Reporting the driver list at the moment the bit turns x
+    /// points straight at the cause.
+    /// Record a fresh x on `id` from raw (val, xz) bit pairs. Takes `&self`
+    /// and records through `RefCell`s, so it can be called from the comb-settle
+    /// fast paths (which write `signal_table` directly and never reach
+    /// `write_sig!`) and from the `&self` isolated evaluators.
+    #[inline]
+    fn warn_x_note_bits(&self, id: usize, ov: u64, ox: u64, nv: u64, nx: u64) {
+        // x is (xz & !val); z (xz & val) is deliberately ignored.
+        let fresh = (nx & !nv) & !(ox & !ov);
+        if fresh == 0 {
+            return;
+        }
+        if !self.warn_x_seen.borrow_mut().insert(id) {
+            return;
+        }
+        let w = self.signal_widths.get(id).copied().unwrap_or(64).max(1);
+        let mut v = Value::zero(w);
+        // Only the low 64 bits are available here; the report caps its own
+        // rendering at 64 bits anyway.
+        let _ = v.set_inline_bits(nv, nx);
+        self.warn_x_pending
+            .borrow_mut()
+            .push((id, self.time, v, self.current_pid));
+    }
+
+    pub fn drain_warn_x(&mut self) {
+        if !self.warn_x {
+            return;
+        }
+        let pending: Vec<(usize, u64, Value, usize)> =
+            std::mem::take(&mut *self.warn_x_pending.borrow_mut());
+        for (id, t, val, pid) in pending {
+            self.report_x_one(id, t, &val, pid);
+        }
+    }
+
+    fn report_x_one(&mut self, id: usize, when: u64, new_val: &Value, pid: usize) {
+        if id >= self.signal_table.len() {
+            return;
+        }
+        let lim = warn_x_limit();
+        if lim != 0 && self.warn_x_count >= lim {
+            return;
+        }
+        let w = new_val.width.max(1) as usize;
+        let mut fresh_x: Vec<usize> = Vec::new();
+        for b in 0..w {
+            if new_val.get_bit(b) == LogicBit::X {
+                fresh_x.push(b);
+            }
+        }
+        if fresh_x.is_empty() {
+            return;
+        }
+        self.warn_x_count += 1;
+
+        let name = self.name_for_id(id).to_string();
+        // `a.b.c.sig` -> instance path `a.b.c`; empty for a top-level signal.
+        let inst = name.rsplit_once('.').map(|(p, _)| p.to_string());
+        let module = self
+            .scope_def_module(inst.as_deref())
+            .unwrap_or_else(|| self.module.name.clone());
+        let where_ = match &inst {
+            Some(p) if !p.is_empty() => format!("instance {} (module {})", p, module),
+            _ => format!("module {}", module),
+        };
+
+        let bits = if fresh_x.len() == w {
+            "all bits".to_string()
+        } else if fresh_x.len() == 1 {
+            format!("bit {}", fresh_x[0])
+        } else {
+            let hi = fresh_x.iter().copied().max().unwrap_or(0);
+            let lo = fresh_x.iter().copied().min().unwrap_or(0);
+            if fresh_x.len() == hi - lo + 1 {
+                format!("bits [{}:{}]", hi, lo)
+            } else {
+                format!("{} bits, highest {}", fresh_x.len(), hi)
+            }
+        };
+
+        eprintln!(
+            "[xezim][warning] X on '{}' at time {} — {} x ({})",
+            name,
+            when,
+            bits,
+            self.warn_x_bin(new_val, w)
+        );
+        eprintln!("                 in {}", where_);
+        let drivers = self.warn_x_driver_lines(id);
+        if drivers.is_empty() {
+            // No continuous/comb/edge driver. Either a procedural process wrote
+            // it — `process_origin` knows which, and that is the useful answer —
+            // or nothing drives it at all, which is its own diagnosis.
+            let by_proc = self.process_origin.get(&pid).map(|&(span, kind)| {
+                let loc = self
+                    .span_file_line_in(span, self.stall_pid_src_file(pid))
+                    .map(|l| format!(" at {}", l))
+                    .unwrap_or_default();
+                format!("{}{}", kind, loc)
+            });
+            match by_proc {
+                Some(d) => {
+                    eprintln!("                 written by:");
+                    eprintln!("                   - {} (procedural)", d);
+                }
+                None => eprintln!(
+                    "                 drivers: NONE FOUND — nothing drives this signal, so it \
+                     reads x; check for an unconnected port or a missing assignment"
+                ),
+            }
+        } else {
+            eprintln!("                 driven by:");
+            for d in drivers {
+                eprintln!("                   - {}", d);
+            }
+        }
+        if lim != 0 && self.warn_x_count == lim {
+            eprintln!(
+                "[xezim][warning] --warn-x limit of {} reached; further X reports suppressed \
+                 (raise with --warn-x-limit N, 0 = unlimited)",
+                lim
+            );
+        }
+    }
+
+    /// Per-bit rendering, capped so a 4096-bit bus does not fill the terminal.
+    fn warn_x_bin(&self, v: &Value, w: usize) -> String {
+        let shown = w.min(64);
+        let mut out = String::with_capacity(shown + 8);
+        if shown < w {
+            out.push_str("low 64 bits: ");
+        }
+        for b in (0..shown).rev() {
+            out.push(match v.get_bit(b) {
+                LogicBit::Zero => '0',
+                LogicBit::One => '1',
+                LogicBit::X => 'x',
+                LogicBit::Z => 'z',
+            });
+        }
+        out
+    }
+
+    /// One line per thing that can write `id`. Built once, from the comb
+    /// entries (continuous assigns, always_comb, fused gates) and the edge
+    /// blocks (always_ff / always @(posedge …)).
+    fn warn_x_driver_lines(&mut self, id: usize) -> Vec<String> {
+        if self.warn_x_drivers.is_none() {
+            let mut map: HashMap<usize, Vec<String>> = HashMap::default();
+            for e in self.comb_entries.iter() {
+                let kind = match &e.item {
+                    CombItem::ContAssign { .. } | CombItem::CompiledContAssign { .. } => {
+                        "continuous assign"
+                    }
+                    CombItem::AlwaysBlock { is_always_comb, .. }
+                    | CombItem::CompiledAlwaysBlock { is_always_comb, .. } => {
+                        if *is_always_comb { "always_comb" } else { "always @(*)" }
+                    }
+                    CombItem::FusedGate { .. }
+                    | CombItem::FusedBufFanout { .. }
+                    | CombItem::FusedAndFanout { .. } => "gate primitive",
+                    CombItem::Udp { .. } | CombItem::UdpBatch { .. } => "UDP",
+                    CombItem::DirectCopy { .. }
+                    | CombItem::FastDirectCopy { .. }
+                    | CombItem::FastDirectFanout { .. } => "continuous assign (copy)",
+                    CombItem::Noop => continue,
+                };
+                let src_file = e
+                    .scope_hint
+                    .as_deref()
+                    .and_then(|sc| self.scope_def_module(Some(sc)))
+                    .and_then(|m| self.module.src_file_of_module.get(&m).copied());
+                let at = self
+                    .span_file_line_in(e.span, src_file)
+                    .map(|l| format!(" at {}", l))
+                    .unwrap_or_default();
+                let scope = match e.scope_hint.as_deref() {
+                    Some(sc) if !sc.is_empty() => format!(" [in {}]", sc),
+                    _ => String::new(),
+                };
+                let line = format!("{}{}{}", kind, at, scope);
+                for &wid in e.write_signal_ids.iter() {
+                    map.entry(wid).or_default().push(line.clone());
+                }
+            }
+            // Edge blocks keep no resolved write set, so derive one.
+            let blocks = Arc::clone(&self.edge_blocks);
+            for b in blocks.iter() {
+                let mut reads: HashSet<String> = HashSet::default();
+                let mut writes: HashSet<String> = HashSet::default();
+                Self::collect_stmt_reads(&b.stmt, &self.module, &mut reads, &mut writes);
+                let kind = match b.kind {
+                    AlwaysKind::AlwaysFf => "always_ff",
+                    AlwaysKind::AlwaysLatch => "always_latch",
+                    AlwaysKind::AlwaysComb => "always_comb",
+                    AlwaysKind::Always => "always @(edge)",
+                };
+                let src_file = (!b.scope.is_empty())
+                    .then(|| self.scope_def_module(Some(b.scope.as_str())))
+                    .flatten()
+                    .and_then(|m| self.module.src_file_of_module.get(&m).copied());
+                let at = self
+                    .span_file_line_in(b.stmt.span, src_file)
+                    .map(|l| format!(" at {}", l))
+                    .unwrap_or_default();
+                let scope = if b.scope.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [in {}]", b.scope)
+                };
+                let line = format!("{}{}{}", kind, at, scope);
+                for wname in writes.iter() {
+                    let mut ids: Vec<usize> = Vec::new();
+                    if let Some(&i) = self.signal_name_to_id.get(wname.as_str()) {
+                        ids.push(i);
+                    }
+                    if !b.scope.is_empty() {
+                        if let Some(&i) = self
+                            .signal_name_to_id
+                            .get(format!("{}.{}", b.scope, wname).as_str())
+                        {
+                            ids.push(i);
+                        }
+                    }
+                    for i in ids {
+                        map.entry(i).or_default().push(line.clone());
+                    }
+                }
+            }
+            // Procedural blocks. Without these a signal a testbench drives
+            // from an `initial` was reported as having NO driver, which reads
+            // as "unconnected port" — the opposite of the truth.
+            let procs: Vec<(&'static str, Statement, String)> = self
+                .module
+                .initial_blocks
+                .iter()
+                .map(|ib| ("initial block", ib.stmt.clone(), ib.scope.clone()))
+                .chain(
+                    self.module
+                        .final_blocks
+                        .iter()
+                        .map(|fb| ("final block", fb.stmt.clone(), fb.scope.clone())),
+                )
+                .collect();
+            for (kind, stmt, scope) in procs {
+                let mut reads: HashSet<String> = HashSet::default();
+                let mut writes: HashSet<String> = HashSet::default();
+                Self::collect_stmt_reads(&stmt, &self.module, &mut reads, &mut writes);
+                let src_file = (!scope.is_empty())
+                    .then(|| self.scope_def_module(Some(scope.as_str())))
+                    .flatten()
+                    .and_then(|m| self.module.src_file_of_module.get(&m).copied());
+                let at = self
+                    .span_file_line_in(stmt.span, src_file)
+                    .map(|l| format!(" at {}", l))
+                    .unwrap_or_default();
+                let where_ = if scope.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [in {}]", scope)
+                };
+                let line = format!("{}{}{}", kind, at, where_);
+                for wname in writes.iter() {
+                    let mut ids: Vec<usize> = Vec::new();
+                    if let Some(&i) = self.signal_name_to_id.get(wname.as_str()) {
+                        ids.push(i);
+                    }
+                    if !scope.is_empty() {
+                        if let Some(&i) = self
+                            .signal_name_to_id
+                            .get(format!("{}.{}", scope, wname).as_str())
+                        {
+                            ids.push(i);
+                        }
+                    }
+                    for i in ids {
+                        map.entry(i).or_default().push(line.clone());
+                    }
+                }
+            }
+            for v in map.values_mut() {
+                v.sort();
+                v.dedup();
+            }
+            self.warn_x_drivers = Some(map);
+        }
+        self.warn_x_drivers
+            .as_ref()
+            .and_then(|m| m.get(&id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn after_signal_write(&mut self, id: usize) {
         self.note_armed_write(id);
         self.note_edge_write(id);

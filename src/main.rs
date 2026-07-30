@@ -114,6 +114,11 @@ fn print_usage() {
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
+    eprintln!("  --x-warn         Warn when a signal first takes an x bit after time 0,");
+    eprintln!("                   naming the signal, its instance/module and its drivers.");
+    eprintln!("                   Also enabled by +X_WARN or X_WARN=1 in the environment.");
+    eprintln!("  --x-warn-limit N Cap --x-warn reports at N (default 50, 0 = unlimited).");
+    eprintln!("                   Also settable as X_WARN_LIMIT=N.");
     eprintln!("  --module-timescale <unit>/<prec>            Timescale for every module with no");
     eprintln!("                     [mod1,mod2=]<unit>/<prec>   explicit source-level timescale (the");
     eprintln!("                     named form limits it to the listed modules). Repeatable. Never");
@@ -1013,6 +1018,20 @@ fn main() {
             }
             _ if handle_gls_flag(arg) => {}
             _ if arg.starts_with('+') => {
+                // `+X_WARN` is both a plusarg (so `$test$plusargs` can see it)
+                // and the switch itself — this arm runs before the explicit
+                // match below, so handle it here too or the flag is swallowed.
+                if arg.eq_ignore_ascii_case("+X_WARN") {
+                    xezim::compiler::simulator::set_warn_x(true);
+                }
+                if let Some(n) = arg
+                    .strip_prefix("+X_WARN_LIMIT=")
+                    .or_else(|| arg.strip_prefix("+x_warn_limit="))
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    xezim::compiler::simulator::set_warn_x(true);
+                    xezim::compiler::simulator::set_warn_x_limit(n);
+                }
                 plusargs.push(arg.clone());
             }
             // `-v <file>` — a library FILE (Verilog-XL/VCS semantics): its
@@ -1090,6 +1109,35 @@ fn main() {
             "--strict" => {
                 sv_parser::set_strict_checks(true);
                 strict_checks = true;
+            }
+            // X_WARN: warn the first time each signal takes an x bit after
+            // time 0, naming the signal, its instance/module and its drivers.
+            // Accepted as a flag, as `+X_WARN` (plusarg), and as `X_WARN=1`
+            // in the environment — same switch, three spellings, because run
+            // scripts reach for different ones.
+            "--x-warn" | "--X_WARN" | "-X_WARN" | "+X_WARN" => {
+                xezim::compiler::simulator::set_warn_x(true);
+            }
+            "--x-warn-limit" | "--X_WARN_LIMIT" => {
+                i += 1;
+                if i < args.len() {
+                    match args[i].parse::<usize>() {
+                        Ok(n) => xezim::compiler::simulator::set_warn_x_limit(n),
+                        Err(_) => {
+                            eprintln!("Error: --x-warn-limit requires a number (0 = unlimited)");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            _ if arg.starts_with("--x-warn-limit=") => {
+                match arg["--x-warn-limit=".len()..].parse::<usize>() {
+                    Ok(n) => xezim::compiler::simulator::set_warn_x_limit(n),
+                    Err(_) => {
+                        eprintln!("Error: --x-warn-limit requires a number (0 = unlimited)");
+                        std::process::exit(1);
+                    }
+                }
             }
             "--no-strict" | "--lenient" => {
                 sv_parser::set_strict_checks(false);
