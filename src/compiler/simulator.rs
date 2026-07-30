@@ -54649,10 +54649,6 @@ impl Simulator {
                 if self.module.classes.contains_key(&resolved) {
                     return Some(resolved);
                 }
-                let pkg_key = format!("uvm_pkg::{}", resolved);
-                if self.module.classes.contains_key(&pkg_key) {
-                    return Some(pkg_key);
-                }
                 // The resolved type may be a value-parameterized
                 // specialization like `special_comp#(1)` (a type param
                 // bound to a value-parameterized class). Return it WITH
@@ -54890,8 +54886,7 @@ impl Simulator {
         let dt = self
             .module
             .typedef_types
-            .get(tn.as_str())
-            .or_else(|| self.module.typedef_types.get(&format!("uvm_pkg::{}", tn)))?;
+            .get(tn.as_str())?;
         match Self::resolve_type_ref(dt, &self.module.typedef_types) {
             DataType::Struct(su) => Some(su),
             _ => None,
@@ -58303,14 +58298,6 @@ impl Simulator {
                 if self.get_class_def(&base).is_some() {
                     return Some((base, sig));
                 }
-                let pkg_base = format!("uvm_pkg::{}", base);
-                if self.get_class_def(&pkg_base).is_some() {
-                    return Some((pkg_base, sig));
-                }
-                let base_short = base.trim_start_matches("uvm_pkg::").to_string();
-                if self.get_class_def(&base_short).is_some() {
-                    return Some((base_short, sig));
-                }
             }
         }
         None
@@ -58375,10 +58362,9 @@ impl Simulator {
         // Run each initializer with current_spec set to this specialization.
         let saved_spec = self.current_spec.clone();
         self.current_spec = Some((base.to_string(), sig.to_string()));
-        let base_short = base.trim_start_matches("uvm_pkg::");
-        let canon_sig = self.canonicalize_spec_sig(base_short, sig);
+        let canon_sig = self.canonicalize_spec_sig(base, sig);
         for (cname, prop, init) in inits {
-            let spec_key = format!("{}#{}::{}", base_short, canon_sig, prop);
+            let spec_key = format!("{}#{}::{}", base, canon_sig, prop);
             if self.class_statics.contains_key(&spec_key) {
                 continue;
             }
@@ -58585,39 +58571,8 @@ impl Simulator {
         out
     }
 
-    /// Resolve a possibly package-qualified class name to the single key
-    /// under which it is stored in `module.classes`.
-    ///
-    /// SystemVerilog classes may be keyed under their bare name (`uvm_object`)
-    /// or their fully-qualified spelling (`uvm_pkg::uvm_object`) depending on
-    /// how they were declared/imported. This centralizes the three-way
-    /// resolution that previously had to be hand-duplicated at every class
-    /// lookup site (cast_type_ok, enum_value_name, class_is_a, …) as a
-    /// `format!("uvm_pkg::{}", …)` fallback.
-    ///
-    /// NOTE: only the `uvm_pkg::` prefix is handled today (UVM is the sole
-    /// multi-file package in the test corpus). Generalizing this to arbitrary
-    /// packages — ideally by canonicalizing package-qualified names once at
-    /// elaboration time in xezim-core — is a tracked follow-up so that new
-    /// packages don't each need a new two-line fallback here.
-    fn class_storage_key(&self, name: &str) -> Option<String> {
-        if self.module.classes.contains_key(name) {
-            return Some(name.to_string());
-        }
-        let prefixed = format!("uvm_pkg::{}", name);
-        if self.module.classes.contains_key(&prefixed) {
-            return Some(prefixed);
-        }
-        let stripped = name.trim_start_matches("uvm_pkg::");
-        if stripped != name && self.module.classes.contains_key(stripped) {
-            return Some(stripped.to_string());
-        }
-        None
-    }
-
     fn get_class_def<'a>(&'a self, name: &str) -> Option<&'a crate::compiler::elaborate::ElaboratedClass> {
-        self.class_storage_key(name)
-            .and_then(|k| self.module.classes.get(&k))
+        self.module.classes.get(name)
     }
 
     fn substitute_spec_params(&self, frag: &str) -> String {
@@ -58644,22 +58599,20 @@ impl Simulator {
     }
 
     fn canonicalize_spec_frag(&self, frag: &str) -> String {
-        let frag_norm = frag.trim().trim_start_matches("uvm_pkg::");
+        let frag_norm = frag.trim();
         if let Some((inner_base, inner_sig)) = self.extract_spec_from_string(frag_norm) {
-            let inner_base_short = inner_base.trim_start_matches("uvm_pkg::");
-            let canon_inner_sig = self.canonicalize_spec_sig(inner_base_short, &inner_sig);
+            let canon_inner_sig = self.canonicalize_spec_sig(&inner_base, &inner_sig);
             if !canon_inner_sig.is_empty() {
-                format!("{}#({})", inner_base_short, canon_inner_sig)
+                format!("{}#({})", inner_base, canon_inner_sig)
             } else {
-                inner_base_short.to_string()
+                inner_base.to_string()
             }
         } else if let Some((inner_base, inner_sig)) = self.resolve_typedef_spec(frag_norm) {
-            let inner_base_short = inner_base.trim_start_matches("uvm_pkg::");
-            let canon_inner_sig = self.canonicalize_spec_sig(inner_base_short, &inner_sig);
+            let canon_inner_sig = self.canonicalize_spec_sig(&inner_base, &inner_sig);
             if !canon_inner_sig.is_empty() {
-                format!("{}#({})", inner_base_short, canon_inner_sig)
+                format!("{}#({})", inner_base, canon_inner_sig)
             } else {
-                inner_base_short.to_string()
+                inner_base.to_string()
             }
         } else {
             let short = frag_norm.to_string();
@@ -58681,7 +58634,7 @@ impl Simulator {
         let class_key = if self.module.classes.contains_key(class_name) {
             class_name.to_string()
         } else {
-            format!("uvm_pkg::{}", class_name)
+            return sig.to_string();
         };
         let (order, tp_defaults, v_defaults): (
             Vec<String>,
@@ -58819,12 +58772,10 @@ impl Simulator {
                     // inherited by `uvm_object_registry#(T,Tname)`).
                     let key = match &self.current_spec {
                         Some((base, sig))
-                            if (base.trim_start_matches("uvm_pkg::") == cname.trim_start_matches("uvm_pkg::")
-                                || self.class_extends(base.trim_start_matches("uvm_pkg::"), cname.trim_start_matches("uvm_pkg::")))
-                                && self.class_is_parameterized(cname.trim_start_matches("uvm_pkg::")) =>
+                            if (base == &cname
+                                || self.class_extends(base.as_str(), &cname))
+                                && self.class_is_parameterized(&cname) =>
                         {
-                            let base_short = base.trim_start_matches("uvm_pkg::");
-                            let cname_short = cname.trim_start_matches("uvm_pkg::");
                             // For inherited statics (cname != base), derive
                             // the DECLARING class's specialization from the
                             // leaf spec. This ensures that
@@ -58832,14 +58783,14 @@ impl Simulator {
                             // `uvm_callbacks#(T,uvm_callback)` — which both
                             // extend `uvm_typed_callbacks#(T)` — share the
                             // same `m_tw_cb_q` static cell.
-                            if base_short == cname_short {
-                                format!("{}#{}::{}", cname_short, self.canonicalize_spec_sig(cname_short, sig), prop)
+                            if base == &cname {
+                                format!("{}#{}::{}", cname, self.canonicalize_spec_sig(&cname, sig.as_str()), prop)
                             } else if let Some(ancestor_sig) =
-                                self.ancestor_spec(base_short, sig, cname_short)
+                                self.ancestor_spec(base.as_str(), sig.as_str(), &cname)
                             {
-                                format!("{}#{}::{}", cname_short, self.canonicalize_spec_sig(cname_short, &ancestor_sig), prop)
+                                format!("{}#{}::{}", cname, self.canonicalize_spec_sig(&cname, &ancestor_sig), prop)
                             } else {
-                                format!("{}#{}::{}", base_short, self.canonicalize_spec_sig(base_short, sig), prop)
+                                format!("{}#{}::{}", base, self.canonicalize_spec_sig(base.as_str(), sig.as_str()), prop)
                             }
                         }
                         _ => format!("{}::{}", cname, prop),
@@ -60207,10 +60158,10 @@ impl Simulator {
     /// `extends` chain; compares parameter-stripped names so `uvm_sequence#(T)`
     /// matches `uvm_sequence`.
     fn class_is_a(&self, derived: &str, base: &str) -> bool {
-        let strip = |s: &str| {
-            let s_no_pkg = s.strip_prefix("uvm_pkg::").unwrap_or(s);
-            s_no_pkg.split('#').next().unwrap_or(s_no_pkg).to_string()
-        };
+        // Class names are keyed bare (the parser keeps only the leaf segment
+        // of a scoped name), so the comparison strips just the `#(params)`
+        // specialization suffix, not a package prefix.
+        let strip = |s: &str| s.split('#').next().unwrap_or(s).to_string();
         let base = strip(base);
         let mut cur = Some(derived.to_string());
         let mut guard = 0;
@@ -60227,7 +60178,6 @@ impl Simulator {
                 .classes
                 .get(&c)
                 .or_else(|| self.module.classes.get(&strip(&c)))
-                .or_else(|| self.module.classes.get(&format!("uvm_pkg::{}", strip(&c))))
                 .and_then(|cd| cd.extends.clone());
         }
         false
@@ -60306,13 +60256,12 @@ impl Simulator {
                 // leaking a `special_comp#(2)` typewide callback onto a
                 // `special_comp#(1)` instance (a UVM callbacks specialization case).
                 let (base, spec_args_from_name) = Self::strip_class_specialization(&raw);
-                // Package-qualified class names may be stored under either the
-                // bare or the `uvm_pkg::`-prefixed key; resolve the storage key
-                // once here, staying permissive (like the None case) if the dest
-                // type is genuinely unknown.
-                let Some(resolved) = self.class_storage_key(&base) else {
+                // If the dest's base class is genuinely unknown, stay
+                // permissive like the None case.
+                if !self.module.classes.contains_key(&base) {
                     return true;
-                };
+                }
+                let resolved = base;
                 // Hierarchy check: the src instance must be `resolved` or a
                 // subclass of it, else the downcast must fail.
                 let is_a = self.class_is_a(&src_class, &resolved);
@@ -63438,7 +63387,6 @@ impl Simulator {
                 self.module
                     .typedef_types
                     .get(tn.as_str())
-                    .or_else(|| self.module.typedef_types.get(&format!("uvm_pkg::{}", tn)))
                     .cloned()
                     .unwrap_or_else(|| DataType::TypeReference {
                         name: name.clone(),
@@ -63883,11 +63831,10 @@ impl Simulator {
             if let DataType::TypeReference { name: tn, .. } = &port.data_type {
                 let type_name = tn.name.name.clone();
                 if self.module.enum_members.contains_key(&type_name)
-                    || self.module.enum_members.contains_key(&format!("uvm_pkg::{}", type_name))
                     || self.module.typedefs.contains_key(&type_name)
                 {
                     self.var_typedef_types.insert(port.name.name.clone(), type_name);
-                } else if self.class_storage_key(&type_name).is_some() {
+                } else if self.module.classes.contains_key(&type_name) {
                     self.var_class_types.insert(port.name.name.clone(), type_name);
                 }
             }
@@ -65636,10 +65583,9 @@ impl Simulator {
     /// reconstruction `special_comp # ( 1 )` vs a typedef-resolved
     /// `special_comp#(1)`) key to the same per-spec static cell.
     fn normalize_spec_ws(s: &str) -> String {
-        let s_norm = s.replace("uvm_pkg::", "");
-        let mut out = String::with_capacity(s_norm.len());
+        let mut out = String::with_capacity(s.len());
         let mut in_str = false;
-        for ch in s_norm.chars() {
+        for ch in s.chars() {
             if ch == '"' {
                 in_str = !in_str;
                 out.push(ch);
@@ -65799,12 +65745,7 @@ impl Simulator {
             if let Some(raw_sig) = raw_sig {
                 let sig = self.canonicalize_spec_sig(&class_name_owned, &raw_sig);
                 let effective_sig = if sig.is_empty() {
-                    let class_key = if self.module.classes.contains_key(&class_name_owned) {
-                        class_name_owned.clone()
-                    } else {
-                        format!("uvm_pkg::{}", class_name_owned)
-                    };
-                    self.module.classes.get(&class_key).map(|cd| {
+                    self.module.classes.get(&class_name_owned).map(|cd| {
                         cd.type_param_defaults.iter().map(|(_, d)| d.as_str()).collect::<Vec<_>>().join(",")
                     }).unwrap_or_default()
                 } else {
@@ -66122,10 +66063,8 @@ impl Simulator {
         // value-parameter lookups in later virtual calls.
         let active_spec = self.current_spec.clone().or(computed_spec.clone());
         if let Some((b, sig)) = active_spec {
-            let b_short = b.trim_start_matches("uvm_pkg::");
-            let c_short = class_def.name.trim_start_matches("uvm_pkg::");
-            let c_base = c_short.split('#').next().unwrap_or(c_short);
-            if b_short == c_base {
+            let c_base = class_def.name.split('#').next().unwrap_or(&class_def.name);
+            if b == c_base {
                 instance.spec = Some((b.clone(), sig));
             }
         }
@@ -73146,11 +73085,10 @@ impl Simulator {
                         if let DataType::TypeReference { name: tn, .. } = &port.data_type {
                             let type_name = tn.name.name.clone();
                             if self.module.enum_members.contains_key(&type_name)
-                                || self.module.enum_members.contains_key(&format!("uvm_pkg::{}", type_name))
                                 || self.module.typedefs.contains_key(&type_name)
                             {
                                 self.var_typedef_types.insert(port.name.name.clone(), type_name);
-                            } else if self.class_storage_key(&type_name).is_some() {
+                            } else if self.module.classes.contains_key(&type_name) {
                                 self.var_class_types.insert(port.name.name.clone(), type_name.clone());
                             }
                         }
@@ -73622,17 +73560,10 @@ impl Simulator {
     /// is the instruction-name enum the lookup is almost always for).
     fn enum_value_name(&self, value: u64, type_hint: Option<&str>) -> Option<String> {
         if let Some(t) = type_hint {
-            let keys = [
-                t.to_string(),
-                format!("uvm_pkg::{}", t),
-                t.trim_start_matches("uvm_pkg::").to_string(),
-            ];
-            for k in &keys {
-                if let Some(members) = self.module.enum_members.get(k) {
-                    for (n, v) in members {
-                        if *v == value {
-                            return Some(n.clone());
-                        }
+            if let Some(members) = self.module.enum_members.get(t) {
+                for (n, v) in members {
+                    if *v == value {
+                        return Some(n.clone());
                     }
                 }
             }
