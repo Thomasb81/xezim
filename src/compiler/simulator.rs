@@ -19763,6 +19763,25 @@ impl Simulator {
             }
             EventControl::HierIdentifier(expr) => {
                 if let ExprKind::Ident(h) = &expr.kind {
+                    // LRM §14.3: the BARE `@cb` form parses as a
+                    // HierIdentifier (the parenthesized `@(cb)` becomes a
+                    // one-term EventExpr, which already resolves clocking
+                    // blocks). Without the same substitution here, `@cb` built
+                    // a sensitivity on a nonexistent signal named `cb`, found
+                    // no signal id, and fell into the delta-yield — returning
+                    // at t=0 instead of waiting for the block's clock edge.
+                    // Every `@cb;` sampling loop then spun without advancing.
+                    let segs: Vec<&str> =
+                        h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    if let Some(cbk) = self.resolve_clocking_key(&segs) {
+                        if let Some((clk, _)) = self.clocking_meta.get(&cbk) {
+                            return vec![Sensitivity {
+                                signal_name: clk.clone(),
+                                edge: EdgeKind::Posedge,
+                                iff: None,
+                            }];
+                        }
+                    }
                     vec![Sensitivity {
                         signal_name: self.resolve_hier_name(h),
                         edge: EdgeKind::AnyEdge,
@@ -20068,6 +20087,18 @@ impl Simulator {
             EventControl::Identifier(id) => {
                 id.name == "__xz_default_clocking"
                     || self.clocking_meta.contains_key(&id.name)
+            }
+            // The bare `@cb` form (a HierIdentifier) is a clocking event too,
+            // so its waiter must resume in the Reactive region like `@(cb)`.
+            EventControl::HierIdentifier(e) => {
+                if let ExprKind::Ident(h) = &e.kind {
+                    let segs: Vec<&str> =
+                        h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    segs == ["__xz_default_clocking"]
+                        || self.resolve_clocking_key(&segs).is_some()
+                } else {
+                    false
+                }
             }
             EventControl::EventExpr(exprs) => exprs.iter().any(|ee| {
                 // `@(cb)` is an edge-less bare ident naming a clocking block.
