@@ -31661,8 +31661,19 @@ impl Simulator {
                 // Guarded on the base having no signal of its own, so an
                 // ordinary packed-vector bit-write (`v[3] = 1`, where `v` IS a
                 // signal) never takes this path.
-                if let ExprKind::Ident(h) = &expr.kind {
-                    let base = self.resolve_hier_name(h);
+                {
+                    // `may_create` only for a plain identifier base: that is
+                    // the procedural-local struct case, where nothing is
+                    // pre-registered. A MemberAccess base (`q[0].arr[i]`) must
+                    // find an EXISTING element — creating one there would
+                    // hijack class-member arrays and virtual-interface writes,
+                    // which own their own storage.
+                    let (base, may_create) = match &expr.kind {
+                        ExprKind::Ident(h) => (Some(self.resolve_hier_name(h)), true),
+                        ExprKind::MemberAccess { .. } => (self.flat_member_name(expr), false),
+                        _ => (None, false),
+                    };
+                    if let Some(base) = base {
                     if !self.signal_name_to_id.contains_key(base.as_str())
                         && !self.signals.contains_key(&base)
                     {
@@ -31676,13 +31687,14 @@ impl Simulator {
                         // bit-write is never diverted here.
                         if self.signal_name_to_id.contains_key(elem.as_str())
                             || self.signals.contains_key(&elem)
-                            || base.contains('.')
+                            || (may_create && base.contains('.'))
                         {
                             let prev = self.get_signal_value_by_name(&elem);
                             let changed = prev.as_ref() != Some(val);
                             self.set_signal_value_by_name(&elem, val.clone());
                             return changed;
                         }
+                    }
                     }
                 }
                 // Ascending packed vector bit-write (`logic [0:7] pa; pa[i]=b`):
@@ -35017,6 +35029,25 @@ impl Simulator {
                         }
                         _ => {}
                     };
+                    // A hierarchical path through a PORT (`dut.result.member`)
+                    // names the formal, but the port collapsed onto the
+                    // parent's signal, so the width map is keyed by THAT
+                    // (`r.member`). Rewrite the base through `port_aliases`.
+                    // Without it the select degraded to a 1-BIT read, so a
+                    // structural check comparing `dut.result.field[i]` against
+                    // a 16-bit lane compared a single bit and always failed.
+                    {
+                        let mut aliased: Vec<String> = Vec::new();
+                        for c in &candidates {
+                            if let Some(dot) = c.rfind('.') {
+                                let (base, member) = (&c[..dot], &c[dot..]);
+                                if let Some(parent) = self.module.port_aliases.get(base) {
+                                    aliased.push(format!("{}{}", parent, member));
+                                }
+                            }
+                        }
+                        candidates.extend(aliased);
+                    }
                     if let Some((_, &elem_w)) = candidates
                         .iter()
                         .find_map(|n| self.module.packed_signal_elem_widths.get_key_value(n))
@@ -35074,15 +35105,24 @@ impl Simulator {
                 // `assign_value`. The elements are individual signals and the
                 // base is not a signal, so this otherwise bit-selected a
                 // phantom scalar and always read x.
-                if let ExprKind::Ident(h) = &expr.kind {
-                    let base = self.resolve_hier_name(h);
-                    if !self.signal_name_to_id.contains_key(base.as_str())
-                        && !self.signals.contains_key(&base)
-                    {
-                        let i = self.eval_expr(index).to_i64().unwrap_or(0);
-                        let elem = format!("{}[{}]", base, i);
-                        if let Some(v) = self.get_signal_value_by_name(&elem) {
-                            return v;
+                {
+                    // `s.arr[i]` where `s` may itself be an element
+                    // (`q[0].arr[i]`), so the base is a MemberAccess over an
+                    // Index rather than a plain Ident.
+                    let base = match &expr.kind {
+                        ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                        ExprKind::MemberAccess { .. } => self.flat_member_name(expr),
+                        _ => None,
+                    };
+                    if let Some(base) = base {
+                        if !self.signal_name_to_id.contains_key(base.as_str())
+                            && !self.signals.contains_key(&base)
+                        {
+                            let i = self.eval_expr(index).to_i64().unwrap_or(0);
+                            let elem = format!("{}[{}]", base, i);
+                            if let Some(v) = self.get_signal_value_by_name(&elem) {
+                                return v;
+                            }
                         }
                     }
                 }
