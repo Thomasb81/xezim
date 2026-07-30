@@ -23291,6 +23291,18 @@ impl Simulator {
             }
         }
         let _dg = DepthGuard;
+        // Only count TOP-LEVEL (depth == 0) activations toward the per-pid
+        // zero-delay livelock limit. A re-entrant call (depth > 0) is a
+        // synchronous sub-invocation fired from within this same activation —
+        // e.g. a function/task the process called, or a trampolined
+        // while/for/repeat body that re-entered run_process_stmts. Such
+        // recursion is bounded (it returns) and is NOT the process re-arming
+        // itself via a #0 / event wait, so inflating `stall_pid_hits` with it
+        // would conflate ordinary recursion with genuine zero-delay livelock
+        // (a process that keeps re-scheduling at one time and never lets the
+        // clock advance). The livelock pattern only manifests at the outermost
+        // dispatch, so the guard stays accurate while re-entrant work is free
+        // to recurse up to the trampoline/stack limits above.
         if self.stall_limit > 0 && depth == 0 {
             let hits = self.stall_pid_hits.entry(pid).or_insert(0);
             // One process re-activated this many times at a SINGLE timestamp is
@@ -31775,8 +31787,46 @@ impl Simulator {
                 right,
                 kind,
             } => {
-                let l = self.eval_expr(left).to_u64().unwrap_or(0) as usize;
-                let r = self.eval_expr(right).to_u64().unwrap_or(0) as usize;
+                // Offset a part-select's bit indices by the declared lower
+                // bound of a PLAIN packed vector (`logic [7:4] v; v[6:5]` ->
+                // storage bits [2:1]), mirroring the read path (LRM §7.4.1 /
+                // §11.5.1). Without this `w[3:2] = 2'b11` on `logic [3:1] w`
+                // wrote storage bits [3:2] (one off the top of a 3-bit word)
+                // instead of [2:1], landing on the wrong bits.
+                //
+                // The multi-D element branch below (packed_signal_elem_widths)
+                // applies its OWN lo_b normalization inside `lsb_of`, and the
+                // ascending / unpacked-array branches index by element rather
+                // than bit — so each of those must keep the RAW indices and is
+                // excluded here. Bit-selects are already correct in both
+                // directions; this closes the part-select WRITE gap.
+                let mut l = self.eval_expr(left).to_i64().unwrap_or(0);
+                let mut r = self.eval_expr(right).to_i64().unwrap_or(0);
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let nm = self.resolve_hier_name(h);
+                    let is_multi_d = self
+                        .module
+                        .packed_signal_elem_widths
+                        .get(&nm)
+                        .copied()
+                        .unwrap_or(0)
+                        > 1;
+                    let is_ascending = self.module.ascending_packed.contains_key(&nm);
+                    let is_unpacked = self.module.arrays.contains_key(&nm);
+                    if !is_multi_d && !is_ascending && !is_unpacked {
+                        if let Some(&(dl, dr)) =
+                            self.module.packed_full_dims.get(&nm).and_then(|d| d.first())
+                        {
+                            let lo_b = dl.min(dr);
+                            if lo_b != 0 {
+                                l -= lo_b;
+                                r -= lo_b;
+                            }
+                        }
+                    }
+                }
+                let l = l.max(0) as usize;
+                let r = r.max(0) as usize;
                 let (mut msb, mut lsb) = match kind {
                     RangeKind::Constant => (l.max(r), l.min(r)),
                     RangeKind::IndexedUp => (l + r.saturating_sub(1), l),
@@ -43622,9 +43672,21 @@ impl Simulator {
                 (h, member.name.clone())
             }
             // A bare `<prop>` inside a class method resolves to
-            // `this.<prop>`.
+            // `this.<prop>` — UNLESS a method-local (or formal) of the
+            // same name is in scope, which SHADOWS the property (LRM §6.21).
+            // Without this guard a `string` property shadowed by an `int`
+            // local is mis-classified as string-valued, so e.g.
+            // `$display("tag", val)` of an `int val = 65` prints the char
+            // 'A' instead of the number 65. This matters at every caller
+            // of `expr_is_string_valued` ($display format-string probing,
+            // concatenation text-join, string ==/!=), hence the check sits
+            // here rather than at one call site.
             ExprKind::Ident(hier) if hier.path.len() == 1 => {
-                (self.this_stack.last().copied().flatten(), hier.path[0].name.name.clone())
+                let name = &hier.path[0].name.name;
+                if self.local_stack.iter().rev().any(|m| m.contains_key(name)) {
+                    return false;
+                }
+                (self.this_stack.last().copied().flatten(), name.clone())
             }
             _ => return false,
         };
@@ -58351,8 +58413,7 @@ impl Simulator {
                 self.class_context_stack.pop();
                 v
             };
-            self.class_statics.insert(spec_key.clone(), v.clone());
-            eprintln!("[DBG_SPEC_INIT] spec_key={} val={:?}", spec_key, v);
+            self.class_statics.insert(spec_key.clone(), v);
         }
         self.current_spec = saved_spec;
     }
@@ -58524,12 +58585,39 @@ impl Simulator {
         out
     }
 
+    /// Resolve a possibly package-qualified class name to the single key
+    /// under which it is stored in `module.classes`.
+    ///
+    /// SystemVerilog classes may be keyed under their bare name (`uvm_object`)
+    /// or their fully-qualified spelling (`uvm_pkg::uvm_object`) depending on
+    /// how they were declared/imported. This centralizes the three-way
+    /// resolution that previously had to be hand-duplicated at every class
+    /// lookup site (cast_type_ok, enum_value_name, class_is_a, …) as a
+    /// `format!("uvm_pkg::{}", …)` fallback.
+    ///
+    /// NOTE: only the `uvm_pkg::` prefix is handled today (UVM is the sole
+    /// multi-file package in the test corpus). Generalizing this to arbitrary
+    /// packages — ideally by canonicalizing package-qualified names once at
+    /// elaboration time in xezim-core — is a tracked follow-up so that new
+    /// packages don't each need a new two-line fallback here.
+    fn class_storage_key(&self, name: &str) -> Option<String> {
+        if self.module.classes.contains_key(name) {
+            return Some(name.to_string());
+        }
+        let prefixed = format!("uvm_pkg::{}", name);
+        if self.module.classes.contains_key(&prefixed) {
+            return Some(prefixed);
+        }
+        let stripped = name.trim_start_matches("uvm_pkg::");
+        if stripped != name && self.module.classes.contains_key(stripped) {
+            return Some(stripped.to_string());
+        }
+        None
+    }
+
     fn get_class_def<'a>(&'a self, name: &str) -> Option<&'a crate::compiler::elaborate::ElaboratedClass> {
-        self.module
-            .classes
-            .get(name)
-            .or_else(|| self.module.classes.get(&format!("uvm_pkg::{}", name)))
-            .or_else(|| self.module.classes.get(name.trim_start_matches("uvm_pkg::")))
+        self.class_storage_key(name)
+            .and_then(|k| self.module.classes.get(&k))
     }
 
     fn substitute_spec_params(&self, frag: &str) -> String {
@@ -60183,6 +60271,23 @@ impl Simulator {
         };
         match dest_type {
             Some(dt) => {
+                // The dest may be a TYPE PARAMETER (e.g. `REQ param_t;` inside
+                // uvm_sequencer_param_base::send_request's `$cast(param_t, t)`).
+                // "REQ" is not a real class, so class_is_a would spuriously fail
+                // (SQRSNDREQCAST). Resolve it to the concrete class via the
+                // current instance's bindings; if it can't be resolved to a known
+                // class, don't enforce (stay permissive like the None case).
+                //
+                // When the resolved type is ALREADY a value-parameterized
+                // specialization form (e.g. `special_comp#(1)` — produced by
+                // class_of_var resolving a type param bound to a
+                // value-parameterized class), it is NOT a type-param name and
+                // resolve_type_param_binding returns None. Detect the `#` and
+                // pass it through directly; strip_class_specialization below
+                // extracts the base class for the hierarchy check and retains
+                // the args for the value-param comparison. Without this, the
+                // `None` fallback made `$cast` permissive and accepted an
+                // object of `special_comp#(2)` as a `special_comp#(1)`.
                 let raw = if self.module.classes.contains_key(&dt) || dt.contains('#') {
                     dt.clone()
                 } else {
@@ -60191,18 +60296,35 @@ impl Simulator {
                         None => return true,
                     }
                 };
+                // The resolved type may be a VALUE-PARAMETERIZED
+                // specialization like `special_comp#(2)` (a type param bound
+                // to a parameterized class). Strip the `#(args)` to get the
+                // base class for the hierarchy check, and retain the args
+                // text for the value-param comparison below. Without this,
+                // `special_comp#(2)` is not in `module.classes`, so the dest
+                // type is unknown and `$cast` falls back to permissive —
+                // leaking a `special_comp#(2)` typewide callback onto a
+                // `special_comp#(1)` instance (a UVM callbacks specialization case).
                 let (base, spec_args_from_name) = Self::strip_class_specialization(&raw);
-                let resolved = if self.module.classes.contains_key(&base) {
-                    base
-                } else if self.module.classes.contains_key(&format!("uvm_pkg::{}", base)) {
-                    format!("uvm_pkg::{}", base)
-                } else {
+                // Package-qualified class names may be stored under either the
+                // bare or the `uvm_pkg::`-prefixed key; resolve the storage key
+                // once here, staying permissive (like the None case) if the dest
+                // type is genuinely unknown.
+                let Some(resolved) = self.class_storage_key(&base) else {
                     return true;
                 };
+                // Hierarchy check: the src instance must be `resolved` or a
+                // subclass of it, else the downcast must fail.
                 let is_a = self.class_is_a(&src_class, &resolved);
                 if !is_a {
                     return false;
                 }
+                // Value-parameter specialization check: if the dest class
+                // has value parameters, src and dest must agree on every
+                // one (e.g. $cast(me[special_comp#(2)], a1[#1]) must fail).
+                // Dest value bindings come from the resolved name's `#(...)`
+                // (type-param-dest case) or the dest var's declared
+                // `#(...)` type_args (direct-decl case).
                 let vp_ok = self.cast_value_params_ok(&resolved, spec_args_from_name.as_deref(), dest, h);
                 vp_ok
             }
@@ -63765,9 +63887,7 @@ impl Simulator {
                     || self.module.typedefs.contains_key(&type_name)
                 {
                     self.var_typedef_types.insert(port.name.name.clone(), type_name);
-                } else if self.module.classes.contains_key(&type_name)
-                    || self.module.classes.contains_key(&format!("uvm_pkg::{}", type_name))
-                {
+                } else if self.class_storage_key(&type_name).is_some() {
                     self.var_class_types.insert(port.name.name.clone(), type_name);
                 }
             }
@@ -66129,6 +66249,28 @@ impl Simulator {
                     || self.module.dynamic_arrays.contains(&scoped_q)
                 {
                     self.populate_queue_from_init(&scoped_q, &init);
+                    continue;
+                }
+                // Fixed-size UNPACKED array member initializer
+                // (`int fa[4] = '{1,2,3,4}`): per-instance storage is the
+                // element signals `<handle>#fa[i]` (registered above as a real
+                // fixed array), NOT a scalar slot in the property map. Apply
+                // the assignment pattern member-wise, mapping pattern item k
+                // to declared index lo+k (handles non-zero lower bounds like
+                // `fa[1:4]`). Non-pattern initializers (replication/default)
+                // are left at the per-element defaults registered above rather
+                // than collapsing the aggregate into a scalar property.
+                if let Some(&(lo, _hi, _w)) = cdef.array_properties.get(&pname) {
+                    let scoped = format!("{}#{}", handle, pname);
+                    if let ExprKind::AssignmentPattern(items) = &init.kind {
+                        for (k, item) in items.iter().enumerate() {
+                            let v = self.eval_expr(item.expr());
+                            self.set_signal_value_by_name(
+                                &format!("{}[{}]", scoped, lo + k as i64),
+                                v,
+                            );
+                        }
+                    }
                     continue;
                 }
                 let val = self.eval_expr(&init);
@@ -73008,9 +73150,7 @@ impl Simulator {
                                 || self.module.typedefs.contains_key(&type_name)
                             {
                                 self.var_typedef_types.insert(port.name.name.clone(), type_name);
-                            } else if self.module.classes.contains_key(&type_name)
-                                || self.module.classes.contains_key(&format!("uvm_pkg::{}", type_name))
-                            {
+                            } else if self.class_storage_key(&type_name).is_some() {
                                 self.var_class_types.insert(port.name.name.clone(), type_name.clone());
                             }
                         }
