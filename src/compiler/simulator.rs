@@ -44322,6 +44322,39 @@ impl Simulator {
                             if ai < args.len() {
                                 let arg = &args[ai];
                                 ai += 1;
+                                // §7.12.1: an array LOCATOR call (`q.unique()`,
+                                // `q.find with (…)`, `q.min()`) RETURNS a queue.
+                                // Only the ASSIGNMENT path materialized that, so
+                                // used directly as an argument the call fell
+                                // through to scalar evaluation and printed 0 —
+                                // `r = q.unique(); $display("%p", r);` was right
+                                // while the one-liner was silently wrong.
+                                if let Some((arr_name, mname, filter, iter_name)) =
+                                    self.locator_call(arg)
+                                {
+                                    let idxs = self.locator_indices_named(
+                                        &arr_name,
+                                        &mname,
+                                        filter.as_ref(),
+                                        iter_name.as_deref(),
+                                    );
+                                    const TMP: &str = "__xz_locator_fmt";
+                                    self.materialize_locator(TMP, &arr_name, &mname, &idxs);
+                                    // An `_index` form yields indices, never the
+                                    // element type, so it is not string-rendered.
+                                    let is_str = !mname.ends_with("_index")
+                                        && self.string_signals.contains(&arr_name);
+                                    let mut parts: Vec<String> = Vec::with_capacity(idxs.len());
+                                    for i in 0..idxs.len() {
+                                        if let Some(v) = self
+                                            .get_signal_value_by_name(&format!("{}[{}]", TMP, i))
+                                        {
+                                            parts.push(Self::render_p_value(&v, is_str));
+                                        }
+                                    }
+                                    result.push_str(&format!("'{{{}}}", parts.join(", ")));
+                                    continue;
+                                }
                                 if let ExprKind::Ident(h) = &arg.kind {
                                     let name = self.resolve_hier_name(h);
                                     if let Some(tag) = self.active_union_tag.get(&name).cloned() {
@@ -57928,6 +57961,12 @@ impl Simulator {
         };
         let saved_item = self.local_stack.last().and_then(|f| f.get("item").cloned());
         let mut acc: Option<i64> = None;
+        // §7.12.3: with a `with` clause the result type is the type of the
+        // EXPRESSION, so the accumulation wraps at that width. A 1-bit
+        // predicate like `q.sum with (item > 4)` therefore counts modulo 2 —
+        // accumulating in a full i64 and returning 32 bits gave the raw match
+        // count (3) where the LRM requires 1.
+        let mut expr_w: u32 = 0;
         for i in 0..size {
             let elem = self
                 .get_signal_value_by_name(&format!("{}[{}]", arr, i))
@@ -57935,7 +57974,11 @@ impl Simulator {
             if let Some(f) = self.local_stack.last_mut() {
                 f.insert("item".to_string(), elem);
             }
-            let v = self.eval_expr(filter).to_i64().unwrap_or(0);
+            let fv = self.eval_expr(filter);
+            if expr_w == 0 {
+                expr_w = fv.width.max(1);
+            }
+            let v = fv.to_i64().unwrap_or(0);
             acc = Some(match (acc, method) {
                 (None, _) => v,
                 (Some(a), "sum") => a + v,
@@ -57962,7 +58005,16 @@ impl Simulator {
         if pushed_frame {
             self.local_stack.pop();
         }
-        Value::from_u64(acc.unwrap_or(0) as u64, 32)
+        // Truncate to the expression's width for the accumulating reductions;
+        // min/max/and/or/xor cannot exceed an operand and need no masking.
+        let w = if expr_w == 0 { 32 } else { expr_w };
+        let raw = acc.unwrap_or(0) as u64;
+        let out = if matches!(method, "sum" | "product") && w < 64 {
+            raw & ((1u64 << w) - 1)
+        } else {
+            raw
+        };
+        Value::from_u64(out, w.max(32))
     }
 
     /// True if `expr` contains a function/method/system/`new` call anywhere —
