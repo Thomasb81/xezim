@@ -41456,9 +41456,24 @@ impl Simulator {
                                             let src_h =
                                                 self.eval_expr(&call_args[0]).to_u64().unwrap_or(0)
                                                 as usize;
-                                            if src_h != 0
-                                                && matches!(self.heap.get(src_h), Some(Some(_)))
-                                            {
+                                            // §8.12: `T x = new src;` shallow-copies
+                                            // `src` ONLY when src is of type T (or a
+                                            // subclass of T). A single class-handle
+                                            // arg of a DIFFERENT, unrelated class is
+                                            // a constructor ARGUMENT, not a copy
+                                            // source — e.g. `factory f = new(b)` where
+                                            // b is a base_cls must call
+                                            // factory::new(b), not copy-construct b.
+                                            // Without this type check, the loose
+                                            // `expr_is_class_handle` test treated any
+                                            // class-typed arg as a copy source,
+                                            // silently skipping the constructor body
+                                            // (so field assignments like
+                                            // `reg_type = t` never ran).
+                                            let is_copy_src = src_h != 0
+                                                && matches!(self.heap.get(src_h), Some(Some(src_inst))
+                                                    if self.class_extends(&src_inst.class_name, cn));
+                                            if is_copy_src {
                                                 produced = Some(self.copy_construct(src_h));
                                             }
                                         }
