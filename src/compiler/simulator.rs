@@ -4091,6 +4091,12 @@ pub struct Simulator {
     in_pre_process_settle: bool,
     /// Call-site (expression span start) → index into `sampled_watches`.
     sampled_watch_site: HashMap<usize, usize>,
+    /// §16.9.3: for a `$rose`/`$fell`/`$stable`/`$changed`/`$past` call with no
+    /// explicit `@(...)` argument and no `default clocking`, the clocking event
+    /// is inferred from the ENCLOSING procedural block's event control. Filled
+    /// in by `register_sampled_watches` (call-site span → (edge code, clock
+    /// signal id)) so the history accumulates from time 0.
+    sampled_site_clock: HashMap<usize, (u8, usize)>,
 }
 
 /// One `$rose/$fell/$stable/$changed/$past(x, @(edge clk))` call site.
@@ -5948,6 +5954,7 @@ impl Simulator {
             name_resolve_hint: RefCell::new(None),
             sampled_watches: Vec::new(),
             sampled_watch_site: HashMap::default(),
+            sampled_site_clock: HashMap::default(),
             pending_t0_triggers: Vec::new(),
             in_pre_process_settle: false,
         };
@@ -27255,6 +27262,26 @@ impl Simulator {
             if self.active_sva_site.is_some() {
                 return None;
             }
+            // No default clocking: fall back to the clock inferred from the
+            // enclosing always block. Without this, procedural `$rose(a)`
+            // inside `always @(posedge clk)` had no history at all — `prev`
+            // defaulted to `cur`, so $rose/$fell were ALWAYS 0 and $stable
+            // ALWAYS 1, silently.
+            if !self.clocking_meta.contains_key("__xz_default_clocking") {
+                let (ec, cid) = *self.sampled_site_clock.get(&expr.span.start)?;
+                let operand = args.first()?.clone();
+                let site = expr.span.start;
+                let widx = self.sampled_watch_for(site, &operand, ec, cid, n)?;
+                let cur = match self.sampled_watches[widx].hist.front() {
+                    Some(v) => v.clone(),
+                    None => {
+                        let op = operand.clone();
+                        self.eval_expr(&op)
+                    }
+                };
+                let past = self.sampled_watches[widx].hist.get(n).cloned();
+                return Some((cur, past));
+            }
             let (clk_str, _) = self.clocking_meta.get("__xz_default_clocking")?.clone();
             // clocking_meta stores the bare clock SIGNAL name (the parser
             // drops the event's edge); default clocking events are
@@ -27291,11 +27318,110 @@ impl Simulator {
         for ib in &self.module.initial_blocks {
             stmts.push(ib.stmt.clone());
         }
-        for ab in &self.module.always_blocks {
-            stmts.push(ab.stmt.clone());
-        }
         for st in stmts {
             self.scan_sampled_stmt(&st);
+        }
+        // §16.9.3: an edge-sensitive always block supplies the inferred
+        // clocking event for every sampled-value call in its body. Sourced
+        // from `edge_blocks` rather than `module.always_blocks` — by the time
+        // this runs the always blocks have already been compiled into edge
+        // blocks and the module vec is empty, which is why procedural
+        // `$rose`/`$fell` had no clock and silently never fired.
+        let blocks = Arc::clone(&self.edge_blocks);
+        let mut tagged: Vec<(Statement, u8, usize)> = Vec::new();
+        for b in blocks.iter() {
+            let clk = b.resolved_sensitivities.iter().find_map(|s| match s.edge {
+                EdgeKind::Posedge => Some((1u8, s.signal_id)),
+                EdgeKind::Negedge => Some((2u8, s.signal_id)),
+                _ => None,
+            });
+            if let Some((ec, cid)) = clk {
+                tagged.push((b.stmt.clone(), ec, cid));
+            }
+        }
+        for (st, ec, cid) in tagged {
+            self.record_sampled_sites(&st, ec, cid);
+            self.scan_sampled_stmt(&st);
+        }
+    }
+
+    /// Tag every sampled-value call site inside `st` with the block's clock.
+    fn record_sampled_sites(&mut self, st: &Statement, ec: u8, cid: usize) {
+        let mut sites: Vec<usize> = Vec::new();
+        Self::collect_sampled_sites_stmt(st, &mut sites);
+        for site in sites {
+            self.sampled_site_clock.entry(site).or_insert((ec, cid));
+        }
+    }
+
+    /// Span starts of every `$rose`/`$fell`/`$stable`/`$changed`/`$past` call
+    /// inside a statement — the key `sampled_site_clock` and
+    /// `sampled_watch_site` both use.
+    fn collect_sampled_sites_stmt(st: &Statement, out: &mut Vec<usize>) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    Self::collect_sampled_sites_stmt(s, out);
+                }
+            }
+            SK::If { condition, then_stmt, else_stmt, .. } => {
+                Self::collect_sampled_sites_expr(condition, out);
+                Self::collect_sampled_sites_stmt(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    Self::collect_sampled_sites_stmt(e, out);
+                }
+            }
+            SK::TimingControl { stmt, .. } => Self::collect_sampled_sites_stmt(stmt, out),
+            SK::For { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body }
+            | SK::Foreach { body, .. } => Self::collect_sampled_sites_stmt(body, out),
+            SK::Case { expr, items, .. } => {
+                Self::collect_sampled_sites_expr(expr, out);
+                for it in items {
+                    Self::collect_sampled_sites_stmt(&it.stmt, out);
+                }
+            }
+            SK::BlockingAssign { rvalue, .. } => Self::collect_sampled_sites_expr(rvalue, out),
+            SK::NonblockingAssign { rvalue, .. } => Self::collect_sampled_sites_expr(rvalue, out),
+            SK::Expr(e) => Self::collect_sampled_sites_expr(e, out),
+            _ => {}
+        }
+    }
+
+    fn collect_sampled_sites_expr(e: &Expression, out: &mut Vec<usize>) {
+        match &e.kind {
+            ExprKind::SystemCall { name, args }
+                if matches!(
+                    name.as_str(),
+                    "$rose" | "$fell" | "$stable" | "$changed" | "$past"
+                ) =>
+            {
+                out.push(e.span.start);
+                for a in args {
+                    Self::collect_sampled_sites_expr(a, out);
+                }
+            }
+            ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
+                for a in args {
+                    Self::collect_sampled_sites_expr(a, out);
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::collect_sampled_sites_expr(left, out);
+                Self::collect_sampled_sites_expr(right, out);
+            }
+            ExprKind::Unary { operand, .. } => Self::collect_sampled_sites_expr(operand, out),
+            ExprKind::Paren(inner) => Self::collect_sampled_sites_expr(inner, out),
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                Self::collect_sampled_sites_expr(condition, out);
+                Self::collect_sampled_sites_expr(then_expr, out);
+                Self::collect_sampled_sites_expr(else_expr, out);
+            }
+            _ => {}
         }
     }
 
