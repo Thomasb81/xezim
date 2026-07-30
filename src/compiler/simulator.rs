@@ -186,6 +186,45 @@ fn sim_debug_enabled() -> bool {
 /// in xezim, so `+notimingcheck` is accepted by the CLI as a documented no-op.
 static NOSPECIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `--warn-x`: report the FIRST time each signal takes an X bit after time 0,
+/// naming the signal, its instance/module, and everything that drives it.
+/// Off by default — X during initialization is normal and would drown the log.
+static WARN_X: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `--warn-x-limit N`: stop after N reports (0 = unlimited).
+static WARN_X_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(50);
+
+pub fn set_warn_x(v: bool) {
+    WARN_X.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_warn_x_limit(n: usize) {
+    WARN_X_LIMIT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn warn_x_enabled() -> bool {
+    if WARN_X.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    // `X_WARN=1` / `X_WARN=on`: same switch, settable without editing the
+    // command line. Any value other than 0/off/no/false enables it.
+    match std::env::var("X_WARN") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "off" && v != "no" && v != "false"
+        }
+        Err(_) => false,
+    }
+}
+
+fn warn_x_limit() -> usize {
+    if let Ok(v) = std::env::var("X_WARN_LIMIT") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n;
+        }
+    }
+    WARN_X_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_nospecify(v: bool) {
     NOSPECIFY.store(v, std::sync::atomic::Ordering::Relaxed);
 }
@@ -435,6 +474,32 @@ macro_rules! write_sig {
             if __wsig_id < $self.signal_inline_bits.len() {
                 let (__wsig_v, __wsig_x) = __wsig_val.raw_bits();
                 $self.signal_inline_bits[__wsig_id] = [__wsig_v, __wsig_x];
+            }
+            // `--warn-x`: record a signal taking a NEW x bit after time 0.
+            // One bool load when disabled. Placed here because the old value is
+            // still in the table, so "became x" is distinguishable from "was
+            // already x". Written inline rather than as a call: this macro
+            // expands inside bodies that already hold a `&mut` borrow of another
+            // field, so only disjoint field access is possible here.
+            if $self.warn_x && $self.time > 0 {
+                let (__xov, __xox) = $self.signal_table[__wsig_id].raw_bits();
+                let (__xnv, __xnx) = __wsig_val.raw_bits();
+                // x is (xz & !val); z is (xz & val) and deliberately ignored —
+                // z is a legitimate steady state for a tri-state net.
+                let __fresh = (__xnx & !__xnv) & !(__xox & !__xov);
+                let __wide_new_x = __wsig_val.width > 64
+                    && __wsig_val.has_xz()
+                    && !$self.signal_table[__wsig_id].has_xz();
+                if (__fresh != 0 || __wide_new_x)
+                    && $self.warn_x_seen.borrow_mut().insert(__wsig_id)
+                {
+                    let __xt = $self.time;
+                    let __xp = $self.current_pid;
+                    $self
+                        .warn_x_pending
+                        .borrow_mut()
+                        .push((__wsig_id, __xt, __wsig_val.clone(), __xp, None));
+                }
             }
             $self.signal_table[__wsig_id] = __wsig_val;
             // Incremental VCD: mark this write dirty (no-op when the dump is off
@@ -2459,6 +2524,41 @@ pub struct Simulator {
     /// are indistinguishable. Applying the gate rule to both made every
     /// `assign y = x;` eat `z`. This says which ids the gate rule applies to.
     signal_gate_driven: Vec<bool>,
+    /// Signal ids whose declared type is `string`. §6.16 makes a string a
+    /// DYNAMIC type with no length limit, but it is stored in the fixed-width
+    /// signal table like everything else — `resolve_type_width` hands it 1024
+    /// bits, i.e. 128 characters. Fitting a value to that width silently
+    /// truncated every longer string (a 130-char concat came back 128, and the
+    /// dropped end took a `{base, "TAIL"}` suffix with it). These ids skip the
+    /// width fit and keep whatever length they are given.
+    signal_is_string: Vec<bool>,
+    /// `--warn-x` state. `warn_x` is a plain field (not the atomic) so the
+    /// write hot path costs one bool load; everything else is touched only
+    /// when a report actually fires.
+    warn_x: bool,
+    /// Signals already recorded, so a register that re-loads an X input every
+    /// cycle is named once rather than ten thousand times. `RefCell` because
+    /// `write_sig!` expands in contexts that already hold a `&mut` borrow of
+    /// another field (the clock-generator loop), so the hook can only touch
+    /// disjoint fields — never `&mut self` as a whole.
+    warn_x_seen: std::cell::RefCell<HashSet<usize>>,
+    /// Captured at the moment of the write — id, time, and the value — and
+    /// formatted later, once a `&mut self` is available again.
+    /// id, time, value, and the process that performed the write. The pid is
+    /// the only attribution available for a procedural write: `initial`/`always`
+    /// bodies are drained into processes at compile time, so they are not in
+    /// `module.initial_blocks` any more, but `process_origin` still knows what
+    /// each pid came from and where.
+    warn_x_pending: std::cell::RefCell<Vec<(usize, u64, Value, usize, Option<String>)>>,
+    /// Dedup for entries identified by NAME rather than id — associative and
+    /// other elements that live in the untyped `signals` map and so have no
+    /// entry in the signal table.
+    warn_x_seen_named: std::cell::RefCell<HashSet<String>>,
+    warn_x_count: usize,
+    /// Lazily built on the first report: signal id -> one line per driver.
+    /// Derived from the comb entries and edge blocks on demand, so a run
+    /// without `--warn-x` pays nothing for it.
+    warn_x_drivers: Option<HashMap<usize, Vec<String>>>,
     /// Signal ids that carry a CONTINUOUS driver — the whole-name LHS of an
     /// `assign` (including the continuous-assigns that inlining synthesizes for
     /// instance port connections). §6.5 forbids mixing continuous and procedural
@@ -3994,6 +4094,12 @@ pub struct Simulator {
     in_pre_process_settle: bool,
     /// Call-site (expression span start) → index into `sampled_watches`.
     sampled_watch_site: HashMap<usize, usize>,
+    /// §16.9.3: for a `$rose`/`$fell`/`$stable`/`$changed`/`$past` call with no
+    /// explicit `@(...)` argument and no `default clocking`, the clocking event
+    /// is inferred from the ENCLOSING procedural block's event control. Filled
+    /// in by `register_sampled_watches` (call-site span → (edge code, clock
+    /// signal id)) so the history accumulates from time 0.
+    sampled_site_clock: HashMap<usize, (u8, usize)>,
 }
 
 /// One `$rose/$fell/$stable/$changed/$past(x, @(edge clk))` call site.
@@ -5221,6 +5327,42 @@ impl Simulator {
                 module.packed_signal_elem_widths.insert(k, ew);
             }
         }
+        // §6.16: mark string-typed ids so assignment does not clamp them to the
+        // placeholder width the elaborator assigns a dynamic type.
+        let mut signal_is_string = vec![false; num_signals];
+        if !module.string_signals.is_empty() {
+            // An ELEMENT of a string collection is a string too. `string_signals`
+            // holds the base name (`q`, `aa`), while the table holds `q[2]`, so
+            // the subscript is stripped before matching — otherwise a
+            // `string q[$]` element kept being clamped to the placeholder width
+            // while a plain `string` variable no longer was.
+            let is_str_name = |n: &str| -> bool {
+                let leaf = n.rsplit('.').next().unwrap_or(n);
+                let base = leaf.split('[').next().unwrap_or(leaf);
+                module.string_signals.contains(n)
+                    || module.string_signals.contains(leaf)
+                    || module.string_signals.contains(base)
+            };
+            for (name, &id) in signal_name_to_id.iter() {
+                if id >= num_signals {
+                    continue;
+                }
+                if is_str_name(name.as_ref()) {
+                    signal_is_string[id] = true;
+                }
+            }
+            // Compact-allocated array elements have no per-element name entry;
+            // mark their whole id range from the base.
+            for (base_name, &(first_id, lo, hi)) in array_first_id.iter() {
+                if !is_str_name(base_name.as_ref()) {
+                    continue;
+                }
+                let n = (hi - lo + 1).max(0) as usize;
+                for id in first_id..(first_id + n).min(num_signals) {
+                    signal_is_string[id] = true;
+                }
+            }
+        }
         // §28.4 vs §10.3: mark ids driven by a lowered gate primitive, so only
         // those get the `buf` truth table's z->x. Same leaf/base matching as
         // the 2-state pass above.
@@ -5353,6 +5495,13 @@ impl Simulator {
             signal_real: signal_real_vec,
             signal_two_state,
             signal_gate_driven,
+            signal_is_string,
+            warn_x: warn_x_enabled(),
+            warn_x_seen: std::cell::RefCell::new(HashSet::default()),
+            warn_x_pending: std::cell::RefCell::new(Vec::new()),
+            warn_x_seen_named: std::cell::RefCell::new(HashSet::default()),
+            warn_x_count: 0,
+            warn_x_drivers: None,
             cont_driven: HashSet::default(),
             signal_type_names,
             time: 0,
@@ -5807,6 +5956,7 @@ impl Simulator {
             name_resolve_hint: RefCell::new(None),
             sampled_watches: Vec::new(),
             sampled_watch_site: HashMap::default(),
+            sampled_site_clock: HashMap::default(),
             pending_t0_triggers: Vec::new(),
             in_pre_process_settle: false,
         };
@@ -9745,6 +9895,15 @@ impl Simulator {
             // (~2.5ms per toggle on c910). Detect this pattern, apply
             // the seed assignment immediately, and register a ClockGen
             // so `fire_clock_generators` can toggle the signal O(1).
+            // The detection below EVALUATES the block's seed RHS, and that
+            // eval memoizes each bare name's resolution on its AST node. It
+            // must therefore run under THIS block's scope — the hint still
+            // holds whatever the previous block (or any earlier compile-time
+            // eval) left, and a bare wildcard-imported constant resolved once
+            // under a sibling's scope stays wrong for the whole run: `user`'s
+            // enum member `C` permanently read `shadower`'s local `int C`.
+            *self.name_resolve_hint.borrow_mut() =
+                (!scope.is_empty()).then(|| scope.clone());
             if let Some(cg) = self.try_extract_initial_clock_gen(&stmts) {
                 self.clock_generators.push(cg);
                 continue;
@@ -12648,6 +12807,8 @@ impl Simulator {
             }
             self.finished = was_finished;
         }
+        // Flush any `--warn-x` reports captured during the final region.
+        self.drain_warn_x();
         self.vcd_finish();
         self.xtrace_finish();
         self.fst_finish();
@@ -13195,9 +13356,25 @@ impl Simulator {
                         }
                     }
                     // Mirror the comb path's `sens_reads = reads - writes`.
-                    b_reads
+                    let reads_covered = b_reads
                         .difference(&b_writes)
-                        .all(|r| resolve_ids(r.as_str()).iter().all(|id| sens_ids.contains(id)))
+                        .all(|r| resolve_ids(r.as_str()).iter().all(|id| sens_ids.contains(id)));
+                    // The reverse must hold too: every LISTED signal has to be
+                    // in the derived read set, or the comb path silently drops
+                    // it from the sensitivity. `always @(a) t = $time;` reads
+                    // no signal at all, so the containment above passes
+                    // VACUOUSLY, the entry's read set came out empty, and the
+                    // block fired exactly once (at t0) — every later edge of
+                    // `a` was missed and the captured time stayed 0. Routing
+                    // the not-equal case to the edge path costs a little speed
+                    // for an unusual shape and follows §9.4.2 exactly.
+                    let read_id_union: std::collections::HashSet<usize> = b_reads
+                        .difference(&b_writes)
+                        .flat_map(|r| resolve_ids(r.as_str()))
+                        .collect();
+                    let sens_covered =
+                        sens_ids.iter().all(|id| read_id_union.contains(id));
+                    reads_covered && sens_covered
                 };
                 if all_level
                     && !has_named_event
@@ -13415,6 +13592,8 @@ impl Simulator {
             compiler.set_tasks(&self.module.tasks);
             compiler.set_params(&self.module.parameters);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                    compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
             compiler.set_array_first_id(&self.array_first_id);
@@ -13458,6 +13637,8 @@ impl Simulator {
                 compiler.set_tasks(&self.module.tasks);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                    compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
@@ -13481,6 +13662,8 @@ impl Simulator {
                 delay_compiler.set_tasks(&self.module.tasks);
                 delay_compiler.set_params(&self.module.parameters);
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                delay_compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
                 delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 delay_compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 delay_compiler.set_array_first_id(&self.array_first_id);
@@ -15466,6 +15649,9 @@ impl Simulator {
                         let src_v = src_v & mask;
                         let src_x = src_x & mask;
                         let (dst_v, dst_x) = self.signal_table[id].raw_bits();
+                        if self.warn_x && self.time > 0 {
+                            self.warn_x_note_bits(id, dst_v & mask, dst_x & mask, src_v, src_x);
+                        }
                         if src_v == (dst_v & mask) && src_x == (dst_x & mask) {
                             handled = true;
                         } else if self.signal_table[id].set_inline_bits(src_v, src_x) {
@@ -16068,6 +16254,16 @@ impl Simulator {
         // 4 GB. Streaming drain releases per-CA allocations as we iterate.
         let cas = std::mem::take(&mut self.module.continuous_assigns);
         let pending_ca = std::mem::take(&mut self.module.pending_cont_assign);
+        // §10.6.2: a whole-ARRAY continuous assign (`assign dst = src;` between
+        // unpacked arrays) has no single signal to drive — the ELEMENTS are the
+        // signals — so it compiled to a phantom scalar and silently drove
+        // nothing, leaving `dst` x for the whole run. Elaboration expands the
+        // module-scope ones, but a SUB-MODULE's assigns arrive here as
+        // `pending_cont_assign` and never pass through that path, so expand
+        // them at the one point every continuous assign is guaranteed to cross.
+        // The array table is snapshotted because the loop below needs `&mut
+        // self`; it is names→ranges only, not ASTs.
+        let arrays_snapshot = self.module.arrays.clone();
         // Hoisted out of the loop to reuse capacity across iterations.
         // Avoids ~2 × N HashMap allocs/drops where N = cont_assign count
         // (63K on c906, 501K on c910). Clear() preserves the bucket array.
@@ -16078,6 +16274,14 @@ impl Simulator {
         for ca in cas
             .into_iter()
             .chain(pending_ca.into_iter().map(|p| p.materialize()))
+            .flat_map(|ca| {
+                match crate::compiler::elaborate::whole_array_assign_parts(
+                    &ca.lhs, &ca.rhs, ca.delay, &arrays_snapshot,
+                ) {
+                    Some(parts) => parts,
+                    None => vec![ca],
+                }
+            })
         {
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.
@@ -16289,7 +16493,18 @@ impl Simulator {
                 CombItem::FusedGate { op }
             } else if let Some(dc_val) = direct_copy {
                 dc_val
-            } else if wids.len() == 1 && lhs_is_bare_ident && struct_member_base_id.is_none() {
+            } else if wids.len() == 1
+                && lhs_is_bare_ident
+                && struct_member_base_id.is_none()
+                // A specify/SDF path delay on the destination must route the
+                // write through the delayed-update scheduler. The bytecode's
+                // writeback commits immediately, so compiling here dropped the
+                // delay for any non-trivial RHS: the DirectCopy/fused-gate
+                // paths already refuse a delayed dst, but a cell whose output
+                // is `assign y = a & b;` (every behavioral gate model) took
+                // this branch and its `(a => y) = 3` specify was ignored.
+                && self.sdf_delays.get(wids[0]).copied().unwrap_or(0) == 0
+            {
                 let dst_id = wids[0];
                 let width = self.signal_widths[dst_id];
                 let mut compiler = super::bytecode::BytecodeCompiler::new(
@@ -16302,6 +16517,8 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                    compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
@@ -16358,6 +16575,8 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                    compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
@@ -16671,6 +16890,8 @@ impl Simulator {
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_params(&self.module.parameters);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                    compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+                    compiler.set_assoc_arrays(&self.module.associative_arrays);
                     compiler.set_packed_full_dims(&self.module.packed_full_dims);
                     compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                     compiler.set_array_first_id(&self.array_first_id);
@@ -19484,6 +19705,31 @@ impl Simulator {
                         Some(Edge::Edge) => EdgeKind::LsbEdge,
                         None => EdgeKind::AnyEdge,
                     };
+                    // §15.5 an event-ARRAY element (`always @(ev[1])`).
+                    // `collect_ident_names` walks past the Index to the base,
+                    // which for an event array is the array name and not a
+                    // 1-bit signal — so the block armed on nothing and never
+                    // fired. Each element has its own backing signal, so name
+                    // it directly. Only a literal index is handled here
+                    // (`event_to_sens` cannot evaluate); a variable index
+                    // keeps the old behaviour.
+                    if let ExprKind::Index { expr: base, index } = &ee.expr.kind {
+                        if let (ExprKind::Ident(bh), ExprKind::Number(NumberLiteral::Integer { value, .. })) =
+                            (&base.kind, &index.kind)
+                        {
+                            if bh.path.len() == 1 {
+                                let key = format!("{}[{}]", bh.path[0].name.name, value);
+                                if self.module.events.contains(key.as_str()) {
+                                    out.push(Sensitivity {
+                                        signal_name: self.resolve_event_key(&key),
+                                        edge,
+                                        iff: ee.iff.clone(),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let mut idents = Vec::new();
                     collect_ident_names(&ee.expr, &mut idents);
                     for &h in &idents {
@@ -19633,6 +19879,25 @@ impl Simulator {
             }
             EventControl::HierIdentifier(expr) => {
                 if let ExprKind::Ident(h) = &expr.kind {
+                    // LRM §14.3: the BARE `@cb` form parses as a
+                    // HierIdentifier (the parenthesized `@(cb)` becomes a
+                    // one-term EventExpr, which already resolves clocking
+                    // blocks). Without the same substitution here, `@cb` built
+                    // a sensitivity on a nonexistent signal named `cb`, found
+                    // no signal id, and fell into the delta-yield — returning
+                    // at t=0 instead of waiting for the block's clock edge.
+                    // Every `@cb;` sampling loop then spun without advancing.
+                    let segs: Vec<&str> =
+                        h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    if let Some(cbk) = self.resolve_clocking_key(&segs) {
+                        if let Some((clk, _)) = self.clocking_meta.get(&cbk) {
+                            return vec![Sensitivity {
+                                signal_name: clk.clone(),
+                                edge: EdgeKind::Posedge,
+                                iff: None,
+                            }];
+                        }
+                    }
                     vec![Sensitivity {
                         signal_name: self.resolve_hier_name(h),
                         edge: EdgeKind::AnyEdge,
@@ -19938,6 +20203,18 @@ impl Simulator {
             EventControl::Identifier(id) => {
                 id.name == "__xz_default_clocking"
                     || self.clocking_meta.contains_key(&id.name)
+            }
+            // The bare `@cb` form (a HierIdentifier) is a clocking event too,
+            // so its waiter must resume in the Reactive region like `@(cb)`.
+            EventControl::HierIdentifier(e) => {
+                if let ExprKind::Ident(h) = &e.kind {
+                    let segs: Vec<&str> =
+                        h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    segs == ["__xz_default_clocking"]
+                        || self.resolve_clocking_key(&segs).is_some()
+                } else {
+                    false
+                }
             }
             EventControl::EventExpr(exprs) => exprs.iter().any(|ee| {
                 // `@(cb)` is an edge-less bare ident naming a clocking block.
@@ -21051,6 +21328,13 @@ impl Simulator {
         // delta: promote so the outer event_loop re-enters run_one_tick,
         // where they run at the top — BEFORE that delta's NBA region (§4.5).
         self.promote_inactive_to_active();
+
+        // `--warn-x` / `X_WARN`: format anything the write hook captured this
+        // tick. Deferred to here because the hook runs under a foreign `&mut`
+        // borrow and can only record, not print.
+        if self.warn_x {
+            self.drain_warn_x();
+        }
 
         self.loop_iters += 1;
     }
@@ -23272,6 +23556,16 @@ impl Simulator {
 
     fn run_process_stmts(&mut self, pid: usize, stmts: &[Statement]) {
         self.current_pid = pid;
+        // Install THIS process's own instance scope as the resolution hint.
+        // The hint is transient sibling-scope state: the previous process (or
+        // a $display argument it evaluated) may have left its scope behind,
+        // and a bare name in this process would then resolve into THAT
+        // instance — `user`'s wildcard-imported enum member `C` read the
+        // sibling `shadower`'s local `int C` (truncated to the enum's width)
+        // purely because shadower's process happened to run first. The reset
+        // helper already existed for loop re-entry; a fresh activation needs
+        // it just as much.
+        self.reset_hint_to_process_scope();
         // Track run_process_stmts recursion depth so the suspend-aware loop
         // handlers (While/For/Repeat below) can trampoline through the event
         // queue instead of recursing when a synchronous loop body never
@@ -24173,6 +24467,48 @@ impl Simulator {
                                     pid,
                                     continuation: cont,
                                 });
+                                return;
+                            }
+                        }
+                        // `@(h.ce)`: a class-property event reached through a
+                        // handle from OUTSIDE the class. `resolve_this_event_field`
+                        // above only covers a bare field on `this`.
+                        if let Some(expr) = Self::event_control_single_expr(event) {
+                            if let Some(key) = self.expr_handle_event_field(&expr) {
+                                let mut cont = vec![*body.clone()];
+                                cont.extend_from_slice(&stmts[i + 1..]);
+                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                    key,
+                                    pid,
+                                    continuation: cont,
+                                });
+                                return;
+                            }
+                        }
+                        // §15.5 a DECLARED named event — including an array
+                        // element (`@ev[1]`) and one reached through an alias
+                        // (`e1 = e2; @e1`). Both need the resolved key rather
+                        // than the raw text: `event_to_sens` walks PAST an
+                        // Index to the base ident, so `@ev[1]` armed on the
+                        // array name `ev` (not a 1-bit signal) and fell into
+                        // the delta-yield below, waking instantly at t=0. And
+                        // an aliased waiter armed on its own name, so it never
+                        // saw `-> e2` — only the TRIGGER side canonicalized
+                        // (§15.5.4). Resolving here fixes both, and keeps the
+                        // delta-yield fallback for genuine non-event locals.
+                        if let Some(key) = self.event_control_event_key(event) {
+                            let canon = self.resolve_event_key(&key);
+                            if self.signal_name_to_id.contains_key(canon.as_str()) {
+                                let mut cont = vec![*body.clone()];
+                                cont.extend_from_slice(&stmts[i + 1..]);
+                                let sens = vec![Sensitivity {
+                                    signal_name: canon,
+                                    edge: EdgeKind::AnyEdge,
+                                    iff: None,
+                                }];
+                                self.event_waiters.push(
+                                    self.make_event_waiter_kind(pid, sens, cont, false),
+                                );
                                 return;
                             }
                         }
@@ -25645,6 +25981,153 @@ impl Simulator {
     /// literals freezes them at the correct moment, and also fixes the same
     /// staleness for a signal-valued index (`mem[addr] <= d;` where `addr`
     /// changes before the region runs).
+    /// `$`'s value for an index whose base is `base`: the last valid index of
+    /// that collection (§11.4.12). None when the base is not an indexable
+    /// collection, in which case there is no bound to install.
+    fn dollar_bound_for_base(&mut self, base: &Expression) -> Option<i64> {
+        let n = match &base.kind {
+            ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+            _ => self.flat_member_name(base),
+        }?;
+        if self.module.dynamic_arrays.contains(&n) {
+            Some(self.get_queue_size(&n) as i64 - 1)
+        } else {
+            self.module.arrays.get(&n).map(|&(_, hi, _)| hi)
+        }
+    }
+
+    /// Does any INDEX or RANGE bound inside this lvalue mention `$`? Scans the
+    /// whole lvalue tree, unlike `expr_contains_dollar`, which only looks at
+    /// one index expression.
+    fn lvalue_mentions_dollar(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                Self::expr_contains_dollar(index) || Self::lvalue_mentions_dollar(expr)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::expr_contains_dollar(left)
+                    || Self::expr_contains_dollar(right)
+                    || Self::lvalue_mentions_dollar(expr)
+            }
+            ExprKind::Paren(i) => Self::lvalue_mentions_dollar(i),
+            ExprKind::MemberAccess { expr, .. } => Self::lvalue_mentions_dollar(expr),
+            _ => false,
+        }
+    }
+
+    /// Rewrite every `$`-bearing index/range bound in an lvalue into a literal,
+    /// each evaluated against ITS OWN base's bound. Returns a clone; only
+    /// called when `lvalue_mentions_dollar` says there is work to do.
+    fn resolve_dollar_in_lvalue(&mut self, e: &Expression) -> Expression {
+        let lit = |v: i64, span| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(64),
+                    signed: true,
+                    base: NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                }),
+                span,
+            )
+        };
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                let base = self.resolve_dollar_in_lvalue(expr);
+                if !Self::expr_contains_dollar(index) {
+                    return Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: index.clone(),
+                        },
+                        e.span,
+                    );
+                }
+                // The bound belongs to the base being indexed here, which is
+                // why this recurses rather than pushing one bound for the
+                // whole tree: `mem[q[$]]` takes q's bound, not mem's.
+                let idx = match self.dollar_bound_for_base(&base) {
+                    Some(b) => {
+                        self.dollar_bound.push(b);
+                        let v = self.eval_expr(index).to_i64().unwrap_or(0);
+                        self.dollar_bound.pop();
+                        lit(v, index.span)
+                    }
+                    None => (**index).clone(),
+                };
+                Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(base),
+                        index: Box::new(idx),
+                    },
+                    e.span,
+                )
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                let base = self.resolve_dollar_in_lvalue(expr);
+                // A range's `$` refers to the base being sliced.
+                let b = self.dollar_bound_for_base(&base);
+                let mut ev = |x: &Expression| -> Box<Expression> {
+                    if !Self::expr_contains_dollar(x) {
+                        return Box::new(x.clone());
+                    }
+                    match b {
+                        Some(bb) => {
+                            self.dollar_bound.push(bb);
+                            let v = self.eval_expr(x).to_i64().unwrap_or(0);
+                            self.dollar_bound.pop();
+                            Box::new(lit(v, x.span))
+                        }
+                        None => Box::new(x.clone()),
+                    }
+                };
+                let l = ev(left);
+                let r = ev(right);
+                Expression::new(
+                    ExprKind::RangeSelect {
+                        expr: Box::new(base),
+                        kind: *kind,
+                        left: l,
+                        right: r,
+                    },
+                    e.span,
+                )
+            }
+            _ => e.clone(),
+        }
+    }
+
+    /// Does this expression mention `$` (§11.4.12 — the last index of the
+    /// collection being indexed)? Used to decide whether an lvalue index has to
+    /// be evaluated with a `dollar_bound` installed.
+    fn expr_contains_dollar(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Dollar => true,
+            ExprKind::Paren(i) => Self::expr_contains_dollar(i),
+            ExprKind::Unary { operand, .. } => Self::expr_contains_dollar(operand),
+            ExprKind::Binary { left, right, .. } => {
+                Self::expr_contains_dollar(left) || Self::expr_contains_dollar(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_contains_dollar(condition)
+                    || Self::expr_contains_dollar(then_expr)
+                    || Self::expr_contains_dollar(else_expr)
+            }
+            _ => false,
+        }
+    }
+
     fn freeze_lvalue_indices(&mut self, e: &Expression) -> Expression {
         let lit = |v: i64, span| {
             Expression::new(
@@ -25683,7 +26166,21 @@ impl Simulator {
         match &e.kind {
             ExprKind::Index { expr, index } => {
                 let base = self.freeze_lvalue_indices(expr);
-                let Some(iv) = freezable(self, index) else {
+                // Same `$` bound the apply-time path installs, so a frozen
+                // `q[$]` literal is the queue's last index and not u64::MAX.
+                let qbound = if Self::expr_contains_dollar(index) {
+                    self.dollar_bound_for_base(expr)
+                } else {
+                    None
+                };
+                if let Some(b) = qbound {
+                    self.dollar_bound.push(b);
+                }
+                let frozen_idx = freezable(self, index);
+                if qbound.is_some() {
+                    self.dollar_bound.pop();
+                }
+                let Some(iv) = frozen_idx else {
                     return Expression::new(
                         ExprKind::Index {
                             expr: Box::new(base),
@@ -25732,6 +26229,31 @@ impl Simulator {
         }
     }
 
+    /// True when an NBA's target is an ASSOCIATIVE-array element (module-level
+    /// `aa[k]`, a class member `m[k]` / `obj.m[k]`, or a static collection).
+    ///
+    /// Those lvalues have no signal id, so the NBA rode the expression queue —
+    /// where the value was first cut to `infer_lhs_width`, which knows nothing
+    /// about an assoc element and answered 1. Every `aa[key] <= v` therefore
+    /// committed the LOW BIT of v (sign-extended: 11 arrived as -1), while the
+    /// blocking form stored v at its own width. The queue now skips the resize
+    /// for these targets, restoring blocking/NBA parity.
+    fn nba_target_is_assoc_elem(&mut self, lvalue: &Expression) -> bool {
+        let ExprKind::Index { expr: base, .. } = &lvalue.kind else {
+            return false;
+        };
+        if self.expr_assoc_name(base).is_some() {
+            return true;
+        }
+        if let ExprKind::Ident(h) = &base.kind {
+            let n = self.resolve_hier_name(h);
+            if self.is_associative_array(&n) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -25754,7 +26276,21 @@ impl Simulator {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
                     if self.module.arrays.contains_key(&name) {
+                        // `$` here is the collection's last index (§11.4.12);
+                        // without the bound it evaluates to u64::MAX and the
+                        // element lookup misses, silently dropping the write.
+                        let db = if Self::expr_contains_dollar(index) {
+                            self.dollar_bound_for_base(expr)
+                        } else {
+                            None
+                        };
+                        if let Some(b) = db {
+                            self.dollar_bound.push(b);
+                        }
                         let idx = self.eval_expr(index).to_u64().unwrap_or(0);
+                        if db.is_some() {
+                            self.dollar_bound.pop();
+                        }
                         // Use a small buffer to avoid allocation for common array names
                         let elem = format!("{}[{}]", name, idx);
                         return self.signal_name_to_id.get(elem.as_str()).copied();
@@ -26049,6 +26585,12 @@ impl Simulator {
         }
         if width == 0 {
             // Untracked class-handle var — never truncate to nothing.
+            return val.clone();
+        }
+        // §6.16: a string has no declared length; the table width is only a
+        // placeholder. Resizing to it truncates from the TOP, which for a
+        // packed string means losing the FRONT of the text.
+        if self.signal_is_string.get(id).copied().unwrap_or(false) && !val.is_real {
             return val.clone();
         }
         let mut v = if val.is_real {
@@ -26825,6 +27367,26 @@ impl Simulator {
             if self.active_sva_site.is_some() {
                 return None;
             }
+            // No default clocking: fall back to the clock inferred from the
+            // enclosing always block. Without this, procedural `$rose(a)`
+            // inside `always @(posedge clk)` had no history at all — `prev`
+            // defaulted to `cur`, so $rose/$fell were ALWAYS 0 and $stable
+            // ALWAYS 1, silently.
+            if !self.clocking_meta.contains_key("__xz_default_clocking") {
+                let (ec, cid) = *self.sampled_site_clock.get(&expr.span.start)?;
+                let operand = args.first()?.clone();
+                let site = expr.span.start;
+                let widx = self.sampled_watch_for(site, &operand, ec, cid, n)?;
+                let cur = match self.sampled_watches[widx].hist.front() {
+                    Some(v) => v.clone(),
+                    None => {
+                        let op = operand.clone();
+                        self.eval_expr(&op)
+                    }
+                };
+                let past = self.sampled_watches[widx].hist.get(n).cloned();
+                return Some((cur, past));
+            }
             let (clk_str, _) = self.clocking_meta.get("__xz_default_clocking")?.clone();
             // clocking_meta stores the bare clock SIGNAL name (the parser
             // drops the event's edge); default clocking events are
@@ -26861,11 +27423,110 @@ impl Simulator {
         for ib in &self.module.initial_blocks {
             stmts.push(ib.stmt.clone());
         }
-        for ab in &self.module.always_blocks {
-            stmts.push(ab.stmt.clone());
-        }
         for st in stmts {
             self.scan_sampled_stmt(&st);
+        }
+        // §16.9.3: an edge-sensitive always block supplies the inferred
+        // clocking event for every sampled-value call in its body. Sourced
+        // from `edge_blocks` rather than `module.always_blocks` — by the time
+        // this runs the always blocks have already been compiled into edge
+        // blocks and the module vec is empty, which is why procedural
+        // `$rose`/`$fell` had no clock and silently never fired.
+        let blocks = Arc::clone(&self.edge_blocks);
+        let mut tagged: Vec<(Statement, u8, usize)> = Vec::new();
+        for b in blocks.iter() {
+            let clk = b.resolved_sensitivities.iter().find_map(|s| match s.edge {
+                EdgeKind::Posedge => Some((1u8, s.signal_id)),
+                EdgeKind::Negedge => Some((2u8, s.signal_id)),
+                _ => None,
+            });
+            if let Some((ec, cid)) = clk {
+                tagged.push((b.stmt.clone(), ec, cid));
+            }
+        }
+        for (st, ec, cid) in tagged {
+            self.record_sampled_sites(&st, ec, cid);
+            self.scan_sampled_stmt(&st);
+        }
+    }
+
+    /// Tag every sampled-value call site inside `st` with the block's clock.
+    fn record_sampled_sites(&mut self, st: &Statement, ec: u8, cid: usize) {
+        let mut sites: Vec<usize> = Vec::new();
+        Self::collect_sampled_sites_stmt(st, &mut sites);
+        for site in sites {
+            self.sampled_site_clock.entry(site).or_insert((ec, cid));
+        }
+    }
+
+    /// Span starts of every `$rose`/`$fell`/`$stable`/`$changed`/`$past` call
+    /// inside a statement — the key `sampled_site_clock` and
+    /// `sampled_watch_site` both use.
+    fn collect_sampled_sites_stmt(st: &Statement, out: &mut Vec<usize>) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    Self::collect_sampled_sites_stmt(s, out);
+                }
+            }
+            SK::If { condition, then_stmt, else_stmt, .. } => {
+                Self::collect_sampled_sites_expr(condition, out);
+                Self::collect_sampled_sites_stmt(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    Self::collect_sampled_sites_stmt(e, out);
+                }
+            }
+            SK::TimingControl { stmt, .. } => Self::collect_sampled_sites_stmt(stmt, out),
+            SK::For { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body }
+            | SK::Foreach { body, .. } => Self::collect_sampled_sites_stmt(body, out),
+            SK::Case { expr, items, .. } => {
+                Self::collect_sampled_sites_expr(expr, out);
+                for it in items {
+                    Self::collect_sampled_sites_stmt(&it.stmt, out);
+                }
+            }
+            SK::BlockingAssign { rvalue, .. } => Self::collect_sampled_sites_expr(rvalue, out),
+            SK::NonblockingAssign { rvalue, .. } => Self::collect_sampled_sites_expr(rvalue, out),
+            SK::Expr(e) => Self::collect_sampled_sites_expr(e, out),
+            _ => {}
+        }
+    }
+
+    fn collect_sampled_sites_expr(e: &Expression, out: &mut Vec<usize>) {
+        match &e.kind {
+            ExprKind::SystemCall { name, args }
+                if matches!(
+                    name.as_str(),
+                    "$rose" | "$fell" | "$stable" | "$changed" | "$past"
+                ) =>
+            {
+                out.push(e.span.start);
+                for a in args {
+                    Self::collect_sampled_sites_expr(a, out);
+                }
+            }
+            ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
+                for a in args {
+                    Self::collect_sampled_sites_expr(a, out);
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::collect_sampled_sites_expr(left, out);
+                Self::collect_sampled_sites_expr(right, out);
+            }
+            ExprKind::Unary { operand, .. } => Self::collect_sampled_sites_expr(operand, out),
+            ExprKind::Paren(inner) => Self::collect_sampled_sites_expr(inner, out),
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                Self::collect_sampled_sites_expr(condition, out);
+                Self::collect_sampled_sites_expr(then_expr, out);
+                Self::collect_sampled_sites_expr(else_expr, out);
+            }
+            _ => {}
         }
     }
 
@@ -29846,6 +30507,9 @@ impl Simulator {
                                 sx = 0;
                             }
                             let (dv, dx) = self.signal_table[*dst_id].raw_bits();
+                            if self.warn_x && self.time > 0 {
+                                self.warn_x_note_bits(*dst_id, dv, dx, sv, sx);
+                            }
                             if (sv != dv || sx != dx)
                                 && self.signal_table[*dst_id].set_inline_bits(sv, sx)
                             {
@@ -29897,6 +30561,9 @@ impl Simulator {
                                 sx = 0;
                             }
                             let (dv, dx) = self.signal_table[dst_id].raw_bits();
+                            if self.warn_x && self.time > 0 {
+                                self.warn_x_note_bits(dst_id, dv, dx, sv, sx);
+                            }
                             if (sv == dv && sx == dx)
                                 || !self.signal_table[dst_id].set_inline_bits(sv, sx)
                             {
@@ -29962,6 +30629,9 @@ impl Simulator {
                         {
                             let (sv, sx) = self.signal_table[*src_id].raw_bits();
                             let (dv, dx) = self.signal_table[*dst_id].raw_bits();
+                            if self.warn_x && self.time > 0 {
+                                self.warn_x_note_bits(*dst_id, dv, dx, sv, sx);
+                            }
                             if sv == dv && sx == dx {
                                 // Already equal; no work, no dirty mark.
                                 handled = true;
@@ -30565,6 +31235,22 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
+        // §11.4.12: `$` in an index is the last valid index of the collection
+        // being indexed. The READ paths install `dollar_bound` before
+        // evaluating; no lvalue path did, so `$` fell through to its
+        // `u64::MAX` default and the write went to a nonexistent element.
+        // Normalising the whole lvalue ONCE here covers every arm below —
+        // plain `q[$]`, a part-select of it (`q[$][3:0]`), and nested forms —
+        // rather than each arm having to remember to push the bound. Gated on
+        // a cheap scan, so an lvalue without `$` is untouched.
+        let dollar_free;
+        let lhs: &Expression = if Self::lvalue_mentions_dollar(lhs) {
+            dollar_free = self.resolve_dollar_in_lvalue(lhs);
+            &dollar_free
+        } else {
+            lhs
+        };
+
         // §18.4: writing a member of a struct/union CLASS property goes to the
         // aggregate's own storage — for a packed struct/union that means
         // splicing the member's bits into the property's raw integral value, so
@@ -31070,7 +31756,10 @@ impl Simulator {
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k] = v` writes
                 // element k of the queue `q[i]` (§7.4.5), not a bit of a scalar.
                 if let Some(qn) = self.indexed_queue_base(expr) {
+                    // `$` is the last valid index of THIS queue.
+                    self.dollar_bound.push(self.get_queue_size(&qn) as i64 - 1);
                     let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                    self.dollar_bound.pop();
                     let elem = format!("{}[{}]", qn, k);
                     let prev = self.get_signal_value_by_name(&elem);
                     let changed = prev.as_ref() != Some(val);
@@ -31099,6 +31788,41 @@ impl Simulator {
                     }
                     return changed;
                 }
+                // `s.arr[i] = v` where `arr` is an UNPACKED ARRAY MEMBER of an
+                // unpacked struct. Its elements are individual signals
+                // (`s.arr[0]` …) and the BASE `s.arr` is not a signal at all,
+                // so every arm here missed and the write degraded into a
+                // bit-select of a phantom scalar — silently discarded. The
+                // member then read back x forever, which made a scoreboard
+                // built on such a struct compare x against every DUT output.
+                //
+                // Guarded on the base having no signal of its own, so an
+                // ordinary packed-vector bit-write (`v[3] = 1`, where `v` IS a
+                // signal) never takes this path.
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let base = self.resolve_hier_name(h);
+                    if !self.signal_name_to_id.contains_key(base.as_str())
+                        && !self.signals.contains_key(&base)
+                    {
+                        let i = self.eval_expr(index).to_i64().unwrap_or(0);
+                        let elem = format!("{}[{}]", base, i);
+                        // A module-level struct has its element signals
+                        // pre-registered. A PROCEDURAL-LOCAL one does not —
+                        // nothing is registered for it at all — so create the
+                        // element on first write. Restricted to a member path
+                        // (`base` contains a dot), so a plain local vector's
+                        // bit-write is never diverted here.
+                        if self.signal_name_to_id.contains_key(elem.as_str())
+                            || self.signals.contains_key(&elem)
+                            || base.contains('.')
+                        {
+                            let prev = self.get_signal_value_by_name(&elem);
+                            let changed = prev.as_ref() != Some(val);
+                            self.set_signal_value_by_name(&elem, val.clone());
+                            return changed;
+                        }
+                    }
+                }
                 // Ascending packed vector bit-write (`logic [0:7] pa; pa[i]=b`):
                 // label i targets internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
@@ -31126,17 +31850,28 @@ impl Simulator {
                 // Class associative-array member element write — base may be
                 // a bare member (`m[k]=v`) or another object's (`obj.m[k]=v`).
                 if let Some(an) = self.expr_assoc_name(expr) {
+                    if std::env::var_os("XEZIM_AW_DBG").is_some() {
+                        eprintln!("[AW] assoc write an={} width={:?} map={:?}",
+                            an, self.assoc_elem_width(&an), self.module.assoc_elem_widths);
+                    }
                     let idx_val = self.eval_expr(index);
                     let idx_str = self.assoc_key_str(&an, &idx_val);
                     let elem_name = format!("{}[{}]", an, idx_str);
-                    let changed = self.signals.get(&elem_name) != Some(val);
-                    self.signals.insert(elem_name, val.clone());
+                    // §10.7: fit to the DECLARED element width when one was
+                    // recorded; class-member collections often have none, in
+                    // which case the value is stored as-is (unchanged).
+                    let fitted = match self.assoc_elem_width(&an) {
+                        Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
+                        _ => val.clone(),
+                    };
+                    let changed = self.signals.get(&elem_name) != Some(&fitted);
+                    self.signals.insert(elem_name, fitted);
                     return changed;
                 }
                 // N-dimensional (N >= 3) unpacked array element assignment
                 {
                     let mut cur = expr.as_ref();
-                    let mut rev_idxs: Vec<&Expression> = vec![index.as_ref()];
+                    let mut rev_idxs: Vec<&Expression> = vec![index];
                     while let ExprKind::Index {
                         expr: inner_e,
                         index: inner_i,
@@ -31536,7 +32271,14 @@ impl Simulator {
                             if idx >= lo && idx <= hi {
                                 let id = first_id + (idx - lo) as usize;
                                 let width = self.signal_widths[id];
-                                let mut resized = val.resize(width);
+                                // §6.16: a string element has no declared
+                                // length — the width is a placeholder.
+                                let mut resized =
+                                    if self.signal_is_string.get(id).copied().unwrap_or(false) {
+                                        val.clone()
+                                    } else {
+                                        val.resize(width)
+                                    };
                                 // Adopt the element's declared signedness — a
                                 // signed RHS (e.g. an `integer`) stored verbatim
                                 // made `reg [15:0] a[]` elements read as signed.
@@ -31557,7 +32299,12 @@ impl Simulator {
                         let elem_name = format!("{}[{}]", name, idx_str);
                         if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
                             let width = self.signal_widths[id];
-                            let mut resized = val.resize(width);
+                            let mut resized =
+                                if self.signal_is_string.get(id).copied().unwrap_or(false) {
+                                    val.clone()
+                                } else {
+                                    val.resize(width)
+                                };
                             resized.is_signed = self.signal_signed[id];
                             let changed = self.signal_table[id] != resized;
                             if changed {
@@ -31571,11 +32318,31 @@ impl Simulator {
                             }
                             return changed;
                         }
-                        // Fallback: slow path / associative array
-                        let changed = self.signals.get(&elem_name).is_none_or(|p| *p != *val);
+                        // Fallback: slow path / associative array.
+                        // §10.7: an assoc element has no entry in the typed
+                        // signal table, so without the elaborator's recorded
+                        // element width the RHS was stored at ITS OWN size —
+                        // `logic [3:0] aa[string]; aa["k"] = 8'hEF` kept all
+                        // eight bits, and `$bits` reported the stored width
+                        // rather than the declared one.
+                        // §6.16: a string element has no fixed length — the
+                        // recorded width is only the elaborator's placeholder,
+                        // and fitting to it would chop the text.
+                        let elem_is_string = self.is_string_collection(&name);
+                        let fitted = match self.assoc_elem_width(&name) {
+                            Some(w) if w != val.width && !val.is_real && !elem_is_string => {
+                                val.resize_for_assign(w)
+                            }
+                            _ => val.clone(),
+                        };
+                        if self.warn_x && self.time > 0 {
+                            let prev = self.signals.get(&elem_name).cloned();
+                            self.warn_x_note_named(&elem_name, prev.as_ref(), &fitted);
+                        }
+                        let changed = self.signals.get(&elem_name).is_none_or(|p| *p != fitted);
                         if changed {
-                            sim_dbg_eprintln!("[DEBUG] signal {} changed to {:?}", elem_name, val);
-                            self.signals.insert(elem_name.clone(), val.clone());
+                            sim_dbg_eprintln!("[DEBUG] signal {} changed to {:?}", elem_name, fitted);
+                            self.signals.insert(elem_name.clone(), fitted);
                             self.mark_dirty(&elem_name);
                         }
                         return changed;
@@ -33700,6 +34467,20 @@ impl Simulator {
                 } else {
                     ctx_width
                 };
+                // §15.5.4: comparing event variables compares their IDENTITY
+                // (which synchronization object they name), not a value. An
+                // event's 1-bit backing signal holds an arbitrary toggle state,
+                // so the integral path returned x — `e1 == e2` after `e1 = e2`
+                // read x instead of 1. Null compares equal only to null.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
+                    let lk = self.event_operand_key(left);
+                    let rk = self.event_operand_key(right);
+                    if let (Some(lk), Some(rk)) = (lk, rk) {
+                        let eq = lk == rk;
+                        let res = if matches!(op, BinaryOp::Eq) { eq } else { !eq };
+                        return Value::from_u64(res as u64, 1);
+                    }
+                }
                 let mut l = self.eval_expr_ctx(left, self_det_w);
                 let mut r = self.eval_expr_ctx(right, self_det_w);
                 // IEEE 1800-2023 §6.16 / Table 6-9: the `==`/`!=` operators
@@ -33789,8 +34570,28 @@ impl Simulator {
                         };
                         wide_l.shift_left(&wr)
                     }
-                    BinaryOp::ShiftRight => wl.shift_right(&wr),
-                    BinaryOp::ArithShiftRight => wl.arith_shift_right(&wr),
+                    BinaryOp::ShiftRight | BinaryOp::ArithShiftRight => {
+                        // §11.4.10: a shift's LEFT operand is
+                        // context-determined, so it is resized to the
+                        // expression's width BEFORE the shift — exactly as the
+                        // left-shift arm above already does. Without it a
+                        // signed operand shifted at its own narrow width and
+                        // only then widened, so the vacated high bits came from
+                        // the narrow result rather than the sign extension:
+                        // `int i = 4'sb1100 >> 1` gave 6 instead of
+                        // 32'h7FFF_FFFE. Only `>>` shows it — `>>>` and `<<`
+                        // agree either way, which is why it survived.
+                        let wide_l = if self_det_w > wl.width {
+                            wl.resize(self_det_w)
+                        } else {
+                            wl
+                        };
+                        if matches!(op, BinaryOp::ShiftRight) {
+                            wide_l.shift_right(&wr)
+                        } else {
+                            wide_l.arith_shift_right(&wr)
+                        }
+                    }
                     _ => Value::new(wl.width.max(wr.width)),
                 }
             }
@@ -34074,7 +34875,10 @@ impl Simulator {
                 // element k of the queue `q[i]` (§7.4.5). Without this the base
                 // resolves to a scalar and `[k]` becomes a bit-select.
                 if let Some(qn) = self.indexed_queue_base(expr) {
+                    // `$` is the last valid index of THIS queue.
+                    self.dollar_bound.push(self.get_queue_size(&qn) as i64 - 1);
                     let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                    self.dollar_bound.pop();
                     return self
                         .get_signal_value_by_name(&format!("{}[{}]", qn, k))
                         .unwrap_or_else(|| Value::new(32));
@@ -34459,6 +35263,39 @@ impl Simulator {
                         let lo = idx * (elem_w as usize);
                         let hi = lo + (elem_w as usize) - 1;
                         return base_v.range_select(hi, lo);
+                    }
+                }
+                // §6.16.3 `str[i]` is a CHARACTER select, not a bit select.
+                // That works for a plain `string` variable, whose name is in
+                // `string_signals` — but an ELEMENT of a string collection
+                // (`q[0][3]`, `arr[i][0]`) has an Index base, so it missed the
+                // name-keyed check and fell through to a 1-bit select, reading
+                // empty even though `len()` reported the right length.
+                if matches!(expr.kind, ExprKind::Index { .. } | ExprKind::MemberAccess { .. }) {
+                    if let Some(fname) = self.flat_member_name(expr) {
+                        if self.is_string_collection(&fname) {
+                            let text = self.eval_expr(expr).to_sv_string();
+                            let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
+                            let b = text.as_bytes().get(i).copied().unwrap_or(0);
+                            return Value::from_u64(b as u64, 8);
+                        }
+                    }
+                }
+                // `s.arr[i]` READ where `arr` is an UNPACKED ARRAY MEMBER of
+                // an unpacked struct — mirror of the write arm in
+                // `assign_value`. The elements are individual signals and the
+                // base is not a signal, so this otherwise bit-selected a
+                // phantom scalar and always read x.
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let base = self.resolve_hier_name(h);
+                    if !self.signal_name_to_id.contains_key(base.as_str())
+                        && !self.signals.contains_key(&base)
+                    {
+                        let i = self.eval_expr(index).to_i64().unwrap_or(0);
+                        let elem = format!("{}[{}]", base, i);
+                        if let Some(v) = self.get_signal_value_by_name(&elem) {
+                            return v;
+                        }
                     }
                 }
                 // Fall back to bit select
@@ -39311,9 +40148,14 @@ impl Simulator {
                         self.assign_value(lvalue, &val.resize_for_assign(w));
                     } else {
                         let frozen = self.freeze_lvalue_indices(lvalue);
+                        let qval = if self.nba_target_is_assoc_elem(lvalue) {
+                            val.clone()
+                        } else {
+                            val.resize_for_assign(w)
+                        };
                         self.nba_queue.push(NbaEntry {
                             lhs: Some(frozen),
-                            value: val.resize_for_assign(w),
+                            value: qval,
                             resolved_id: None,
                         });
                     }
@@ -39324,9 +40166,14 @@ impl Simulator {
                         .push((self.time + d, id, val.resize_for_assign(w)));
                 } else {
                     let frozen = self.freeze_lvalue_indices(lvalue);
+                    let qval = if self.nba_target_is_assoc_elem(lvalue) {
+                        val.clone()
+                    } else {
+                        val.resize_for_assign(w)
+                    };
                     self.nba_queue.push(NbaEntry {
                         lhs: Some(frozen),
-                        value: val.resize_for_assign(w),
+                        value: qval,
                         resolved_id: None,
                     });
                 }
@@ -40257,7 +41104,25 @@ impl Simulator {
                         // hint across the whole nested-delay window.
                         let saved_hint_nested = self.name_resolve_hint.borrow().clone();
                         let delay = self.eval_delay_ticks(d);
-                        self.apply_nba();
+                        // §4.4/§4.5: the NBA region of the CURRENT timestamp
+                        // runs after every active-region process at that
+                        // timestamp has evaluated its RHS. Flushing here is
+                        // premature when this delay is inside an EDGE block:
+                        // the remaining blocks on the same edge have not
+                        // sampled yet, and committing now lets them read the
+                        // post-edge value. A `always @(posedge clk) begin #1;
+                        // … end` observer anywhere in a testbench therefore
+                        // broke every OTHER clocked block that sampled a
+                        // signal written by a sibling block on that edge —
+                        // `d <= dut.if.sig;` recorded the new value, so a
+                        // one-cycle pipeline check saw no delay at all.
+                        // Outside an edge block (a plain initial/task `#d`)
+                        // keep flushing: the active region there is just this
+                        // process, and `run_events_until` below re-flushes at
+                        // the proper point either way.
+                        if !self.in_edge_block {
+                            self.apply_nba();
+                        }
                         self.settle_combinatorial();
                         self.check_edges();
                         let _ = self.drain_edge_cascade(self.cascade_limit);
@@ -41830,6 +42695,22 @@ impl Simulator {
                     self.fire_instance_event(key);
                     return;
                 }
+                // `-> h.ce` / `-> this.ce`: a class-property event reached
+                // through a handle (the `->` parser flattens it to a dotted
+                // name).
+                if name.name.contains('.') {
+                    if let Some(key) = self.resolve_handle_event_field(&name.name) {
+                        self.fire_instance_event(key);
+                        return;
+                    }
+                }
+                // An event bound to a `ref` formal fires the CALLER's event.
+                if !self.module.events.contains(name.name.as_str()) {
+                    if let Some(k) = self.ref_bound_event_key(&name.name) {
+                        self.fire_named_event(&k);
+                        return;
+                    }
+                }
                 self.fire_named_event(&name.name);
             }
             StatementKind::Coverpoint { .. } | StatementKind::Cross { .. } => {}
@@ -41976,6 +42857,14 @@ impl Simulator {
                 }
             }
         }
+        // `h.ce.triggered` / `this.ce.triggered` — a per-instance class event.
+        if let Some(k) = self.expr_handle_event_field(e) {
+            let stamp = Self::instance_event_stamp_key(&k);
+            if self.event_triggered_time.get(stamp.as_str()) == Some(&now) {
+                return Some(true);
+            }
+            keys.push(stamp);
+        }
         if keys.is_empty() {
             return None;
         }
@@ -42054,6 +42943,126 @@ impl Simulator {
         }
     }
 
+    /// The identity key of an event-valued operand, for `==`/`!=` (§15.5.4):
+    /// the alias-resolved storage key of a declared event, or the null key for
+    /// a `null` literal. `None` when the operand is not an event, so ordinary
+    /// comparisons are untouched.
+    fn event_operand_key(&mut self, e: &Expression) -> Option<String> {
+        if matches!(e.kind, ExprKind::Null) {
+            return Some(Self::EVENT_NULL_KEY.to_string());
+        }
+        let k = self.event_ref_key(e)?;
+        Some(self.resolve_event_key(&k))
+    }
+
+    /// `.triggered` stamp key for a per-instance class event. Instance events
+    /// have no backing signal (the handle is dynamic), so they cannot use the
+    /// name-keyed signal path; this gives them a distinct key in the same
+    /// `event_triggered_time` table. The `\x02` prefix cannot collide with a
+    /// user identifier.
+    fn instance_event_stamp_key(key: &(usize, String)) -> String {
+        format!("\u{2}inst{}#{}", key.0, key.1)
+    }
+
+    /// §15.5 an event that is a CLASS PROPERTY reached through a handle:
+    /// `h.ce`, `this.ce`, or a dotted name the `->` parser flattened. Returns
+    /// the per-instance `(handle, field)` identity. `resolve_this_event_field`
+    /// only covers a BARE field name on `this`, so `@(h.ce)` and `-> h.ce`
+    /// from outside the class had no identity at all — the waiter fell into
+    /// the delta-yield and woke at t=0, and the trigger fired a name nothing
+    /// was listening to.
+    fn resolve_handle_event_field(&mut self, dotted: &str) -> Option<(usize, String)> {
+        let (recv, field) = dotted.rsplit_once('.')?;
+        if recv.contains('.') {
+            return None; // deeper chains are not modelled
+        }
+        let handle = if recv == "this" {
+            self.this_stack.last().copied().flatten()?
+        } else {
+            self.eval_ident_handle(recv)?
+        };
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
+        if inst.properties.contains_key(field) {
+            Some((handle, field.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// The same, from an EXPRESSION (`@(h.ce)`, `h.ce.triggered`).
+    fn expr_handle_event_field(&mut self, e: &Expression) -> Option<(usize, String)> {
+        let dotted = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                let recv = match &expr.kind {
+                    ExprKind::This => "this".to_string(),
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                        h.path[0].name.name.clone()
+                    }
+                    _ => return None,
+                };
+                format!("{}.{}", recv, member.name)
+            }
+            // `h.ce` also reaches here as a two-segment HIERARCHICAL name,
+            // which is how `@(h.ce)` parses — the receiver is a class handle,
+            // not an instance path, so the hierarchical resolver finds nothing.
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                format!("{}.{}", h.path[0].name.name, h.path[1].name.name)
+            }
+            _ => return None,
+        };
+        self.resolve_handle_event_field(&dotted)
+    }
+
+    /// §15.5 / §13.5.2: an event passed as a `ref` formal. `-> x` and `@x`
+    /// inside the subroutine must act on the CALLER's event, but the formal
+    /// name is not itself a declared event, so the trigger fired a name with
+    /// no sync object and the caller's waiter hung forever. `ref_binding_stack`
+    /// already maps the formal to the caller's actual expression; resolve it
+    /// to that event's key. Innermost frame first, so nested calls resolve to
+    /// the nearest binding.
+    fn ref_bound_event_key(&mut self, name: &str) -> Option<String> {
+        let bound = self
+            .ref_binding_stack
+            .iter()
+            .rev()
+            .find_map(|m| m.get(name).cloned())?;
+        let key = self.event_ref_key(&bound)?;
+        Some(self.resolve_event_key(&key))
+    }
+
+    /// The single un-edged expression of an event control (`@e`, `@(e)`,
+    /// `@ev[1]`, `@(h.ce)`), or None for edge terms / multi-term lists / `*`.
+    fn event_control_single_expr(event: &EventControl) -> Option<Expression> {
+        match event {
+            EventControl::HierIdentifier(e) => Some((*e).clone()),
+            EventControl::EventExpr(terms) if terms.len() == 1 && terms[0].edge.is_none() => {
+                Some(terms[0].expr.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// If this event control names a single DECLARED event variable — `@ev`,
+    /// `@(ev)`, `@ev_arr[i]` — return its storage key (`ev`, `ev_arr[3]`).
+    /// `None` for edge-qualified terms, multi-term lists, `*`, and anything
+    /// that is not a declared event, all of which keep their existing paths.
+    fn event_control_event_key(&mut self, event: &EventControl) -> Option<String> {
+        let expr = Self::event_control_single_expr(event)?;
+        if let Some(k) = self.event_ref_key(&expr) {
+            return Some(k);
+        }
+        // `@x` on a `ref event` formal waits on the caller's event.
+        if let ExprKind::Ident(h) = &expr.kind {
+            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                let n = h.path[0].name.name.clone();
+                return self.ref_bound_event_key(&n);
+            }
+        }
+        None
+    }
+
     /// Wake every process parked on `@<field>` for instance `key` (an edge
     /// trigger: only processes already waiting when `-><field>` fires resume).
     /// Each woken continuation is scheduled for the current time so it runs in
@@ -42061,6 +43070,11 @@ impl Simulator {
     /// `->e` resumes an `@e` waiter for a module-scope named event.
     fn fire_instance_event(&mut self, key: (usize, String)) {
         let now = self.time;
+        // §15.5.3: `<h>.<ev>.triggered` must read 1 for the rest of this slot.
+        // Instance events have no backing signal, so stamp the same table the
+        // name-keyed path uses, under a synthetic per-instance key.
+        let stamp = Self::instance_event_stamp_key(&key);
+        self.event_triggered_time.insert(stamp, now);
         let mut woken = Vec::new();
         self.instance_event_waiters.retain(|w| {
             if w.key == key {
@@ -43950,6 +44964,39 @@ impl Simulator {
                             if ai < args.len() {
                                 let arg = &args[ai];
                                 ai += 1;
+                                // §7.12.1: an array LOCATOR call (`q.unique()`,
+                                // `q.find with (…)`, `q.min()`) RETURNS a queue.
+                                // Only the ASSIGNMENT path materialized that, so
+                                // used directly as an argument the call fell
+                                // through to scalar evaluation and printed 0 —
+                                // `r = q.unique(); $display("%p", r);` was right
+                                // while the one-liner was silently wrong.
+                                if let Some((arr_name, mname, filter, iter_name)) =
+                                    self.locator_call(arg)
+                                {
+                                    let idxs = self.locator_indices_named(
+                                        &arr_name,
+                                        &mname,
+                                        filter.as_ref(),
+                                        iter_name.as_deref(),
+                                    );
+                                    const TMP: &str = "__xz_locator_fmt";
+                                    self.materialize_locator(TMP, &arr_name, &mname, &idxs);
+                                    // An `_index` form yields indices, never the
+                                    // element type, so it is not string-rendered.
+                                    let is_str = !mname.ends_with("_index")
+                                        && self.string_signals.contains(&arr_name);
+                                    let mut parts: Vec<String> = Vec::with_capacity(idxs.len());
+                                    for i in 0..idxs.len() {
+                                        if let Some(v) = self
+                                            .get_signal_value_by_name(&format!("{}[{}]", TMP, i))
+                                        {
+                                            parts.push(Self::render_p_value(&v, is_str));
+                                        }
+                                    }
+                                    result.push_str(&format!("'{{{}}}", parts.join(", ")));
+                                    continue;
+                                }
                                 if let ExprKind::Ident(h) = &arg.kind {
                                     let name = self.resolve_hier_name(h);
                                     if let Some(tag) = self.active_union_tag.get(&name).cloned() {
@@ -46110,6 +47157,356 @@ impl Simulator {
     /// Canonical post-write hook for in-place `signal_table[id]` mutations.
     /// It intentionally leaves `signal_has_xz` stale-conservative; tightening
     /// that hint can enable JIT paths that do not yet support every X/Z case.
+    /// `--warn-x`: a write is putting an x bit into `id` that was not x
+    /// before. Reports once per signal, with the instance/module it lives in
+    /// and every driver that can write it.
+    ///
+    /// X after time 0 is the classic gate-level/RTL-integration failure —
+    /// an unconnected port, a register never reset, a bus with no active
+    /// driver — and a waveform only shows WHERE it surfaced, not what drove
+    /// it there. Reporting the driver list at the moment the bit turns x
+    /// points straight at the cause.
+    /// Record a fresh x on `id` from raw (val, xz) bit pairs. Takes `&self`
+    /// and records through `RefCell`s, so it can be called from the comb-settle
+    /// fast paths (which write `signal_table` directly and never reach
+    /// `write_sig!`) and from the `&self` isolated evaluators.
+    #[inline]
+    fn warn_x_note_bits(&self, id: usize, ov: u64, ox: u64, nv: u64, nx: u64) {
+        // x is (xz & !val); z (xz & val) is deliberately ignored.
+        let fresh = (nx & !nv) & !(ox & !ov);
+        if fresh == 0 {
+            return;
+        }
+        if !self.warn_x_seen.borrow_mut().insert(id) {
+            return;
+        }
+        let w = self.signal_widths.get(id).copied().unwrap_or(64).max(1);
+        let mut v = Value::zero(w);
+        // Only the low 64 bits are available here; the report caps its own
+        // rendering at 64 bits anyway.
+        let _ = v.set_inline_bits(nv, nx);
+        self.warn_x_pending
+            .borrow_mut()
+            .push((id, self.time, v, self.current_pid, None));
+    }
+
+    /// Record a fresh x on a value stored by NAME rather than by signal id —
+    /// an associative-array element, and anything else kept in the untyped
+    /// `signals` map. Those never pass through `write_sig!` or the raw-bit
+    /// fast paths, so without this an x landing in `aa["k"]` went unreported
+    /// while the very same x in a queue element (which does have an id) was
+    /// reported — an inconsistency more confusing than silence.
+    fn warn_x_note_named(&self, name: &str, old: Option<&Value>, new: &Value) {
+        let has_new_x = (0..new.width as usize).any(|b| {
+            new.get_bit(b) == LogicBit::X
+                && old.is_none_or(|o| {
+                    b >= o.width as usize || o.get_bit(b) != LogicBit::X
+                })
+        });
+        if !has_new_x {
+            return;
+        }
+        if !self.warn_x_seen_named.borrow_mut().insert(name.to_string()) {
+            return;
+        }
+        self.warn_x_pending.borrow_mut().push((
+            usize::MAX,
+            self.time,
+            new.clone(),
+            self.current_pid,
+            Some(name.to_string()),
+        ));
+    }
+
+    pub fn drain_warn_x(&mut self) {
+        if !self.warn_x {
+            return;
+        }
+        let pending: Vec<(usize, u64, Value, usize, Option<String>)> =
+            std::mem::take(&mut *self.warn_x_pending.borrow_mut());
+        for (id, t, val, pid, named) in pending {
+            self.report_x_one(id, t, &val, pid, named);
+        }
+    }
+
+    fn report_x_one(
+        &mut self,
+        id: usize,
+        when: u64,
+        new_val: &Value,
+        pid: usize,
+        named: Option<String>,
+    ) {
+        if named.is_none() && id >= self.signal_table.len() {
+            return;
+        }
+        let lim = warn_x_limit();
+        if lim != 0 && self.warn_x_count >= lim {
+            return;
+        }
+        let w = new_val.width.max(1) as usize;
+        let mut fresh_x: Vec<usize> = Vec::new();
+        for b in 0..w {
+            if new_val.get_bit(b) == LogicBit::X {
+                fresh_x.push(b);
+            }
+        }
+        if fresh_x.is_empty() {
+            return;
+        }
+        self.warn_x_count += 1;
+
+        let name = match &named {
+            Some(n) => n.clone(),
+            None => self.name_for_id(id).to_string(),
+        };
+        // `aa[key]` / `q[3]`: the instance path is what precedes the element
+        // name, so strip the subscript before splitting off the scope.
+        let name_for_scope = name
+            .split_once('[')
+            .map(|(base, _)| base.to_string())
+            .unwrap_or_else(|| name.clone());
+        // `a.b.c.sig` -> instance path `a.b.c`; empty for a top-level signal.
+        let inst = name_for_scope.rsplit_once('.').map(|(p, _)| p.to_string());
+        let module = self
+            .scope_def_module(inst.as_deref())
+            .unwrap_or_else(|| self.module.name.clone());
+        let where_ = match &inst {
+            Some(p) if !p.is_empty() => format!("instance {} (module {})", p, module),
+            _ => format!("module {}", module),
+        };
+
+        let bits = if fresh_x.len() == w {
+            "all bits".to_string()
+        } else if fresh_x.len() == 1 {
+            format!("bit {}", fresh_x[0])
+        } else {
+            let hi = fresh_x.iter().copied().max().unwrap_or(0);
+            let lo = fresh_x.iter().copied().min().unwrap_or(0);
+            if fresh_x.len() == hi - lo + 1 {
+                format!("bits [{}:{}]", hi, lo)
+            } else {
+                format!("{} bits, highest {}", fresh_x.len(), hi)
+            }
+        };
+
+        eprintln!(
+            "[xezim][warning] X on '{}' at time {} — {} x ({})",
+            name,
+            when,
+            bits,
+            self.warn_x_bin(new_val, w)
+        );
+        eprintln!("                 in {}", where_);
+        let drivers = if named.is_some() {
+            Vec::new()
+        } else {
+            self.warn_x_driver_lines(id)
+        };
+        if drivers.is_empty() {
+            // No continuous/comb/edge driver. Either a procedural process wrote
+            // it — `process_origin` knows which, and that is the useful answer —
+            // or nothing drives it at all, which is its own diagnosis.
+            let by_proc = self.process_origin.get(&pid).map(|&(span, kind)| {
+                let loc = self
+                    .span_file_line_in(span, self.stall_pid_src_file(pid))
+                    .map(|l| format!(" at {}", l))
+                    .unwrap_or_default();
+                format!("{}{}", kind, loc)
+            });
+            match by_proc {
+                Some(d) => {
+                    eprintln!("                 written by:");
+                    eprintln!("                   - {} (procedural)", d);
+                }
+                None => eprintln!(
+                    "                 drivers: NONE FOUND — nothing drives this signal, so it \
+                     reads x; check for an unconnected port or a missing assignment"
+                ),
+            }
+        } else {
+            eprintln!("                 driven by:");
+            for d in drivers {
+                eprintln!("                   - {}", d);
+            }
+        }
+        if lim != 0 && self.warn_x_count == lim {
+            eprintln!(
+                "[xezim][warning] --warn-x limit of {} reached; further X reports suppressed \
+                 (raise with --warn-x-limit N, 0 = unlimited)",
+                lim
+            );
+        }
+    }
+
+    /// Per-bit rendering, capped so a 4096-bit bus does not fill the terminal.
+    fn warn_x_bin(&self, v: &Value, w: usize) -> String {
+        let shown = w.min(64);
+        let mut out = String::with_capacity(shown + 8);
+        if shown < w {
+            out.push_str("low 64 bits: ");
+        }
+        for b in (0..shown).rev() {
+            out.push(match v.get_bit(b) {
+                LogicBit::Zero => '0',
+                LogicBit::One => '1',
+                LogicBit::X => 'x',
+                LogicBit::Z => 'z',
+            });
+        }
+        out
+    }
+
+    /// One line per thing that can write `id`. Built once, from the comb
+    /// entries (continuous assigns, always_comb, fused gates) and the edge
+    /// blocks (always_ff / always @(posedge …)).
+    fn warn_x_driver_lines(&mut self, id: usize) -> Vec<String> {
+        if self.warn_x_drivers.is_none() {
+            let mut map: HashMap<usize, Vec<String>> = HashMap::default();
+            for e in self.comb_entries.iter() {
+                let kind = match &e.item {
+                    CombItem::ContAssign { .. } | CombItem::CompiledContAssign { .. } => {
+                        "continuous assign"
+                    }
+                    CombItem::AlwaysBlock { is_always_comb, .. }
+                    | CombItem::CompiledAlwaysBlock { is_always_comb, .. } => {
+                        if *is_always_comb { "always_comb" } else { "always @(*)" }
+                    }
+                    CombItem::FusedGate { .. }
+                    | CombItem::FusedBufFanout { .. }
+                    | CombItem::FusedAndFanout { .. } => "gate primitive",
+                    CombItem::Udp { .. } | CombItem::UdpBatch { .. } => "UDP",
+                    CombItem::DirectCopy { .. }
+                    | CombItem::FastDirectCopy { .. }
+                    | CombItem::FastDirectFanout { .. } => "continuous assign (copy)",
+                    CombItem::Noop => continue,
+                };
+                let src_file = e
+                    .scope_hint
+                    .as_deref()
+                    .and_then(|sc| self.scope_def_module(Some(sc)))
+                    .and_then(|m| self.module.src_file_of_module.get(&m).copied());
+                let at = self
+                    .span_file_line_in(e.span, src_file)
+                    .map(|l| format!(" at {}", l))
+                    .unwrap_or_default();
+                let scope = match e.scope_hint.as_deref() {
+                    Some(sc) if !sc.is_empty() => format!(" [in {}]", sc),
+                    _ => String::new(),
+                };
+                let line = format!("{}{}{}", kind, at, scope);
+                for &wid in e.write_signal_ids.iter() {
+                    map.entry(wid).or_default().push(line.clone());
+                }
+            }
+            // Edge blocks keep no resolved write set, so derive one.
+            let blocks = Arc::clone(&self.edge_blocks);
+            for b in blocks.iter() {
+                let mut reads: HashSet<String> = HashSet::default();
+                let mut writes: HashSet<String> = HashSet::default();
+                Self::collect_stmt_reads(&b.stmt, &self.module, &mut reads, &mut writes);
+                let kind = match b.kind {
+                    AlwaysKind::AlwaysFf => "always_ff",
+                    AlwaysKind::AlwaysLatch => "always_latch",
+                    AlwaysKind::AlwaysComb => "always_comb",
+                    AlwaysKind::Always => "always @(edge)",
+                };
+                let src_file = (!b.scope.is_empty())
+                    .then(|| self.scope_def_module(Some(b.scope.as_str())))
+                    .flatten()
+                    .and_then(|m| self.module.src_file_of_module.get(&m).copied());
+                let at = self
+                    .span_file_line_in(b.stmt.span, src_file)
+                    .map(|l| format!(" at {}", l))
+                    .unwrap_or_default();
+                let scope = if b.scope.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [in {}]", b.scope)
+                };
+                let line = format!("{}{}{}", kind, at, scope);
+                for wname in writes.iter() {
+                    let mut ids: Vec<usize> = Vec::new();
+                    if let Some(&i) = self.signal_name_to_id.get(wname.as_str()) {
+                        ids.push(i);
+                    }
+                    if !b.scope.is_empty() {
+                        if let Some(&i) = self
+                            .signal_name_to_id
+                            .get(format!("{}.{}", b.scope, wname).as_str())
+                        {
+                            ids.push(i);
+                        }
+                    }
+                    for i in ids {
+                        map.entry(i).or_default().push(line.clone());
+                    }
+                }
+            }
+            // Procedural blocks. Without these a signal a testbench drives
+            // from an `initial` was reported as having NO driver, which reads
+            // as "unconnected port" — the opposite of the truth.
+            let procs: Vec<(&'static str, Statement, String)> = self
+                .module
+                .initial_blocks
+                .iter()
+                .map(|ib| ("initial block", ib.stmt.clone(), ib.scope.clone()))
+                .chain(
+                    self.module
+                        .final_blocks
+                        .iter()
+                        .map(|fb| ("final block", fb.stmt.clone(), fb.scope.clone())),
+                )
+                .collect();
+            for (kind, stmt, scope) in procs {
+                let mut reads: HashSet<String> = HashSet::default();
+                let mut writes: HashSet<String> = HashSet::default();
+                Self::collect_stmt_reads(&stmt, &self.module, &mut reads, &mut writes);
+                let src_file = (!scope.is_empty())
+                    .then(|| self.scope_def_module(Some(scope.as_str())))
+                    .flatten()
+                    .and_then(|m| self.module.src_file_of_module.get(&m).copied());
+                let at = self
+                    .span_file_line_in(stmt.span, src_file)
+                    .map(|l| format!(" at {}", l))
+                    .unwrap_or_default();
+                let where_ = if scope.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [in {}]", scope)
+                };
+                let line = format!("{}{}{}", kind, at, where_);
+                for wname in writes.iter() {
+                    let mut ids: Vec<usize> = Vec::new();
+                    if let Some(&i) = self.signal_name_to_id.get(wname.as_str()) {
+                        ids.push(i);
+                    }
+                    if !scope.is_empty() {
+                        if let Some(&i) = self
+                            .signal_name_to_id
+                            .get(format!("{}.{}", scope, wname).as_str())
+                        {
+                            ids.push(i);
+                        }
+                    }
+                    for i in ids {
+                        map.entry(i).or_default().push(line.clone());
+                    }
+                }
+            }
+            for v in map.values_mut() {
+                v.sort();
+                v.dedup();
+            }
+            self.warn_x_drivers = Some(map);
+        }
+        self.warn_x_drivers
+            .as_ref()
+            .and_then(|m| m.get(&id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn after_signal_write(&mut self, id: usize) {
         self.note_armed_write(id);
         self.note_edge_write(id);
@@ -49615,6 +51012,38 @@ impl Simulator {
         }
     }
 
+    /// Declared element width of an associative array, when the elaborator
+    /// recorded one.
+    ///
+    /// Deliberately conservative: the map is keyed by DECLARATION name, and
+    /// guessing wrong silently corrupts data (a too-narrow width truncates a
+    /// good value), whereas guessing nothing merely restores the older
+    /// store-as-is behaviour. So a CLASS-member collection (`<handle>#m`) is
+    /// never resolved through its bare leaf — a class's `logic [7:0] m[string]`
+    /// would otherwise pick up an unrelated module-scope `logic [3:0] m[string]`
+    /// and truncate to 4 bits. Only an exact match, or an instance-scoped
+    /// `inst.name` whose leaf is the declaration, is trusted.
+    /// Is `name` (a collection, or one of its elements) string-typed? Used to
+    /// keep §6.16's "no declared length" rule for elements as well as scalars.
+    fn is_string_collection(&self, name: &str) -> bool {
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        let base = leaf.split('[').next().unwrap_or(leaf);
+        self.string_signals.contains(name)
+            || self.string_signals.contains(leaf)
+            || self.string_signals.contains(base)
+    }
+
+    fn assoc_elem_width(&self, name: &str) -> Option<u32> {
+        if let Some(&w) = self.module.assoc_elem_widths.get(name) {
+            return Some(w);
+        }
+        if name.contains('#') {
+            return None;
+        }
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        self.module.assoc_elem_widths.get(leaf).copied()
+    }
+
     fn is_associative_array(&self, name: &str) -> bool {
         self.module.associative_arrays.contains_key(name)
     }
@@ -50477,8 +51906,14 @@ impl Simulator {
             let w = self.signal_widths[id];
             // A width-0 signal (e.g. an untracked module-scope class handle)
             // would truncate to nothing; keep the value's natural width so a
-            // class handle (`c = factory.create_...()`) is preserved.
-            let resized = if w == 0 { val } else { val.resize(w) };
+            // class handle (`c = factory.create_...()`) is preserved. §6.16: a
+            // string (or an element of a string collection) has no declared
+            // length either — the table width is a placeholder, and resizing to
+            // it chops the text. This is the path `push_back` takes, so without
+            // it a `string q[$]` element was still clamped to 128 characters
+            // after scalar strings had been fixed.
+            let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
+            let resized = if w == 0 || is_str { val } else { val.resize(w) };
             if self.signal_table[id] != resized {
                 if !self.dirty_signals[id] {
                     self.dirty_signals[id] = true;
@@ -50493,7 +51928,8 @@ impl Simulator {
         // Array-element fallback (1D compact resolver).
         if let Some(id) = resolve_array_elem_id(name, &self.array_first_id) {
             let w = self.signal_widths[id];
-            let resized = val.resize(w);
+            let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
+            let resized = if is_str { val } else { val.resize(w) };
             if self.signal_table[id] != resized {
                 if !self.dirty_signals[id] {
                     self.dirty_signals[id] = true;
@@ -56752,14 +58188,29 @@ impl Simulator {
                 fields.iter().map(|(f, _, _)| f.clone()).collect()
             } else {
                 let prefix = format!("{}.", vname);
+                // A member that is an UNPACKED ARRAY exists as one signal per
+                // element (`s.arr[0]` …), so its leaves legitimately contain
+                // `[`. Excluding them made array members invisible to every
+                // consumer of this function — most visibly struct ASSIGNMENT,
+                // where `b = a;` copied the scalar members and left the array
+                // ones x. Nested members (`inner.b`, `inner.b[0]`) still carry
+                // a `.` and stay excluded; they are not direct children.
                 let mut fs: Vec<String> = self
                     .signal_name_to_id
                     .keys()
                     .filter_map(|k| k.strip_prefix(&prefix))
-                    .filter(|rest| !rest.contains('.') && !rest.contains('['))
+                    .filter(|rest| !rest.contains('.'))
                     .map(|rest| rest.to_string())
                     .collect();
-                fs.sort();
+                // Natural order, so `arr[2]` precedes `arr[10]` rather than
+                // sorting lexicographically (only affects display order).
+                fs.sort_by_key(|f| match f.split_once('[') {
+                    Some((base, idx)) => (
+                        base.to_string(),
+                        idx.trim_end_matches(']').parse::<i64>().unwrap_or(0),
+                    ),
+                    None => (f.clone(), -1),
+                });
                 fs.dedup();
                 if fs.is_empty() {
                     return None;
@@ -57241,6 +58692,12 @@ impl Simulator {
         };
         let saved_item = self.local_stack.last().and_then(|f| f.get("item").cloned());
         let mut acc: Option<i64> = None;
+        // §7.12.3: with a `with` clause the result type is the type of the
+        // EXPRESSION, so the accumulation wraps at that width. A 1-bit
+        // predicate like `q.sum with (item > 4)` therefore counts modulo 2 —
+        // accumulating in a full i64 and returning 32 bits gave the raw match
+        // count (3) where the LRM requires 1.
+        let mut expr_w: u32 = 0;
         for i in 0..size {
             let elem = self
                 .get_signal_value_by_name(&format!("{}[{}]", arr, i))
@@ -57248,7 +58705,11 @@ impl Simulator {
             if let Some(f) = self.local_stack.last_mut() {
                 f.insert("item".to_string(), elem);
             }
-            let v = self.eval_expr(filter).to_i64().unwrap_or(0);
+            let fv = self.eval_expr(filter);
+            if expr_w == 0 {
+                expr_w = fv.width.max(1);
+            }
+            let v = fv.to_i64().unwrap_or(0);
             acc = Some(match (acc, method) {
                 (None, _) => v,
                 (Some(a), "sum") => a + v,
@@ -57275,7 +58736,16 @@ impl Simulator {
         if pushed_frame {
             self.local_stack.pop();
         }
-        Value::from_u64(acc.unwrap_or(0) as u64, 32)
+        // Truncate to the expression's width for the accumulating reductions;
+        // min/max/and/or/xor cannot exceed an operand and need no masking.
+        let w = if expr_w == 0 { 32 } else { expr_w };
+        let raw = acc.unwrap_or(0) as u64;
+        let out = if matches!(method, "sum" | "product") && w < 64 {
+            raw & ((1u64 << w) - 1)
+        } else {
+            raw
+        };
+        Value::from_u64(out, w.max(32))
     }
 
     /// True if `expr` contains a function/method/system/`new` call anywhere —
@@ -61670,6 +63140,96 @@ impl Simulator {
                 return Value::from_u64(base.sv_string_bytes().len() as u64, 32);
             }
 
+            // §6.16 query methods on a receiver that is not a plain identifier
+            // — `q[0].substr(1,3)`, `arr[i].getc(0)`, a string literal, a
+            // function result. `eval_builtin_method` resolves its receiver by
+            // NAME, so those all missed it and returned empty; only `len`/`size`
+            // had the fallback above, which made a queue element look like it
+            // held a string of the right LENGTH but no CONTENT. These methods
+            // are read-only, so evaluating the receiver here is safe (`putc`
+            // mutates and is deliberately excluded — it needs an lvalue).
+            if matches!(
+                mname,
+                "substr" | "getc" | "toupper" | "tolower" | "atoi" | "atohex"
+                    | "atooct" | "atobin" | "atoreal" | "compare" | "icompare"
+            ) && !matches!(expr.kind, ExprKind::Ident(_))
+            {
+                let text = self.eval_expr(expr).to_sv_string();
+                match mname {
+                    "substr" => {
+                        let a = args
+                            .first()
+                            .map(|e| self.eval_expr(e).to_u64().unwrap_or(0) as usize)
+                            .unwrap_or(0);
+                        let b = args
+                            .get(1)
+                            .map(|e| self.eval_expr(e).to_u64().unwrap_or(0) as usize)
+                            .unwrap_or(0);
+                        let bytes = text.as_bytes();
+                        // §6.16.8: an out-of-range or inverted range yields "".
+                        if a > b || b >= bytes.len() {
+                            return Value::from_string("");
+                        }
+                        return Value::from_string(
+                            &String::from_utf8_lossy(&bytes[a..=b]).into_owned(),
+                        );
+                    }
+                    "getc" => {
+                        let i = args
+                            .first()
+                            .map(|e| self.eval_expr(e).to_u64().unwrap_or(0) as usize)
+                            .unwrap_or(0);
+                        let b = text.as_bytes().get(i).copied().unwrap_or(0);
+                        return Value::from_u64(b as u64, 8);
+                    }
+                    "toupper" => return Value::from_string(&text.to_uppercase()),
+                    "tolower" => return Value::from_string(&text.to_lowercase()),
+                    "atoi" => {
+                        let t = text.trim();
+                        let neg = t.starts_with('-');
+                        let digits: String =
+                            t.trim_start_matches(['-', '+']).chars().take_while(|c| c.is_ascii_digit()).collect();
+                        let n: i64 = digits.parse().unwrap_or(0);
+                        let mut v = Value::from_u64(if neg { (-n) as u64 } else { n as u64 }, 32);
+                        v.is_signed = true;
+                        return v;
+                    }
+                    "atohex" => {
+                        return Value::from_u64(
+                            u64::from_str_radix(text.trim(), 16).unwrap_or(0),
+                            32,
+                        )
+                    }
+                    "atooct" => {
+                        return Value::from_u64(u64::from_str_radix(text.trim(), 8).unwrap_or(0), 32)
+                    }
+                    "atobin" => {
+                        return Value::from_u64(u64::from_str_radix(text.trim(), 2).unwrap_or(0), 32)
+                    }
+                    "atoreal" => return Value::from_f64(text.trim().parse::<f64>().unwrap_or(0.0)),
+                    "compare" | "icompare" => {
+                        let other = args
+                            .first()
+                            .map(|e| self.eval_expr(e).to_sv_string())
+                            .unwrap_or_default();
+                        let (l, r) = if mname == "icompare" {
+                            (text.to_lowercase(), other.to_lowercase())
+                        } else {
+                            (text.clone(), other)
+                        };
+                        let c: i64 = match l.cmp(&r) {
+                            std::cmp::Ordering::Less => -1,
+                            std::cmp::Ordering::Equal => 0,
+                            std::cmp::Ordering::Greater => 1,
+                        };
+                        let mut v = Value::from_u64(c as u64, 32);
+                        v.is_signed = true;
+                        return v;
+                    }
+                    _ => {}
+                }
+            }
+
             if mname == "get_next_item" && !real_uvm {
                 if let Some(arg) = args.first() {
                     // Create a simple_transaction
@@ -64139,6 +65699,22 @@ impl Simulator {
                     }
                 }
                 PortDirection::Ref => {
+                    // §15.5: a `ref event` formal is bound by IDENTITY, not by
+                    // value — `-> x` fires the caller's sync object (resolved
+                    // through `ref_binding_stack`). Copying a value back on
+                    // return would rewrite the event's 1-bit toggle signal with
+                    // the stale value captured at call time, cancelling the
+                    // edge before the main loop delivered it: the trigger
+                    // "happened" and the caller's `@e` waiter still hung.
+                    if matches!(
+                        &port.data_type,
+                        crate::ast::types::DataType::Simple {
+                            kind: crate::ast::types::SimpleType::Event,
+                            ..
+                        }
+                    ) {
+                        continue;
+                    }
                     let val = if i < args.len() {
                         self.eval_expr(&args[i])
                     } else {
