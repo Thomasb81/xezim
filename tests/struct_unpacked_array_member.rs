@@ -14,9 +14,16 @@
 //! LOCAL one has nothing registered, so the write creates the element (only for
 //! a member path — a plain local vector's bit-write is never diverted).
 //!
-//! KNOWN GAP, still open: pushing such a struct through a QUEUE loses the
-//! members (`scratchpad/tb/e1.sv` E1D, `e3.sv` E3C), as does a hierarchical
-//! `dut.result.member[i]` select on a packed-2D struct member (`e4.sv` E4B).
+//! Also fixed here: reading an array member of a QUEUE ELEMENT
+//! (`q[0].arr[i]`, a MemberAccess base rather than an Ident), and a
+//! HIERARCHICAL select on a packed-2D struct member reached through a PORT
+//! (`dut.result.plus_one[i]`) — the port collapses onto the parent's signal,
+//! so the element-width map is keyed by THAT name and the lookup has to go
+//! through `port_aliases`; without it the select read a single bit.
+//!
+//! KNOWN GAP, still open: a PROCEDURAL-LOCAL queue of structs stores no
+//! members at all — every push/pop yields zeros (`scratchpad/tb/e7.sv`).
+//! Module-level queues of structs work.
 //!
 //! Verified byte-identical to a reference simulator.
 
@@ -125,4 +132,67 @@ endmodule
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "rv"), 0x09, "bit-writes still target bits");
     assert_eq!(u(&sim, "rp"), 0xAB, "packed 2D element write unaffected");
+}
+
+/// An array member of a QUEUE ELEMENT — the base is a MemberAccess over an
+/// Index, not a plain identifier.
+#[test]
+fn array_member_of_a_queue_element() {
+    let src = r#"
+module top;
+  typedef struct { logic [15:0] arr [4]; int scalar; } s_t;
+  s_t q[$];
+  s_t src, got;
+  int e0, esc, p0, p3, psc;
+  initial begin
+    src.arr[0] = 16'h1111; src.arr[3] = 16'h4444; src.scalar = 42;
+    q.push_back(src);
+    e0 = q[0].arr[0]; esc = q[0].scalar;
+    got = q.pop_front();
+    p0 = got.arr[0]; p3 = got.arr[3]; psc = got.scalar;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "e0"), 0x1111, "q[0].arr[0] reads the element");
+    assert_eq!(u(&sim, "esc"), 42, "and the scalar member");
+    assert_eq!(u(&sim, "p0"), 0x1111, "pop still carries the array");
+    assert_eq!(u(&sim, "p3"), 0x4444);
+    assert_eq!(u(&sim, "psc"), 42);
+}
+
+/// A hierarchical select on a packed-2D struct member reached through a PORT.
+/// The port collapses onto the parent's signal, so the element width is keyed
+/// by the parent's name — without following `port_aliases` this read one bit.
+#[test]
+fn hierarchical_packed_2d_struct_member_select_through_a_port() {
+    let src = r#"
+typedef struct packed { logic [3:0][15:0] plus_one; logic [3:0][15:0] xor_mask; } res_t;
+module inner (output logic [3:0][15:0] bus);
+  assign bus = {16'h4444, 16'h3333, 16'h2222, 16'h1111};
+endmodule
+module mid (output res_t result);
+  logic [3:0][15:0] out_bus;
+  inner u_i (.bus(out_bus));
+  assign result.plus_one = out_bus;
+  assign result.xor_mask = out_bus;
+endmodule
+module top;
+  res_t r;
+  mid dut (.result(r));
+  int loc0, loc3, hier0, hier3, sub0;
+  initial begin
+    #1;
+    loc0 = r.plus_one[0];            hier0 = dut.result.plus_one[0];
+    loc3 = r.plus_one[3];            hier3 = dut.result.plus_one[3];
+    sub0 = dut.u_i.bus[0];
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "loc0"), 0x1111, "local select");
+    assert_eq!(u(&sim, "hier0"), 0x1111, "hierarchical select through a port");
+    assert_eq!(u(&sim, "loc3"), 0x4444);
+    assert_eq!(u(&sim, "hier3"), 0x4444);
+    assert_eq!(u(&sim, "sub0"), 0x1111, "and a plain hierarchical 2D element");
 }
