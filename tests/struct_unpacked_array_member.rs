@@ -21,9 +21,13 @@
 //! so the element-width map is keyed by THAT name and the lookup has to go
 //! through `port_aliases`; without it the select read a single bit.
 //!
-//! KNOWN GAP, still open: a PROCEDURAL-LOCAL queue of structs stores no
-//! members at all — every push/pop yields zeros (`scratchpad/tb/e7.sv`).
-//! Module-level queues of structs work.
+//! And finally the PROCEDURAL-LOCAL queue of structs, which stored no members
+//! at all (every push/pop yielded zeros): the runtime registered a local's
+//! declared type only when the declarator had NO dimensions, so a local
+//! collection had no element type. `queue_elem_struct` then returned None and
+//! `push_back` fell back to a packed scalar copy — and an unpacked struct has
+//! no container signal, so every member was lost. Module-scope queues were
+//! unaffected because elaboration registers them.
 //!
 //! Verified byte-identical to a reference simulator.
 
@@ -195,4 +199,61 @@ endmodule
     assert_eq!(u(&sim, "loc3"), 0x4444);
     assert_eq!(u(&sim, "hier3"), 0x4444);
     assert_eq!(u(&sim, "sub0"), 0x1111, "and a plain hierarchical 2D element");
+}
+
+/// A struct with an unpacked-array member through a PROCEDURAL-LOCAL queue,
+/// in both directions (local source, module-level source).
+#[test]
+fn procedural_local_queue_of_structs_keeps_its_members() {
+    let src = r#"
+module top;
+  typedef struct { logic [15:0] arr [4]; int scalar; } s_t;
+  s_t mod_src;
+  int f_a, f_s, s_a, s_s, m_a, m_s;
+  initial begin
+    s_t src1, src2, g;
+    s_t lq[$];
+    src1.arr[0] = 16'h1111; src1.scalar = 1;
+    src2.arr[0] = 16'h2222; src2.scalar = 2;
+    mod_src.arr[0] = 16'h3333; mod_src.scalar = 3;
+    lq.push_back(src1);
+    lq.push_back(src2);
+    g = lq.pop_front(); f_a = g.arr[0]; f_s = g.scalar;
+    g = lq.pop_front(); s_a = g.arr[0]; s_s = g.scalar;
+    lq.push_back(mod_src);
+    g = lq.pop_front(); m_a = g.arr[0]; m_s = g.scalar;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "f_a"), 0x1111, "first push survives");
+    assert_eq!(u(&sim, "f_s"), 1);
+    assert_eq!(u(&sim, "s_a"), 0x2222, "and the second is distinct");
+    assert_eq!(u(&sim, "s_s"), 2);
+    assert_eq!(u(&sim, "m_a"), 0x3333, "a module-level struct pushes in too");
+    assert_eq!(u(&sim, "m_s"), 3);
+}
+
+/// A local queue of plain scalars must be unaffected by registering element
+/// types for dimensioned locals.
+#[test]
+fn local_queues_of_scalars_are_unaffected() {
+    let src = r#"
+module top;
+  int a, b, n;
+  initial begin
+    int q[$];
+    string sq[$];
+    string s;
+    q.push_back(11); q.push_back(22);
+    a = q.pop_front(); b = q.pop_back(); n = q.size();
+    sq.push_back("hi");
+    s = sq.pop_front();
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "a"), 11);
+    assert_eq!(u(&sim, "b"), 22);
+    assert_eq!(u(&sim, "n"), 0, "queue drained");
 }

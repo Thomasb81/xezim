@@ -41500,14 +41500,20 @@ impl Simulator {
                     ) {
                         self.module.events.insert(d.name.name.clone());
                     }
+                    // Declared ELEMENT type of a local. `var_decl_types` holds
+                    // the element type for a collection, so this is the same
+                    // `data_type` either way — the unpacked dims live on the
+                    // declarator. Registering it only for SCALAR locals meant a
+                    // local QUEUE OF STRUCTS had no element type, so
+                    // `queue_elem_struct` returned None and `push_back` fell
+                    // back to a packed scalar copy: an unpacked struct has no
+                    // container signal, so every member was lost and the queue
+                    // yielded zeros. Module-scope queues were unaffected because
+                    // elaboration registers them.
+                    self.module
+                        .var_decl_types
+                        .insert(d.name.name.clone(), data_type.clone());
                     if d.dimensions.is_empty() {
-                        // Declared type of a scalar local: the member-wise
-                        // struct copy (`u2 = u1`) resolves the element type
-                        // through var_decl_types, which only module-scope
-                        // decls registered.
-                        self.module
-                            .var_decl_types
-                            .insert(d.name.name.clone(), data_type.clone());
                         // Packed multi-D local (`logic [1:0][3:0] m;`): record
                         // the per-element width so `m[i]` is an element slice,
                         // not a bit-select — module-scope decls already do.
