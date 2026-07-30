@@ -19,9 +19,11 @@
 //! struct-member assigns propagate x. The struct assigns looked like the
 //! culprit; they were faithfully forwarding an x source.
 //!
-//! KNOWN GAP (not covered here, deliberately): the same assignment INSIDE an
-//! instantiated sub-module is still dropped — inlined bodies reach neither
-//! pending-drain this fix hooks. `scratchpad/sm/s4.sv` / `s6.sv` reproduce it.
+//! The SUB-MODULE case needed a second fix. An inlined body's assigns reach
+//! neither elaborate-side pending-drain — the simulator drains
+//! `pending_cont_assign` itself — and on the way there the array names looked
+//! undeclared (an unpacked array has no signal under its own name), so each
+//! side got a 1-BIT implicit net and the assignment drove a phantom scalar.
 //!
 //! Arrays of DIFFERENT element counts are left on their existing path rather
 //! than expanded (assigning between differently-sized unpacked arrays is
@@ -127,4 +129,102 @@ endmodule
     assert_eq!(u(&sim, "p1"), 0x022);
     assert_eq!(u(&sim, "pk"), 0x003, "packed 2D whole assign");
     assert_eq!(u(&sim, "sc"), 0x5A, "plain scalar assign");
+}
+
+/// The reported shape: a sub-module drives an unpacked-array OUTPUT PORT with
+/// a whole-array assign, and the parent reads the elements. This is what left
+/// a CDC design's pointer array x for an entire run.
+#[test]
+fn whole_array_assign_through_a_submodule_output_port() {
+    let src = r#"
+`timescale 1ns/1ns
+module producer (output logic [9:0] o [4]);
+  logic [9:0] internal [4];
+  initial begin
+    internal[0] = 10'h011; internal[1] = 10'h022;
+    internal[2] = 10'h033; internal[3] = 10'h044;
+  end
+  assign o = internal;
+endmodule
+module top;
+  logic [9:0] got [4];
+  producer u (.o(got));
+  int g0, g1, g2, g3;
+  initial begin
+    #1;
+    g0 = got[0]; g1 = got[1]; g2 = got[2]; g3 = got[3];
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "g0"), 0x011);
+    assert_eq!(u(&sim, "g1"), 0x022);
+    assert_eq!(u(&sim, "g2"), 0x033);
+    assert_eq!(u(&sim, "g3"), 0x044);
+}
+
+/// The same assign entirely LOCAL to a sub-module — proves the sub-module gap
+/// was not about the port, and that no phantom implicit net is created.
+#[test]
+fn whole_array_assign_local_to_a_submodule() {
+    let src = r#"
+`timescale 1ns/1ns
+module inner (output logic [9:0] probe);
+  logic [9:0] a [4];
+  logic [9:0] b [4];
+  initial begin a[0] = 10'h011; a[1] = 10'h022; a[2] = 10'h033; a[3] = 10'h044; end
+  assign b = a;
+  assign probe = b[1];
+endmodule
+module top;
+  logic [9:0] p;
+  inner u (.probe(p));
+  int seen;
+  initial #1 seen = p;
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "seen"), 0x022, "a sub-module-local whole-array assign drives");
+}
+
+/// End-to-end in the shape that surfaced it: an array output port feeds
+/// per-member continuous assigns into a packed struct, clocked.
+#[test]
+fn array_output_port_feeding_struct_member_assigns() {
+    let src = r#"
+`timescale 1ns/1ns
+package pk;
+  typedef struct packed { logic [9:0] f; } hf_t;
+  typedef struct packed { hf_t w3; hf_t w2; hf_t w1; hf_t w0; } ps_t;
+endpackage
+module counters #(parameter int N = 4, parameter int W = 10)
+  (input logic clk, output logic [W-1:0] ptr_next [N]);
+  logic [W-1:0] ptr [N];
+  initial for (int i = 0; i < N; i++) ptr[i] = '0;
+  always @(posedge clk) for (int i = 0; i < N; i++) ptr[i] <= ptr[i] + 1;
+  assign ptr_next = ptr;
+endmodule
+module top;
+  import pk::*;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  logic [9:0] pos [4];
+  ps_t sync_client;
+  counters #(.N(4), .W(10)) u (.clk(clk), .ptr_next(pos));
+  assign sync_client.w0 = pos[0];
+  assign sync_client.w1 = pos[1];
+  assign sync_client.w2 = pos[2];
+  assign sync_client.w3 = pos[3];
+  int unk_at_1, pos0_at_21, w0_at_21;
+  initial begin
+    #1  unk_at_1 = $isunknown(sync_client);
+    #20 pos0_at_21 = pos[0];
+        w0_at_21   = sync_client.w0;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 400).expect("simulate failed");
+    assert_eq!(u(&sim, "unk_at_1"), 0, "the struct resolves as soon as the array does");
+    assert_eq!(u(&sim, "pos0_at_21"), 2, "two posedges elapsed");
+    assert_eq!(u(&sim, "w0_at_21"), 2, "and the member assign forwards it");
 }

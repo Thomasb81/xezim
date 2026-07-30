@@ -16156,6 +16156,16 @@ impl Simulator {
         // 4 GB. Streaming drain releases per-CA allocations as we iterate.
         let cas = std::mem::take(&mut self.module.continuous_assigns);
         let pending_ca = std::mem::take(&mut self.module.pending_cont_assign);
+        // §10.6.2: a whole-ARRAY continuous assign (`assign dst = src;` between
+        // unpacked arrays) has no single signal to drive — the ELEMENTS are the
+        // signals — so it compiled to a phantom scalar and silently drove
+        // nothing, leaving `dst` x for the whole run. Elaboration expands the
+        // module-scope ones, but a SUB-MODULE's assigns arrive here as
+        // `pending_cont_assign` and never pass through that path, so expand
+        // them at the one point every continuous assign is guaranteed to cross.
+        // The array table is snapshotted because the loop below needs `&mut
+        // self`; it is names→ranges only, not ASTs.
+        let arrays_snapshot = self.module.arrays.clone();
         // Hoisted out of the loop to reuse capacity across iterations.
         // Avoids ~2 × N HashMap allocs/drops where N = cont_assign count
         // (63K on c906, 501K on c910). Clear() preserves the bucket array.
@@ -16166,6 +16176,14 @@ impl Simulator {
         for ca in cas
             .into_iter()
             .chain(pending_ca.into_iter().map(|p| p.materialize()))
+            .flat_map(|ca| {
+                match crate::compiler::elaborate::whole_array_assign_parts(
+                    &ca.lhs, &ca.rhs, ca.delay, &arrays_snapshot,
+                ) {
+                    Some(parts) => parts,
+                    None => vec![ca],
+                }
+            })
         {
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.
