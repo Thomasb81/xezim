@@ -34197,8 +34197,28 @@ impl Simulator {
                         };
                         wide_l.shift_left(&wr)
                     }
-                    BinaryOp::ShiftRight => wl.shift_right(&wr),
-                    BinaryOp::ArithShiftRight => wl.arith_shift_right(&wr),
+                    BinaryOp::ShiftRight | BinaryOp::ArithShiftRight => {
+                        // §11.4.10: a shift's LEFT operand is
+                        // context-determined, so it is resized to the
+                        // expression's width BEFORE the shift — exactly as the
+                        // left-shift arm above already does. Without it a
+                        // signed operand shifted at its own narrow width and
+                        // only then widened, so the vacated high bits came from
+                        // the narrow result rather than the sign extension:
+                        // `int i = 4'sb1100 >> 1` gave 6 instead of
+                        // 32'h7FFF_FFFE. Only `>>` shows it — `>>>` and `<<`
+                        // agree either way, which is why it survived.
+                        let wide_l = if self_det_w > wl.width {
+                            wl.resize(self_det_w)
+                        } else {
+                            wl
+                        };
+                        if matches!(op, BinaryOp::ShiftRight) {
+                            wide_l.shift_right(&wr)
+                        } else {
+                            wide_l.arith_shift_right(&wr)
+                        }
+                    }
                     _ => Value::new(wl.width.max(wr.width)),
                 }
             }
