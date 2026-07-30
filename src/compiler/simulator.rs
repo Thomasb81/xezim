@@ -25691,6 +25691,45 @@ impl Simulator {
     /// literals freezes them at the correct moment, and also fixes the same
     /// staleness for a signal-valued index (`mem[addr] <= d;` where `addr`
     /// changes before the region runs).
+    /// `$`'s value for an index whose base is `base`: the last valid index of
+    /// that collection (§11.4.12). None when the base is not an indexable
+    /// collection, in which case there is no bound to install.
+    fn dollar_bound_for_base(&mut self, base: &Expression) -> Option<i64> {
+        let n = match &base.kind {
+            ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+            _ => self.flat_member_name(base),
+        }?;
+        if self.module.dynamic_arrays.contains(&n) {
+            Some(self.get_queue_size(&n) as i64 - 1)
+        } else {
+            self.module.arrays.get(&n).map(|&(_, hi, _)| hi)
+        }
+    }
+
+    /// Does this expression mention `$` (§11.4.12 — the last index of the
+    /// collection being indexed)? Used to decide whether an lvalue index has to
+    /// be evaluated with a `dollar_bound` installed.
+    fn expr_contains_dollar(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Dollar => true,
+            ExprKind::Paren(i) => Self::expr_contains_dollar(i),
+            ExprKind::Unary { operand, .. } => Self::expr_contains_dollar(operand),
+            ExprKind::Binary { left, right, .. } => {
+                Self::expr_contains_dollar(left) || Self::expr_contains_dollar(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_contains_dollar(condition)
+                    || Self::expr_contains_dollar(then_expr)
+                    || Self::expr_contains_dollar(else_expr)
+            }
+            _ => false,
+        }
+    }
+
     fn freeze_lvalue_indices(&mut self, e: &Expression) -> Expression {
         let lit = |v: i64, span| {
             Expression::new(
@@ -25729,7 +25768,21 @@ impl Simulator {
         match &e.kind {
             ExprKind::Index { expr, index } => {
                 let base = self.freeze_lvalue_indices(expr);
-                let Some(iv) = freezable(self, index) else {
+                // Same `$` bound the apply-time path installs, so a frozen
+                // `q[$]` literal is the queue's last index and not u64::MAX.
+                let qbound = if Self::expr_contains_dollar(index) {
+                    self.dollar_bound_for_base(expr)
+                } else {
+                    None
+                };
+                if let Some(b) = qbound {
+                    self.dollar_bound.push(b);
+                }
+                let frozen_idx = freezable(self, index);
+                if qbound.is_some() {
+                    self.dollar_bound.pop();
+                }
+                let Some(iv) = frozen_idx else {
                     return Expression::new(
                         ExprKind::Index {
                             expr: Box::new(base),
@@ -25825,7 +25878,21 @@ impl Simulator {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
                     if self.module.arrays.contains_key(&name) {
+                        // `$` here is the collection's last index (§11.4.12);
+                        // without the bound it evaluates to u64::MAX and the
+                        // element lookup misses, silently dropping the write.
+                        let db = if Self::expr_contains_dollar(index) {
+                            self.dollar_bound_for_base(expr)
+                        } else {
+                            None
+                        };
+                        if let Some(b) = db {
+                            self.dollar_bound.push(b);
+                        }
                         let idx = self.eval_expr(index).to_u64().unwrap_or(0);
+                        if db.is_some() {
+                            self.dollar_bound.pop();
+                        }
                         // Use a small buffer to avoid allocation for common array names
                         let elem = format!("{}[{}]", name, idx);
                         return self.signal_name_to_id.get(elem.as_str()).copied();
@@ -31114,10 +31181,37 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                let dollar_norm;
+                let index: &Expression = if Self::expr_contains_dollar(index) {
+                    match self.dollar_bound_for_base(expr) {
+                        Some(b) => {
+                            self.dollar_bound.push(b);
+                            let v = self.eval_expr(index).to_i64().unwrap_or(0);
+                            self.dollar_bound.pop();
+                            dollar_norm = Expression::new(
+                                ExprKind::Number(NumberLiteral::Integer {
+                                    size: Some(64),
+                                    signed: true,
+                                    base: NumberBase::Decimal,
+                                    value: v.to_string(),
+                                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                                }),
+                                index.span,
+                            );
+                            &dollar_norm
+                        }
+                        None => index,
+                    }
+                } else {
+                    index
+                };
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k] = v` writes
                 // element k of the queue `q[i]` (§7.4.5), not a bit of a scalar.
                 if let Some(qn) = self.indexed_queue_base(expr) {
+                    // `$` is the last valid index of THIS queue.
+                    self.dollar_bound.push(self.get_queue_size(&qn) as i64 - 1);
                     let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                    self.dollar_bound.pop();
                     let elem = format!("{}[{}]", qn, k);
                     let prev = self.get_signal_value_by_name(&elem);
                     let changed = prev.as_ref() != Some(val);
@@ -31173,17 +31267,28 @@ impl Simulator {
                 // Class associative-array member element write — base may be
                 // a bare member (`m[k]=v`) or another object's (`obj.m[k]=v`).
                 if let Some(an) = self.expr_assoc_name(expr) {
+                    if std::env::var_os("XEZIM_AW_DBG").is_some() {
+                        eprintln!("[AW] assoc write an={} width={:?} map={:?}",
+                            an, self.assoc_elem_width(&an), self.module.assoc_elem_widths);
+                    }
                     let idx_val = self.eval_expr(index);
                     let idx_str = self.assoc_key_str(&an, &idx_val);
                     let elem_name = format!("{}[{}]", an, idx_str);
-                    let changed = self.signals.get(&elem_name) != Some(val);
-                    self.signals.insert(elem_name, val.clone());
+                    // §10.7: fit to the DECLARED element width when one was
+                    // recorded; class-member collections often have none, in
+                    // which case the value is stored as-is (unchanged).
+                    let fitted = match self.assoc_elem_width(&an) {
+                        Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
+                        _ => val.clone(),
+                    };
+                    let changed = self.signals.get(&elem_name) != Some(&fitted);
+                    self.signals.insert(elem_name, fitted);
                     return changed;
                 }
                 // N-dimensional (N >= 3) unpacked array element assignment
                 {
                     let mut cur = expr.as_ref();
-                    let mut rev_idxs: Vec<&Expression> = vec![index.as_ref()];
+                    let mut rev_idxs: Vec<&Expression> = vec![index];
                     while let ExprKind::Index {
                         expr: inner_e,
                         index: inner_i,
@@ -31618,11 +31723,23 @@ impl Simulator {
                             }
                             return changed;
                         }
-                        // Fallback: slow path / associative array
-                        let changed = self.signals.get(&elem_name).is_none_or(|p| *p != *val);
+                        // Fallback: slow path / associative array.
+                        // §10.7: an assoc element has no entry in the typed
+                        // signal table, so without the elaborator's recorded
+                        // element width the RHS was stored at ITS OWN size —
+                        // `logic [3:0] aa[string]; aa["k"] = 8'hEF` kept all
+                        // eight bits, and `$bits` reported the stored width
+                        // rather than the declared one.
+                        let fitted = match self.assoc_elem_width(&name) {
+                            Some(w) if w != val.width && !val.is_real => {
+                                val.resize_for_assign(w)
+                            }
+                            _ => val.clone(),
+                        };
+                        let changed = self.signals.get(&elem_name).is_none_or(|p| *p != fitted);
                         if changed {
-                            sim_dbg_eprintln!("[DEBUG] signal {} changed to {:?}", elem_name, val);
-                            self.signals.insert(elem_name.clone(), val.clone());
+                            sim_dbg_eprintln!("[DEBUG] signal {} changed to {:?}", elem_name, fitted);
+                            self.signals.insert(elem_name.clone(), fitted);
                             self.mark_dirty(&elem_name);
                         }
                         return changed;
@@ -34047,7 +34164,10 @@ impl Simulator {
                 // element k of the queue `q[i]` (§7.4.5). Without this the base
                 // resolves to a scalar and `[k]` becomes a bit-select.
                 if let Some(qn) = self.indexed_queue_base(expr) {
+                    // `$` is the last valid index of THIS queue.
+                    self.dollar_bound.push(self.get_queue_size(&qn) as i64 - 1);
                     let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                    self.dollar_bound.pop();
                     return self
                         .get_signal_value_by_name(&format!("{}[{}]", qn, k))
                         .unwrap_or_else(|| Value::new(32));
@@ -49684,6 +49804,22 @@ impl Simulator {
         if let Some(sink) = self.fst_writer.take() {
             sink.finish();
         }
+    }
+
+    /// Declared element width of an associative array, when the elaborator
+    /// recorded one. Tries the resolved name and its leaf, mirroring how the
+    /// other per-signal maps are consulted.
+    fn assoc_elem_width(&self, name: &str) -> Option<u32> {
+        if let Some(&w) = self.module.assoc_elem_widths.get(name) {
+            return Some(w);
+        }
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        let base = leaf.split('#').next_back().unwrap_or(leaf);
+        self.module
+            .assoc_elem_widths
+            .get(leaf)
+            .or_else(|| self.module.assoc_elem_widths.get(base))
+            .copied()
     }
 
     fn is_associative_array(&self, name: &str) -> bool {
