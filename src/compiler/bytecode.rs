@@ -257,6 +257,20 @@ pub struct BytecodeCompiler<'a> {
     /// bit `i` and silently drops the upper bits. Set via
     /// `set_packed_elem_widths`.
     packed_elem_widths: Option<&'a HashMap<String, u32>>,
+    /// Declared element width of each associative array (§10.7). Without it an
+    /// assoc lvalue fell through `infer_lhs_width` to the 1-bit "bit-select on
+    /// a plain packed signal" default, so a compiled `aa[k] <= v` truncated the
+    /// value to a single bit.
+    assoc_elem_widths: Option<&'a HashMap<String, u32>>,
+    /// Names of ASSOCIATIVE arrays. Their keys are not dense indices and their
+    /// elements have no signal ids, so none of the bytecode store paths can
+    /// address them: `lookup_array_name` misses (they are not in `arrays`), and
+    /// the fall-through treated the base as a scalar and wrote a BIT of a
+    /// phantom signal — an `aa[k] = v` inside an `always_ff` was silently lost
+    /// (`exists()` stayed 0) while the same write from an `initial` block, which
+    /// runs on the AST path, worked. Detected here so the statement bails to
+    /// that AST path instead.
+    assoc_arrays: Option<&'a HashMap<String, bool>>,
     /// Declared packed dimensions (outermost first) per signal, from the
     /// elaborated model. Needed because a packed element's LSB offset is
     /// `(idx - low_bound) * elem_w` for a DESCENDING range — the plain
@@ -323,6 +337,8 @@ impl<'a> BytecodeCompiler<'a> {
             params: None,
             top_module_name: None,
             packed_elem_widths: None,
+            assoc_elem_widths: None,
+            assoc_arrays: None,
             packed_full_dims: None,
             loop_break_patches: Vec::new(),
             loop_continue_patches: Vec::new(),
@@ -409,6 +425,34 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_packed_elem_widths(&mut self, w: &'a HashMap<String, u32>) {
         self.packed_elem_widths = Some(w);
+    }
+
+    pub fn set_assoc_elem_widths(&mut self, w: &'a HashMap<String, u32>) {
+        self.assoc_elem_widths = Some(w);
+    }
+
+    pub fn set_assoc_arrays(&mut self, a: &'a HashMap<String, bool>) {
+        self.assoc_arrays = Some(a);
+    }
+
+    /// Does this identifier name an associative array (in any of the spellings
+    /// the lvalue paths try)?
+    fn is_assoc_target(&self, hier: &HierarchicalIdentifier) -> bool {
+        let Some(m) = self.assoc_arrays else {
+            return false;
+        };
+        let raw = Self::hier_raw_name(hier);
+        if m.contains_key(&raw) {
+            return true;
+        }
+        if let Some(scope) = &self.scope_hint {
+            if m.contains_key(&format!("{}.{}", scope, raw)) {
+                return true;
+            }
+        }
+        hier.path
+            .last()
+            .is_some_and(|s| m.contains_key(&s.name.name))
     }
 
     pub fn set_packed_full_dims(&mut self, d: &'a HashMap<String, Vec<(i64, i64)>>) {
@@ -2074,6 +2118,10 @@ impl<'a> BytecodeCompiler<'a> {
                     return true;
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
+                    if self.is_assoc_target(hier) {
+                        self.bail("nba_target_assoc");
+                        return false;
+                    }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
                             let array = self.array_operand(name);
@@ -2363,6 +2411,10 @@ impl<'a> BytecodeCompiler<'a> {
                     return true;
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
+                    if self.is_assoc_target(hier) {
+                        self.bail("blocking_target_assoc");
+                        return false;
+                    }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
                             let array = self.array_operand(name);
@@ -2680,6 +2732,20 @@ impl<'a> BytecodeCompiler<'a> {
                             })
                     }) {
                         if elem_w > 1 {
+                            return elem_w;
+                        }
+                    }
+                    // An ASSOCIATIVE array's element: its width lives in its
+                    // own map (assoc elements have no signal-table entry, so
+                    // `arrays` does not carry them).
+                    if let Some(elem_w) = self.assoc_elem_widths.and_then(|m| {
+                        m.get(raw.as_str()).copied().or_else(|| {
+                            hier.path
+                                .last()
+                                .and_then(|s| m.get(s.name.name.as_str()).copied())
+                        })
+                    }) {
+                        if elem_w > 0 {
                             return elem_w;
                         }
                     }
