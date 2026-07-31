@@ -102,3 +102,33 @@ endmodule
     assert_eq!(u(&sim, "parens_r"), 512, "explicit parens still override");
     assert_eq!(u(&sim, "with_mul"), 18, "precedence over * unchanged");
 }
+
+/// ===/!== widening of a signed integer LITERAL sign-extends against a wider
+/// unsigned operand (commercial consensus; ivtest `sv_cast_packed_array`):
+/// `64'hFF..F0 !== -16` is FALSE. A signed VARIABLE in the same position
+/// zero-extends per the propagated unsigned type — the reference draws the
+/// line at literal-vs-variable, and so does xezim (at the eval site, since
+/// Value has no source shape).
+#[test]
+fn case_equality_extends_by_own_sign() {
+    let src = r#"
+module top;
+  logic [63:0] u64;
+  logic signed [7:0] s8;
+  int ne, eq, sx_eq, sx_ne;
+  initial begin
+    u64 = 64'hFFFF_FFFF_FFFF_FFF0;
+    ne = (u64 !== -16);
+    eq = (u64 === -16);
+    s8 = -1;
+    sx_eq = (16'hFFFF === s8);
+    sx_ne = (16'h00FF === s8);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "ne"), 0, "the LITERAL -16 sign-extends against the unsigned 64-bit");
+    assert_eq!(u(&sim, "eq"), 1);
+    assert_eq!(u(&sim, "sx_eq"), 0, "a signed VARIABLE zero-extends (propagated unsigned)");
+    assert_eq!(u(&sim, "sx_ne"), 1);
+}
