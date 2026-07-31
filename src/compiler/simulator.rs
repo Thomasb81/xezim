@@ -25855,11 +25855,39 @@ impl Simulator {
             10_000
         };
         let mut safety: u64 = 0;
+        let mut broke = false;
         while !self.finished && safety < cap {
             safety += 1;
             for s in &body_stmts {
                 self.exec_statement(s);
+                // §12.7.2: `break` (and a `return` out of the enclosing
+                // task/function, which sets the same flag) LEAVES the loop —
+                // a timing-free `forever` with a break in it terminates and is
+                // not a livelock. Ignoring the flag here ran the body to the
+                // stall cap and then reported a false stall, killing the run
+                // before the process could reach its own `$finish`.
+                if self.break_flag {
+                    broke = true;
+                    break;
+                }
+                // §12.7.2 `continue` ends only THIS iteration.
+                if self.continue_flag {
+                    self.continue_flag = false;
+                    break;
+                }
             }
+            if broke {
+                break;
+            }
+        }
+        if broke {
+            // The loop is done; the statements AFTER it still have to run.
+            self.break_flag = false;
+            let after_stmts: Vec<Statement> = after.to_vec();
+            if !after_stmts.is_empty() {
+                self.run_process_stmts(pid, &after_stmts);
+            }
+            return;
         }
         if !self.finished && safety >= cap {
             eprintln!(
@@ -26068,6 +26096,13 @@ impl Simulator {
             }
             let v = sim.eval_expr(idx);
             if v.is_real || v.width > 64 {
+                return None;
+            }
+            // An x/z bound must NOT freeze into a literal: `to_i64` masks the
+            // unknown bits away, so `i = 'hx; x[i +: 2] <= 2'b11` froze to
+            // `x[0 +: 2]` and wrote the low bits. Leaving the expression alone
+            // lets the apply-time path see the x and discard the write (§11.5.1).
+            if v.has_xz() {
                 return None;
             }
             v.to_i64()
@@ -31160,6 +31195,20 @@ impl Simulator {
             lhs
         };
 
+        // §7.4.6 / §11.5.1: an ELEMENT index containing x or z selects nothing,
+        // so the write is discarded — `a['hx] = v` must leave every element
+        // alone. The index folded to 0 through `to_u64`, so it silently
+        // clobbered a[0]. The right-hand side is still evaluated by the caller
+        // (its side effects stand); only the store is dropped.
+        if let ExprKind::Index { expr: base, index } = &lhs.kind {
+            if !Self::expr_is_stream(base) {
+                let iv = self.eval_expr(index);
+                if iv.has_xz() && !iv.is_real {
+                    return false;
+                }
+            }
+        }
+
         // §18.4: writing a member of a struct/union CLASS property goes to the
         // aggregate's own storage — for a packed struct/union that means
         // splicing the member's bits into the property's raw integral value, so
@@ -32458,13 +32507,36 @@ impl Simulator {
                 right,
                 kind,
             } => {
-                let l = self.eval_expr(left).to_u64().unwrap_or(0) as usize;
-                let r = self.eval_expr(right).to_u64().unwrap_or(0) as usize;
-                let (mut msb, mut lsb) = match kind {
-                    RangeKind::Constant => (l.max(r), l.min(r)),
-                    RangeKind::IndexedUp => (l + r.saturating_sub(1), l),
-                    RangeKind::IndexedDown => (l, l.saturating_sub(r.saturating_sub(1))),
+                // §11.5.1: a part-select bound may be NEGATIVE, and a write
+                // through a partially out-of-range select stores only the bits
+                // that DO land in the vector (`bit [3:0] x; x[4:-1] <= 6'b101010`
+                // leaves x = 4'b0101). Reading the bounds through `to_u64` made
+                // -1 a huge unsigned index, so `l + r - 1` overflowed and
+                // aborted the run. `to_i64` sign-extends only a value whose
+                // type IS signed, so ordinary indices are untouched.
+                // §11.5.1: an index containing x or z selects nothing — the
+                // write is DISCARDED, not applied at bit 0. `to_i64` reports
+                // that as None; folding it to 0 silently wrote the low bits
+                // (`i = 'hx; x[i +: 2] = 2'b11` left x = 4'b0011).
+                let lval_b = self.eval_expr(left);
+                let rval_b = self.eval_expr(right);
+                if lval_b.has_xz() || rval_b.has_xz() {
+                    return false;
+                }
+                let (Some(li), Some(ri)) = (lval_b.to_i64(), rval_b.to_i64()) else {
+                    return false;
                 };
+                let (msb_i, lsb_i): (i64, i64) = match kind {
+                    RangeKind::Constant => (li.max(ri), li.min(ri)),
+                    RangeKind::IndexedUp => (li + (ri - 1).max(0), li),
+                    RangeKind::IndexedDown => (li, li - (ri - 1).max(0)),
+                };
+                // The SOURCE bit for target bit `i` is `i - lsb_i`, which stays
+                // signed: with lsb_i = -1 the vector's bit 0 takes source bit 1.
+                let src_base = lsb_i;
+                let l = li.max(0) as usize;
+                let r = ri.max(0) as usize;
+                let (mut msb, mut lsb) = (msb_i.max(0) as usize, lsb_i.max(0) as usize);
                 // §7.4.1 element-range WRITE on a packed multi-D base:
                 // `wv[2:1] = 16'hBEEF` / `wv[1 +: 2] = …` targets whole
                 // ELEMENTS. The bit-based msb/lsb above wrote a 2-bit sliver
@@ -32589,8 +32661,12 @@ impl Simulator {
                 if let Some(id) = target_id {
                     let width = self.signal_widths[id] as usize;
                     // Whole-word fast path: if the range covers the whole
-                    // signal, skip the per-bit loop.
-                    if lsb == 0 && msb + 1 >= width {
+                    // signal, skip the per-bit loop. A NEGATIVE low bound is
+                    // excluded — the clamped `lsb` is 0 there, but the source
+                    // bits are SHIFTED (`x[4:-1]` puts source bit 1 in x[0]),
+                    // so resizing the value and storing it whole picks the
+                    // wrong bits.
+                    if src_base >= 0 && lsb == 0 && msb + 1 >= width {
                         let resized = val.resize(width as u32);
                         let changed = self.signal_table[id] != resized;
                         if changed {
@@ -32601,11 +32677,27 @@ impl Simulator {
                         return changed;
                     }
                     let mut changed = false;
-                    for i in lsb..=msb.min(width.saturating_sub(1)) {
-                        let nb = val.get_bit(i - lsb);
-                        if self.signal_table[id].get_bit(i) != nb {
-                            self.signal_table[id].set_bit(i, nb);
-                            changed = true;
+                    let hi = msb.min(width.saturating_sub(1));
+                    // The source offset is the EFFECTIVE low bit — `lsb` after
+                    // the element-scaling and ascending-declaration rewrites
+                    // above, which is what the loop always used. Only a
+                    // NEGATIVE low bound needs the pre-clamp value, and those
+                    // rewrites never apply to one (they clamp at 0).
+                    let base = if src_base < 0 { src_base } else { lsb as i64 };
+                    // `msb_i < 0` means the whole select sits below bit 0 —
+                    // nothing is written (the clamped msb/lsb would otherwise
+                    // both read 0 and clobber the low bit).
+                    if msb_i >= 0 && hi >= lsb {
+                        for i in lsb..=hi {
+                            let src = i as i64 - base;
+                            if src < 0 {
+                                continue;
+                            }
+                            let nb = val.get_bit(src as usize);
+                            if self.signal_table[id].get_bit(i) != nb {
+                                self.signal_table[id].set_bit(i, nb);
+                                changed = true;
+                            }
                         }
                     }
                     if changed {
@@ -33456,6 +33548,15 @@ impl Simulator {
                     }
                 false
             }
+            _ => false,
+        }
+    }
+
+    /// A streaming concatenation, looking through parentheses.
+    fn expr_is_stream(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::StreamOp { .. } => true,
+            ExprKind::Paren(inner) => Self::expr_is_stream(inner),
             _ => false,
         }
     }
@@ -34384,6 +34485,28 @@ impl Simulator {
                 } else {
                     r
                 };
+                // §6.16.3: the relational operators on `string` operands compare
+                // LEXICOGRAPHICALLY, not as zero-extended bit vectors. Comparing
+                // the packed values made the comparison depend on LENGTH first:
+                // "Jello" (40 bits) against "z" (8 bits) widened "z" to
+                // 0x000000007A, so `"Jello" < "z"` came out FALSE even though
+                // 'J' < 'z'. Equality was already correct — two byte strings
+                // are equal iff their packed values are — so only the four
+                // ordering operators are routed here.
+                if matches!(
+                    op,
+                    BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
+                ) && (self.expr_is_string_valued(left) || self.expr_is_string_valued(right))
+                {
+                    let ord = wl.to_sv_string().cmp(&wr.to_sv_string());
+                    let t = match op {
+                        BinaryOp::Lt => ord.is_lt(),
+                        BinaryOp::Leq => ord.is_le(),
+                        BinaryOp::Gt => ord.is_gt(),
+                        _ => ord.is_ge(),
+                    };
+                    return Value::from_u64(t as u64, 1);
+                }
                 match op {
                     BinaryOp::Add => wl.add(&wr),
                     BinaryOp::Sub => wl.sub(&wr),
@@ -34566,13 +34689,27 @@ impl Simulator {
                     }
                     out
                 };
-                // §11.4.14: as a plain RHS the stream is a self-determined
-                // expression — a wider PACKED target zero-extends it like any
-                // assignment (w = {<<4{16'hABCD}} gives 0000_dcba, matching
-                // the commercial consensus). Left-justification applies only
-                // when the STREAM is the assignment TARGET (handled in the
-                // unpack path), not here.
-                streamed
+                // §11.4.14.2: a stream assigned to a WIDER integral target is
+                // LEFT-justified — the LRM's own example is
+                //   `bit [99:0] d = {>>{a, b, c}};  // d[3:0] = 0`
+                // (a 96-bit stream landing in d[99:4]), and the companion
+                // `int j = {>>{a, b, c}};` is called an ERROR precisely because
+                // a stream may not be truncated. This is the opposite of an
+                // ordinary assignment, which zero-extends on the LEFT, and the
+                // rule holds for a cast too (`int'({<<8{16'hABCD}})` is
+                // 32'hcdab_0000, not 32'h0000_cdab).
+                //
+                // `ctx_width` is the assignment/cast target width; it is 0
+                // wherever no target width applies, so the self-determined
+                // value is returned unchanged there. A NARROWER target is an
+                // LRM error — left to the caller's ordinary fit rather than
+                // made fatal here.
+                if ctx_width > streamed.width {
+                    let pad = Value::zero(ctx_width - streamed.width);
+                    streamed.concat_with(&pad)
+                } else {
+                    streamed
+                }
             }
             ExprKind::Replication { count, exprs } => {
                 // Replication evaluation. Two correctness/perf fixes vs. the
@@ -34989,7 +35126,27 @@ impl Simulator {
                         {
                             self.eval_expr(&def_expr)
                         } else {
-                            Value::new(1)
+                            // §7.8.6: reading a NONEXISTENT element yields the
+                            // element type's default initial value — 0 for a
+                            // 2-state type, x for a 4-state one — at the
+                            // ELEMENT's width. A flat 1-bit x was wrong twice
+                            // over: `int aa[int]; aa[7]` read x instead of 0,
+                            // and even where x was right the 1-bit width made
+                            // `%h` print a single `x` for what should be `xx`.
+                            // (The read still must not CREATE the element —
+                            // `num()` is unchanged, which is why this is a
+                            // value-only fallback.)
+                            let ew = self.assoc_elem_width(&name).unwrap_or(1).max(1);
+                            if self.module.two_state_signals.contains(&name)
+                                || name
+                                    .rsplit('.')
+                                    .next()
+                                    .is_some_and(|l| self.module.two_state_signals.contains(l))
+                            {
+                                Value::zero(ew)
+                            } else {
+                                Value::new(ew)
+                            }
                         };
                         if self.signed_signals.contains(&elem_name) {
                             v.is_signed = true;
@@ -35301,12 +35458,33 @@ impl Simulator {
                     }
                 }
                 let base = self.eval_expr(expr);
-                let l = self.eval_expr(left).to_u64().unwrap_or(0) as usize;
-                let r = self.eval_expr(right).to_u64().unwrap_or(0) as usize;
+                // §11.5.1: a part-select bound may be NEGATIVE — those bits read
+                // x, they are not dropped. Reading the bounds through `to_u64`
+                // turned a negative base into a huge unsigned index, so
+                // `w[-4 +: 8]` computed `l + r - 1` on 0xFFFF_FFFC and panicked
+                // in the shift rather than returning `fx`. `to_i64` only
+                // sign-extends a value whose type IS signed, so an ordinary
+                // unsigned index is unaffected.
+                let li = self.eval_expr(left).to_i64().unwrap_or(0);
+                let ri = self.eval_expr(right).to_i64().unwrap_or(0);
+                let l = li.max(0) as usize;
+                let r = ri.max(0) as usize;
 
                 match kind {
-                    RangeKind::Constant => base.range_select(l, r),
-                    RangeKind::IndexedUp => base.range_select(l + r - 1, l),
+                    RangeKind::Constant => {
+                        if li >= 0 && ri >= 0 {
+                            base.range_select(l, r)
+                        } else {
+                            base.range_select_signed(li.max(ri), li.min(ri))
+                        }
+                    }
+                    RangeKind::IndexedUp => {
+                        if li >= 0 {
+                            base.range_select(l + r - 1, l)
+                        } else {
+                            base.range_select_signed(li + ri - 1, li)
+                        }
+                    }
                     RangeKind::IndexedDown => {
                         // §11.5.1: `[l -: r]` selects r bits down from l. When
                         // `l < r-1` the low bound is negative — those bits read
@@ -35596,8 +35774,57 @@ impl Simulator {
                                     .product();
                                 return Value::from_u64(n * *ew as u64, 32);
                             }
-                            if let Some(w) = self.module.typedefs.get(&name) {
-                                return Value::from_u64(*w as u64, 32);
+                            if let Some(w) = self.module.typedefs.get(&name).copied() {
+                                // §20.6.2: a typedef carrying UNPACKED dims is
+                                // element_bits × the dimension sizes —
+                                // `typedef int T[3:0]` is 128, not 32. The
+                                // table holds only the element width, so the
+                                // dims have to be folded in here.
+                                let mult: u64 = Self::typedef_dims_via_tables(
+                                    &self.module,
+                                    self.class_context_stack
+                                        .last()
+                                        .cloned()
+                                        .flatten()
+                                        .unwrap_or_default()
+                                        .as_str(),
+                                    &name,
+                                )
+                                .map(|dims| {
+                                    use crate::ast::types::UnpackedDimension;
+                                    dims.iter()
+                                        .map(|d| match d {
+                                            UnpackedDimension::Range { left, right, .. } => {
+                                                let l = super::elaborate::const_eval_i64_with_params(
+                                                    left,
+                                                    Some(&self.module.parameters),
+                                                )
+                                                .unwrap_or(0);
+                                                let r = super::elaborate::const_eval_i64_with_params(
+                                                    right,
+                                                    Some(&self.module.parameters),
+                                                )
+                                                .unwrap_or(0);
+                                                (l - r).unsigned_abs() + 1
+                                            }
+                                            UnpackedDimension::Expression { expr, .. } => {
+                                                super::elaborate::const_eval_i64_with_params(
+                                                    expr,
+                                                    Some(&self.module.parameters),
+                                                )
+                                                .unwrap_or(1)
+                                                    .max(1)
+                                                    as u64
+                                            }
+                                            // A dynamic/queue/assoc dimension has
+                                            // no compile-time size; §20.6.2 leaves
+                                            // $bits on those unspecified.
+                                            _ => 1,
+                                        })
+                                        .product::<u64>()
+                                })
+                                .unwrap_or(1);
+                                return Value::from_u64(w as u64 * mult.max(1), 32);
                             }
                             // §20.6.2: `$bits(<type>)` where the type is a bare
                             // keyword (`$bits(integer)`, `$bits(byte)`) — the
@@ -36380,6 +36607,29 @@ impl Simulator {
                 // → real cast widens; otherwise resize to the type's width and
                 // stamp its signedness.
                 "$__xz_type_cast" => {
+                    // §11.4.14.2: a cast is an assignment context for a
+                    // streaming concatenation, so the cast width has to reach
+                    // the stream for it to left-justify (`int'({<<8{16'hABCD}})`
+                    // is 32'hcdab_0000). Only a stream operand gets the width —
+                    // every other operand keeps the self-determined evaluation
+                    // it has always had.
+                    if let Some(inner) = args.get(1).filter(|a| Self::expr_is_stream(a)) {
+                        if let Some(ExprKind::TypeLiteral(dt)) = args.first().map(|a| &a.kind) {
+                            let dt = dt.clone();
+                            if !super::elaborate::is_type_real(&dt) {
+                                let w = super::elaborate::resolve_type_width(
+                                    &dt,
+                                    Some(&self.module.parameters),
+                                    Some(&self.module.typedefs),
+                                )
+                                .max(1);
+                                let inner = inner.clone();
+                                let mut out = self.eval_expr_ctx(&inner, w).resize(w);
+                                out.is_signed = super::elaborate::is_type_signed(&dt);
+                                return out;
+                            }
+                        }
+                    }
                     let Some(ExprKind::TypeLiteral(dt)) = args.first().map(|a| &a.kind) else {
                         return args
                             .get(1)
@@ -40778,6 +41028,12 @@ impl Simulator {
                         break;
                     }
                     self.break_flag = false;
+                    // §12.7.2: clear `continue` before each iteration, as the
+                    // `for` loop already did. Left set, the body's very first
+                    // statement saw the stale flag and skipped the whole block
+                    // every time — the loop variable never advanced and a
+                    // `while` containing a `continue` spun forever.
+                    self.continue_flag = false;
                     self.exec_statement(body);
                     if self.break_flag {
                         // Keep the flag set while a `disable` unwinds to an
@@ -40801,6 +41057,7 @@ impl Simulator {
                     }
                     i += 1;
                     self.break_flag = false;
+                    self.continue_flag = false;
                     self.exec_statement(body);
                     if self.break_flag {
                         // Keep the flag set while a `disable` unwinds to an
@@ -40810,6 +41067,7 @@ impl Simulator {
                         }
                         break;
                     }
+                    self.continue_flag = false;
                     if !self.eval_expr(condition).is_true() {
                         break;
                     }
@@ -45107,8 +45365,18 @@ impl Simulator {
                                         result.push_str(&field(core, 0));
                                     }
                                     's' | 'S' => {
+                                        // A literal takes the same field
+                                        // treatment as a string variable —
+                                        // `%5s` of "ab" is "   ab". Pushing the
+                                        // literal raw dropped the width only for
+                                        // literals, so the same format applied
+                                        // to `s = "ab"` and to "ab" printed
+                                        // differently. (The literal still
+                                        // bypasses `to_sv_string`, which would
+                                        // lose a literal's embedded NULs.)
                                         if let ExprKind::StringLiteral(s) = &args[ai - 1].kind {
-                                            result.push_str(s);
+                                            let lit = s.clone();
+                                            result.push_str(&field(lit, 0));
                                         } else {
                                             result.push_str(&field(v.to_sv_string(), 0));
                                         }
@@ -48140,17 +48408,15 @@ impl Simulator {
                 right,
                 kind,
             } => {
-                let l = self.eval_expr(left).to_u64().unwrap_or(0);
-                let r = self.eval_expr(right).to_u64().unwrap_or(0);
+                // Signed bounds: `x[0:-1]` is TWO bits wide. Read as u64 the
+                // -1 became 0xFFFF_FFFF, `l >= r` picked the wrong branch and
+                // the width came out 0 — which then resized the RHS to nothing,
+                // so a partially out-of-range NBA wrote no bits at all.
+                let l = self.eval_expr(left).to_i64().unwrap_or(0);
+                let r = self.eval_expr(right).to_i64().unwrap_or(0);
                 let count = match kind {
-                    RangeKind::IndexedUp | RangeKind::IndexedDown => r as u32,
-                    RangeKind::Constant => {
-                        if l >= r {
-                            (l - r + 1) as u32
-                        } else {
-                            (r - l + 1) as u32
-                        }
-                    }
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => r.max(0) as u32,
+                    RangeKind::Constant => (l - r).unsigned_abs() as u32 + 1,
                 };
                 // §7.4.1: an element range on a packed multi-D lvalue is
                 // count × elem_w bits wide, not count bits — the RHS was
