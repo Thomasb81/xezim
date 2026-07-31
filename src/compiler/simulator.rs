@@ -2887,6 +2887,11 @@ pub struct Simulator {
     /// variable name (consistent with the simulator's global-by-bare-
     /// name treatment of subroutine locals).
     viface_var_aliases: HashMap<String, String>,
+    /// §25.9: the interface instance behind the vif a function RETURN just
+    /// produced (`return req_vif;`) — consumed by a `vd = call();` assignment
+    /// so accessor-style getters keep the binding. Cleared before each such
+    /// call.
+    last_vif_return: Option<String>,
     /// While a `with (item...)` filter is being evaluated over a queue whose
     /// elements are unpacked STRUCTS, `item` names no value — the element's
     /// members live in separate signals. Bind it to the element's flat name
@@ -5630,6 +5635,7 @@ impl Simulator {
             tlm_connections: HashMap::default(),
             local_iface_aliases: Vec::new(),
             viface_var_aliases: HashMap::default(),
+            last_vif_return: None,
             item_alias: None,
             dist_picked_once: HashSet::default(),
             rand_ranges: HashMap::default(),
@@ -31028,8 +31034,19 @@ impl Simulator {
                         return Some(uq.to_string());
                     }
                 }
+                // §26.3: strip a PACKAGE prefix — `P::s` flattens to the bare
+                // storage name `s` (see resolve_hier_name), so member paths
+                // like `P::s.x` become `s.x`.
+                let skip = usize::from(
+                    h.path.len() >= 2
+                        && self.module.packages.contains(&h.path[0].name.name)
+                        && !self
+                            .signal_name_to_id
+                            .contains_key(h.path[0].name.name.as_str())
+                        && !self.signals.contains_key(&h.path[0].name.name),
+                );
                 Some(
-                    h.path
+                    h.path[skip..]
                         .iter()
                         .map(|s| s.name.name.as_str())
                         .collect::<Vec<_>>()
@@ -33758,6 +33775,32 @@ impl Simulator {
                 }
             }
             ExprKind::Ident(hier) => {
+                // §26.3: a PACKAGE-scoped reference (`P::s.x` = [P, s, x])
+                // reads exactly like the bare `s.x` — the prefix carries no
+                // hierarchy at runtime, but every shape-keyed branch below
+                // (2-segment struct slices, enum members, …) would miss the
+                // 3-segment form. Strip the prefix once and re-enter.
+                if hier.path.len() >= 2
+                    && hier.path[0].selects.is_empty()
+                    && self.module.packages.contains(&hier.path[0].name.name)
+                    && !self
+                        .signal_name_to_id
+                        .contains_key(hier.path[0].name.name.as_str())
+                    && !self.signals.contains_key(&hier.path[0].name.name)
+                    && !self.module.classes.contains_key(&hier.path[0].name.name)
+                {
+                    // Keep `P::x` (len 2) on the existing paths — those work
+                    // via the bare-name fallbacks; only deeper paths need the
+                    // reshape.
+                    if hier.path.len() >= 3 {
+                        let mut stripped = hier.clone();
+                        stripped.path.remove(0);
+                        stripped.cached_signal_id = std::cell::Cell::new(None);
+                        stripped.cached_resolved_name = std::cell::OnceCell::new();
+                        let e2 = Expression::new(ExprKind::Ident(stripped), expr.span);
+                        return self.eval_expr_ctx(&e2, ctx_width);
+                    }
+                }
                 // §18.4: `<obj>.<agg_prop>.<member>` / `<agg_prop>.<member>`
                 // that parsed as a FLAT hier ident — same aggregate-class-
                 // property storage as the `MemberAccess` shape (see there).
@@ -41509,6 +41552,16 @@ impl Simulator {
                         }
                     }
                     self.return_value = Some(self.eval_expr(e));
+                    // §25.9: a returned VIRTUAL INTERFACE carries only a
+                    // sentinel value; record the instance it is bound to so
+                    // the caller's `vd = getter();` can re-establish the
+                    // alias. Guarded on the name resolving to a REAL
+                    // interface instance, so ordinary returns never match.
+                    if let Some(bound) = self.resolve_vif_rhs_name(e) {
+                        if self.is_interface_instance(&bound) {
+                            self.last_vif_return = Some(bound);
+                        }
+                    }
                 }
                 self.break_flag = true;
                 self.return_flag = true;
@@ -46547,6 +46600,26 @@ impl Simulator {
         // that guidance.
         if let Some(cached) = hier.cached_resolved_name.get() {
             return cached.clone();
+        }
+        // §26.3: a PACKAGE-scoped reference (`P::s`, `P::s.x`) resolves to the
+        // package variable's BARE storage name — the package prefix carries no
+        // hierarchy at runtime. Without this, `P::s.x` searched for a signal
+        // "P.s.x" and read x while the bare "s.x" member path worked. Only a
+        // registered package name is stripped, and never when a same-named
+        // SIGNAL exists (an instance path must win).
+        if hier.path.len() >= 2
+            && hier.path[0].selects.is_empty()
+            && self.module.packages.contains(&hier.path[0].name.name)
+            && !self.signal_name_to_id.contains_key(hier.path[0].name.name.as_str())
+            && !self.signals.contains_key(&hier.path[0].name.name)
+        {
+            let stripped: String = hier.path[1..]
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            let _ = hier.cached_resolved_name.set(stripped.clone());
+            return stripped;
         }
         let resolved = self.resolve_hier_name_uncached(hier);
         // OnceCell::set returns Err if already set (race) — ignore; value
@@ -60764,6 +60837,18 @@ impl Simulator {
                         // value path stores the null handle — keeping a
                         // later `vif == null` true.
                         self.viface_var_aliases.remove(name);
+                    } else if matches!(&rvalue.kind, ExprKind::Call { .. }) {
+                        // `vd = mgr.get_vif();` — run the call; the callee's
+                        // return recorded the bound instance (see the Return
+                        // arm). Without this, accessor-style getters returned
+                        // only the sentinel and the alias was lost.
+                        self.last_vif_return = None;
+                        let v = self.eval_expr(rvalue);
+                        if let Some(bound) = self.last_vif_return.take() {
+                            self.viface_var_aliases.insert(name.to_string(), bound);
+                        }
+                        self.assign_value(lvalue, &v);
+                        return true;
                     } else if let Some(bound) = self.resolve_vif_rhs_name(rvalue) {
                         // Only a resolved interface INSTANCE (directly, or
                         // through another vif's current binding) may bind.
@@ -61115,12 +61200,30 @@ impl Simulator {
             }
             // `obj.v` — a bound vif of another object.
             ExprKind::Ident(h) if h.path.len() == 2 => {
-                let oh = self.eval_ident_handle(&h.path[0].name.name).unwrap_or(0);
+                // §25.9: `bus.modport` — a MODPORT VIEW of a structural
+                // interface instance binds to the instance itself (a modport
+                // restricts directions; it does not create new storage).
+                // Without this, `rv = rb.driver;` bound nothing and every
+                // write through `rv` landed on a phantom copy.
+                let head = &h.path[0].name.name;
+                if self.is_interface_instance(head) {
+                    return Some(head.clone());
+                }
+                let oh = self.eval_ident_handle(head).unwrap_or(0);
                 self.virtual_iface_bindings
                     .get(&(oh, h.path[1].name.name.clone()))
                     .map(|(b, _)| b.clone())
             }
             ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 {
+                        let head = &h.path[0].name.name;
+                        // Same §25.9 modport-view case in MemberAccess shape.
+                        if self.is_interface_instance(head) {
+                            return Some(head.clone());
+                        }
+                    }
+                }
                 let oh = self.eval_handle_expr(expr).unwrap_or(0);
                 self.virtual_iface_bindings
                     .get(&(oh, member.name.clone()))
@@ -62363,6 +62466,26 @@ impl Simulator {
         } else {
             func
         };
+        // §26.3: a method call on a PACKAGE-scoped variable — `P::c.f1(x)`
+        // flattens to Ident([P, c, f1]) — dispatches exactly like the
+        // unqualified `c.f1(x)`: the package prefix contributes nothing at
+        // runtime (the variable's storage is registered under its bare name).
+        // Strip it and re-enter, so every receiver shape (class handle, enum,
+        // collection) resolves through the ordinary paths. Only a REGISTERED
+        // package name is stripped, and only when the remaining path still
+        // has a receiver + method.
+        if let ExprKind::Ident(hier) = &func.kind {
+            if hier.path.len() >= 3
+                && hier.path[0].selects.is_empty()
+                && self.module.packages.contains(&hier.path[0].name.name)
+            {
+                let mut stripped = hier.clone();
+                stripped.path.remove(0);
+                stripped.cached_signal_id = std::cell::Cell::new(None);
+                let f = Expression::new(ExprKind::Ident(stripped), func.span);
+                return self.eval_call_inner(&f, args);
+            }
+        }
         // A subroutine declared in a named generate-for scope is addressed as
         // `block[index].task(...)`. Elaboration stores each iteration under
         // that exact hierarchical key.
@@ -62888,7 +63011,12 @@ impl Simulator {
             // type_name on a signal, or extracted from a type-cast
             // receiver `enum_type'(VAL)` (parses as Call { func: Ident(type),
             // args: [...] }).
-            if matches!(mname, "first" | "last" | "next" | "prev" | "num") && args.is_empty() {
+            // §6.19.6: next/prev take an optional count (`e.next(2)`); the
+            // guard excluded ANY-arg calls, so `P::e.next(1)` fell through to
+            // the generic member-call machinery and returned 0.
+            if (matches!(mname, "first" | "last" | "num") && args.is_empty())
+                || (matches!(mname, "next" | "prev") && args.len() <= 1)
+            {
                 // Recover type from a type-cast receiver `e_t'(VAL)`. The
                 // parser drops the type prefix and parses as `Paren(VAL)`,
                 // so we search enum_members for a typedef that contains
@@ -62933,21 +63061,18 @@ impl Simulator {
                             "first" => return Value::from_u64(members[0].1, mw),
                             "last"  => return Value::from_u64(members[members.len()-1].1, mw),
                             "next" | "prev" => {
+                                let step = args
+                                    .first()
+                                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
+                                    .unwrap_or(1) as usize;
                                 let cur = self.eval_expr(expr).to_u64().unwrap_or(0);
                                 let pos = members.iter().position(|(_, v)| *v == cur);
                                 if let Some(p) = pos {
+                                    let n = members.len();
                                     let next_p = if mname == "next" {
-                                        if p + 1 >= members.len() {
-                                            0
+                                        (p + step) % n
                                     } else {
-                                            p + 1
-                                        }
-                                    } else {
-                                        if p == 0 {
-                                            members.len() - 1
-                                        } else {
-                                            p - 1
-                                        }
+                                        (p + n - (step % n)) % n
                                     };
                                     return Value::from_u64(members[next_p].1, mw);
                                 }
@@ -64246,6 +64371,28 @@ impl Simulator {
                 }
             }
 
+            // §6.19.6: enum method with ARGS through a scoped/flattened path —
+            // `P::e.next(1)` flattens to `[P, e, next]`. The no-parens form is
+            // handled at the hier-read site; the CALL form fell through to the
+            // generic machinery and returned 0. Dispatch on the second-to-last
+            // segment exactly like the array-builtin branch below.
+            if hier.path.len() >= 2 {
+                let m = hier.path.last().unwrap().name.name.as_str();
+                if matches!(m, "first" | "last" | "next" | "prev" | "num") {
+                    let bare = hier.path[hier.path.len() - 2].name.name.clone();
+                    let is_enum_var = self
+                        .type_name_of_var(&bare)
+                        .map(|tn| self.module.enum_members.contains_key(&tn))
+                        .unwrap_or(false)
+                        || self.module.enum_members.contains_key(&bare);
+                    if is_enum_var {
+                        let m = m.to_string();
+                        if let Some(v) = self.eval_builtin_method(&bare, &m, args) {
+                            return v;
+                        }
+                    }
+                }
+            }
             // Built-in array/queue method reached through a scoped or flattened
             // path, e.g. `pkg::arr.size()` flattens to `[pkg, arr, size]` — the
             // array is the second-to-last segment, not `path[0]`. Without this
@@ -75476,6 +75623,22 @@ impl Simulator {
                     .and_then(|id| self.signal_type_names.get(id).cloned())
                 {
                     return Some(t);
+                }
+                // §26.3: a PACKAGE-scoped reference (`P::e`) stores its signal
+                // under the bare leaf — the dotted spelling resolves nothing,
+                // which left `P::e.next(1)` with no type and the call fell to
+                // the generic machinery (returning 0).
+                if hier.path.len() >= 2
+                    && self.module.packages.contains(&hier.path[0].name.name)
+                {
+                    let leaf = &hier.path.last().unwrap().name.name;
+                    if let Some(t) = self
+                        .signal_name_to_id
+                        .get(leaf.as_str())
+                        .and_then(|id| self.signal_type_names.get(id).cloned())
+                    {
+                        return Some(t);
+                    }
                 }
                 // `var_class_types` / `var_typedef_types` are FLAT
                 // accumulators that are NOT cleared on scope/method exit,
