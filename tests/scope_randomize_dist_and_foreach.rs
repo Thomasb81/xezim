@@ -186,3 +186,41 @@ endmodule
     assert!(u(&sim, "c1") > u(&sim, "chi"), "plain dist still biased");
     assert_eq!(u(&sim, "ok_fixed"), 1, "fixed-array foreach still pins");
 }
+
+/// The CLASS-constraint path handles the same per-bit foreach: a constraint
+/// block iterating a packed state vector's bits and guarding a rand
+/// property's bit-selects. This is a separate solver from the inline path —
+/// rand COLLECTIONS own class foreach handling, so a packed vector fell
+/// through every arm and `constraint_unmodeled` excused it from the
+/// satisfaction check.
+#[test]
+fn class_constraint_foreach_over_packed_bits() {
+    let src = r#"
+module top;
+  class C;
+    rand bit [3:0] pattern;
+    bit [3:0] possible;
+    constraint c_bits {
+      foreach (possible[i]) {
+        if (possible[i]) { pattern[i] dist { 0 := 98, 1 := 2 }; }
+        else             { pattern[i] == 0; }
+      }
+    }
+  endclass
+  int st_all, illegal, n;
+  initial begin
+    C c;
+    c = new();
+    c.possible = 4'b1011;
+    st_all = 1;
+    for (n = 0; n < 40; n++) begin
+      if (c.randomize() != 1) st_all = 0;
+      if ((c.pattern & ~c.possible) != 0) illegal++;
+    end
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "st_all"), 1);
+    assert_eq!(u(&sim, "illegal"), 0, "bits outside `possible` stay 0 in the class path");
+}

@@ -71383,6 +71383,21 @@ impl Simulator {
                 self.solve_array_sum_eqs(&constraints, &rand_colls, &rand_set, &mut pinned_elems);
             }
 
+            // §18.5.7 foreach over a PACKED vector's bits (`foreach
+            // (possible[i]) if (possible[i]) pattern[i] dist …; else
+            // pattern[i] == 0;`). Not a rand COLLECTION, so every collection
+            // arm skips it, and `constraint_unmodeled` then excused it from
+            // the satisfaction check — the guard bits were silently ignored.
+            // Pin the bits deterministically here, after the draws.
+            for con in &constraints {
+                for item in &con.items {
+                    self.apply_packed_bit_foreach(handle, item, &rand_set);
+                }
+            }
+            for item in inline {
+                self.apply_packed_bit_foreach(handle, item, &rand_set);
+            }
+
             let mut all_ok = true;
             for con in &constraints {
                 for item in &con.items {
@@ -71666,6 +71681,190 @@ impl Simulator {
     /// stamp a `rand integer` came back unsigned and every later compare
     /// (`int_val < 0`, `int_val inside {[-100:100]}`, the satisfaction judge)
     /// silently read it as a huge positive number.
+    /// §18.5.7: a `foreach` whose iterated variable is a PACKED vector — a
+    /// state vector whose bits guard per-bit constraints on a rand property
+    /// (`if (possible[i]) pattern[i] dist {…}; else pattern[i] == 0;`). Class
+    /// collections do not cover it, so nothing applied the body. Iterate the
+    /// bits with the index bound, evaluate the guards against the instance,
+    /// and pin the constrained bits directly in the property map.
+    fn apply_packed_bit_foreach(
+        &mut self,
+        handle: usize,
+        item: &ConstraintItem,
+        rand_set: &HashSet<String>,
+    ) {
+        use crate::ast::decl::ConstraintItem as CI;
+        match item {
+            CI::Block(items) => {
+                for it in items {
+                    self.apply_packed_bit_foreach(handle, it, rand_set);
+                }
+            }
+            CI::Soft(inner) => self.apply_packed_bit_foreach(handle, inner, rand_set),
+            CI::Foreach {
+                array,
+                vars,
+                item: body,
+                ..
+            } => {
+                let Some(base) = Self::foreach_base_name(array) else {
+                    return;
+                };
+                // A rand collection / fixed rand array is owned by the
+                // collection pipeline; only a PACKED scalar property (or
+                // plain state vector) takes this path.
+                let cls = match self.heap.get(handle).and_then(|o| o.as_ref()) {
+                    Some(i) => i.class_name.clone(),
+                    None => return,
+                };
+                let is_fixed_array = self
+                    .module
+                    .classes
+                    .get(&cls)
+                    .is_some_and(|cd| cd.array_properties.contains_key(&base));
+                if is_fixed_array {
+                    return;
+                }
+                let w = match self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.properties.get(&base))
+                    .map(|v| v.width)
+                {
+                    Some(w) if w > 1 => w,
+                    _ => return,
+                };
+                let idx_var: Option<String> = vars
+                    .first()
+                    .and_then(|v| v.as_ref().map(|id| id.name.clone()));
+                let body = (**body).clone();
+                for i in 0..w as i64 {
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    if let Some(iv) = &idx_var {
+                        frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
+                    }
+                    self.local_stack.push(frame);
+                    self.apply_bit_body(handle, &body, rand_set);
+                    self.local_stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One iteration of a packed-bit foreach body: guards evaluated against
+    /// the instance, `prop[i] == K` and `prop[i] dist/inside {…}` pinned by
+    /// writing the bit into the property.
+    fn apply_bit_body(&mut self, handle: usize, item: &ConstraintItem, rand_set: &HashSet<String>) {
+        use crate::ast::decl::ConstraintItem as CI;
+        match item {
+            CI::Block(items) => {
+                for it in items {
+                    self.apply_bit_body(handle, it, rand_set);
+                }
+            }
+            CI::Soft(inner) => self.apply_bit_body(handle, inner, rand_set),
+            CI::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                if self.eval_expr(condition).is_true() {
+                    let t = (**then_item).clone();
+                    self.apply_bit_body(handle, &t, rand_set);
+                } else if let Some(ei) = else_item {
+                    let e = (**ei).clone();
+                    self.apply_bit_body(handle, &e, rand_set);
+                }
+            }
+            CI::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
+                if self.eval_expr(condition).is_true() {
+                    let c = (**constraint).clone();
+                    self.apply_bit_body(handle, &c, rand_set);
+                }
+            }
+            CI::Expr(e) => {
+                if let ExprKind::Binary {
+                    op: BinaryOp::Eq,
+                    left,
+                    right,
+                } = &e.kind
+                {
+                    if let Some((prop, bit)) = self.rand_prop_bit_select(left, rand_set) {
+                        let v = self.eval_expr(right);
+                        self.write_prop_bit(handle, &prop, bit, v.is_true());
+                    } else if let Some((prop, bit)) = self.rand_prop_bit_select(right, rand_set) {
+                        let v = self.eval_expr(left);
+                        self.write_prop_bit(handle, &prop, bit, v.is_true());
+                    }
+                }
+            }
+            CI::Inside {
+                expr,
+                range,
+                is_dist,
+                dist_weights,
+                ..
+            } => {
+                if let Some((prop, bit)) = self.rand_prop_bit_select(expr, rand_set) {
+                    let picked = if *is_dist && !dist_weights.is_empty() {
+                        self.pick_dist_value(None, range, dist_weights)
+                    } else {
+                        self.pick_from_ranges(range, 1, false)
+                    };
+                    if let Some(v) = picked {
+                        self.write_prop_bit(handle, &prop, bit, v.is_true());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `Some((prop, bit_index))` when `e` is `prop[<const-evaluable idx>]` of a
+    /// rand property.
+    fn rand_prop_bit_select(
+        &mut self,
+        e: &Expression,
+        rand_set: &HashSet<String>,
+    ) -> Option<(String, u32)> {
+        let ExprKind::Index { expr, index } = &e.kind else {
+            return None;
+        };
+        let ExprKind::Ident(h) = &expr.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let prop = h.path[0].name.name.clone();
+        if !rand_set.contains(&prop) {
+            return None;
+        }
+        let idx = (**index).clone();
+        let i = self.eval_expr(&idx).to_i64()?;
+        u32::try_from(i).ok().map(|b| (prop, b))
+    }
+
+    /// Set bit `bit` of instance property `prop` to `on`.
+    fn write_prop_bit(&mut self, handle: usize, prop: &str, bit: u32, on: bool) {
+        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+            if let Some(cur) = inst.properties.get(prop) {
+                let mut v = cur.clone();
+                if (bit as usize) < v.width as usize {
+                    v.set_bit(bit as usize, if on { LogicBit::One } else { LogicBit::Zero });
+                    inst.properties.insert(prop.to_string(), v);
+                }
+            }
+        }
+    }
+
     fn set_prop_if_changed(&mut self, handle: usize, name: &str, val: Value) -> bool {
         let mut val = val;
         if !val.is_signed && !val.is_real && self.class_prop_signed_of(handle, name) {
