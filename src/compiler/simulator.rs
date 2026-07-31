@@ -33707,6 +33707,23 @@ impl Simulator {
         }
     }
 
+    /// A signed integer literal, possibly under unary minus/plus or parens —
+    /// the shapes whose ===/!== widening sign-extends by consensus.
+    fn expr_is_signed_literal(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { signed, .. }) => *signed,
+            ExprKind::Unary { op, operand } => {
+                matches!(op, crate::ast::expr::UnaryOp::Minus | crate::ast::expr::UnaryOp::Plus)
+                    && matches!(
+                        &operand.kind,
+                        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { .. })
+                    )
+            }
+            ExprKind::Paren(inner) => Self::expr_is_signed_literal(inner),
+            _ => false,
+        }
+    }
+
     /// A streaming concatenation, looking through parentheses.
     fn expr_is_stream(e: &Expression) -> bool {
         match &e.kind {
@@ -34687,6 +34704,34 @@ impl Simulator {
                         _ => ord.is_ge(),
                     };
                     return Value::from_u64(t as u64, 1);
+                }
+                // ===/!==/==?/!=? widening of a signed INTEGER LITERAL: the
+                // commercial consensus sign-extends `-16` against a wider
+                // unsigned operand (`u64 !== -16` is false for 64'hFF..F0)
+                // while a signed VARIABLE in the same position zero-extends
+                // per the propagated unsigned type. The distinction lives in
+                // the EXPRESSION (literal vs variable), so it is applied here
+                // rather than in Value::case_eq.
+                if matches!(
+                    op,
+                    BinaryOp::CaseEq
+                        | BinaryOp::CaseNeq
+                        | BinaryOp::WildcardEq
+                        | BinaryOp::WildcardNeq
+                ) {
+                    let (mut a, mut b) = (wl, wr);
+                    if a.is_signed && a.width < b.width && Self::expr_is_signed_literal(left) {
+                        a = a.resize(b.width);
+                    }
+                    if b.is_signed && b.width < a.width && Self::expr_is_signed_literal(right) {
+                        b = b.resize(a.width);
+                    }
+                    return match op {
+                        BinaryOp::CaseEq => a.case_eq(&b),
+                        BinaryOp::CaseNeq => a.case_eq(&b).logic_not(),
+                        BinaryOp::WildcardEq => a.wildcard_eq(&b),
+                        _ => a.wildcard_ne(&b),
+                    };
                 }
                 match op {
                     BinaryOp::Add => wl.add(&wr),
@@ -72788,6 +72833,45 @@ impl Simulator {
         let mut val = val;
         if !val.is_signed && !val.is_real && self.class_prop_signed_of(handle, name) {
             val.is_signed = true;
+        }
+        // §8.10: a STATIC property is one shared variable — a write through
+        // `this.prop` / `handle.prop` must land in the class-static cell, not
+        // create a per-instance copy (which then shadowed the static on every
+        // later read from THAT instance while every other instance still saw
+        // the old value).
+        if let Some(Some(inst)) = self.heap.get(handle) {
+            let cn = inst.class_name.clone();
+            if let Some(cd) = self.module.classes.get(&cn) {
+                // Only genuine `static` members — param_defaults (class
+                // localparams) also satisfy static_prop_key but are constants.
+                let is_static = {
+                    let mut cur = Some(cn.clone());
+                    let mut found = false;
+                    while let Some(c) = cur {
+                        match self.module.classes.get(&c) {
+                            Some(cdef) => {
+                                if cdef.static_properties.contains(name) {
+                                    found = true;
+                                    break;
+                                }
+                                cur = cdef.extends.clone();
+                            }
+                            None => break,
+                        }
+                    }
+                    let _ = cd;
+                    found
+                };
+                if is_static {
+                    if let Some(key) = self.static_prop_key(&cn, name) {
+                        let changed = self.class_statics.get(&key) != Some(&val);
+                        if changed {
+                            self.class_statics.insert(key, val);
+                        }
+                        return changed;
+                    }
+                }
+            }
         }
         if let Some(Some(inst)) = self.heap.get_mut(handle) {
             if inst.properties.get(name).is_none_or(|cur| *cur != val) {
