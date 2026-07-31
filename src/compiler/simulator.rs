@@ -31566,12 +31566,28 @@ impl Simulator {
                     .filter(|w| *w > 0)
                     .unwrap_or(val.width);
                 let is_real = self.real_signals.contains(&name);
+                // §6.16: a string has no declared length — for a `string`
+                // LOCAL the widths-map entry is the 1024-bit placeholder
+                // `resolve_type_width` hands the dynamic type, and resizing to
+                // it truncates the FRONT of the text (a packed string keeps
+                // its text in the low bits). Module-level strings are exempt
+                // via `signal_is_string` on the signal-table path; this
+                // map-backed store is where PROCEDURAL LOCALS land, so exempt
+                // them here too. Issue #64: a 129-char `$system` command came
+                // back as 128 chars shifted one byte left ("echo …" → "cho …").
+                let is_str = self.string_signals.contains(&name)
+                    || hier
+                        .path
+                        .last()
+                        .is_some_and(|s| self.string_signals.contains(&s.name.name));
                 let mut resized = if is_real {
                     if val.is_real {
                         val.clone()
                     } else {
                         Value::from_f64(val.to_f64())
                     }
+                } else if is_str && !val.is_real {
+                    val.clone()
                 } else {
                     if val.is_real {
                         Self::real_to_int(val.to_f64(), width)
