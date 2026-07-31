@@ -4337,6 +4337,55 @@ impl Simulator {
     /// global, `foreach` over the member missed the data entirely and
     /// iterated a junk fallback, and a `ref`-writeback caller saw one zero
     /// element instead of the pushed contents.
+    /// §7.4.1: a packed-struct MEMBER that is itself a packed multi-D vector
+    /// (`struct packed { bit [7:0][7:0] a; ... } foo;`) needs `foo.a` in the
+    /// packed-element tables, or `foo.a[5] = v` degrades to a single-BIT
+    /// select (and, worse, silently no-ops through the struct fallback while
+    /// the RANGE form `foo.a[2:1]` works — which is exactly how it hid).
+    /// Derives each member's element shape from the declared struct type and
+    /// registers the dotted path alongside the flattened field layout.
+    fn register_struct_member_packed_dims(module: &mut ElaboratedModule) {
+        use crate::ast::types::DataType;
+        let vars: Vec<String> = module.packed_struct_fields.keys().cloned().collect();
+        for var in vars {
+            let Some(dt) = module.var_decl_types.get(&var).cloned() else {
+                continue;
+            };
+            let resolved = match &dt {
+                DataType::TypeReference { name, .. } => module
+                    .typedef_types
+                    .get(&name.name.name)
+                    .cloned()
+                    .unwrap_or(dt.clone()),
+                _ => dt.clone(),
+            };
+            let DataType::Struct(su) = resolved else { continue };
+            if !su.packed {
+                continue;
+            }
+            for member in &su.members {
+                let Some(ew) = super::elaborate::packed_inner_elem_width(
+                    &member.data_type,
+                    &module.parameters,
+                    &module.typedefs,
+                ) else {
+                    continue;
+                };
+                let fdims = super::elaborate::packed_full_dims_of(
+                    &member.data_type,
+                    &module.parameters,
+                );
+                for mdecl in &member.declarators {
+                    let key = format!("{}.{}", var, mdecl.name.name);
+                    module.packed_signal_elem_widths.entry(key.clone()).or_insert(ew);
+                    if let Some(fd) = &fdims {
+                        module.packed_full_dims.entry(key).or_insert_with(|| fd.clone());
+                    }
+                }
+            }
+        }
+    }
+
     fn classify_typedef_collection_properties(module: &mut ElaboratedModule) {
         use crate::ast::types::{SimpleType, UnpackedDimension as UD};
         let mut classes: Vec<String> = module.classes.keys().cloned().collect();
@@ -4758,6 +4807,7 @@ impl Simulator {
         // collection typedef must be classified as a queue/assoc/array member
         // — elaborate_class only saw the class's OWN local typedefs.
         Self::classify_typedef_collection_properties(&mut module);
+        Self::register_struct_member_packed_dims(&mut module);
         let materialize_ms = phase_materialize.elapsed().as_secs_f64() * 1000.0;
 
         // Collect just *names* from the two source maps and sort them
@@ -30122,7 +30172,19 @@ impl Simulator {
                     }
                 }
                 let w = self.infer_lhs_width(lhs);
-                let val = self.eval_expr_ctx(rhs, w).resize(w);
+                // §7.4.2/§10.9: `assign x = '{...}` (or `assign x[i] = '{...}`
+                // on an array of packed vectors) converts each item to the
+                // ELEMENT type. The generic eval concatenates items at their
+                // own widths, which scrambles any item that is not exactly
+                // element-sized.
+                let val = if let ExprKind::AssignmentPattern(items) = &rhs.kind {
+                    self.packed_pattern_for_lhs(lhs, items)
+                        .or_else(|| self.eval_packed_struct_pattern(lhs, items))
+                        .unwrap_or_else(|| self.eval_expr_ctx(rhs, w))
+                        .resize(w)
+                } else {
+                    self.eval_expr_ctx(rhs, w).resize(w)
+                };
                 let delay = if *explicit_delay > 0 {
                     *explicit_delay
                 } else {
@@ -31169,7 +31231,24 @@ impl Simulator {
                     continue;
                 }
             }
-            let piece = self.eval_expr_ctx(e, *w).resize(*w);
+            let piece = if let ExprKind::AssignmentPattern(sub) = &e.kind {
+                // A nested pattern on a NON-struct member (a packed vector,
+                // `bit [2:0][3:0] y` with `'{4,5,6}`): split the member width
+                // evenly across the positional items — the generic eval would
+                // concat the items at their own widths. The empty-dims call
+                // derives the element count from the item list itself.
+                self.packed_pattern_value(sub, &[], *w)
+                    .unwrap_or_else(|| self.eval_expr_ctx(e, *w).resize(*w))
+            } else {
+                let raw = self.eval_expr_ctx(e, *w);
+                if raw.is_real {
+                    // §6.12.2: a real item CONVERTS (rounds) to the member
+                    // type; resize would reinterpret its IEEE-754 bits.
+                    Self::real_to_int(raw.to_f64(), *w)
+                } else {
+                    raw.resize(*w)
+                }
+            };
             let dst = off - base_offset;
             for b in 0..*w {
                 acc.set_bit((dst + b) as usize, piece.get_bit(b as usize));
@@ -31194,7 +31273,7 @@ impl Simulator {
         } else {
             lhs
         };
-
+        
         // §7.4.6 / §11.5.1: an ELEMENT index containing x or z selects nothing,
         // so the write is discarded — `a['hx] = v` must leave every element
         // alone. The index folded to 0 through `to_u64`, so it silently
@@ -31752,7 +31831,27 @@ impl Simulator {
                         ExprKind::MemberAccess { .. } => (self.flat_member_name(expr), false),
                         _ => (None, false),
                     };
-                    if let Some(base) = base {
+                    // A member of a PACKED struct is a bit-slice of the
+                    // parent signal, not element storage — `foo.a[5] = v` on
+                    // `struct packed { bit [7:0][7:0] a; ... } foo;` must
+                    // splice into `foo`. Creating a phantom "foo.a[5]" here
+                    // swallowed the write silently (the RANGE form worked,
+                    // which is how it hid). Skip so it reaches the packed
+                    // element/bit-select arms below.
+                    let base_is_packed_member = |sim: &Self, b: &str| -> bool {
+                        if sim.module.packed_signal_elem_widths.contains_key(b) {
+                            return true;
+                        }
+                        b.rsplit_once('.').is_some_and(|(root, leaf)| {
+                            sim.module
+                                .packed_struct_fields
+                                .get(root)
+                                .is_some_and(|fs| fs.iter().any(|(f, _, _)| {
+                                    f == leaf || f.starts_with(&format!("{}.", leaf))
+                                }))
+                        })
+                    };
+                    if let Some(base) = base.filter(|b| !base_is_packed_member(self, b)) {
                     if !self.signal_name_to_id.contains_key(base.as_str())
                         && !self.signals.contains_key(&base)
                     {
@@ -33051,6 +33150,45 @@ impl Simulator {
                                         self.mark_dirty(&arr_name);
                                     }
                                     return changed;
+                                }
+                            }
+                            // `foo.a[i][msb:lsb]` where `a` is a packed
+                            // multi-D MEMBER of a packed struct: no signal
+                            // exists under the dotted name — splice at
+                            // field_offset + i*elem_w + lsb within the ROOT
+                            // signal (§7.4.1).
+                            if let Some((root, leaf)) = arr_name.rsplit_once('.') {
+                                let field_off = self
+                                    .module
+                                    .packed_struct_fields
+                                    .get(root)
+                                    .and_then(|fs| {
+                                        fs.iter().find(|(f, _, _)| f == leaf).map(|(_, o, _)| *o)
+                                    });
+                                if let (Some(field_off), Some(&id)) =
+                                    (field_off, self.signal_name_to_id.get(root))
+                                {
+                                    let total_w = self.signal_widths[id] as usize;
+                                    let alo = field_off as usize + lo;
+                                    let ahi = field_off as usize + hi;
+                                    if ahi < total_w {
+                                        let mut cur = self.signal_table[id].clone();
+                                        let mut changed = false;
+                                        for i in alo..=ahi {
+                                            let nb = val.get_bit(i - alo);
+                                            if cur.get_bit(i) != nb {
+                                                cur.set_bit(i, nb);
+                                                changed = true;
+                                            }
+                                        }
+                                        if changed {
+                                            self.signal_table[id] = cur;
+                                            self.table_modified = true;
+                                            self.after_signal_write(id);
+                                            self.mark_dirty(root);
+                                        }
+                                        return changed;
+                                    }
                                 }
                             }
                         }
@@ -34594,10 +34732,42 @@ impl Simulator {
                     } else {
                         t.merge_unknown(&e)
                     }
-                } else if c.is_true() {
-                    self.eval_expr_ctx(then_expr, ctx_width)
                 } else {
-                    self.eval_expr_ctx(else_expr, ctx_width)
+                    let (taken, other): (&Expression, &Expression) = if c.is_true() {
+                        (then_expr, else_expr)
+                    } else {
+                        (else_expr, then_expr)
+                    };
+                    let mut v = self.eval_expr_ctx(taken, ctx_width);
+                    // §11.4.11 + §11.8.1: BOTH branches determine the result
+                    // type. If either is unsigned the result is unsigned, and
+                    // the narrower branch is then extended by the RESULT's
+                    // signedness — `x ? s : x` with `shortint s = -1` and
+                    // `int unsigned x` is 65535, not -1. Only the taken branch
+                    // is evaluated for its VALUE; the other is consulted for
+                    // its type — and only when it is a bare identifier or
+                    // literal. That keeps the probe side-effect-free AND cheap:
+                    // probing an arbitrary expression re-evaluated it, which
+                    // doubles the work in hot loops and goes EXPONENTIAL on
+                    // nested ternaries (each level probes a branch that itself
+                    // probes both of its branches — two ivtest cases went from
+                    // pass to TIMEOUT before this was narrowed).
+                    let other_is_cheap = matches!(
+                        &other.kind,
+                        ExprKind::Ident(_) | ExprKind::Number(_)
+                    );
+                    if !v.is_real && other_is_cheap {
+                        let o = self.eval_expr_ctx(other, ctx_width);
+                        if !o.is_real {
+                            if !o.is_signed {
+                                v.is_signed = false;
+                            }
+                            if o.width > v.width {
+                                v = v.resize(o.width);
+                            }
+                        }
+                    }
+                    v
                 }
             }
             ExprKind::Concatenation(parts) => {
@@ -57015,7 +57185,23 @@ impl Simulator {
                 }
             }
         }
-        let v = self.eval_expr(e);
+        // §10.9.2: each item is evaluated in the context of the ELEMENT type —
+        // `int d[]; d = '{1'b1 + 1'b1}` is 2, not a 1-bit wrap to 0, and a
+        // signed narrower item sign-extends. Self-determined evaluation gave
+        // the wrapped/zero-extended value.
+        let elem_w = super::elaborate::resolve_type_width(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        let mut v = if elem_w > 0 {
+            self.eval_expr_ctx(e, elem_w)
+        } else {
+            self.eval_expr(e)
+        };
+        if elem_w > 0 && !v.is_real && v.width != elem_w {
+            v = v.resize_for_assign(elem_w);
+        }
         // A `real` leaf keeps its real value even when the element signal was
         // never flagged real (array elements are synthesized without the flag);
         // otherwise `real m[3] = '{1.5, ...}` truncates to integers.
@@ -57499,6 +57685,110 @@ impl Simulator {
     ///
     /// Returns false when `base` really IS a single signal (a scalar, a packed
     /// struct, an array of packed elements) — those keep the packed path.
+    /// Build the packed value for a positional pattern applied to a packed
+    /// multi-D target. `dims` are the DECLARED packed dims outermost-first;
+    /// each nesting level consumes one. Returns None when the shape cannot be
+    /// honored (item count mismatch and no default) so the caller can fall
+    /// back rather than store garbage.
+    fn packed_pattern_value(
+        &mut self,
+        items: &[AssignmentPatternItem],
+        dims: &[(i64, i64)],
+        total_w: u32,
+    ) -> Option<Value> {
+        let count: u64 = match dims.first() {
+            Some(&(l, r)) => (l - r).unsigned_abs() + 1,
+            None => items.len() as u64,
+        };
+        if count == 0 || total_w == 0 || total_w as u64 % count != 0 {
+            return None;
+        }
+        let elem_w = total_w / count as u32;
+        // Positional items, with `default:` filling any positions not given.
+        let mut default_v: Option<Value> = None;
+        let mut ordered: Vec<&Expression> = Vec::new();
+        for item in items {
+            match item {
+                AssignmentPatternItem::Ordered(e) => ordered.push(e),
+                AssignmentPatternItem::Default(e) => {
+                    let dv = self.eval_expr(e);
+                    default_v = Some(self.fit_pattern_item_value(dv, elem_w));
+                }
+                _ => return None,
+            }
+        }
+        if default_v.is_none() && ordered.len() as u64 != count {
+            return None;
+        }
+        let mut acc = Value::zero(0);
+        for k in (0..count as usize).rev() {
+            let ev = match ordered.get(k) {
+                Some(e) => {
+                    if let ExprKind::AssignmentPattern(sub) = &e.kind {
+                        self.packed_pattern_value(sub, dims.get(1..).unwrap_or(&[]), elem_w)?
+                    } else {
+                        let v = self.eval_expr(e);
+                        self.fit_pattern_item_value(v, elem_w)
+                    }
+                }
+                None => default_v.clone()?,
+            };
+            acc = ev.concat_with(&acc);
+        }
+        Some(acc)
+    }
+
+    /// Convert one pattern item to the element type: reals round (§6.12.2),
+    /// everything else fits by ordinary assignment resize.
+    fn fit_pattern_item_value(&self, v: Value, elem_w: u32) -> Value {
+        if v.is_real {
+            Self::real_to_int(v.to_f64(), elem_w)
+        } else {
+            v.resize_for_assign(elem_w)
+        }
+    }
+
+    /// Packed-pattern value for an assignment TARGET (bare packed vector, or
+    /// an element of an unpacked array of packed vectors). None when the
+    /// target has no registered packed element shape.
+    fn packed_pattern_for_lhs(
+        &mut self,
+        lhs: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> Option<Value> {
+        let (name, is_elem) = match &lhs.kind {
+            ExprKind::Ident(h) => (self.resolve_hier_name(h), false),
+            ExprKind::Index { expr, .. } => {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    (self.resolve_hier_name(h), true)
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        let elem_w = *self.module.packed_signal_elem_widths.get(&name)?;
+        let _ = elem_w;
+        let total_w = if is_elem {
+            self.module.arrays.get(&name).map(|t| t.2)?
+        } else {
+            if self.module.arrays.contains_key(&name) {
+                return None; // whole-array target: the unpacked path owns it
+            }
+            self.lookup_signal_width(&name)?
+        };
+        let dims: Vec<(i64, i64)> = self
+            .module
+            .packed_full_dims
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| {
+                let ew = self.module.packed_signal_elem_widths[&name] as i64;
+                vec![((total_w as i64 / ew) - 1, 0)]
+            });
+        self.packed_pattern_value(items, &dims, total_w)
+    }
+
     fn assign_pattern_aggregate(&mut self, base: &str, items: &[AssignmentPatternItem]) -> bool {
         if items.is_empty() {
             return false;
@@ -57558,6 +57848,37 @@ impl Simulator {
                 }
                 self.set_queue_size(base, exprs.len() as u64);
                 return true;
+            }
+        }
+
+        // §7.4.2/§10.9: a positional pattern onto a PACKED multi-D vector —
+        // `bit [3:0][3:0] x; x = '{1'b1, 2, 3.0, "TEST"};` — converts each
+        // item to the ELEMENT type and packs MSB-element-first, recursing one
+        // packed dimension per nesting level (a nested `'{...}` inside a 4-bit
+        // element splits it into four 1-bit sub-elements). Falling through to
+        // the generic eval concatenated the items at their OWN widths, so a
+        // 1-bit item shifted every later element. Real items convert (§6.12.2
+        // rounds), strings keep their low bits.
+        if !self.module.arrays.contains_key(base)
+            && self.module.packed_signal_elem_widths.contains_key(base)
+        {
+            if let Some(total_w) = self.lookup_signal_width(base) {
+                let dims: Vec<(i64, i64)> = self
+                    .module
+                    .packed_full_dims
+                    .get(base)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let ew = self.module.packed_signal_elem_widths[base] as i64;
+                        vec![((total_w as i64 / ew) - 1, 0)]
+                    });
+                if let Some(v) = self.packed_pattern_value(items, &dims, total_w) {
+                    self.set_signal_value_by_name(base, v);
+                    if !self.in_edge_block {
+                        self.settle_combinatorial();
+                    }
+                    return true;
+                }
             }
         }
 
@@ -67461,7 +67782,19 @@ impl Simulator {
                 if Self::expr_contains_call(&init) {
                     continue;
                 }
-                let val = self.eval_expr(&init);
+                let mut val = self.eval_expr(&init);
+                // §11.8.1: the re-evaluated initializer must be stamped with
+                // the PROPERTY's declared signedness and width, not the
+                // literal's. `bit [15:0] u = -1;` otherwise stored a signed
+                // value and `c.u > 0` compared as -1 rather than 65535.
+                if let Some(sig) = cdef.properties.get(&pname) {
+                    if !sig.is_real && !val.is_real {
+                        if sig.width > 0 && val.width != sig.width {
+                            val = val.resize(sig.width);
+                        }
+                        val.is_signed = sig.is_signed;
+                    }
+                }
                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
                     inst.properties.insert(pname, val);
                 }
@@ -74813,6 +75146,38 @@ impl Simulator {
                             if w > 0 && w != ret.width {
                                 ret = ret.resize_for_assign(w);
                             }
+                        }
+                    }
+                    // §13.4.1: a class method's return takes its DECLARED type,
+                    // exactly as a module-level function's does. Only the
+                    // parameter-sized case above was handled, so
+                    // `function bit [15:0] u; return -1;` handed back the
+                    // literal's signedness and `c.u() > 0` read it as -1.
+                    if let ClassMethodKind::Function(f) = &method.kind {
+                        // Only PLAINLY integral declared types are stamped — a
+                        // TypeReference may name a class (the return is a heap
+                        // HANDLE whose "width" is meaningless and whose value
+                        // must pass through untouched), and Implicit means no
+                        // declared type at all. The first version of this stamp
+                        // resized those and broke handle-returning methods.
+                        let plainly_integral = matches!(
+                            f.return_type,
+                            DataType::IntegerVector { .. } | DataType::IntegerAtom { .. }
+                        );
+                        if plainly_integral
+                            && !ret.is_real
+                            && !ret_is_string
+                            && dyn_ret_type.is_none()
+                        {
+                            let w = resolve_type_width(
+                                &f.return_type,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            );
+                            if w > 0 && w != ret.width {
+                                ret = ret.resize(w);
+                            }
+                            ret.is_signed = super::elaborate::is_type_signed(&f.return_type);
                         }
                     }
                     // Snapshot output/ref formal values before dropping locals.
