@@ -53209,6 +53209,22 @@ impl Simulator {
                     left,
                     right,
                 } => {
+                    // §18.5.9: `arr.size() == N` on a dynamic-array target
+                    // SIZES the array (`new[N]` semantics, elements random).
+                    // Nothing handled it, so the call reported success with
+                    // the array left at its old size — the ubiquitous
+                    // `std::randomize(list) with { list.size() == N; }` idiom
+                    // silently produced an empty list.
+                    if let Some(arr) = self.size_call_on_target(left, targets) {
+                        let n = self.eval_expr(right).to_i64().unwrap_or(0).max(0) as u64;
+                        self.resize_random_dyn_target(&arr, n);
+                        return;
+                    }
+                    if let Some(arr) = self.size_call_on_target(right, targets) {
+                        let n = self.eval_expr(left).to_i64().unwrap_or(0).max(0) as u64;
+                        self.resize_random_dyn_target(&arr, n);
+                        return;
+                    }
                     if let Some(lv) = self.target_for(left, targets) {
                         let v = self.eval_expr(right);
                         self.assign_value(&lv, &v);
@@ -53244,6 +53260,37 @@ impl Simulator {
                 dist_weights,
                 ..
             } => {
+                // §18.3/§11.5.1: the constrained term may be a BIT or PART
+                // SELECT of a target (`pattern[i] dist {0 := 98, 1 := 2}`,
+                // the per-bit shape a foreach over a packed vector produces).
+                // `target_for` matches whole variables only, so these picked
+                // nothing and the dist/inside was silently dropped.
+                if self.target_for(expr, targets).is_none()
+                    && self.is_select_of_target(expr, targets)
+                {
+                    let picked = if *is_dist && !dist_weights.is_empty() {
+                        self.pick_dist_value(None, range, dist_weights)
+                    } else {
+                        let rs: Vec<Expression> = range
+                            .iter()
+                            .map(|r| match r {
+                                ConstraintRange::Value(e) => e.clone(),
+                                ConstraintRange::Range { lo, hi } => Expression::new(
+                                    ExprKind::Range(
+                                        Box::new((*lo).clone()),
+                                        Box::new((*hi).clone()),
+                                    ),
+                                    lo.span,
+                                ),
+                            })
+                            .collect();
+                        self.pick_inside_value(&rs)
+                    };
+                    if let Some(v) = picked {
+                        self.assign_value(expr, &v);
+                    }
+                    return;
+                }
                 if let Some(lv) = self.target_for(expr, targets) {
                     let picked = if *is_dist && !dist_weights.is_empty() {
                         // §18.12 `std::randomize(v) with { v dist {...} }` — no
@@ -53320,6 +53367,12 @@ impl Simulator {
                     let (lo, hi) = self
                         .foreach_dims(&arr_name)
                         .and_then(|d| d.first().copied())
+                        // A DYNAMIC array registers the sentinel bounds
+                        // (0, -1), which made this loop EMPTY — the whole
+                        // foreach body silently applied to nothing, so
+                        // `std::randomize(list) with { foreach ... }` left
+                        // every element unconstrained. Use the live size.
+                        .filter(|&(l, h)| h >= l)
                         .unwrap_or_else(|| (0, self.get_queue_size(&arr_name) as i64 - 1));
                     let elem_w = self
                         .module
@@ -53343,9 +53396,84 @@ impl Simulator {
                         self.solve_inline_foreach_elem(item, &arr_name, i, elem_w);
                         self.local_stack.pop();
                     }
+                } else if let Some(w) = Self::plain_ident_name(base)
+                    .and_then(|n| self.lookup_signal_width(&n))
+                    .filter(|&w| w > 1)
+                {
+                    // §18.5.7 foreach over a PACKED vector's bits
+                    // (`foreach (possible[i]) …`) — often a STATE vector whose
+                    // bits GUARD constraints on bit-selects of the target
+                    // (`if (possible[i]) pattern[i] dist …; else pattern[i]==0;`).
+                    // There is no unpacked array to solve elements of, so bind
+                    // the index and apply the body as ordinary inline
+                    // constraints — the select-aware equality/dist arms write
+                    // through `target[i]`.
+                    let idx_var: Option<String> = vars
+                        .first()
+                        .and_then(|v| v.as_ref().map(|id| id.name.clone()));
+                    for i in 0..w as i64 {
+                        let mut frame: HashMap<String, Value> = HashMap::default();
+                        if let Some(iv) = &idx_var {
+                            frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
+                        }
+                        self.local_stack.push(frame);
+                        self.apply_inline_constraint(item, targets);
+                        self.local_stack.pop();
+                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// `Some(array_name)` when `e` is `<target>.size()` / `<target>.len()` on a
+    /// dynamic-array/queue scope-randomize target.
+    fn size_call_on_target(
+        &mut self,
+        e: &Expression,
+        targets: &[(String, Expression)],
+    ) -> Option<String> {
+        let ExprKind::Call { func, args } = &e.kind else {
+            return None;
+        };
+        if !args.is_empty() {
+            return None;
+        }
+        let ExprKind::MemberAccess { expr, member } = &func.kind else {
+            return None;
+        };
+        if member.name != "size" && member.name != "len" {
+            return None;
+        }
+        let lv = self.target_for(expr, targets)?;
+        let ExprKind::Ident(h) = &lv.kind else {
+            return None;
+        };
+        let nm = self.resolve_hier_name(h);
+        if self.module.dynamic_arrays.contains(&nm) || self.module.arrays.contains_key(&nm) {
+            Some(nm)
+        } else {
+            None
+        }
+    }
+
+    /// `new[n]`-style resize of a dynamic-array randomize target: set the size
+    /// and draw a fresh random value for every element (they are rand and
+    /// otherwise unconstrained; later constraint items may overwrite).
+    fn resize_random_dyn_target(&mut self, arr: &str, n: u64) {
+        use rand::Rng;
+        let w = self
+            .module
+            .arrays
+            .get(arr)
+            .map(|t| t.2)
+            .unwrap_or(32)
+            .max(1);
+        self.set_queue_size(arr, n);
+        for i in 0..n {
+            let r: u64 = self.cur_rng().gen();
+            let masked = if w >= 64 { r } else { r & ((1u64 << w) - 1) };
+            self.set_signal_value_by_name(&format!("{}[{}]", arr, i), Value::from_u64(masked, w));
         }
     }
 
