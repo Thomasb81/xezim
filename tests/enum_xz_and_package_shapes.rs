@@ -163,3 +163,44 @@ endmodule
     assert_eq!(u(&sim, "via_int") as u32 as i32, -20);
     assert_eq!(u(&sim, "both_u"), 1, "unsigned member stays unsigned");
 }
+
+/// §7.4.1 ASCENDING packed dims (`[0:N-1]`) mirror slot order — element 0 is
+/// the TOP slot, and within an ascending element type bit label 0 is the MSB
+/// (ivtest `br884` unaligned packed-array access + `struct10`'s `bar` half).
+/// Three layers were unmirrored: element offsets in single-element writes,
+/// inner bit labels in `arr[i][m:l]` writes, and single-dim ascending STRUCT
+/// MEMBERS (`bit [0:15] b; b[14:15]` is the LOW two bits) — the last guarded
+/// to single-dim members only, since element scaling already normalizes
+/// multi-dim ones.
+#[test]
+fn ascending_packed_dims_mirror_slots() {
+    let src = r#"
+module test;
+  logic [0:3][3:0] lt;
+  struct packed { bit [0:7][7:0] a; bit [0:15] b; } bar;
+  logic [15:0] lt_after_e0, lt_after_range, bar_b1, bar_b2;
+  logic [63:0] bar_a1, bar_a2;
+  initial begin
+    lt = '0; lt[0] = 4'hF;            // ascending: element 0 = TOP nibble
+    lt_after_e0 = lt;
+    lt = '0; lt[0][1:0] = 2'b11;      // inner [3:0] descending: low 2 bits of the top nibble
+    lt_after_range = lt;
+    bar = '0; bar.b = '1; bar.b[14:15] = '0;  // ascending member: labels 14,15 = LOW bits
+    bar_b1 = bar.b;
+    bar = '0; bar.b = '1; bar.b[0:1] = '0;    // labels 0,1 = TOP bits
+    bar_b2 = bar.b;
+    bar = '0; bar.a[5:6] = 16'h1234;  // ascending elements 5,6 = slots 2,1
+    bar_a1 = bar.a;
+    bar = '0; bar.a[2] = 8'h42;       // element 2 = slot 5
+    bar_a2 = bar.a;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "lt_after_e0"), 0xF000, "element 0 is the top slot");
+    assert_eq!(u(&sim, "lt_after_range"), 0x3000, "inner labels stay descending");
+    assert_eq!(u(&sim, "bar_b1"), 0xFFFC, "labels 14:15 are the low bits");
+    assert_eq!(u(&sim, "bar_b2"), 0x3FFF, "labels 0:1 are the top bits");
+    assert_eq!(u(&sim, "bar_a1"), 0x0000_0000_0012_3400, "element range mirrors");
+    assert_eq!(u(&sim, "bar_a2"), 0x0000_4200_0000_0000, "single element mirrors");
+}
