@@ -39734,6 +39734,60 @@ impl Simulator {
                     }
                     None => rvalue,
                 };
+                // §9.4.5 intra-assignment EVENT control on an NBA
+                // (`lhs <= [repeat(n)] @(edge sig) rhs`, canonicalized to
+                // `$__xz_intra_ev(n, edge, sig, rhs)`). Only the BLOCKING arm
+                // handled the marker, so this rvalue fell through to plain
+                // eval — an unknown system call, i.e. ZERO — and the NBA
+                // posted 0 immediately, clobbering the variable instead of
+                // updating it at the n-th edge. Capture the RHS NOW, spawn a
+                // one-shot process that waits the events and posts the saved
+                // value as an ordinary NBA; the CURRENT process continues
+                // without blocking (that is what makes it nonblocking).
+                if let ExprKind::SystemCall { name, args } = &rvalue.kind {
+                    if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
+                        let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(1) as i64;
+                        let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
+                        let val = self.eval_expr(&args[3]);
+                        let saved = self.make_intra_saved_expr(val, rvalue.span);
+                        let edge = match edge_code {
+                            1 => Some(Edge::Posedge),
+                            2 => Some(Edge::Negedge),
+                            _ => None,
+                        };
+                        let mut cont: Vec<Statement> = Vec::new();
+                        for _ in 0..n_val.max(0) {
+                            cont.push(Statement::new(
+                                StatementKind::TimingControl {
+                                    control: TimingControl::Event(EventControl::EventExpr(vec![
+                                        EventExpr {
+                                            edge,
+                                            expr: args[2].clone(),
+                                            iff: None,
+                                            span: stmt.span,
+                                        },
+                                    ])),
+                                    stmt: Box::new(Statement::new(StatementKind::Null, stmt.span)),
+                                },
+                                stmt.span,
+                            ));
+                        }
+                        cont.push(Statement::new(
+                            StatementKind::NonblockingAssign {
+                                lvalue: lvalue.clone(),
+                                delay: None,
+                                rvalue: saved,
+                            },
+                            stmt.span,
+                        ));
+                        let child = self.next_pid;
+                        self.next_pid += 1;
+                        self.process_origin
+                            .insert(child, (stmt.span, "intra-assignment event NBA"));
+                        self.event_queue.schedule(self.time, child, cont);
+                        return;
+                    }
+                }
                 // A named/ordered/default pattern driven onto a PACKED struct
                 // (or sub-member) must be laid out by member offset, not
                 // blind-concatenated — see try_assign_packed_struct_pattern.
