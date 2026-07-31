@@ -204,3 +204,60 @@ endmodule
     assert_eq!(u(&sim, "bar_a1"), 0x0000_0000_0012_3400, "element range mirrors");
     assert_eq!(u(&sim, "bar_a2"), 0x0000_4200_0000_0000, "single element mirrors");
 }
+
+/// §6.16: string equality is by TEXT and 2-state — an out-of-bounds read of a
+/// string queue/dynamic array stores x bits whose text is "", and the compare
+/// against "" must be 1, not X (ivtest `sv_queue_oob_string`,
+/// `sv_darray_oob_string`).
+#[test]
+fn oob_string_collection_reads_compare_empty() {
+    let src = r#"
+module test;
+  string q[$];
+  string d[];
+  string x, y;
+  int ex, ey, ne;
+  initial begin
+    x = q[1];
+    d = new[1];
+    y = d[5];
+    ex = (x == "");
+    ey = (y == "");
+    ne = (x != "abc");
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "ex"), 1, "oob queue element compares equal to empty");
+    assert_eq!(u(&sim, "ey"), 1, "oob dynamic-array element too");
+    assert_eq!(u(&sim, "ne"), 1, "!= is 2-state as well");
+}
+
+/// §23.2.2 / A.1.2: module-HEADER imports precede the parameter list and are
+/// usable in it (ivtest `mod_inst_pkg`): `module m import P::*; #(parameter
+/// X = FOO)` must see the package's FOO. Tested in the TOP-module form — the
+/// strict reference rejects an imported function in a port range outright
+/// ("external function may not be used in a constant expression"), so the
+/// lenient acceptance itself is the pinned behavior, and the instantiated
+/// form's port sizing remains a known gap.
+#[test]
+fn header_imports_feed_parameter_defaults() {
+    let src = r#"
+package fooPkg;
+  localparam FOO = 5;
+endpackage
+package barPkg;
+  function int get_size(input int x); return x + 3; endfunction
+endpackage
+module test import fooPkg::*, barPkg::*; #(parameter P = FOO) (input [get_size(7)-1:0] ip);
+  int pv, bv;
+  initial begin
+    pv = P;
+    bv = $bits(ip);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "pv"), 5, "the imported FOO reaches the parameter default");
+    assert_eq!(u(&sim, "bv"), 10, "the imported function sizes the port");
+}
