@@ -34861,15 +34861,27 @@ impl Simulator {
                 // ordering operators are routed here.
                 if matches!(
                     op,
-                    BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
+                    BinaryOp::Lt
+                        | BinaryOp::Leq
+                        | BinaryOp::Gt
+                        | BinaryOp::Geq
+                        | BinaryOp::Eq
+                        | BinaryOp::Neq
                 ) && (self.expr_is_string_valued(left) || self.expr_is_string_valued(right))
                 {
-                    let ord = wl.to_sv_string().cmp(&wr.to_sv_string());
+                    // §6.16: string comparison is by TEXT. Equality also goes
+                    // through here because an out-of-bounds string-collection
+                    // read stores X bits whose text is "" — a bit-level
+                    // compare against "" then yielded X instead of 1 (§6.16
+                    // strings are 2-state).
+                    let (a, b) = (wl.to_sv_string(), wr.to_sv_string());
                     let t = match op {
-                        BinaryOp::Lt => ord.is_lt(),
-                        BinaryOp::Leq => ord.is_le(),
-                        BinaryOp::Gt => ord.is_gt(),
-                        _ => ord.is_ge(),
+                        BinaryOp::Lt => a < b,
+                        BinaryOp::Leq => a <= b,
+                        BinaryOp::Gt => a > b,
+                        BinaryOp::Geq => a >= b,
+                        BinaryOp::Eq => a == b,
+                        _ => a != b,
                     };
                     return Value::from_u64(t as u64, 1);
                 }
