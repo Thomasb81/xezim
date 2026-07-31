@@ -117,3 +117,49 @@ endmodule
     assert_eq!(u(&sim, "b"), 8, "4 elements x 2 bits");
     assert_eq!(u(&sim, "d"), 2);
 }
+
+/// §7.4.2: packed dims AFTER an enum body (`enum {...} [1:0] x;`) make a
+/// packed array of the enum — mirroring the struct body-suffix form
+/// (ivtest `array_packed`).
+#[test]
+fn enum_body_suffix_packed_dims() {
+    let src = r#"
+module test;
+  typedef enum logic [7:0] { A } E;
+  E [1:0] ep2;
+  enum logic [7:0] { B } [1:0] ep3;
+  int b2, b3;
+  initial begin
+    b2 = $bits(ep2);
+    b3 = $bits(ep3);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "b2"), 16, "typedef'd enum with packed dims");
+    assert_eq!(u(&sim, "b3"), 16, "anonymous enum with body-suffix dims");
+}
+
+/// §7.2.1: a packed-struct member read carries the member's DECLARED
+/// signedness — the slice itself is a raw bit pattern (ivtest
+/// `struct_packed_sysfunct2`: `%0d` of an `int` member printed unsigned).
+#[test]
+fn struct_member_reads_keep_declared_signedness() {
+    let src = r#"
+module test;
+  struct packed { int s; int unsigned u; } x;
+  int neg, via_int, both_u;
+  initial begin
+    x.s = -20;
+    x.u = -10;
+    neg     = (x.s < 0);
+    via_int = x.s;
+    both_u  = (x.u > 0);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "neg"), 1, "int member compares signed");
+    assert_eq!(u(&sim, "via_int") as u32 as i32, -20);
+    assert_eq!(u(&sim, "both_u"), 1, "unsigned member stays unsigned");
+}

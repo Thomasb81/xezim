@@ -33707,6 +33707,45 @@ impl Simulator {
         }
     }
 
+    /// §7.2.1: whether a packed-struct MEMBER's declared type is signed —
+    /// slices of the parent are unsigned bit patterns, so member reads must
+    /// re-stamp the declared signedness (`struct packed { int s; ... } x;`
+    /// printed `x.s` as 4294967276 instead of -20). Resolves through the
+    /// root's declared struct type; nested paths use the leaf member name.
+    fn struct_member_signed(&self, root: &str, field: &str) -> bool {
+        let Some(dt) = self.module.var_decl_types.get(root) else {
+            return false;
+        };
+        let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+        let crate::ast::types::DataType::Struct(su) = resolved else {
+            return false;
+        };
+        let leaf = field.rsplit('.').next().unwrap_or(field);
+        fn find_signed(
+            su: &crate::ast::types::StructUnionType,
+            leaf: &str,
+            module: &ElaboratedModule,
+        ) -> bool {
+            for m in &su.members {
+                for d in &m.declarators {
+                    if d.name.name == leaf {
+                        return super::elaborate::is_type_signed_resolved(
+                            &m.data_type,
+                            &module.typedef_types,
+                        );
+                    }
+                }
+                if let crate::ast::types::DataType::Struct(inner) = &m.data_type {
+                    if find_signed(inner, leaf, module) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        find_signed(su, leaf, &self.module)
+    }
+
     /// A signed integer literal, possibly under unary minus/plus or parens —
     /// the shapes whose ===/!== widening sign-extends by consensus.
     fn expr_is_signed_literal(e: &Expression) -> bool {
@@ -34221,7 +34260,15 @@ impl Simulator {
                                 fields.iter().find(|(m, _, _)| m == &sub).cloned()
                             {
                                 if let Some(sig) = self.get_signal_value_by_name(obj_name) {
-                                    return sig.range_select((off + w - 1) as usize, off as usize);
+                                    let mut v =
+                                        sig.range_select((off + w - 1) as usize, off as usize);
+                                    // §7.2.1: the member's DECLARED signedness
+                                    // (the slice itself is an unsigned bit
+                                    // pattern; `int s` printed as unsigned).
+                                    if self.struct_member_signed(obj_name, &sub) {
+                                        v.is_signed = true;
+                                    }
+                                    return v;
                                 }
                             }
                         }
@@ -37904,7 +37951,12 @@ impl Simulator {
                             fields.iter().find(|(m, _, _)| m == &member.name).cloned()
                         {
                             if let Some(sig) = self.get_local_or_signal(&name) {
-                                return sig.range_select((off + w - 1) as usize, off as usize);
+                                let mut v =
+                                    sig.range_select((off + w - 1) as usize, off as usize);
+                                if self.struct_member_signed(&name, &member.name) {
+                                    v.is_signed = true;
+                                }
+                                return v;
                             }
                         }
                     }
@@ -52177,7 +52229,16 @@ impl Simulator {
         // the container rather than reading a stale lazily-created leaf.
         if let Some((base, off, w)) = self.packed_leaf_of_hier(name) {
             if let Some(cur) = self.get_signal_value_by_name(&base) {
-                return Some(cur.range_select((off + w - 1) as usize, off as usize));
+                let mut v = cur.range_select((off + w - 1) as usize, off as usize);
+                // §7.2.1: the slice is a raw bit pattern — re-stamp the
+                // member's DECLARED signedness (`int s` in a packed struct
+                // printed as unsigned without this).
+                if let Some(field) = name.strip_prefix(&format!("{}.", base)) {
+                    if self.struct_member_signed(&base, field) {
+                        v.is_signed = true;
+                    }
+                }
+                return Some(v);
             }
         }
         self.signals.get(name).cloned()
