@@ -7273,6 +7273,20 @@ impl Simulator {
     /// conversions to `outs` in order (C-scanf semantics — stops at the
     /// first mismatch). Returns the number of conversions assigned.
     fn sv_sscanf(&mut self, src: &str, fmt: &str, outs: &[Expression]) -> i64 {
+        self.sv_sscanf_consumed(src, fmt, outs).0
+    }
+
+    /// Like `sv_sscanf`, but also returns how many CHARS of `src` were
+    /// consumed, so `$fscanf` can push the unread remainder back (§21.3.4.2:
+    /// the file position advances only past what the format matched — reading
+    /// one `%s` of a two-word line must leave the second word readable, and
+    /// `$feof` false).
+    fn sv_sscanf_consumed(
+        &mut self,
+        src: &str,
+        fmt: &str,
+        outs: &[Expression],
+    ) -> (i64, usize) {
         let s: Vec<char> = src.chars().collect();
         let mut si = 0usize;
         let mut oi = 0usize;
@@ -7401,7 +7415,7 @@ impl Simulator {
                 }
             }
         }
-        assigned
+        (assigned, si)
     }
 
     fn eval_file_handle_arg(&mut self, expr: &Expression) -> i32 {
@@ -33768,6 +33782,24 @@ impl Simulator {
                         }
                     }
                     // `ClassName::static_prop` — explicit static property read.
+                    // §9.7: the built-in `process` class's state enum
+                    // (`process::RUNNING` …). Never user-declared, so the
+                    // class lookup below finds nothing and the reference
+                    // silently read 0 — `p.status() == process::WAITING`
+                    // compared 2 == 0 and was ALWAYS false, even with the
+                    // status itself correct.
+                    if hier.path.len() == 2 && hier.path[0].name.name == "process" {
+                        if let Some(v) = match hier.path[1].name.name.as_str() {
+                            "FINISHED" => Some(0u64),
+                            "RUNNING" => Some(1),
+                            "WAITING" => Some(2),
+                            "SUSPENDED" => Some(3),
+                            "KILLED" => Some(4),
+                            _ => None,
+                        } {
+                            return Value::from_u64(v, 32);
+                        }
+                    }
                     if hier.path.len() == 2 {
                         let cls = &hier.path[0].name.name;
                         let prop = &hier.path[1].name.name;
@@ -35863,9 +35895,36 @@ impl Simulator {
                             }
                         })
                         .unwrap_or_default();
-                    match self.sv_read_line(fd) {
+                    // A previous partial read may have pushed back just the
+                    // tail whitespace of its line ("\n"); the numeric/string
+                    // conversions all skip leading whitespace across lines, so
+                    // a whitespace-only line is transparent — pull the next.
+                    let mut first_line = self.sv_read_line(fd);
+                    while first_line.as_deref().is_some_and(|l| l.trim().is_empty()) {
+                        first_line = self.sv_read_line(fd);
+                    }
+                    match first_line {
                         Some(line) => {
-                            let n = self.sv_sscanf(&line, &fmt, &args[2..]);
+                            let (n, consumed) = self.sv_sscanf_consumed(&line, &fmt, &args[2..]);
+                            // §21.3.4.2: the position advances only past what
+                            // the format matched. `sv_read_line` pulled a whole
+                            // line, so push the unread tail back (reversed —
+                            // the pushback buffer is a LIFO whose top is the
+                            // next char). Without this, `$fscanf(fd, "%s", w)`
+                            // on a two-word line dropped the second word and
+                            // `$feof` reported end-of-file with data left.
+                            let rest: Vec<char> = line.chars().skip(consumed).collect();
+                            if !rest.is_empty() {
+                                let buf = self.ungetc_buf.entry(fd).or_default();
+                                let mut bytes: Vec<u8> = Vec::new();
+                                for ch in rest {
+                                    let mut tmp = [0u8; 4];
+                                    bytes.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+                                }
+                                for &b in bytes.iter().rev() {
+                                    buf.push(b);
+                                }
+                            }
                             Value::from_u64(n as u64, 32)
                         }
                         None => Value::from_u64(u32::MAX as u64, 32), // EOF = -1
@@ -63027,6 +63086,40 @@ impl Simulator {
                 if let Some(Some(_)) = self.cg_heap.get(handle) {
                     return self.exec_cg_method_call(handle, &member.name, args);
                 }
+                // §8.20: a NON-virtual method binds to the receiver's DECLARED
+                // type, not the object's runtime type. Dispatch always started
+                // at the runtime class, so `base_h.nonvirt()` on a handle
+                // holding a Derived ran Derived's override. Only divert when
+                // everything is certain: the receiver is a plain variable with
+                // a known declared class, the method is found in that class's
+                // chain with a real body, and NO definition in the chain is
+                // virtual (an override of a virtual method is virtual even
+                // without the keyword, §8.20).
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        if let Some(decl_cls) = self.class_of_var(&h.path[0].name.name) {
+                            let decl_base =
+                                decl_cls.split('#').next().unwrap_or(&decl_cls).to_string();
+                            if let Some(target) =
+                                self.nonvirtual_target_class(&decl_base, &member.name)
+                            {
+                                let runtime = self
+                                    .heap
+                                    .get(handle)
+                                    .and_then(|o| o.as_ref())
+                                    .map(|i| i.class_name.clone());
+                                if runtime.as_deref() != Some(target.as_str()) {
+                                    return self.exec_method_in_class_hierarchy(
+                                        handle,
+                                        &target,
+                                        &member.name,
+                                        args,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 return self.exec_method_call(handle, &member.name, args);
             }
         }
@@ -64068,6 +64161,32 @@ impl Simulator {
                                 } else if matches!(method_name.as_str(), "write" | "put") {
                                     if self.tlm_deliver(handle, method_name, args) {
                                         return Value::zero(32);
+                                    }
+                                }
+                            }
+                            // §8.20: non-virtual methods bind to the DECLARED
+                            // type of the receiver (see nonvirtual_target_class;
+                            // the flattened `Ident([obj, method])` shape is the
+                            // common parse for `obj.m()`, so the MemberAccess-
+                            // site check alone never fired).
+                            if let Some(decl_cls) = self.class_of_var(obj_name) {
+                                let decl_base =
+                                    decl_cls.split('#').next().unwrap_or(&decl_cls).to_string();
+                                if let Some(target) =
+                                    self.nonvirtual_target_class(&decl_base, method_name)
+                                {
+                                    let runtime = self
+                                        .heap
+                                        .get(handle)
+                                        .and_then(|o| o.as_ref())
+                                        .map(|i| i.class_name.clone());
+                                    if runtime.as_deref() != Some(target.as_str()) {
+                                        return self.exec_method_in_class_hierarchy(
+                                            handle,
+                                            &target,
+                                            method_name,
+                                            args,
+                                        );
                                     }
                                 }
                             }
@@ -73943,6 +74062,51 @@ impl Simulator {
             return self.exec_method_in_class_hierarchy(handle, &pname, method_name, args);
         }
         Value::zero(32)
+    }
+
+    /// §8.20: the class whose definition a NON-virtual call through a handle
+    /// of declared type `decl_cls` must bind to — the first class from
+    /// `decl_cls` upward that defines `m` with a real body. `None` when the
+    /// method is virtual anywhere in the chain (an override of a virtual
+    /// method is implicitly virtual), has no body in the chain (extern /
+    /// pure — other machinery owns those), is a constructor, or the chain is
+    /// not fully resolvable — all of which keep runtime dispatch.
+    fn nonvirtual_target_class(&self, decl_cls: &str, m: &str) -> Option<String> {
+        use crate::ast::decl::{ClassMethodKind, ClassQualifier};
+        if m == "new" {
+            return None;
+        }
+        let mut target: Option<String> = None;
+        let mut cur = Some(decl_cls.to_string());
+        let mut guard = 0;
+        while let Some(cname) = cur {
+            guard += 1;
+            if guard > 32 {
+                return None;
+            }
+            let cd = self.module.classes.get(&cname)?;
+            if let Some(method) = cd.methods.get(m) {
+                if method.qualifiers.contains(&ClassQualifier::Virtual)
+                    || method.qualifiers.contains(&ClassQualifier::Pure)
+                {
+                    return None; // virtual: runtime dispatch is correct
+                }
+                match &method.kind {
+                    ClassMethodKind::Function(_) | ClassMethodKind::Task(_) => {
+                        if target.is_none() {
+                            target = Some(cd.name.clone());
+                        }
+                        // Keep walking: a virtual declaration higher up makes
+                        // every override virtual.
+                    }
+                    _ => return None, // extern / pure prototype
+                }
+            }
+            cur = cd.extends.clone().map(|e: String| {
+                e.split('#').next().unwrap_or(e.as_str()).to_string()
+            });
+        }
+        target
     }
 
     fn exec_method_in_class_hierarchy(
