@@ -97,3 +97,31 @@ endmodule
     assert_eq!(u(&sim, "narrow"), 0xCD, "a sized local still truncates");
     assert_eq!(u(&sim, "wide_in") as u32, 0x1234_5678);
 }
+
+/// Issue #65 (follow-up to #64): a MODULE-level `string` DECLARATION
+/// initializer past 128 characters. The runtime stores were already exempt
+/// from the placeholder-width fit; the declaration-elaboration path still fit
+/// the initial value to 1024 bits, so the front of the text was lost before
+/// time 0 — while the identical procedural assignment was correct, which is
+/// exactly what made it look "already fixed".
+#[test]
+fn module_level_declaration_initializer_past_128_chars() {
+    let long_a = format!("echo_SAFE_{}_END", "A".repeat(130));
+    let src = format!(
+        r#"
+module top;
+  string cmd1 = "{long_a}";
+  int l1, p1, tail1;
+  initial begin
+    l1 = cmd1.len();
+    p1 = (cmd1.substr(0, 9) == "echo_SAFE_");
+    tail1 = (cmd1.substr(cmd1.len()-4, cmd1.len()-1) == "_END");
+  end
+endmodule
+"#
+    );
+    let sim = simulate(&src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "l1"), 144, "the full initializer survives");
+    assert_eq!(u(&sim, "p1"), 1, "the FRONT of the text survives");
+    assert_eq!(u(&sim, "tail1"), 1, "and the tail");
+}
