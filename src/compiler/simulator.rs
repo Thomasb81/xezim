@@ -32475,7 +32475,11 @@ impl Simulator {
                             let total_w = self.signal_widths[id];
                             let mut cur = self.signal_table[id].clone();
                             let piece = val.resize(elem_w);
-                            let lo = idx * (elem_w as usize);
+                            // Normalized for ascending / non-zero-based outer
+                            // dims (§7.4.1) — raw idx*w mirrored [0:N-1] slots.
+                            let Some(lo) = self.packed_elem_lsb(&pkey, idx as i64, elem_w) else {
+                                return false;
+                            };
                             if lo + (elem_w as usize) <= total_w as usize {
                                 let prev = cur.clone();
                                 for i in 0..(elem_w as usize) {
@@ -32844,6 +32848,19 @@ impl Simulator {
                             if let Some((_, field_off, field_w)) =
                                 fields.iter().find(|(m, _, _)| m == &fname).cloned()
                                 {
+                                // §7.4.1: an ASCENDING member dim mirrors the
+                                // bit labels (`bit [0:15] b; b[14:15]` = the
+                                // LOW two bits).
+                                let (lsb, msb) = if let Some(mw) =
+                                    self.struct_member_ascending(&root, &fname)
+                                {
+                                    let mw = mw as usize;
+                                    let m2 = (mw - 1).saturating_sub(lsb);
+                                    let l2 = (mw - 1).saturating_sub(msb.min(mw - 1));
+                                    (l2, m2)
+                                } else {
+                                    (lsb, msb)
+                                };
                                 if let Some(&id) = self.signal_name_to_id.get(root.as_str()) {
                                     let total_w = self.signal_widths[id] as usize;
                                     let lo = (field_off as usize) + lsb;
@@ -33126,9 +33143,25 @@ impl Simulator {
                         if let Some(&elem_w) = self.module.packed_signal_elem_widths.get(&arr_name)
                         {
                             let idx = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
-                            let base_off = idx * (elem_w as usize);
-                            let lo = base_off + lsb;
-                            let hi = base_off + msb.min((elem_w as usize).saturating_sub(1));
+                            let Some(base_off) =
+                                self.packed_elem_lsb(&arr_name, idx as i64, elem_w)
+                            else {
+                                return false;
+                            };
+                            // Inner-dim labels mirror on an ascending
+                            // `[0:W-1]` element type (§7.4.1).
+                            let (Some(b_lsb), Some(b_msb)) = (
+                                self.packed_inner_bit(&arr_name, lsb as i64, elem_w),
+                                self.packed_inner_bit(
+                                    &arr_name,
+                                    msb.min((elem_w as usize).saturating_sub(1)) as i64,
+                                    elem_w,
+                                ),
+                            ) else {
+                                return false;
+                            };
+                            let lo = base_off + b_lsb.min(b_msb);
+                            let hi = base_off + b_lsb.max(b_msb);
                             if let Some(&id) = self.signal_name_to_id.get(arr_name.as_str()) {
                                 let total_w = self.signal_widths[id] as usize;
                                 if hi < total_w {
@@ -33705,6 +33738,94 @@ impl Simulator {
             }
             _ => false,
         }
+    }
+
+    /// §7.4.1: bit offset of ELEMENT `idx` of the packed multi-D signal
+    /// `name`, normalized against the declared outer dimension — a descending
+    /// `[N-1:0]` maps idx→(idx-lo)·w, an ASCENDING `[0:N-1]` mirrors the slot
+    /// order (element 0 is the TOP slot). The raw `idx*elem_w` computation is
+    /// only right for the normalized descending case.
+    fn packed_elem_lsb(&self, name: &str, idx: i64, elem_w: u32) -> Option<usize> {
+        let lsb = match self.module.packed_full_dims.get(name).and_then(|d| d.first()) {
+            None => idx * elem_w as i64,
+            Some(&(dl, dr)) => {
+                let (lo_b, hi_b) = (dl.min(dr), dl.max(dr));
+                if idx < lo_b || idx > hi_b {
+                    return None;
+                }
+                let count = hi_b - lo_b + 1;
+                let off = idx - lo_b;
+                let slot = if dl >= dr { off } else { count - 1 - off };
+                slot * elem_w as i64
+            }
+        };
+        (lsb >= 0).then_some(lsb as usize)
+    }
+
+    /// §7.4.1: bit position of LABEL `label` within one element of packed
+    /// multi-D signal `name` — mirrors an ASCENDING inner dimension
+    /// (`[0:W-1]` label 0 is the element's MSB). Descending or unregistered
+    /// dims return the label unchanged.
+    fn packed_inner_bit(&self, name: &str, label: i64, elem_w: u32) -> Option<usize> {
+        match self.module.packed_full_dims.get(name).and_then(|d| d.get(1)) {
+            None => (label >= 0).then_some(label as usize),
+            Some(&(dl, dr)) => {
+                let (lo_b, hi_b) = (dl.min(dr), dl.max(dr));
+                if label < lo_b || label > hi_b {
+                    return None;
+                }
+                let count = hi_b - lo_b + 1;
+                let off = label - lo_b;
+                let slot = if dl >= dr { off } else { count - 1 - off };
+                let _ = elem_w;
+                (slot >= 0).then_some(slot as usize)
+            }
+        }
+    }
+
+    /// §7.4.1: whether a packed-struct MEMBER's declared (outermost) packed
+    /// dimension is ASCENDING (`bit [0:15] b`), and the member's width — bit
+    /// LABELS then mirror (`b[14:15]` is the LOW two bits). None for
+    /// descending/undimensioned members.
+    fn struct_member_ascending(&self, root: &str, field: &str) -> Option<u32> {
+        let dt = self.module.var_decl_types.get(root)?;
+        let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+        let crate::ast::types::DataType::Struct(su) = resolved else {
+            return None;
+        };
+        let leaf = field.rsplit('.').next().unwrap_or(field);
+        for m in &su.members {
+            if !m.declarators.iter().any(|d| d.name.name == leaf) {
+                continue;
+            }
+            let dims = match &m.data_type {
+                crate::ast::types::DataType::IntegerVector { dimensions, .. } => dimensions,
+                _ => return None,
+            };
+            // Multi-dim members (`bit [0:7][7:0] a`) are handled by the
+            // ELEMENT-scaling path, which already normalizes slot order via
+            // packed_full_dims — mirroring again here corrupted the offsets.
+            if dims.len() != 1 {
+                return None;
+            }
+            if let Some(crate::ast::types::PackedDimension::Range { left, right, .. }) =
+                dims.first()
+            {
+                let l = super::elaborate::const_eval_i64_with_params(
+                    left,
+                    Some(&self.module.parameters),
+                )?;
+                let r = super::elaborate::const_eval_i64_with_params(
+                    right,
+                    Some(&self.module.parameters),
+                )?;
+                if l < r {
+                    return Some((r - l + 1) as u32);
+                }
+            }
+            return None;
+        }
+        None
     }
 
     /// §7.2.1: whether a packed-struct MEMBER's declared type is signed —
@@ -35558,10 +35679,11 @@ impl Simulator {
                         }
                         candidates.extend(aliased);
                     }
-                    if let Some((_, &elem_w)) = candidates
+                    if let Some((matched_key, &elem_w)) = candidates
                         .iter()
                         .find_map(|n| self.module.packed_signal_elem_widths.get_key_value(n))
                     {
+                        let matched_key = matched_key.clone();
                         let idx = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                         // For `pp.words[i]`, the base eval reads the WHOLE
                         // struct, so we slice at struct-field-offset +
@@ -35589,7 +35711,10 @@ impl Simulator {
                             }
                         }
                         let base_v = self.eval_expr(expr);
-                        let lo = idx * (elem_w as usize);
+                        let Some(lo) = self.packed_elem_lsb(&matched_key, idx as i64, elem_w)
+                        else {
+                            return Value::new(elem_w);
+                        };
                         let hi = lo + (elem_w as usize) - 1;
                         return base_v.range_select(hi, lo);
                     }
