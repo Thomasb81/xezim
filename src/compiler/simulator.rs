@@ -31634,6 +31634,20 @@ impl Simulator {
                         }
                     }
                 } else if hier.path.len() > 1 {
+                    // Property write through a class handle evaluated from the prefix
+                    // (e.g. `stor.handle.val = 777`).
+                    if hier.path.len() >= 2 {
+                        let prop_name = &hier.path.last().unwrap().name.name;
+                        let mut head_hier = hier.clone();
+                        head_hier.path.pop();
+                        let head_expr = Expression::new(ExprKind::Ident(head_hier), lhs.span);
+                        let base_val = self.eval_expr(&head_expr);
+                        let handle = base_val.to_u64().unwrap_or(0) as usize;
+                        if handle != 0 && handle < self.heap.len() && self.heap[handle].is_some() {
+                            let fitted = self.fit_class_prop(handle, prop_name, val);
+                            return self.set_prop_if_changed(handle, prop_name, fitted);
+                        }
+                    }
                     // `ClassName::static_prop` — explicit static property write.
                     if hier.path.len() == 2 {
                         let cls = hier.path[0].name.name.clone();
@@ -33756,43 +33770,40 @@ impl Simulator {
                         }
                     }
                 }
-                // Local struct variable member write: `result.field1 = ...`
+                // Struct variable member write: `result.field1 = ...`
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if hier.path.len() == 1 {
                         let base_name = hier.path[0].name.name.as_str();
-                        if !self.local_stack.is_empty() {
-                            let last_idx = self.local_stack.len() - 1;
-                            if self.local_stack[last_idx].contains_key(base_name) {
-                                let type_name =
-                                    self.var_typedef_types.get(base_name).map(|s| s.as_str());
-                                let dt: Option<DataType> = type_name
-                                    .and_then(|tn| self.module.typedef_types.get(tn).cloned());
-                                if let Some(dt) = dt {
-                                    let resolved =
-                                        Self::resolve_type_ref(&dt, &self.module.typedef_types);
-                                    if let Some(fields) = Self::struct_field_layout(&resolved) {
-                                        if let Some((_, off, w, _real)) = fields
-                                            .iter()
-                                            .find(|(m, _, _, _)| m == &member.name)
-                                            .cloned()
-                                        {
-                                            let mut cur = self.local_stack[last_idx]
-                                                .get(base_name)
-                                                .cloned()
-                                                .unwrap_or_else(|| Value::zero(off + w));
-                                            if (off + w) as usize > cur.width as usize {
-                                                cur = cur.resize(off + w);
-                                            }
-                                            let piece = val.resize(w);
-                                            for i in 0..w {
-                                                let bit = piece.get_bit(i as usize);
-                                                cur.set_bit((off + i) as usize, bit);
-                                            }
-                                            self.local_stack[last_idx]
-                                                .insert(base_name.to_string(), cur);
-                                            return true;
-                                        }
+                        let type_name = self
+                            .var_typedef_types
+                            .get(base_name)
+                            .cloned()
+                            .or_else(|| self.get_expr_type_name(expr));
+                        let dt: Option<DataType> = type_name
+                            .as_deref()
+                            .and_then(|tn| self.module.typedef_types.get(tn).cloned());
+                        if let Some(dt) = dt {
+                            let resolved =
+                                Self::resolve_type_ref(&dt, &self.module.typedef_types);
+                            if let Some(fields) = Self::struct_field_layout(&resolved) {
+                                if let Some((_, off, w, _real)) = fields
+                                    .iter()
+                                    .find(|(m, _, _, _)| m == &member.name)
+                                    .cloned()
+                                {
+                                    let mut cur = self
+                                        .get_local_or_signal(base_name)
+                                        .unwrap_or_else(|| Value::zero(off + w));
+                                    if (off + w) as usize > cur.width as usize {
+                                        cur = cur.resize(off + w);
                                     }
+                                    let piece = val.resize(w);
+                                    for i in 0..w {
+                                        let bit = piece.get_bit(i as usize);
+                                        cur.set_bit((off + i) as usize, bit);
+                                    }
+                                    self.set_local_or_signal(base_name, cur);
+                                    return true;
                                 }
                             }
                         }
@@ -38236,22 +38247,26 @@ impl Simulator {
                         // matching the base_val width (handles queue elements
                         // where the element type isn't directly registered for
                         // the queue variable name).
-                        for td in self.module.typedef_types.values() {
-                            let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
-                            if let Some(fields) = Self::struct_field_layout(&resolved) {
-                                let total_w: u32 = fields.iter().map(|(_, _, w, _)| w).sum();
-                                if total_w == base_val.width {
-                                    if let Some((_, off, w, fr)) = fields
-                                        .iter()
-                                        .find(|(m, _, _, _)| m == &member.name)
-                                        .cloned()
-                                    {
-                                        let mut v = base_val
-                                            .range_select((off + w - 1) as usize, off as usize);
-                                        if fr {
-                                            v.is_real = true;
+                        let base_h = base_val.to_u64().unwrap_or(0) as usize;
+                        let is_heap_obj = base_h != 0 && base_h < self.heap.len() && self.heap[base_h].is_some();
+                        if !is_heap_obj {
+                            for td in self.module.typedef_types.values() {
+                                let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
+                                if let Some(fields) = Self::struct_field_layout(&resolved) {
+                                    let total_w: u32 = fields.iter().map(|(_, _, w, _)| w).sum();
+                                    if total_w == base_val.width {
+                                        if let Some((_, off, w, fr)) = fields
+                                            .iter()
+                                            .find(|(m, _, _, _)| m == &member.name)
+                                            .cloned()
+                                        {
+                                            let mut v = base_val
+                                                .range_select((off + w - 1) as usize, off as usize);
+                                            if fr {
+                                                v.is_real = true;
+                                            }
+                                            return v;
                                         }
-                                        return v;
                                     }
                                 }
                             }
