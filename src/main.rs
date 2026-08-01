@@ -1848,7 +1848,14 @@ suppressed but the explicit SDF annotation still applies."
         let mut total_desc = 0;
         let mut total_err = 0;
         let mut total_warn = 0;
-        for (label, source) in file_labels.iter().zip(preprocessed_sources.iter()) {
+        for (fi, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
+            xezim::progress_status(&format!(
+                "[{}] parsing {}/{}: {}",
+                if mode == Mode::Parse { "parse" } else { "compile" },
+                fi + 1,
+                file_labels.len(),
+                label.rsplit('/').next().unwrap_or(label)
+            ));
             let tokens = xezim::lexer::Lexer::new(source).tokenize();
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
@@ -1874,6 +1881,7 @@ suppressed but the explicit SDF annotation still applies."
                 println!("{:#?}", source_ast);
             }
         }
+        xezim::progress_clear();
         println!(
             "Parsed {} file(s): {} descriptions, {} errors, {} warnings",
             preprocessed_sources.len(),
@@ -1892,7 +1900,14 @@ suppressed but the explicit SDF annotation still applies."
         let mut total_err = 0;
         let mut total_warn = 0;
 
-        for (label, source) in file_labels.iter().zip(preprocessed_sources.iter()) {
+        for (fi, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
+            xezim::progress_status(&format!(
+                "[{}] parsing {}/{}: {}",
+                if mode == Mode::Parse { "parse" } else { "compile" },
+                fi + 1,
+                file_labels.len(),
+                label.rsplit('/').next().unwrap_or(label)
+            ));
             let tokens = xezim::lexer::Lexer::new(source).tokenize();
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
@@ -1914,6 +1929,7 @@ suppressed but the explicit SDF annotation still applies."
                 .filter(|d| d.severity == xezim::diagnostics::Severity::Warning)
                 .count();
         }
+        xezim::progress_clear();
         println!(
             "Parsed {} file(s): {} descriptions, {} errors, {} warnings",
             preprocessed_sources.len(),
