@@ -109,13 +109,22 @@ fn print_usage() {
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
-    eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
+    eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
+    eprintln!("  --verbose        Per-file compile progress: each file as it is parsed and the");
+    eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
+    eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
+    eprintln!("                     sources in parse order, -v library files, -y library dirs");
+    eprintln!("  --dump-merged-sv <file>  Write ALL sources, fully preprocessed (`ifdef");
+    eprintln!("                     resolved, macros expanded, `includes inlined), into one");
+    eprintln!("                     self-contained .sv file — a standalone repro for");
+    eprintln!("                     debugging parse/elaboration problems in -f builds");
     eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
-    eprintln!("  --x-warn         Warn when a signal first takes an x bit after time 0,");
-    eprintln!("                   naming the signal, its instance/module and its drivers.");
+    eprintln!("  --x-warn         Warn when a signal holding a valid 0/1 value takes an x bit");
+    eprintln!("                   after time 0, naming the signal, its instance/module and its");
+    eprintln!("                   drivers. Signals x/z from the start are never reported.");
     eprintln!("                   Also enabled by +X_WARN or X_WARN=1 in the environment.");
     eprintln!("  --x-warn-limit N Cap --x-warn reports at N (default 50, 0 = unlimited).");
     eprintln!("                   Also settable as X_WARN_LIMIT=N.");
@@ -835,6 +844,8 @@ fn main() {
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
+    let mut dump_files_list = false;
+    let mut dump_merged_sv: Option<String> = None;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
@@ -1293,8 +1304,24 @@ fn main() {
             _ if arg.starts_with("--fst-scope=") => {
                 fst_scopes.push(arg["--fst-scope=".len()..].to_string());
             }
-            "--sim_debug" => {
+            // `--sim_debug` kept as a compatibility alias for existing scripts.
+            "--sim-debug" | "--sim_debug" => {
                 sim_debug = true;
+            }
+            "--dump-files-list" => {
+                dump_files_list = true;
+            }
+            "--dump-merged-sv" => {
+                i += 1;
+                if i < args.len() {
+                    dump_merged_sv = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: --dump-merged-sv requires an output file name");
+                    std::process::exit(1);
+                }
+            }
+            _ if arg.starts_with("--dump-merged-sv=") => {
+                dump_merged_sv = Some(arg["--dump-merged-sv=".len()..].to_string());
             }
             "--threads" => {
                 i += 1;
@@ -1466,6 +1493,46 @@ fn main() {
             }
         }
         i += 1;
+    }
+
+    if verbose {
+        xezim::set_compile_verbose(true);
+    }
+
+    // `--dump-files-list`: the fully resolved compilation file set, after every
+    // `-f` args file has been expanded. Printed BEFORE the files are read so
+    // the list still appears when a file is missing or fails to parse — that
+    // is exactly the situation the flag exists to debug.
+    if dump_files_list {
+        println!("=== files list: {} source file(s) ===", source_files.len());
+        for (i, sf) in source_files.iter().enumerate() {
+            let exists = Path::new(sf).exists();
+            println!(
+                "  {:>4}. {}{}",
+                i + 1,
+                sf,
+                if exists { "" } else { "   [NOT FOUND]" }
+            );
+        }
+        if !lib_files.is_empty() {
+            println!("--- -v library file(s): {} ---", lib_files.len());
+            for lf in &lib_files {
+                println!("  {}", lf);
+            }
+        }
+        if !lib_dirs.is_empty() {
+            println!("--- -y library dir(s): {} ---", lib_dirs.len());
+            for ld in &lib_dirs {
+                println!("  {}", ld);
+            }
+        }
+        if !include_dirs.is_empty() {
+            println!("--- include dir(s): {} ---", include_dirs.len());
+            for id in &include_dirs {
+                println!("  {}", id);
+            }
+        }
+        println!("=== end files list ===");
     }
 
     if source_files.is_empty() {
@@ -1692,6 +1759,61 @@ suppressed but the explicit SDF annotation still applies."
             }
         };
 
+    // `--dump-merged-sv <file>`: one self-contained .sv with every source in
+    // parse order, fully preprocessed — `ifdef branches resolved, macros
+    // expanded, `includes inlined. A 125-file `-f` build becomes a single
+    // re-runnable repro for parse/elaboration debugging. Blank lines left by
+    // the preprocessor are kept so line numbers inside each section still
+    // match the per-file diagnostics.
+    if let Some(ref merged_out) = dump_merged_sv {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "// Merged preprocessed sources — xezim {} ({} file(s))\n\
+             // Defines, `ifdef selection and `include expansion already applied.\n\
+             // NOTE: `timescale directives are consumed by the preprocessor and\n\
+             // not re-emitted; pass --module-timescale when re-running this file.\n",
+            env!("CARGO_PKG_VERSION"),
+            preprocessed_sources.len()
+        ));
+        for (i, (label, text)) in file_labels
+            .iter()
+            .zip(preprocessed_sources.iter())
+            .enumerate()
+        {
+            out.push_str(&format!(
+                "\n// ===== file {}/{}: {} =====\n",
+                i + 1,
+                preprocessed_sources.len(),
+                label
+            ));
+            out.push_str(text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        match std::fs::write(merged_out, &out) {
+            Ok(()) => println!(
+                "Wrote merged preprocessed SV to {} ({} files, {} bytes)",
+                merged_out,
+                preprocessed_sources.len(),
+                out.len()
+            ),
+            Err(e) => {
+                eprintln!("Error: cannot write '{}': {}", merged_out, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Version banner for every mode except --preprocess, whose stdout must
+    // stay pure source text. The simulate path adds its own Max-time lines
+    // below. Build identity in --compile/--parse logs matters for exactly the
+    // situation those modes are used in: debugging with a specific build.
+    if mode != Mode::Preprocess {
+        println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
+        println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
+    }
+
     if mode == Mode::Preprocess {
         // IEEE 1800-2017 §22: preprocess-only mode. The preprocessor has
         // already run (expanding macros and `\`include`s, evaluating
@@ -1726,7 +1848,14 @@ suppressed but the explicit SDF annotation still applies."
         let mut total_desc = 0;
         let mut total_err = 0;
         let mut total_warn = 0;
-        for (label, source) in file_labels.iter().zip(preprocessed_sources.iter()) {
+        for (fi, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
+            xezim::progress_status(&format!(
+                "[{}] parsing {}/{}: {}",
+                if mode == Mode::Parse { "parse" } else { "compile" },
+                fi + 1,
+                file_labels.len(),
+                label.rsplit('/').next().unwrap_or(label)
+            ));
             let tokens = xezim::lexer::Lexer::new(source).tokenize();
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
@@ -1752,6 +1881,7 @@ suppressed but the explicit SDF annotation still applies."
                 println!("{:#?}", source_ast);
             }
         }
+        xezim::progress_clear();
         println!(
             "Parsed {} file(s): {} descriptions, {} errors, {} warnings",
             preprocessed_sources.len(),
@@ -1770,7 +1900,14 @@ suppressed but the explicit SDF annotation still applies."
         let mut total_err = 0;
         let mut total_warn = 0;
 
-        for (label, source) in file_labels.iter().zip(preprocessed_sources.iter()) {
+        for (fi, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
+            xezim::progress_status(&format!(
+                "[{}] parsing {}/{}: {}",
+                if mode == Mode::Parse { "parse" } else { "compile" },
+                fi + 1,
+                file_labels.len(),
+                label.rsplit('/').next().unwrap_or(label)
+            ));
             let tokens = xezim::lexer::Lexer::new(source).tokenize();
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
@@ -1792,6 +1929,7 @@ suppressed but the explicit SDF annotation still applies."
                 .filter(|d| d.severity == xezim::diagnostics::Severity::Warning)
                 .count();
         }
+        xezim::progress_clear();
         println!(
             "Parsed {} file(s): {} descriptions, {} errors, {} warnings",
             preprocessed_sources.len(),
@@ -1855,8 +1993,6 @@ suppressed but the explicit SDF annotation still applies."
         return;
     }
 
-    println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-    println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
     println!("Max time: {} ns", max_time);
     println!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
