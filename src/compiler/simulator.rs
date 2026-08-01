@@ -69140,7 +69140,7 @@ impl Simulator {
                         break;
                     }
                     let acd = match self.module.classes.get(&ancestor) {
-                        Some(c) => c.clone(),
+                        Some(c) => c,
                         None => break,
                     };
                     // Find `tn` in the ancestor's full param_order (type +
