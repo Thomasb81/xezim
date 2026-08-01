@@ -19780,6 +19780,31 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §15.5.3: `@(ev.triggered)` blocks until the event
+                        // fires — the wakeable signal is the EVENT, not a
+                        // "triggered" leaf. Without the strip the sensitivity
+                        // named nonexistent "ev.triggered", fell into the
+                        // no-signal delta-yield fallback and woke at t=0
+                        // (issue #68).
+                        if segs.len() >= 2 && *segs.last().unwrap() == "triggered" {
+                            let head = segs[..segs.len() - 1].join(".");
+                            let leaf = segs[segs.len() - 2];
+                            if self.module.events.contains(&head)
+                                || self.module.events.contains(leaf)
+                            {
+                                let key = if self.module.events.contains(&head) {
+                                    head
+                                } else {
+                                    leaf.to_string()
+                                };
+                                out.push(Sensitivity {
+                                    signal_name: self.resolve_event_key(&key),
+                                    edge,
+                                    iff: ee.iff.clone(),
+                                });
+                                continue;
+                            }
+                        }
                         let sig = self.resolve_hier_name(h);
                         let cb_key = self
                             .resolve_clocking_key(&segs)
@@ -48729,6 +48754,24 @@ impl Simulator {
             // refs to interface signals. Flatten the chain into a dotted name
             // and let the signal table's hierarchical/aliased lookup find it.
             ExprKind::MemberAccess { expr: base, member } => {
+                // §15.5.3 again for the MemberAccess parse shape:
+                // `@(ev.triggered)` must wake on `ev`, not on a nonexistent
+                // "ev.triggered" signal — the latter fell into the no-signal
+                // fallback and woke immediately at t=0 (issue #68).
+                if member.name == "triggered" {
+                    if let ExprKind::Ident(h) = &base.kind {
+                        let ev = self.resolve_hier_name(h);
+                        if self.module.events.contains(&ev)
+                            || self
+                                .module
+                                .events
+                                .contains(ev.rsplit('.').next().unwrap_or(&ev))
+                        {
+                            names.push(ev);
+                            return;
+                        }
+                    }
+                }
                 let mut parts: Vec<String> = vec![member.name.clone()];
                 let mut cur = base.as_ref();
                 loop {
