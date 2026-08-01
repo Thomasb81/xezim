@@ -33779,7 +33779,10 @@ impl Simulator {
                                             let mut cur = self.local_stack[last_idx]
                                                 .get(base_name)
                                                 .cloned()
-                                                .unwrap_or_else(|| Value::zero(65));
+                                                .unwrap_or_else(|| Value::zero(off + w));
+                                            if (off + w) as usize > cur.width as usize {
+                                                cur = cur.resize(off + w);
+                                            }
                                             let piece = val.resize(w);
                                             for i in 0..w {
                                                 let bit = piece.get_bit(i as usize);
@@ -40061,6 +40064,7 @@ impl Simulator {
                 };
                 if is_new_call {
                     let type_name = self.get_expr_type_name(lvalue);
+
                     // §6.20.3 type-parameter construction: if the declared
                     // type is a class type parameter (e.g. `T obj = new;`),
                     // resolve it through the current instance's bindings to
@@ -43583,6 +43587,7 @@ impl Simulator {
                             let tn = name.name.name.clone();
                             if self.module.enum_members.contains_key(&tn)
                                 || self.module.typedefs.contains_key(&tn)
+                                || self.module.typedef_types.contains_key(&tn)
                             {
                                 self.var_typedef_types.insert(d.name.name.clone(), tn);
                             }
@@ -52435,14 +52440,74 @@ impl Simulator {
         None
     }
 
-    fn resolve_typedef_spec(&self, name: &str) -> Option<(String, String)> {
+    /// Resolve a TYPEDEF declared as a member of `class_name` to the target
+    /// CLASS it names — the class-scoped analogue of
+    /// `resolve_simple_typedef_class` (which is module-scoped). Used to
+    /// dispatch `Class::typedef::static_method(...)`: the middle segment is a
+    /// typedef alias (e.g. UVM's `typedef <registry>#(...) type_id;` or a plain
+    /// `typedef Holder type_id;`) rather than a class, so the static-call
+    /// dispatcher must follow the alias to the real class. Returns `None` for
+    /// parameterized aliases (those go through `resolve_typedef_spec`) or
+    /// non-class targets.
+    fn resolve_class_member_typedef_class(
+        &self,
+        class_name: &str,
+        member: &str,
+    ) -> Option<String> {
         use crate::ast::types::DataType;
+        let cd = self.module.classes.get(class_name)?;
+        let dt = cd.typedef_targets.get(member)?;
+        if let DataType::TypeReference { name: tn, type_args, .. } = dt {
+            if !type_args.is_empty() {
+                return None;
+            }
+            let synth = crate::ast::types::TypeName {
+                scope: None,
+                name: crate::ast::Identifier {
+                    name: tn.name.name.clone(),
+                    span: crate::ast::Span::dummy(),
+                },
+                span: crate::ast::Span::dummy(),
+            };
+            return self.resolve_typeref_class_name(&synth);
+        }
+        None
+    }
+
+    fn resolve_typedef_spec(&self, name: &str) -> Option<(String, String)> {
         let dt = self.lookup_typedef_target(name)?;
+        self.spec_from_typedef_dt(&dt)
+    }
+
+    /// Class-scoped analogue of `resolve_typedef_spec`: resolve a TYPEDEF
+    /// declared as a member of `class_name` (e.g. UVM's
+    /// `typedef uvm_object_registry#(T,"N") type_id;` inside class `T`) to its
+    /// specialization `(base, sig)`. Used to dispatch
+    /// `Class::typedef::static_method(...)` when the typedef is parameterized —
+    /// the middle segment names a typedef alias, not a class, so the static-call
+    /// dispatcher must follow the alias to the real specialization.
+    fn resolve_class_member_typedef_spec(
+        &self,
+        class_name: &str,
+        member: &str,
+    ) -> Option<(String, String)> {
+        let cd = self.module.classes.get(class_name)?;
+        let dt = cd.typedef_targets.get(member)?;
+        self.spec_from_typedef_dt(dt)
+    }
+
+    /// Build a specialization `(base_class, signature)` from a typedef's
+    /// `DataType` (a `TypeReference` with type args). Shared by the module-
+    /// scoped `resolve_typedef_spec` and the class-scoped
+    /// `resolve_class_member_typedef_spec`. Returns `None` for non-parameterized
+    /// typedefs or bases that don't resolve to a real class.
+    fn spec_from_typedef_dt(&self, dt: &crate::ast::types::DataType) -> Option<(String, String)> {
+        use crate::ast::types::DataType;
         if let DataType::TypeReference {
             name: tn,
             type_args,
             ..
-        } = &dt
+        } = dt
         {
             if type_args.is_empty() {
                 return None;
@@ -63658,6 +63723,57 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §8.23 / §6.18: `Class::typedef_alias::method(args)` —
+                        // the middle segment is a TYPEDEF declared inside
+                        // `Class` (e.g. UVM's `typedef <registry>#(...) type_id;`,
+                        // or a plain `typedef Holder type_id;`), not a class
+                        // itself. Resolve the alias to its target class and
+                        // dispatch the static method there. Without this,
+                        // `base_class::type_id::get()` (and `type_id::create`)
+                        // never reached the registry's `get()`, so the factory's
+                        // singleton lookup returned null and `type_id::get() !=
+                        // get()` identity checks failed.
+                        else if !self
+                            .local_stack
+                            .last()
+                            .is_some_and(|m| m.contains_key(pkg.as_str()))
+                            && !self.signal_name_to_id.contains_key(pkg.as_str())
+                            && self.module.classes.contains_key(pkg.as_str())
+                        {
+                            // Non-parameterized class-scoped typedef alias.
+                            if let Some(resolved) =
+                                self.resolve_class_member_typedef_class(pkg, &cls)
+                            {
+                                if let Some(res) = self.exec_static_method(&resolved, mname, args)
+                                {
+                                    return res;
+                                }
+                                if mname == "new" {
+                                    if let Some(cd) = self.module.classes.get(&resolved).cloned() {
+                                        return self.instantiate_class(&cd, args);
+                                    }
+                                }
+                            }
+                            // Parameterized class-scoped typedef alias — e.g.
+                            // UVM `typedef uvm_object_registry#(T,"N") type_id;`
+                            // inside class T, called as `T::type_id::get()`. The
+                            // broken generic fallback lost the return value for
+                            // class-typed returns, so the factory's singleton
+                            // identity check failed. Dispatch on the resolved
+                            // specialization with its statics materialised.
+                            if let Some((base, sig)) =
+                                self.resolve_class_member_typedef_spec(pkg, &cls)
+                            {
+                                self.ensure_spec_statics(&base, &sig);
+                                let saved = self.current_spec.take();
+                                self.current_spec = Some((base.clone(), sig));
+                                let res = self.exec_static_method(&base, mname, args);
+                                self.current_spec = saved;
+                                if let Some(v) = res {
+                                    return v;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -66950,6 +67066,22 @@ impl Simulator {
         .max(1);
         self.widths.insert(ret_name.clone(), ret_w);
         locals.insert(ret_name.clone(), Value::zero(ret_w));
+        // Register the return variable's declared type (mirroring the port
+        // loop above) so a bare `funcname = new(...)` assignment can resolve
+        // the class to construct: `get_expr_type_name` / the generic `new`
+        // path key off `var_class_types` / `var_typedef_types`. Without this,
+        // an implicit `function C f(); ... f = new();` returns null because
+        // the `new` falls through to a context-free eval that yields 0.
+        if let DataType::TypeReference { name: tn, .. } = &fd.return_type {
+            let type_name = tn.name.name.clone();
+            if self.module.enum_members.contains_key(&type_name)
+                || self.module.typedefs.contains_key(&type_name)
+            {
+                self.var_typedef_types.insert(ret_name.clone(), type_name);
+            } else if self.module.classes.contains_key(&type_name) {
+                self.var_class_types.insert(ret_name.clone(), type_name);
+            }
+        }
         // Mark string-typed return var / params for character indexing.
         if Self::is_string_data_type(&fd.return_type) {
             self.string_signals.insert(ret_name.clone());
@@ -76951,6 +77083,30 @@ impl Simulator {
             .and_then(Self::container_base)
     }
 
+    fn lookup_type_member(&self, type_name: &str, member: &str) -> Option<String> {
+        if let Some(t) = self.class_prop_type_named(type_name, member) {
+            return Some(t);
+        }
+        if let Some(dt) = self.module.typedef_types.get(type_name).cloned() {
+            let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
+            if let DataType::Struct(su) = resolved {
+                for m in &su.members {
+                    for d in &m.declarators {
+                        if d.name.name == member {
+                            if let DataType::TypeReference { name, .. } = &m.data_type {
+                                return Some(name.name.name.clone());
+                            }
+                            if let DataType::TypeReference { name, .. } = self.resolve_dt(&m.data_type) {
+                                return Some(name.name.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn class_prop_type_named(&self, class_name: &str, prop: &str) -> Option<String> {
         let mut cur = Some(class_name.to_string());
         while let Some(cname) = cur {
@@ -77171,31 +77327,24 @@ impl Simulator {
                         }
                     }
                 }
-                // `ClassName::static_prop` (2-segment): look up the static
-                // property's declared type. Needed for bare `new` type
-                // inference (`container::the_obj = new`) — without this,
-                // get_expr_type_name returns None and the construction is
-                // skipped, leaving the static property null.
-                if hier.path.len() == 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
-                    let cls = &hier.path[0].name.name;
-                    let prop = &hier.path[1].name.name;
-                    if let Some(t) = self.class_prop_type_named(cls, prop) {
-                        return Some(t);
-                    }
-                }
-                // `ClassName::static_obj_handle.member...` (3+ segments):
-                // resolve the static property's declared type, then walk the
-                // remaining segments through class property types. Needed for
-                // `ClassName::obj.member = new(...)` type inference — e.g.
-                // UVM's `the_pool.inst = new` where `the_pool` is a static
-                // holding an object whose `member` is itself a class handle.
-                if hier.path.len() >= 3 && hier.path.iter().all(|s| s.selects.is_empty()) {
-                    let cls = &hier.path[0].name.name;
-                    let prop = &hier.path[1].name.name;
-                    if let Some(mut tn) = self.class_prop_type_named(cls, prop) {
+                // Multi-segment path resolution (e.g. `stor.handle`, `ClassName::static_prop`, `obj.field.subfield`)
+                if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    let root = &hier.path[0].name.name;
+                    let curr_type = if let Some(t) = self.var_class_types.get(root) {
+                        Some(t.clone())
+                    } else if let Some(t) = self.var_typedef_types.get(root) {
+                        Some(t.clone())
+                    } else if self.module.classes.contains_key(root) {
+                        Some(root.clone())
+                    } else if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                        self.class_prop_type_named(&ctx, root)
+                    } else {
+                        None
+                    };
+                    if let Some(mut tn) = curr_type {
                         let mut ok = true;
-                        for seg in &hier.path[2..] {
-                            if let Some(next) = self.class_prop_type_named(&tn, &seg.name.name) {
+                        for seg in &hier.path[1..] {
+                            if let Some(next) = self.lookup_type_member(&tn, &seg.name.name) {
                                 tn = next;
                             } else {
                                 ok = false;
@@ -77292,6 +77441,26 @@ impl Simulator {
                         if let Some(tn) = self.get_expr_type_name(base) {
                             if let Some(mt) = self.class_prop_type_named(&tn, &member.name) {
                                 return Some(mt);
+                            }
+                        }
+                    }
+                }
+                if let Some(base_type) = self.get_expr_type_name(base) {
+                    let dt_opt = self.module.typedef_types.get(&base_type).cloned();
+                    if let Some(dt) = dt_opt {
+                        let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
+                        if let DataType::Struct(su) = resolved {
+                            for m in &su.members {
+                                for d in &m.declarators {
+                                    if d.name.name == member.name {
+                                        if let DataType::TypeReference { name, .. } = &m.data_type {
+                                            return Some(name.name.name.clone());
+                                        }
+                                        if let DataType::TypeReference { name, .. } = self.resolve_dt(&m.data_type) {
+                                            return Some(name.name.name.clone());
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
