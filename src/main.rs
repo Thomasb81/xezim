@@ -114,6 +114,10 @@ fn print_usage() {
     eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
     eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
     eprintln!("                     sources in parse order, -v library files, -y library dirs");
+    eprintln!("  --dump-merged-sv <file>  Write ALL sources, fully preprocessed (`ifdef");
+    eprintln!("                     resolved, macros expanded, `includes inlined), into one");
+    eprintln!("                     self-contained .sv file — a standalone repro for");
+    eprintln!("                     debugging parse/elaboration problems in -f builds");
     eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
@@ -841,6 +845,7 @@ fn main() {
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
     let mut dump_files_list = false;
+    let mut dump_merged_sv: Option<String> = None;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
@@ -1306,6 +1311,18 @@ fn main() {
             "--dump-files-list" => {
                 dump_files_list = true;
             }
+            "--dump-merged-sv" => {
+                i += 1;
+                if i < args.len() {
+                    dump_merged_sv = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: --dump-merged-sv requires an output file name");
+                    std::process::exit(1);
+                }
+            }
+            _ if arg.starts_with("--dump-merged-sv=") => {
+                dump_merged_sv = Some(arg["--dump-merged-sv=".len()..].to_string());
+            }
             "--threads" => {
                 i += 1;
                 if i < args.len() {
@@ -1741,6 +1758,52 @@ suppressed but the explicit SDF annotation still applies."
                 std::process::exit(1);
             }
         };
+
+    // `--dump-merged-sv <file>`: one self-contained .sv with every source in
+    // parse order, fully preprocessed — `ifdef branches resolved, macros
+    // expanded, `includes inlined. A 125-file `-f` build becomes a single
+    // re-runnable repro for parse/elaboration debugging. Blank lines left by
+    // the preprocessor are kept so line numbers inside each section still
+    // match the per-file diagnostics.
+    if let Some(ref merged_out) = dump_merged_sv {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "// Merged preprocessed sources — xezim {} ({} file(s))\n\
+             // Defines, `ifdef selection and `include expansion already applied.\n\
+             // NOTE: `timescale directives are consumed by the preprocessor and\n\
+             // not re-emitted; pass --module-timescale when re-running this file.\n",
+            env!("CARGO_PKG_VERSION"),
+            preprocessed_sources.len()
+        ));
+        for (i, (label, text)) in file_labels
+            .iter()
+            .zip(preprocessed_sources.iter())
+            .enumerate()
+        {
+            out.push_str(&format!(
+                "\n// ===== file {}/{}: {} =====\n",
+                i + 1,
+                preprocessed_sources.len(),
+                label
+            ));
+            out.push_str(text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        match std::fs::write(merged_out, &out) {
+            Ok(()) => println!(
+                "Wrote merged preprocessed SV to {} ({} files, {} bytes)",
+                merged_out,
+                preprocessed_sources.len(),
+                out.len()
+            ),
+            Err(e) => {
+                eprintln!("Error: cannot write '{}': {}", merged_out, e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     if mode == Mode::Preprocess {
         // IEEE 1800-2017 §22: preprocess-only mode. The preprocessor has
