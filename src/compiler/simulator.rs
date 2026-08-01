@@ -36482,7 +36482,11 @@ impl Simulator {
                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(32))
                         .unwrap_or(32) as u32;
                     if let Some(a) = args.get(1) {
-                        let v = self.eval_expr(a).resize(n.max(1));
+                        // §6.24.1: the cast size is the operand's evaluation
+                        // CONTEXT, as if assigned to a variable of that width —
+                        // `5'(3'd7 + 3'd6)` computes the sum at 5 bits (13),
+                        // not at the operands' self-determined 3 bits (5).
+                        let v = self.eval_expr_ctx(a, n.max(1)).resize(n.max(1));
                         return v;
                     }
                     Value::zero(n.max(1))
@@ -66949,7 +66953,18 @@ impl Simulator {
         )
         .max(1);
         self.widths.insert(ret_name.clone(), ret_w);
-        locals.insert(ret_name.clone(), Value::zero(ret_w));
+        // §13.4.1: the return variable is a VARIABLE of the return type — its
+        // initial value is the type default: x for a 4-state type, 0 for a
+        // 2-state one. An empty `function integer y(); endfunction` returns
+        // 'bx (ivtest br_gh337); seeding zero unconditionally masked that.
+        let ret_init = if super::elaborate::is_type_real(&fd.return_type) {
+            Value::from_f64(0.0)
+        } else if super::elaborate::is_type_two_state(&fd.return_type) {
+            Value::zero(ret_w)
+        } else {
+            Value::new(ret_w)
+        };
+        locals.insert(ret_name.clone(), ret_init);
         // Mark string-typed return var / params for character indexing.
         if Self::is_string_data_type(&fd.return_type) {
             self.string_signals.insert(ret_name.clone());
@@ -76531,7 +76546,15 @@ impl Simulator {
                                 )
                                 .max(1);
                                 self.widths.insert(rn.clone(), rw);
-                                Value::zero(rw)
+                                // §13.4.1: type default — x for 4-state (see
+                                // the module-function twin above).
+                                if super::elaborate::is_type_real(&f.return_type) {
+                                    Value::from_f64(0.0)
+                                } else if super::elaborate::is_type_two_state(&f.return_type) {
+                                    Value::zero(rw)
+                                } else {
+                                    Value::new(rw)
+                                }
                             }
                         } else {
                             Value::zero(32)
