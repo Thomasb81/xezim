@@ -756,7 +756,103 @@ fn redirect_stdio_to_log(path: &str) -> std::io::Result<()> {
     ))
 }
 
+/// Post-elaboration design summary (vendor-elaborator style). xezim inlines
+/// the hierarchy into one flat module, so the left column counts FLATTENED
+/// runtime objects and the right column counts unique parsed definitions —
+/// a sanity check that the whole design was analyzed.
+fn print_design_summary(
+    defs: &std::collections::HashMap<
+        String,
+        xezim::SourceDefinition,
+        impl std::hash::BuildHasher,
+    >,
+    elab: &xezim::compiler::ElaboratedModule,
+) {
+    use xezim::SourceDefinition as SD;
+    let uniq = |f: &dyn Fn(&SD) -> bool| defs.values().filter(|d| f(d)).count();
+    let u_mod = uniq(&|d| matches!(d, SD::Module(_)));
+    let u_ifc = uniq(&|d| matches!(d, SD::Interface(_)));
+    let u_prog = uniq(&|d| matches!(d, SD::Program(_)));
+    let u_pkg = uniq(&|d| matches!(d, SD::Package(_)));
+    let u_cls = uniq(&|d| matches!(d, SD::Class(_)));
+    let u_udp = uniq(&|d| matches!(d, SD::Udp(_)));
+    let arr_elems: i64 = elab
+        .arrays
+        .values()
+        .map(|&(lo, hi, _)| (hi - lo + 1).max(0))
+        .sum();
+    println!("Design summary (flattened / unique definitions):");
+    let row = |label: &str, inst: usize, uniqn: usize| {
+        println!("  {:<28}{:>12}  {:>8}", label, inst, uniqn);
+    };
+    println!("  {:<28}{:>12}  {:>8}", "", "flattened", "unique");
+    row("Modules:", elab.src_file_of_module.len(), u_mod);
+    row("Interfaces:", elab.interfaces.len(), u_ifc);
+    row("Programs:", u_prog, u_prog);
+    row("Packages:", elab.packages.len(), u_pkg);
+    row("UDP instances:", elab.udp_instances.len(), u_udp);
+    row("Classes:", elab.classes.len(), u_cls);
+    println!("  {:<28}{:>12}", "Signals:", elab.signals.len());
+    println!(
+        "  {:<28}{:>12}  ({} elements)",
+        "Unpacked arrays:",
+        elab.arrays.len(),
+        arr_elems
+    );
+    println!("  {:<28}{:>12}", "Named events:", elab.events.len());
+    println!("  {:<28}{:>12}", "Always blocks:", elab.always_blocks.len());
+    println!("  {:<28}{:>12}", "Initial blocks:", elab.initial_blocks.len());
+    println!("  {:<28}{:>12}", "Final blocks:", elab.final_blocks.len());
+    println!(
+        "  {:<28}{:>12}",
+        "Cont. assignments:",
+        elab.continuous_assigns.len()
+    );
+    println!("  {:<28}{:>12}", "Functions:", elab.functions.len());
+    println!("  {:<28}{:>12}", "Tasks:", elab.tasks.len());
+    println!(
+        "  {:<28}{:>9} ns",
+        "Simulation time unit:",
+        elab.tick_s * 1e9
+    );
+}
+
+/// Peak/current memory and CPU usage, vendor-tool style, so long builds can
+/// be compared against other tools' footers.
+fn print_resource_usage(wall_start: std::time::Instant) {
+    let mut peak = String::new();
+    let mut cur = String::new();
+    if let Ok(st) = std::fs::read_to_string("/proc/self/status") {
+        for line in st.lines() {
+            if let Some(v) = line.strip_prefix("VmHWM:") {
+                peak = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("VmRSS:") {
+                cur = v.trim().to_string();
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0 {
+            let user = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 / 1e6;
+            let sys = ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 / 1e6;
+            println!(
+                "xezim: CPU Usage - {:.1}s system + {:.1}s user = {:.1}s total (wall {:.1}s)",
+                sys,
+                user,
+                sys + user,
+                wall_start.elapsed().as_secs_f64()
+            );
+        }
+    }
+    if !peak.is_empty() || !cur.is_empty() {
+        println!("xezim: Memory Usage - Current: {}, Peak: {}", cur, peak);
+    }
+}
+
 fn main() {
+    let compile_wall_start = std::time::Instant::now();
     spawn_memory_watchdog();
     // Install the SIGUSR1 hang-report handler before compile: a user poking a
     // seemingly-hung run during a long elaboration must not kill it (the
@@ -1966,6 +2062,8 @@ suppressed but the explicit SDF annotation still applies."
                     std::process::exit(1);
                 }
                 println!("Elaboration successful");
+                print_design_summary(&_defs, &elab);
+                print_resource_usage(compile_wall_start);
                 // §6.21: keep compiled artifacts consistent with the simulate
                 // path — re-issue static initializers that call simulation-time
                 // system functions as time-0 assignments (issue #26).
