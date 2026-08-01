@@ -32144,6 +32144,54 @@ impl Simulator {
                     }
                     }
                 }
+                // BIT-select write into a PACKED-STRUCT MEMBER
+                // (`t.f2[3] = 1'b1`): the member is a bit-slice of the parent
+                // signal, and no arm below handles a MemberAccess base — the
+                // write fell through and vanished (the RANGE form worked,
+                // which is how it hid). Read the member slice, set the bit,
+                // splice back through the central by-name setter.
+                if matches!(&expr.kind, ExprKind::MemberAccess { .. })
+                    || matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() > 1)
+                {
+                    if let Some(base) = self.flat_member_name(expr) {
+                        // Only the plain single-descending-dimension member:
+                        // a MULTI-DIM member (`foo.a[5]` on bit [7:0][7:0])
+                        // selects an ELEMENT, and an ascending member mirrors
+                        // its bit labels — both belong to the arms below.
+                        let multi_dim = self
+                            .module
+                            .packed_signal_elem_widths
+                            .get(&base)
+                            .is_some_and(|&ew| ew > 1)
+                            || self
+                                .module
+                                .packed_full_dims
+                                .get(&base)
+                                .is_some_and(|d| d.len() > 1);
+                        let ascending = base
+                            .rsplit_once('.')
+                            .is_some_and(|(root, leaf)| self.struct_member_ascending(root, leaf).is_some());
+                        if !multi_dim && !ascending && self.packed_leaf_of_hier(&base).is_some() {
+                            let idx_v = self.eval_expr(index);
+                            if idx_v.has_xz() {
+                                return false; // §11.5.1: x/z index selects nothing
+                            }
+                            let i = idx_v.to_i64().unwrap_or(0);
+                            if let Some(mut cur) = self.get_signal_value_by_name(&base) {
+                                if i >= 0 && (i as u32) < cur.width {
+                                    let prev = cur.clone();
+                                    cur.set_bit(i as usize, val.get_bit(0));
+                                    let changed = cur != prev;
+                                    if changed {
+                                        self.set_signal_value_by_name(&base, cur);
+                                    }
+                                    return changed;
+                                }
+                                return false; // out-of-range bit write discarded
+                            }
+                        }
+                    }
+                }
                 // Ascending packed vector bit-write (`logic [0:7] pa; pa[i]=b`):
                 // label i targets internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
@@ -41010,9 +41058,14 @@ impl Simulator {
                 // A named/ordered/default pattern driven onto a PACKED struct
                 // (or sub-member) must be laid out by member offset, not
                 // blind-concatenated — see try_assign_packed_struct_pattern.
+                // A pattern onto a PACKED ARRAY lvalue likewise expands per
+                // ELEMENT (`cdts <= '{default: v}` on logic [1:0][9:0] filled
+                // only element 0 through the generic eval) — same route the
+                // CA and blocking paths already take.
                 let val = match &rvalue.kind {
                     ExprKind::AssignmentPattern(items) => self
-                        .eval_packed_struct_pattern(lvalue, items)
+                        .packed_pattern_for_lhs(lvalue, items)
+                        .or_else(|| self.eval_packed_struct_pattern(lvalue, items))
                         .unwrap_or_else(|| self.eval_expr(rvalue)),
                     _ => self.eval_expr(rvalue),
                 };
