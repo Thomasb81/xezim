@@ -1961,8 +1961,24 @@ impl<'a> BytecodeCompiler<'a> {
                                 return Some(dest);
                             }
                         }
+                        let mut phys_l = l as i64;
+                        let mut phys_r = r as i64;
+                        if let ExprKind::Ident(h) = &expr.kind {
+                            if let Some((dl, dr)) = self.packed_outer_dim(h) {
+                                let lo_b = dl.min(dr);
+                                if lo_b != 0 {
+                                    phys_l -= lo_b;
+                                    phys_r -= lo_b;
+                                }
+                            }
+                        }
                         let dest = self.alloc_reg();
-                        self.emit(Insn::RangeSelectConst(dest, base, l, r));
+                        self.emit(Insn::RangeSelectConst(
+                            dest,
+                            base,
+                            phys_l.max(0) as u32,
+                            phys_r.max(0) as u32,
+                        ));
                         return Some(dest);
                     }
                     let l = self.compile_expr(left, 0)?;

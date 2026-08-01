@@ -228,6 +228,12 @@ fn untimed_module_inherits_preceding_directive() {
 module timed; initial $printtimescale; endmodule
 module inherits_it; initial $printtimescale; endmodule
 "#);
-    assert!(o.contains("(inherits_it) is 1us / 1ns"),
+    // The module is a top, so under the multi-top wrapper its name reports as
+    // `__xezim_multi_top.inherits_it`. The name is incidental — what matters is
+    // that it INHERITED the preceding `1us/1ns` directive instead of defaulting
+    // to 1s/1s, so assert on the value of the inherits_it line.
+    let inherits_line = o.lines().find(|l| l.contains("inherits_it"))
+        .expect("inherits_it $printtimescale line missing");
+    assert!(inherits_line.contains("1us / 1ns"),
         "module after a directive must inherit it; got: {}", o);
 }
