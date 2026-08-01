@@ -18779,6 +18779,23 @@ impl Simulator {
     /// are harmlessly dropped later; only module-level references (the hidden
     /// dependencies) survive. A thread-local active-set breaks (mutual)
     /// recursion so recursive functions don't loop forever here.
+    /// §20.7 array query on a size-varying operand (dynamic array, queue,
+    /// string). The result type is `int` — SIGNED — and an empty collection
+    /// answers `$right`/`$high` with -1, not a clamped 0.
+    fn dynamic_query_result(sn: &str, size: u64) -> Value {
+        let hi = size as i64 - 1;
+        let r: i64 = match sn {
+            "$size" => size as i64,
+            "$left" | "$low" => 0,
+            "$right" | "$high" => hi,
+            "$increment" => -1,
+            _ => 0,
+        };
+        let mut v = Value::from_u64((r as u64) & 0xFFFF_FFFF, 32);
+        v.is_signed = true;
+        v
+    }
+
     fn collect_function_reads(name: &str, module: &ElaboratedModule, reads: &mut HashSet<String>) {
         thread_local! {
             static ACTIVE: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
@@ -18792,6 +18809,13 @@ impl Simulator {
             return;
         }
         let mut scratch_writes: HashSet<String> = HashSet::default();
+        // §13.4.3: a default-argument expression is evaluated at call time, so
+        // its reads are part of the caller's sensitivity too.
+        for port in &fdecl.ports {
+            if let Some(def) = &port.default {
+                Self::collect_expr_reads(def, module, reads);
+            }
+        }
         for item in &fdecl.items {
             Self::collect_stmt_reads(item, module, reads, &mut scratch_writes);
         }
@@ -37265,16 +37289,17 @@ impl Simulator {
                             if let Some(nm) = self.array_operand_name(arg) {
                                 if self.module.dynamic_arrays.contains(&nm) {
                                     let size = self.get_queue_size(&nm);
-                                    let hi = size as i64 - 1;
-                                    let r = match sn.as_str() {
-                                        "$size" => size,
-                                        "$left" | "$low" => 0,
-                                        "$right" | "$high" => hi.max(0) as u64,
-                                        "$increment" => 0u64.wrapping_sub(1),
-                                        _ => 0,
-                                    };
-                                    return Value::from_u64(r, 32);
+                                    return Self::dynamic_query_result(&sn, size);
                                 }
+                            }
+                            // §7.11 applies to strings too: a string acts as a
+                            // dynamic array of bytes, so the queries track its
+                            // CURRENT length ($left 0, $right len-1) — not the
+                            // 1024-bit placeholder width it fell through to.
+                            if self.expr_is_string_valued(arg) {
+                                let len =
+                                    self.eval_expr(arg).sv_string_bytes().len() as u64;
+                                return Self::dynamic_query_result(&sn, len);
                             }
                         }
                     }
@@ -48818,6 +48843,24 @@ impl Simulator {
     /// a class constructor, an array builtin), where the caller falls back to
     /// evaluation.
     fn call_return_width(&mut self, func: &Expression) -> Option<u32> {
+        // A queue/dyn-array method reached here through the generic Call
+        // fallback and EVALUATED — so `s - q.pop_back()` popped once for the
+        // width probe and once for the value, silently draining the queue.
+        // Answer the value-returning builtins from the element type instead.
+        if let Some((obj, mname)) = self.collection_method_of(func) {
+            match mname.as_str() {
+                "size" | "num" | "len" => return Some(32),
+                "pop_front" | "pop_back" => {
+                    let w = self
+                        .lookup_signal_width(&format!("{}[0]", obj))
+                        .or_else(|| self.module.arrays.get(&obj).map(|t| t.2));
+                    if let Some(w) = w.filter(|w| *w > 0) {
+                        return Some(w);
+                    }
+                }
+                _ => {}
+            }
+        }
         let ExprKind::Ident(h) = &func.kind else {
             return None;
         };
@@ -57780,6 +57823,32 @@ impl Simulator {
             if let Some(v) = v {
                 self.set_signal_value_by_name(&format!("{}[{}]", obj_name, newi), v);
             }
+        }
+    }
+
+    /// A method call on a queue / dynamic array / fixed collection: the
+    /// receiver's flat name and the method name. Purely syntactic + table
+    /// lookup — never evaluates the receiver.
+    fn collection_method_of(&mut self, func: &Expression) -> Option<(String, String)> {
+        let (obj, mname) = match &func.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (self.flat_member_name(expr)?, member.name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mname = h.path.last()?.name.name.clone();
+                let obj = h.path[..h.path.len() - 1]
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                (obj, mname)
+            }
+            _ => return None,
+        };
+        if self.module.dynamic_arrays.contains(&obj) || self.module.arrays.contains_key(&obj) {
+            Some((obj, mname))
+        } else {
+            None
         }
     }
 
