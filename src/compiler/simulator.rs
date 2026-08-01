@@ -49604,6 +49604,21 @@ impl Simulator {
             _ => self.eval_expr(expr).width,
         }
     }
+    /// Cheaply test whether the method name of a call callee (`recv.m(...)`
+    /// as `MemberAccess`, or a 2+-segment `Ident`) satisfies `pred`, WITHOUT
+    /// running `flat_member_name` over the receiver. Used to gate the
+    /// expensive `collection_method_of` so it only runs for names it could
+    /// possibly answer (size/num/len/pop_*). See `call_return_width`.
+    fn callee_method_name_is<F: Fn(&str) -> bool>(&self, func: &Expression, pred: F) -> bool {
+        match &func.kind {
+            ExprKind::MemberAccess { member, .. } => pred(&member.name),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                pred(&h.path.last().expect("len>=2").name.name)
+            }
+            _ => false,
+        }
+    }
+
     /// Declared return width of the function `func` names, without calling it.
     /// `None` when the callee is not a plain module-scope function (a method,
     /// a class constructor, an array builtin), where the caller falls back to
@@ -49613,18 +49628,32 @@ impl Simulator {
         // fallback and EVALUATED — so `s - q.pop_back()` popped once for the
         // width probe and once for the value, silently draining the queue.
         // Answer the value-returning builtins from the element type instead.
-        if let Some((obj, mname)) = self.collection_method_of(func) {
-            match mname.as_str() {
-                "size" | "num" | "len" => return Some(32),
-                "pop_front" | "pop_back" => {
-                    let w = self
-                        .lookup_signal_width(&format!("{}[0]", obj))
-                        .or_else(|| self.module.arrays.get(&obj).map(|t| t.2));
-                    if let Some(w) = w.filter(|w| *w > 0) {
-                        return Some(w);
+        //
+        // GATE: only invoke `collection_method_of` (which runs
+        // `flat_member_name` over the receiver on EVERY call) when the
+        // callee's method name is one of the value-returning collection
+        // builtins. `infer_width` probes every arithmetic/bitwise operand
+        // each evaluation, so a class method used in a loop
+        // (`sum += e.get_a()`) drove `flat_member_name` through the receiver
+        // millions of times only to have `collection_method_of` return None.
+        // Class methods (`get_a`, `compute`, …) fall through to
+        // `class_method_return_width` below without that cost.
+        if self.callee_method_name_is(func, |m| {
+            matches!(m, "size" | "num" | "len" | "pop_front" | "pop_back")
+        }) {
+            if let Some((obj, mname)) = self.collection_method_of(func) {
+                match mname.as_str() {
+                    "size" | "num" | "len" => return Some(32),
+                    "pop_front" | "pop_back" => {
+                        let w = self
+                            .lookup_signal_width(&format!("{}[0]", obj))
+                            .or_else(|| self.module.arrays.get(&obj).map(|t| t.2));
+                        if let Some(w) = w.filter(|w| *w > 0) {
+                            return Some(w);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         // A class METHOD call (`recv.m(...)`): the width comes from the
@@ -49671,19 +49700,20 @@ impl Simulator {
     fn class_method_return_width(&self, func: &Expression) -> Option<u32> {
         use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::DataType;
-        // Extract (receiver head name, method name) from the two shapes a
-        // method-call callee parses to. A nested receiver (`a.b.m()`) would
-        // need heap walking to type, so stay conservative and return None.
-        let (recv_head, mname): (String, String) = match &func.kind {
+        // Extract (receiver head name, method name) as BORROWED slices.
+        // `infer_width` probes every arithmetic/bitwise operand on each
+        // evaluation, so the two `String` allocations this used to do ran in
+        // every loop iteration; borrowing from `func` avoids them.
+        let (recv_head, mname): (&str, &str) = match &func.kind {
             ExprKind::MemberAccess { expr, member } => {
                 let head = match &expr.kind {
-                    ExprKind::Ident(h) if h.path.len() == 1 => h.path[0].name.name.clone(),
+                    ExprKind::Ident(h) if h.path.len() == 1 => h.path[0].name.name.as_str(),
                     _ => return None,
                 };
-                (head, member.name.clone())
+                (head, member.name.as_str())
             }
             ExprKind::Ident(h) if h.path.len() == 2 => {
-                (h.path[0].name.name.clone(), h.path[1].name.name.clone())
+                (h.path[0].name.name.as_str(), h.path[1].name.name.as_str())
             }
             _ => return None,
         };
@@ -49691,20 +49721,24 @@ impl Simulator {
         // local of class type, or a class-typed signal. Subtler resolutions
         // (properties of `this`, typedef locals, …) return None and keep the
         // prior fallback.
-        let class_name = self
-            .var_class_types
-            .get(&recv_head)
-            .cloned()
-            .or_else(|| {
-                self.signal_name_to_id
-                    .get(recv_head.as_str())
-                    .and_then(|id| self.signal_type_names.get(id).cloned())
-            })?;
+        //
+        // NOTE: `var_class_types` is a FLAT accumulator never cleared on
+        // scope/method exit (see the note at `class_prop_type`), so this
+        // binding can be stale across method calls — the result is therefore
+        // NOT memoisable by AST node. That is pre-existing behaviour.
+        let class_name: String = if let Some(cn) = self.var_class_types.get(recv_head) {
+            cn.clone()
+        } else {
+            let id = *self.signal_name_to_id.get(recv_head)?;
+            self.signal_type_names.get(&id)?.clone()
+        };
         // Walk the inheritance chain read-only to the method's return type.
-        let mut cur = Some(class_name);
-        while let Some(cn) = cur {
-            let cd = self.module.classes.get(&cn)?;
-            if let Some(m) = cd.methods.get(&mname) {
+        // `extends` must be cloned per level: the borrow of a `classes` entry
+        // can't be carried across loop iterations (the entry is dropped at
+        // each iteration end).
+        let mut cur = class_name;
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if let Some(m) = cd.methods.get(mname) {
                 if let ClassMethodKind::Function(f) = &m.kind {
                     if matches!(f.return_type, DataType::Real { .. }) {
                         return Some(64);
@@ -49721,7 +49755,7 @@ impl Simulator {
                 }
                 return None; // task / extern / pure prototype
             }
-            cur = cd.extends.clone();
+            cur = cd.extends.clone()?;
         }
         None
     }
