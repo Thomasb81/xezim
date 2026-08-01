@@ -39592,9 +39592,42 @@ impl Simulator {
                                         }
                                     }
                                     None
-                                })
-                                .filter(|cn| self.module.classes.contains_key(cn));
-                            if let Some(cn) = elem_cls {
+                                });
+                            // The element type is often a TYPEDEF alias (UVM's
+                            // `uvm_sev_override_array` = `uvm_pool#(sev,sev)`, or
+                            // a plain `typedef sev_pool pool_t;`). The maps
+                            // above record the TYPEDEF name, which isn't a key in
+                            // `module.classes` — so filtering by `contains_key`
+                            // alone rejected it, `new` was dropped, and the
+                            // stored element had no resolvable class. Method calls
+                            // on it (`add`/`num`/`exists`) then silently no-op'd,
+                            // breaking every assoc-array-of-typedef'd-class
+                            // construction (UVM severity-id overrides store
+                            // `uvm_pool#(sev,sev)` handles this way).
+                            // Resolve the typedef to the underlying class, and
+                            // carry a `(base, sig)` spec for parameterized
+                            // typedefs so the element's type-param members bind.
+                            let elem_cls: Option<(String, Option<(String, String)>)> =
+                                match elem_cls {
+                                    Some(cn)
+                                        if self.module.classes.contains_key(&cn) =>
+                                    {
+                                        Some((cn, None))
+                                    }
+                                    Some(cn) => self
+                                        .resolve_simple_typedef_class(&cn)
+                                        .filter(|c| self.module.classes.contains_key(c))
+                                        .map(|c| (c, None))
+                                        .or_else(|| {
+                                            self.resolve_typedef_spec(&cn)
+                                                .filter(|(b, _)| {
+                                                    self.module.classes.contains_key(b)
+                                                })
+                                                .map(|(b, s)| (b.clone(), Some((b, s))))
+                                        }),
+                                    None => None,
+                                };
+                            if let Some((cn, spec)) = elem_cls {
                                 let ctor_args: &[Expression] = match &rvalue.kind {
                                     ExprKind::Call { args, .. } => args,
                                     _ => &[],
@@ -39634,7 +39667,15 @@ impl Simulator {
                                     }
                                 }
                                 if let Some(cd) = self.module.classes.get(&cn).cloned() {
-                                    let v = self.instantiate_class(&cd, ctor_args);
+                                    let v = if let Some((b, s)) = spec {
+                                        let saved = self.current_spec.take();
+                                        self.current_spec = Some((b, s));
+                                        let r = self.instantiate_class(&cd, ctor_args);
+                                        self.current_spec = saved;
+                                        r
+                                    } else {
+                                        self.instantiate_class(&cd, ctor_args)
+                                    };
                                     self.assign_value(lvalue, &v);
                                     return;
                                 }
