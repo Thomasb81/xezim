@@ -33867,6 +33867,16 @@ impl Simulator {
         find_signed(su, leaf, &self.module)
     }
 
+    /// Leaf identifier name of an expression, if it is a plain (possibly
+    /// scoped/dotted) identifier.
+    fn expr_leaf_name(e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+            ExprKind::Paren(inner) => Self::expr_leaf_name(inner),
+            _ => None,
+        }
+    }
+
     /// A signed integer literal, possibly under unary minus/plus or parens —
     /// the shapes whose ===/!== widening sign-extends by consensus.
     fn expr_is_signed_literal(e: &Expression) -> bool {
@@ -59758,11 +59768,14 @@ impl Simulator {
                         "first" => Value::from_u64(members[0].1, mw),
                         "last"  => Value::from_u64(members[members.len()-1].1, mw),
                         "next" | "prev" => {
-                            let cur = self
-                                .get_signal_value_by_name(obj_name)
-                                .map(|v| v.to_u64().unwrap_or(0))
-                                .unwrap_or(0);
-                            let pos = members.iter().position(|(_, v)| *v == cur);
+                            let cur_v = self.get_signal_value_by_name(obj_name);
+                            let cur_xz = cur_v.as_ref().is_some_and(|v| v.has_xz());
+                            let cur = cur_v.map(|v| v.to_u64().unwrap_or(0)).unwrap_or(0);
+                            let pos = if cur_xz {
+                                None
+                            } else {
+                                members.iter().position(|(_, v)| *v == cur)
+                            };
                             if let Some(p) = pos {
                                 // LRM §6.19.6: next(N)/prev(N) step N places with
                                 // wrapping (next of last -> first, prev of first
@@ -59775,8 +59788,13 @@ impl Simulator {
                                     (p + members.len() - step) % members.len()
                                 };
                                 Value::from_u64(members[new_p].1, mw)
-                            } else {
+                            } else if self.module.two_state_signals.contains(obj_name) {
+                                // §6.19.6: an invalid value maps to the base
+                                // type's DEFAULT — 0 for 2-state.
                                 Value::zero(mw)
+                            } else {
+                                // ... and x for a 4-state base.
+                                Value::new(mw)
                             }
                         }
                         _ => unreachable!(),
@@ -63308,8 +63326,13 @@ impl Simulator {
                                     .first()
                                     .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                                     .unwrap_or(1) as usize;
-                                let cur = self.eval_expr(expr).to_u64().unwrap_or(0);
-                                let pos = members.iter().position(|(_, v)| *v == cur);
+                                let cur_v = self.eval_expr(expr);
+                                let cur = cur_v.to_u64().unwrap_or(0);
+                                let pos = if cur_v.has_xz() {
+                                    None
+                                } else {
+                                    members.iter().position(|(_, v)| *v == cur)
+                                };
                                 if let Some(p) = pos {
                                     let n = members.len();
                                     let next_p = if mname == "next" {
@@ -63319,7 +63342,20 @@ impl Simulator {
                                     };
                                     return Value::from_u64(members[next_p].1, mw);
                                 }
-                                return Value::zero(mw);
+                                // §6.19.6: next/prev of a value NOT in the
+                                // enum returns the base type's DEFAULT initial
+                                // value — 0 for a 2-state base, x for 4-state.
+                                return if self
+                                    .get_expr_type_name(expr)
+                                    .as_deref()
+                                    .is_some_and(|t| self.module.two_state_signals.contains(t))
+                                    || Self::expr_leaf_name(expr).is_some_and(|n| {
+                                        self.module.two_state_signals.contains(&n)
+                                    }) {
+                                    Value::zero(mw)
+                                } else {
+                                    Value::new(mw)
+                                };
                             }
                             _ => {}
                         }

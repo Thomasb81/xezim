@@ -261,3 +261,28 @@ endmodule
     assert_eq!(u(&sim, "pv"), 5, "the imported FOO reaches the parameter default");
     assert_eq!(u(&sim, "bv"), 10, "the imported function sizes the port");
 }
+
+/// §6.19.2/§6.19.6: an enum's state-ness follows its BASE type — a 2-state
+/// base defaults the variable to 0 (4-state to x), and next/prev of an
+/// INVALID value returns that same default (ivtest `pr3366217i`).
+#[test]
+fn enum_default_and_invalid_next_follow_base_type() {
+    let src = r#"
+module top;
+  enum bit [3:0] {a2 = 1, b2 = 2} evar2;
+  enum reg [3:0] {a4 = 1, b4 = 2} evar4;
+  int i2, x4, n2, n4;
+  initial begin
+    i2 = (evar2 === 0);
+    x4 = (evar4 === 4'bx);
+    evar2 = evar2.next; n2 = (evar2 === 0);
+    evar4 = evar4.next; n4 = (evar4 === 4'bx);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "i2"), 1, "2-state base defaults to 0");
+    assert_eq!(u(&sim, "x4"), 1, "4-state base defaults to x");
+    assert_eq!(u(&sim, "n2"), 1, "next of invalid stays at the 2-state default");
+    assert_eq!(u(&sim, "n4"), 1, "next of invalid stays x for 4-state");
+}
