@@ -61832,10 +61832,24 @@ impl Simulator {
     /// `"DeclClass::prop"` storage key for a static property, if one of
     /// `start_class` or its ancestors declares `prop` as `static`.
     fn static_prop_key(&self, start_class: &str, prop: &str) -> Option<String> {
-        self.static_prop_key_inner(start_class, prop)
+        self.static_prop_key_spec(start_class, prop, None)
     }
 
-    fn static_prop_key_inner(&self, start_class: &str, prop: &str) -> Option<String> {
+    fn static_prop_key_spec(
+        &self,
+        start_class: &str,
+        prop: &str,
+        spec_override: Option<&(String, String)>,
+    ) -> Option<String> {
+        self.static_prop_key_inner(start_class, prop, spec_override)
+    }
+
+    fn static_prop_key_inner(
+        &self,
+        start_class: &str,
+        prop: &str,
+        spec_override: Option<&(String, String)>,
+    ) -> Option<String> {
         let mut cur = Some(start_class.to_string());
         while let Some(cname) = cur {
             if let Some(cd) = self.module.classes.get(&cname) {
@@ -61852,7 +61866,8 @@ impl Simulator {
                     // AND inherited from parameterized ancestors (the common
                     // UVM pattern: `uvm_registry_common::m__initialized` is
                     // inherited by `uvm_object_registry#(T,Tname)`).
-                    let key = match &self.current_spec {
+                    let active_spec = spec_override.or(self.current_spec.as_ref());
+                    let key = match active_spec {
                         Some((base, sig))
                             if (base == &cname
                                 || self.class_extends(base.as_str(), &cname))
@@ -63079,20 +63094,13 @@ impl Simulator {
     /// first, then the instance's CLASS static cell. Mirrors `member_handle`
     /// for the value-reading path used by `eval_expr`.
     fn read_member_value(&self, handle: usize, member: &str) -> Option<Value> {
-        if let Some(v) = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
-            .and_then(|i| i.properties.get(member).cloned())
-        {
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref());
+        if let Some(v) = inst.and_then(|i| i.properties.get(member).cloned()) {
             return Some(v);
         }
-        let cn = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
-            .map(|i| i.class_name.clone())?;
-        let key = self.static_prop_key(&cn, member)?;
+        let cn = inst.map(|i| i.class_name.clone())?;
+        let spec = inst.and_then(|i| i.spec.as_ref());
+        let key = self.static_prop_key_spec(&cn, member, spec)?;
         self.class_statics.get(&key).cloned()
     }
 
@@ -63101,22 +63109,17 @@ impl Simulator {
     /// property accessed through an instance handle refers to the class's
     /// shared static). Returns None if neither holds a handle.
     fn member_handle(&self, handle: usize, member: &str) -> Option<usize> {
-        if let Some(h) = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref());
+        if let Some(h) = inst
             .and_then(|i| i.properties.get(member))
             .and_then(|v| v.to_u64())
             .map(|h| h as usize)
         {
             return Some(h);
         }
-        let cn = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
-            .map(|i| i.class_name.clone())?;
-        let key = self.static_prop_key(&cn, member)?;
+        let cn = inst.map(|i| i.class_name.clone())?;
+        let spec = inst.and_then(|i| i.spec.as_ref());
+        let key = self.static_prop_key_spec(&cn, member, spec)?;
         self.class_statics
             .get(&key)
             .and_then(|v| v.to_u64())
@@ -69473,6 +69476,11 @@ impl Simulator {
             let c_base = class_def.name.split('#').next().unwrap_or(&class_def.name);
             if b == c_base {
                 instance.spec = Some((b.clone(), sig));
+            } else if self.class_extends(&b, c_base) {
+                if let Some(anc_sig) = self.ancestor_spec(&b, &sig, c_base) {
+                    let anc_sig = self.canonicalize_spec_sig(c_base, &anc_sig);
+                    instance.spec = Some((c_base.to_string(), anc_sig));
+                }
             }
         }
         self.heap.push(Some(instance));
@@ -69521,9 +69529,19 @@ impl Simulator {
                     .get(&pname)
                     .and_then(|s| s.type_name.as_deref())
                     .and_then(Self::container_base);
-                let is_new = matches!(&init.kind, ExprKind::Call { func, .. }
-                    if matches!(&func.kind, ExprKind::Ident(h)
-                        if h.path.len() == 1 && h.path[0].name.name == "new"));
+                let (is_new, ctor_args): (bool, &[Expression]) = match &init.kind {
+                    ExprKind::Call { func, args }
+                        if matches!(&func.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new") =>
+                    {
+                        (true, args.as_slice())
+                    }
+                    ExprKind::Ident(h)
+                        if h.path.len() == 1 && h.path[0].name.name == "new" =>
+                    {
+                        (true, &[])
+                    }
+                    _ => (false, &[]),
+                };
                 if let (Some(kind), true) = (cont_kind, is_new) {
                     let ch = self.heap.len();
                     self.heap.push(Some(ClassInstance {
@@ -69559,22 +69577,27 @@ impl Simulator {
                         .get(&pname)
                         .and_then(|s| s.type_name.clone());
                     if let Some(tn) = prop_tn {
-                        if self.module.classes.contains_key(&tn) {
-                            if let ExprKind::Call { args, .. } = &init.kind {
-                                if let Some(cd2) = self.module.classes.get(&tn).cloned() {
-                                    // Resolve any type-parameter bindings the
-                                    // ctor args may need from the active spec.
-                                    let ta = self.this_property_type_args(&pname);
-                                    let v = self.instantiate_class_with_type_args(
-                                        &cd2,
-                                        args,
-                                        ta.as_deref(),
-                                    );
-                                    if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                        inst.properties.insert(pname, v);
-                                    }
-                                    continue;
+                        let concrete_tn = if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
+                            self.lookup_typedef_target(&tn)
+                        {
+                            name.name.name.clone()
+                        } else {
+                            tn
+                        };
+                        if self.module.classes.contains_key(&concrete_tn) {
+                            if let Some(cd2) = self.module.classes.get(&concrete_tn).cloned() {
+                                // Resolve any type-parameter bindings the
+                                // ctor args may need from the active spec.
+                                let ta = self.this_property_type_args(&pname);
+                                let v = self.instantiate_class_with_type_args(
+                                    &cd2,
+                                    ctor_args,
+                                    ta.as_deref(),
+                                );
+                                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                    inst.properties.insert(pname, v);
                                 }
+                                continue;
                             }
                         }
                     }
