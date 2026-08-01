@@ -32586,8 +32586,15 @@ impl Simulator {
                         {
                             let lo_b = dl.min(dr);
                             if lo_b != 0 {
+                                // Offset the base/lo INDEX only. In
+                                // `[base +: W]` / `[base -: W]` the right
+                                // operand is a WIDTH, not an index, so it must
+                                // not be shifted — only the constant `[msb:lsb]`
+                                // form has two indices (LRM §7.4.1 / §11.5.1).
                                 l -= lo_b;
-                                r -= lo_b;
+                                if matches!(kind, RangeKind::Constant) {
+                                    r -= lo_b;
+                                }
                             }
                         }
                     }
@@ -35445,8 +35452,15 @@ impl Simulator {
                         if let Some(&(dl, dr)) = dims.first() {
                             let lo_b = dl.min(dr);
                             if lo_b != 0 {
+                                // Offset the base/lo INDEX only. In
+                                // `[base +: W]` / `[base -: W]` the right
+                                // operand is a WIDTH, not an index, so it must
+                                // not be shifted — only the constant `[msb:lsb]`
+                                // form has two indices (LRM §7.4.1 / §11.5.1).
                                 l_val -= lo_b;
-                                r_val -= lo_b;
+                                if matches!(kind, RangeKind::Constant) {
+                                    r_val -= lo_b;
+                                }
                             }
                         }
                     }
@@ -61613,8 +61627,8 @@ impl Simulator {
     /// `uvm_object::compare(rhs)` is inherited by every UVM object, yet
     /// without this guard `obj.compare(other)` silently ran the lexicographic
     /// `string::compare` builtin (returning -1/0/1) instead of the user
-    /// method — so `d1.compare(d2)` looked "equal" and
-    /// `03data/10comparer/20nullobj` failed. Mirrors the per-name `name()`
+    /// method — so `d1.compare(d2)` looked "equal" even when the two objects
+    /// differ. Mirrors the per-name `name()`
     /// guard below, but walks the inheritance chain (`class_has_method`) so
     /// inherited methods like `uvm_object::compare` are detected.
     fn class_expr_has_method(&self, recv: &Expression, mname: &str) -> bool {
@@ -67769,21 +67783,28 @@ impl Simulator {
                 // Fixed-size UNPACKED array member initializer
                 // (`int fa[4] = '{1,2,3,4}`): per-instance storage is the
                 // element signals `<handle>#fa[i]` (registered above as a real
-                // fixed array), NOT a scalar slot in the property map. Apply
-                // the assignment pattern member-wise, mapping pattern item k
-                // to declared index lo+k (handles non-zero lower bounds like
-                // `fa[1:4]`). Non-pattern initializers (replication/default)
-                // are left at the per-element defaults registered above rather
-                // than collapsing the aggregate into a scalar property.
-                if let Some(&(lo, _hi, _w)) = cdef.array_properties.get(&pname) {
+                // fixed array), NOT a scalar slot in the property map. Expand
+                // the assignment pattern over the DECLARED index range, so the
+                // replication form `'{4{9}}` and the `default:` fill
+                // (`'{default:7}`) reach EVERY element instead of collapsing
+                // into `fa[0]` as one packed value (LRM §10.9.1 / §10.10). The
+                // positional `'{1,2,3,4}` path is unchanged, and non-zero lower
+                // bounds (`fa[1:4]`) keep their declared indices. This shares
+                // `pattern_elems`, the same expansion the general array-pattern
+                // spread (`assign_pattern_array`) uses.
+                if let Some(&(lo, hi, _w)) = cdef.array_properties.get(&pname) {
                     let scoped = format!("{}#{}", handle, pname);
                     if let ExprKind::AssignmentPattern(items) = &init.kind {
-                        for (k, item) in items.iter().enumerate() {
-                            let v = self.eval_expr(item.expr());
-                            self.set_signal_value_by_name(
-                                &format!("{}[{}]", scoped, lo + k as i64),
-                                v,
-                            );
+                        let indices: Vec<i64> = (lo..=hi).collect();
+                        let elems = self.pattern_elems(items, &indices);
+                        for (k, e) in elems.into_iter().enumerate() {
+                            if let Some(e) = e {
+                                let v = self.eval_expr(e);
+                                self.set_signal_value_by_name(
+                                    &format!("{}[{}]", scoped, indices[k]),
+                                    v,
+                                );
+                            }
                         }
                     }
                     continue;
