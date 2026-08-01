@@ -49397,6 +49397,19 @@ impl Simulator {
                 _ => {}
             }
         }
+        // A class METHOD call (`recv.m(...)`): the width comes from the
+        // method's declared return type, resolved through the inheritance
+        // chain — NOT by executing the method. Without this, `infer_width`
+        // of a method call fell through to `eval_expr(expr).width` and RAN
+        // the method purely to read its width, so any method used inside an
+        // arithmetic expression (`a + obj.compute()`) executed twice — once
+        // for width, once for the value — double-firing side effects and
+        // doubling the per-call cost. `class_method_return_width` is
+        // conservative: it returns `None` for anything it can't cheaply
+        // resolve, preserving the prior fallback behaviour there.
+        if let Some(w) = self.class_method_return_width(func) {
+            return Some(w);
+        }
         let ExprKind::Ident(h) = &func.kind else {
             return None;
         };
@@ -49417,6 +49430,70 @@ impl Simulator {
             Some(&self.module.typedefs),
         );
         (w > 0).then_some(w)
+    }
+
+    /// Declared return width of a class METHOD call — `recv.m(...)` parsed as
+    /// `MemberAccess`, or `recv.m` as a 2-segment hierarchical identifier —
+    /// resolved through the inheritance chain WITHOUT executing the method.
+    /// `None` for anything not cheaply resolvable (the caller then keeps its
+    /// existing evaluation fallback), so this only ever widens the set of
+    /// calls whose width is taken statically. See `call_return_width`.
+    fn class_method_return_width(&self, func: &Expression) -> Option<u32> {
+        use crate::ast::decl::ClassMethodKind;
+        use crate::ast::types::DataType;
+        // Extract (receiver head name, method name) from the two shapes a
+        // method-call callee parses to. A nested receiver (`a.b.m()`) would
+        // need heap walking to type, so stay conservative and return None.
+        let (recv_head, mname): (String, String) = match &func.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                let head = match &expr.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 => h.path[0].name.name.clone(),
+                    _ => return None,
+                };
+                (head, member.name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 => {
+                (h.path[0].name.name.clone(), h.path[1].name.name.clone())
+            }
+            _ => return None,
+        };
+        // Resolve the receiver's class type. Common cases only — a bare
+        // local of class type, or a class-typed signal. Subtler resolutions
+        // (properties of `this`, typedef locals, …) return None and keep the
+        // prior fallback.
+        let class_name = self
+            .var_class_types
+            .get(&recv_head)
+            .cloned()
+            .or_else(|| {
+                self.signal_name_to_id
+                    .get(recv_head.as_str())
+                    .and_then(|id| self.signal_type_names.get(id).cloned())
+            })?;
+        // Walk the inheritance chain read-only to the method's return type.
+        let mut cur = Some(class_name);
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(m) = cd.methods.get(&mname) {
+                if let ClassMethodKind::Function(f) = &m.kind {
+                    if matches!(f.return_type, DataType::Real { .. }) {
+                        return Some(64);
+                    }
+                    if matches!(f.return_type, DataType::Void { .. }) {
+                        return None;
+                    }
+                    let w = super::elaborate::resolve_type_width(
+                        &f.return_type,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    );
+                    return (w > 0).then_some(w);
+                }
+                return None; // task / extern / pure prototype
+            }
+            cur = cd.extends.clone();
+        }
+        None
     }
 
     fn infer_lhs_width(&mut self, expr: &Expression) -> u32 {
@@ -76447,542 +76524,558 @@ impl Simulator {
         method_name: &str,
         args: &[Expression],
     ) -> Value {
-        use crate::ast::decl::ClassMethodKind;
+        use crate::ast::decl::{ClassMethod, ClassMethodKind};
         let mut cur_class = Some(start_class.to_string());
         while let Some(cname) = cur_class {
-            if let Some(class_def) = self.module.classes.get(&cname).cloned() {
-                if let Some(method) = class_def.methods.get(method_name) {
-                    let (ports, body) = match &method.kind {
-                        ClassMethodKind::Function(f) => (&f.ports, &f.items),
-                        ClassMethodKind::Task(t) => (&t.ports, &t.items),
-                        _ => {
-                            cur_class = class_def.extends.clone();
+            // Resolve the matched method + parent-class pointer in a scoped
+            // borrow, cloning AT MOST the single matched method — never the
+            // whole ElaboratedClass. Cloning the entire class (every method,
+            // property, constraint, param map, …) on each lookup made method
+            // dispatch O(class_size × call_count); under heavy call load
+            // through deep inheritance hierarchies that is pathological. Now
+            // only the matched Function/Task body is ever cloned; a miss
+            // (absent / extern / pure) walks up for free.
+            let (method_opt, parent): (Option<ClassMethod>, Option<String>) =
+                match self.module.classes.get(&cname) {
+                    Some(class_def) => (
+                        class_def
+                            .methods
+                            .get(method_name)
+                            .filter(|m| matches!(
+                                m.kind,
+                                ClassMethodKind::Function(_) | ClassMethodKind::Task(_)
+                            ))
+                            .cloned(),
+                        class_def.extends.clone(),
+                    ),
+                    None => (None, None),
+                };
+            cur_class = parent;
+            if let Some(method) = method_opt {
+                let (ports, body) = match &method.kind {
+                    ClassMethodKind::Function(f) => (&f.ports, &f.items),
+                    ClassMethodKind::Task(t) => (&t.ports, &t.items),
+                    _ => unreachable!("non-Function/Task methods filtered out above"),
+                };
+                let mut locals: HashMap<String, Value> = HashMap::default();
+                // §13.5.3: reorder named args into formal order and fill any
+                // omitted (`.name()` / positional `,,`) slot from the formal's
+                // default before positional binding below.
+                let normalized = Self::normalize_call_args(ports, args);
+                let args: &[Expression] = normalized.as_deref().unwrap_or(args);
+                // A function may set its result via the implicit
+                // return variable named after the function (`f = ...`)
+                // instead of an explicit `return`.
+                let fn_ret_name: Option<String> = match &method.kind {
+                    ClassMethodKind::Function(f) => Some(f.name.name.name.clone()),
+                    _ => None,
+                };
+                let ret_is_string = matches!(&method.kind,
+                    ClassMethodKind::Function(f) if Self::is_string_data_type(&f.return_type));
+                // A packed return type whose range references a CLASS
+                // parameter (`function bit [W-1:0] mk();`) can only be
+                // sized per instance — capture it for the clamp at the
+                // return point below. Literal ranges resolve here (params
+                // = None succeeds) and stay un-clamped as before.
+                let dyn_ret_type: Option<DataType> = match &method.kind {
+                    ClassMethodKind::Function(f) => {
+                        let dims = match &f.return_type {
+                            DataType::IntegerVector { dimensions, .. } => Some(dimensions),
+                            DataType::Implicit { dimensions, .. } => Some(dimensions),
+                            _ => None,
+                        };
+                        dims.filter(|ds| {
+                            ds.iter().any(|d| {
+                                matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                                    if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
+                                        || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
+                            })
+                        })
+                        .map(|_| f.return_type.clone())
+                    }
+                    _ => None,
+                };
+                self.push_queue_frame();
+                // `output`/`inout`/`ref` formals copy back to the caller's
+                // actual on return (e.g. `randomize_instr(output riscv_instr
+                // instr, …)` writing the picked instruction to `instr_list[i]`).
+                let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+                let mut queue_writebacks: Vec<(String, String)> = Vec::new();
+                let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
+                let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
+                for (i, port) in ports.iter().enumerate() {
+                    let is_assoc = self.port_is_assoc_array(port);
+                    // An associative-array `output`/`inout`/`ref` formal
+                    // is copied back via the assoc-param signal-namespace
+                    // merge, NOT the scalar `output_bindings` path (which
+                    // can't represent an AA). §13.5.2.
+                    if matches!(
+                        port.direction,
+                        PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                    ) && i < args.len()
+                        && !is_assoc
+                    {
+                        output_bindings.push((port.name.name.clone(), args[i].clone()));
+                    }
+                    if i < args.len() {
+                        if let Some((param, caller)) = self.bind_assoc_param(port, &args[i]) {
+                            let is_out = matches!(
+                                port.direction,
+                                PortDirection::Output
+                                    | PortDirection::Inout
+                                    | PortDirection::Ref
+                            );
+                            assoc_params.push((param, caller, is_out));
                             continue;
                         }
-                    };
-                    let mut locals: HashMap<String, Value> = HashMap::default();
-                    // §13.5.3: reorder named args into formal order and fill any
-                    // omitted (`.name()` / positional `,,`) slot from the formal's
-                    // default before positional binding below.
-                    let normalized = Self::normalize_call_args(ports, args);
-                    let args: &[Expression] = normalized.as_deref().unwrap_or(args);
-                    // A function may set its result via the implicit
-                    // return variable named after the function (`f = ...`)
-                    // instead of an explicit `return`.
-                    let fn_ret_name: Option<String> = match &method.kind {
-                        ClassMethodKind::Function(f) => Some(f.name.name.name.clone()),
-                        _ => None,
-                    };
-                    let ret_is_string = matches!(&method.kind,
-                        ClassMethodKind::Function(f) if Self::is_string_data_type(&f.return_type));
-                    // A packed return type whose range references a CLASS
-                    // parameter (`function bit [W-1:0] mk();`) can only be
-                    // sized per instance — capture it for the clamp at the
-                    // return point below. Literal ranges resolve here (params
-                    // = None succeeds) and stay un-clamped as before.
-                    let dyn_ret_type: Option<DataType> = match &method.kind {
-                        ClassMethodKind::Function(f) => {
-                            let dims = match &f.return_type {
-                                DataType::IntegerVector { dimensions, .. } => Some(dimensions),
-                                DataType::Implicit { dimensions, .. } => Some(dimensions),
-                                _ => None,
-                            };
-                            dims.filter(|ds| {
-                                ds.iter().any(|d| {
-                                    matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
-                                        if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
-                                            || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
-                                })
-                            })
-                            .map(|_| f.return_type.clone())
+                        if self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals) {
+                            continue;
                         }
-                        _ => None,
-                    };
-                    self.push_queue_frame();
-                    // `output`/`inout`/`ref` formals copy back to the caller's
-                    // actual on return (e.g. `randomize_instr(output riscv_instr
-                    // instr, …)` writing the picked instruction to `instr_list[i]`).
-                    let mut output_bindings: Vec<(String, Expression)> = Vec::new();
-                    let mut queue_writebacks: Vec<(String, String)> = Vec::new();
-                    let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
-                    let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
-                    for (i, port) in ports.iter().enumerate() {
-                        let is_assoc = self.port_is_assoc_array(port);
-                        // An associative-array `output`/`inout`/`ref` formal
-                        // is copied back via the assoc-param signal-namespace
-                        // merge, NOT the scalar `output_bindings` path (which
-                        // can't represent an AA). §13.5.2.
-                        if matches!(
-                            port.direction,
-                            PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-                        ) && i < args.len()
-                            && !is_assoc
-                        {
-                            output_bindings.push((port.name.name.clone(), args[i].clone()));
-                        }
-                        if i < args.len() {
-                            if let Some((param, caller)) = self.bind_assoc_param(port, &args[i]) {
-                                let is_out = matches!(
-                                    port.direction,
-                                    PortDirection::Output
-                                        | PortDirection::Inout
-                                        | PortDirection::Ref
-                                );
-                                assoc_params.push((param, caller, is_out));
-                                continue;
-                            }
-                            if self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals) {
-                                continue;
-                            }
-                            // §6.18/§6.20.3: typedef'd / type-param-bound
-                            // formal — dims live on the type (see the same
-                            // resolution in exec_function_call).
-                            if std::env::var("XZ_BD_DBG").is_ok() {
-                                if let crate::ast::types::DataType::TypeReference { name, .. } =
-                                    &port.data_type
-                                {
-                                    eprintln!(
-                                        "[BDDBG] port={} tn={} in_tud={} tud_keys={:?}",
-                                        port.name.name,
-                                        name.name.name,
-                                        self.module
-                                            .typedef_unpacked_dims
-                                            .contains_key(&name.name.name),
-                                        self.module
-                                            .typedef_unpacked_dims
-                                            .keys()
-                                            .collect::<Vec<_>>()
-                                    );
-                                }
-                            }
-                            let eff_dims: Vec<crate::ast::types::UnpackedDimension> = if port
-                                .dimensions
-                                .is_empty()
-                            {
-                                if let crate::ast::types::DataType::TypeReference { name, .. } =
-                                    &port.data_type
-                                    {
-                                        let tn = &name.name.name;
-                                        // Resolve against the CALLEE's own
-                                        // type bindings — `this` isn't pushed
-                                        // yet while formals bind.
-                                        let concrete = self
-                                            .heap
-                                            .get(handle)
-                                            .and_then(|o| o.as_ref())
-                                            .and_then(|i| i.type_bindings.get(tn).cloned())
-                                            .or_else(|| self.resolve_type_param_binding(tn))
-                                            .unwrap_or_else(|| tn.clone());
-                                        // CLASS-LOCAL typedef (`typedef int
-                                        // q_t[$];` inside the class): the dims
-                                        // live on the callee class's own
-                                        // typedef table, walked before the
-                                        // module's — a `ref q_t out_q` formal
-                                        // was bound as a scalar, so the
-                                        // callee's push_backs never reached
-                                        // the caller (§13.5.2).
-                                    Self::typedef_dims_via_tables(&self.module, &cname, &concrete)
-                                        .unwrap_or_default()
-                                    } else {
-                                        Vec::new()
-                                    }
-                                } else {
-                                    port.dimensions.clone()
-                                };
-                            if let Some(caller) = self.bind_queue_param(
-                                &port.name.name,
-                                &eff_dims,
-                                &args[i],
-                                &port.data_type,
-                            ) {
-                                let is_out = matches!(
-                                    port.direction,
-                                    PortDirection::Output
-                                        | PortDirection::Inout
-                                        | PortDirection::Ref
-                                );
-                                if is_out && !caller.is_empty() {
-                                    queue_writebacks.push((port.name.name.clone(), caller));
-                                }
-                                continue;
-                            }
-                            // §13.5.2 / §18.5.12: a FIXED unpacked-array formal
-                            // (`function bit [7:0] parity(bit [7:0] a[4])`) is
-                            // passed BY VALUE. Only the free-function path bound
-                            // one; a class method bound it as a scalar, so the
-                            // body read X and a user function taking an array —
-                            // legal in a constraint — always returned 0.
-                            if let Some(info) = self.bind_array_arg(port, &args[i]) {
-                                if matches!(
-                                    port.direction,
-                                    PortDirection::Output
-                                        | PortDirection::Inout
-                                        | PortDirection::Ref
-                                ) {
-                                    array_writebacks.push(info);
-                                }
-                                continue;
-                            }
-                        }
-                        let mut val = if i < args.len() {
-                            self.eval_expr(&args[i])
-                        } else if let Some(def) = &port.default {
-                            // Caller omitted this arg → apply the formal's
-                            // default (was using 0). UVM uvm_sequence_base::
-                            // start(..., int this_priority = -1): missing arg
-                            // must be -1, not 0, else `this_priority < -1`
-                            // (read unsigned) fatals SEQPRI.
-                            self.eval_expr(def)
-                        } else {
-                            Value::zero(32)
-                        };
-                        if super::elaborate::is_type_signed(&port.data_type) {
-                            val.is_signed = true;
-                        }
-                        if let DataType::TypeReference { name: tn, .. } = &port.data_type {
-                            let type_name = tn.name.name.clone();
-                            if self.module.enum_members.contains_key(&type_name)
-                                || self.module.typedefs.contains_key(&type_name)
-                            {
-                                self.var_typedef_types.insert(port.name.name.clone(), type_name);
-                            } else if self.module.classes.contains_key(&type_name) {
-                                self.var_class_types.insert(port.name.name.clone(), type_name.clone());
-                            }
-                        }
-                        locals.insert(port.name.name.clone(), val);
-                    }
-                    if let Some(rn) = &fn_ret_name {
-                        // Initialise the implicit return variable to match its
-                        // declared type. A STRING return must start as an empty
-                        // string Value, not a 32-bit int — otherwise an implicit
-                        // `funcname = {a, "b", ...}` string-concat assignment
-                        // coerces to the int's 32-bit width and reads back empty
-                        // (uvm_default_report_server::compose_report_message uses
-                        // exactly this form, so its composed line came out blank).
-                        let init = if let ClassMethodKind::Function(f) = &method.kind {
-                            if Self::is_string_data_type(&f.return_type) {
-                                Value::from_string("")
-                            } else {
-                                // Size the implicit return cell to the declared
-                                // return width so a bit-select write
-                                // `retname[i] = ...` for i >= 32 (uvm_packer's
-                                // unpack_field_int filling a 64-bit
-                                // uvm_integral_t) lands; a 32-bit cell dropped
-                                // the upper half. Register the width too so a
-                                // later `retname = <narrow>` zero-extends back,
-                                // mirroring a typed VarDecl.
-                                let rw = super::elaborate::resolve_type_width(
-                                    &f.return_type,
-                                    Some(&self.module.parameters),
-                                    Some(&self.module.typedefs),
-                                )
-                                .max(1);
-                                self.widths.insert(rn.clone(), rw);
-                                Value::zero(rw)
-                            }
-                        } else {
-                            Value::zero(32)
-                        };
-                        locals.entry(rn.clone()).or_insert(init);
-                        // Register the return variable's class type so an
-                        // implicit-return `funcname = new()` knows WHICH class to
-                        // construct — exactly as a typed local `T t = new()` does
-                        // (var_class_types is consulted when a bare `new()` has no
-                        // explicit class). Without this the bare `new()` can't
-                        // resolve its class and yields a broken instance whose
-                        // method calls bind the wrong `this`/params. This is the
-                        // `uvm_report_message::new_report_message` form
-                        // (`new_report_message = new(name)`); fixing it makes the
-                        // real report message's set_action/get_action persist so
-                        // the report-server `$display` fires natively.
-                        if let ClassMethodKind::Function(f) = &method.kind {
+                        // §6.18/§6.20.3: typedef'd / type-param-bound
+                        // formal — dims live on the type (see the same
+                        // resolution in exec_function_call).
+                        if std::env::var("XZ_BD_DBG").is_ok() {
                             if let crate::ast::types::DataType::TypeReference { name, .. } =
-                                &f.return_type
+                                &port.data_type
                             {
-                                let cn = name.name.name.clone();
-                                if self.module.classes.contains_key(&cn) {
-                                    self.var_class_types.insert(rn.clone(), cn);
+                                eprintln!(
+                                    "[BDDBG] port={} tn={} in_tud={} tud_keys={:?}",
+                                    port.name.name,
+                                    name.name.name,
+                                    self.module
+                                        .typedef_unpacked_dims
+                                        .contains_key(&name.name.name),
+                                    self.module
+                                        .typedef_unpacked_dims
+                                        .keys()
+                                        .collect::<Vec<_>>()
+                                );
+                            }
+                        }
+                        let eff_dims: Vec<crate::ast::types::UnpackedDimension> = if port
+                            .dimensions
+                            .is_empty()
+                        {
+                            if let crate::ast::types::DataType::TypeReference { name, .. } =
+                                &port.data_type
+                                {
+                                    let tn = &name.name.name;
+                                    // Resolve against the CALLEE's own
+                                    // type bindings — `this` isn't pushed
+                                    // yet while formals bind.
+                                    let concrete = self
+                                        .heap
+                                        .get(handle)
+                                        .and_then(|o| o.as_ref())
+                                        .and_then(|i| i.type_bindings.get(tn).cloned())
+                                        .or_else(|| self.resolve_type_param_binding(tn))
+                                        .unwrap_or_else(|| tn.clone());
+                                    // CLASS-LOCAL typedef (`typedef int
+                                    // q_t[$];` inside the class): the dims
+                                    // live on the callee class's own
+                                    // typedef table, walked before the
+                                    // module's — a `ref q_t out_q` formal
+                                    // was bound as a scalar, so the
+                                    // callee's push_backs never reached
+                                    // the caller (§13.5.2).
+                                Self::typedef_dims_via_tables(&self.module, &cname, &concrete)
+                                    .unwrap_or_default()
+                                } else {
+                                    Vec::new()
                                 }
+                            } else {
+                                port.dimensions.clone()
+                            };
+                        if let Some(caller) = self.bind_queue_param(
+                            &port.name.name,
+                            &eff_dims,
+                            &args[i],
+                            &port.data_type,
+                        ) {
+                            let is_out = matches!(
+                                port.direction,
+                                PortDirection::Output
+                                    | PortDirection::Inout
+                                    | PortDirection::Ref
+                            );
+                            if is_out && !caller.is_empty() {
+                                queue_writebacks.push((port.name.name.clone(), caller));
                             }
+                            continue;
                         }
-                    }
-                    // Mark string-typed return variable and params so `s[i]`
-                    // does byte (character) indexing instead of bit-select.
-                    // `string_signals` is a global set; re-inserting is harmless.
-                    if let ClassMethodKind::Function(f) = &method.kind {
-                        if Self::is_string_data_type(&f.return_type) {
-                            self.string_signals.insert(f.name.name.name.clone());
-                        }
-                    }
-                    for port in ports.iter() {
-                        if Self::is_string_data_type(&port.data_type) {
-                            self.string_signals.insert(port.name.name.clone());
-                        }
-                    }
-                    // Loop-control flags (`break`/`continue`) are frame-local:
-                    // save the caller's, clear them for this body, and restore
-                    // afterward so a `continue`/`break` inside the callee can't
-                    // leak out and poison the caller's subsequent statements
-                    // (exec_statement bails when either flag is set).
-                    let saved_break = self.break_flag;
-                    let saved_continue = self.continue_flag;
-                    let saved_return = self.return_flag;
-                    self.break_flag = false;
-                    self.continue_flag = false;
-                    self.return_flag = false;
-                    // LRM §25.9 virtual-interface formal-arg aliasing
-                    // (class-method dispatch). Resolve the actuals' vif bindings
-                    // NOW, while `this_stack` is still the CALLER's context
-                    // (the bound vif lives there), before pushing the callee's.
-                    let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
-                    for (i, port) in ports.iter().enumerate() {
-                        if i < args.len() {
-                            if let Some((f, b)) =
-                                self.vif_formal_alias(&port.data_type, &port.name.name, &args[i])
-                            {
-                                iface_alias_frame.insert(f, b);
+                        // §13.5.2 / §18.5.12: a FIXED unpacked-array formal
+                        // (`function bit [7:0] parity(bit [7:0] a[4])`) is
+                        // passed BY VALUE. Only the free-function path bound
+                        // one; a class method bound it as a scalar, so the
+                        // body read X and a user function taking an array —
+                        // legal in a constraint — always returned 0.
+                        if let Some(info) = self.bind_array_arg(port, &args[i]) {
+                            if matches!(
+                                port.direction,
+                                PortDirection::Output
+                                    | PortDirection::Inout
+                                    | PortDirection::Ref
+                            ) {
+                                array_writebacks.push(info);
                             }
+                            continue;
                         }
                     }
-                    // PURE_SV_LRM §8.25: a `static` member of a parameterized
-                    // class is per-SPECIALIZATION. Reached from an INSTANCE method
-                    // (e.g. `uvm_resource#(T)::my_type` via `r.get_type_handle()->
-                    // get_type()`) there is no `#(spec)` on the call, so
-                    // `current_spec` is None and static_prop_key uses the shared
-                    // `Class::member` cell — while an explicit `Class#(spec)::member`
-                    // uses `Class#spec::member`. That made get_type() !=
-                    // get_type_handle(), breaking the resource-pool type match
-                    // (config_db GET). Seed current_spec from the instance's own
-                    // type bindings so both paths key the same per-spec cell. Sig =
-                    // the type params' bound leaf names in declaration order (the
-                    // parser now captures builtin type args as Ident leaf names, so
-                    // this matches extract_call_spec's type_args_text).
-                    let saved_spec = self.current_spec.clone();
-                    if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
-                        let cn = inst.class_name.clone();
-                        let bindings = inst.type_bindings.clone();
-                        // Override the active spec with THIS instance's own
-                        // specialization when it differs from the active
-                        // spec's class. Prefer the instance's captured full
-                        // specialization (`spec`), which carries BOTH type
-                        // and value params as a complete sig (unlike the
-                        // type_bindings-only rebuild below). The full `spec`
-                        // is what restores the specialization a
-                        // typedef-specialization singleton was constructed
-                        // under, so a later virtual call can answer
-                        // value-param lookups (the UVM factory
-                        // get_type_name chain). The type_bindings rebuild is
-                        // the legacy fallback: an instance method of
-                        // `uvm_resource#(int)` must key uvm_resource's
-                        // per-spec cell even when called while an UNRELATED
-                        // spec is active (e.g. the enclosing
-                        // `uvm_config_db#(int)`, whose base `uvm_config_db`
-                        // wouldn't match `uvm_resource` in static_prop_key
-                        // and would fall back to the shared unspec'd cell →
-                        // the get_type/get_type_handle mismatch).
-                        let differs = match self.current_spec.as_ref() {
-                            None => true,
-                            // Switch when the base class differs OR the
-                            // instance's own specialization (same base,
-                            // different sig) differs. The latter is the
-                            // UVM callback typewide-recursion case:
-                            // `base_comp.m_add_tw_cbs` calls
-                            // `cb_pair.m_add_tw_cbs(cb)` where cb_pair is a
-                            // DIFFERENT specialization's instance (e.g.
-                            // uvm_callbacks#(b_comp)). Without restoring
-                            // the instance's spec, the recursed method's
-                            // `m_t_inst.m_tw_cb_q` static access keys off
-                            // the caller's (base_comp) cell, so typewide
-                            // callbacks never propagate to derived types.
-                            Some((b, s)) => {
-                                *b != cn
-                                    || inst
-                                        .spec
-                                        .as_ref()
-                                        .is_some_and(|(ib, is)| {
-                                            ib != b || is != s
-                                        })
-                            }
-                        };
-                        if differs {
-                            if inst.spec.is_some() {
-                                self.current_spec = inst.spec.clone();
-                            } else if let Some(cd) = self.module.classes.get(&cn) {
-                                let mut param_names = cd.param_order.clone();
-                                if param_names.is_empty() {
-                                    param_names = cd.type_param_names.clone();
-                                }
-                                if !param_names.is_empty() {
-                                    let sig_frags: Vec<String> = param_names
-                                        .iter()
-                                        .filter_map(|p| {
-                                            if let Some(b) = bindings.get(p) {
-                                                Some(b.clone())
-                                            } else if let Some(v) = inst.properties.get(p) {
-                                                Some(v.to_string())
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect();
-                                    if sig_frags.len() == param_names.len() {
-                                        self.current_spec = Some((cn.clone(), sig_frags.join(",")));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    self.this_stack.push(Some(handle));
-                    self.local_stack.push(locals);
-                    // Record the `local_stack` depth BEFORE this method's own
-                    // frame (i.e. the count of caller frames) so that
-                    // `get_expr_type_name`'s `in_any_frame` check only considers
-                    // the current method's locals — not a caller's same-named
-                    // local that leaked into the flat `var_class_types` map.
-                    self.method_local_base.push(self.local_stack.len() - 1);
-                    self.class_context_stack.push(Some(cname.clone()));
-                    self.local_iface_aliases.push(iface_alias_frame);
-                    // §6.21: open a static-local sync frame so a `static`
-                    // local declared in the method body persists across calls.
-                    // (Class methods previously never opened one — only free
-                    // functions/tasks did — so a `static this_type m_inst;`
-                    // inside `get()` was re-initialized every call and the
-                    // UVM factory singleton never survived.) The key itself is
-                    // made class/spec-aware at the declaration site above.
-                    self.static_local_syncs
-                        .push((method_name.to_string(), Vec::new()));
-                    for stmt in body {
-                        self.exec_statement(stmt);
-                        if self.break_flag || self.return_flag {
-                            break;
-                        }
-                    }
-                    // Write back any static locals declared in this body before
-                    // the locals frame is dropped.
-                    self.sync_static_locals();
-                    self.current_spec = saved_spec;
-                    self.local_iface_aliases.pop();
-                    if self.parked_from_exec {
-                        // The process was parked by exec_statement's Wait handler.
-                        // Keep break/return flags set so they propagate up to
-                        // run_process_stmts. Don't restore the saved values.
+                    let mut val = if i < args.len() {
+                        self.eval_expr(&args[i])
+                    } else if let Some(def) = &port.default {
+                        // Caller omitted this arg → apply the formal's
+                        // default (was using 0). UVM uvm_sequence_base::
+                        // start(..., int this_priority = -1): missing arg
+                        // must be -1, not 0, else `this_priority < -1`
+                        // (read unsigned) fatals SEQPRI.
+                        self.eval_expr(def)
                     } else {
-                        self.break_flag = saved_break;
-                        self.continue_flag = saved_continue;
-                        self.return_flag = saved_return;
+                        Value::zero(32)
+                    };
+                    if super::elaborate::is_type_signed(&port.data_type) {
+                        val.is_signed = true;
                     }
-                    self.class_context_stack.pop();
-                    self.method_local_base.pop();
-                    let implicit = fn_ret_name.as_ref().and_then(|rn| {
-                        let lv = self.local_stack.last().and_then(|m| m.get(rn).cloned());
-                        // A `funcname = {a, b, ...}` string-concat assignment is
-                        // serviced by the string-concat path, which writes the
-                        // result via set_signal_value_by_name (the SIGNAL store),
-                        // not the local frame — so a string return whose local is
-                        // still empty has its real value in the signal store
-                        // (this is uvm_default_report_server::compose_report_message,
-                        // whose composed line was coming back blank).
-                        if ret_is_string
-                            && lv.as_ref().is_none_or(|v| v.to_sv_string().is_empty())
+                    if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+                        let type_name = tn.name.name.clone();
+                        if self.module.enum_members.contains_key(&type_name)
+                            || self.module.typedefs.contains_key(&type_name)
                         {
-                            self.get_signal_value_by_name(rn).or(lv)
+                            self.var_typedef_types.insert(port.name.name.clone(), type_name);
+                        } else if self.module.classes.contains_key(&type_name) {
+                            self.var_class_types.insert(port.name.name.clone(), type_name.clone());
+                        }
+                    }
+                    locals.insert(port.name.name.clone(), val);
+                }
+                if let Some(rn) = &fn_ret_name {
+                    // Initialise the implicit return variable to match its
+                    // declared type. A STRING return must start as an empty
+                    // string Value, not a 32-bit int — otherwise an implicit
+                    // `funcname = {a, "b", ...}` string-concat assignment
+                    // coerces to the int's 32-bit width and reads back empty
+                    // (uvm_default_report_server::compose_report_message uses
+                    // exactly this form, so its composed line came out blank).
+                    let init = if let ClassMethodKind::Function(f) = &method.kind {
+                        if Self::is_string_data_type(&f.return_type) {
+                            Value::from_string("")
                         } else {
-                            lv
-                        }
-                    });
-                    let mut ret = self
-                        .return_value
-                        .take()
-                        .or(implicit)
-                        .unwrap_or(Value::zero(32));
-                    // Per-instance return clamp for a class-parameter-sized
-                    // return type: `box#(4)` with `function bit [W-1:0] mk()`
-                    // must hand back 4 bits, not whatever width the body's
-                    // last assignment happened to carry.
-                    if let Some(rt) = &dyn_ret_type {
-                        if !ret.is_real {
-                            let scope = self.instance_param_scope(handle);
-                            let w = resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs));
-                            if w > 0 && w != ret.width {
-                                ret = ret.resize_for_assign(w);
-                            }
-                        }
-                    }
-                    // §13.4.1: a class method's return takes its DECLARED type,
-                    // exactly as a module-level function's does. Only the
-                    // parameter-sized case above was handled, so
-                    // `function bit [15:0] u; return -1;` handed back the
-                    // literal's signedness and `c.u() > 0` read it as -1.
-                    if let ClassMethodKind::Function(f) = &method.kind {
-                        // Only PLAINLY integral declared types are stamped — a
-                        // TypeReference may name a class (the return is a heap
-                        // HANDLE whose "width" is meaningless and whose value
-                        // must pass through untouched), and Implicit means no
-                        // declared type at all. The first version of this stamp
-                        // resized those and broke handle-returning methods.
-                        let plainly_integral = matches!(
-                            f.return_type,
-                            DataType::IntegerVector { .. } | DataType::IntegerAtom { .. }
-                        );
-                        if plainly_integral
-                            && !ret.is_real
-                            && !ret_is_string
-                            && dyn_ret_type.is_none()
-                        {
-                            let w = resolve_type_width(
+                            // Size the implicit return cell to the declared
+                            // return width so a bit-select write
+                            // `retname[i] = ...` for i >= 32 (uvm_packer's
+                            // unpack_field_int filling a 64-bit
+                            // uvm_integral_t) lands; a 32-bit cell dropped
+                            // the upper half. Register the width too so a
+                            // later `retname = <narrow>` zero-extends back,
+                            // mirroring a typed VarDecl.
+                            let rw = super::elaborate::resolve_type_width(
                                 &f.return_type,
                                 Some(&self.module.parameters),
                                 Some(&self.module.typedefs),
-                            );
-                            if w > 0 && w != ret.width {
-                                ret = ret.resize(w);
+                            )
+                            .max(1);
+                            self.widths.insert(rn.clone(), rw);
+                            Value::zero(rw)
+                        }
+                    } else {
+                        Value::zero(32)
+                    };
+                    locals.entry(rn.clone()).or_insert(init);
+                    // Register the return variable's class type so an
+                    // implicit-return `funcname = new()` knows WHICH class to
+                    // construct — exactly as a typed local `T t = new()` does
+                    // (var_class_types is consulted when a bare `new()` has no
+                    // explicit class). Without this the bare `new()` can't
+                    // resolve its class and yields a broken instance whose
+                    // method calls bind the wrong `this`/params. This is the
+                    // `uvm_report_message::new_report_message` form
+                    // (`new_report_message = new(name)`); fixing it makes the
+                    // real report message's set_action/get_action persist so
+                    // the report-server `$display` fires natively.
+                    if let ClassMethodKind::Function(f) = &method.kind {
+                        if let crate::ast::types::DataType::TypeReference { name, .. } =
+                            &f.return_type
+                        {
+                            let cn = name.name.name.clone();
+                            if self.module.classes.contains_key(&cn) {
+                                self.var_class_types.insert(rn.clone(), cn);
                             }
-                            ret.is_signed = super::elaborate::is_type_signed(&f.return_type);
                         }
                     }
-                    // Snapshot output/ref formal values before dropping locals.
-                    let writebacks: Vec<(Value, Expression)> = output_bindings
-                        .iter()
-                        .filter_map(|(pn, caller)| {
-                            self.local_stack
-                                .last()
-                                .and_then(|l| l.get(pn).cloned())
-                                .map(|v| (v, caller.clone()))
-                        })
-                        .collect();
-                    self.local_stack.pop();
-                    self.this_stack.pop();
-                    self.pop_and_restore_queue_frame();
-                    for (param, caller) in &queue_writebacks {
-                        self.writeback_queue_param(param, caller);
-                    }
-                    // §13.5.2: copy `output`/`inout`/`ref` fixed-array formals
-                    // back onto the caller's array (a plain `input` formal is
-                    // by value and must NOT write back — §18.5.12 relies on
-                    // that for array args to constraint functions).
-                    if !array_writebacks.is_empty() {
-                        self.writeback_array_args(&array_writebacks);
-                    }
-                    for (v, caller) in writebacks {
-                        self.assign_value(&caller, &v);
-                    }
-                    // §13.5.2: copy `output`/`inout`/`ref` associative-array
-                    // formals back onto the caller's AA (signal-namespace
-                    // merge), then drop the formal's temporary copy.
-                    for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
-                        if param == caller {
-                            continue;
-                        }
-                        if is_out {
-                            self.writeback_assoc_param(&param, &caller);
-                        }
-                        self.purge_assoc_param(&param);
-                    }
-                    return ret;
                 }
-                cur_class = class_def.extends.clone();
-            } else {
-                break;
+                // Mark string-typed return variable and params so `s[i]`
+                // does byte (character) indexing instead of bit-select.
+                // `string_signals` is a global set; re-inserting is harmless.
+                if let ClassMethodKind::Function(f) = &method.kind {
+                    if Self::is_string_data_type(&f.return_type) {
+                        self.string_signals.insert(f.name.name.name.clone());
+                    }
+                }
+                for port in ports.iter() {
+                    if Self::is_string_data_type(&port.data_type) {
+                        self.string_signals.insert(port.name.name.clone());
+                    }
+                }
+                // Loop-control flags (`break`/`continue`) are frame-local:
+                // save the caller's, clear them for this body, and restore
+                // afterward so a `continue`/`break` inside the callee can't
+                // leak out and poison the caller's subsequent statements
+                // (exec_statement bails when either flag is set).
+                let saved_break = self.break_flag;
+                let saved_continue = self.continue_flag;
+                let saved_return = self.return_flag;
+                self.break_flag = false;
+                self.continue_flag = false;
+                self.return_flag = false;
+                // LRM §25.9 virtual-interface formal-arg aliasing
+                // (class-method dispatch). Resolve the actuals' vif bindings
+                // NOW, while `this_stack` is still the CALLER's context
+                // (the bound vif lives there), before pushing the callee's.
+                let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
+                for (i, port) in ports.iter().enumerate() {
+                    if i < args.len() {
+                        if let Some((f, b)) =
+                            self.vif_formal_alias(&port.data_type, &port.name.name, &args[i])
+                        {
+                            iface_alias_frame.insert(f, b);
+                        }
+                    }
+                }
+                // PURE_SV_LRM §8.25: a `static` member of a parameterized
+                // class is per-SPECIALIZATION. Reached from an INSTANCE method
+                // (e.g. `uvm_resource#(T)::my_type` via `r.get_type_handle()->
+                // get_type()`) there is no `#(spec)` on the call, so
+                // `current_spec` is None and static_prop_key uses the shared
+                // `Class::member` cell — while an explicit `Class#(spec)::member`
+                // uses `Class#spec::member`. That made get_type() !=
+                // get_type_handle(), breaking the resource-pool type match
+                // (config_db GET). Seed current_spec from the instance's own
+                // type bindings so both paths key the same per-spec cell. Sig =
+                // the type params' bound leaf names in declaration order (the
+                // parser now captures builtin type args as Ident leaf names, so
+                // this matches extract_call_spec's type_args_text).
+                let saved_spec = self.current_spec.clone();
+                if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
+                    let cn = inst.class_name.clone();
+                    let bindings = inst.type_bindings.clone();
+                    // Override the active spec with THIS instance's own
+                    // specialization when it differs from the active
+                    // spec's class. Prefer the instance's captured full
+                    // specialization (`spec`), which carries BOTH type
+                    // and value params as a complete sig (unlike the
+                    // type_bindings-only rebuild below). The full `spec`
+                    // is what restores the specialization a
+                    // typedef-specialization singleton was constructed
+                    // under, so a later virtual call can answer
+                    // value-param lookups (the UVM factory
+                    // get_type_name chain). The type_bindings rebuild is
+                    // the legacy fallback: an instance method of
+                    // `uvm_resource#(int)` must key uvm_resource's
+                    // per-spec cell even when called while an UNRELATED
+                    // spec is active (e.g. the enclosing
+                    // `uvm_config_db#(int)`, whose base `uvm_config_db`
+                    // wouldn't match `uvm_resource` in static_prop_key
+                    // and would fall back to the shared unspec'd cell →
+                    // the get_type/get_type_handle mismatch).
+                    let differs = match self.current_spec.as_ref() {
+                        None => true,
+                        // Switch when the base class differs OR the
+                        // instance's own specialization (same base,
+                        // different sig) differs. The latter is the
+                        // UVM callback typewide-recursion case:
+                        // `base_comp.m_add_tw_cbs` calls
+                        // `cb_pair.m_add_tw_cbs(cb)` where cb_pair is a
+                        // DIFFERENT specialization's instance (e.g.
+                        // uvm_callbacks#(b_comp)). Without restoring
+                        // the instance's spec, the recursed method's
+                        // `m_t_inst.m_tw_cb_q` static access keys off
+                        // the caller's (base_comp) cell, so typewide
+                        // callbacks never propagate to derived types.
+                        Some((b, s)) => {
+                            *b != cn
+                                || inst
+                                    .spec
+                                    .as_ref()
+                                    .is_some_and(|(ib, is)| {
+                                        ib != b || is != s
+                                    })
+                        }
+                    };
+                    if differs {
+                        if inst.spec.is_some() {
+                            self.current_spec = inst.spec.clone();
+                        } else if let Some(cd) = self.module.classes.get(&cn) {
+                            let mut param_names = cd.param_order.clone();
+                            if param_names.is_empty() {
+                                param_names = cd.type_param_names.clone();
+                            }
+                            if !param_names.is_empty() {
+                                let sig_frags: Vec<String> = param_names
+                                    .iter()
+                                    .filter_map(|p| {
+                                        if let Some(b) = bindings.get(p) {
+                                            Some(b.clone())
+                                        } else if let Some(v) = inst.properties.get(p) {
+                                            Some(v.to_string())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+                                if sig_frags.len() == param_names.len() {
+                                    self.current_spec = Some((cn.clone(), sig_frags.join(",")));
+                                }
+                            }
+                        }
+                    }
+                }
+                self.this_stack.push(Some(handle));
+                self.local_stack.push(locals);
+                // Record the `local_stack` depth BEFORE this method's own
+                // frame (i.e. the count of caller frames) so that
+                // `get_expr_type_name`'s `in_any_frame` check only considers
+                // the current method's locals — not a caller's same-named
+                // local that leaked into the flat `var_class_types` map.
+                self.method_local_base.push(self.local_stack.len() - 1);
+                self.class_context_stack.push(Some(cname.clone()));
+                self.local_iface_aliases.push(iface_alias_frame);
+                // §6.21: open a static-local sync frame so a `static`
+                // local declared in the method body persists across calls.
+                // (Class methods previously never opened one — only free
+                // functions/tasks did — so a `static this_type m_inst;`
+                // inside `get()` was re-initialized every call and the
+                // UVM factory singleton never survived.) The key itself is
+                // made class/spec-aware at the declaration site above.
+                self.static_local_syncs
+                    .push((method_name.to_string(), Vec::new()));
+                for stmt in body {
+                    self.exec_statement(stmt);
+                    if self.break_flag || self.return_flag {
+                        break;
+                    }
+                }
+                // Write back any static locals declared in this body before
+                // the locals frame is dropped.
+                self.sync_static_locals();
+                self.current_spec = saved_spec;
+                self.local_iface_aliases.pop();
+                if self.parked_from_exec {
+                    // The process was parked by exec_statement's Wait handler.
+                    // Keep break/return flags set so they propagate up to
+                    // run_process_stmts. Don't restore the saved values.
+                } else {
+                    self.break_flag = saved_break;
+                    self.continue_flag = saved_continue;
+                    self.return_flag = saved_return;
+                }
+                self.class_context_stack.pop();
+                self.method_local_base.pop();
+                let implicit = fn_ret_name.as_ref().and_then(|rn| {
+                    let lv = self.local_stack.last().and_then(|m| m.get(rn).cloned());
+                    // A `funcname = {a, b, ...}` string-concat assignment is
+                    // serviced by the string-concat path, which writes the
+                    // result via set_signal_value_by_name (the SIGNAL store),
+                    // not the local frame — so a string return whose local is
+                    // still empty has its real value in the signal store
+                    // (this is uvm_default_report_server::compose_report_message,
+                    // whose composed line was coming back blank).
+                    if ret_is_string
+                        && lv.as_ref().is_none_or(|v| v.to_sv_string().is_empty())
+                    {
+                        self.get_signal_value_by_name(rn).or(lv)
+                    } else {
+                        lv
+                    }
+                });
+                let mut ret = self
+                    .return_value
+                    .take()
+                    .or(implicit)
+                    .unwrap_or(Value::zero(32));
+                // Per-instance return clamp for a class-parameter-sized
+                // return type: `box#(4)` with `function bit [W-1:0] mk()`
+                // must hand back 4 bits, not whatever width the body's
+                // last assignment happened to carry.
+                if let Some(rt) = &dyn_ret_type {
+                    if !ret.is_real {
+                        let scope = self.instance_param_scope(handle);
+                        let w = resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs));
+                        if w > 0 && w != ret.width {
+                            ret = ret.resize_for_assign(w);
+                        }
+                    }
+                }
+                // §13.4.1: a class method's return takes its DECLARED type,
+                // exactly as a module-level function's does. Only the
+                // parameter-sized case above was handled, so
+                // `function bit [15:0] u; return -1;` handed back the
+                // literal's signedness and `c.u() > 0` read it as -1.
+                if let ClassMethodKind::Function(f) = &method.kind {
+                    // Only PLAINLY integral declared types are stamped — a
+                    // TypeReference may name a class (the return is a heap
+                    // HANDLE whose "width" is meaningless and whose value
+                    // must pass through untouched), and Implicit means no
+                    // declared type at all. The first version of this stamp
+                    // resized those and broke handle-returning methods.
+                    let plainly_integral = matches!(
+                        f.return_type,
+                        DataType::IntegerVector { .. } | DataType::IntegerAtom { .. }
+                    );
+                    if plainly_integral
+                        && !ret.is_real
+                        && !ret_is_string
+                        && dyn_ret_type.is_none()
+                    {
+                        let w = resolve_type_width(
+                            &f.return_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        );
+                        if w > 0 && w != ret.width {
+                            ret = ret.resize(w);
+                        }
+                        ret.is_signed = super::elaborate::is_type_signed(&f.return_type);
+                    }
+                }
+                // Snapshot output/ref formal values before dropping locals.
+                let writebacks: Vec<(Value, Expression)> = output_bindings
+                    .iter()
+                    .filter_map(|(pn, caller)| {
+                        self.local_stack
+                            .last()
+                            .and_then(|l| l.get(pn).cloned())
+                            .map(|v| (v, caller.clone()))
+                    })
+                    .collect();
+                self.local_stack.pop();
+                self.this_stack.pop();
+                self.pop_and_restore_queue_frame();
+                for (param, caller) in &queue_writebacks {
+                    self.writeback_queue_param(param, caller);
+                }
+                // §13.5.2: copy `output`/`inout`/`ref` fixed-array formals
+                // back onto the caller's array (a plain `input` formal is
+                // by value and must NOT write back — §18.5.12 relies on
+                // that for array args to constraint functions).
+                if !array_writebacks.is_empty() {
+                    self.writeback_array_args(&array_writebacks);
+                }
+                for (v, caller) in writebacks {
+                    self.assign_value(&caller, &v);
+                }
+                // §13.5.2: copy `output`/`inout`/`ref` associative-array
+                // formals back onto the caller's AA (signal-namespace
+                // merge), then drop the formal's temporary copy.
+                for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+                    if param == caller {
+                        continue;
+                    }
+                    if is_out {
+                        self.writeback_assoc_param(&param, &caller);
+                    }
+                    self.purge_assoc_param(&param);
+                }
+                return ret;
             }
         }
         Value::zero(32)
