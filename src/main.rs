@@ -2167,6 +2167,11 @@ suppressed but the explicit SDF annotation still applies."
                     std::process::exit(1);
                 }
                 println!("Elaboration successful");
+                if std::env::var("XZ_INST_PROF").is_ok() {
+                    // Per-instantiation elaboration section timings (also
+                    // prints one [IPROF] line per instance).
+                    xezim::compiler::elaborate::iprof_dump();
+                }
                 if let Some(ref mo) = dump_merged_sv {
                     append_adopted_libs_to_merged(mo);
                 }
