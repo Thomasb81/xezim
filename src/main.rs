@@ -1805,6 +1805,15 @@ suppressed but the explicit SDF annotation still applies."
         }
     }
 
+    // Version banner for every mode except --preprocess, whose stdout must
+    // stay pure source text. The simulate path adds its own Max-time lines
+    // below. Build identity in --compile/--parse logs matters for exactly the
+    // situation those modes are used in: debugging with a specific build.
+    if mode != Mode::Preprocess {
+        println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
+        println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
+    }
+
     if mode == Mode::Preprocess {
         // IEEE 1800-2017 §22: preprocess-only mode. The preprocessor has
         // already run (expanding macros and `\`include`s, evaluating
@@ -1968,8 +1977,6 @@ suppressed but the explicit SDF annotation still applies."
         return;
     }
 
-    println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-    println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
     println!("Max time: {} ns", max_time);
     println!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
