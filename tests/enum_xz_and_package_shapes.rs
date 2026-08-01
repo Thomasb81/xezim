@@ -286,3 +286,28 @@ endmodule
     assert_eq!(u(&sim, "n2"), 1, "next of invalid stays at the 2-state default");
     assert_eq!(u(&sim, "n4"), 1, "next of invalid stays x for 4-state");
 }
+
+/// §3.14.2.3: `timeunit`/`timeprecision` at COMPILATION-UNIT scope apply to
+/// modules with no timescale of their own — previously parsed and DROPPED, so
+/// fractional delays truncated to the 1 ns default tick and `#78.1ps`
+/// collapsed to 0 (ivtest `test_tliteral`).
+#[test]
+fn unit_scope_timeunit_declarations_apply() {
+    let src = r#"
+timeunit 1ns;
+timeprecision 10ps;
+module test;
+  parameter factor = 1e-9/10e-12;
+  longint t1, t2;
+  initial begin
+    #33.1ns;
+    t1 = $realtime*factor;
+    #78.1ps;
+    t2 = $realtime*factor;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 200).expect("simulate failed");
+    assert_eq!(u(&sim, "t1"), 3310, "33.1ns lands on the 10ps grid");
+    assert_eq!(u(&sim, "t2"), 3318, "78.1ps rounds to 8 ticks more");
+}
