@@ -18905,7 +18905,25 @@ impl Simulator {
         }
         let fdecl = match module.functions.get(name) {
             Some(f) => f,
-            None => return,
+            None => {
+                // An inlined instance registers its functions under
+                // "<inst>.<name>" while the call site still says "<name>" —
+                // so `always_comb d = y(a)` inside an instance never followed
+                // `y` (or its nested callees) and missed the module vars they
+                // read (br_gh277b). Union the reads of every scoped match:
+                // over-approximating sensitivity is safe.
+                let suffix = format!(".{}", name);
+                let scoped: Vec<String> = module
+                    .functions
+                    .keys()
+                    .filter(|k| k.ends_with(suffix.as_str()))
+                    .cloned()
+                    .collect();
+                for k in scoped {
+                    Self::collect_function_reads(&k, module, reads);
+                }
+                return;
+            }
         };
         let entered = ACTIVE.with(|a| a.borrow_mut().insert(name.to_string()));
         if !entered {
@@ -31564,6 +31582,41 @@ impl Simulator {
                             let changed = prev.as_ref() != Some(&resized);
                             self.set_signal_value_by_name(&target, resized);
                             return changed;
+                        }
+                    }
+                }
+                // A DOTTED local: an inlined-instance function's return
+                // variable lives in the frame under its registered name
+                // ("dut.z"), and the rewritten body assigns exactly that
+                // dotted lvalue — which skipped the single-segment local
+                // check below and leaked to the global map, so every
+                // hier-named function returned its never-written init
+                // (br_gh277b: x, formerly a masking 0).
+                if hier.path.len() > 1 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    if !self.local_stack.is_empty() {
+                        let joined = hier
+                            .path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        let last_idx = self.local_stack.len() - 1;
+                        if self.local_stack[last_idx].contains_key(joined.as_str()) {
+                            let fitted = if !val.is_real {
+                                if let Some(&target_w) = self.widths.get(&joined) {
+                                    if val.width < target_w {
+                                        val.resize_for_assign(target_w)
+                                    } else {
+                                        val.clone()
+                                    }
+                                } else {
+                                    val.clone()
+                                }
+                            } else {
+                                val.clone()
+                            };
+                            self.local_stack[last_idx].insert(joined, fitted);
+                            return true;
                         }
                     }
                 }

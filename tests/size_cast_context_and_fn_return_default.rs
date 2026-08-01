@@ -67,3 +67,41 @@ endmodule
     assert_eq!(u(&sim, "part_x"), 1, "untaken assign path leaves x");
     assert_eq!(u(&sim, "part_set"), 1, "taken path returns the value");
 }
+
+/// br_gh277b: inside an INLINED INSTANCE, a function formal that shares its
+/// name with another module-scope object (here function `y`) was rewritten to
+/// the prefixed module name, so the body read a nonexistent signal (x). The
+/// formal must shadow (§13.4). Also covers nested function calls reading
+/// module vars — the always_comb sensitivity follows scoped callees.
+#[test]
+fn instance_function_formal_shadows_module_scope_name() {
+    let src = r#"
+module duti;
+  reg a, b, c, d;
+  function z(input x, input y);
+    z = x + y;
+  endfunction
+  function y(input x);
+    y = z(x, b) + z(x, c);
+  endfunction
+  always_comb d = y(a);
+endmodule
+module tb;
+  duti u();
+  int direct_z, direct_y, comb_d;
+  initial begin
+    #1 u.a = 0;
+    #1 u.b = 0;
+    #1 u.c = 1;
+    #1;
+    direct_z = (u.z(1'b0, 1'b1) === 1'b1);
+    direct_y = (u.y(1'b0) === 1'b1);
+    comb_d = (u.d === 1'b1);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "direct_z"), 1, "formal y must shadow module function y");
+    assert_eq!(u(&sim, "direct_y"), 1, "nested scoped call");
+    assert_eq!(u(&sim, "comb_d"), 1, "always_comb refires on vars read in scoped callees");
+}
