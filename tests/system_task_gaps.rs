@@ -539,3 +539,33 @@ endmodule
     assert!(nz >= 38, "$random must vary (got {} non-zero of 40):\n{}", nz, joined);
     assert!(neg > 0, "$random is signed — expected some negatives:\n{}", joined);
 }
+
+// ---------------------------------------------------------------- group 8
+
+/// Cadence/Xcelium SHM + SST2 waveform tasks take a SCOPE as first argument
+/// (`$shm_probe(testbench, "AC")`). Elaboration's identifier validation
+/// treated that scope as a value lookup and failed the whole testbench with
+/// "Undeclared identifier 'testbench'" — a field report from a real
+/// Xcelium-built verification environment. They must elaborate and no-op.
+#[test]
+fn shm_and_record_tasks_with_scope_args_elaborate() {
+    let src = r#"
+module tb;
+  logic clk = 0;
+  int done = 0;
+  always #5 clk = ~clk;
+  initial begin
+    $shm_open("waves.shm");
+    $shm_probe(tb, "AC");
+    $recordvars(tb);
+    $probe(tb.clk);
+    #12;
+    done = 1;
+    $shm_close;
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("SHM scope args must not fail elaboration");
+    assert_eq!(u(&sim, "done"), 1, "sim must run past the SHM calls");
+}
