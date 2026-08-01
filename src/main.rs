@@ -109,7 +109,11 @@ fn print_usage() {
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
-    eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
+    eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
+    eprintln!("  --verbose        Per-file compile progress: each file as it is parsed and the");
+    eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
+    eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
+    eprintln!("                     sources in parse order, -v library files, -y library dirs");
     eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
@@ -835,6 +839,7 @@ fn main() {
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
+    let mut dump_files_list = false;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
@@ -1293,8 +1298,12 @@ fn main() {
             _ if arg.starts_with("--fst-scope=") => {
                 fst_scopes.push(arg["--fst-scope=".len()..].to_string());
             }
-            "--sim_debug" => {
+            // `--sim_debug` kept as a compatibility alias for existing scripts.
+            "--sim-debug" | "--sim_debug" => {
                 sim_debug = true;
+            }
+            "--dump-files-list" => {
+                dump_files_list = true;
             }
             "--threads" => {
                 i += 1;
@@ -1466,6 +1475,46 @@ fn main() {
             }
         }
         i += 1;
+    }
+
+    if verbose {
+        xezim::set_compile_verbose(true);
+    }
+
+    // `--dump-files-list`: the fully resolved compilation file set, after every
+    // `-f` args file has been expanded. Printed BEFORE the files are read so
+    // the list still appears when a file is missing or fails to parse — that
+    // is exactly the situation the flag exists to debug.
+    if dump_files_list {
+        println!("=== files list: {} source file(s) ===", source_files.len());
+        for (i, sf) in source_files.iter().enumerate() {
+            let exists = Path::new(sf).exists();
+            println!(
+                "  {:>4}. {}{}",
+                i + 1,
+                sf,
+                if exists { "" } else { "   [NOT FOUND]" }
+            );
+        }
+        if !lib_files.is_empty() {
+            println!("--- -v library file(s): {} ---", lib_files.len());
+            for lf in &lib_files {
+                println!("  {}", lf);
+            }
+        }
+        if !lib_dirs.is_empty() {
+            println!("--- -y library dir(s): {} ---", lib_dirs.len());
+            for ld in &lib_dirs {
+                println!("  {}", ld);
+            }
+        }
+        if !include_dirs.is_empty() {
+            println!("--- include dir(s): {} ---", include_dirs.len());
+            for id in &include_dirs {
+                println!("  {}", id);
+            }
+        }
+        println!("=== end files list ===");
     }
 
     if source_files.is_empty() {
