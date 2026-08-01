@@ -133,6 +133,17 @@ fn double_backtick_outside_a_string_joins_tokens() {
     assert_eq!(squash(&out), "foo_bar", "got {out:?}");
 }
 
+/// IEEE 1800-2023 §22.5.1: Token pasting `` `` `` occurs before macro lookup on the resulting merged token.
+#[test]
+fn double_backtick_token_pasting_before_macro_lookup() {
+    let out = pp("`define FOO_BAR 42\n`define CONCAT(x) `FOO_``x\n`CONCAT(BAR)\n");
+    assert_eq!(squash(&out), "42", "got {out:?}");
+
+    let out2 = pp("`define A 1\n`define B 2\n`define AB 99\n`define PASTE(x,y) `x``y\n`PASTE(A,B)\n");
+    assert_eq!(squash(&out2), "99", "got {out2:?}");
+}
+
+
 /// The rule that makes the opaque-string treatment necessary: a formal whose
 /// name also appears inside a format string is NOT substituted there.
 /// Substituting it would corrupt the message text.
