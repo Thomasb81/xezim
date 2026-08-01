@@ -456,7 +456,16 @@ macro_rules! vcd_mark {
 macro_rules! write_sig {
     ($self:ident, $id:expr, $val:expr) => {{
         let __wsig_id = $id;
-        let __wsig_val = $val;
+        let mut __wsig_val = $val;
+        // Invariant: a table slot's stored signedness is the signal's DECLARED
+        // signedness (`signal_signed[id]`), never the rvalue's. An unsized
+        // decimal literal is signed (§5.7.1), so without this `barr[i] = 9`
+        // stamped is_signed onto a `bit [3:0]` element and every later read
+        // sign-extended it (-7). Real values are exempt (is_signed unused) and
+        // strings never reach a sized table slot with it consulted.
+        if !__wsig_val.is_real && __wsig_id < $self.signal_signed.len() {
+            __wsig_val.is_signed = $self.signal_signed[__wsig_id];
+        }
         // LRM §9.3.1: skip writes to forced signals.
         if !$self.forced_signals.contains_key(&__wsig_id) {
             if __wsig_id < $self.signal_has_xz.len() {
@@ -52454,7 +52463,15 @@ impl Simulator {
             // it a `string q[$]` element was still clamped to 128 characters
             // after scalar strings had been fixed.
             let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
-            let resized = if w == 0 || is_str { val } else { val.resize(w) };
+            let mut resized = if w == 0 || is_str { val } else { val.resize(w) };
+            // §6.11.1: storage keeps the SIGNAL'S declared signedness, not the
+            // rvalue's. An unsized decimal literal is signed (§5.7.1), so
+            // `barr[i] = 9` stamped is_signed onto a `bit [3:0]` element and
+            // every later read sign-extended it (-7). Strings/handles (w==0)
+            // and reals keep their value untouched.
+            if w != 0 && !is_str && !resized.is_real {
+                resized.is_signed = self.signal_signed[id];
+            }
             if self.signal_table[id] != resized {
                 if !self.dirty_signals[id] {
                     self.dirty_signals[id] = true;
@@ -52470,7 +52487,14 @@ impl Simulator {
         if let Some(id) = resolve_array_elem_id(name, &self.array_first_id) {
             let w = self.signal_widths[id];
             let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
-            let resized = if is_str { val } else { val.resize(w) };
+            let mut resized = if is_str { val } else { val.resize(w) };
+            // §6.11.1: storage keeps the ELEMENT'S declared signedness, not the
+            // rvalue's. An unsized decimal literal is signed (§5.7.1), so
+            // `barr[i] = 9` stamped is_signed onto a `bit [3:0]` cell and every
+            // later read sign-extended it (barr[i] read back as -7).
+            if !is_str && !resized.is_real {
+                resized.is_signed = self.signal_signed[id];
+            }
             if self.signal_table[id] != resized {
                 if !self.dirty_signals[id] {
                     self.dirty_signals[id] = true;
