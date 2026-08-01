@@ -311,3 +311,39 @@ endmodule
     assert_eq!(u(&sim, "t1"), 3310, "33.1ns lands on the 10ps grid");
     assert_eq!(u(&sim, "t2"), 3318, "78.1ps rounds to 8 ticks more");
 }
+
+/// §13.4.3 constant functions over REALS (ivtest `cfunc_assign_op_real`):
+/// four faces of one theme — the const-function evaluator was integer-only.
+/// Formals now convert to their declared type (`input real x` bound to `5`),
+/// real results survive the return/substitution (they were re-literalized via
+/// to_i64), `eval_init_for_width` no longer bit-reinterprets reals through
+/// resize, and ++/-- are real-aware at both interpreter arms.
+#[test]
+fn constant_functions_over_reals() {
+    let src = r#"
+module test;
+  function real f_div(input real x);
+    begin x /= 2; f_div = x; end
+  endfunction
+  function real f_inc(input real x);
+    begin ++x; f_inc = x; end
+  endfunction
+  function int f_int(input int x);
+    f_int = x + 1;
+  endfunction
+  localparam D5 = f_div(5);
+  localparam I5 = f_inc(5);
+  localparam N5 = f_int(5);
+  int d_ok, i_ok, n_ok;
+  initial begin
+    d_ok = (D5 == 2.5);
+    i_ok = (I5 == 6.0);
+    n_ok = (N5 == 6);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "d_ok"), 1, "real division keeps the fraction");
+    assert_eq!(u(&sim, "i_ok"), 1, "++ on a real formal");
+    assert_eq!(u(&sim, "n_ok"), 1, "integer functions unchanged");
+}
