@@ -542,6 +542,24 @@ endmodule
 
 // ---------------------------------------------------------------- group 8
 
+/// §20.12 assertion controls take a SCOPE argument. The field-confirmed
+/// killer: `initial begin $assertoff(0,testbench); wait(rst_l===1); 
+/// $asserton(0,testbench); end` failed whole-testbench elaboration with
+/// "Undeclared identifier 'testbench'".
+#[test]
+fn assertion_control_scope_args_elaborate() {
+    let src = r#"
+module tb;
+  logic rst_l = 0;
+  int done = 0;
+  initial begin $assertoff(0,tb); wait (rst_l === 1'b1); $asserton(0,tb); end
+  initial begin #5 rst_l = 1; #2 done = 1; $finish; end
+endmodule: tb
+"#;
+    let sim = simulate(src, 100).expect("assertion-control scope args must elaborate");
+    assert_eq!(u(&sim, "done"), 1, "sim must run past $assertoff/$asserton");
+}
+
 /// Cadence/Xcelium SHM + SST2 waveform tasks take a SCOPE as first argument
 /// (`$shm_probe(testbench, "AC")`). Elaboration's identifier validation
 /// treated that scope as a value lookup and failed the whole testbench with
