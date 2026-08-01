@@ -139,6 +139,9 @@ fn print_usage() {
     eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)");
     eprintln!("                    (default: $XEZIM_CACHE_DIR or $XDG_CACHE_HOME/xezim/designs).");
     eprintln!("  --no-cache       Force-disable the design cache (default; XEZIM_NO_CACHE=1 too).");
+    eprintln!("  --artifact-compression <none|1-22>  -o artifact compression: 'none' writes raw");
+    eprintln!("                   bincode (larger file, fastest load); 1-22 sets the zstd level");
+    eprintln!("                   (default 3). Both kinds are auto-detected when loading.");
     eprintln!("  --cache-compression-level <1-22>  Set zstd compression level for cache files");
     eprintln!("                   (default: 3). Higher = better compression but slower.");
     eprintln!("                   Can also be set via XEZIM_CACHE_COMPRESSION_LEVEL=N.");
@@ -1520,6 +1523,35 @@ fn main() {
             "--cache" => {
                 // Explicit opt-in to the experimental warm-start cache.
                 design_cache_enabled = true;
+            }
+            // Artifact (-o) compression: `none` writes raw bincode (larger,
+            // instant load); a number is a zstd level. Default: zstd level 3.
+            "--artifact-compression" => {
+                i += 1;
+                let v = args.get(i).cloned().unwrap_or_default();
+                match v.as_str() {
+                    "none" | "off" | "0" => xezim_core::set_artifact_uncompressed(true),
+                    _ => match v.parse::<i32>() {
+                        Ok(n) if (1..=22).contains(&n) => xezim_core::set_zstd_level(n),
+                        _ => {
+                            eprintln!("Error: --artifact-compression takes 'none' or a zstd level 1-22");
+                            std::process::exit(1);
+                        }
+                    },
+                }
+            }
+            _ if arg.starts_with("--artifact-compression=") => {
+                let v = &arg["--artifact-compression=".len()..];
+                match v {
+                    "none" | "off" | "0" => xezim_core::set_artifact_uncompressed(true),
+                    _ => match v.parse::<i32>() {
+                        Ok(n) if (1..=22).contains(&n) => xezim_core::set_zstd_level(n),
+                        _ => {
+                            eprintln!("Error: --artifact-compression takes 'none' or a zstd level 1-22");
+                            std::process::exit(1);
+                        }
+                    },
+                }
             }
             "--cache-compression-level" => {
                 i += 1;
