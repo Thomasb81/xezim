@@ -484,9 +484,12 @@ macro_rules! write_sig {
             if $self.warn_x && $self.time > 0 {
                 let (__xov, __xox) = $self.signal_table[__wsig_id].raw_bits();
                 let (__xnv, __xnx) = __wsig_val.raw_bits();
-                // x is (xz & !val); z is (xz & val) and deliberately ignored —
-                // z is a legitimate steady state for a tri-state net.
-                let __fresh = (__xnx & !__xnv) & !(__xox & !__xov);
+                let _ = __xov;
+                // x is (xz & !val). Report only a VALID 0/1 bit (old xz clear)
+                // going x: a bit that has been x or z all along — an undriven
+                // input, an uninitialized reg first materializing — is not a
+                // valid-value corruption and stays silent.
+                let __fresh = (__xnx & !__xnv) & !__xox;
                 let __wide_new_x = __wsig_val.width > 64
                     && __wsig_val.has_xz()
                     && !$self.signal_table[__wsig_id].has_xz();
@@ -47683,8 +47686,10 @@ impl Simulator {
     /// `write_sig!`) and from the `&self` isolated evaluators.
     #[inline]
     fn warn_x_note_bits(&self, id: usize, ov: u64, ox: u64, nv: u64, nx: u64) {
-        // x is (xz & !val); z (xz & val) is deliberately ignored.
-        let fresh = (nx & !nv) & !(ox & !ov);
+        let _ = ov;
+        // x is (nx & !nv). Only a VALID 0/1 bit (old xz clear) going x is
+        // reported — see the write_sig! macro's twin check.
+        let fresh = (nx & !nv) & !ox;
         if fresh == 0 {
             return;
         }
@@ -47708,10 +47713,13 @@ impl Simulator {
     /// while the very same x in a queue element (which does have an id) was
     /// reported — an inconsistency more confusing than silence.
     fn warn_x_note_named(&self, name: &str, old: Option<&Value>, new: &Value) {
+        // Fresh only when the bit previously held a VALID 0/1: a value born x
+        // (no prior element, or an x/z bit) is not a corruption to report.
         let has_new_x = (0..new.width as usize).any(|b| {
             new.get_bit(b) == LogicBit::X
-                && old.is_none_or(|o| {
-                    b >= o.width as usize || o.get_bit(b) != LogicBit::X
+                && old.is_some_and(|o| {
+                    b < o.width as usize
+                        && matches!(o.get_bit(b), LogicBit::Zero | LogicBit::One)
                 })
         });
         if !has_new_x {

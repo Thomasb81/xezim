@@ -118,8 +118,9 @@ fn print_usage() {
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
-    eprintln!("  --x-warn         Warn when a signal first takes an x bit after time 0,");
-    eprintln!("                   naming the signal, its instance/module and its drivers.");
+    eprintln!("  --x-warn         Warn when a signal holding a valid 0/1 value takes an x bit");
+    eprintln!("                   after time 0, naming the signal, its instance/module and its");
+    eprintln!("                   drivers. Signals x/z from the start are never reported.");
     eprintln!("                   Also enabled by +X_WARN or X_WARN=1 in the environment.");
     eprintln!("  --x-warn-limit N Cap --x-warn reports at N (default 50, 0 = unlimited).");
     eprintln!("                   Also settable as X_WARN_LIMIT=N.");

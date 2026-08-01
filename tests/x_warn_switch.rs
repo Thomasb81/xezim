@@ -270,3 +270,45 @@ endmodule
         "attributed to the register that took the x; got:\n{out}"
     );
 }
+
+/// A signal that has been x (or z) since the beginning must never be blamed,
+/// even when the x pattern changes or first materializes at t>0 through an
+/// undriven input. Only a bit that held a VALID 0/1 and then went x reports.
+#[test]
+fn x_from_beginning_is_silent_valid_to_x_reports() {
+    let src = r#"
+`timescale 1ns/1ns
+module top(input logic din);         // undriven input: x/z from the start
+  logic clk = 0;
+  always #5 clk = ~clk;
+  logic q1;                          // captures x forever: silent
+  logic mid;
+  assign mid = din & 1'b1;           // x through comb logic: silent
+  logic q2 = 0;                      // valid then corrupted: REPORT
+  logic q3;                          // x, then valid, then x: REPORT
+  always @(posedge clk) q1 <= din;
+  initial begin
+    #7  q3 = 1'b1;
+    #10 q2 = 1'bx;
+    #10 q3 = 1'bx;
+    #10 $finish;
+  end
+endmodule
+"#;
+    let out = run("frombeg", src, &[], &[("X_WARN", "1")]);
+    if out.is_empty() {
+        return;
+    }
+    assert!(
+        !out.contains("X on 'q1'") && !out.contains("X on 'mid'") && !out.contains("X on 'din'"),
+        "x-from-beginning signals must stay silent; got:\n{out}"
+    );
+    assert!(
+        out.contains("X on 'q2'"),
+        "valid 0 corrupted to x must report; got:\n{out}"
+    );
+    assert!(
+        out.contains("X on 'q3'"),
+        "x -> valid -> x must report the corruption; got:\n{out}"
+    );
+}
