@@ -220,7 +220,7 @@ impl<'a> Drop for ArenaGuard<'a> {
 /// This is the recommended way to use arenas to ensure they're always reset.
 #[macro_export]
 macro_rules! arena_scope {
-    ($arena:expr) => {
+    ($arena:expr_2021) => {
         $crate::compiler::arena::ArenaGuard::new(&$arena)
     };
 }
