@@ -2810,17 +2810,6 @@ pub struct Simulator {
     /// bus_if.master vif`) so the rewrite path can also emit a direction
     /// warning when writing to a modport-input member.
     virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
-    /// `uvm_config_db#(virtual X)::set/get` records the bound interface
-    /// interface NAME by scope here, because config_db otherwise flows an opaque
-    /// UVM uvm_config_db scope-aware store (in addition to the flat
-    /// `__uvm_cfgdb__` signal keys, kept as a fallback). Each set records the
-    /// fully-resolved scope pattern `<cntxt.get_full_name()>.<inst_name>`, the
-    /// field, the value, and (for a virtual-interface value) the bound
-    /// interface instance name. A get computes its own scope
-    /// `<cntxt.get_full_name()>.<inst_name>` and takes the LAST-set entry whose
-    /// field matches and whose scope pattern glob-matches — so two sets to
-    /// different scopes with the same field no longer collide on a bare key.
-    cfgdb_scoped: Vec<(String, String, Value, Option<String>)>,
     /// UVM run-phase objection tracking (simplified, global). raise_objection
     /// increments, drop_objection decrements; when the count returns to 0 after
     /// having been raised, the run phase ends after `uvm_phase_drain` ticks: the
@@ -5603,7 +5592,6 @@ impl Simulator {
             dpi_unresolved: HashSet::default(),
             heap: vec![None], // index 0 is null
             virtual_iface_bindings: HashMap::default(),
-            cfgdb_scoped: Vec::new(),
             uvm_obj_count: 0,
             uvm_obj_raised: false,
             uvm_phase_drain: 0,
@@ -53951,219 +53939,6 @@ impl Simulator {
         m(pat.as_bytes(), text.as_bytes())
     }
 
-    /// Match a config_db set scope `pattern` against a getter scope. Tries the
-    /// full pattern first; then, because xezim's `get_full_name` yields a
-    /// component's LEAF name (not the full hierarchical path), also matches the
-    /// pattern's last dotted segment against the getter — so `*.d1` / `*.agent.*`
-    /// still select by the requesting component's name.
-    fn cfg_scope_matches(pattern: &str, getter: &str) -> bool {
-        if Self::cfg_glob_match(pattern, getter) {
-            return true;
-        }
-        let last = pattern.rsplit('.').next().unwrap_or(pattern);
-        last != pattern && Self::cfg_glob_match(last, getter)
-    }
-
-    /// Resolve a config_db scope `<cntxt.get_full_name()>.<inst_name>` (UVM's
-    /// effective lookup/registration scope). `uvm_root::get()` / null cntxt
-    /// contributes an empty prefix (so the scope is just inst_name).
-    fn cfg_scope(&mut self, cntxt: Option<&Expression>, inst: &str) -> String {
-        let full = cntxt
-            .and_then(|e| {
-                let h = self.eval_expr(e).to_u64().unwrap_or(0) as usize;
-                if h == 0 || h >= self.heap.len() {
-                    return None;
-                }
-                let s = self
-                    .exec_method_call(h, "get_full_name", &[])
-                    .to_sv_string();
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
-            })
-            .unwrap_or_default();
-        match (full.is_empty(), inst.is_empty()) {
-            (true, _) => inst.to_string(),
-            (false, true) => full,
-            (false, false) => format!("{}.{}", full, inst),
-        }
-    }
-
-    /// `uvm_config_db#(T)::set/get/exists(cntxt, inst_name, field_name, value)`.
-    /// Scope-aware: each set records `<cntxt.get_full_name()>.<inst_name>` and a
-    /// get matches its own scope against those patterns (UVM glob), so sets to
-    /// distinct scopes with the same field don't collide. A flat
-    /// `__uvm_cfgdb__` signal-key store is kept as a fallback.
-    fn exec_config_db(&mut self, mname: &str, args: &[Expression]) -> Value {
-        // Pull args by name when named-form is used (`.field_name(...)`),
-        // falling back to positional otherwise: (cntxt, inst_name, field_name, value).
-        let find_named = |nm: &str| -> Option<&Expression> {
-            args.iter().find_map(|a| match &a.kind {
-                ExprKind::NamedArg {
-                    name,
-                    expr: Some(e),
-                } if name.name == nm => Some(&**e),
-                _ => None,
-            })
-        };
-        let field_expr = find_named("field_name").or_else(|| args.get(2));
-        let value_expr = find_named("value").or_else(|| args.get(3));
-        let inst_expr  = find_named("inst_name").or_else(|| args.get(1));
-        let field = field_expr
-            .map(|a| self.eval_expr(a).to_sv_string())
-            .unwrap_or_default();
-        let inst = inst_expr
-            .map(|a| self.eval_expr(a).to_sv_string())
-            .unwrap_or_default();
-        let cntxt_expr = find_named("cntxt").or_else(|| args.first());
-        let scope = self.cfg_scope(cntxt_expr, &inst);
-        let key = format!("__uvm_cfgdb__{}|{}", inst, field);
-        match mname {
-            "set" => {
-                if let Some(v) = value_expr {
-                    let val = self.eval_expr(v);
-                    // Virtual-interface value: remember the bound interface
-                    // instance name (a direct iface ident, or another vif's
-                    // current target) for the get-side binding.
-                    let vif_iname = self.resolve_vif_rhs_name(v).filter(|_| {
-                        matches!(&v.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. })
-                    });
-                    // Scope-aware store (primary).
-                    self.cfgdb_scoped.push((
-                        scope.clone(),
-                        field.clone(),
-                        val.clone(),
-                        vif_iname.clone(),
-                    ));
-                    // Flat fallback keys (back-compat for the loose lookup).
-                    self.signals.insert(key.clone(), val.clone());
-                    self.signals.insert(format!("__uvm_cfgdb__{}", field), val);
-                    if let Some(iname) = vif_iname {
-                        let nv = Value::from_string(&iname);
-                        self.signals
-                            .insert(format!("__uvm_cfgvif__{}|{}", inst, field), nv.clone());
-                        self.signals.insert(format!("__uvm_cfgvif__{}", field), nv);
-                    }
-                }
-                Value::zero(32)
-            }
-            "exists" => {
-                let bare = format!("__uvm_cfgdb__{}", field);
-                Value::from_u64(
-                    (self.signals.contains_key(&key) || self.signals.contains_key(&bare)) as u64,
-                    32,
-                )
-            }
-            // get(...) writes the 4th arg (by ref) and returns 1 on hit. Walk
-            // a few key forms so wildcard sets (`"*"`, `"*foo"`) reach plain
-            // gets with inst_name "" or specific child names.
-            _ => {
-                // Scope-aware match first: the LAST-set entry whose field
-                // matches and whose set scope pattern glob-matches this getter's
-                // scope. Falls back to the flat keys when no scoped entry hits.
-                let scoped = self
-                    .cfgdb_scoped
-                    .iter()
-                    .rev()
-                    .find(|(s, f, _, _)| f == &field && Self::cfg_scope_matches(s, &scope))
-                    .map(|(_, _, v, vif)| (v.clone(), vif.clone()));
-                let (hit, scoped_vif): (Option<Value>, Option<String>) = match scoped {
-                    Some((v, vif)) => (Some(v), vif),
-                    None => {
-                        let bare = format!("__uvm_cfgdb__{}", field);
-                        let candidates = [
-                            key.clone(),
-                            format!("__uvm_cfgdb__*|{}", field),
-                            format!("__uvm_cfgdb__*{}|{}", inst, field),
-                            bare,
-                        ];
-                        let mut h: Option<Value> = None;
-                        for k in candidates.iter() {
-                            if let Some(v) = self.signals.get(k).cloned() {
-                                h = Some(v);
-                                break;
-                            }
-                        }
-                        let vif = if h.is_some() {
-                            let vif_cands = [
-                                format!("__uvm_cfgvif__{}|{}", inst, field),
-                                format!("__uvm_cfgvif__*|{}", field),
-                                format!("__uvm_cfgvif__*{}|{}", inst, field),
-                                format!("__uvm_cfgvif__{}", field),
-                            ];
-                            vif_cands
-                                .iter()
-                                .find_map(|k| self.signals.get(k).map(|v| v.to_sv_string()))
-                                .filter(|s| !s.is_empty())
-                        } else {
-                            None
-                        };
-                        (h, vif)
-                    }
-                };
-                if let Some(val) = hit {
-                    if let Some(dst) = value_expr {
-                        self.assign_value(dst, &val);
-                        // If this field carried a virtual-interface instance
-                        // name, bind it to the destination vif property so
-                        // `vif.member` resolves and `@(posedge vif.clk)` events
-                        // sensitize on the real interface signal.
-                        if let Some(iname) = scoped_vif {
-                            // Determine (handle, prop) for the destination so we can
-                            // record a virtual_iface_bindings entry.
-                            let hp: Option<(usize, String)> = match &dst.kind {
-                                ExprKind::Ident(h) if h.path.len() == 1 => {
-                                    // Single-segment: could be `this.prop` (when inside a
-                                    // class method) or a plain local/module variable.
-                                    let prop = h.path[0].name.name.clone();
-                                    let th = self.this_stack.last().copied().flatten();
-                                    if let Some(hh) = th {
-                                        Some((hh, prop))
-                                    } else {
-                                        // No class context — record by variable name so that
-                                        // a later `obj.vif = local_var` can propagate.
-                                        self.signals.insert(
-                                            format!("__vif_local__{}", prop),
-                                            Value::from_string(&iname),
-                                        );
-                                        None
-                                    }
-                                }
-                                ExprKind::Ident(h) if h.path.len() == 2 => self
-                                    .eval_ident_handle(&h.path[0].name.name)
-                                    .map(|hh| (hh, h.path[1].name.name.clone())),
-                                ExprKind::MemberAccess { expr, member } => self
-                                    .eval_handle_expr(expr)
-                                    .map(|hh| (hh, member.name.clone())),
-                                _ => None,
-                            };
-                            if let Some((hh, prop)) = hp {
-                                if hh != 0 {
-                                    let is_vif = self
-                                        .heap
-                                        .get(hh)
-                                        .and_then(|o| o.as_ref())
-                                        .map(|i| i.class_name.clone())
-                                        .and_then(|cn| self.module.classes.get(&cn))
-                                        .map(|c| c.virtual_iface_properties.contains_key(&prop))
-                                        .unwrap_or(false);
-                                    if is_vif {
-                                        self.virtual_iface_bindings
-                                            .insert((hh, prop), (iname, None));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Value::from_u64(1, 32)
-                } else {
-                    Value::zero(32)
-                }
-            }
-        }
-    }
 
     /// `<call> with { constraints }`. For `std::randomize(vars) with {...}` the
     /// listed vars are randomized then narrowed by the inline constraints
@@ -63401,32 +63176,6 @@ impl Simulator {
         method_name: &str,
         args: &[Expression],
     ) -> Option<Value> {
-        // Intercept uvm_config_db static methods to ensure config_db works correctly
-        // This is needed because the regular method call interception doesn't catch
-        // static method calls like `uvm_config_db#(int)::set(...)`
-        if class_name == "uvm_config_db" {
-            match method_name {
-                "set" => {
-                    // Store in xezim's config DB (handles scope matching correctly)
-                    let result = self.exec_config_db("set", args);
-                    // Also call UVM's implementation to populate resource pool
-                    // (bypass our interception to avoid infinite recursion)
-                    let _ = self.exec_static_method_internal(class_name, method_name, args);
-                    return Some(result);
-                }
-                "get" | "exists" => {
-                    // Try xezim's config DB first
-                    let xezim_result = self.exec_config_db(method_name, args);
-                    if xezim_result.to_u64().unwrap_or(0) == 1 {
-                        return Some(xezim_result);
-                    }
-                    // Fall back to UVM's resource pool
-                    let result = self.exec_static_method_internal(class_name, method_name, args);
-                    return result;
-                }
-                _ => {}
-            }
-        }
         // Constructors (`new`) are never static — they always require an
         // instance to be allocated first. If we dispatch them through the
         // static path, the constructor body executes with `this`=0 (null),
@@ -63722,39 +63471,6 @@ impl Simulator {
                         if routed {
                             return self.exec_super_method_call(handle, mname, args);
                         }
-                    }
-                }
-            }
-
-            // Intercept the factory's by-name create EARLY (before the real
-            // `uvm_default_factory::create_component_by_name` body, whose
-            // `m_type_names` is empty, runs and returns null). Resolve the
-            // requested type to its concrete class and construct it (the real
-            // net effect). Receiver must be a factory instance.
-            if matches!(mname, "create_component_by_name" | "create_object_by_name") {
-                let recv_is_factory = self
-                    .eval_handle_expr(expr)
-                    .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
-                    .is_some_and(|i| i.class_name.contains("factory"));
-                if recv_is_factory {
-                    let type_name = args
-                        .first()
-                        .map(|a| self.eval_expr(a).to_sv_string())
-                        .unwrap_or_default();
-                    if let Some(cd) = self.pure_factory_lookup(&type_name) {
-                        let ctor_args: Vec<Expression> = if mname == "create_component_by_name" {
-                            let mut v = Vec::new();
-                            if let Some(n) = args.get(2) {
-                                v.push(n.clone());
-                            }
-                            if let Some(p) = args.get(3) {
-                                v.push(p.clone());
-                            }
-                            v
-                        } else {
-                            args.get(2).cloned().into_iter().collect()
-                        };
-                        return self.instantiate_class(&cd, &ctor_args);
                     }
                 }
             }
@@ -69131,38 +68847,6 @@ impl Simulator {
         {
             if let Some(v) = self.exec_rand_state_method(handle, method_name, args) {
                 return v;
-            }
-        }
-        // The real `uvm_factory::create_component_by_name` /
-        // `create_object_by_name` calls (on a real factory handle) reach here.
-        // The genuine factory's `m_type_names` is empty (per-spec registry
-        // registration isn't fully driven), so resolve the requested name to
-        // the concrete class via `pure_factory_lookup` and construct it — the
-        // real net effect (`wrapper.create_component` -> `T::new`).
-        if matches!(
-            method_name,
-            "create_component_by_name" | "create_object_by_name"
-        ) {
-            let type_name = args
-                .first()
-                .map(|a| self.eval_expr(a).to_sv_string())
-                .unwrap_or_default();
-            if let Some(cd) = self.pure_factory_lookup(&type_name) {
-                let ctor_args: Vec<Expression> = if method_name == "create_component_by_name" {
-                    let mut v = Vec::new();
-                    if let Some(n) = args.get(2) {
-                        v.push(n.clone());
-                    }
-                    if let Some(p) = args.get(3) {
-                        v.push(p.clone());
-                    }
-                    v
-                } else {
-                    args.get(2).cloned().into_iter().collect()
-                };
-                let r = self.instantiate_class(&cd, &ctor_args);
-                self.return_value = Some(r.clone());
-                return r;
             }
         }
         if method_name == "randomize" {
