@@ -926,6 +926,9 @@ struct ParallelBlockSlice {
     ptr: *const super::bytecode::Insn,
     len: usize,
     num_regs: usize,
+    /// CompiledBlock::nba_dup_targets, carried across the thread boundary
+    /// because the raw slice loses the owning block.
+    nba_dup: bool,
 }
 
 unsafe impl Send for ParallelBlockSlice {}
@@ -1186,6 +1189,7 @@ fn exec_parallel_chunk(
             array_first_id,
             &mut vm_regs,
             *bi as u32,
+            bs.nba_dup,
         );
         thread_nba.append(&mut nba);
     }
@@ -10502,6 +10506,7 @@ impl Simulator {
             &self.array_first_id,
             vm_regs,
             bi as u32,
+            cb.nba_dup_targets,
         );
         nbas.into_iter()
             .map(|nba| (nba.signal_id, nba.value))
@@ -10750,6 +10755,7 @@ impl Simulator {
                 &mut vm_regs,
                 &mut dirtied,
                 0,
+                compiled.nba_dup_targets,
             );
             if unsup {
                 unsupported += 1;
@@ -11075,6 +11081,7 @@ impl Simulator {
                     vm_regs,
                     dirtied,
                     0,
+                    compiled.nba_dup_targets,
                 );
                 // Deferred NBAs from comb blocks (rare; deferred_nba=0 on
                 // c910) would be applied at end-of-tick by the coordinator;
@@ -11229,6 +11236,7 @@ impl Simulator {
                     vm_regs,
                     dirtied,
                     0,
+                    compiled.nba_dup_targets,
                 );
                 !unsupported
             }
@@ -14330,6 +14338,10 @@ impl Simulator {
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
         vm_regs: &mut Vec<Value>,
         block_index: u32,
+        // CompiledBlock::nba_dup_targets — false for the overwhelming majority
+        // of blocks, which lets the whole-value NBA arms skip the linear
+        // last-write-wins scan entirely.
+        nba_dup: bool,
     ) -> Vec<NbaFast> {
         use super::bytecode::Insn;
         let mut nba_out: Vec<NbaFast> = Vec::new();
@@ -14515,7 +14527,11 @@ impl Simulator {
                     // §10.4.2 last-write-wins: an entry already queued for this
                     // signal supersedes signal_table, so compare against it
                     // rather than eliding against a stale current value.
-                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                    if let Some(i) = if nba_dup {
+                        nba_out.iter().rposition(|n| n.signal_id == *sig_id)
+                    } else {
+                        None
+                    } {
                         nba_out[i].value = (**k).clone();
                     } else if signal_table[*sig_id] != **k {
                         nba_out.push(NbaFast {
@@ -14585,7 +14601,11 @@ impl Simulator {
                     // + ~70% of apply_nba's per-entry work on c910 (flop Q
                     // outputs reload the same value most cycles).
                     // §10.4.2 last-write-wins: see the NbaAssignConst arm.
-                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                    if let Some(i) = if nba_dup {
+                        nba_out.iter().rposition(|n| n.signal_id == *sig_id)
+                    } else {
+                        None
+                    } {
                         nba_out[i].value = val;
                     } else if signal_table[*sig_id] != val {
                         nba_out.push(NbaFast {
@@ -14754,6 +14774,8 @@ impl Simulator {
         vm_regs: &mut Vec<Value>,
         dirtied: &mut Vec<u32>,
         block_index: u32,
+        // See `exec_insns_isolated`: CompiledBlock::nba_dup_targets.
+        nba_dup: bool,
     ) -> (Vec<NbaFast>, bool) {
         use super::bytecode::Insn;
         let mut nba_out: Vec<NbaFast> = Vec::new();
@@ -14949,7 +14971,11 @@ impl Simulator {
                     // Const pre-resized at fuse time: compare, clone only on change.
                     // §10.4.2 last-write-wins: an entry already queued for this
                     // signal supersedes the snapshot view.
-                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                    if let Some(i) = if nba_dup {
+                        nba_out.iter().rposition(|n| n.signal_id == *sig_id)
+                    } else {
+                        None
+                    } {
                         nba_out[i].value = (**k).clone();
                     } else if view[*sig_id] != **k {
                         nba_out.push(NbaFast {
@@ -15150,7 +15176,11 @@ impl Simulator {
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
                     // §10.4.2 last-write-wins: see the NbaAssignConst arm.
-                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                    if let Some(i) = if nba_dup {
+                        nba_out.iter().rposition(|n| n.signal_id == *sig_id)
+                    } else {
+                        None
+                    } {
                         nba_out[i].value = val;
                     } else if view[*sig_id] != val {
                         nba_out.push(NbaFast {
@@ -28965,6 +28995,7 @@ impl Simulator {
                                 ptr: cb.instructions.as_ptr(),
                                 len: cb.instructions.len(),
                                 num_regs: cb.num_regs as usize,
+                                nba_dup: cb.nba_dup_targets,
                             },
                         ));
                     }
@@ -29249,6 +29280,7 @@ impl Simulator {
                                     array_first_id,
                                     &mut vm_regs,
                                     *bi as u32,
+                                    bs.nba_dup,
                                 );
                                 thread_nba.append(&mut nba);
                             }
@@ -29278,6 +29310,7 @@ impl Simulator {
                                             array_first_id,
                                             &mut vm_regs,
                                             *bi as u32,
+                                            bs.nba_dup,
                                         );
                                         thread_nba.append(&mut nba);
                                     }
@@ -78958,6 +78991,7 @@ impl CombSettleCtx {
                     vm_regs,
                     dirtied,
                     0,
+                    compiled.nba_dup_targets,
                 );
                 !unsupported
             }
@@ -79160,6 +79194,7 @@ impl SendExecContext {
             &self.array_first_id,
             vm_regs,
             bi as u32,
+            cb.nba_dup_targets,
         );
         nbas.into_iter()
             .map(|nba| (nba.signal_id, nba.value))
