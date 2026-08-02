@@ -23153,8 +23153,11 @@ impl Simulator {
     /// testbench loop var `c` shadow-resolve to the DUT instance's `c`,
     /// and the per-node cache froze it: the loop never terminated.
     fn reset_hint_to_process_scope(&self) {
-        let h = self.process_scope_hint.get(&self.current_pid).cloned();
-        *self.name_resolve_hint.borrow_mut() = h;
+        let h = self.process_scope_hint.get(&self.current_pid);
+        let mut cur = self.name_resolve_hint.borrow_mut();
+        if cur.as_deref() != h.map(|s| s.as_str()) {
+            *cur = h.cloned();
+        }
     }
 
     /// Remember that a procedural comb entry ran while a process was mid-flight,
@@ -23786,6 +23789,16 @@ impl Simulator {
         );
         let mut i = 0;
         while i < stmts.len() && !self.finished {
+            // `resolve_hier_name` installs the parent scope as the resolution
+            // hint whenever it resolves a DOTTED name, and nothing restored it.
+            // So after a testbench statement read `u_dut.sig`, the hint stayed
+            // "u_dut" and the NEXT statement's unqualified names resolved into
+            // the DUT: `sel = 3'd4;` wrote `u_dut.sel` (promptly overwritten by
+            // the port's continuous assign), so the stimulus silently stopped
+            // reaching the design. Re-anchor to this process's own scope at
+            // every statement boundary; a hint deliberately installed for a
+            // statement is set inside that statement's own handler.
+            self.reset_hint_to_process_scope();
             let stmt = &stmts[i];
 
             // An inlined task/method `return` (return_flag set) must unwind to
@@ -35193,10 +35206,32 @@ impl Simulator {
                 // IEEE §11.6.1: For context-determined operations, the width is
                 // max(lhs_width, rhs_width, context_width), computed BEFORE evaluation
                 // so that sub-expressions are widened to the full expression width.
+                // §11.4.10 / §11.6.1: a shift's LEFT operand (and the operands
+                // of / % **) is context-determined, but the context width is
+                // the MAXIMUM of the surrounding context and the operand's own
+                // width — never smaller. Propagating a narrow LHS width down
+                // truncated the operand before the operation:
+                // `logic [4:0] r; r <= (1 << s) >> 3;` evaluated `1 << 5` at
+                // 5 bits (0) instead of 32 (32), so r read 0 instead of 4.
+                // (+ - * & | ^ preserve the low bits either way, which is why
+                // only this family showed it.) A shift's RIGHT operand stays
+                // self-determined.
+                let widens_left = matches!(
+                    op,
+                    BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ArithShiftRight
+                        | BinaryOp::Div
+                        | BinaryOp::Mod
+                        | BinaryOp::Power
+                );
                 let self_det_w = if is_arith_or_bitwise {
                     let lw = self.infer_width(left);
                     let rw = self.infer_width(right);
                     lw.max(rw).max(ctx_width)
+                } else if widens_left {
+                    self.infer_width(left).max(ctx_width)
                 } else {
                     ctx_width
                 };
@@ -35215,7 +35250,19 @@ impl Simulator {
                     }
                 }
                 let mut l = self.eval_expr_ctx(left, self_det_w);
-                let mut r = self.eval_expr_ctx(right, self_det_w);
+                let is_shift_op = matches!(
+                    op,
+                    BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ArithShiftRight
+                );
+                let mut r = if is_shift_op {
+                    let rw = self.infer_width(right);
+                    self.eval_expr_ctx(right, rw)
+                } else {
+                    self.eval_expr_ctx(right, self_det_w)
+                };
                 // IEEE 1800-2023 §6.16 / Table 6-9: the `==`/`!=` operators
                 // are 2-STATE when applied to the `string` data type — they
                 // compare the textual content and always yield a definite
