@@ -137,3 +137,41 @@ endmodule
     assert_eq!(u(&sim, "o_a"), 3, "overridden header param member");
     assert_eq!(u(&sim, "o_b"), 0x123);
 }
+
+/// §6.20.2 / §6.16 / §20.5, round 3 of the parameter probe sweep:
+/// multi-dimensional packed and unpacked parameter arrays, string-parameter
+/// text concatenation, and real→int conversion in constant context.
+#[test]
+fn multidim_string_and_real_parameters() {
+    let src = r#"
+module tb;
+  // multi-dim PACKED parameter: element select, not bit select
+  localparam logic [1:0][7:0] MP = '{8'hAA, 8'hBB};
+  localparam logic [7:0] MP0 = MP[0];
+  localparam logic [7:0] MP1 = MP[1];
+  // 2-D UNPACKED parameter array
+  localparam int UA [0:1][0:1] = '{'{1, 2}, '{3, 4}};
+  // string parameters: text concatenation
+  localparam string NAME = "widget";
+  localparam string PFX  = "pre_";
+  localparam string CAT  = {PFX, NAME};
+  // real → int in constant context ($rtoi truncates)
+  localparam real PI = 3.14159;
+  localparam int  PI_I = $rtoi(PI * 100.0);
+  int mp0, mp1, ua01, ua10, catlen, pii;
+  initial begin
+    mp0 = MP0; mp1 = MP1;
+    ua01 = UA[0][1]; ua10 = UA[1][0];
+    catlen = CAT.len();
+    pii = PI_I;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "mp0"), 0xBB, "packed multi-dim element select");
+    assert_eq!(u(&sim, "mp1"), 0xAA);
+    assert_eq!(u(&sim, "ua01"), 2, "2-D unpacked parameter array");
+    assert_eq!(u(&sim, "ua10"), 3);
+    assert_eq!(u(&sim, "catlen"), 10, "string parameter concat is text (pre_widget)");
+    assert_eq!(u(&sim, "pii"), 314, "$rtoi in constant context");
+}
