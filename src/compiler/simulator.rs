@@ -36611,9 +36611,21 @@ impl Simulator {
                     if let Some(arg) = args.first() {
                         // §20.6.2: `$bits(logic [7:0])` — a TYPE operand.
                         if let ExprKind::TypeLiteral(dt) = &arg.kind {
+                            // Inside a parameterized class method the type may
+                            // be sized by a CLASS value parameter
+                            // (`$bits(logic [W-1:0])`), which is absent from
+                            // the module parameter map — the width collapsed
+                            // to 1. Overlay the active specialization, and
+                            // resolve a bare TYPE-PARAMETER name through its
+                            // declared default AST (`parameter type T = logic
+                            // [W-1:0]`), which likewise sizes from W.
+                            let spec = self.params_with_class_spec();
+                            let params = spec.as_ref().unwrap_or(&self.module.parameters);
+                            let resolved_dt = self.class_type_param_default(dt);
+                            let target = resolved_dt.as_ref().unwrap_or(dt);
                             let w = super::elaborate::resolve_type_width(
-                                dt,
-                                Some(&self.module.parameters),
+                                target,
+                                Some(params),
                                 Some(&self.module.typedefs),
                             )
                             .max(1);
@@ -36621,6 +36633,38 @@ impl Simulator {
                         }
                         if let ExprKind::Ident(hier) = &arg.kind {
                             let name = self.resolve_hier_name(hier);
+                            // A bare TYPE PARAMETER of the enclosing class
+                            // (`$bits(T)` with `parameter type T = logic
+                            // [W-1:0]`) parses as an identifier, not a type
+                            // literal — size its default against the active
+                            // specialization's value parameters.
+                            if let Some(leaf) = hier.path.last().map(|s| s.name.name.clone()) {
+                                let as_ty = crate::ast::types::DataType::TypeReference {
+                                    name: crate::ast::types::TypeName {
+                                        scope: None,
+                                        name: crate::ast::Identifier {
+                                            name: leaf,
+                                            span: arg.span,
+                                        },
+                                        span: arg.span,
+                                    },
+                                    dimensions: Vec::new(),
+                                    type_args: Vec::new(),
+                                    span: arg.span,
+                                };
+                                if let Some(dflt) = self.class_type_param_default(&as_ty) {
+                                    let spec = self.params_with_class_spec();
+                                    let params =
+                                        spec.as_ref().unwrap_or(&self.module.parameters);
+                                    let w = super::elaborate::resolve_type_width(
+                                        &dflt,
+                                        Some(params),
+                                        Some(&self.module.typedefs),
+                                    )
+                                    .max(1);
+                                    return Value::from_u64(w as u64, 32);
+                                }
+                            }
                             // Unpacked array: $bits = element_bits * product of
                             // dimension sizes (IEEE 1800-2017 §20.6.2). The
                             // signal's own Value holds only one element, so the
@@ -68410,6 +68454,76 @@ impl Simulator {
     ///
     /// Returns None when no specialization is active or `name` is not a value
     /// parameter (type parameters are handled by `resolve_type_param_with`).
+    /// `module.parameters` overlaid with the ACTIVE class specialization's
+    /// value parameters, or `None` when no class spec is active (the caller
+    /// then uses `module.parameters` directly, so the common path is free).
+    /// If `dt` names a TYPE PARAMETER of the active class specialization and
+    /// that parameter is using its DEFAULT, return the default's declared
+    /// type so the caller can size it against the current value parameters.
+    /// Returns None for an explicitly-bound type param (the binding is
+    /// already a concrete type name) or outside a class.
+    fn class_type_param_default(
+        &self,
+        dt: &crate::ast::types::DataType,
+    ) -> Option<crate::ast::types::DataType> {
+        use crate::ast::types::DataType;
+        let DataType::TypeReference { name, .. } = dt else {
+            return None;
+        };
+        let tn = name.name.name.as_str();
+        let (base, sig) = self.current_spec.as_ref()?;
+        let cd = self.module.classes.get(base)?;
+        if !cd.type_param_names.iter().any(|t| t == tn) {
+            return None;
+        }
+        // An EXPLICIT binding wins — decided by slot in the specialization's
+        // argument list, not by `resolve_type_param_binding` (which falls back
+        // to the default fragment and so cannot tell the two apart). Only a
+        // type param left at its default is resolved from the default AST.
+        if let Some(idx) = cd.param_order.iter().position(|p| p == tn) {
+            let frags = Self::split_spec_args(sig);
+            if let Some(f) = frags.get(idx).map(|f| f.trim()).filter(|f| !f.is_empty()) {
+                // An unspecified type param is filled in with its own default
+                // FRAGMENT, which is lossy for a parameterized type (`logic
+                // [W-1:0]` renders as `logic`). Matching that fragment means
+                // the default is in force, so prefer the exact default AST;
+                // anything else is an explicit binding and wins.
+                let is_default_frag = cd
+                    .type_param_defaults
+                    .iter()
+                    .any(|(n, d)| n == tn && d.trim() == f);
+                if !is_default_frag {
+                    return None;
+                }
+            }
+        }
+        cd.type_param_default_types
+            .iter()
+            .find(|(n, _)| n == tn)
+            .map(|(_, d)| d.clone())
+    }
+
+    fn params_with_class_spec(&mut self) -> Option<HashMap<String, Value>> {
+        let (base, _) = self.current_spec.clone()?;
+        let cd = self.module.classes.get(&base).cloned()?;
+        let names: Vec<String> = cd
+            .param_order
+            .iter()
+            .filter(|n| !cd.type_param_names.iter().any(|t| t == *n))
+            .cloned()
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        let mut m = self.module.parameters.clone();
+        for n in names {
+            if let Some(v) = self.resolve_value_param_from_spec(&n) {
+                m.insert(n, v);
+            }
+        }
+        Some(m)
+    }
+
     fn resolve_value_param_from_spec(&mut self, name: &str) -> Option<Value> {
         // Cycle guard: a value param's specialization argument can itself
         // be a bare name that resolves back into value-param resolution for
@@ -68447,7 +68561,21 @@ impl Simulator {
         } else {
             &cd.param_order
         };
-        let idx = order.iter().position(|p| p == name)?;
+        let Some(idx) = order.iter().position(|p| p == name) else {
+            // Not a positional class parameter — but a class-BODY localparam
+            // is a class constant that may be sized from the parameters
+            // (`localparam int MYW = W;`). Its property value was baked at
+            // elaboration from the DEFAULTS, so every specialization read the
+            // default. Re-evaluate the declared initializer with the active
+            // specialization bound; the cycle guard above covers a
+            // self-referential initializer.
+            let init = cd
+                .param_defaults
+                .iter()
+                .find(|(n, _)| n == name)
+                .and_then(|(_, e)| e.clone())?;
+            return Some(self.eval_expr(&init));
+        };
         // Split the specialization's raw arg text on TOP-LEVEL commas (a naive
         // split would break on commas inside a string literal or a nested
         // call), then evaluate the fragment at `name`'s position.
