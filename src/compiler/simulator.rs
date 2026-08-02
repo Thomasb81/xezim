@@ -40327,8 +40327,23 @@ impl Simulator {
                                     .as_ref()
                                     .map(|r| self.module.classes.contains_key(r) || self.module.covergroups.contains_key(r))
                                     .unwrap_or_else(|| {
-                                        self.module.classes.contains_key(&tn)
+                                        if self.module.classes.contains_key(&tn)
                                             || self.module.covergroups.contains_key(&tn)
+                                        {
+                                            return true;
+                                        }
+                                        // §8.25: a type parameter may bind to
+                                        // a SPECIALIZED class name `Base#(args)`
+                                        // (e.g. `T obj` where T = `pkg#(int)` —
+                                        // the UVM factory's registry#
+                                        // (impl#(bitstream))::create_object).
+                                        // The specialized name isn't a key in
+                                        // module.classes, but its base is.
+                                        self.extract_spec_from_string(&tn)
+                                            .map(|(base, _)| {
+                                                self.module.classes.contains_key(&base)
+                                            })
+                                            .unwrap_or(false)
                                     })
                             })
                             .unwrap_or(false);
@@ -40354,6 +40369,32 @@ impl Simulator {
                     let type_name =
                         type_name.map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn));
                     if let Some(tname) = type_name {
+                        // §8.25: the type-parameter resolved to a SPECIALIZED
+                        // class name `Base#(args)` (e.g. `T obj = new()` where
+                        // `T` is bound to `pkg#(int)` — the UVM factory's
+                        // `uvm_object_registry#(T)::create_object` does `T obj;
+                        // obj = new(name)`). The plain-name lookup below only
+                        // finds the unspecialized `Base` in module.classes, so
+                        // extract the specialization and carry it through
+                        // `current_spec`: `instantiate_class_with_type_args`
+                        // snapshots `current_spec` onto the instance's `spec`,
+                        // and later virtual dispatch on the instance restores
+                        // it (so the instance's inherited methods resolve `T`
+                        // correctly). Mirrors the factory `create` path.
+                        if let Some((base, sig)) = self.extract_spec_from_string(&tname) {
+                            if let Some(class_def) = self.module.classes.get(&base).cloned() {
+                                self.ensure_spec_statics(&base, &sig);
+                                let saved_spec = self.current_spec.clone();
+                                self.current_spec = Some((base.clone(), sig));
+                                let handle = self.instantiate_class(&class_def, ctor_args);
+                                self.current_spec = saved_spec;
+                                self.assign_value(lvalue, &handle.resize(w));
+                                if !self.in_edge_block {
+                                    self.settle_combinatorial();
+                                }
+                                return;
+                            }
+                        }
                         let cls = if self.module.classes.contains_key(&tname) {
                             tname.clone()
                         } else if let Some(resolved) = self.resolve_simple_typedef_class(&tname) {
@@ -68718,6 +68759,15 @@ impl Simulator {
             // form a type-parameter DEFAULT uses, so both routes name the type
             // identically.
             ExprKind::TypeLiteral(dt) => crate::elaborate::data_type_to_spec_fragment(dt),
+            // A SPECIALIZED class name `C#(int)` used as a type argument.
+            // Render the full `base#(args)` string (whitespace-normalized to
+            // match `current_spec`/`extract_spec_from_string`), so the
+            // recorded type binding can later drive a `T obj; obj = new()`
+            // construction of the SPECIALIZED class — not just the base.
+            ExprKind::Specialization { base, type_args_text } => {
+                let bn = Self::leaf_ident_name(base)?;
+                Some(format!("{}#({})", bn, Self::normalize_spec_ws(type_args_text)))
+            }
             _ => None,
         }
     }
@@ -68764,6 +68814,24 @@ impl Simulator {
                 if h.path.len() == 1 && h.path[0].selects.is_empty())
             {
                 return self.is_known_type_leaf(&member.name);
+            }
+        }
+        // A SPECIALIZED class name used as a type argument — `C#(int)` in
+        // `registry#(C#(int))` (UVM's
+        // `uvm_object_registry#(impl#(bitstream))`). The bare Ident /
+        // MemberAccess arms above only see unspecialized names; without this
+        // the specialized arg was classed as a VALUE, breaking positional
+        // parameter binding — the type param went unbound and silently fell
+        // back to its declared default, so a later `T obj; obj = new()` built
+        // the default class instead of the specialized one.
+        if let ExprKind::Specialization { base, .. } = &e.kind {
+            let leaf = match &base.kind {
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                _ => None,
+            };
+            if let Some(n) = leaf {
+                return self.is_known_type_leaf(n);
             }
         }
         false
