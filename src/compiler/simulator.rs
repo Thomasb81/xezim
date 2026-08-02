@@ -2841,10 +2841,13 @@ pub struct Simulator {
     uvm_obj_raised: bool,
     uvm_phase_drain: u64,
     uvm_pending_end: Option<u64>,
-    /// When true (env `PURE_SV_LRM=1`), every UVM-specific shim is disabled and
-    /// UVM is executed as ordinary SystemVerilog through the LRM engine (the
-    /// native phaser, objection/config_db/factory/TLM/report/topology
-    /// interceptions are all bypassed). Default false → use the UVM shim.
+    /// When true (the DEFAULT, and also when `PURE_SV_LRM` is unset), UVM is
+    /// executed as ordinary SystemVerilog through the LRM engine: the genuine
+    /// `uvm_pkg.sv` runs, and every UVM-specific shim (native phaser,
+    /// objection/config_db/factory/TLM/report/topology interception) is
+    /// bypassed. When false (`PURE_SV_LRM=0`, LEGACY), the mock library and
+    /// those native shims run instead. The legacy mode is deprecated; see the
+    /// `PURE_SV_LRM=0` warning emitted at construction.
     pure_sv_lrm: bool,
     /// Memo for transitive blocking-task detection (pure-LRM mode only): maps a
     /// subroutine name to whether its body — following calls — eventually hits a
@@ -5640,10 +5643,21 @@ impl Simulator {
             uvm_phase_drain: 0,
             uvm_pending_end: None,
             // Pure-LRM semantics are the DEFAULT; PURE_SV_LRM=0 opts back
-            // into the legacy UVM-hack mode.
-            pure_sv_lrm: std::env::var("PURE_SV_LRM")
-                .map(|v| v != "0")
-                .unwrap_or(true),
+            // into the legacy mock+shim mode. That mode is deprecated.
+            pure_sv_lrm: {
+                let pure_sv_lrm = std::env::var("PURE_SV_LRM")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
+                if !pure_sv_lrm {
+                    eprintln!(
+                        "warning: PURE_SV_LRM=0 (legacy mock/shim UVM mode) is \
+                         deprecated and will be removed; use the default pure-SV \
+                         path (run with the genuine uvm_pkg.sv and PURE_SV_LRM \
+                         unset or =1)."
+                    );
+                }
+                pure_sv_lrm
+            },
             tb_cache: std::cell::RefCell::new(HashMap::default()),
             uvm_components: Vec::new(),
             uvm_post_run_done: false,
