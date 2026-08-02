@@ -14386,7 +14386,12 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     // Const pre-resized at fuse time: compare, clone only on change.
-                    if signal_table[*sig_id] != **k {
+                    // §10.4.2 last-write-wins: an entry already queued for this
+                    // signal supersedes signal_table, so compare against it
+                    // rather than eliding against a stale current value.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = (**k).clone();
+                    } else if signal_table[*sig_id] != **k {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: (**k).clone(),
@@ -14453,7 +14458,10 @@ impl Simulator {
                     // entry; doing it here saves the push + queue traversal
                     // + ~70% of apply_nba's per-entry work on c910 (flop Q
                     // outputs reload the same value most cycles).
-                    if signal_table[*sig_id] != val {
+                    // §10.4.2 last-write-wins: see the NbaAssignConst arm.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = val;
+                    } else if signal_table[*sig_id] != val {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: val,
@@ -14813,7 +14821,11 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     // Const pre-resized at fuse time: compare, clone only on change.
-                    if view[*sig_id] != **k {
+                    // §10.4.2 last-write-wins: an entry already queued for this
+                    // signal supersedes the snapshot view.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = (**k).clone();
+                    } else if view[*sig_id] != **k {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: (**k).clone(),
@@ -15011,7 +15023,10 @@ impl Simulator {
                 // ── Deferred (non-blocking) writes — queued like settle ──
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
-                    if view[*sig_id] != val {
+                    // §10.4.2 last-write-wins: see the NbaAssignConst arm.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = val;
+                    } else if view[*sig_id] != val {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: val,
@@ -15412,7 +15427,16 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     // Const pre-resized at fuse time: compare, clone only on change.
-                    if self.signal_table[*sig_id] != **k {
+                    if let Some(i) = self.nba_fast_index.get(*sig_id) {
+                        // §10.4.2 last-write-wins. A value already QUEUED for
+                        // this signal in this time step is what it will become,
+                        // so the elision below must not compare against
+                        // signal_table — that is the stale pre-update value.
+                        // Eliding here let an earlier NBA survive a later one
+                        // that happened to match the old value, which is how
+                        // `x <= a; if (rst) {x,y} <= 0;` kept `a` under reset.
+                        self.nba_fast[i].value = (**k).clone();
+                    } else if self.signal_table[*sig_id] != **k {
                         self.nba_fast_index.insert(*sig_id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
                             block_index: 0,
@@ -15479,7 +15503,14 @@ impl Simulator {
                     // Eval-time elision: skip the queue push when the
                     // value already matches signal_table.  See the
                     // exec_insns_isolated sibling.  Bumps prof_nba_elided.
-                    if self.signal_table[*sig_id] != val {
+                    //
+                    // §10.4.2 last-write-wins: an entry already QUEUED for this
+                    // signal is what it will become, so the elision must not
+                    // compare against the stale signal_table value — overwrite
+                    // the queued entry instead.
+                    if let Some(i) = self.nba_fast_index.get(*sig_id) {
+                        self.nba_fast[i].value = val;
+                    } else if self.signal_table[*sig_id] != val {
                         // Update nba_fast_index too so a follow-up partial-range
                         // or bit NBA to the same signal merges into THIS new
                         // whole-value entry, not into a stale earlier partial.
