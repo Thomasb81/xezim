@@ -262,11 +262,9 @@ independently reproduces the sibling tree's "~2.9 us per procedural resume vs
 
 Ranked follow-ups:
 
-1. **Resume by cursor, not by copy.** Store `(pid, block, resume_index)` and let
-   the process re-enter its own statement list. Removes the clone entirely and
-   makes resume cost independent of continuation length. This is the "fibers"
-   project; it is architectural, and it would also fix the recurring
-   `process_suspended` propagation bugs.
+1. ~~**Resume by cursor, not by copy.**~~ **BUILT, CORRECT, SLOWER, REVERTED
+   (2026-07-29).** See §6b — the recommendation as written here was wrong in its
+   premise, and the implementation that corrected the premise still lost.
 2. ~~`pid_counts` -> dense `Vec`~~ — **TRIED, NEUTRAL, REVERTED.** The map is
    keyed by consecutive small integers and touched on every `schedule` /
    `pop_front` / `is_pid_suspended`, so the SipHash looked like free money. It
@@ -284,6 +282,101 @@ Note the scope: on DUT-heavy RTL the event queue is nearly free (`sched` ~0.1 ms
 on c906). All of this matters on **testbench/UVM-heavy** loads, where processes
 suspend and resume constantly.
 
+## 6b. Resume-by-cursor — built, correct, SLOWER, reverted (2026-07-29)
+
+**The §6.1 recommendation above was not implementable as written, and the thing
+that replaced it still lost. Both halves are worth recording.**
+
+**Why "store `(pid, block, resume_index)`" is impossible here.**
+`run_process_stmts` does not execute an AST node; it executes a list it
+SYNTHESIZES. A blocking `begin/end` is flattened into the caller's stream and a
+blocking task call is spliced in front of the caller's tail — 25 such sites in
+one ~1,670-line function. So the statements a parked process still owes are
+routinely a concatenation that exists nowhere in the source, and no index into
+the AST can name it. The workable form is a cursor plus a FRAME CHAIN: a shared
+`Arc<[Statement]>` + offset + `next` link, so a splice pushes a frame instead of
+copying the caller's tail onto the end of the body.
+
+**That was implemented in full** (`ProcCont`, 25 splice sites converted to
+pushed frames, 9 suspension captures converted to `resume_at`, the 8
+continuation-carrying structs and the whole `TimingWheel` retyped). It is
+correct: **1,302 tests pass** and c906 is counter-identical (`edges_fired
+9,684,685 / insns 46,816,268 / entry_evals 6,470,193 / nba_elided 2,371,064`,
+`TEST PASSED`, end time 332550).
+
+**It is also slower** (paired, interleaved):
+
+| load | before | after | |
+|---|---|---|---|
+| c906 RTL | 2,535 / 2,676 / 2,667 ms | 2,652 / 2,590 / 2,626 ms | neutral |
+| 400 live processes | 5,087 / 4,987 ms | 5,398 / 5,271 ms | **+5%** |
+| `cont_pre_100` (empty continuation) | 3,374 ms | 3,477 ms | **+3%** |
+| `cont_post_100` (100-stmt continuation) | 3,871 ms | 4,205 ms | **+9%** |
+
+**Why, and it is the whole lesson: SPLICES ARE FAR MORE FREQUENT THAN
+SUSPENSIONS.** A blocking `begin/end` inside a `forever` re-splices on every
+iteration; a process suspends once per iteration at most. The old code paid a
+deep clone per SUSPENSION. The new code removes that but adds `Arc::from(vec)`
+— an allocation plus an O(N) move — per SPLICE, on top of the `inner.clone()`
+that both versions pay. `cont_pre_100` isolates it exactly: its continuation is
+empty, so `resume_at` saves nothing and the +3% is pure added Arc
+materialization.
+
+The 0.35 us/statement measured in §6 is real, but it is the cost of the splice
+clone, which the probe could not separate from the suspension clone — both scale
+with the same N.
+
+**What would actually be needed:** the AST itself holding `Arc<[Statement]>`, so
+a splice shares the block body instead of cloning it. That is an `xezim-core`
+change through the parser and elaborator, and it is the real prerequisite —
+without it, any frame-chain scheme pays to materialize what it wants to share. A
+pointer-keyed `Arc` cache for AST blocks was considered and rejected: the frame a
+`SeqBlock` is read from can itself be a temporary, so the address key has an ABA
+hazard that would silently execute a stale body.
+
+### CORRECTION (same day): on REAL UVM the frame chain is a ~3.6% WIN
+
+The verdict above was reached on synthetics (`cont_*`, `many_procs`) because no
+UVM benchmark existed. One now does — `bench/run_uvm_bench.sh`, added precisely
+because this section had to guess. Re-judged on it (paired, interleaved, 3 reps,
+median; `verdict=ok` means end time and fatal count matched):
+
+| benchmark | before | after | delta |
+|---|---|---|---|
+| `phases/basic` | 6,421.8 ms | 6,105.3 ms | **-4.9%** |
+| `tlm1/hierarchy` | 10,371.2 ms | 9,908.5 ms | **-4.5%** |
+| `tlm1/producer_consumer` | 8,250.8 ms | 7,925.2 ms | **-3.9%** |
+| `objections` | 3,384.0 ms | 3,263.4 ms | **-3.6%** |
+| `tlm1/fifo` | 8,058.6 ms | 7,887.7 ms | **-2.1%** |
+| `interfaces` | 15,538.4 ms | 15,708.2 ms | +1.1% |
+| `hello_world` | 22,744.6 ms | 22,886.3 ms | +0.6% |
+
+Five of seven faster, the two regressions inside noise. **The synthetics were
+unrepresentative and led to the wrong call.** `cont_post_100` is a tight
+`forever` that re-splices a 100-statement block every iteration — the single
+shape where paying `Arc::from` per splice to save one suspension clone is a bad
+trade. Real UVM code splices smaller bodies through deeper task-call chains,
+where chaining the caller's tail instead of copying it wins.
+
+The +5% on `many_procs` and +9% on `cont_post_100` are still real; this is a
+trade, not a free win. DUT loads (c906, c910) were neutral either way, so
+nothing regresses there.
+
+**Status: the code was reverted before this measurement existed, and the working
+tree no longer has it.** Re-landing means re-deriving it from §6b (the design is
+described precisely enough: `ProcCont`, 25 splice sites to
+`pushed`, 9 suspension captures to `resume_at`, 8 continuation structs and
+`TimingWheel` retyped) and re-running both gates — 1,302 tests plus c906/c910
+counter identity, which it passed. Worth doing; it is also still true that the
+AST `Arc<[Statement]>` change (see `ast_shared_stmt_lists_scope.md`) removes the
+`Arc::from` this trade is paying for, and would turn the two remaining
+regressions into wins as well.
+
+**Method lesson, and it is the same one as Round 3 of this document:** the
+benchmark you lack is the conclusion you get wrong. This section confidently
+reverted a correct 3.6% improvement because the only available workloads
+exaggerated one code shape.
+
 ---
 
 ## 7. Where this landed
@@ -299,11 +392,20 @@ Tried and rejected, recorded so they are not re-run:
 * `XEZIM_DIRTY_EDGE` default-on (§5a) — sound but not counter-identical.
 * `pid_counts` -> dense `Vec` (§6.2) — neutral at 3 and at 400 live processes.
 
+Also tried, reverted, and then VINDICATED by a better benchmark:
+
+* **Resume-by-cursor / frame chain** (§6b) — built in full, byte-identical,
+  reverted on synthetic evidence, then measured **-3.6% median on real UVM** once
+  `bench/run_uvm_bench.sh` existed. Needs re-deriving and re-landing.
+
 Still open, ranked:
 
-1. **Resume-by-cursor** (§6.1) — the measured ~0.35 us per trailing statement per
-   resume is the largest single number left in this document, but it is only
-   visible on testbench/UVM loads and the fix is architectural.
+0. **Re-land the frame chain** (§6b correction) — a measured ~3.6% on UVM that
+   was thrown away for want of a benchmark. Cheapest real win on this list.
+1. **`Arc<[Statement]>` in the AST** (`xezim-core` parser/elaborator) — the
+   prerequisite §6b ran into. It would make a splice share a block body instead
+   of deep-cloning it on every loop iteration, which is where the per-statement
+   cost actually lives, and only then does the frame chain pay off.
 2. **Transitive clock-net collapse** (§5c) — M0 the chain-depth distribution
    first. The dedup above already collapses the *detect* cost of a replicated
    clock tree; what remains is its *settle* cost, and nothing here has measured

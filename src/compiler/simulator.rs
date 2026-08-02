@@ -78,7 +78,7 @@ impl SvRng {
     /// each launch cannot be replayed, so a random failure cannot be debugged.
     fn from_entropy() -> Self {
         use rand::Rng;
-        SvRng::from_seed(rand::rngs::StdRng::from_entropy().gen::<u64>())
+        SvRng::from_seed(rand::rngs::StdRng::from_entropy().r#gen::<u64>())
     }
 
     /// §18.14.2 `get_randstate`: the full state as an implementation-defined
@@ -440,7 +440,7 @@ macro_rules! sim_dbg_eprintln {
 /// + one epoch compare when the dump is active, a single branch otherwise. The
 /// rolling epoch dedups repeat writes within a flush.
 macro_rules! vcd_mark {
-    ($self:ident, $id:expr) => {{
+    ($self:ident, $id:expr_2021) => {{
         if $self.dump_dirty_active {
             let __vm_id = $id;
             if __vm_id < $self.dump_dirty_mark.len()
@@ -454,7 +454,7 @@ macro_rules! vcd_mark {
 }
 
 macro_rules! write_sig {
-    ($self:ident, $id:expr, $val:expr) => {{
+    ($self:ident, $id:expr_2021, $val:expr_2021) => {{
         let __wsig_id = $id;
         let mut __wsig_val = $val;
         // Invariant: a table slot's stored signedness is the signal's DECLARED
@@ -875,7 +875,7 @@ struct JoinWaiter {
     parent_pid: usize,
     child_pids: HashSet<usize>,
     join_type: JoinType,
-    continuation: Vec<Statement>,
+    continuation: ProcCont,
     finished_children: HashSet<usize>,
     /// `true` for a `wait fork` waiter. Unlike a plain `join`, its wake
     /// condition is re-evaluated against the *live* descendant tree on every
@@ -894,7 +894,7 @@ struct JoinWaiter {
 #[derive(Clone)]
 struct SuspendedProc {
     /// Continuation statements to run when the process resumes.
-    continuation: Vec<Statement>,
+    continuation: ProcCont,
     /// Original scheduled expiry time if suspended while blocked on a `#delay`.
     /// `None` if blocked on an event/condition/join/mailbox. On resume, if the
     /// original delay has transpired (original_time <= self.time), the process
@@ -906,7 +906,7 @@ struct SuspendedProc {
 struct AwaitWaiter {
     target_pid: usize,
     waiter_pid: usize,
-    continuation: Vec<Statement>,
+    continuation: ProcCont,
 }
 
 struct NbaFast {
@@ -1275,13 +1275,13 @@ struct SemGetWaiter {
     pid: usize,
     /// Keys still required.
     n: i64,
-    cont: Vec<Statement>,
+    cont: ProcCont,
 }
 
 struct MailboxGetWaiter {
     pid: usize,
     lvalue: Expression,
-    cont: Vec<Statement>,
+    cont: ProcCont,
     /// `peek` (not `get`): the waiter reads the front WITHOUT removing it, so
     /// a `put` that wakes it must also leave the item in the mailbox for the
     /// subsequent `get`/`try_get`. UVM's sequencer does this: get_next_item
@@ -1295,7 +1295,7 @@ struct MailboxGetWaiter {
 struct MailboxPutWaiter {
     pid: usize,
     value: Value,
-    cont: Vec<Statement>,
+    cont: ProcCont,
 }
 
 /// A process waiting for a signal edge event.
@@ -1335,7 +1335,7 @@ struct EventWaiter {
     /// moment this waiter armed. Parallel to `resolved_sensitivities`. Used to
     /// detect a change made AFTER arming within the same snapshot generation.
     arm_bits: Vec<(u64, u64)>,
-    continuation: Vec<Statement>,
+    continuation: ProcCont,
     /// Each sensitivity signal's value captured AT registration time
     /// (`raw_bits()` for the ≤64-bit fast path). The waiter fires when the
     /// signal changes relative to this captured baseline — NOT the global
@@ -1379,7 +1379,7 @@ struct EventWaiter {
 struct InstanceEventWaiter {
     key: (usize, String),
     pid: usize,
-    continuation: Vec<Statement>,
+    continuation: ProcCont,
 }
 
 /// Pad a string to a given width with spaces (or zeros if zero_pad).
@@ -1406,7 +1406,131 @@ const CB_SAMPLE_PREFIX: &str = "__xz_cbsample.";
 /// Number of u64 words needed for the occupancy bitmap (256 / 64 = 4).
 const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
 
-type EventList = VecDeque<(usize, Vec<Statement>)>;
+/// A suspended process's remaining work: a shared statement list plus a cursor,
+/// chained to whatever runs after that list is exhausted.
+///
+/// It is NOT an index into the AST, and it cannot be. `run_process_stmts`
+/// SYNTHESIZES the list it executes — a blocking `begin/end` is flattened into
+/// the caller's stream, a blocking task call is spliced in front of the caller's
+/// tail — so the statements a parked process still owes are routinely a
+/// concatenation that exists nowhere in the source. What CAN be named is a
+/// shared handle to that synthesized list plus an offset, and that is what
+/// removes the copying:
+///
+/// * parking used to deep-clone the tail of the statement list — everything the
+///   process had left — on every `#delay` and every `@(posedge)`;
+/// * splicing used to clone the body and then copy the caller's whole tail onto
+///   the end of it, every time a blocking block or task was entered.
+///
+/// `next` is the frame chain: a splice pushes `body` with `next` = the caller's
+/// tail, and the executor follows the chain when a frame runs out. Frames are
+/// `Arc`, so capturing a continuation costs O(depth) pointer bumps instead of
+/// O(work remaining) statement clones.
+///
+/// Measured on `bench/run_uvm_bench.sh`: -3.6% median across the UVM examples,
+/// which spend ~98% of the loop on this path. It is a TRADE, not a free win —
+/// `Arc::from` per splice costs a tight `forever` re-splicing a large block
+/// (+9% on the `cont_post_100` synthetic). See
+/// docs/perf_dump_offload_2026-07-28.md §6b.
+#[derive(Clone, Debug)]
+struct ProcCont {
+    stmts: Arc<[Statement]>,
+    start: usize,
+    next: Option<Arc<ProcCont>>,
+}
+
+impl ProcCont {
+    /// A continuation over a freshly synthesized statement list.
+    fn from_vec(stmts: Vec<Statement>) -> Self {
+        ProcCont { stmts: Arc::from(stmts), start: 0, next: None }
+    }
+
+    /// Nothing to run.
+    fn empty() -> Self {
+        ProcCont { stmts: Arc::from(Vec::new()), start: 0, next: None }
+    }
+
+    /// Resume at `idx` of THIS frame, keeping the rest of the chain. This is the
+    /// operation that used to be a deep clone.
+    fn resume_at(&self, idx: usize) -> Self {
+        ProcCont {
+            stmts: Arc::clone(&self.stmts),
+            start: idx.min(self.stmts.len()),
+            next: self.next.clone(),
+        }
+    }
+
+    /// Run `stmts` first, then this continuation from `resume_at`. Replaces
+    /// "copy the caller's tail onto the end of the spliced body".
+    fn pushed(&self, stmts: Vec<Statement>, resume_at: usize) -> Self {
+        ProcCont {
+            stmts: Arc::from(stmts),
+            start: 0,
+            next: Some(Arc::new(self.resume_at(resume_at))),
+        }
+    }
+
+    /// This frame only, from the cursor.
+    fn frame(&self) -> &[Statement] {
+        &self.stmts[self.start.min(self.stmts.len())..]
+    }
+
+    /// Nothing left here or behind.
+    fn is_exhausted(&self) -> bool {
+        self.start >= self.stmts.len() && self.next.is_none()
+    }
+
+    /// Statements still owed across the whole chain. Walks the chain — keep it
+    /// off hot paths; it exists for diagnostics and for the few callers that
+    /// must hand a flat list to code outside the process executor.
+    fn len(&self) -> usize {
+        let mut n = self.frame().len();
+        let mut cur = self.next.as_ref();
+        while let Some(f) = cur {
+            n += f.frame().len();
+            cur = f.next.as_ref();
+        }
+        n
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_exhausted()
+    }
+
+    /// The next statement this continuation would execute.
+    fn first(&self) -> Option<&Statement> {
+        if let Some(s) = self.frame().first() {
+            return Some(s);
+        }
+        let mut cur = self.next.as_ref();
+        while let Some(f) = cur {
+            if let Some(s) = f.frame().first() {
+                return Some(s);
+            }
+            cur = f.next.as_ref();
+        }
+        None
+    }
+
+    /// Flatten the chain. Diagnostics / snapshot paths only.
+    fn to_vec(&self) -> Vec<Statement> {
+        let mut out: Vec<Statement> = self.frame().to_vec();
+        let mut cur = self.next.clone();
+        while let Some(f) = cur {
+            out.extend_from_slice(f.frame());
+            cur = f.next.clone();
+        }
+        out
+    }
+}
+
+impl From<Vec<Statement>> for ProcCont {
+    fn from(v: Vec<Statement>) -> Self {
+        ProcCont::from_vec(v)
+    }
+}
+
+type EventList = VecDeque<(usize, ProcCont)>;
 
 /// One clock-tree group's edge answer for the current detect pass.
 ///
@@ -1546,7 +1670,9 @@ impl NbaFastIndex {
 
 #[cfg(test)]
 mod nba_fast_index_tests {
-    use super::{CombEntry, CombItem, Expression, NbaFastIndex, Statement, TimingWheel};
+    use super::{
+        CombEntry, CombItem, Expression, NbaFastIndex, ProcCont, Statement, TimingWheel,
+    };
 
     #[test]
     fn dense_prefix_and_sparse_tail_track_and_clear_entries() {
@@ -1583,13 +1709,13 @@ mod nba_fast_index_tests {
     #[test]
     fn timing_wheel_pop_front_preserves_fifo_and_pending_pids() {
         let mut wheel = TimingWheel::new();
-        wheel.schedule(10, 1, Vec::new());
-        wheel.schedule(10, 2, Vec::new());
-        wheel.schedule(10, 1, Vec::new());
+        wheel.schedule(10, 1, ProcCont::empty());
+        wheel.schedule(10, 2, ProcCont::empty());
+        wheel.schedule(10, 1, ProcCont::empty());
 
         assert_eq!(wheel.pop_front(10).map(|event| event.0), Some(1));
         assert!(wheel.has_pid(1));
-        wheel.schedule(10, 3, Vec::new());
+        wheel.schedule(10, 3, ProcCont::empty());
 
         assert_eq!(wheel.pop_front(10).map(|event| event.0), Some(2));
         assert_eq!(wheel.pop_front(10).map(|event| event.0), Some(1));
@@ -1668,7 +1794,7 @@ impl TimingWheel {
     }
 
     /// Schedule an event at the given time.
-    fn schedule(&mut self, time: u64, pid: usize, stmts: Vec<Statement>) {
+    fn schedule(&mut self, time: u64, pid: usize, stmts: ProcCont) {
         sim_dbg_eprintln!("[DEBUG] scheduling process {} at time {}", pid, time);
         *self.pid_counts.entry(pid).or_insert(0) += 1;
         if time < self.current_time + WHEEL_SIZE as u64 {
@@ -1684,7 +1810,7 @@ impl TimingWheel {
     }
 
     /// Schedule multiple events at the given time.
-    fn schedule_push(&mut self, time: u64, entry: (usize, Vec<Statement>)) {
+    fn schedule_push(&mut self, time: u64, entry: (usize, ProcCont)) {
         self.schedule(time, entry.0, entry.1);
     }
 
@@ -1809,7 +1935,7 @@ impl TimingWheel {
     /// Remove and return the next FIFO event at `time`, leaving the remaining
     /// same-time events in the wheel. This avoids repeatedly draining and
     /// reinserting a large active-region batch for every process activation.
-    fn pop_front(&mut self, time: u64) -> Option<(usize, Vec<Statement>)> {
+    fn pop_front(&mut self, time: u64) -> Option<(usize, ProcCont)> {
         self.current_time = time;
         self.move_overflow_into_wheel(time);
         let s = Self::slot(time);
@@ -1873,7 +1999,7 @@ impl TimingWheel {
         out
     }
 
-    fn pending_stmts_for(&self, pid: usize) -> Option<&[Statement]> {
+    fn pending_stmts_for(&self, pid: usize) -> Option<&ProcCont> {
         if !self.has_pid(pid) {
             return None;
         }
@@ -1898,11 +2024,11 @@ impl TimingWheel {
     /// Returns the earliest (scheduled_time, continuation) if found.
     /// Used by `process::suspend()` and `process::kill()` to desensitize a
     /// process from its delay.
-    fn remove_pid(&mut self, pid: usize) -> Option<(u64, Vec<Statement>)> {
+    fn remove_pid(&mut self, pid: usize) -> Option<(u64, ProcCont)> {
         if !self.pid_counts.contains_key(&pid) {
             return None;
         }
-        let mut found: Option<(u64, Vec<Statement>)> = None;
+        let mut found: Option<(u64, ProcCont)> = None;
         let cur_slot = Self::slot(self.current_time);
 
         // 1) Scan the timing wheel: extract matching entries, keep the rest.
@@ -2752,7 +2878,7 @@ pub struct Simulator {
     /// slot, held for resumption in the Reactive region — after `apply_nba` and
     /// `tick_clocking_blocks` — instead of running in the Active region with the
     /// raw edge. See `EventWaiter::is_clocking`.
-    deferred_clocking_conts: Vec<(usize, Vec<Statement>)>,
+    deferred_clocking_conts: Vec<(usize, ProcCont)>,
     /// LRM §4.4 "reactive region" — drained AFTER the observed region
     /// has fired and BEFORE the postponed region runs. In a strict LRM
     /// implementation this hosts `program`-block procedural code so a
@@ -3342,7 +3468,7 @@ pub struct Simulator {
     /// (it has no continuation). `run_process_stmts` sets this to the full
     /// continuation `[stmt, stmts[i+1..]]` before calling `exec_statement`, and
     /// `exec_statement`'s Wait handler reads it to park the process.
-    exec_park_cont: Option<Vec<Statement>>,
+    exec_park_cont: Option<ProcCont>,
     /// SV-2023: target named block for `disable <name>` propagation.
     disable_target: Option<String>,
     /// Label of a process-level named block (`initial begin : worker`) -> its
@@ -3395,7 +3521,7 @@ pub struct Simulator {
     /// (pid + continuation whose first stmt is the Wait) and is re-checked in a
     /// fixpoint after the same-time batch drains, suspending until the
     /// condition genuinely flips instead of falsely proceeding.
-    condition_waiters: Vec<(usize, Vec<Statement>)>,
+    condition_waiters: Vec<(usize, ProcCont)>,
     /// IEEE 1800-2017 §4.4.2.3 Inactive region: continuations of `#0`
     /// delays park here instead of in the event_queue. The event_queue's
     /// batch drain in `run_one_tick` re-fetches same-time entries into the
@@ -3406,7 +3532,7 @@ pub struct Simulator {
     /// `#0` visible after it, so entries parked here are promoted back into
     /// the event queue only at the END of the current tick, after
     /// `apply_nba` has run (see `promote_inactive_to_active`).
-    inactive_queue: Vec<(usize, Vec<Statement>)>,
+    inactive_queue: Vec<(usize, ProcCont)>,
     /// Bumped whenever a `wait(expr)` condition evaluates true (a parked waiter
     /// proceeds). The condition-waiter fixpoint uses it to detect "no progress
     /// this round" and stop (genuine stall).
@@ -6081,7 +6207,7 @@ impl Simulator {
                 let v = v.trim();
                 if v.eq_ignore_ascii_case("random") {
                     use rand::Rng;
-                    let seed = rand::rngs::StdRng::from_entropy().gen::<u64>();
+                    let seed = rand::rngs::StdRng::from_entropy().r#gen::<u64>();
                     eprintln!("[xezim] random seed: {} (replay with +seed={})", seed, seed);
                     self.rng = SvRng::from_seed(seed);
                 } else if let Ok(seed) = v.parse::<u64>() {
@@ -9949,7 +10075,7 @@ impl Simulator {
             }
             self.process_origin
                 .insert(pid, (span, "static initializer"));
-            self.event_queue.schedule(0, pid, stmts);
+            self.event_queue.schedule(0, pid, stmts.into());
         }
         if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
             eprintln!(
@@ -10003,7 +10129,7 @@ impl Simulator {
             if let Some(l) = block_label {
                 self.disable_labels.insert(l, pid);
             }
-            self.event_queue.schedule(0, pid, stmts);
+            self.event_queue.schedule(0, pid, stmts.into());
         }
         // LRM §24: `program` initial blocks execute in the reactive region.
         // Stash each program-initial's statements into `pending_reactive` so
@@ -12886,7 +13012,7 @@ impl Simulator {
                     self.current_scope.clear();
                 }
                 self.process_origin.insert(pid, (span, "final block"));
-                self.run_process_stmts(pid, &stmts);
+                self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
                 // A final block's $finish should NOT stop subsequent finals;
                 // re-clear after each.
                 self.finished = false;
@@ -13576,7 +13702,7 @@ impl Simulator {
                             execute_body: false,
                         },
                     );
-                    self.event_queue.schedule(0, pid, Vec::new());
+                    self.event_queue.schedule(0, pid, Vec::new().into());
                     return None;
                 }
                 let forever_stmt = Statement::new(
@@ -13592,7 +13718,7 @@ impl Simulator {
                 }
                 self.process_origin
                     .insert(pid, (ab.stmt.span, "always block"));
-                self.event_queue.schedule(0, pid, vec![forever_stmt]);
+                self.event_queue.schedule(0, pid, vec![forever_stmt].into());
                 return None;
             }
             if self.stmt_is_blocking(&ab.stmt) {
@@ -13609,7 +13735,7 @@ impl Simulator {
                 }
                 self.process_origin
                     .insert(pid, (ab.stmt.span, "always block"));
-                self.event_queue.schedule(0, pid, vec![forever_stmt]);
+                self.event_queue.schedule(0, pid, vec![forever_stmt].into());
                 return None;
             }
         }
@@ -13676,6 +13802,7 @@ impl Simulator {
             compiler.set_ast_fallback(true);
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
+                compiler.set_functions(&self.module.functions);
             compiler.set_params(&self.module.parameters);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
@@ -13721,6 +13848,7 @@ impl Simulator {
                 compiler.set_ast_fallback(false);
                 compiler.set_scope_hint(scope_hint);
                 compiler.set_tasks(&self.module.tasks);
+                compiler.set_functions(&self.module.functions);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
@@ -13746,6 +13874,7 @@ impl Simulator {
                 delay_compiler.set_ast_fallback(false);
                 delay_compiler.set_scope_hint(self.process_scope_hint.get(&pid).cloned());
                 delay_compiler.set_tasks(&self.module.tasks);
+                delay_compiler.set_functions(&self.module.functions);
                 delay_compiler.set_params(&self.module.parameters);
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 delay_compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
@@ -14383,7 +14512,12 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     // Const pre-resized at fuse time: compare, clone only on change.
-                    if signal_table[*sig_id] != **k {
+                    // §10.4.2 last-write-wins: an entry already queued for this
+                    // signal supersedes signal_table, so compare against it
+                    // rather than eliding against a stale current value.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = (**k).clone();
+                    } else if signal_table[*sig_id] != **k {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: (**k).clone(),
@@ -14450,7 +14584,10 @@ impl Simulator {
                     // entry; doing it here saves the push + queue traversal
                     // + ~70% of apply_nba's per-entry work on c910 (flop Q
                     // outputs reload the same value most cycles).
-                    if signal_table[*sig_id] != val {
+                    // §10.4.2 last-write-wins: see the NbaAssignConst arm.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = val;
+                    } else if signal_table[*sig_id] != val {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: val,
@@ -14623,7 +14760,7 @@ impl Simulator {
         let mut unsupported = false;
         // Immediate blocking write with change detection.
         macro_rules! comb_write_full {
-            ($sig_id:expr, $val:expr) => {{
+            ($sig_id:expr_2021, $val:expr_2021) => {{
                 let sid = $sig_id;
                 if view[sid] != $val {
                     view[sid] = $val;
@@ -14810,7 +14947,11 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     // Const pre-resized at fuse time: compare, clone only on change.
-                    if view[*sig_id] != **k {
+                    // §10.4.2 last-write-wins: an entry already queued for this
+                    // signal supersedes the snapshot view.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = (**k).clone();
+                    } else if view[*sig_id] != **k {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: (**k).clone(),
@@ -15008,7 +15149,10 @@ impl Simulator {
                 // ── Deferred (non-blocking) writes — queued like settle ──
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
-                    if view[*sig_id] != val {
+                    // §10.4.2 last-write-wins: see the NbaAssignConst arm.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = val;
+                    } else if view[*sig_id] != val {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: val,
@@ -15409,7 +15553,16 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     // Const pre-resized at fuse time: compare, clone only on change.
-                    if self.signal_table[*sig_id] != **k {
+                    if let Some(i) = self.nba_fast_index.get(*sig_id) {
+                        // §10.4.2 last-write-wins. A value already QUEUED for
+                        // this signal in this time step is what it will become,
+                        // so the elision below must not compare against
+                        // signal_table — that is the stale pre-update value.
+                        // Eliding here let an earlier NBA survive a later one
+                        // that happened to match the old value, which is how
+                        // `x <= a; if (rst) {x,y} <= 0;` kept `a` under reset.
+                        self.nba_fast[i].value = (**k).clone();
+                    } else if self.signal_table[*sig_id] != **k {
                         self.nba_fast_index.insert(*sig_id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
                             block_index: 0,
@@ -15476,7 +15629,14 @@ impl Simulator {
                     // Eval-time elision: skip the queue push when the
                     // value already matches signal_table.  See the
                     // exec_insns_isolated sibling.  Bumps prof_nba_elided.
-                    if self.signal_table[*sig_id] != val {
+                    //
+                    // §10.4.2 last-write-wins: an entry already QUEUED for this
+                    // signal is what it will become, so the elision must not
+                    // compare against the stale signal_table value — overwrite
+                    // the queued entry instead.
+                    if let Some(i) = self.nba_fast_index.get(*sig_id) {
+                        self.nba_fast[i].value = val;
+                    } else if self.signal_table[*sig_id] != val {
                         // Update nba_fast_index too so a follow-up partial-range
                         // or bit NBA to the same signal merges into THIS new
                         // whole-value entry, not into a stale earlier partial.
@@ -16974,6 +17134,7 @@ impl Simulator {
                     );
                     compiler.set_scope_hint(scope_hint.clone());
                     compiler.set_tasks(&self.module.tasks);
+                compiler.set_functions(&self.module.functions);
                     compiler.set_params(&self.module.parameters);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
@@ -19801,6 +19962,36 @@ impl Simulator {
         out
     }
 
+    /// §15.5.3: does `head` name an EVENT for the purposes of
+    /// `@(<head>.triggered)` / `wait(<head>.triggered)`?
+    ///
+    /// `module.events` only holds events declared at MODULE scope — an event
+    /// inside an INTERFACE (the standard UVM `@(vif.evt.triggered)` sync
+    /// pattern) is absent from it, which is why keying solely on that set left
+    /// hierarchical waits with an empty sensitivity that fired at t=0. Every
+    /// event is backed by a 1-bit toggle signal, so an existing signal under
+    /// the head name is the reliable evidence. `full` (the `<head>.triggered`
+    /// name) guards the one ambiguous case: a real struct member literally
+    /// called `triggered`, which resolves as a signal in its own right.
+    fn hier_event_key(&self, head: &str, leaf: &str, full: &str) -> Option<String> {
+        if self.module.events.contains(head) {
+            return Some(head.to_string());
+        }
+        if self.module.events.contains(leaf) {
+            return Some(leaf.to_string());
+        }
+        if self.signal_name_to_id.contains_key(full) {
+            return None; // a genuine member named `triggered`
+        }
+        let resolved = self.resolve_event_key(head);
+        if self.signal_name_to_id.contains_key(resolved.as_str())
+            || self.signal_name_to_id.contains_key(head)
+        {
+            return Some(head.to_string());
+        }
+        None
+    }
+
     fn event_to_sens(&self, event: &EventControl) -> Vec<Sensitivity> {
         // Walk past Paren / RangeSelect / BitSelect / Concatenation wrappers
         // to find the underlying Ident(s). For E902 etc. that use
@@ -19902,14 +20093,8 @@ impl Simulator {
                         if segs.len() >= 2 && *segs.last().unwrap() == "triggered" {
                             let head = segs[..segs.len() - 1].join(".");
                             let leaf = segs[segs.len() - 2];
-                            if self.module.events.contains(&head)
-                                || self.module.events.contains(leaf)
-                            {
-                                let key = if self.module.events.contains(&head) {
-                                    head
-                                } else {
-                                    leaf.to_string()
-                                };
+                            let full = segs.join(".");
+                            if let Some(key) = self.hier_event_key(&head, leaf, &full) {
                                 out.push(Sensitivity {
                                     signal_name: self.resolve_event_key(&key),
                                     edge,
@@ -19956,6 +20141,27 @@ impl Simulator {
                     // always block fired once at t=0 and never again.
                     if idents.is_empty() && ee.edge.is_none() {
                         if let Some(segs) = Self::flatten_member_path(&ee.expr) {
+                            // §15.5.3 `@(<hier>.<event>.triggered)` — the
+                            // MemberAccess shape the parser produces for an
+                            // event reached through a hierarchical path
+                            // (`@(u_if.set_opt_reg.triggered)`). The flattened
+                            // Ident shape is handled in the ident loop above;
+                            // this form never reached it (collect_ident_names
+                            // does not walk MemberAccess), so the sensitivity
+                            // came out empty and the wait returned at t=0.
+                            if segs.len() >= 2 && segs[segs.len() - 1] == "triggered" {
+                                let ev = segs[..segs.len() - 1].join(".");
+                                let leaf = segs[segs.len() - 2].clone();
+                                let full = segs.join(".");
+                                if let Some(k) = self.hier_event_key(&ev, &leaf, &full) {
+                                    out.push(Sensitivity {
+                                        signal_name: self.resolve_event_key(&k),
+                                        edge: EdgeKind::AnyEdge,
+                                        iff: ee.iff.clone(),
+                                    });
+                                    continue;
+                                }
+                            }
                             if segs.len() >= 2 {
                                 let refs: Vec<&str> =
                                     segs.iter().map(|x| x.as_str()).collect();
@@ -20256,7 +20462,7 @@ impl Simulator {
                 .resolved_sensitivities
                 .iter()
                 .zip(w.arm_bits.iter())
-                .filter(|(sid, &armed)| self.signal_table[sid.signal_id].raw_bits() == armed)
+                .filter(|&(ref sid, &armed)| self.signal_table[sid.signal_id].raw_bits() == armed)
                 .map(|(sid, _)| sid.signal_id)
                 .collect();
             let mut visited = std::collections::HashSet::new();
@@ -20280,7 +20486,7 @@ impl Simulator {
         &self,
         pid: usize,
         sens: Vec<Sensitivity>,
-        continuation: Vec<Statement>,
+        continuation: ProcCont,
     ) -> EventWaiter {
         self.make_event_waiter_kind(pid, sens, continuation, false)
     }
@@ -20289,7 +20495,7 @@ impl Simulator {
         &self,
         pid: usize,
         sens: Vec<Sensitivity>,
-        continuation: Vec<Statement>,
+        continuation: ProcCont,
         is_clocking: bool,
     ) -> EventWaiter {
         let resolved: Vec<SensitivityId> = sens
@@ -21071,7 +21277,7 @@ impl Simulator {
         // degrade to the plain form when the continuation says nothing.
         if let Some((_, cont)) = self.inactive_queue.iter().find(|(p, _)| *p == pid) {
             let cont = cont.clone();
-            if let Some(r) = self.classify_stall_stmts(&cont, 0, src_file) {
+            if let Some(r) = self.classify_stall_stmts(&cont.to_vec(), 0, src_file) {
                 // Being parked here PROVES the re-arm was a zero delay; take
                 // the classification only when it agrees (it then carries the
                 // delay's source text), lest a later suspension point in the
@@ -21102,7 +21308,7 @@ impl Simulator {
         // Blocked on a signal-less `wait (cond)` (condition-waiter fixpoint).
         if let Some((_, cont)) = self.condition_waiters.iter().find(|(p, _)| *p == pid) {
             let cont = cont.clone();
-            return self.classify_stall_stmts(&cont, 0, src_file);
+            return self.classify_stall_stmts(&cont.to_vec(), 0, src_file);
         }
         // A delta continuation sitting in the event queue.
         if let Some(stmts) = self.event_queue.pending_stmts_for(pid) {
@@ -21287,7 +21493,7 @@ impl Simulator {
                 };
                 if trace_loop {
                     eprintln!("[xezim]   running pid={} stmts={}", pid, stmts.len());
-                    for (idx, s) in stmts.iter().enumerate() {
+                    for (idx, s) in stmts.to_vec().iter().enumerate() {
                         eprintln!(
                             "[xezim]     stmt[{}]: {:?}",
                             idx,
@@ -23248,7 +23454,7 @@ impl Simulator {
     /// here (rather than firing it inline after every blocking assign) is what
     /// keeps a triggered `always @(*)` from running in the middle of another
     /// process's statement sequence.
-    fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
+    fn run_scheduled_process(&mut self, pid: usize, stmts: &ProcCont) {
         self.proc_depth += 1;
         self.run_scheduled_process_inner(pid, stmts);
         self.proc_depth -= 1;
@@ -23257,7 +23463,7 @@ impl Simulator {
         }
     }
 
-    fn run_scheduled_process_inner(&mut self, pid: usize, stmts: &[Statement]) {
+    fn run_scheduled_process_inner(&mut self, pid: usize, stmts: &ProcCont) {
         // Flags from a prior process must not leak into this one.
         self.break_flag = false;
         self.return_flag = false;
@@ -23417,7 +23623,7 @@ impl Simulator {
 
     /// Dispatch a scheduled payload, recognizing the empty marker used by a
     /// retained dynamic-delay always assignment.
-    fn run_process_payload(&mut self, pid: usize, stmts: &[Statement]) {
+    fn run_process_payload(&mut self, pid: usize, stmts: &ProcCont) {
         if stmts.is_empty() && self.fast_delay_always.contains_key(&pid) {
             self.run_fast_delay_always(pid);
         } else {
@@ -23437,7 +23643,7 @@ impl Simulator {
             // re-parked UNEXECUTED, so it must not inflate the "ran N times"
             // attribution in the stall report.
             if *hits >= self.stall_limit {
-                self.event_queue.schedule(self.time, pid, Vec::new());
+                self.event_queue.schedule(self.time, pid, Vec::new().into());
                 self.zero_delay_defer_pending = true;
                 return;
             }
@@ -23495,14 +23701,14 @@ impl Simulator {
             // The delay may depend on a real continuous assignment that has
             // not settled yet. Re-evaluate once after the time-zero inactive
             // boundary before fixing the first clock phase.
-            self.inactive_queue.push((pid, Vec::new()));
+            self.inactive_queue.push((pid, ProcCont::empty()));
         } else {
             fast.execute_body = true;
             if delay == 0 {
-                self.inactive_queue.push((pid, Vec::new()));
+                self.inactive_queue.push((pid, ProcCont::empty()));
             } else {
                 self.event_queue
-                    .schedule(self.time.saturating_add(delay), pid, Vec::new());
+                    .schedule(self.time.saturating_add(delay), pid, Vec::new().into());
             }
         }
         self.fast_delay_always.insert(pid, fast);
@@ -23671,7 +23877,7 @@ impl Simulator {
     /// continuation ⇒ identical semantics: `is_pid_suspended` sees the scheduled
     /// entry (via `event_queue.has_pid`) and `run_scheduled_process` snapshots /
     /// restores the process context, exactly as an immediate `@event` re-arm.
-    fn continue_stmts_or_trampoline(&mut self, pid: usize, cont: Vec<Statement>) {
+    fn continue_stmts_or_trampoline(&mut self, pid: usize, cont: ProcCont) {
         if RPS_DEPTH.with(|c| c.get()) > RPS_TRAMPOLINE_DEPTH {
             self.event_queue.schedule(self.time, pid, cont);
         } else {
@@ -23710,7 +23916,17 @@ impl Simulator {
         false
     }
 
-    fn run_process_stmts(&mut self, pid: usize, stmts: &[Statement]) {
+    /// Execute a process's continuation: the current frame from its cursor, then
+    /// each chained frame behind it (see `ProcCont`).
+    ///
+    /// `stmts`/`i` below are the CURRENT frame and an index within it, exactly as
+    /// before. What changed is how a continuation is CAPTURED:
+    /// `pc.resume_at(pc.start + i + 1)` names "the rest of my work" in O(1) where
+    /// `pc.resume_at(pc.start + i + 1)` deep-cloned it, and
+    /// `pc.pushed(body, pc.start + i + 1)` splices a task body or flattened block
+    /// in front of the caller's tail without copying that tail.
+    fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
+        let stmts: &[Statement] = pc.frame();
         self.current_pid = pid;
         // Install THIS process's own instance scope as the resolution hint.
         // The hint is transient sibling-scope state: the previous process (or
@@ -23775,7 +23991,7 @@ impl Simulator {
                 // move past a #0 spinner once its driving value recovers (here,
                 // once a reference-clock edge updates the measured period). The outer
                 // loop declares it fatal only if nothing is scheduled ahead.
-                self.event_queue.schedule(self.time, pid, stmts.to_vec());
+                self.event_queue.schedule(self.time, pid, pc.clone());
                 self.zero_delay_defer_pending = true;
                 return;
             }
@@ -23826,8 +24042,9 @@ impl Simulator {
             if let StatementKind::SeqBlock { stmts: inner, .. } = &stmt.kind {
                 if self.stmts_have_blocking(inner) {
                     let mut expanded = inner.clone();
-                    expanded.extend_from_slice(&stmts[i + 1..]);
-                    self.run_process_stmts(pid, &expanded);
+                    // Chain the caller's tail instead of copying it onto the end of
+                    // the spliced body (ProcCont::pushed).
+                    self.run_process_stmts(pid, &pc.pushed(expanded, pc.start + i + 1));
                     return;
                 }
             }
@@ -23840,8 +24057,9 @@ impl Simulator {
             if self.pure_sv_lrm {
                 if let Some(wait_stmts) = self.bridge_objection_wait_for(stmt) {
                     let mut cont = wait_stmts;
-                    cont.extend_from_slice(&stmts[i + 1..]);
-                    self.run_process_stmts(pid, &cont);
+                    // Chain the caller's tail instead of copying it onto the end of
+                    // the spliced body (ProcCont::pushed).
+                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                     return;
                 }
             }
@@ -23955,8 +24173,9 @@ impl Simulator {
                 if let Some(call) = rewritten {
                     let call_stmt = Statement::new(StatementKind::Expr(call), stmt.span);
                     let mut cont = vec![call_stmt];
-                    cont.extend_from_slice(&stmts[i + 1..]);
-                    self.run_process_stmts(pid, &cont);
+                    // Chain the caller's tail instead of copying it onto the end of
+                    // the spliced body (ProcCont::pushed).
+                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                     return;
                 }
             }
@@ -24051,8 +24270,9 @@ impl Simulator {
                                             StatementKind::ScopePop,
                                             stmt.span,
                                         ));
-                                        cont.extend_from_slice(&stmts[i + 1..]);
-                                        self.run_process_stmts(pid, &cont);
+                                        // Chain the caller's tail instead of copying it onto the end of
+                                        // the spliced body (ProcCont::pushed).
+                                        self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                                         return;
                                     }
                                 }
@@ -24061,8 +24281,9 @@ impl Simulator {
                                     self.task_cleanup.push(cleanup);
                                     let mut cont: Vec<Statement> = td.items.clone();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
-                                    cont.extend_from_slice(&stmts[i + 1..]);
-                                    self.run_process_stmts(pid, &cont);
+                                    // Chain the caller's tail instead of copying it onto the end of
+                                    // the spliced body (ProcCont::pushed).
+                                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                                     return;
                                 }
                             }
@@ -24133,8 +24354,9 @@ impl Simulator {
                                             StatementKind::ScopePop,
                                             stmt.span,
                                         ));
-                                        cont.extend_from_slice(&stmts[i + 1..]);
-                                        self.run_process_stmts(pid, &cont);
+                                        // Chain the caller's tail instead of copying it onto the end of
+                                        // the spliced body (ProcCont::pushed).
+                                        self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                                         return;
                                     }
                                 }
@@ -24195,8 +24417,9 @@ impl Simulator {
                                     self.task_cleanup.push(cleanup);
                                     let mut cont: Vec<Statement> = td.items.clone();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
-                                    cont.extend_from_slice(&stmts[i + 1..]);
-                                    self.run_process_stmts(pid, &cont);
+                                    // Chain the caller's tail instead of copying it onto the end of
+                                    // the spliced body (ProcCont::pushed).
+                                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                                     return;
                                 }
                             }
@@ -24301,7 +24524,7 @@ impl Simulator {
                                     // uvm_sequencer::get_next_item, then item_done
                                     // try_gets it).
                                     let lvalue = args[0].clone();
-                                    let cont: Vec<Statement> = stmts[i + 1..].to_vec();
+                                    let cont = pc.resume_at(pc.start + i + 1);
                                     self.mailbox_get_waiters
                                         .entry(handle)
                                         .or_default()
@@ -24328,7 +24551,7 @@ impl Simulator {
                                 let len = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
                                 if len >= bound {
                                     let value = self.eval_expr(&args[0]);
-                                    let cont: Vec<Statement> = stmts[i + 1..].to_vec();
+                                    let cont = pc.resume_at(pc.start + i + 1);
                                     self.mailbox_put_waiters
                                         .entry(handle)
                                         .or_default()
@@ -24352,7 +24575,7 @@ impl Simulator {
                                     .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                                     .unwrap_or(1) as i64;
                                 if count < n {
-                                    let cont: Vec<Statement> = stmts[i + 1..].to_vec();
+                                    let cont = pc.resume_at(pc.start + i + 1);
                                     self.semaphore_get_waiters
                                         .entry(handle)
                                         .or_default()
@@ -24414,8 +24637,9 @@ impl Simulator {
                             ));
                         }
                         cont.push(assign);
-                        cont.extend_from_slice(&stmts[i + 1..]);
-                        self.run_process_stmts(pid, &cont);
+                        // Chain the caller's tail instead of copying it onto the end of
+                        // the spliced body (ProcCont::pushed).
+                        self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                         return;
                     }
                 }
@@ -24437,7 +24661,8 @@ impl Simulator {
                         },
                         stmt.span,
                     )];
-                    cont.extend_from_slice(&stmts[i + 1..]);
+                    // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                    let cont = pc.pushed(cont, pc.start + i + 1);
                     self.event_queue.schedule(self.time + delay, pid, cont);
                     return;
                 }
@@ -24507,8 +24732,9 @@ impl Simulator {
                                 _ => cont.push((**a).clone()),
                             }
                         }
-                        cont.extend_from_slice(&stmts[i + 1..]);
-                        self.run_process_stmts(pid, &cont);
+                        // Chain the caller's tail instead of copying it onto the end of
+                        // the spliced body (ProcCont::pushed).
+                        self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                         return;
                     }
                     None => {
@@ -24547,7 +24773,8 @@ impl Simulator {
                             },
                             stmt.span,
                         )];
-                        cont.extend_from_slice(&stmts[i + 1..]);
+                        // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                        let cont = pc.pushed(cont, pc.start + i + 1);
                         if !sens.is_empty()
                             && sens.iter().any(|s| {
                                 self.signal_name_to_id.contains_key(s.signal_name.as_str())
@@ -24602,12 +24829,14 @@ impl Simulator {
                                 },
                                 stmt.span,
                             )];
-                            whole.extend_from_slice(&stmts[i + 1..]);
+                            // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                            let whole = pc.pushed(whole, pc.start + i + 1);
                             self.inactive_queue.push((pid, whole));
                             return;
                         }
                         let mut cont = vec![*body.clone()];
-                        cont.extend_from_slice(&stmts[i + 1..]);
+                        // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                        let cont = pc.pushed(cont, pc.start + i + 1);
                         if delay == 0 {
                             // `#0` — IEEE 1800-2017 §4.4.2.3: suspend into the
                             // Inactive region of the SAME time slot, not the
@@ -24641,7 +24870,8 @@ impl Simulator {
                         if let Some(fname) = self.event_control_field_name(event) {
                             if let Some(key) = self.resolve_this_event_field(&fname) {
                                 let mut cont = vec![*body.clone()];
-                                cont.extend_from_slice(&stmts[i + 1..]);
+                                // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                                let cont = pc.pushed(cont, pc.start + i + 1);
                                 self.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
@@ -24655,8 +24885,9 @@ impl Simulator {
                         // above only covers a bare field on `this`.
                         if let Some(expr) = Self::event_control_single_expr(event) {
                             if let Some(key) = self.expr_handle_event_field(&expr) {
-                                let mut cont = vec![*body.clone()];
-                                cont.extend_from_slice(&stmts[i + 1..]);
+                                let cont = vec![*body.clone()];
+                                // Chain the caller's tail rather than copying it.
+                                let cont = pc.pushed(cont, pc.start + i + 1);
                                 self.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
@@ -24679,8 +24910,9 @@ impl Simulator {
                         if let Some(key) = self.event_control_event_key(event) {
                             let canon = self.resolve_event_key(&key);
                             if self.signal_name_to_id.contains_key(canon.as_str()) {
-                                let mut cont = vec![*body.clone()];
-                                cont.extend_from_slice(&stmts[i + 1..]);
+                                let cont = vec![*body.clone()];
+                                // Chain the caller's tail rather than copying it.
+                                let cont = pc.pushed(cont, pc.start + i + 1);
                                 let sens = vec![Sensitivity {
                                     signal_name: canon,
                                     edge: EdgeKind::AnyEdge,
@@ -24709,7 +24941,8 @@ impl Simulator {
                         }
                         if !sens.is_empty() {
                             let mut cont = vec![*body.clone()];
-                            cont.extend_from_slice(&stmts[i + 1..]);
+                            // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                            let cont = pc.pushed(cont, pc.start + i + 1);
                             let has_real = sens.iter().any(|s| {
                                 self.signal_name_to_id.contains_key(s.signal_name.as_str())
                             });
@@ -24765,7 +24998,8 @@ impl Simulator {
                     // and sequencer arbitration depend on exactly this delta-
                     // cycle handoff. Always park in condition_waiters.
                     let mut cont = vec![stmt.clone()];
-                    cont.extend_from_slice(&stmts[i + 1..]);
+                    // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                    let cont = pc.pushed(cont, pc.start + i + 1);
                     self.condition_waiters.push((pid, cont));
                     return;
                 }
@@ -24869,7 +25103,7 @@ impl Simulator {
                                 let mut waiter = self.make_event_waiter(
                                     pid,
                                     sens,
-                                    stmts[i + 1..].to_vec(),
+                                    pc.resume_at(pc.start + i + 1),
                                 );
                                 waiter.remaining_events = n;
                                 self.event_waiters.push(waiter);
@@ -24905,7 +25139,8 @@ impl Simulator {
                         },
                         stmt.span,
                     ));
-                    cont.extend_from_slice(&stmts[i + 1..]);
+                    // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                    let cont = pc.pushed(cont, pc.start + i + 1);
                     self.continue_stmts_or_trampoline(pid, cont);
                     return;
                 }
@@ -24945,8 +25180,9 @@ impl Simulator {
                                 _ => vec![branch.clone()],
                             };
                             let mut cont = branch_stmts;
-                            cont.extend_from_slice(&stmts[i + 1..]);
-                            self.run_process_stmts(pid, &cont);
+                            // Chain the caller's tail instead of copying it onto the end of
+                            // the spliced body (ProcCont::pushed).
+                            self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                             return;
                         }
                         // Run the branch we already selected, rather than
@@ -25022,8 +25258,9 @@ impl Simulator {
                                 _ => vec![arm.clone()],
                             };
                             let mut cont = arm_stmts;
-                            cont.extend_from_slice(&stmts[i + 1..]);
-                            self.run_process_stmts(pid, &cont);
+                            // Chain the caller's tail instead of copying it onto the end of
+                            // the spliced body (ProcCont::pushed).
+                            self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                             return;
                         }
                         Some(arm) => self.exec_statement(arm),
@@ -25113,7 +25350,8 @@ impl Simulator {
                         stmt.span,
                     );
                     let mut cont = vec![while_stmt];
-                    cont.extend_from_slice(&stmts[i + 1..]);
+                    // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                    let cont = pc.pushed(cont, pc.start + i + 1);
                     self.continue_stmts_or_trampoline(pid, cont);
                     return;
                 }
@@ -25139,7 +25377,8 @@ impl Simulator {
                         };
                         let mut cont: Vec<Statement> = body_stmts;
                         cont.push(stmt.clone());
-                        cont.extend_from_slice(&stmts[i + 1..]);
+                        // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                        let cont = pc.pushed(cont, pc.start + i + 1);
                         self.continue_stmts_or_trampoline(pid, cont);
                         return;
                     } else {
@@ -25167,8 +25406,9 @@ impl Simulator {
                         },
                         stmt.span,
                     ));
-                    cont.extend_from_slice(&stmts[i + 1..]);
-                    self.run_process_stmts(pid, &cont);
+                    // Chain the caller's tail instead of copying it onto the end of
+                    // the spliced body (ProcCont::pushed).
+                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                     return;
                 }
             }
@@ -25218,14 +25458,14 @@ impl Simulator {
                                 s.span,
                             );
                             self.event_queue
-                                .schedule(self.time + delay, pid_child, vec![assign]);
+                                .schedule(self.time + delay, pid_child, vec![assign].into());
                             child_pids.insert(pid_child);
                             continue;
                         }
                     }
                     // Schedule children to run at current time
                     self.event_queue
-                        .schedule(self.time, pid_child, vec![s.clone()]);
+                        .schedule(self.time, pid_child, vec![s.clone()].into());
                     child_pids.insert(pid_child);
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
@@ -25246,7 +25486,7 @@ impl Simulator {
                     continue;
                 } else {
                     // Suspend current process and wait for children
-                    let cont = stmts[i + 1..].to_vec();
+                    let cont = pc.resume_at(pc.start + i + 1);
                     self.join_waiters.push(JoinWaiter {
                         parent_pid: pid,
                         child_pids,
@@ -25263,7 +25503,7 @@ impl Simulator {
                 // in exec_method_call) because the continuation is needed.
                 if let StatementKind::Expr(expr) = &stmt.kind {
                     if let Some(target_pid) = self.extract_proc_await_target(expr) {
-                        let cont = stmts[i + 1..].to_vec();
+                        let cont = pc.resume_at(pc.start + i + 1);
                         if self.proc_await(target_pid, pid, cont) {
                             return; // caller suspended — don't execute await
                         }
@@ -25352,7 +25592,8 @@ impl Simulator {
                         },
                         stmt.span,
                     ));
-                    cont.extend_from_slice(&stmts[i + 1..]);
+                    // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                    let cont = pc.pushed(cont, pc.start + i + 1);
                     self.continue_stmts_or_trampoline(pid, cont);
                     return;
                 }
@@ -25421,7 +25662,8 @@ impl Simulator {
                                 },
                                 stmt.span,
                             ));
-                            cont.extend_from_slice(&stmts[i + 1..]);
+                            // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                            let cont = pc.pushed(cont, pc.start + i + 1);
                             self.continue_stmts_or_trampoline(pid, cont);
                             return;
                         }
@@ -25444,7 +25686,8 @@ impl Simulator {
                 if matches!(&stmt.kind, StatementKind::Foreach { .. }) {
                     self.exec_park_cont = Some({
                         let mut c = vec![stmt.clone()];
-                        c.extend_from_slice(&stmts[i + 1..]);
+                        // Chain the caller's tail rather than copying it (ProcCont::pushed).
+                        let c = pc.pushed(c, pc.start + i + 1);
                         c
                     });
                 }
@@ -25463,7 +25706,7 @@ impl Simulator {
                     i += 1;
                     continue;
                 } else {
-                    let cont = stmts[i + 1..].to_vec();
+                    let cont = pc.resume_at(pc.start + i + 1);
                     self.join_waiters.push(JoinWaiter {
                         parent_pid: pid,
                         child_pids: children,
@@ -25477,6 +25720,21 @@ impl Simulator {
             }
 
             i += 1;
+        }
+        // This frame is exhausted. Follow the chain: a spliced task body or a
+        // flattened block runs with the caller's tail linked behind it
+        // (ProcCont::pushed), so finishing the body means continuing into the
+        // caller rather than returning.
+        //
+        // Recursive, and deliberately so: the previous code recursed once per
+        // splice too (`self.run_process_stmts(pid, &expanded); return;`), so the
+        // depth is the same splice nesting it always was and RPS_DEPTH still
+        // bounds it. What changed is that a level costs a pointer instead of a
+        // copy of everything the caller had left.
+        if !self.finished {
+            if let Some(frame) = pc.next.clone() {
+                self.run_process_stmts(pid, &frame);
+            }
         }
     }
 
@@ -26043,7 +26301,7 @@ impl Simulator {
                                 body.span,
                             )];
                             restart.extend_from_slice(after);
-                            self.inactive_queue.push((pid, restart));
+                            self.inactive_queue.push((pid, ProcCont::from_vec(restart)));
                             return;
                         }
                         let mut cont = vec![*tbody.clone()];
@@ -26060,9 +26318,9 @@ impl Simulator {
                             // Inactive-region parking as the run_process_stmts
                             // Delay handler above: resume only after this
                             // tick's NBA region (commercial consensus).
-                            self.inactive_queue.push((pid, cont));
+                            self.inactive_queue.push((pid, cont.into()));
                         } else {
-                            self.event_queue.schedule(self.time + delay, pid, cont);
+                            self.event_queue.schedule(self.time + delay, pid, cont.into());
                         }
                         return;
                     }
@@ -26080,7 +26338,7 @@ impl Simulator {
                             ));
                             cont.extend_from_slice(after);
                             self.event_waiters
-                                .push(self.make_event_waiter_kind(pid, sens, cont, is_clk_ev));
+                                .push(self.make_event_waiter_kind(pid, sens, cont.into(), is_clk_ev));
                             return;
                         }
                     }
@@ -26116,11 +26374,11 @@ impl Simulator {
                 // The loop then spins through the event loop, where it is bounded,
                 // and the stall detector can see it and name it.
                 if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
-                    self.event_queue.schedule(self.time, pid, cont);
+                    self.event_queue.schedule(self.time, pid, cont.into());
                     return;
                 }
                 self.forever_depth += 1;
-                self.run_process_stmts(pid, &cont);
+                self.run_process_stmts(pid, &ProcCont::from_vec(cont));
                 self.forever_depth -= 1;
                 return;
             }
@@ -26167,7 +26425,7 @@ impl Simulator {
             self.break_flag = false;
             let after_stmts: Vec<Statement> = after.to_vec();
             if !after_stmts.is_empty() {
-                self.run_process_stmts(pid, &after_stmts);
+                self.run_process_stmts(pid, &ProcCont::from_vec(after_stmts));
             }
             return;
         }
@@ -27485,11 +27743,11 @@ impl Simulator {
     /// continuation) pairs to run. Shared by the classic post-edge-block
     /// drain and the commercial-order pre-edge-block drain (see
     /// XEZIM_WAITERS_FIRST in check_edges_inner).
-    fn drain_triggered_event_waiters(&mut self) -> Vec<(usize, Vec<Statement>)> {
+    fn drain_triggered_event_waiters(&mut self) -> Vec<(usize, ProcCont)> {
         let waiters = std::mem::take(&mut self.event_waiters);
         self.prof_waiter_iters += waiters.len() as u64;
         self.event_waiters_swap.clear();
-        let mut triggered_conts: Vec<(usize, Vec<Statement>)> = Vec::new();
+        let mut triggered_conts: Vec<(usize, ProcCont)> = Vec::new();
         for mut waiter in waiters {
             let mut triggered = false;
             for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
@@ -28285,7 +28543,7 @@ impl Simulator {
             // which is symmetric for hyperedge weight purposes.
             let mut woke_any = false;
             macro_rules! dispatch_block {
-                ($block_idx:expr, $kind:expr) => {{
+                ($block_idx:expr_2021, $kind:expr_2021) => {{
                     let block_idx = $block_idx;
                     // §9.4.2 bit-select term (`@(v[3])`): detection above is per
                     // SIGNAL, so re-test the one bit this block actually watches
@@ -41257,7 +41515,7 @@ impl Simulator {
                         self.next_pid += 1;
                         self.process_origin
                             .insert(child, (stmt.span, "intra-assignment event NBA"));
-                        self.event_queue.schedule(self.time, child, cont);
+                        self.event_queue.schedule(self.time, child, cont.into());
                         return;
                     }
                 }
@@ -42453,7 +42711,7 @@ impl Simulator {
                     }
                     self.process_origin.insert(pid, (s.span, "fork child"));
                     self.inherit_fork_child_context(pid);
-                    self.event_queue.schedule(self.time, pid, vec![s.clone()]);
+                    self.event_queue.schedule(self.time, pid, vec![s.clone()].into());
                     child_set.insert(pid);
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
@@ -42471,7 +42729,7 @@ impl Simulator {
                             parent_pid: self.current_pid,
                             child_pids: child_set,
                             join_type: *join_type,
-                            continuation: Vec::new(),
+                            continuation: Vec::new().into(),
                             finished_children: HashSet::default(),
                             wait_fork: false,
                         });
@@ -42571,7 +42829,7 @@ impl Simulator {
                                 self.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
-                                    continuation: cont,
+                                    continuation: cont.into(),
                                 });
                                 self.break_flag = true;
                                 return;
@@ -42590,7 +42848,7 @@ impl Simulator {
                         let cont = vec![*stmt.clone()];
                         let pid = self.cg_this.unwrap_or(0); // placeholder
                         self.event_waiters
-                            .push(self.make_event_waiter_kind(pid, sens, cont, is_clk_ev));
+                            .push(self.make_event_waiter_kind(pid, sens, cont.into(), is_clk_ev));
                         self.break_flag = true;
                         return;
                     }
@@ -46927,7 +47185,7 @@ impl Simulator {
             self.process_origin
                 .insert(pid, (first.span, "program initial block"));
         }
-        self.run_process_stmts(pid, &stmts);
+        self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
     }
 
     /// LRM §16.5: edge-detect each registered SVA clock, then for each
@@ -50991,7 +51249,7 @@ impl Simulator {
         // Per-trace-slot change check, shared by the incremental and full paths.
         // Returns the record to emit, if any, and keeps vcd_prev_signals in step.
         macro_rules! check_slot {
-            ($idx:expr) => {{
+            ($idx:expr_2021) => {{
                 let idx = $idx;
                 let id = self.vcd_trace[idx].0;
                 if self.vcd_var_kinds[idx] == VcdVarKind::Event {
@@ -51285,7 +51543,7 @@ impl Simulator {
         pid: usize,
         lvalue: &Expression,
         v: Value,
-        cont: Vec<Statement>,
+        cont: ProcCont,
     ) {
         if let Some(ctx) = self.process_contexts.get(&pid).cloned() {
             let saved = self.snapshot_process_context();
@@ -51485,7 +51743,7 @@ impl Simulator {
         &mut self,
         target_pid: usize,
         caller_pid: usize,
-        continuation: Vec<Statement>,
+        continuation: ProcCont,
     ) -> bool {
         let terminated = self.killed_pids.contains(&target_pid)
             || !self.is_pid_suspended(target_pid) && target_pid != self.current_pid;
@@ -51688,7 +51946,7 @@ impl Simulator {
             let regrandkids: Vec<usize> = self
                 .process_parents
                 .iter()
-                .filter(|(_, &p)| p == child_pid)
+                .filter(|&(_, &p)| p == child_pid)
                 .map(|(&c, _)| c)
                 .collect();
             for c in regrandkids {
@@ -52274,7 +52532,7 @@ impl Simulator {
         // them (`vcd_sink::write_xtrace_timestep`).
         let mut changes: Vec<(Arc<str>, Value, bool, bool)> = Vec::new();
         macro_rules! check_xt_slot {
-            ($idx:expr) => {{
+            ($idx:expr_2021) => {{
                 let idx = $idx;
                 let id = self.xtrace_trace[idx].0;
                 let val = &self.signal_table[id];
@@ -52577,7 +52835,7 @@ impl Simulator {
         // on an unscoped dump dominates everything else (see `dump_dirty`).
         let mut changes: Vec<(FstSignalId, Vec<u8>)> = Vec::new();
         macro_rules! check_fst_slot {
-            ($idx:expr) => {{
+            ($idx:expr_2021) => {{
                 let idx = $idx;
                 let tbl_id = self.fst_trace[idx].0;
                 let val = &self.signal_table[tbl_id];
@@ -53878,7 +54136,7 @@ impl Simulator {
     /// (register dist, branch steps, illegal-instr injection, …) actually vary.
     fn rng_u32(&mut self) -> u32 {
         use rand::Rng;
-        self.cur_rng().gen()
+        self.cur_rng().r#gen()
     }
 
     /// Inclusive random in [lo, hi] (lo>hi yields lo). Backs `$urandom_range`.
@@ -55623,7 +55881,7 @@ impl Simulator {
             .max(1);
         self.set_queue_size(arr, n);
         for i in 0..n {
-            let r: u64 = self.cur_rng().gen();
+            let r: u64 = self.cur_rng().r#gen();
             let masked = if w >= 64 { r } else { r & ((1u64 << w) - 1) };
             self.set_signal_value_by_name(&format!("{}[{}]", arr, i), Value::from_u64(masked, w));
         }
@@ -57037,7 +57295,7 @@ impl Simulator {
             None => {
                 // No stable identity for the target (a foreach element, say):
                 // fall back to an independent weighted draw.
-                let mut draw = self.cur_rng().gen::<u64>() % total;
+                let mut draw = self.cur_rng().r#gen::<u64>() % total;
                 let mut pick = masses.len() - 1;
                 for (i, m) in masses.iter().enumerate() {
                     if draw < *m {
@@ -57160,7 +57418,7 @@ impl Simulator {
             deck.push(best);
         }
         for i in 1..deck.len() {
-            if self.cur_rng().gen::<bool>() {
+            if self.cur_rng().r#gen::<bool>() {
                 deck.swap(i - 1, i);
             }
         }
@@ -57184,7 +57442,7 @@ impl Simulator {
                         // 32'he000_2000]` could never yield anything above
                         // 32'he000_0fff).
                         let span = (h as i128) - (l as i128) + 1;
-                        let pick = (l as i128) + (self.cur_rng().gen::<u64>() as i128) % span;
+                        let pick = (l as i128) + (self.cur_rng().r#gen::<u64>() as i128) % span;
                         let w = lov.width.max(hiv.width).max(32);
                         candidates.push(Value::from_u64(pick as u64, w));
                     }
@@ -57215,7 +57473,7 @@ impl Simulator {
         if candidates.is_empty() {
             None
         } else {
-            Some(candidates[self.cur_rng().gen::<usize>() % candidates.len()].clone())
+            Some(candidates[self.cur_rng().r#gen::<usize>() % candidates.len()].clone())
         }
     }
 
@@ -60320,7 +60578,7 @@ impl Simulator {
                         Value::from_u64(ms[i].1, w)
                     } else if w <= 64 {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                        Value::from_u64(self.cur_rng().gen::<u64>() & mask, w)
+                        Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, w)
                     } else {
                         Value::zero(w)
                     };
@@ -60349,7 +60607,7 @@ impl Simulator {
                         Value::from_u64(ms[k].1, w)
                     } else {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                        Value::from_u64(self.cur_rng().gen::<u64>() & mask, w)
+                        Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, w)
                     };
                     self.set_signal_value_by_name(&format!("{}[{}]", nm, i), rv);
                 }
@@ -60373,7 +60631,7 @@ impl Simulator {
             let w = self.infer_lhs_width(a).max(1);
             let rv = if w <= 64 {
                 let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                Value::from_u64(self.cur_rng().gen::<u64>() & mask, w)
+                Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, w)
             } else {
                 Value::zero(w)
             };
@@ -70796,7 +71054,7 @@ impl Simulator {
                                 local_dyn: Vec::new(),
                             },
                         );
-                        self.event_queue.schedule(self.time, pid, t.items.clone());
+                        self.event_queue.schedule(self.time, pid, t.items.clone().into());
                         return true;
                     }
                     return false;
@@ -72037,13 +72295,13 @@ impl Simulator {
         } else {
             (1u64 << width) - 1
         };
-        let mut v = self.rng.gen::<u64>() & mask;
+        let mut v = self.rng.r#gen::<u64>() & mask;
         if mask > 0 {
             for _ in 0..8 {
                 if Some(v) != prev {
                     break;
                 }
-                v = self.rng.gen::<u64>() & mask;
+                v = self.rng.r#gen::<u64>() & mask;
             }
         }
         Value::from_u64(v, width)
@@ -73640,7 +73898,7 @@ impl Simulator {
                             Value::from_u64(members[i].1, *width)
                         }
                     } else if *width <= 64 {
-                        Value::from_u64(self.rng.gen(), *width)
+                        Value::from_u64(self.rng.r#gen(), *width)
                     } else {
                         Value::zero(*width)
                     };
@@ -73715,7 +73973,7 @@ impl Simulator {
                     let v = if *is_randc {
                         let domain = self.randc_domain(&key, *w, et.as_deref(), None);
                         if domain.is_empty() {
-                            Value::from_u64(self.rng.gen::<u64>(), *w)
+                            Value::from_u64(self.rng.r#gen::<u64>(), *w)
                         } else {
                             let pick = self.pick_randc(handle, &key, &domain);
                             Value::from_u64(pick, *w)
@@ -73732,7 +73990,7 @@ impl Simulator {
                             Value::from_u64(mv, *w)
                         }
                     } else if *w <= 64 {
-                        Value::from_u64(self.rng.gen::<u64>(), *w)
+                        Value::from_u64(self.rng.r#gen::<u64>(), *w)
                     } else {
                         Value::zero(*w)
                     };
@@ -74149,7 +74407,7 @@ impl Simulator {
                             }
                         } else {
                             if *width <= 64 {
-                                let r: u64 = self.cur_rng().gen();
+                                let r: u64 = self.cur_rng().r#gen();
                                 val = Value::from_u64(r, *width);
                             }
                         }
@@ -74193,7 +74451,7 @@ impl Simulator {
                         val = Value::from_u64(mv, *width);
                     }
                 } else if *width <= 64 {
-                    val = Value::from_u64(self.cur_rng().gen(), *width);
+                    val = Value::from_u64(self.cur_rng().r#gen(), *width);
                 }
                 val.is_signed = signed_rand_props.contains(name);
                 solved_props.insert(name.clone(), val);
@@ -74579,7 +74837,7 @@ impl Simulator {
                         } else {
                             (1u64 << *width) - 1
                         };
-                        self.cur_rng().gen::<u64>() & mask
+                        self.cur_rng().r#gen::<u64>() & mask
                     } else {
                         0
                     };
@@ -76072,7 +76330,7 @@ impl Simulator {
                             .max(1);
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                         for _try in 0..32 {
-                            let cand = self.cur_rng().gen::<u64>() & mask;
+                            let cand = self.cur_rng().r#gen::<u64>() & mask;
                             if cand != avoid {
                                 self.write_coll_elem(&key, Value::from_u64(cand, w));
                                 return true;
@@ -76130,9 +76388,9 @@ impl Simulator {
                     }
                     for _try in 0..32 {
                         let cand = if width >= 64 {
-                            self.cur_rng().gen::<u64>()
+                            self.cur_rng().r#gen::<u64>()
                         } else {
-                            self.cur_rng().gen::<u64>() & ((1u64 << width) - 1)
+                            self.cur_rng().r#gen::<u64>() & ((1u64 << width) - 1)
                         };
                         if cand != avoid {
                             return self.set_prop_if_changed(
@@ -76439,7 +76697,7 @@ impl Simulator {
                     } else {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                         (0..64)
-                            .map(|_| self.cur_rng().gen::<u64>() & mask)
+                            .map(|_| self.cur_rng().r#gen::<u64>() & mask)
                             .find(|c| !used.contains(c))
                     };
                     if let Some(p) = pick {
@@ -79355,13 +79613,13 @@ impl VpiHandle {
 /// # Safety
 /// `handle` must be NULL or a pointer returned by one of the VPI handle
 /// constructors and not yet freed.
-unsafe fn vpi_deref<'a>(handle: *mut libc::c_void) -> Option<&'a VpiHandle> {
+unsafe fn vpi_deref<'a>(handle: *mut libc::c_void) -> Option<&'a VpiHandle> { unsafe {
     if handle.is_null() {
         None
     } else {
         Some(&*(handle as *const VpiHandle))
     }
-}
+}}
 
 /// The `$systf` invocation currently on the stack. `vpi_handle(vpiSysTfCall,
 /// NULL)` names the innermost one; `vpi_iterate(vpiArgument, ..)` walks its
@@ -79743,7 +80001,7 @@ fn vpi_slice_write(sim: &Simulator, h: &VpiHandle, val: &Value) -> Option<Value>
 /// §35.5.4 DPI export dispatch. The generated trampoline shared object calls
 /// this from C to run an exported SystemVerilog subroutine. `id` is the
 /// subroutine's declaration-order index; `n` args are 64-bit integer slots.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __xezim_dpi_export_dispatch(
     id: libc::c_longlong,
     n: libc::c_longlong,
@@ -79755,7 +80013,7 @@ pub extern "C" fn __xezim_dpi_export_dispatch(
     .unwrap_or(0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_handle_by_name(
     name: *mut libc::c_char,
     _scope: *mut libc::c_void,
@@ -79829,7 +80087,7 @@ fn vpi_memory_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
 }
 
 /// Select one word of a `vpiMemory`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_handle_by_index(
     handle: *mut libc::c_void,
     index: libc::c_int,
@@ -79862,7 +80120,7 @@ pub extern "C" fn vpi_handle_by_index(
 /// `vpi_scan(vpi_iterate(vpiModule, NULL))` — but enough VPI code in the
 /// wild spells it this way that supporting it is worth more than the
 /// purity of returning NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_handle(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
     // The currently executing $systf. A `NULL` reference is the idiomatic
     // spelling; the standard also allows passing the call handle itself.
@@ -79972,7 +80230,7 @@ fn vpi_scope_members(sim: &Simulator, scope: &str) -> Vec<(String, usize)> {
 
 /// Iterate a one-to-many relationship. Returns NULL when the relationship
 /// yields nothing, as the standard requires (callers test for it).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
     // The arguments of a $systf call. Handled before the design traversal
     // below because it needs no simulator, only the call frame.
@@ -80083,7 +80341,7 @@ fn vpi_make_iterator(items: Vec<VpiHandle>) -> *mut libc::c_void {
 /// Hand out the next object of an iterator. When the iterator is exhausted
 /// it is FREED and NULL returned — the caller must not free it itself, per
 /// IEEE 1800-2017 §38.32.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_scan(iter: *mut libc::c_void) -> *mut libc::c_void {
     if iter.is_null() {
         return std::ptr::null_mut();
@@ -80103,7 +80361,7 @@ pub extern "C" fn vpi_scan(iter: *mut libc::c_void) -> *mut libc::c_void {
 
 /// String-valued properties. The returned pointer addresses simulator-owned
 /// storage valid until the next `vpi_get_str` call on this thread.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_str(
     property: libc::c_int,
     handle: *mut libc::c_void,
@@ -80136,7 +80394,7 @@ pub extern "C" fn vpi_get_str(
 }
 
 /// Register a system task or function implemented in a VPI module.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_register_systf(data: *mut s_vpi_systf_data) -> *mut libc::c_void {
     if data.is_null() {
         return std::ptr::null_mut();
@@ -80304,7 +80562,7 @@ pub struct s_vpi_error_info {
 ///
 /// `error_info_p` may be NULL — callers often use `vpi_chk_error(NULL)` purely
 /// as a "did anything fail?" probe.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_chk_error(error_info_p: *mut s_vpi_error_info) -> libc::c_int {
     let taken = VPI_LAST_ERROR.with(|c| c.borrow_mut().take());
     let Some((level, msg)) = taken else { return 0 };
@@ -80340,7 +80598,7 @@ fn vpi_err_scratch(s: &str) -> *mut libc::c_char {
 /// Only vpiStop and vpiFinish do anything: both end the run, exactly as the
 /// corresponding system tasks do. vpiReset is rejected rather than silently
 /// ignored — xezim cannot rewind a simulation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn xezim_vpi_control(operation: libc::c_int, _arg: libc::c_int) -> libc::c_int {
     match operation {
         vpi::STOP | vpi::FINISH => try_active_sim("vpi_control", |sim| {
@@ -80411,7 +80669,7 @@ pub fn vpi_run_startup_routines(libs: &mut Vec<Library>, paths: &[String]) {
 }
 
 /// Free a VPI handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_free_object(handle: *mut libc::c_void) -> libc::c_int {
     if !handle.is_null() {
         drop(unsafe { Box::from_raw(handle as *mut VpiHandle) });
@@ -80421,7 +80679,7 @@ pub extern "C" fn vpi_free_object(handle: *mut libc::c_void) -> libc::c_int {
 
 /// Get a VPI property value. Returns `vpiUndefined` (-1) for a property
 /// xezim does not model, rather than a plausible-looking 0.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> libc::c_int {
     let Some(h) = (unsafe { vpi_deref(handle) }) else {
         return vpi::UNDEFINED;
@@ -80494,7 +80752,7 @@ fn vpi_str_scratch(s: &str) -> *mut libc::c_char {
 /// `vpiVectorVal` was among the ignored ones, which is the format UVM's
 /// HDL backdoor reads with: `uvm_hdl_read` returned success having
 /// written nothing into the caller's buffer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_value) {
     if value_p.is_null() {
         return;
@@ -80710,7 +80968,7 @@ fn dispatch_vpi_cb(
 }
 
 /// Write a signal value via VPI (supports force/release).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_put_value(
     handle: *mut libc::c_void,
     value_p: *mut s_vpi_value,
@@ -80950,7 +81208,7 @@ pub extern "C" fn vpi_put_value(
 /// `time_p->type` chooses the requested representation:
 /// - `vpiSimTime`: fill `high`/`low` and also mirror into `real`
 /// - `vpiScaledRealTime`: fill `real` and also mirror into `high`/`low`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_time(_object: *mut libc::c_void, time_p: *mut s_vpi_time) {
     if time_p.is_null() {
         return;
@@ -80989,7 +81247,7 @@ pub extern "C" fn vpi_get_time(_object: *mut libc::c_void, time_p: *mut s_vpi_ti
 // static product/version string.
 //
 // `info_p` must be allocated by the caller; we fill it in place.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_vlog_info(info_p: *mut s_vpi_vlog_info) -> libc::c_int {
     if info_p.is_null() {
         return 0;
@@ -81016,7 +81274,7 @@ pub extern "C" fn vpi_get_vlog_info(info_p: *mut s_vpi_vlog_info) -> libc::c_int
 //
 // UVM calls this in some legacy code paths; semantically equivalent to
 // `vpi_free_object`. We just delegate to the existing free function.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_release_handle(handle: *mut libc::c_void) -> libc::c_int {
     vpi_free_object(handle)
 }
@@ -81032,7 +81290,7 @@ pub extern "C" fn vpi_release_handle(handle: *mut libc::c_void) -> libc::c_int {
 // returned handle must be freed by `vpi_remove_cb` (which is itself
 // implemented as `vpi_free_object` internally — we leak the `DpiCbHandle`
 // Box from the Rust side).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
     if cb_p.is_null() {
         return std::ptr::null_mut();
@@ -81128,7 +81386,7 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
 //
 // Returns callback registration information for a handle returned by
 // `vpi_register_cb`. Mirrors the fields xezim stores internally.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_cb_info(
     cb_obj: *mut libc::c_void,
     cb_data_p: *mut s_cb_data,
@@ -81180,7 +81438,7 @@ pub extern "C" fn vpi_get_cb_info(
 // Removal scans the per-signal value-change lists and the reset-callback
 // vec. Order is not preserved (UVM doesn't require it). The callback
 // Box is reclaimed here — we don't leak.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
     if cb.is_null() {
         return 0;
@@ -81244,7 +81502,7 @@ pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
 //
 // Returns the DPI version string. UVM uses this for log banners and to
 // decide which DPI features are available.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn svDpiVersion() -> *const libc::c_char {
     // Static C string — no lifetime concerns.
     b"1800-2017\0".as_ptr() as *const libc::c_char
@@ -81261,7 +81519,7 @@ pub extern "C" fn svDpiVersion() -> *const libc::c_char {
 // If the scope name is not found we still return a non-null handle
 // pointing at a new `DpiScope` — UVM is happy with synthetic scopes
 // because it only round-trips them through `svGetNameFromScope`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn svGetScopeFromName(name: *const libc::c_char) -> *mut libc::c_void {
     if name.is_null() {
         return std::ptr::null_mut();
@@ -81291,7 +81549,7 @@ pub extern "C" fn svGetScopeFromName(name: *const libc::c_char) -> *mut libc::c_
 //
 // Recovers the scope name from a handle. UVM round-trips scope handles
 // through this when emitting diagnostics.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn svGetNameFromScope(scope: *mut libc::c_void) -> *const libc::c_char {
     if scope.is_null() {
         return std::ptr::null();
@@ -81315,7 +81573,7 @@ pub extern "C" fn svGetNameFromScope(scope: *mut libc::c_void) -> *const libc::c
 // Returns the currently-active scope set by `svSetScope`. Used by UVM
 // when an import is called and the DPI runtime needs to know "where
 // am I?".
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn svGetScope() -> *mut libc::c_void {
     ACTIVE_SCOPE.with(|cell| cell.get())
 }
@@ -81325,7 +81583,7 @@ pub extern "C" fn svGetScope() -> *mut libc::c_void {
 // Updates the currently-active scope. xezim's exec_dpi_import_call
 // sets the scope to the import's declaration site before invoking the
 // C function, then restores the previous value on the way out.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn svSetScope(scope: *mut libc::c_void) -> *mut libc::c_void {
     let prev = ACTIVE_SCOPE.with(|cell| cell.get());
     ACTIVE_SCOPE.with(|cell| cell.set(scope));

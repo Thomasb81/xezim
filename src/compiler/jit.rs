@@ -68,30 +68,30 @@ pub type JitFn = unsafe extern "C" fn(sim: *mut u8) -> u32;
 /// `jit_fallback_flag` so the caller knows to re-run via the
 /// interpreter. Returns the best-effort `val_bits` anyway so the JIT
 /// can keep executing without branching per load.
-#[no_mangle]
-pub unsafe extern "C" fn xezim_jit_load_signal(sim: *mut u8, id: u32) -> u64 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xezim_jit_load_signal(sim: *mut u8, id: u32) -> u64 { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     sim.jit_load_signal(id as usize)
-}
+}}
 
 /// Write `signal_table[id] = val_bits` (width-masked) with full
 /// dirty-tracking and mark_dirty_id behavior — i.e. matches
 /// `Insn::BlockingAssign` semantics. Returns nothing; caller trusts
 /// the bridge to propagate correctly.
-#[no_mangle]
-pub unsafe extern "C" fn xezim_jit_store_signal(sim: *mut u8, id: u32, val_bits: u64, width: u32) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xezim_jit_store_signal(sim: *mut u8, id: u32, val_bits: u64, width: u32) { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     sim.jit_store_signal(id as usize, val_bits, width);
-}
+}}
 
 /// Schedule a non-blocking assign: push `(signal_id, value)` to
 /// `nba_fast` so the next `apply_nba` pass writes `signal_table[id]`.
 /// Mirrors `Insn::NbaAssign` semantics.
-#[no_mangle]
-pub unsafe extern "C" fn xezim_jit_schedule_nba(sim: *mut u8, id: u32, val_bits: u64, width: u32) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xezim_jit_schedule_nba(sim: *mut u8, id: u32, val_bits: u64, width: u32) { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     sim.jit_schedule_nba(id as usize, val_bits, width);
-}
+}}
 
 /// JIT Stage 4 Tier A — leaner NBA schedule variant.  Caller (JIT
 /// codegen) emits a call to this only when:
@@ -104,62 +104,62 @@ pub unsafe extern "C" fn xezim_jit_schedule_nba(sim: *mut u8, id: u32, val_bits:
 /// the same signal merge correctly.  Net per-call saving: ~3-5 ns
 /// (the bulk of NBA cost — HashMap insert + Vec push — remains in
 /// Tier B/C territory).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn xezim_jit_schedule_nba_fast(
     sim: *mut u8,
     id: u32,
     val_bits: u64,
-) {
+) { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     sim.jit_schedule_nba_fast(id as usize, val_bits);
-}
+}}
 
 /// Schedule a non-blocking assign to a dynamic bit-range: merges `val_bits`
 /// at bits `[hi_bits:lo_bits]` into the current signal value.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn xezim_jit_schedule_nba_range_dyn(
     sim: *mut u8,
     id: u32,
     hi_bits: u64,
     lo_bits: u64,
     val_bits: u64,
-) {
+) { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     sim.jit_schedule_nba_range(id as usize, hi_bits as u32, lo_bits as u32, val_bits);
-}
+}}
 
 /// Schedule a non-blocking assign to a dynamic bit-index.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn xezim_jit_schedule_nba_bit_dyn(
     sim: *mut u8,
     id: u32,
     idx: u64,
     val_bits: u64,
-) {
+) { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     sim.jit_schedule_nba_bit(id as usize, idx as usize, val_bits != 0);
-}
+}}
 
 /// Perform a blocking assign to a dynamic bit-range.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn xezim_jit_blocking_assign_range_dyn(
     sim: *mut u8,
     id: u32,
     hi_bits: u64,
     lo_bits: u64,
     val_bits: u64,
-) {
+) { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     sim.jit_blocking_assign_range(id as usize, hi_bits as u32, lo_bits as u32, val_bits);
-}
+}}
 
 /// Load an array element value as u64.
-#[no_mangle]
-pub unsafe extern "C" fn xezim_jit_load_array_elem(sim: *mut u8, name_ptr: *const u8, idx: i64) -> u64 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xezim_jit_load_array_elem(sim: *mut u8, name_ptr: *const u8, idx: i64) -> u64 { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     let name = std::ffi::CStr::from_ptr(name_ptr as *const i8).to_string_lossy();
     sim.jit_load_array_elem(&name, idx)
-}
+}}
 
 /// Path B X/Z runtime pre-check. Reads the slice of `n` u32 sig_ids
 /// pointed at by `ids_ptr` and returns 1 if ANY of those signals
@@ -174,12 +174,12 @@ pub unsafe extern "C" fn xezim_jit_load_array_elem(sim: *mut u8, name_ptr: *cons
 /// the duration of the call. The Cranelift codegen materialises a
 /// data symbol holding the per-block input list and passes it in,
 /// satisfying this contract.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn xezim_jit_inputs_have_xz(
     sim: *mut u8,
     ids_ptr: *const u32,
     n: u32,
-) -> u32 {
+) -> u32 { unsafe {
     let sim = &*(sim as *const crate::compiler::simulator::Simulator);
     let ids = std::slice::from_raw_parts(ids_ptr, n as usize);
     if sim.jit_inputs_have_xz(ids) {
@@ -187,7 +187,7 @@ pub unsafe extern "C" fn xezim_jit_inputs_have_xz(
     } else {
         0
     }
-}
+}}
 
 /// Stubs when the feature is disabled — everything is None / no-op so
 /// `exec_bytecode` always falls through to the interpreter.
