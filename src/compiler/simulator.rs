@@ -2812,14 +2812,6 @@ pub struct Simulator {
     virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
     /// UVM run-phase objection tracking (simplified, global). raise_objection
     /// increments, drop_objection decrements; when the count returns to 0 after
-    /// having been raised, the run phase ends after `uvm_phase_drain` ticks: the
-    /// post-run function phases (extract/check/report/final) run and the sim
-    /// finishes. Without this a UVM test whose design has no `$finish` (it ends
-    /// via objections) ran its driver `forever` loops to max_time.
-    uvm_obj_count: i64,
-    uvm_obj_raised: bool,
-    uvm_phase_drain: u64,
-    uvm_pending_end: Option<u64>,
     /// Memo for transitive blocking-task detection (pure-LRM mode only): maps a
     /// subroutine name to whether its body — following calls — eventually hits a
     /// blocking construct (`#`/`@`/`wait`/`fork…join[_any]`). Lets a task that
@@ -2827,21 +2819,6 @@ pub struct Simulator {
     /// instead of the name whitelist. Keyed by bare name (over-approx across a
     /// free task / same-named method). See `subroutine_name_blocks`.
     tb_cache: std::cell::RefCell<HashMap<String, bool>>,
-    /// Component handles discovered by the route-B phaser (build order), used to
-    /// run the post-run function phases at objection-driven phase end.
-    uvm_components: Vec<usize>,
-    /// Set once the post-run phases have executed so they run exactly once.
-    uvm_post_run_done: bool,
-    /// True once extract/check/report/final (+ report_summarize) have run,
-    /// whether via the genuine UVM library's `$finish` or the event-loop-exit
-    /// backstop. Prevents double-firing these stateful callbacks.
-    uvm_cleanup_done: bool,
-    /// Set when the genuine UVM library calls `$finish`, meaning its own
-    /// phase schedule ran the cleanup phases and report_summarize. The
-    /// objection-driven `end_run_phase` backstop checks this to avoid double-firing
-    /// extract/check/report/final, and the event-loop-exit backstop uses it to
-    /// decide whether cleanup still needs to run for objection-free tests.
-    genuine_uvm_finished: bool,
     /// LRM §25.9: stack of per-call virtual-interface formal-arg
     /// aliases. When a task or function takes `virtual <iface> <name>`,
     /// the call hooks add a frame mapping `<name>` to the caller's
@@ -5592,15 +5569,7 @@ impl Simulator {
             dpi_unresolved: HashSet::default(),
             heap: vec![None], // index 0 is null
             virtual_iface_bindings: HashMap::default(),
-            uvm_obj_count: 0,
-            uvm_obj_raised: false,
-            uvm_phase_drain: 0,
-            uvm_pending_end: None,
             tb_cache: std::cell::RefCell::new(HashMap::default()),
-            uvm_components: Vec::new(),
-            uvm_post_run_done: false,
-            uvm_cleanup_done: false,
-            genuine_uvm_finished: false,
             local_iface_aliases: Vec::new(),
             viface_var_aliases: HashMap::default(),
             last_vif_return: None,
@@ -20626,7 +20595,6 @@ impl Simulator {
             .into_iter()
             .chain(next_clk_time.filter(|&t| t > self.time))
             .chain(next_delayed.filter(|&t| t > self.time))
-            .chain(self.uvm_pending_end.filter(|&t| t > self.time))
             .min()
             .filter(|&t| t <= self.max_time);
         let Some(ft) = future else {
@@ -21816,7 +21784,6 @@ impl Simulator {
                 && !has_clocks
                 && self.delayed_updates.is_empty()
                 && !has_reactive
-                && self.uvm_pending_end.is_none()
             {
                 break;
             }
@@ -21827,7 +21794,6 @@ impl Simulator {
                 && !has_timed
                 && !has_clocks
                 && self.delayed_updates.is_empty()
-                && self.uvm_pending_end.is_none()
             {
                 break;
             }
@@ -21847,7 +21813,6 @@ impl Simulator {
                 next_eq_time,
                 next_clk_time,
                 next_delayed,
-                self.uvm_pending_end,
             ]
                 .into_iter()
                 .flatten()
@@ -21956,10 +21921,7 @@ impl Simulator {
             if let Some(b) = tick_barrier {
                 b.wait();
             }
-            // UVM objection-driven run-phase end (after the drain elapses).
-            // (The legacy non-pure shim's end_run_phase backstop was removed
             // The genuine library owns the full phase schedule
-            // schedule.)
             // Periodic invariant check — every 1000 iters; bail on
             // mismatch to surface bugs early.
             if verify_inline_bits && iters % 1000 == 0 {
@@ -21973,17 +21935,6 @@ impl Simulator {
                     break;
                 }
             }
-        }
-        // Backstop: tests with NO run-phase objections (e.g. 00hello) never
-        // trigger the objection-driven `end_run_phase`, and the genuine
-        // schedule's terminal propagation (uvm.uvm_end -> DONE) is not yet
-        // wired, so their genuine extract/check/report/final never fire. If we
-        // drained the event loop without the genuine library reaching
-        // `$finish` and without cleanup having run, run it now so the test
-        // gets its report_phase / PASSED output. run_uvm_cleanup_phases is
-        // idempotent, and genuine_uvm_finished gates the double-fire.
-        if !self.genuine_uvm_finished {
-            self.run_uvm_cleanup_phases();
         }
         if verify_inline_bits && !self.signal_inline_bits.is_empty() {
             let mismatches = self.verify_inline_bits_invariant(iters);
@@ -45117,11 +45068,6 @@ impl Simulator {
                         name, self.time, bt
                     );
                 }
-                // The genuine UVM library reached `$finish`, so its phase
-                // schedule ran the cleanup phases + report_summarize. Mark it
-                // so the objection-driven end_run_phase backstop does NOT
-                // re-fire them (double-exec would break stateful callbacks).
-                self.genuine_uvm_finished = true;
                 self.finished = true;
             }
             "$fclose" => {
@@ -63921,25 +63867,6 @@ impl Simulator {
                 }
             }
 
-            // UVM run-phase objection mechanism — intercept by method name
-            // regardless of the receiver (the run_phase `phase` arg is a null
-            // handle in the route-B phaser, so the normal `obj.method` dispatch
-            // would bail before reaching exec_method_call).
-            if matches!(
-                mname,
-                "raise_objection" | "drop_objection" | "set_drain_time"
-            ) {
-                // The real objection runs (drives get_objection_total for the
-                // wait_for bridge), but the pure phaser does NOT exercise
-                // uvm_phase::execute_phase's `m_phase_proc.kill()` termination
-                // — so a run phase whose objections drop would otherwise run
-                // its forked component run_phase forever-loops to max_time.
-                // Also drive the drain/pending-end tracker here so the sim ends
-                // when objections drop; then fall through to the real objection
-                // method.
-                self.handle_uvm_objection(mname, args);
-            }
-
             // §18.13 rand_mode / constraint_mode
             // Receiver forms:
             //   obj.x.rand_mode(0/1)        — disable/enable rand var x
@@ -69781,115 +69708,6 @@ impl Simulator {
             }
         }
         false
-    }
-
-    /// Run the post-run function phases (extract/check/report/final) across
-    /// all live uvm_components, then emit the UVM Report Summary. Mirrors what
-    /// `uvm_root::run_test` does after the run domain ends. Idempotent via
-    /// `uvm_cleanup_done`.
-    fn run_uvm_cleanup_phases(&mut self) {
-        if self.uvm_cleanup_done {
-            return;
-        }
-        self.uvm_cleanup_done = true;
-        let mut comps = self.uvm_components.clone();
-        if comps.is_empty() {
-            // The real UVM phaser builds components via the
-            // factory, not the route-B bootstrap that fills `uvm_components` —
-            // so collect every live uvm_component from the heap. Without this
-            // a pure run ended with an empty summary and no monitor
-            // `report_phase` (COLLECTED PACKETS).
-            for i in 1..self.heap.len() {
-                if let Some(cn) = self
-                    .heap
-                    .get(i)
-                    .and_then(|o| o.as_ref())
-                    .map(|inst| inst.class_name.clone())
-                {
-                    if self.class_is_a(&cn, "uvm_component") {
-                        comps.push(i);
-                    }
-                }
-            }
-        }
-        // extract -> check -> report -> final (function phases). UVM orders
-        // extract/check/report bottom-up and final top-down; the flat order is
-        // adequate for the report/scoreboard summary.
-        for phase in [
-            "extract_phase",
-            "check_phase",
-            "report_phase",
-            "final_phase",
-        ] {
-            for &c in comps.iter() {
-                if self.class_has_method(
-                    &self
-                        .heap
-                        .get(c)
-                        .and_then(|o| o.as_ref().map(|i| i.class_name.clone()))
-                        .unwrap_or_default(),
-                    phase,
-                ) {
-                    self.exec_method_call(c, phase, &[]);
-                }
-            }
-        }
-    }
-
-    /// Triggered when the run-phase objection count returns to 0 (after a
-    /// raise) and the drain has elapsed. This only TERMINATES
-    /// the sim (sets `finished`); it never runs the cleanup phases itself —
-    /// those are run either by the genuine UVM library (which calls `$finish`
-    /// after its own extract/check/report/final) or by the event-loop-exit
-    /// backstop (for objection-free tests whose genuine schedule deadlocks).
-    /// Centralising termination here lets the `genuine_uvm_finished` flag
-    /// prevent double-firing regardless of the tick-level race between
-    /// objection-drop and genuine `$finish`.
-    fn end_run_phase(&mut self) {
-        if self.uvm_post_run_done {
-            return;
-        }
-        self.uvm_post_run_done = true;
-        // UVM's phase scheduler drives the full run_phase +
-        // pre_reset→...→post_shutdown schedule. When all phases complete, UVM
-        // calls $finish which sets genuine_uvm_finished. Don't set finished
-        // here - let the $finish handler do it.
-        return;
-    }
-
-    /// UVM run-phase objection bookkeeping (simplified, global counter).
-    /// `raise_objection`/`drop_objection`/`set_drain_time` are routed here
-    /// regardless of receiver — the route-B phaser passes a null `phase`, so the
-    /// normal `obj.method` dispatch never reaches a real objection object.
-    fn handle_uvm_objection(&mut self, mname: &str, args: &[Expression]) -> Value {
-        match mname {
-            "raise_objection" => {
-                let n = args
-                    .get(2)
-                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
-                    .unwrap_or(1) as i64;
-                self.uvm_obj_count += n.max(1);
-                self.uvm_obj_raised = true;
-                self.uvm_pending_end = None;
-            }
-            "drop_objection" => {
-                let n = args
-                    .get(2)
-                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
-                    .unwrap_or(1) as i64;
-                self.uvm_obj_count -= n.max(1);
-                if self.uvm_obj_count <= 0 && self.uvm_obj_raised {
-                    self.uvm_pending_end = Some(self.time + self.uvm_phase_drain);
-                }
-            }
-            "set_drain_time" => {
-                if let Some(t) = args.get(1) {
-                    self.uvm_phase_drain = self.eval_expr(t).to_u64().unwrap_or(0);
-                }
-            }
-            _ => {}
-        }
-        Value::zero(32)
     }
 
     /// §18.4.3 Compute the domain of a randc property: every value the
