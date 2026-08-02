@@ -38723,8 +38723,9 @@ impl Simulator {
                     let cls = self.heap[handle].as_ref().map(|i| i.class_name.clone());
                     match cls {
                         Some(cn) if self.class_parameterless_function(&cn, &member.name) => {
-                            self.exec_method_call(handle, &member.name, &[]);
-                            return Value::zero(32);
+                            let res = self.exec_method_call(handle, &member.name, &[]);
+                            self.return_flag = false;
+                            return res;
                         }
                         _ => {}
                     }
@@ -45907,8 +45908,8 @@ impl Simulator {
             }
             ExprKind::MemberAccess { .. } => {
                 // A `this.<prop>` / `obj.<prop>` access where the property is
-                // declared `string` in the class definition.
-                self.class_member_is_string(expr)
+                // declared `string` in the class definition, or a 0-arg method.
+                self.class_member_is_string(expr) || self.call_returns_string(expr)
             }
             // A method/function call whose return type is `string`
             // (e.g. `obj.sprint()`, `this.convert2string()`). Without
@@ -46086,17 +46087,7 @@ impl Simulator {
     /// the `ClassInstance.class_name` in the heap. Used by
     /// `call_returns_string` when static type analysis fails.
     fn runtime_recv_class(&self, recv: &Expression) -> Option<String> {
-        let name = match &recv.kind {
-            ExprKind::Ident(h) if !h.path.is_empty() => &h.path[0].name.name,
-            _ => return None,
-        };
-        // Get the heap index: from the local frame, or from `this_stack`.
-        let handle: usize = if name == "this" {
-            self.this_stack.last().copied().flatten()?
-        } else {
-            let v = self.local_stack.last().and_then(|m| m.get(name))?;
-            v.to_u64()? as usize
-        };
+        let handle = self.eval_handle_expr(recv)?;
         self.heap
             .get(handle)
             .and_then(|o| o.as_ref())
@@ -63150,7 +63141,7 @@ impl Simulator {
         while let Some(cname) = cur {
             if let Some(cd) = self.module.classes.get(&cname) {
                 if let Some(m) = cd.methods.get(name) {
-                    return matches!(&m.kind, ClassMethodKind::Function(f) if f.ports.is_empty());
+                    return matches!(&m.kind, ClassMethodKind::Function(f) if f.ports.is_empty() || f.ports.iter().all(|p| p.default.is_some()));
                 }
                 cur = cd.extends.clone();
             } else {
