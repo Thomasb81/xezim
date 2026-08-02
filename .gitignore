@@ -42,3 +42,6 @@ scratchpad/
 
 # one-off helper/scratch fragments
 *.new_helper
+
+# UVM benchmark result CSVs (bench/run_uvm_bench.sh)
+bench_uvm_*.csv

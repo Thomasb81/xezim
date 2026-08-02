@@ -114,10 +114,13 @@ fn print_usage() {
     eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
     eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
     eprintln!("                     sources in parse order, -v library files, -y library dirs");
-    eprintln!("  --dump-merged-sv <file>  Write ALL sources, fully preprocessed (`ifdef");
+    eprintln!("  --dump-merged-sv <file>  Write the sources, fully preprocessed (`ifdef");
     eprintln!("                     resolved, macros expanded, `includes inlined), into one");
     eprintln!("                     self-contained .sv file — a standalone repro for");
-    eprintln!("                     debugging parse/elaboration problems in -f builds");
+    eprintln!("                     debugging parse/elaboration problems in -f builds.");
+    eprintln!("                     With -s <top>, keeps only the files reachable from that");
+    eprintln!("                     top (conservative: may keep one extra, never one fewer);");
+    eprintln!("                     without -s, writes every input file.");
     eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
@@ -871,6 +874,133 @@ fn print_resource_usage(wall_start: std::time::Instant) {
     if !peak.is_empty() || !cur.is_empty() {
         println!("xezim: Memory Usage - Current: {}, Peak: {}", cur, peak);
     }
+}
+
+/// Design units DECLARED at the top level of one preprocessed file, plus every
+/// identifier the file mentions. Both come from one lexer pass, so comments and
+/// string literals can never contribute a false name.
+///
+/// A unit counts as declared here only at nesting depth 0 (or inside nothing
+/// but `package`s, which is where classes normally live) — otherwise an ANSI
+/// port list's `interface foo_if.mp p` would register `foo_if` as *defined* by
+/// the instantiating file and misroute every reference to it.
+fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<String>) {
+    use xezim::lexer::TokenKind as TK;
+    let toks = xezim::lexer::Lexer::new(text).tokenize();
+    let mut declared = Vec::new();
+    let mut refs = std::collections::HashSet::new();
+    // Open unit keywords, innermost last.
+    let mut stack: Vec<&str> = Vec::new();
+    let mut prev: &str = "";
+    let mut i = 0usize;
+    while i < toks.len() {
+        let t = &toks[i];
+        let text_s = t.text.as_str();
+        if matches!(t.kind, TK::Identifier | TK::EscapedIdentifier) {
+            refs.insert(text_s.to_string());
+            prev = text_s;
+            i += 1;
+            continue;
+        }
+        let kind = match text_s {
+            "module" | "macromodule" => Some("module"),
+            "interface" => Some("interface"),
+            "program" => Some("program"),
+            "package" => Some("package"),
+            "primitive" => Some("primitive"),
+            "checker" => Some("checker"),
+            "class" => Some("class"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            // `interface class C` is a CLASS declaration — don't also open an
+            // interface scope for it, or the missing `endinterface` unbalances
+            // everything that follows.
+            let iface_class = kind == "interface"
+                && toks.get(i + 1).is_some_and(|n| n.text == "class");
+            // `typedef class C;` is a §6.18 forward declaration, not a
+            // definition; the real one may live in another file entirely.
+            let fwd = kind == "class" && prev == "typedef";
+            if !iface_class && !fwd {
+                let top_level = stack.iter().all(|s| *s == "package");
+                if top_level {
+                    // Skip the modifiers that may sit between the keyword and
+                    // the name (`module automatic m`, `class static C`).
+                    let mut j = i + 1;
+                    while toks.get(j).is_some_and(|n| {
+                        matches!(n.text.as_str(), "static" | "automatic" | "virtual")
+                    }) {
+                        j += 1;
+                    }
+                    if let Some(n) = toks.get(j) {
+                        if matches!(n.kind, TK::Identifier | TK::EscapedIdentifier) {
+                            declared.push(n.text.clone());
+                        }
+                    }
+                }
+                stack.push(kind);
+            }
+        } else if text_s.starts_with("end")
+            && matches!(
+                text_s,
+                "endmodule"
+                    | "endinterface"
+                    | "endprogram"
+                    | "endpackage"
+                    | "endprimitive"
+                    | "endchecker"
+                    | "endclass"
+            )
+        {
+            stack.pop();
+        }
+        prev = text_s;
+        i += 1;
+    }
+    (declared, refs)
+}
+
+/// `--dump-merged-sv` with `-s <top>`: the indices of the files actually needed
+/// to elaborate `top`, in original order.
+///
+/// The closure is LEXICAL and runs before parsing, so the dump still works when
+/// the design does not elaborate — which is the situation the flag exists for.
+/// A file is pulled in when it declares a unit some already-included file
+/// mentions by name. That is deliberately conservative: it can keep more than
+/// strictly necessary (a file's *other* units drag their own dependencies
+/// along), never less. Returns None when `top` is not declared by any input
+/// file — it may come from a `-v`/`-y` library, and dumping everything is the
+/// safe answer.
+fn merged_sv_files_for_top(top: &str, texts: &[String]) -> Option<Vec<usize>> {
+    let scanned: Vec<_> = texts.iter().map(|t| scan_units_and_refs(t)).collect();
+    // First declaration wins, matching the elaborator's own resolution.
+    let mut owner: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (fi, (declared, _)) in scanned.iter().enumerate() {
+        for name in declared {
+            owner.entry(name.as_str()).or_insert(fi);
+        }
+    }
+    let start = *owner.get(top)?;
+    let mut keep = vec![false; texts.len()];
+    let mut queue = vec![start];
+    keep[start] = true;
+    while let Some(fi) = queue.pop() {
+        for name in &scanned[fi].1 {
+            if let Some(&dep) = owner.get(name.as_str()) {
+                if !keep[dep] {
+                    keep[dep] = true;
+                    queue.push(dep);
+                }
+            }
+        }
+    }
+    Some(
+        keep.iter()
+            .enumerate()
+            .filter(|(_, k)| **k)
+            .map(|(i, _)| i)
+            .collect(),
+    )
 }
 
 /// `--dump-merged-sv` phase 2: after elaboration, append the `-v`/`-y`
@@ -1967,6 +2097,25 @@ suppressed but the explicit SDF annotation still applies."
     // the preprocessor are kept so line numbers inside each section still
     // match the per-file diagnostics.
     if let Some(ref merged_out) = dump_merged_sv {
+        // With `-s <top>`, keep only the files needed to elaborate that top —
+        // the whole point of the flag is cutting a 125-file build down to a
+        // re-runnable repro, and for a shared `-f` list most of those files
+        // belong to some other top.
+        let keep: Vec<usize> = match top_module.as_deref() {
+            Some(top) => match merged_sv_files_for_top(top, &preprocessed_sources) {
+                Some(sel) => sel,
+                None => {
+                    eprintln!(
+                        "Warning: --dump-merged-sv: top module '{}' is not declared by any \
+                         input file (a -v/-y library?); dumping all files",
+                        top
+                    );
+                    (0..preprocessed_sources.len()).collect()
+                }
+            },
+            None => (0..preprocessed_sources.len()).collect(),
+        };
+        let pruned = keep.len() < preprocessed_sources.len();
         let mut out = String::new();
         out.push_str(&format!(
             "// Merged preprocessed sources — xezim {} ({} file(s))\n\
@@ -1974,19 +2123,26 @@ suppressed but the explicit SDF annotation still applies."
              // NOTE: `timescale directives are consumed by the preprocessor and\n\
              // not re-emitted; pass --module-timescale when re-running this file.\n",
             env!("CARGO_PKG_VERSION"),
-            preprocessed_sources.len()
+            keep.len()
         ));
-        for (i, (label, text)) in file_labels
-            .iter()
-            .zip(preprocessed_sources.iter())
-            .enumerate()
-        {
+        if pruned {
+            out.push_str(&format!(
+                "// Reduced to the files reachable from top '{}' ({} of {} inputs).\n\
+                 // The closure is lexical and conservative: it may keep a file more\n\
+                 // than strictly needed, never one fewer. Omit -s to dump everything.\n",
+                top_module.as_deref().unwrap_or(""),
+                keep.len(),
+                preprocessed_sources.len()
+            ));
+        }
+        for (n, &i) in keep.iter().enumerate() {
             out.push_str(&format!(
                 "\n// ===== file {}/{}: {} =====\n",
-                i + 1,
-                preprocessed_sources.len(),
-                label
+                n + 1,
+                keep.len(),
+                file_labels[i]
             ));
+            let text = &preprocessed_sources[i];
             out.push_str(text);
             if !text.ends_with('\n') {
                 out.push('\n');
@@ -1994,9 +2150,18 @@ suppressed but the explicit SDF annotation still applies."
         }
         match std::fs::write(merged_out, &out) {
             Ok(()) => println!(
-                "Wrote merged preprocessed SV to {} ({} files, {} bytes)",
+                "Wrote merged preprocessed SV to {} ({} files{}, {} bytes)",
                 merged_out,
-                preprocessed_sources.len(),
+                keep.len(),
+                if pruned {
+                    format!(
+                        " of {}, reachable from '{}'",
+                        preprocessed_sources.len(),
+                        top_module.as_deref().unwrap_or("")
+                    )
+                } else {
+                    String::new()
+                },
                 out.len()
             ),
             Err(e) => {
