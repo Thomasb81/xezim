@@ -1965,7 +1965,7 @@ struct ClassInstance {
     /// Maps a class TYPE-parameter name (e.g. `T` in
     /// `class Mk #(type T=Base)`) to the concrete class name it was
     /// specialized with (e.g. `Base`). Populated by
-    /// `instantiate_class_with_type_args`. Used under PURE_SV_LRM so an
+    /// `instantiate_class_with_type_args`. Used in pure-SV mode so an
     /// unqualified `obj = new()` whose declared type is a type parameter
     /// constructs the bound concrete class (running its real `new`). Empty
     /// for classes without type parameters / non-specialized instances.
@@ -2810,7 +2810,7 @@ pub struct Simulator {
     /// bus_if.master vif`) so the rewrite path can also emit a direction
     /// warning when writing to a modport-input member.
     virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
-    /// PURE_SV_LRM: `uvm_config_db#(virtual X)::set/get` records the bound
+    /// Pure-SV: `uvm_config_db#(virtual X)::set/get` records the bound
     /// interface NAME by scope here, because config_db otherwise flows an opaque
     /// Value and loses the interface identity (so a config_db-bound vif reads
     /// non-null but `vif.member`/edge-waits don't resolve). Entries are
@@ -2841,14 +2841,6 @@ pub struct Simulator {
     uvm_obj_raised: bool,
     uvm_phase_drain: u64,
     uvm_pending_end: Option<u64>,
-    /// When true (the DEFAULT, and also when `PURE_SV_LRM` is unset), UVM is
-    /// executed as ordinary SystemVerilog through the LRM engine: the genuine
-    /// `uvm_pkg.sv` runs, and every UVM-specific shim (native phaser,
-    /// objection/config_db/factory/TLM/report/topology interception) is
-    /// bypassed. When false (`PURE_SV_LRM=0`, LEGACY), the mock library and
-    /// those native shims run instead. The legacy mode is deprecated; see the
-    /// `PURE_SV_LRM=0` warning emitted at construction.
-    pure_sv_lrm: bool,
     /// Memo for transitive blocking-task detection (pure-LRM mode only): maps a
     /// subroutine name to whether its body — following calls — eventually hits a
     /// blocking construct (`#`/`@`/`wait`/`fork…join[_any]`). Lets a task that
@@ -2862,10 +2854,10 @@ pub struct Simulator {
     /// Set once the post-run phases have executed so they run exactly once.
     uvm_post_run_done: bool,
     /// True once extract/check/report/final (+ report_summarize) have run,
-    /// whether by the genuine UVM library (PURE_SV_LRM, via `$finish`) or by
+    /// whether by the genuine UVM library (via the genuine library's `$finish`) or by
     /// the shim. Prevents double-firing these stateful callbacks.
     uvm_cleanup_done: bool,
-    /// Set when the genuine UVM library (PURE_SV_LRM) calls `$finish`, meaning
+    /// Set when the genuine UVM library (pure-SV) calls `$finish`, meaning
     /// its own phase schedule ran the cleanup phases and report_summarize. The
     /// shim's `end_run_phase` backstop checks this to avoid double-firing
     /// extract/check/report/final, and the event-loop-exit backstop uses it to
@@ -2876,15 +2868,6 @@ pub struct Simulator {
     /// FATAL] and by message id (sorted). Populated at the report choke point.
     uvm_sev_counts: [u64; 4],
     uvm_id_counts: std::collections::BTreeMap<String, u64>,
-    /// UVM TLM connection graph: port/export handle -> connected target
-    /// handles, in connect() order. Recorded by intercepting `connect()`
-    /// (the UVM source keys its m_provided_by by get_full_name(), which xezim
-    /// returns as the component LEAF — so two exports named "analysis_export"
-    /// collided and only the last connect survived). `write()`/`put()` deliver
-    /// through this map (analysis broadcast to ALL subscribers, put -> fifo).
-    /// The pull-port path (get_next_item) still uses the UVM m_imp_list, which
-    /// connect() also builds, so it is unaffected.
-    tlm_connections: HashMap<usize, Vec<usize>>,
     /// LRM §25.9: stack of per-call virtual-interface formal-arg
     /// aliases. When a task or function takes `virtual <iface> <name>`,
     /// the call hooks add a frame mapping `<name>` to the caller's
@@ -5642,22 +5625,6 @@ impl Simulator {
             uvm_obj_raised: false,
             uvm_phase_drain: 0,
             uvm_pending_end: None,
-            // Pure-LRM semantics are the DEFAULT; PURE_SV_LRM=0 opts back
-            // into the legacy mock+shim mode. That mode is deprecated.
-            pure_sv_lrm: {
-                let pure_sv_lrm = std::env::var("PURE_SV_LRM")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
-                if !pure_sv_lrm {
-                    eprintln!(
-                        "warning: PURE_SV_LRM=0 (legacy mock/shim UVM mode) is \
-                         deprecated and will be removed; use the default pure-SV \
-                         path (run with the genuine uvm_pkg.sv and PURE_SV_LRM \
-                         unset or =1)."
-                    );
-                }
-                pure_sv_lrm
-            },
             tb_cache: std::cell::RefCell::new(HashMap::default()),
             uvm_components: Vec::new(),
             uvm_post_run_done: false,
@@ -5665,7 +5632,6 @@ impl Simulator {
             genuine_uvm_finished: false,
             uvm_sev_counts: [0; 4],
             uvm_id_counts: std::collections::BTreeMap::new(),
-            tlm_connections: HashMap::default(),
             local_iface_aliases: Vec::new(),
             viface_var_aliases: HashMap::default(),
             last_vif_return: None,
@@ -22022,14 +21988,9 @@ impl Simulator {
                 b.wait();
             }
             // UVM objection-driven run-phase end (after the drain elapses).
-            // In PURE_SV_LRM the genuine library owns the full phase schedule
-            // (run_phase + pre_reset→reset→...→post_shutdown). The shim's
-            // end_run_phase would prematurely set finished=true, killing the
-            // event loop before sequential phases can advance through UVM's
-            // phase hopper. Only use the shim in non-pure mode (route-B phaser).
-            if !self.pure_sv_lrm {
-                self.maybe_end_run_phase();
-            }
+            // (The legacy non-pure shim's end_run_phase backstop was removed
+            // with the legacy pure-SV=0 mode; the genuine library now owns the full phase
+            // schedule.)
             // Periodic invariant check — every 1000 iters; bail on
             // mismatch to surface bugs early.
             if verify_inline_bits && iters % 1000 == 0 {
@@ -22044,15 +22005,15 @@ impl Simulator {
                 }
             }
         }
-        // PURE_SV_LRM backstop: tests with NO run-phase objections (e.g.
-        // 00hello) never trigger the objection-driven `end_run_phase`, and the
-        // genuine schedule's terminal propagation (uvm.uvm_end -> DONE) is not
-        // yet wired, so their genuine extract/check/report/final never fire.
-        // If we drained the event loop without the genuine library reaching
+        // Backstop: tests with NO run-phase objections (e.g. 00hello) never
+        // trigger the objection-driven `end_run_phase`, and the genuine
+        // schedule's terminal propagation (uvm.uvm_end -> DONE) is not yet
+        // wired, so their genuine extract/check/report/final never fire. If we
+        // drained the event loop without the genuine library reaching
         // `$finish` and without cleanup having run, run it now so the test
         // gets its report_phase / PASSED output. run_uvm_cleanup_phases is
         // idempotent, and genuine_uvm_finished gates the double-fire.
-        if self.pure_sv_lrm && !self.genuine_uvm_finished {
+        if !self.genuine_uvm_finished {
             self.run_uvm_cleanup_phases();
         }
         if verify_inline_bits && !self.signal_inline_bits.is_empty() {
@@ -23850,18 +23811,16 @@ impl Simulator {
                 }
             }
 
-            // PURE_SV_LRM: bridge a genuine-UVM objection sync call
-            // `objn.wait_for(evt, obj)` to a condition-wait on the objection
-            // total (see bridge_objection_wait_for). Must run BEFORE Stage 1b
-            // would inline wait_for's real body (whose
+            // Bridge a genuine-UVM objection sync call `objn.wait_for(evt, obj)`
+            // to a condition-wait on the objection total (see
+            // bridge_objection_wait_for). Must run BEFORE Stage 1b would
+            // inline wait_for's real body (whose
             // `@(m_events[obj].all_dropped)` member-event wait can't block).
-            if self.pure_sv_lrm {
-                if let Some(wait_stmts) = self.bridge_objection_wait_for(stmt) {
-                    let mut cont = wait_stmts;
-                    cont.extend_from_slice(&stmts[i + 1..]);
-                    self.run_process_stmts(pid, &cont);
-                    return;
-                }
+            if let Some(wait_stmts) = self.bridge_objection_wait_for(stmt) {
+                let mut cont = wait_stmts;
+                cont.extend_from_slice(&stmts[i + 1..]);
+                self.run_process_stmts(pid, &cont);
+                return;
             }
 
             // Stage 0: normalize a parenless task/method call (LRM §13.5
@@ -24016,43 +23975,17 @@ impl Simulator {
                                 .then(|| self.module.tasks.get(&h.path[0].name.name).cloned())
                                 .flatten()
                             {
-                                // UVM `run_test` -> built-in Rust phaser
-                                // (run_uvm_test_real builds the tree + runs
-                                // phases). The source uvm_root::run_test needs
-                                // method `this` it never gets here and uses a
-                                // fork/wait phaser the scheduler can't advance.
-                                // Only route when a concrete test is named (a
-                                // run_test("x") arg OR +UVM_TESTNAME): with no
-                                // test, the source path's behavior is preserved
-                                // (e.g. chapter-16 16.17--expect-uvm calls bare
-                                // run_test() and must not hit the NOTEST fatal).
-                                if td.name.name.name == "run_test" && self.uses_real_uvm() {
-                                    let tn = args.first().and_then(|a| {
-                                        if let ExprKind::StringLiteral(s) = &a.kind {
-                                            Some(s.clone())
-                                        } else {
-                                            None
-                                        }
-                                    });
-                                    let has_plus = self.plusargs.iter().any(|a| {
-                                        Self::plusarg_payload(a).starts_with("UVM_TESTNAME=")
-                                    });
-                                    if tn.is_some() || has_plus {
-                                        self.run_uvm_test_real(tn);
-                                        return;
-                                    }
-                                }
-                                // PURE_SV_LRM: a bare `run_test(name)` call resolves
-                                // (via module.tasks) to `uvm_root::run_test`'s body,
-                                // which is a METHOD — the uvm_globals.svh wrapper does
-                                // `top = cs.get_root(); top.run_test(name)`. Inline it
-                                // WITH `this` bound to the uvm_root singleton; without a
-                                // `this`, its member accesses (m_children, m_phase_*)
-                                // resolve against nothing, so `m_children.num()==0` and
-                                // the body bails at the NOCOMP fatal before ever
-                                // reaching the phase-runner fork.
-                                if self.pure_sv_lrm
-                                    && td.name.name.name == "run_test"
+                                // A bare `run_test(name)` call resolves (via
+                                // module.tasks) to `uvm_root::run_test`'s body,
+                                // which is a METHOD — the uvm_globals.svh wrapper
+                                // does `top = cs.get_root(); top.run_test(name)`.
+                                // Inline it WITH `this` bound to the uvm_root
+                                // singleton; without a `this`, its member
+                                // accesses (m_children, m_phase_*) resolve
+                                // against nothing, so `m_children.num()==0` and
+                                // the body bails at the NOCOMP fatal before
+                                // ever reaching the phase-runner fork.
+                                if td.name.name.name == "run_test"
                                     && self.stmts_have_blocking(&td.items)
                                 {
                                     let root_h = self
@@ -24162,7 +24095,7 @@ impl Simulator {
                 }
             }
 
-            // Stage 1c (PURE_SV_LRM): a blocking STATIC method call
+            // Stage 1c: a blocking STATIC method call
             // `Class::method()` with no receiver handle — Stage 1b skipped it
             // because `path[0]` is a class name, not a handle var. The UVM phaser
             // is forked as `uvm_phase::m_run_phases()`, whose body is
@@ -24171,57 +24104,55 @@ impl Simulator {
             // suspend, so the forever loop spins to the loop cap and never yields
             // to the forked `execute_phase`. Inline it (static context = the
             // class, null `this`) so those waits suspend the process.
-            if self.pure_sv_lrm {
-                if let StatementKind::Expr(expr) = &stmt.kind {
-                    if let ExprKind::Call { func, args } = &expr.kind {
-                        // `Class::method()` reaches here in two parse shapes:
-                        // a flattened 2-segment Ident `[Class, method]`, OR a
-                        // MemberAccess `{ expr: Ident(Class), member: method }`
-                        // (the `::` static form). Stage 1b already tried — and
-                        // failed — to resolve the receiver as a handle, so a
-                        // bare class name reaching here is a static call.
-                        let scoped: Option<(String, String)> = match &func.kind {
-                            ExprKind::Ident(h)
-                                if h.path.len() == 2
-                                    && self.module.classes.contains_key(&h.path[0].name.name) =>
-                            {
-                                Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
-                            }
-                            ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
-                                    ExprKind::Ident(h)
-                                        if h.path.len() == 1
-                                            && self
-                                                .module
-                                                .classes
-                                                .contains_key(&h.path[0].name.name) =>
-                                    {
-                                    Some((h.path[0].name.name.clone(), member.name.clone()))
-                                    }
-                                    _ => None,
-                            },
-                            _ => None,
-                        };
-                        if let Some((cls, mn)) = scoped {
-                            if let Some((td, mclass)) = self.resolve_class_task(&cls, &mn) {
-                                if self.stmts_have_blocking(&td.items) {
-                                    let mut cleanup = self.bind_task_frame(&td, args);
-                                    // Static context: push the declaring class for
-                                    // member/static resolution, with a null `this`.
-                                    self.this_stack.push(None);
-                                    self.class_context_stack.push(Some(mclass));
-                                    cleanup.pushed_method_this = true;
-                                    self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.clone();
-                                    cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
-                                    cont.extend_from_slice(&stmts[i + 1..]);
-                                    self.run_process_stmts(pid, &cont);
-                                    return;
+            if let StatementKind::Expr(expr) = &stmt.kind {
+                if let ExprKind::Call { func, args } = &expr.kind {
+                    // `Class::method()` reaches here in two parse shapes:
+                    // a flattened 2-segment Ident `[Class, method]`, OR a
+                    // MemberAccess `{ expr: Ident(Class), member: method }`
+                    // (the `::` static form). Stage 1b already tried — and
+                    // failed — to resolve the receiver as a handle, so a
+                    // bare class name reaching here is a static call.
+                    let scoped: Option<(String, String)> = match &func.kind {
+                        ExprKind::Ident(h)
+                            if h.path.len() == 2
+                                && self.module.classes.contains_key(&h.path[0].name.name) =>
+                        {
+                            Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
+                        }
+                        ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
+                                ExprKind::Ident(h)
+                                    if h.path.len() == 1
+                                        && self
+                                            .module
+                                            .classes
+                                            .contains_key(&h.path[0].name.name) =>
+                                {
+                                Some((h.path[0].name.name.clone(), member.name.clone()))
                                 }
+                                _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((cls, mn)) = scoped {
+                        if let Some((td, mclass)) = self.resolve_class_task(&cls, &mn) {
+                            if self.stmts_have_blocking(&td.items) {
+                                let mut cleanup = self.bind_task_frame(&td, args);
+                                // Static context: push the declaring class for
+                                // member/static resolution, with a null `this`.
+                                self.this_stack.push(None);
+                                self.class_context_stack.push(Some(mclass));
+                                cleanup.pushed_method_this = true;
+                                self.task_cleanup.push(cleanup);
+                                let mut cont: Vec<Statement> = td.items.clone();
+                                cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
+                                cont.extend_from_slice(&stmts[i + 1..]);
+                                self.run_process_stmts(pid, &cont);
+                                return;
                             }
                         }
                     }
                 }
-            }
+                }
 
             // LRM §15.4.2: blocking mailbox.get(var) on an empty mailbox.
             // When the next statement is `<mb>.get(<lvalue>);` and the
@@ -25840,7 +25771,7 @@ impl Simulator {
         )
     }
 
-    /// PURE_SV_LRM bridge: rewrite a genuine-UVM objection sync call
+    /// genuine-UVM bridge: rewrite a genuine-UVM objection sync call
     /// `objn.wait_for(evt, obj)` into condition-wait(s) on the objection total.
     ///
     /// The real `uvm_objection::wait_for` blocks on
@@ -26112,7 +26043,7 @@ impl Simulator {
             // synchronously. (Top-level `#delay`/`@event` — e.g. `always #5 clk`
             // clock generators — are handled above and never reach here.)
             if !matches!(&s.kind, StatementKind::TimingControl { .. })
-                && (self.stmt_is_blocking(s) || (self.pure_sv_lrm && Self::stmt_is_mailbox_get(s)))
+                && (self.stmt_is_blocking(s) || Self::stmt_is_mailbox_get(s))
             {
                 let mut cont: Vec<Statement> = vec![s.clone()];
                 cont.extend_from_slice(&body_stmts[i + 1..]);
@@ -34318,7 +34249,7 @@ impl Simulator {
         // wrapper(s) from the member/ident chain so resolution sees the same
         // shape as the pre-`Specialization` AST. The `#(...)` text only matters
         // for per-spec static keying (handled at the static-dispatch sites).
-        // Keeps default mode identical to before. (PURE_SV_LRM Stage 1.)
+        // Keeps default mode identical to before. (pure-SV.)
         if Self::expr_has_specialization(expr) {
             // Set the active specialization (for per-spec static keying) while
             // resolving the stripped shape, e.g. `C#(params)::prop` reads the
@@ -42934,7 +42865,7 @@ impl Simulator {
                 // inside a method (else `rq` reads X, `rq==null` is X, the
                 // `new()` is skipped, and X is stored — breaking the resource
                 // pool's whole rtab/ri_tab population).
-                // PURE_SV_LRM: a class-scoped typedef (e.g.
+                // Pure-SV: a class-scoped typedef (e.g.
                 // `uvm_resource_types::rsrc_q_t` → `uvm_queue#(...)`, declared
                 // INSIDE a class) is registered in neither `typedefs` (the width
                 // map) nor `typedef_types`, so `resolve_type_width` fell back to
@@ -42945,9 +42876,7 @@ impl Simulator {
                 // works inside a method (else `rq` reads X, `rq==null` is X, the
                 // `new()` is skipped, and X is stored — which silently broke the
                 // resource pool's whole rtab/ri_tab population and config_db).
-                // Gated to pure mode so default mode stays byte-exact.
-                let unknown_typeref_handle = self.pure_sv_lrm
-                    && !two_state
+                let unknown_typeref_handle = !two_state
                     && !is_class_handle
                     && match data_type {
                         crate::ast::types::DataType::TypeReference {
@@ -43752,9 +43681,7 @@ impl Simulator {
                                             .insert(d.name.name.clone(), ta);
                                     }
                                 }
-                            } else if self.pure_sv_lrm
-                                && self.resolve_type_param_binding(cn).is_some()
-                            {
+                            } else if self.resolve_type_param_binding(cn).is_some() {
                                 // `cn` is a class TYPE parameter (e.g. `T obj;`
                                 // inside a parameterized-class method). Record
                                 // the param name so a separate `obj = new()`
@@ -44539,15 +44466,11 @@ impl Simulator {
                     if let ExprKind::Ident(hier) = &func.kind {
                         if hier.path.last().unwrap().name.name == "new" {
                             let type_name = self.get_expr_type_name(left);
-                            // PURE_SV_LRM type-parameter construction: resolve a
-                            // type-parameter-typed destination through the
-                            // current instance's bindings to its concrete class.
-                            let type_name = if self.pure_sv_lrm {
-                                type_name
-                                    .map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn))
-                            } else {
-                                type_name
-                            };
+                            // Resolve a type-parameter-typed destination
+                            // through the current instance's bindings to its
+                            // concrete class.
+                            let type_name = type_name
+                                .map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn));
                             if let Some(tname) = type_name {
                                 if let Some(class_def) = self.module.classes.get(&tname).cloned() {
                                     let lname_opt = if let ExprKind::Ident(lh) = &left.kind {
@@ -44904,7 +44827,7 @@ impl Simulator {
             // the `$sformatf` *function* form, the format string is arg1 here.
             // UVM's report path uses `$swrite(time_str, "%0t", $time)`, so
             // without this the composed report line had a blank time field.
-            // Not gated on PURE_SV_LRM: these are plain §21.3 tasks and were a
+            // Not gated on Pure-SV: these are plain §21.3 tasks and were a
             // silent no-op in the default mode (issue #24).
             "$swrite" | "$swriteb" | "$swriteh" | "$swriteo" | "$sformat" => {
                 if let Some(dest) = args.first() {
@@ -45021,13 +44944,11 @@ impl Simulator {
                         name, self.time, bt
                     );
                 }
-                // PURE_SV_LRM: the genuine UVM library reached `$finish`, so its
-                // phase schedule ran the cleanup phases + report_summarize. Mark
-                // it so the shim's objection-driven end_run_phase backstop does
-                // NOT re-fire them (double-exec would break stateful callbacks).
-                if self.pure_sv_lrm {
-                    self.genuine_uvm_finished = true;
-                }
+                // The genuine UVM library reached `$finish`, so its phase
+                // schedule ran the cleanup phases + report_summarize. Mark it
+                // so the objection-driven end_run_phase backstop does NOT
+                // re-fire them (double-exec would break stateful callbacks).
+                self.genuine_uvm_finished = true;
                 self.finished = true;
             }
             "$fclose" => {
@@ -61330,17 +61251,6 @@ impl Simulator {
         None
     }
 
-    /// True when the real IEEE/Accellera uvm-1.2 package is compiled in
-    /// (as opposed to the bundled `uvm_mock.svh`). The native UVM shims
-    /// below are bypassed in that case so the genuine UVM source runs —
-    /// `uvm_objection` is defined only by the real package.
-    fn uses_real_uvm(&self) -> bool {
-        // PURE_SV_LRM=1 forces this false so every `real_uvm`-gated shim
-        // (native phaser, TLM, factory bridge, run_test, randomize leniency)
-        // is disabled and the genuine UVM SystemVerilog runs instead.
-        !self.pure_sv_lrm && self.module.classes.contains_key("uvm_objection")
-    }
-
     /// Break any cycle in the class `extends` graph. A self- or mutually-
     /// referential `extends` (which can arise from a parameterized class
     /// whose base resolves to the same name) would make every ancestor-
@@ -62397,7 +62307,7 @@ impl Simulator {
         }
     }
 
-    /// PURE_SV_LRM `uvm_config_db#(virtual X)::set/get` — carry the interface
+    /// pure-SV `uvm_config_db#(virtual X)::set/get` — carry the interface
     /// binding (which config_db's value round-trip loses). Returns Some(result)
     /// only when this is genuinely a virtual-interface set/get; None otherwise
     /// so the real config_db handles ordinary values.
@@ -63633,10 +63543,7 @@ impl Simulator {
                     let result = self.exec_config_db("set", args);
                     // Also call UVM's implementation to populate resource pool
                     // (bypass our interception to avoid infinite recursion)
-                    let saved = self.pure_sv_lrm;
-                    self.pure_sv_lrm = true;
                     let _ = self.exec_static_method_internal(class_name, method_name, args);
-                    self.pure_sv_lrm = saved;
                     return Some(result);
                 }
                 "get" | "exists" => {
@@ -63646,10 +63553,7 @@ impl Simulator {
                         return Some(xezim_result);
                     }
                     // Fall back to UVM's resource pool
-                    let saved = self.pure_sv_lrm;
-                    self.pure_sv_lrm = true;
                     let result = self.exec_static_method_internal(class_name, method_name, args);
-                    self.pure_sv_lrm = saved;
                     return result;
                 }
                 _ => {}
@@ -63707,7 +63611,7 @@ impl Simulator {
     /// matching (which looks for Ident/MemberAccess chains) sees the same shape
     /// as before the `Specialization` AST node existed. The `#(...)` spec text
     /// is preserved in the original AST for per-spec static keying (handled at
-    /// the static-dispatch sites under PURE_SV_LRM); this only normalizes shape.
+    /// the static-dispatch sites in pure-SV mode); this only normalizes shape.
     fn expr_has_specialization(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Specialization { .. } => true,
@@ -63751,7 +63655,7 @@ impl Simulator {
         }
     }
 
-    /// PURE-mode (`PURE_SV_LRM=1`) resolution of `C::type_id::create`.
+    /// pure-SV resolution of `C::type_id::create`.
     /// A class `C` registers itself with a UVM-style factory via a typedef
     /// `typedef <registry>#(T,"N") type_id;` where `<registry>` is
     /// `uvm_component_registry` / `uvm_object_registry`. The net effect of
@@ -63888,8 +63792,7 @@ impl Simulator {
                 }
             }
         }
-        // Intercept UVM method calls
-        let real_uvm = self.uses_real_uvm();
+        // Intercept UVM method calls.
         if let ExprKind::MemberAccess { expr, member } = &func.kind {
             let mname = member.name.as_str();
 
@@ -63955,14 +63858,12 @@ impl Simulator {
                 }
             }
 
-            // PURE_SV_LRM: intercept the factory's by-name create EARLY (before
-            // the real `uvm_default_factory::create_component_by_name` body,
-            // whose `m_type_names` is empty, runs and returns null). Resolve the
+            // Intercept the factory's by-name create EARLY (before the real
+            // `uvm_default_factory::create_component_by_name` body, whose
+            // `m_type_names` is empty, runs and returns null). Resolve the
             // requested type to its concrete class and construct it (the real
             // net effect). Receiver must be a factory instance.
-            if self.pure_sv_lrm
-                && matches!(mname, "create_component_by_name" | "create_object_by_name")
-            {
+            if matches!(mname, "create_component_by_name" | "create_object_by_name") {
                 let recv_is_factory = self
                     .eval_handle_expr(expr)
                     .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
@@ -63998,42 +63899,15 @@ impl Simulator {
                 mname,
                 "raise_objection" | "drop_objection" | "set_drain_time"
             ) {
-                if !self.pure_sv_lrm {
-                    return self.handle_uvm_objection(mname, args);
-                }
-                // PURE_SV_LRM: the real objection runs (drives get_objection_total
-                // for the wait_for bridge), but the pure phaser does NOT exercise
-                // uvm_phase::execute_phase's `m_phase_proc.kill()` termination — so
-                // a run phase whose objections drop would otherwise run its forked
-                // component run_phase forever-loops to max_time. Also drive the
-                // drain/pending-end tracker here so the sim ends when objections
-                // drop; then fall through to the real objection method.
+                // The real objection runs (drives get_objection_total for the
+                // wait_for bridge), but the pure phaser does NOT exercise
+                // uvm_phase::execute_phase's `m_phase_proc.kill()` termination
+                // — so a run phase whose objections drop would otherwise run
+                // its forked component run_phase forever-loops to max_time.
+                // Also drive the drain/pending-end tracker here so the sim ends
+                // when objections drop; then fall through to the real objection
+                // method.
                 self.handle_uvm_objection(mname, args);
-            }
-
-            // UVM TLM: record the connection graph and deliver analysis/put
-            // traffic through it (see tlm_connections). Done before the UVM
-            // source dispatch so analysis broadcast reaches EVERY subscriber.
-            if real_uvm {
-                if mname == "connect" {
-                    let ph = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
-                    let tgt = args
-                        .first()
-                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as usize)
-                        .unwrap_or(0);
-                    if ph != 0 && tgt != 0 {
-                        self.tlm_connections.entry(ph).or_default().push(tgt);
-                    }
-                    // fall through: UVM connect() still builds m_imp_list for
-                    // the pull-port (get_next_item) path.
-                } else if matches!(mname, "write" | "put") {
-                    let ph = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
-                    if ph != 0 && self.tlm_deliver(ph, mname, args) {
-                        return Value::zero(32);
-                    }
-                    // no recorded targets → fall through (e.g. an analysis_imp's
-                    // own write forwards to its parent via the UVM source).
-                }
             }
 
             // §18.13 rand_mode / constraint_mode
@@ -64150,23 +64024,9 @@ impl Simulator {
             // Real UVM routes this through the resource pool, which the direct
             // phaser does not fully drive; service it with a simple field-keyed
             // store so set/get round-trips (riscv-dv passes the cfg this way).
-            if !self.pure_sv_lrm && matches!(mname, "set" | "get" | "exists") {
-                fn find_config_db(e: &Expression) -> bool {
-                    match &e.kind {
-                        ExprKind::Ident(h) => {
-                            h.path.iter().any(|s| s.name.name.contains("config_db"))
-                        }
-                        ExprKind::MemberAccess { expr: b, .. } => find_config_db(b),
-                        _ => false,
-                    }
-                }
-                if find_config_db(expr) {
-                    return self.exec_config_db(mname, args);
-                }
-            }
-            // PURE_SV_LRM: preserve the virtual-interface binding across
-            // config_db (the value round-trip loses the iface identity).
-            if self.pure_sv_lrm && matches!(mname, "set" | "get") {
+            // Preserve the virtual-interface binding across config_db
+            // (the value round-trip loses the iface identity).
+            if matches!(mname, "set" | "get") {
                 fn find_config_db2(e: &Expression) -> bool {
                     match &e.kind {
                         ExprKind::Ident(h) => {
@@ -64947,7 +64807,7 @@ impl Simulator {
                 }
             }
 
-            if mname == "get_next_item" && !real_uvm {
+            if mname == "get_next_item" {
                 if let Some(arg) = args.first() {
                     // Create a simple_transaction
                     if let Some(class_def) = self.module.classes.get("simple_transaction").cloned()
@@ -64966,155 +64826,11 @@ impl Simulator {
                 }
                 return Value::zero(32);
             }
-            // `uvm_top.run_test()` (also `uvm_root::get().run_test()`): real
-            // UVM's `uvm_root::run_test` forks `m_run_phases` and waits on
-            // `m_phase_all_done`, but xezim runs that fork synchronously and
-            // never advances the phaser — so the wait would deadlock and the
-            // initial process would fall through to $finish. Drive the standard
-            // phase methods directly over the component tree instead, using
-            // the factory bridge already wired up below.
-            if mname == "run_test" && real_uvm {
-                let test_name = args.first().and_then(|a| {
-                    if let ExprKind::StringLiteral(s) = &a.kind {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                });
-                self.run_uvm_test_real(test_name);
-                return Value::zero(32);
-            }
-            // `ClassName::type_id::create(name[, parent])`. For mock UVM this
-            // is always serviced directly. For real UVM, only testbench
-            // classes are intercepted: the real factory cannot construct them
-            // (per-specialization registry registration is not modeled, so it
-            // returns null), whereas UVM's own internal classes (uvm_*) self-
-            // register and must use their real construction — routing those
-            // through here would recurse via uvm_component/report-handler
-            // creation during build.
-            if !self.pure_sv_lrm && mname == "create" {
-                if let ExprKind::MemberAccess {
-                    expr: inner_expr,
-                    member: inner_member,
-                } = &expr.kind
-                {
-                    if inner_member.name.as_str() == "type_id" {
-                        if let ExprKind::Ident(hier) = &inner_expr.kind {
-                            let class_name = &hier.path[0].name.name;
-                            // The real UVM factory returns null for uvm_ classes
-                            // (per-specialization registry isn't modeled). For
-                            // uvm_component-derived classes we leave that alone to
-                            // avoid build-time recursion, but a uvm_ LEAF object
-                            // (e.g. uvm_report_handler) returning null is fatal:
-                            // every component's m_rh becomes null, so get_action
-                            // returns UVM_NO_ACTION and *all* `uvm_info/`uvm_error
-                            // macros are silently suppressed. Construct such leaf
-                            // uvm_ objects directly so they run new()->initialize().
-                            let is_uvm = class_name.starts_with("uvm_");
-                            let is_component = if is_uvm {
-                                let mut cur = Some(class_name.clone());
-                                let mut found = false;
-                                let mut depth = 0;
-                                while let Some(c) = cur {
-                                    if c == "uvm_component" {
-                                        found = true;
-                                        break;
-                                    }
-                                    if depth > 64 {
-                                        break;
-                                    }
-                                    depth += 1;
-                                    cur = self
-                                        .module
-                                        .classes
-                                        .get(&c)
-                                        .and_then(|cd| cd.extends.clone());
-                                }
-                                found
-                            } else {
-                                false
-                            };
-                            let intercept = !real_uvm || !is_uvm || !is_component;
-                            if intercept {
-                                if let Some(class_def) =
-                                    self.module.classes.get(class_name).cloned()
-                                {
-                                    return self.instantiate_class(&class_def, args);
-                                }
-                                // `typedef uvm_sequencer#(item) sqr_t;
-                                // sqr_t::type_id::create(...)` — the name is a
-                                // typedef alias of a parameterized class (LRM
-                                // §6.18: a synonym, §8.25.1: same
-                                // specialization), not a class itself. Resolve
-                                // the alias to its base class + type args and
-                                // construct directly — same bridge as the
-                                // PURE_SV_LRM branch below; without it the
-                                // create falls through to the real factory,
-                                // which returns null, and the agent's
-                                // sequencer silently never exists.
-                                if let Some(DataType::TypeReference { name, type_args, .. }) =
-                                    self.module.typedef_types.get(class_name).cloned()
-                                {
-                                    if let Some(class_def) =
-                                        self.module.classes.get(&name.name.name).cloned()
-                                    {
-                                        let ta: Option<&[Expression]> = if type_args.is_empty() {
-                                            None
-                                        } else {
-                                            Some(&type_args)
-                                        };
-                                        return self.instantiate_class_with_type_args(
-                                            &class_def, args, ta,
-                                        );
-                                    }
-                                }
-                                // A TYPE-PARAMETER receiver: `T::type_id::create(...)`
-                                // where `T` is a type parameter of the enclosing
-                                // parameterized class (e.g. UVM's
-                                // `uvm_reg_predictor#(BUSTYPE)::type_name()` calls
-                                // `BUSTYPE::type_id::create("t")`). The nested
-                                // `type_id` class is never elaborated (nested
-                                // classes are not registered in `module.classes`),
-                                // so without resolving `T` to its concrete
-                                // specialization argument here, `create` returns
-                                // null and the constructed object's
-                                // `get_type_name()` is empty — which silently
-                                // breaks the factory's `m_type_name` cache.
-                                if let Some(resolved) =
-                                    self.resolve_type_param_binding(class_name)
-                                {
-                                    if let Some((base, sig)) =
-                                        self.extract_spec_from_string(&resolved)
-                                    {
-                                        self.ensure_spec_statics(&base, &sig);
-                                        let saved = self.current_spec.clone();
-                                        self.current_spec =
-                                            Some((base.clone(), sig));
-                                        if let Some(class_def) =
-                                            self.module.classes.get(&base).cloned()
-                                        {
-                                            let r = self.instantiate_class(&class_def, args);
-                                            self.current_spec = saved;
-                                            return r;
-                                        }
-                                        self.current_spec = saved;
-                                    } else if let Some(class_def) =
-                                        self.module.classes.get(&resolved).cloned()
-                                    {
-                                        return self.instantiate_class(&class_def, args);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // PURE mode (`PURE_SV_LRM=1`, UVM shim disabled): `C::type_id::create`
-            // is not serviced by the shim above. Resolve it from the design's
-            // own `typedef <registry>#(T,"N") type_id;` registration and
-            // construct the registered type `T` directly — the LRM-faithful net
-            // effect of the real factory's `type_id::create`.
-            if self.pure_sv_lrm && mname == "create" {
+            // `ClassName::type_id::create(name[, parent])`: resolve from the
+            // design's own `typedef <registry>#(T,"N") type_id;` registration
+            // and construct the registered type `T` directly — the LRM-faithful
+            // net effect of the real factory's `type_id::create`.
+            if mname == "create" {
                 if let ExprKind::MemberAccess {
                     expr: inner_expr,
                     member: inner_member,
@@ -65213,56 +64929,12 @@ impl Simulator {
                     }
                 }
             }
-            if !real_uvm
-                && !self.pure_sv_lrm
-                && (mname == "item_done"
-                    || mname == "connect"
-                    || mname == "raise_objection"
-                    || mname == "drop_objection")
-            {
-                return Value::zero(32);
-            }
-            // UVM factory bridge: `factory.create_component_by_name(type, ...)`
-            // / `create_object_by_name`. The real factory's name->proxy map
-            // is empty because per-specialization registry registration
-            // (`uvm_component_registry#(T,name)::me`) needs parameterized-
-            // class specialization, which xezim does not yet model. As a
-            // bounded bridge, resolve the requested type name directly
-            // against the elaborated classes and construct it. Component
-            // ctor is `new(name, parent)`; object ctor is `new(name)`.
-            if real_uvm && (mname == "create_component_by_name" || mname == "create_object_by_name")
-            {
-                let type_name = args
-                    .first()
-                    .map(|a| self.eval_expr(a).to_sv_string())
-                    .unwrap_or_default();
-                if let Some(cd) = self.module.classes.get(&type_name).cloned() {
-                    let ctor_args: Vec<Expression> = if mname == "create_component_by_name" {
-                            // (req_type, parent_inst_path, name, parent)
-                            let mut v = Vec::new();
-                            if let Some(n) = args.get(2) {
-                                v.push(n.clone());
-                            }
-                            if let Some(p) = args.get(3) {
-                                v.push(p.clone());
-                            }
-                            v
-                        } else {
-                            // (req_type, parent_inst_path, name)
-                            args.get(2).cloned().into_iter().collect()
-                        };
-                    return self.instantiate_class(&cd, &ctor_args);
-                }
-                return Value::zero(32);
-            }
-            // PURE_SV_LRM: same factory bridge, but resolve the requested name
-            // through `pure_factory_lookup` (class name OR a `type_id` registry
-            // typedef's registered name) and construct the real class — the net
-            // effect of the real `wrapper.create_component`/`create_object`
-            // (which runs `T::new`), without the native shim's by-name map.
-            if self.pure_sv_lrm
-                && (mname == "create_component_by_name" || mname == "create_object_by_name")
-            {
+            // Same factory bridge, but resolve the requested name through
+            // `pure_factory_lookup` (class name OR a `type_id` registry
+            // typedef's registered name) and construct the real class — the
+            // net effect of the real `wrapper.create_component`/`create_object`
+            // (which runs `T::new`).
+            if mname == "create_component_by_name" || mname == "create_object_by_name" {
                 let type_name = args
                     .first()
                     .map(|a| self.eval_expr(a).to_sv_string())
@@ -65284,27 +64956,6 @@ impl Simulator {
                 }
                 return Value::zero(32);
             }
-            // Legacy default-mode analysis-port shim: broadcast a bare
-            // `x.write(...)` to every "scoreboard" instance. This must NOT fire
-            // in PURE_SV_LRM — there the genuine UVM `write` methods run, and
-            // this shim would swallow `uvm_resource#(T)::write` (breaking
-            // config_db's value store → GET read 0).
-            if mname == "write" && !real_uvm && !self.pure_sv_lrm {
-                // Call write on scoreboard
-                let mut sb_handles = Vec::new();
-                for i in 1..self.heap.len() {
-                    if let Some(Some(inst)) = self.heap.get(i) {
-                        if inst.class_name.contains("scoreboard") {
-                            sb_handles.push(i);
-                        }
-                    }
-                }
-                for handle in sb_handles {
-                    self.exec_method_call(handle, "write", args);
-                }
-                return Value::zero(32);
-            }
-
             if let ExprKind::Ident(hier) = &expr.kind {
                 if hier.path.last().unwrap().name.name == "super" {
                     if let Some(Some(handle)) = self.this_stack.last() {
@@ -65710,147 +65361,6 @@ impl Simulator {
                         _ => Value::zero(32),
                     };
                 }
-                if !self.pure_sv_lrm && name == "uvm_report_enabled" {
-                    // xezim services UVM reporting directly (see the
-                    // uvm_report_* interception below and run_uvm_test_real).
-                    // The design's real uvm_report_enabled routes through the
-                    // uvm_root singleton, which the direct phaser bypasses, so
-                    // always report enabled here regardless of real-vs-mock UVM.
-                    return Value::from_u64(1, 32);
-                }
-                if !self.pure_sv_lrm && name == "get_is_active" && !real_uvm {
-                    // UVM_ACTIVE is typically 1 in UVM
-                    return Value::from_u64(1, 32);
-                }
-                if !self.pure_sv_lrm
-                    && (name == "uvm_report_info"
-                        || name == "uvm_report_warning"
-                        || name == "uvm_report_error"
-                        || name == "uvm_report_fatal")
-                {
-                    let id = args
-                        .first()
-                        .map(|a| self.eval_expr(a).to_sv_string())
-                        .unwrap_or_default();
-                    let msg = args
-                        .get(1)
-                        .map(|a| self.eval_expr(a).to_sv_string())
-                        .unwrap_or_default();
-                    // Component context: the `this` handle's UVM name, if any.
-                    let ctx = self
-                        .this_stack
-                        .last()
-                        .copied()
-                        .flatten()
-                        .and_then(|h| self.heap.get(h).and_then(|x| x.as_ref()))
-                        .and_then(|inst| inst.properties.get("m_name").cloned())
-                        .map(|v| v.to_sv_string())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "reporter".to_string());
-                    let severity = name.replace("uvm_report_", "").to_uppercase();
-                    self.tally_uvm_report(&severity, &id);
-                    let line =
-                        format!("UVM_{} @ {}: {} [{}] {}", severity, self.time, ctx, id, msg);
-                    self.record_output(line.clone());
-                    self.stdout_writeln(&line);
-                    if name == "uvm_report_fatal" {
-                        self.finished = true;
-                    }
-                    return Value::zero(32);
-                }
-                if name == "run_test" && real_uvm {
-                    let test_name = args.first().and_then(|a| {
-                        if let ExprKind::StringLiteral(s) = &a.kind {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    });
-                    self.run_uvm_test_real(test_name);
-                    return Value::zero(32);
-                }
-                if !self.pure_sv_lrm && name == "run_test" && !real_uvm {
-                    let test_name = if let Some(arg) = args.first() {
-                        if let ExprKind::StringLiteral(s) = &arg.kind {
-                            s.clone()
-                        } else {
-                            "simple_test".to_string()
-                        }
-                    } else {
-                        "simple_test".to_string()
-                    };
-                    println!(
-                        "UVM_INFO @ {:>3}: reporter [RNTST] Running test {}...",
-                        self.time, test_name
-                    );
-
-                    if let Some(test_def) = self.module.classes.get(&test_name).cloned() {
-                        let handle = self.instantiate_class(&test_def, &[]);
-                        let handle_val = handle.to_u64().unwrap_or(0) as usize;
-
-                        // Bootstrapping UVM phases
-                        let mut components = vec![handle_val];
-
-                        // build_phase
-                        let mut i = 0;
-                        while i < components.len() {
-                            let c = components[i];
-                            let heap_len = self.heap.len();
-                            self.exec_method_call(c, "build_phase", &[]);
-                            for new_h in heap_len..self.heap.len() {
-                                components.push(new_h);
-                            }
-                            i += 1;
-                        }
-
-                        // connect_phase
-                        for &c in &components {
-                            self.exec_method_call(c, "connect_phase", &[]);
-                        }
-
-                        // run_phase
-                        for &c in &components {
-                            if !self.spawn_method_task_process(c, "run_phase", &[]) {
-                                self.exec_method_call(c, "run_phase", &[]);
-                            }
-                        }
-                    }
-                    return Value::zero(32);
-                }
-            }
-
-            // Intercept type_id::create. Serviced for real UVM too: the direct
-            // phaser (run_uvm_test_real) does not initialize UVM's factory
-            // singleton via the normal run_test path, so route construction
-            // through xezim's class machinery instead of the real factory.
-            if !self.pure_sv_lrm
-                && len >= 3
-                && path[len - 1].name.name == "create"
-                && path[len - 2].name.name == "type_id"
-                && (!real_uvm || !path[len - 3].name.name.starts_with("uvm_"))
-            {
-                let class_name = &path[len - 3].name.name;
-                if let Some(class_def) = self.module.classes.get(class_name).cloned() {
-                    return self.instantiate_class(&class_def, args);
-                }
-                // Typedef alias of a parameterized class (same bridge as the
-                // MemberAccess path above and the PURE_SV_LRM branch below).
-                if let Some(DataType::TypeReference { name, type_args, .. }) =
-                    self.module.typedef_types.get(class_name).cloned()
-                {
-                    if let Some(class_def) =
-                        self.module.classes.get(&name.name.name).cloned()
-                    {
-                        let ta: Option<&[Expression]> = if type_args.is_empty() {
-                            None
-                        } else {
-                            Some(&type_args)
-                        };
-                        return self.instantiate_class_with_type_args(
-                            &class_def, args, ta,
-                        );
-                    }
-                }
             }
 
             // PURE-mode counterpart of the flattened `...,type_id,create` path
@@ -65860,8 +65370,7 @@ impl Simulator {
             // typedef alias (e.g. `typedef base_seq#(T) my_sqr`) there is no
             // class entry for `my_sqr`; fall through to `typedef_types` to
             // resolve the alias and instantiate the parameterised target.
-            if self.pure_sv_lrm
-                && len >= 3
+            if len >= 3
                 && path[len - 1].name.name == "create"
                 && path[len - 2].name.name == "type_id"
             {
@@ -65886,18 +65395,6 @@ impl Simulator {
                             &class_def, args, ta,
                         );
                     }
-                }
-            }
-
-            // `uvm_config_db#(T)::set/get/exists(...)` flattened into an Ident
-            // path (e.g. from module-scope initial blocks). The MemberAccess
-            // branch above only catches the class-method invocation form.
-            if !self.pure_sv_lrm && len >= 2 {
-                let tail = path[len - 1].name.name.as_str();
-                if matches!(tail, "set" | "get" | "exists")
-                    && path.iter().any(|s| s.name.name.contains("config_db"))
-                {
-                    return self.exec_config_db(tail, args);
                 }
             }
 
@@ -66416,28 +65913,6 @@ impl Simulator {
                             return self.exec_cg_method_call(handle, method_name, args);
                         }
                         if handle < self.heap.len() && self.heap[handle].is_some() {
-                            // TLM intercept: statement-level obj.connect()/write()
-                            // flattens to Ident([obj, method]) and never reaches the
-                            // MemberAccess intercept above — mirror it here.
-                            if real_uvm {
-                                if method_name == "connect" {
-                                    let tgt = args
-                                        .first()
-                                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as usize)
-                                        .unwrap_or(0);
-                                    if tgt != 0 {
-                                        self.tlm_connections
-                                            .entry(handle)
-                                            .or_default()
-                                            .push(tgt);
-                                    }
-                                    // fall through to execute the real connect() body
-                                } else if matches!(method_name.as_str(), "write" | "put") {
-                                    if self.tlm_deliver(handle, method_name, args) {
-                                        return Value::zero(32);
-                                    }
-                                }
-                            }
                             // §8.20: non-virtual methods bind to the DECLARED
                             // type of the receiver (see nonvirtual_target_class;
                             // the flattened `Ident([obj, method])` shape is the
@@ -67659,44 +67134,42 @@ impl Simulator {
         self.this_stack.push(handle_opt);
         self.class_context_stack.push(Some(mclass.clone()));
         if let Some(h) = handle_opt {
-            if self.pure_sv_lrm {
-                if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
-                    let cn = inst.class_name.clone();
-                    let bindings = inst.type_bindings.clone();
-                    let differs = match self.current_spec.as_ref() {
-                        None => true,
-                        Some((b, s)) => {
-                            *b != cn
-                                || inst
-                                    .spec
-                                    .as_ref()
-                                    .is_some_and(|(ib, is)| ib != b || is != s)
+            if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
+                let cn = inst.class_name.clone();
+                let bindings = inst.type_bindings.clone();
+                let differs = match self.current_spec.as_ref() {
+                    None => true,
+                    Some((b, s)) => {
+                        *b != cn
+                            || inst
+                                .spec
+                                .as_ref()
+                                .is_some_and(|(ib, is)| ib != b || is != s)
+                    }
+                };
+                if differs {
+                    if inst.spec.is_some() {
+                        self.current_spec = inst.spec.clone();
+                    } else if let Some(cd) = self.module.classes.get(&cn) {
+                        let mut param_names = cd.param_order.clone();
+                        if param_names.is_empty() {
+                            param_names = cd.type_param_names.clone();
                         }
-                    };
-                    if differs {
-                        if inst.spec.is_some() {
-                            self.current_spec = inst.spec.clone();
-                        } else if let Some(cd) = self.module.classes.get(&cn) {
-                            let mut param_names = cd.param_order.clone();
-                            if param_names.is_empty() {
-                                param_names = cd.type_param_names.clone();
-                            }
-                            if !param_names.is_empty() {
-                                let sig_frags: Vec<String> = param_names
-                                    .iter()
-                                    .filter_map(|p| {
-                                        if let Some(b) = bindings.get(p) {
-                                            Some(b.clone())
-                                        } else if let Some(v) = inst.properties.get(p) {
-                                            Some(v.to_string())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-                                if sig_frags.len() == param_names.len() {
-                                    self.current_spec = Some((cn, sig_frags.join(",")));
-                                }
+                        if !param_names.is_empty() {
+                            let sig_frags: Vec<String> = param_names
+                                .iter()
+                                .filter_map(|p| {
+                                    if let Some(b) = bindings.get(p) {
+                                        Some(b.clone())
+                                    } else if let Some(v) = inst.properties.get(p) {
+                                        Some(v.to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            if sig_frags.len() == param_names.len() {
+                                self.current_spec = Some((cn, sig_frags.join(",")));
                             }
                         }
                     }
@@ -69076,7 +68549,7 @@ impl Simulator {
         self.instantiate_class_with_type_args(class_def, args, None)
     }
 
-    /// PURE_SV_LRM: resolve a factory-requested type name to the concrete
+    /// Pure-SV: resolve a factory-requested type name to the concrete
     /// elaborated class. UVM's `uvm_*_utils(C)` registers C under name "C", so
     /// the requested name usually IS the class name; also reverse-resolve via
     /// `type_id` typedef targets (`uvm_*_registry#(C,"N")` -> N) for the rare
@@ -69460,8 +68933,8 @@ impl Simulator {
         // Record concrete bindings for the leaf class's TYPE parameters
         // (e.g. `T -> Base` for `Mk#(Base)`). A later unqualified `obj =
         // new()` whose declared type is one of these params resolves through
-        // these bindings to construct the right class (see the `new` dispatch
-        // gated by `pure_sv_lrm`). Type and value params may be INTERLEAVED
+        // these bindings to construct the right class (see the `new`
+        // dispatch). Type and value params may be INTERLEAVED
         // (e.g. `uvm_component_registry#(type T, string Tname)` — type first),
         // so look each type param up by NAME in `arg_map` (which maps args by
         // `param_order` slot, or by kind for the recovered named form §8.26).
@@ -69815,18 +69288,16 @@ impl Simulator {
                 return v;
             }
         }
-        // PURE_SV_LRM: the real `uvm_factory::create_component_by_name` /
+        // The real `uvm_factory::create_component_by_name` /
         // `create_object_by_name` calls (on a real factory handle) reach here.
         // The genuine factory's `m_type_names` is empty (per-spec registry
         // registration isn't fully driven), so resolve the requested name to
         // the concrete class via `pure_factory_lookup` and construct it — the
         // real net effect (`wrapper.create_component` -> `T::new`).
-        if self.pure_sv_lrm
-            && matches!(
-                method_name,
-                "create_component_by_name" | "create_object_by_name"
-            )
-        {
+        if matches!(
+            method_name,
+            "create_component_by_name" | "create_object_by_name"
+        ) {
             let type_name = args
                 .first()
                 .map(|a| self.eval_expr(a).to_sv_string())
@@ -69849,31 +69320,6 @@ impl Simulator {
                 return r;
             }
         }
-        // UVM field-op user-hook query. The UVM source errors (GET_USER_HOOK)
-        // when m_is_set==0, which xezim hits because the field_op recycle pool
-        // (m_get_available_op/m_recycle) reuses an op without re-running set()
-        // before the query during the topology print's nested do_execute_op
-        // recursion. The hook is enabled by default (m_user_hook=1 unless
-        // disable_user_hook was called), so report enabled and skip the guard.
-        if !self.pure_sv_lrm
-            && method_name == "user_hook_enabled"
-            && self
-                .heap
-                .get(handle)
-                .and_then(|o| o.as_ref())
-                .map(|i| i.class_name == "uvm_field_op")
-                .unwrap_or(false)
-        {
-            let disabled = self
-                .heap
-                .get(handle)
-                .and_then(|o| o.as_ref())
-                .and_then(|i| i.properties.get("m_user_hook"))
-                .and_then(|v| v.to_u64())
-                .map(|v| v == 0)
-                .unwrap_or(false);
-            return Value::from_u64(if disabled { 0 } else { 1 }, 32);
-        }
         if method_name == "randomize" {
             // §18.11: `obj.randomize(null)` is the in-line constraint CHECKER —
             // it randomizes nothing and just reports whether the object's
@@ -69882,25 +69328,6 @@ impl Simulator {
                 return self.exec_randomize_check(handle, &[]);
             }
             return self.exec_randomize(handle);
-        }
-        // uvm_component::sprint(printer) — the real UVM printer machinery
-        // (uvm_printer field stack / m_uvm_status_container) isn't driven by the
-        // Route-B phaser, so it returns empty. For a component in the live tree,
-        // render the topology table ourselves (uvm_table_printer format) from the
-        // component hierarchy. Non-component objects fall through to the source.
-        if !self.pure_sv_lrm && method_name == "sprint" && self.uvm_components.contains(&handle) {
-            let topo = self.render_uvm_topology(handle);
-            return Value::from_string(&topo);
-        }
-        // UVM run-phase objection mechanism (also intercepted here for the
-        // valid-receiver dispatch path; see handle_uvm_objection).
-        if !self.pure_sv_lrm
-            && matches!(
-                method_name,
-                "raise_objection" | "drop_objection" | "set_drain_time"
-            )
-        {
-            return self.handle_uvm_objection(method_name, args);
         }
         // `uvm_cmdline_processor` arg queries. UVM normally fills its arg list
         // via DPI (stubbed empty under `-DUVM_NO_DPI`), so serve these directly
@@ -70220,235 +69647,6 @@ impl Simulator {
         false
     }
 
-    /// Drive UVM phasing directly when the design links real UVM 1.2. The
-    /// component is created via the factory-backed class machinery, then the
-    /// standard phases are invoked in order over the component tree. UVM's own
-    /// objection/fork-based phase scheduler is bypassed (see the caller). The
-    /// runtime (`run_phase` etc.) phases are executed synchronously: generator-
-    /// style testbenches such as riscv-dv do all their work at time 0 without
-    /// raising objections, so no time advancement is required.
-    fn run_uvm_test_real(&mut self, arg_test_name: Option<String>) {
-        // +UVM_TESTNAME on the command line overrides the run_test() argument.
-        let plus_test = self.plusargs.iter().find_map(|a| {
-            Self::plusarg_payload(a)
-                .strip_prefix("UVM_TESTNAME=")
-                .map(|s| s.to_string())
-        });
-        let test_name = match plus_test.or(arg_test_name) {
-            Some(t) if !t.is_empty() => t,
-            _ => {
-                let line = "UVM_FATAL @ 0: reporter [NOTEST] No test specified \
-                    via +UVM_TESTNAME or run_test() argument."
-                    .to_string();
-                self.record_output(line.clone());
-                self.stdout_writeln(&line);
-                return;
-            }
-        };
-
-        let Some(test_def) = self.module.classes.get(&test_name).cloned() else {
-            let line = format!(
-                "UVM_FATAL @ 0: reporter [INVTST] Requested test \"{}\" not found.",
-                test_name
-            );
-            self.record_output(line.clone());
-            self.stdout_writeln(&line);
-            return;
-        };
-
-        self.tally_uvm_report("INFO", "RNTST");
-        let line = format!(
-            "UVM_INFO @ 0: reporter [RNTST] Running test {}...",
-            test_name
-        );
-        self.record_output(line.clone());
-        self.stdout_writeln(&line);
-
-        // Construct the top-level test component with the conventional instance
-        // name. Pass the name as the constructor's first arg (uvm_component::new
-        // is `new(name, parent)`): an EMPTY arg list makes name="" / parent=null,
-        // and that path loops in the source `new()` (after building the phase
-        // domain). The factory bridge always passes (name, parent), which is why
-        // factory-created components construct cleanly; mirror it here.
-        let name_arg = Expression::new(
-            ExprKind::StringLiteral("uvm_test_top".to_string()),
-            crate::ast::Span::dummy(),
-        );
-        let handle_val = self
-            .instantiate_class(&test_def, std::slice::from_ref(&name_arg))
-            .to_u64()
-            .unwrap_or(0) as usize;
-        if let Some(Some(inst)) = self.heap.get_mut(handle_val) {
-            inst.properties
-                .insert("m_name".to_string(), Value::from_string("uvm_test_top"));
-        }
-
-        // build_phase is top-down and may create child components; discover
-        // them by diffing the heap across each call (BFS). Non-component heap
-        // objects (config objects, etc.) created here are harmless: a phase
-        // call resolving to no method is a no-op.
-        // Only call build_phase on uvm_component-derived classes. Non-component
-        // heap entries (cfg objects, transactions, queues) have no build_phase
-        // semantics in UVM and may trigger field-automation work that loops.
-        let is_component = |sim: &Self, h: usize| -> bool {
-            let cls = match sim.heap.get(h).and_then(|o| o.as_ref()) {
-                Some(inst) => inst.class_name.clone(),
-                None => return false,
-            };
-            let mut cur = Some(cls);
-            let mut depth = 0;
-            while let Some(c) = cur {
-                if c == "uvm_component" {
-                    return true;
-                }
-                if depth > 32 {
-                    return false;
-                }
-                depth += 1;
-                cur = sim.module.classes.get(&c).and_then(|cd| cd.extends.clone());
-            }
-            false
-        };
-        let mut components = vec![handle_val];
-        let mut i = 0;
-        while i < components.len() {
-            let c = components[i];
-            if !is_component(self, c) {
-                i += 1;
-                continue;
-            }
-            let cls = self
-                .heap
-                .get(c)
-                .and_then(|o| o.as_ref())
-                .map(|inst| inst.class_name.clone())
-                .unwrap_or_default();
-            let t0 = std::time::Instant::now();
-            let heap_len = self.heap.len();
-            self.exec_method_call(c, "build_phase", &[]);
-            let dt = t0.elapsed().as_millis();
-            if dt > 50 || self.heap.len() > heap_len + 50 {
-                eprintln!(
-                    "[xezim][uvm] build_phase #{} h={} class={} took {}ms heap {}->{}",
-                    i,
-                    c,
-                    cls,
-                    dt,
-                    heap_len,
-                    self.heap.len()
-                );
-            }
-            for new_h in heap_len..self.heap.len() {
-                components.push(new_h);
-            }
-            if components.len() > 5000 {
-                eprintln!(
-                    "[xezim][uvm] build_phase BFS aborted at {} components (runaway)",
-                    components.len()
-                );
-                break;
-            }
-            i += 1;
-        }
-
-        let extends_class = |sim: &Self, h: usize, target: &str| -> bool {
-            let cls = match sim.heap.get(h).and_then(|o| o.as_ref()) {
-                Some(inst) => inst.class_name.clone(),
-                None => return false,
-            };
-            let mut cur = Some(cls);
-            let mut depth = 0;
-            while let Some(c) = cur {
-                if c == target {
-                    return true;
-                }
-                if depth > 32 {
-                    return false;
-                }
-                depth += 1;
-                cur = sim.module.classes.get(&c).and_then(|cd| cd.extends.clone());
-            }
-            false
-        };
-
-        // FUNCTION phases (LRM-compliant: synchronous, no time advance, no
-        // process spawning per UVM 1.2 §9.6 / IEEE 1800-2017 §13.4 — functions
-        // cannot consume time): walk the component tree and invoke each phase
-        // method directly in order.
-        for &c in &components {
-            if self.finished {
-                return;
-            }
-            self.exec_method_call(c, "connect_phase", &[]);
-        }
-        // Port resolution (uvm_component::do_resolve_bindings, IEEE 1800.2
-        // §5.5) runs between connect and end_of_elaboration: it walks each
-        // port's connect()-established m_provided_by chain and fills m_imp_list
-        // so size()/get_if() work and a driver's seq_item_port reaches the
-        // sequencer (else get_next_item has no interface -> DRVCONNECT, no
-        // stimulus). do_resolve_bindings recurses into child (incl. port)
-        // components and is idempotent (m_resolved guard), so a per-component
-        // pass covers the whole tree safely.
-        for &c in &components {
-            if self.finished {
-                return;
-            }
-            self.exec_method_call(c, "do_resolve_bindings", &[]);
-        }
-        // Publish the component list BEFORE end_of_elaboration so the topology
-        // print (`this.sprint(printer)` in end_of_elaboration_phase, intercepted
-        // in exec_method_call) can render the tree. The list is complete after
-        // build_phase; connect/resolve add no components. Refreshed again below.
-        self.uvm_components = components.clone();
-        for phase in ["end_of_elaboration_phase", "start_of_simulation_phase"] {
-            for &c in &components {
-                if self.finished {
-                    return;
-                }
-                self.exec_method_call(c, phase, &[]);
-            }
-        }
-
-        // RUNTIME phase (`run_phase`) per UVM 1.2 §9.8.1.1 / SV LRM tasks: each
-        // component's run_phase forks as a concurrent process. Returns to the
-        // caller after spawning so the main event loop can advance simulation
-        // time, fire `#`-delays, run forever-loops in interfaces, etc. The
-        // synchronous `exec_method_call` fallback drove `#N` past the queue
-        // and kept the design's clock-gen forever block from ever firing.
-        //
-        // Drivers (`uvm_driver`-derived) run a `forever get_next_item; drive;
-        // item_done end` rendezvous with the sequencer. With real UVM TLM now
-        // functional (mailbox-backed m_req_fifo + blocking get suspension) the
-        // driver's run_phase can be spawned like any other component; its
-        // get_next_item suspends until a sequence sends an item. Skipping it
-        // only under mock UVM, where the sequencer/fifo aren't modeled and the
-        // driver would block forever on a disconnected port (NTCONN).
-        let real_uvm = self.uses_real_uvm();
-        // Remember the component list so the event loop can run the post-run
-        // function phases (extract/check/report/final) when the run-phase
-        // objection count drops to 0 (see maybe_end_run_phase).
-        self.uvm_components = components.clone();
-        for &c in &components {
-            if self.finished {
-                return;
-            }
-            if !real_uvm && extends_class(self, c, "uvm_driver") {
-                continue;
-            }
-            if !self.spawn_method_task_process(c, "run_phase", &[]) {
-                // Fallback: components whose run_phase is a function, or
-                // classes that don't override it — call inline so they at
-                // least see the phase tick.
-                self.exec_method_call(c, "run_phase", &[]);
-            }
-        }
-        // Function phases AFTER run_phase (extract/check/report/final) are NOT
-        // invoked here — they run at objection-driven phase end via
-        // maybe_end_run_phase() (called from the event loop), after the
-        // run_phase tasks have actually executed. A design that $finish'es
-        // itself (firmware tests) ends before that, unaffected.
-    }
-
     /// Run the post-run UVM function phases on every component, then finish.
     /// Render the UVM test-topology table (uvm_table_printer format) for the
     /// subtree rooted at `root`, from the live component hierarchy. Columns are
@@ -70562,7 +69760,7 @@ impl Simulator {
         self.uvm_cleanup_done = true;
         let mut comps = self.uvm_components.clone();
         if comps.is_empty() {
-            // PURE_SV_LRM: the real UVM phaser builds components via the
+            // Pure-SV: the real UVM phaser builds components via the
             // factory, not the route-B bootstrap that fills `uvm_components` —
             // so collect every live uvm_component from the heap. Without this
             // a pure run ended with an empty summary and no monitor
@@ -70617,7 +69815,7 @@ impl Simulator {
     }
 
     /// Triggered when the run-phase objection count returns to 0 (after a
-    /// raise) and the drain has elapsed. In PURE_SV_LRM this only TERMINATES
+    /// raise) and the drain has elapsed. In pure-SV mode this only TERMINATES
     /// the sim (sets `finished`); it never runs the cleanup phases itself —
     /// those are run either by the genuine UVM library (which calls `$finish`
     /// after its own extract/check/report/final) or by the event-loop-exit
@@ -70630,56 +69828,11 @@ impl Simulator {
             return;
         }
         self.uvm_post_run_done = true;
-        if self.pure_sv_lrm {
-            // In PURE_SV_LRM mode, UVM's phase scheduler drives the full
-            // run_phase + pre_reset→...→post_shutdown schedule. When all
-            // phases complete, UVM calls $finish which sets genuine_uvm_finished.
-            // Don't set finished here - let the $finish handler do it.
-            return;
-        }
-        self.run_uvm_cleanup_phases();
-        self.finished = true;
-    }
-
-    /// Deliver a TLM `write`/`put` through the recorded connection graph: call
-    /// the same method on every connected target (an analysis_export/imp that
-    /// forwards to its subscriber/fifo, or a fifo's put_export). Returns true if
-    /// at least one target was recorded (caller should not also run the UVM
-    /// source path). Analysis ports broadcast to ALL targets.
-    fn tlm_deliver(&mut self, port: usize, mname: &str, args: &[Expression]) -> bool {
-        let targets = match self.tlm_connections.get(&port) {
-            Some(t) if !t.is_empty() => t.clone(),
-            _ => return false,
-        };
-        for tgt in targets {
-            // An analysis `write` must run the connected imp's OWN write method,
-            // because `uvm_analysis_imp_decl(SFX)` generates an imp whose write
-            // forwards to `m_imp.write``SFX` (e.g. `write_in`) — NOT the plain
-            // `write`. Shortcutting to the implementer and calling `write`
-            // directly (as the pull path does) silently no-ops for those
-            // suffixed subscribers. The generated analysis-imp write carries no
-            // "port not bound" guard, so invoking it directly is safe; its body
-            // dispatches to the correct suffixed method on the implementer.
-            if mname == "write" {
-                self.exec_method_call(tgt, mname, args);
-                continue;
-            }
-            // Pull/blocking traffic (`put`/`get`): the imp's own forwarding
-            // carries a "port not bound" guard keyed on m_imp_list (which the
-            // route-B phaser doesn't populate), so calling the imp directly
-            // would stall — deliver straight to the implementer it wraps.
-            let implementer = self
-                .heap
-                .get(tgt)
-                .and_then(|o| o.as_ref())
-                .and_then(|i| i.properties.get("m_imp"))
-                .and_then(|v| v.to_u64())
-                .map(|h| h as usize)
-                .filter(|&h| h != 0 && h < self.heap.len())
-                .unwrap_or(tgt);
-            self.exec_method_call(implementer, mname, args);
-        }
-        true
+        // UVM's phase scheduler drives the full run_phase +
+        // pre_reset→...→post_shutdown schedule. When all phases complete, UVM
+        // calls $finish which sets genuine_uvm_finished. Don't set finished
+        // here - let the $finish handler do it.
+        return;
     }
 
     /// UVM run-phase objection bookkeeping (simplified, global counter).
@@ -70715,18 +69868,6 @@ impl Simulator {
             _ => {}
         }
         Value::zero(32)
-    }
-
-    /// If a run-phase objection drop scheduled a phase end and the drain has
-    /// elapsed (objections still at 0), end the run phase. Called once per tick
-    /// from the event loop.
-    fn maybe_end_run_phase(&mut self) {
-        if let Some(t) = self.uvm_pending_end {
-            if self.uvm_obj_count <= 0 && self.time >= t {
-                self.uvm_pending_end = None;
-                self.end_run_phase();
-            }
-        }
     }
 
     /// §18.4.3 Compute the domain of a randc property: every value the
@@ -74150,34 +73291,6 @@ impl Simulator {
                 }
             }
 
-            // Best-effort for real-UVM testbenches: on the final trial, rather
-            // than fataling the whole run (DV_CHECK_RANDOMIZE_FATAL), keep the
-            // propagated good-faith assignment and report success. xezim's
-            // solver does not model every construct riscv-dv leans on (dynamic-
-            // array sizing, array-membership over runtime queues, disjunctions),
-            // and the generator tolerates a config that satisfies the scalar
-            // constraints. Mock/unit randomization keeps strict semantics.
-            if _trial == 999 && self.uses_real_uvm() {
-                thread_local!(static WARNED: std::cell::RefCell<HashSet<String>> =
-                    std::cell::RefCell::new(HashSet::default()));
-                let first = WARNED.with(|w| w.borrow_mut().insert(class_name.clone()));
-                if first {
-                    let line = format!(
-                        "UVM_WARNING @ {}: reporter [RNDBESTEFFORT] {}::randomize() \
-                         not fully satisfiable by xezim's constraint solver; \
-                         proceeding with best-effort assignment",
-                        self.time, class_name
-                    );
-                    self.record_output(line.clone());
-                    self.stdout_writeln(&line);
-                }
-                if has_post {
-                    self.exec_method_call(handle, "post_randomize", &[]);
-                }
-                self.this_stack.pop();
-                self.class_context_stack.pop();
-                return Value::from_u64(1, 32);
-            }
 
             if let Some(Some(inst)) = self.heap.get_mut(handle) {
                 for (name, val) in backup {
@@ -76967,7 +76080,7 @@ impl Simulator {
                             }
                         }
                     }
-                    // PURE_SV_LRM §8.25: a `static` member of a parameterized
+                    // pure-SV §8.25: a `static` member of a parameterized
                     // class is per-SPECIALIZATION. Reached from an INSTANCE method
                     // (e.g. `uvm_resource#(T)::my_type` via `r.get_type_handle()->
                     // get_type()`) there is no `#(spec)` on the call, so
