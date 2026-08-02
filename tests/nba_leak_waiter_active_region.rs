@@ -57,7 +57,8 @@ fn waiter_sees_pre_nba_state_of_current_cycle() {
     // Default off because some testbenches (e.g. c910 tb.v initial
     // blocks with `@(posedge clk)` reads) depend on the legacy
     // schedule-into-event_queue behavior.
-    std::env::set_var("XEZIM_ACTIVE_REGION", "1");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("XEZIM_ACTIVE_REGION", "1") };
     let sim = simulate(SRC, 100).expect("simulate failed");
     // At sim t=15 (the second posedge clk):
     //   - cnt has the post-NBA value from t=5 (cnt=1) — the value
