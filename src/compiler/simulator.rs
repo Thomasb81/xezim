@@ -34676,12 +34676,7 @@ impl Simulator {
                         let mname = hier.path[1].name.name.as_str();
                         if self.is_associative_array(obj_name) {
                             if mname == "size" || mname == "num" {
-                                let prefix = format!("{}[", obj_name);
-                                let count = self
-                                    .signals
-                                    .keys()
-                                    .filter(|k| k.starts_with(&prefix))
-                                    .count();
+                                let count = self.assoc_top_level_keys(obj_name).len();
                                 return Value::from_u64(count as u64, 32);
                             }
                             if mname == "delete" {
@@ -38473,12 +38468,7 @@ impl Simulator {
                     if self.is_associative_array(&name) {
                         let mname = member.name.as_str();
                         if mname == "size" || mname == "num" {
-                            let prefix = format!("{}[", name);
-                            let count = self
-                                .signals
-                                .keys()
-                                .filter(|k| k.starts_with(&prefix))
-                                .count();
+                            let count = self.assoc_top_level_keys(&name).len();
                             return Value::from_u64(count as u64, 32);
                         }
                         if mname == "delete" {
@@ -38516,12 +38506,7 @@ impl Simulator {
                                 // Associative array: count live keys
                                 // (`<h>#<name>[<key>` prefix).
                                 if self.is_associative_array(&scoped) {
-                                    let prefix = format!("{}[", scoped);
-                                    let count = self
-                                        .signals
-                                        .keys()
-                                        .filter(|k| k.starts_with(&prefix))
-                                        .count();
+                                    let count = self.assoc_top_level_keys(&scoped).len();
                                     return Value::from_u64(count as u64, 32);
                                 }
                                 // Queue / dynamic array: read `.size` signal.
@@ -41596,6 +41581,54 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §7.9.1/§7.10: `foreach (all[outer, inner])` over an
+                        // ASSOCIATIVE ARRAY OF QUEUES (`T all[key][$]`). The
+                        // outer index walks the (sparse) assoc keys, the inner
+                        // index walks each key's queue. Unlike the
+                        // dynamic-array-of-dynamic-arrays branch above, the
+                        // keys are not a dense [0,N) range, so iterate the
+                        // collected top-level keys and each key's `.size`.
+                        if vars.len() >= 2 {
+                            let akeys = self.assoc_top_level_keys(&an);
+                            let is_assoc_of_queue = !akeys.is_empty()
+                                && akeys.iter().all(|k| {
+                                    let qn = format!("{}[{}]", an, k);
+                                    self.module.dynamic_arrays.contains(&qn)
+                                        || self.signals.contains_key(&format!("{}.size", qn))
+                                });
+                            if is_assoc_of_queue {
+                                let ov = vars[0].as_ref().map(|v| v.name.clone());
+                                let iv = vars[1].as_ref().map(|v| v.name.clone());
+                                if let Some(n) = &ov { self.widths.insert(n.clone(), 32); }
+                                if let Some(n) = &iv { self.widths.insert(n.clone(), 32); }
+                                'akeys: for key in &akeys {
+                                    let qn = format!("{}[{}]", an, key);
+                                    let inner = self.get_queue_size(&qn);
+                                    for j in 0..inner {
+                                        if self.finished { break 'akeys; }
+                                        if let Some(n) = &ov {
+                                            let kv = if let Ok(v) = key.parse::<i64>() {
+                                                Value::from_u64(v as u64, 32)
+                                            } else {
+                                                Value::from_string(key)
+                                            };
+                                            self.set_loop_var(n, kv);
+                                        }
+                                        if let Some(n) = &iv {
+                                            self.set_loop_var(n, Value::from_u64(j, 32));
+                                        }
+                                        self.continue_flag = false;
+                                        self.exec_statement(body);
+                                        if self.break_flag { break 'akeys; }
+                                        self.continue_flag = false;
+                                    }
+                                }
+                                self.auto_loop_vars.truncate(fe_auto_len);
+                                self.restore_loop_vars(&fe_saved);
+                                if !self.return_flag { self.break_flag = false; }
+                                return;
+                            }
+                        }
                         if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                             // A queue / dynamic array carries an authoritative
                             // `<name>.size` shadow and is DENSE: iterate the
@@ -41810,6 +41843,75 @@ impl Simulator {
                                     body,
                                     var_scope.as_deref(),
                                 );
+                                self.auto_loop_vars.truncate(fe_auto_len);
+                                self.restore_loop_vars(&fe_saved);
+                                if !self.return_flag { self.break_flag = false; }
+                                return;
+                            }
+                        }
+                        // §12.7.3 / §7.9.1: `foreach (all[outer, inner])` over
+                        // an ASSOCIATIVE ARRAY OF QUEUES (`T all[key][$]`, e.g.
+                        // uvm_resource_pool's `sort_by_precedence`). The outer
+                        // var walks the sparse assoc keys (ascending for an
+                        // integer-keyed array), the inner var walks each key's
+                        // queue [0, size); higher cardinality (inner) changes
+                        // fastest. `foreach_dims` returns None for a sparse
+                        // assoc, so without this the 2-var form fell through to
+                        // the 1-var scan below and only ever bound `outer` —
+                        // `inner` stayed at its last value and the body ran
+                        // once per key (losing the queue elements).
+                        if self.is_associative_array(&name) {
+                            let akeys = self.assoc_top_level_keys(&name);
+                            let is_assoc_of_queue = !akeys.is_empty()
+                                && akeys.iter().all(|k| {
+                                    let qn = format!("{}[{}]", name, k);
+                                    self.module.dynamic_arrays.contains(&qn)
+                                        || self.signals.contains_key(&format!("{}.size", qn))
+                                });
+                            if is_assoc_of_queue {
+                                let ov = vars[0].as_ref().map(|v| v.name.clone());
+                                let iv = vars[1].as_ref().map(|v| v.name.clone());
+                                if let Some(n) = &ov { self.widths.insert(n.clone(), 32); }
+                                if let Some(n) = &iv { self.widths.insert(n.clone(), 32); }
+                                let is_str = self
+                                    .module
+                                    .associative_arrays
+                                    .get(&name)
+                                    .copied()
+                                    .unwrap_or(false);
+                                'akeys: for key in &akeys {
+                                    let qn = format!("{}[{}]", name, key);
+                                    let inner = self.get_queue_size(&qn);
+                                    for j in 0..inner {
+                                        if self.finished { break 'akeys; }
+                                        if let Some(n) = &ov {
+                                            let kv = if is_str {
+                                                Value::from_string(key)
+                                            } else {
+                                                Value::from_u64(
+                                                    key.parse::<u64>().unwrap_or(0),
+                                                    32,
+                                                )
+                                            };
+                                            self.set_loop_var_aliased(
+                                                var_scope.as_deref(),
+                                                n,
+                                                kv,
+                                            );
+                                        }
+                                        if let Some(n) = &iv {
+                                            self.set_loop_var_aliased(
+                                                var_scope.as_deref(),
+                                                n,
+                                                Value::from_u64(j, 32),
+                                            );
+                                        }
+                                        self.continue_flag = false;
+                                        self.exec_statement(body);
+                                        if self.break_flag { break 'akeys; }
+                                        self.continue_flag = false;
+                                    }
+                                }
                                 self.auto_loop_vars.truncate(fe_auto_len);
                                 self.restore_loop_vars(&fe_saved);
                                 if !self.return_flag { self.break_flag = false; }
@@ -52882,6 +52984,38 @@ impl Simulator {
         }
     }
 
+    /// Collect the TOP-LEVEL keys of an associative array `obj_name`, sorted
+    /// and de-duplicated. Correctly handles an associative array WHOSE
+    /// ELEMENTS are queues/dynamic-arrays (`T arr[key][$]`) — such arrays
+    /// store elements as `arr[KEY][IDX]`, so a naive `arr[KEY]` prefix scan
+    /// would collect the nested element keys (`KEY][IDX`) and report
+    /// `num()`/`first()` over the wrong set. The top-level assoc key is the
+    /// text between `arr[` and the FIRST `]`, uniform across plain assoc
+    /// (`arr[KEY]`), assoc-of-queue (`arr[KEY][i]`), and multidim assoc
+    /// (`arr[k1][k2]`). Returned sorted (numeric keys ascending by value,
+    /// else lexicographic) to match the LRM's first/next/last/prev order and
+    /// `num()`'s count of distinct keys.
+    fn assoc_top_level_keys(&self, obj_name: &str) -> Vec<String> {
+        let prefix = format!("{}[", obj_name);
+        let mut keys: Vec<String> = self
+            .signals
+            .keys()
+            .map(|k| k.as_str())
+            .chain(self.signal_name_to_id.keys().map(|k| &**k))
+            .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
+            .filter_map(|k| {
+                let rest = &k[prefix.len()..];
+                rest.find(']').map(|pos| rest[..pos].to_string())
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        if !keys.is_empty() && keys.iter().all(|k| k.parse::<i64>().is_ok()) {
+            keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
+        }
+        keys
+    }
+
     /// `a.b.c` where `a.b` is a signal carrying a bit layout (a nested packed
     /// struct, or an untagged union whose members all sit at bit 0): the leaf's
     /// `(container, offset, width)`. Such a dotted name parses as ONE
@@ -61047,18 +61181,14 @@ impl Simulator {
                     return Some(Value::from_u64(q.len() as u64, 32));
                 }
             }
-            let prefix = format!("{}[", obj_name);
-            let count1 = self
-                .signals
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .count();
-            let count2 = self
-                .signal_name_to_id
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .count();
-            return Some(Value::from_u64((count1 + count2) as u64, 32));
+            // Count distinct TOP-LEVEL keys: for `obj[KEY]` storage this is
+            // just the element count (== queue/dynamic-array size), but for
+            // an assoc-of-queue `obj[KEY][IDX]` it collapses every element of
+            // a key's queue onto that one key (so `num()` reports the number
+            // of associative keys, not the total element count). The
+            // first-`]` extraction + dedup is uniform across plain assoc,
+            // assoc-of-queue, queues, and dynamic arrays.
+            return Some(Value::from_u64(self.assoc_top_level_keys(obj_name).len() as u64, 32));
         }
         if mname == "sum" {
             let cur_size = self.get_queue_size(obj_name) as usize;
@@ -61268,19 +61398,8 @@ impl Simulator {
         }
         if (mname == "first" || mname == "last" || mname == "next" || mname == "prev")
             && self.is_associative_array(obj_name) {
-                let prefix = format!("{}[", obj_name);
-                let mut keys: Vec<String> = self
-                    .signals
-                    .keys()
-                    .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
-                    .map(|k| k[prefix.len()..k.len() - 1].to_string())
-                    .collect();
+                let keys = self.assoc_top_level_keys(obj_name);
                 let all_numeric = keys.iter().all(|k| k.parse::<i64>().is_ok());
-                if all_numeric {
-                    keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
-                } else {
-                    keys.sort();
-                }
                 if keys.is_empty() {
                     return Some(Value::zero(32));
                 }
