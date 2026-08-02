@@ -884,11 +884,17 @@ fn print_resource_usage(wall_start: std::time::Instant) {
 /// but `package`s, which is where classes normally live) — otherwise an ANSI
 /// port list's `interface foo_if.mp p` would register `foo_if` as *defined* by
 /// the instantiating file and misroute every reference to it.
-fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<String>) {
+fn scan_units_and_refs(
+    text: &str,
+) -> (Vec<String>, std::collections::HashSet<String>, bool) {
     use xezim::lexer::TokenKind as TK;
     let toks = xezim::lexer::Lexer::new(text).tokenize();
     let mut declared = Vec::new();
     let mut refs = std::collections::HashSet::new();
+    // §23.11: a top-level `bind` attaches instances to a module named
+    // elsewhere. Nothing REFERENCES the bind file by name, so reachability
+    // alone would always drop it — silently removing checkers from the repro.
+    let mut top_level_bind = false;
     // Open unit keywords, innermost last.
     let mut stack: Vec<&str> = Vec::new();
     let mut prev: &str = "";
@@ -953,11 +959,13 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
             )
         {
             stack.pop();
+        } else if text_s == "bind" && stack.is_empty() {
+            top_level_bind = true;
         }
         prev = text_s;
         i += 1;
     }
-    (declared, refs)
+    (declared, refs, top_level_bind)
 }
 
 /// `--dump-merged-sv` with `-s <top>`: the indices of the files actually needed
@@ -975,7 +983,7 @@ fn merged_sv_files_for_top(top: &str, texts: &[String]) -> Option<Vec<usize>> {
     let scanned: Vec<_> = texts.iter().map(|t| scan_units_and_refs(t)).collect();
     // First declaration wins, matching the elaborator's own resolution.
     let mut owner: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for (fi, (declared, _)) in scanned.iter().enumerate() {
+    for (fi, (declared, _, _)) in scanned.iter().enumerate() {
         for name in declared {
             owner.entry(name.as_str()).or_insert(fi);
         }
@@ -984,6 +992,20 @@ fn merged_sv_files_for_top(top: &str, texts: &[String]) -> Option<Vec<usize>> {
     let mut keep = vec![false; texts.len()];
     let mut queue = vec![start];
     keep[start] = true;
+    // A file that declares no design unit at all is never REFERENCED by name,
+    // so reachability alone would always drop it — yet it may hold §3.12
+    // compilation-unit declarations (a `typedef`/function/parameter at file
+    // scope) or a top-level `bind`, both of which the rest of the design uses
+    // without naming the file. Dropping those does not merely fail to compile:
+    // it can silently CHANGE the answer, which is the one thing a reduction
+    // tool must never do. Seed them all, then let the walk expand from them
+    // (that is what pulls in a checker reachable only through a bind).
+    for (fi, (declared, _, top_bind)) in scanned.iter().enumerate() {
+        if (declared.is_empty() || *top_bind) && !keep[fi] {
+            keep[fi] = true;
+            queue.push(fi);
+        }
+    }
     while let Some(fi) = queue.pop() {
         for name in &scanned[fi].1 {
             if let Some(&dep) = owner.get(name.as_str()) {
