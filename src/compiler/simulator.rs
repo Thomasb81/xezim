@@ -19805,6 +19805,36 @@ impl Simulator {
         out
     }
 
+    /// §15.5.3: does `head` name an EVENT for the purposes of
+    /// `@(<head>.triggered)` / `wait(<head>.triggered)`?
+    ///
+    /// `module.events` only holds events declared at MODULE scope — an event
+    /// inside an INTERFACE (the standard UVM `@(vif.evt.triggered)` sync
+    /// pattern) is absent from it, which is why keying solely on that set left
+    /// hierarchical waits with an empty sensitivity that fired at t=0. Every
+    /// event is backed by a 1-bit toggle signal, so an existing signal under
+    /// the head name is the reliable evidence. `full` (the `<head>.triggered`
+    /// name) guards the one ambiguous case: a real struct member literally
+    /// called `triggered`, which resolves as a signal in its own right.
+    fn hier_event_key(&self, head: &str, leaf: &str, full: &str) -> Option<String> {
+        if self.module.events.contains(head) {
+            return Some(head.to_string());
+        }
+        if self.module.events.contains(leaf) {
+            return Some(leaf.to_string());
+        }
+        if self.signal_name_to_id.contains_key(full) {
+            return None; // a genuine member named `triggered`
+        }
+        let resolved = self.resolve_event_key(head);
+        if self.signal_name_to_id.contains_key(resolved.as_str())
+            || self.signal_name_to_id.contains_key(head)
+        {
+            return Some(head.to_string());
+        }
+        None
+    }
+
     fn event_to_sens(&self, event: &EventControl) -> Vec<Sensitivity> {
         // Walk past Paren / RangeSelect / BitSelect / Concatenation wrappers
         // to find the underlying Ident(s). For E902 etc. that use
@@ -19906,14 +19936,8 @@ impl Simulator {
                         if segs.len() >= 2 && *segs.last().unwrap() == "triggered" {
                             let head = segs[..segs.len() - 1].join(".");
                             let leaf = segs[segs.len() - 2];
-                            if self.module.events.contains(&head)
-                                || self.module.events.contains(leaf)
-                            {
-                                let key = if self.module.events.contains(&head) {
-                                    head
-                                } else {
-                                    leaf.to_string()
-                                };
+                            let full = segs.join(".");
+                            if let Some(key) = self.hier_event_key(&head, leaf, &full) {
                                 out.push(Sensitivity {
                                     signal_name: self.resolve_event_key(&key),
                                     edge,
@@ -19960,6 +19984,27 @@ impl Simulator {
                     // always block fired once at t=0 and never again.
                     if idents.is_empty() && ee.edge.is_none() {
                         if let Some(segs) = Self::flatten_member_path(&ee.expr) {
+                            // §15.5.3 `@(<hier>.<event>.triggered)` — the
+                            // MemberAccess shape the parser produces for an
+                            // event reached through a hierarchical path
+                            // (`@(u_if.set_opt_reg.triggered)`). The flattened
+                            // Ident shape is handled in the ident loop above;
+                            // this form never reached it (collect_ident_names
+                            // does not walk MemberAccess), so the sensitivity
+                            // came out empty and the wait returned at t=0.
+                            if segs.len() >= 2 && segs[segs.len() - 1] == "triggered" {
+                                let ev = segs[..segs.len() - 1].join(".");
+                                let leaf = segs[segs.len() - 2].clone();
+                                let full = segs.join(".");
+                                if let Some(k) = self.hier_event_key(&ev, &leaf, &full) {
+                                    out.push(Sensitivity {
+                                        signal_name: self.resolve_event_key(&k),
+                                        edge: EdgeKind::AnyEdge,
+                                        iff: ee.iff.clone(),
+                                    });
+                                    continue;
+                                }
+                            }
                             if segs.len() >= 2 {
                                 let refs: Vec<&str> =
                                     segs.iter().map(|x| x.as_str()).collect();
