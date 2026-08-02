@@ -24266,6 +24266,20 @@ impl Simulator {
                                 self.finished = true;
                                 return;
                             }
+                            let mbx_empty = self
+                                .mailboxes
+                                .get(&handle)
+                                .map(|q| q.is_empty())
+                                .unwrap_or(false);
+                            if mbx_empty {
+                                // §15.4.1/§15.4.2: a producer parked on a FULL
+                                // bounded mailbox can proceed now that the box is
+                                // empty. Only a consuming `get` used to admit it,
+                                // so a get that PARKED on the empty box left both
+                                // sides asleep — a zero-delay producer/consumer
+                                // pair deadlocked after filling the bound once.
+                                self.admit_mailbox_put_waiter(handle);
+                            }
                             if let Some(q) = self.mailboxes.get(&handle) {
                                 if q.is_empty() {
                                     // Blocking get/peek on an empty mailbox: park
@@ -25044,7 +25058,18 @@ impl Simulator {
                                 if let Some(frame) = self.local_stack.last_mut() {
                                     frame.insert(name.name.clone(), rv);
                                 } else {
-                                    self.set_signal_value_by_name(&name.name, rv);
+                                    // §12.7.1: a variable declared in the for-init
+                                    // has AUTOMATIC lifetime — it is local to the
+                                    // loop. With no call frame (an initial block or
+                                    // a fork child) it used to land in the GLOBAL
+                                    // signal map, so two concurrent processes each
+                                    // running `for (int i ...)` shared one counter
+                                    // and clobbered each other's index. Only the
+                                    // suspend-aware path can interleave, so give
+                                    // the process its own frame here.
+                                    let mut f: HashMap<String, Value> = HashMap::default();
+                                    f.insert(name.name.clone(), rv);
+                                    self.local_stack.push(f);
                                 }
                             }
                             ForInit::Assign { lvalue, rvalue } => {
@@ -50968,6 +50993,25 @@ impl Simulator {
         // is the `@m_event` waiter (e.g. uvm_heartbeat's abort branch) fired
         // the join prematurely, killing the loop branch.
         if self.instance_event_waiters.iter().any(|w| w.pid == pid) {
+            return true;
+        }
+        // §15.4.1: a producer parked on a FULL bounded mailbox, and §15.3.3 a
+        // process parked on a semaphore, are equally suspended. Only the GET
+        // side was listed, so a blocked producer looked FINISHED: its
+        // ProcessContext was discarded (losing its loop state) and an
+        // enclosing `fork ... join` completed while it was still mid-loop.
+        if self
+            .mailbox_put_waiters
+            .values()
+            .any(|q| q.iter().any(|w| w.pid == pid))
+        {
+            return true;
+        }
+        if self
+            .semaphore_get_waiters
+            .values()
+            .any(|q| q.iter().any(|w| w.pid == pid))
+        {
             return true;
         }
         false

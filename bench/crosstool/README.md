@@ -101,11 +101,17 @@ Also cross-verified between xezim and the reference:
   B1/B2 (RTL event scheduling) and slow on B4 (testbench runtime), and that
   difference is the useful finding.
 
-## Known result: B4 fails on xezim
+## What B4 found
 
-As of this writing `b4_oop_tb` **FAILs on xezim** while the reference passes it.
-A bounded-mailbox producer/consumer running in zero simulation time loses the
-consumer's continuation, so `join` returns while a child process is still
-mid-loop (produced/consumed stop short of `N_PKT`). Plain `fork`/`join` without
-a mailbox is unaffected. This is a real xezim defect, left visible on purpose —
-a benchmark suite that hides its own tool's failures is worthless.
+B4 failed on xezim when first written, while the reference passed it, and the
+two defects behind it are now fixed:
+
+1. §12.7.1 — a `for`-init variable has automatic lifetime, but with no call
+   frame (initial block or fork child) it lived in the global signal map, so
+   two concurrent `for (int i ...)` loops shared one counter.
+2. A producer parked on a full bounded mailbox was not counted as suspended,
+   so its process context was discarded and the enclosing `join` completed
+   while it was still mid-loop. A `get` parking on an empty box also failed to
+   admit a producer parked on "full", deadlocking both sides.
+
+That is the point of running a benchmark on more than one tool.
