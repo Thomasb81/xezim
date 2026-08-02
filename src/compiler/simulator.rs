@@ -5237,11 +5237,6 @@ impl Simulator {
                 }
             }
         }
-        for (nm, v) in array_elem_inits {
-            if let Some(&id) = signal_name_to_id.get(nm.as_str()) {
-                signal_table[id] = v;
-            }
-        }
         let arrays_1d_ms = phase_arrays_1d.elapsed().as_secs_f64() * 1000.0;
         let phase_arrays_other = std::time::Instant::now();
         let mut arrays_2d_sorted: Vec<(&String, &((i64, i64), (i64, i64), u32))> =
@@ -5290,6 +5285,15 @@ impl Simulator {
                     &mut signal_name_to_id,
                     &mut id_to_name,
                 );
+            }
+        }
+        // Elements that carry a value from ELABORATION (an unpacked-array
+        // parameter, §6.20.2). Deliberately after the 2-D / N-D creation
+        // loops: those rebuild storage for their names, so restoring earlier
+        // left a multi-dimensional parameter array zero-filled.
+        for (nm, v) in array_elem_inits {
+            if let Some(&id) = signal_name_to_id.get(nm.as_str()) {
+                signal_table[id] = v;
             }
         }
         // §6.8 again for the 2-D / N-D element storage (named slots).
