@@ -65439,6 +65439,70 @@ impl Simulator {
                 }
             }
 
+            // §6.16 string methods (len/size/getc/substr) and §6.16.6
+            // (compare/icompare/atoreal) on a hierarchical-ident receiver
+            // (`u_if.data.len()`, `top.dut.cfg.substr(0,3)`). They were
+            // excluded from `is_array_builtin_method`'s collection block
+            // above (a string field is not a collection) and from the
+            // no-arg string block below (its `args.is_empty()` gate), so
+            // they fell through to the generic tail, which mis-derived the
+            // receiver as just `path[0]` instead of the full
+            // `path[0..len-1]` (IEEE 1800-2023 §23.6 — the receiver of
+            // `a.b.m()` is `a.b`, not `a`; the parser flattens the call
+            // into `Ident([a, b, m])`).
+            //
+            // `len`/`size`/`getc`/`substr` dispatch by the resolved
+            // hierarchical name (their handlers read the value via
+            // `get_local_signal_or_static`, which finds the hierarchical
+            // signal); `compare`/`icompare`/`atoreal` evaluate the receiver
+            // by value. The USER-METHOD guard is essential: a class instance
+            // whose class defines a same-named method (e.g. a `container`
+            // with its own `len()`) must dispatch to the real method, not
+            // the string builtin — without it `c.len()` on a container
+            // local returned the byte length of the handle instead of
+            // calling `container::len`. The guard evaluates the receiver to
+            // a handle and asks `class_has_method` (value-based, mirroring
+            // the MemberAccess `len`/`size` fallback).
+            if len >= 2
+                && matches!(
+                    path[len - 1].name.name.as_str(),
+                    "len" | "size" | "getc" | "substr"
+                        | "compare" | "icompare" | "atoreal"
+                )
+            {
+                let m = path[len - 1].name.name.clone();
+                let base = HierarchicalIdentifier {
+                    root: hier.root.clone(),
+                    path: path[..len - 1].to_vec(),
+                    span: hier.span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                let recv = self.eval_expr(&base_expr);
+                let recv_h = recv.to_u64().unwrap_or(0) as usize;
+                let is_user_method = recv_h != 0
+                    && self
+                        .heap
+                        .get(recv_h)
+                        .and_then(|o| o.as_ref())
+                        .is_some_and(|i| self.class_has_method(&i.class_name, &m));
+                if !is_user_method {
+                    if matches!(m.as_str(), "len" | "size" | "getc" | "substr") {
+                        if let ExprKind::Ident(bh) = &base_expr.kind {
+                            let bn = self.resolve_hier_name(bh);
+                            if self.get_local_signal_or_static(&bn).is_some() {
+                                if let Some(res) = self.eval_builtin_method(&bn, &m, args) {
+                                    return res;
+                                }
+                            }
+                        }
+                    } else if let Some(v) = self.string_method(&base_expr, &m, args) {
+                        return v;
+                    }
+                }
+            }
+
             // Enum `.name()` / string `.tolower()`/`.toupper()` where the
             // receiver flattened into the ident path (`v.name()` ->
             // Ident([v, name])). The MemberAccess form is handled earlier; this
