@@ -1965,7 +1965,7 @@ struct ClassInstance {
     /// Maps a class TYPE-parameter name (e.g. `T` in
     /// `class Mk #(type T=Base)`) to the concrete class name it was
     /// specialized with (e.g. `Base`). Populated by
-    /// `instantiate_class_with_type_args`. Used in pure-SV mode so an
+    /// `instantiate_class_with_type_args`. Used so an unqualified `obj = new()`
     /// unqualified `obj = new()` whose declared type is a type parameter
     /// constructs the bound concrete class (running its real `new`). Empty
     /// for classes without type parameters / non-specialized instances.
@@ -2810,7 +2810,7 @@ pub struct Simulator {
     /// bus_if.master vif`) so the rewrite path can also emit a direction
     /// warning when writing to a modport-input member.
     virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
-    /// Pure-SV: `uvm_config_db#(virtual X)::set/get` records the bound
+    /// `uvm_config_db#(virtual X)::set/get` records the bound interface
     /// interface NAME by scope here, because config_db otherwise flows an opaque
     /// Value and loses the interface identity (so a config_db-bound vif reads
     /// non-null but `vif.member`/edge-waits don't resolve). Entries are
@@ -2854,20 +2854,15 @@ pub struct Simulator {
     /// Set once the post-run phases have executed so they run exactly once.
     uvm_post_run_done: bool,
     /// True once extract/check/report/final (+ report_summarize) have run,
-    /// whether by the genuine UVM library (via the genuine library's `$finish`) or by
-    /// the shim. Prevents double-firing these stateful callbacks.
+    /// whether via the genuine UVM library's `$finish` or the event-loop-exit
+    /// backstop. Prevents double-firing these stateful callbacks.
     uvm_cleanup_done: bool,
-    /// Set when the genuine UVM library (pure-SV) calls `$finish`, meaning
-    /// its own phase schedule ran the cleanup phases and report_summarize. The
-    /// shim's `end_run_phase` backstop checks this to avoid double-firing
+    /// Set when the genuine UVM library calls `$finish`, meaning its own
+    /// phase schedule ran the cleanup phases and report_summarize. The
+    /// objection-driven `end_run_phase` backstop checks this to avoid double-firing
     /// extract/check/report/final, and the event-loop-exit backstop uses it to
     /// decide whether cleanup still needs to run for objection-free tests.
     genuine_uvm_finished: bool,
-    /// UVM report-server tallies for the `--- UVM Report Summary ---` block
-    /// emitted at end_run_phase: counts by severity [INFO, WARNING, ERROR,
-    /// FATAL] and by message id (sorted). Populated at the report choke point.
-    uvm_sev_counts: [u64; 4],
-    uvm_id_counts: std::collections::BTreeMap<String, u64>,
     /// LRM §25.9: stack of per-call virtual-interface formal-arg
     /// aliases. When a task or function takes `virtual <iface> <name>`,
     /// the call hooks add a frame mapping `<name>` to the caller's
@@ -2936,7 +2931,7 @@ pub struct Simulator {
     /// range is const-eval'd once per specialization instead of per store.
     spec_prop_width_cache: std::cell::RefCell<HashMap<(String, String, String), Option<u32>>>,
     /// Tracks class names currently being constructed via the `type_id::create()`
-    /// PURE-mode shortcut, to prevent infinite recursion when a parameterized
+    /// shortcut, to prevent infinite recursion when a parameterized
     /// class's constructor or static initializers re-enter `type_id::create()`
     /// for the same class.
     type_id_create_in_progress: HashSet<String>,
@@ -5630,8 +5625,6 @@ impl Simulator {
             uvm_post_run_done: false,
             uvm_cleanup_done: false,
             genuine_uvm_finished: false,
-            uvm_sev_counts: [0; 4],
-            uvm_id_counts: std::collections::BTreeMap::new(),
             local_iface_aliases: Vec::new(),
             viface_var_aliases: HashMap::default(),
             last_vif_return: None,
@@ -21989,7 +21982,7 @@ impl Simulator {
             }
             // UVM objection-driven run-phase end (after the drain elapses).
             // (The legacy non-pure shim's end_run_phase backstop was removed
-            // with the legacy pure-SV=0 mode; the genuine library now owns the full phase
+            // The genuine library owns the full phase schedule
             // schedule.)
             // Periodic invariant check — every 1000 iters; bail on
             // mismatch to surface bugs early.
@@ -25771,7 +25764,7 @@ impl Simulator {
         )
     }
 
-    /// genuine-UVM bridge: rewrite a genuine-UVM objection sync call
+    /// Bridge: rewrite a genuine-UVM objection sync call
     /// `objn.wait_for(evt, obj)` into condition-wait(s) on the objection total.
     ///
     /// The real `uvm_objection::wait_for` blocks on
@@ -34249,7 +34242,7 @@ impl Simulator {
         // wrapper(s) from the member/ident chain so resolution sees the same
         // shape as the pre-`Specialization` AST. The `#(...)` text only matters
         // for per-spec static keying (handled at the static-dispatch sites).
-        // Keeps default mode identical to before. (pure-SV.)
+        // Keeps behavior identical to before.
         if Self::expr_has_specialization(expr) {
             // Set the active specialization (for per-spec static keying) while
             // resolving the stripped shape, e.g. `C#(params)::prop` reads the
@@ -42865,7 +42858,7 @@ impl Simulator {
                 // inside a method (else `rq` reads X, `rq==null` is X, the
                 // `new()` is skipped, and X is stored — breaking the resource
                 // pool's whole rtab/ri_tab population).
-                // Pure-SV: a class-scoped typedef (e.g.
+                // A class-scoped typedef (e.g.
                 // `uvm_resource_types::rsrc_q_t` → `uvm_queue#(...)`, declared
                 // INSIDE a class) is registered in neither `typedefs` (the width
                 // map) nor `typedef_types`, so `resolve_type_width` fell back to
@@ -44827,7 +44820,7 @@ impl Simulator {
             // the `$sformatf` *function* form, the format string is arg1 here.
             // UVM's report path uses `$swrite(time_str, "%0t", $time)`, so
             // without this the composed report line had a blank time field.
-            // Not gated on Pure-SV: these are plain §21.3 tasks and were a
+            // These are plain §21.3 tasks and were a
             // silent no-op in the default mode (issue #24).
             "$swrite" | "$swriteb" | "$swriteh" | "$swriteo" | "$sformat" => {
                 if let Some(dest) = args.first() {
@@ -62307,7 +62300,7 @@ impl Simulator {
         }
     }
 
-    /// pure-SV `uvm_config_db#(virtual X)::set/get` — carry the interface
+    /// `uvm_config_db#(virtual X)::set/get` — carry the interface
     /// binding (which config_db's value round-trip loses). Returns Some(result)
     /// only when this is genuinely a virtual-interface set/get; None otherwise
     /// so the real config_db handles ordinary values.
@@ -63611,7 +63604,7 @@ impl Simulator {
     /// matching (which looks for Ident/MemberAccess chains) sees the same shape
     /// as before the `Specialization` AST node existed. The `#(...)` spec text
     /// is preserved in the original AST for per-spec static keying (handled at
-    /// the static-dispatch sites in pure-SV mode); this only normalizes shape.
+    /// the static-dispatch sites); this only normalizes shape.
     fn expr_has_specialization(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Specialization { .. } => true,
@@ -63655,7 +63648,7 @@ impl Simulator {
         }
     }
 
-    /// pure-SV resolution of `C::type_id::create`.
+    /// Resolution of `C::type_id::create`.
     /// A class `C` registers itself with a UVM-style factory via a typedef
     /// `typedef <registry>#(T,"N") type_id;` where `<registry>` is
     /// `uvm_component_registry` / `uvm_object_registry`. The net effect of
@@ -65363,7 +65356,7 @@ impl Simulator {
                 }
             }
 
-            // PURE-mode counterpart of the flattened `...,type_id,create` path
+            // Counterpart of the flattened `...,type_id,create` path
             // (the MemberAccess form is handled in eval_call_inner's call site
             // above). Resolve `C::type_id::create` from `C`'s own registry
             // typedef and construct the registered target class.  When `C` is a
@@ -68549,7 +68542,7 @@ impl Simulator {
         self.instantiate_class_with_type_args(class_def, args, None)
     }
 
-    /// Pure-SV: resolve a factory-requested type name to the concrete
+    /// Resolve a factory-requested type name to the concrete
     /// elaborated class. UVM's `uvm_*_utils(C)` registers C under name "C", so
     /// the requested name usually IS the class name; also reverse-resolve via
     /// `type_id` typedef targets (`uvm_*_registry#(C,"N")` -> N) for the rare
@@ -69647,108 +69640,6 @@ impl Simulator {
         false
     }
 
-    /// Run the post-run UVM function phases on every component, then finish.
-    /// Render the UVM test-topology table (uvm_table_printer format) for the
-    /// subtree rooted at `root`, from the live component hierarchy. Columns are
-    /// Name / Type / Size / Value; components are indented by hierarchy depth
-    /// and show `@<handle>` as their value. Internal field-automation rows
-    /// (sequencer arrays/integrals) are omitted — the component+port tree is the
-    /// meaningful topology. Handle ids won't match a reference run's inst ids.
-    fn render_uvm_topology(&mut self, root: usize) -> String {
-        let root_name = self
-            .exec_method_call(root, "get_full_name", &[])
-            .to_sv_string();
-        // (full_name, type, handle) for every component under `root`.
-        let mut rows: Vec<(String, String, usize)> = Vec::new();
-        let prefix = format!("{}.", root_name);
-        for h in self.uvm_components.clone() {
-            let fname = self
-                .exec_method_call(h, "get_full_name", &[])
-                .to_sv_string();
-            if fname == root_name || fname.starts_with(&prefix) {
-                let cls = self
-                    .heap
-                    .get(h)
-                    .and_then(|o| o.as_ref())
-                    .map(|i| i.class_name.clone())
-                    .unwrap_or_default();
-                // Skip the internal `uvm_port_component` wrapper twin that each
-                // port/export carries (same leaf name as the port itself) — UVM's
-                // table printer shows only the port, not its wrapper.
-                if cls == "uvm_port_component" {
-                    continue;
-                }
-                rows.push((fname, cls, h));
-            }
-        }
-        // Alphabetical by full name groups children under parents and orders
-        // siblings deterministically (matches UVM creation order on this TB).
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        let root_depth = root_name.matches('.').count();
-        let sep = "-".repeat(70);
-        let mut out = String::new();
-        out.push('\n');
-        out.push_str(&sep);
-        out.push('\n');
-        out.push_str(&format!(
-            "{:<32}{:<28}{:<6}{}\n",
-            "Name", "Type", "Size", "Value"
-        ));
-        out.push_str(&sep);
-        out.push('\n');
-        for (fname, cls, h) in rows {
-            let depth = fname.matches('.').count().saturating_sub(root_depth);
-            let leaf = fname.rsplit('.').next().unwrap_or(&fname);
-            let name_col = format!("{}{}", "  ".repeat(depth), leaf);
-            out.push_str(&format!("{:<32}{:<28}{:<6}@{}\n", name_col, cls, "-", h));
-        }
-        out.push_str(&sep);
-        out
-    }
-
-    /// Tally a UVM report for the end-of-run `--- UVM Report Summary ---` block.
-    /// `severity` is INFO/WARNING/ERROR/FATAL; `id` is the message id (the first
-    /// arg to `uvm_info`/etc.). Called at every UVM report emission site.
-    fn tally_uvm_report(&mut self, severity: &str, id: &str) {
-        let sidx = match severity {
-            "INFO" => 0,
-            "WARNING" => 1,
-            "ERROR" => 2,
-            "FATAL" => 3,
-            _ => return,
-        };
-        self.uvm_sev_counts[sidx] += 1;
-        *self.uvm_id_counts.entry(id.to_string()).or_insert(0) += 1;
-    }
-
-    /// Emit the `--- UVM Report Summary ---` block (uvm_report_server::
-    /// report_summarize), matching UVM's format: counts by severity then by id.
-    /// Counts reflect the reports xezim actually issued this run.
-    fn emit_uvm_report_summary(&mut self) {
-        let mut out = String::new();
-        out.push_str("--- UVM Report Summary ---\n\n");
-        out.push_str("** Report counts by severity\n");
-        out.push_str(&format!("UVM_INFO :  {:3}\n", self.uvm_sev_counts[0]));
-        out.push_str(&format!("UVM_WARNING :  {:3}\n", self.uvm_sev_counts[1]));
-        out.push_str(&format!("UVM_ERROR :  {:3}\n", self.uvm_sev_counts[2]));
-        out.push_str(&format!("UVM_FATAL :  {:3}\n", self.uvm_sev_counts[3]));
-        out.push_str("** Report counts by id\n");
-        let ids: Vec<(String, u64)> = self
-            .uvm_id_counts
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        for (id, n) in ids {
-            out.push_str(&format!("[{}]  {:3}\n", id, n));
-        }
-        // Trailing newline trimmed by writeln.
-        for line in out.lines() {
-            let l = line.to_string();
-            self.record_output(l.clone());
-            self.stdout_writeln(&l);
-        }
-    }
-
     /// Run the post-run function phases (extract/check/report/final) across
     /// all live uvm_components, then emit the UVM Report Summary. Mirrors what
     /// `uvm_root::run_test` does after the run domain ends. Idempotent via
@@ -69760,7 +69651,7 @@ impl Simulator {
         self.uvm_cleanup_done = true;
         let mut comps = self.uvm_components.clone();
         if comps.is_empty() {
-            // Pure-SV: the real UVM phaser builds components via the
+            // The real UVM phaser builds components via the
             // factory, not the route-B bootstrap that fills `uvm_components` —
             // so collect every live uvm_component from the heap. Without this
             // a pure run ended with an empty summary and no monitor
@@ -69800,22 +69691,10 @@ impl Simulator {
                 }
             }
         }
-        // uvm_root::run_test calls report_server.report_summarize() after the
-        // report phase — emit the summary block. Only when the run showed any
-        // UVM evidence (components, objections, or tallied reports): a pure-SV
-        // design that merely drains its event loop must not end with a UVM
-        // Report Summary.
-        if !comps.is_empty()
-            || self.uvm_obj_raised
-            || self.uvm_sev_counts.iter().any(|&c| c > 0)
-            || !self.uvm_id_counts.is_empty()
-        {
-            self.emit_uvm_report_summary();
-        }
     }
 
     /// Triggered when the run-phase objection count returns to 0 (after a
-    /// raise) and the drain has elapsed. In pure-SV mode this only TERMINATES
+    /// raise) and the drain has elapsed. This only TERMINATES
     /// the sim (sets `finished`); it never runs the cleanup phases itself —
     /// those are run either by the genuine UVM library (which calls `$finish`
     /// after its own extract/check/report/final) or by the event-loop-exit
@@ -76080,7 +75959,7 @@ impl Simulator {
                             }
                         }
                     }
-                    // pure-SV §8.25: a `static` member of a parameterized
+                    // §8.25: a `static` member of a parameterized
                     // class is per-SPECIALIZATION. Reached from an INSTANCE method
                     // (e.g. `uvm_resource#(T)::my_type` via `r.get_type_handle()->
                     // get_type()`) there is no `#(spec)` on the call, so

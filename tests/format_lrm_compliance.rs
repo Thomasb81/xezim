@@ -1,6 +1,6 @@
 //! Issues #24 and #25: LRM §21.2.1 / §21.3 string-formatting compliance.
 //!
-//!   $swrite/$sformat   were a silent no-op in the legacy mode, and only
+//!   $swrite/$sformat   were a silent no-op, and only
 //!                      the FIRST format string in an argument list was
 //!                      honoured — every later argument was dropped.
 //!   %m                 consumed an argument slot, so `$display("%m")` (no
