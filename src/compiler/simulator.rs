@@ -13676,6 +13676,7 @@ impl Simulator {
             compiler.set_ast_fallback(true);
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
+                compiler.set_functions(&self.module.functions);
             compiler.set_params(&self.module.parameters);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
@@ -13721,6 +13722,7 @@ impl Simulator {
                 compiler.set_ast_fallback(false);
                 compiler.set_scope_hint(scope_hint);
                 compiler.set_tasks(&self.module.tasks);
+                compiler.set_functions(&self.module.functions);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
@@ -13746,6 +13748,7 @@ impl Simulator {
                 delay_compiler.set_ast_fallback(false);
                 delay_compiler.set_scope_hint(self.process_scope_hint.get(&pid).cloned());
                 delay_compiler.set_tasks(&self.module.tasks);
+                delay_compiler.set_functions(&self.module.functions);
                 delay_compiler.set_params(&self.module.parameters);
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 delay_compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
@@ -16974,6 +16977,7 @@ impl Simulator {
                     );
                     compiler.set_scope_hint(scope_hint.clone());
                     compiler.set_tasks(&self.module.tasks);
+                compiler.set_functions(&self.module.functions);
                     compiler.set_params(&self.module.parameters);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
