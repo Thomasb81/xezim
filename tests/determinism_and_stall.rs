@@ -135,9 +135,11 @@ module tb;
   end
 endmodule
 "#;
-    std::env::set_var("XEZIM_STALL_LIMIT", "2000");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("XEZIM_STALL_LIMIT", "2000") };
     let sim = run(SRC, &[]);
-    std::env::remove_var("XEZIM_STALL_LIMIT");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("XEZIM_STALL_LIMIT") };
 
     // It stalled at time 0 — it must not have silently "finished" at some later
     // time, and it must not have hung (reaching this line proves that).
@@ -170,9 +172,11 @@ module tb;
   end
 endmodule
 "#;
-    std::env::set_var("XEZIM_STALL_LIMIT", "2000");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("XEZIM_STALL_LIMIT", "2000") };
     let sim = run(SRC, &[]);
-    std::env::remove_var("XEZIM_STALL_LIMIT");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("XEZIM_STALL_LIMIT") };
     assert_eq!(sim.time, 0, "wait-on-true livelock cannot advance time");
 }
 

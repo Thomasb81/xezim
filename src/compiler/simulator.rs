@@ -78,7 +78,7 @@ impl SvRng {
     /// each launch cannot be replayed, so a random failure cannot be debugged.
     fn from_entropy() -> Self {
         use rand::Rng;
-        SvRng::from_seed(rand::rngs::StdRng::from_entropy().gen::<u64>())
+        SvRng::from_seed(rand::rngs::StdRng::from_entropy().r#gen::<u64>())
     }
 
     /// §18.14.2 `get_randstate`: the full state as an implementation-defined
@@ -440,7 +440,7 @@ macro_rules! sim_dbg_eprintln {
 /// + one epoch compare when the dump is active, a single branch otherwise. The
 /// rolling epoch dedups repeat writes within a flush.
 macro_rules! vcd_mark {
-    ($self:ident, $id:expr) => {{
+    ($self:ident, $id:expr_2021) => {{
         if $self.dump_dirty_active {
             let __vm_id = $id;
             if __vm_id < $self.dump_dirty_mark.len()
@@ -454,7 +454,7 @@ macro_rules! vcd_mark {
 }
 
 macro_rules! write_sig {
-    ($self:ident, $id:expr, $val:expr) => {{
+    ($self:ident, $id:expr_2021, $val:expr_2021) => {{
         let __wsig_id = $id;
         let mut __wsig_val = $val;
         // Invariant: a table slot's stored signedness is the signal's DECLARED
@@ -6207,7 +6207,7 @@ impl Simulator {
                 let v = v.trim();
                 if v.eq_ignore_ascii_case("random") {
                     use rand::Rng;
-                    let seed = rand::rngs::StdRng::from_entropy().gen::<u64>();
+                    let seed = rand::rngs::StdRng::from_entropy().r#gen::<u64>();
                     eprintln!("[xezim] random seed: {} (replay with +seed={})", seed, seed);
                     self.rng = SvRng::from_seed(seed);
                 } else if let Ok(seed) = v.parse::<u64>() {
@@ -14752,7 +14752,7 @@ impl Simulator {
         let mut unsupported = false;
         // Immediate blocking write with change detection.
         macro_rules! comb_write_full {
-            ($sig_id:expr, $val:expr) => {{
+            ($sig_id:expr_2021, $val:expr_2021) => {{
                 let sid = $sig_id;
                 if view[sid] != $val {
                     view[sid] = $val;
@@ -20386,7 +20386,7 @@ impl Simulator {
                 .resolved_sensitivities
                 .iter()
                 .zip(w.arm_bits.iter())
-                .filter(|(sid, &armed)| self.signal_table[sid.signal_id].raw_bits() == armed)
+                .filter(|&(ref sid, &armed)| self.signal_table[sid.signal_id].raw_bits() == armed)
                 .map(|(sid, _)| sid.signal_id)
                 .collect();
             let mut visited = std::collections::HashSet::new();
@@ -28467,7 +28467,7 @@ impl Simulator {
             // which is symmetric for hyperedge weight purposes.
             let mut woke_any = false;
             macro_rules! dispatch_block {
-                ($block_idx:expr, $kind:expr) => {{
+                ($block_idx:expr_2021, $kind:expr_2021) => {{
                     let block_idx = $block_idx;
                     // §9.4.2 bit-select term (`@(v[3])`): detection above is per
                     // SIGNAL, so re-test the one bit this block actually watches
@@ -51173,7 +51173,7 @@ impl Simulator {
         // Per-trace-slot change check, shared by the incremental and full paths.
         // Returns the record to emit, if any, and keeps vcd_prev_signals in step.
         macro_rules! check_slot {
-            ($idx:expr) => {{
+            ($idx:expr_2021) => {{
                 let idx = $idx;
                 let id = self.vcd_trace[idx].0;
                 if self.vcd_var_kinds[idx] == VcdVarKind::Event {
@@ -51870,7 +51870,7 @@ impl Simulator {
             let regrandkids: Vec<usize> = self
                 .process_parents
                 .iter()
-                .filter(|(_, &p)| p == child_pid)
+                .filter(|&(_, &p)| p == child_pid)
                 .map(|(&c, _)| c)
                 .collect();
             for c in regrandkids {
@@ -52456,7 +52456,7 @@ impl Simulator {
         // them (`vcd_sink::write_xtrace_timestep`).
         let mut changes: Vec<(Arc<str>, Value, bool, bool)> = Vec::new();
         macro_rules! check_xt_slot {
-            ($idx:expr) => {{
+            ($idx:expr_2021) => {{
                 let idx = $idx;
                 let id = self.xtrace_trace[idx].0;
                 let val = &self.signal_table[id];
@@ -52759,7 +52759,7 @@ impl Simulator {
         // on an unscoped dump dominates everything else (see `dump_dirty`).
         let mut changes: Vec<(FstSignalId, Vec<u8>)> = Vec::new();
         macro_rules! check_fst_slot {
-            ($idx:expr) => {{
+            ($idx:expr_2021) => {{
                 let idx = $idx;
                 let tbl_id = self.fst_trace[idx].0;
                 let val = &self.signal_table[tbl_id];
@@ -54060,7 +54060,7 @@ impl Simulator {
     /// (register dist, branch steps, illegal-instr injection, …) actually vary.
     fn rng_u32(&mut self) -> u32 {
         use rand::Rng;
-        self.cur_rng().gen()
+        self.cur_rng().r#gen()
     }
 
     /// Inclusive random in [lo, hi] (lo>hi yields lo). Backs `$urandom_range`.
@@ -55805,7 +55805,7 @@ impl Simulator {
             .max(1);
         self.set_queue_size(arr, n);
         for i in 0..n {
-            let r: u64 = self.cur_rng().gen();
+            let r: u64 = self.cur_rng().r#gen();
             let masked = if w >= 64 { r } else { r & ((1u64 << w) - 1) };
             self.set_signal_value_by_name(&format!("{}[{}]", arr, i), Value::from_u64(masked, w));
         }
@@ -57219,7 +57219,7 @@ impl Simulator {
             None => {
                 // No stable identity for the target (a foreach element, say):
                 // fall back to an independent weighted draw.
-                let mut draw = self.cur_rng().gen::<u64>() % total;
+                let mut draw = self.cur_rng().r#gen::<u64>() % total;
                 let mut pick = masses.len() - 1;
                 for (i, m) in masses.iter().enumerate() {
                     if draw < *m {
@@ -57342,7 +57342,7 @@ impl Simulator {
             deck.push(best);
         }
         for i in 1..deck.len() {
-            if self.cur_rng().gen::<bool>() {
+            if self.cur_rng().r#gen::<bool>() {
                 deck.swap(i - 1, i);
             }
         }
@@ -57366,7 +57366,7 @@ impl Simulator {
                         // 32'he000_2000]` could never yield anything above
                         // 32'he000_0fff).
                         let span = (h as i128) - (l as i128) + 1;
-                        let pick = (l as i128) + (self.cur_rng().gen::<u64>() as i128) % span;
+                        let pick = (l as i128) + (self.cur_rng().r#gen::<u64>() as i128) % span;
                         let w = lov.width.max(hiv.width).max(32);
                         candidates.push(Value::from_u64(pick as u64, w));
                     }
@@ -57397,7 +57397,7 @@ impl Simulator {
         if candidates.is_empty() {
             None
         } else {
-            Some(candidates[self.cur_rng().gen::<usize>() % candidates.len()].clone())
+            Some(candidates[self.cur_rng().r#gen::<usize>() % candidates.len()].clone())
         }
     }
 
@@ -60502,7 +60502,7 @@ impl Simulator {
                         Value::from_u64(ms[i].1, w)
                     } else if w <= 64 {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                        Value::from_u64(self.cur_rng().gen::<u64>() & mask, w)
+                        Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, w)
                     } else {
                         Value::zero(w)
                     };
@@ -60531,7 +60531,7 @@ impl Simulator {
                         Value::from_u64(ms[k].1, w)
                     } else {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                        Value::from_u64(self.cur_rng().gen::<u64>() & mask, w)
+                        Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, w)
                     };
                     self.set_signal_value_by_name(&format!("{}[{}]", nm, i), rv);
                 }
@@ -60555,7 +60555,7 @@ impl Simulator {
             let w = self.infer_lhs_width(a).max(1);
             let rv = if w <= 64 {
                 let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                Value::from_u64(self.cur_rng().gen::<u64>() & mask, w)
+                Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, w)
             } else {
                 Value::zero(w)
             };
@@ -72219,13 +72219,13 @@ impl Simulator {
         } else {
             (1u64 << width) - 1
         };
-        let mut v = self.rng.gen::<u64>() & mask;
+        let mut v = self.rng.r#gen::<u64>() & mask;
         if mask > 0 {
             for _ in 0..8 {
                 if Some(v) != prev {
                     break;
                 }
-                v = self.rng.gen::<u64>() & mask;
+                v = self.rng.r#gen::<u64>() & mask;
             }
         }
         Value::from_u64(v, width)
@@ -73822,7 +73822,7 @@ impl Simulator {
                             Value::from_u64(members[i].1, *width)
                         }
                     } else if *width <= 64 {
-                        Value::from_u64(self.rng.gen(), *width)
+                        Value::from_u64(self.rng.r#gen(), *width)
                     } else {
                         Value::zero(*width)
                     };
@@ -73897,7 +73897,7 @@ impl Simulator {
                     let v = if *is_randc {
                         let domain = self.randc_domain(&key, *w, et.as_deref(), None);
                         if domain.is_empty() {
-                            Value::from_u64(self.rng.gen::<u64>(), *w)
+                            Value::from_u64(self.rng.r#gen::<u64>(), *w)
                         } else {
                             let pick = self.pick_randc(handle, &key, &domain);
                             Value::from_u64(pick, *w)
@@ -73914,7 +73914,7 @@ impl Simulator {
                             Value::from_u64(mv, *w)
                         }
                     } else if *w <= 64 {
-                        Value::from_u64(self.rng.gen::<u64>(), *w)
+                        Value::from_u64(self.rng.r#gen::<u64>(), *w)
                     } else {
                         Value::zero(*w)
                     };
@@ -74331,7 +74331,7 @@ impl Simulator {
                             }
                         } else {
                             if *width <= 64 {
-                                let r: u64 = self.cur_rng().gen();
+                                let r: u64 = self.cur_rng().r#gen();
                                 val = Value::from_u64(r, *width);
                             }
                         }
@@ -74375,7 +74375,7 @@ impl Simulator {
                         val = Value::from_u64(mv, *width);
                     }
                 } else if *width <= 64 {
-                    val = Value::from_u64(self.cur_rng().gen(), *width);
+                    val = Value::from_u64(self.cur_rng().r#gen(), *width);
                 }
                 val.is_signed = signed_rand_props.contains(name);
                 solved_props.insert(name.clone(), val);
@@ -74761,7 +74761,7 @@ impl Simulator {
                         } else {
                             (1u64 << *width) - 1
                         };
-                        self.cur_rng().gen::<u64>() & mask
+                        self.cur_rng().r#gen::<u64>() & mask
                     } else {
                         0
                     };
@@ -76254,7 +76254,7 @@ impl Simulator {
                             .max(1);
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                         for _try in 0..32 {
-                            let cand = self.cur_rng().gen::<u64>() & mask;
+                            let cand = self.cur_rng().r#gen::<u64>() & mask;
                             if cand != avoid {
                                 self.write_coll_elem(&key, Value::from_u64(cand, w));
                                 return true;
@@ -76312,9 +76312,9 @@ impl Simulator {
                     }
                     for _try in 0..32 {
                         let cand = if width >= 64 {
-                            self.cur_rng().gen::<u64>()
+                            self.cur_rng().r#gen::<u64>()
                         } else {
-                            self.cur_rng().gen::<u64>() & ((1u64 << width) - 1)
+                            self.cur_rng().r#gen::<u64>() & ((1u64 << width) - 1)
                         };
                         if cand != avoid {
                             return self.set_prop_if_changed(
@@ -76621,7 +76621,7 @@ impl Simulator {
                     } else {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                         (0..64)
-                            .map(|_| self.cur_rng().gen::<u64>() & mask)
+                            .map(|_| self.cur_rng().r#gen::<u64>() & mask)
                             .find(|c| !used.contains(c))
                     };
                     if let Some(p) = pick {
@@ -79537,13 +79537,13 @@ impl VpiHandle {
 /// # Safety
 /// `handle` must be NULL or a pointer returned by one of the VPI handle
 /// constructors and not yet freed.
-unsafe fn vpi_deref<'a>(handle: *mut libc::c_void) -> Option<&'a VpiHandle> {
+unsafe fn vpi_deref<'a>(handle: *mut libc::c_void) -> Option<&'a VpiHandle> { unsafe {
     if handle.is_null() {
         None
     } else {
         Some(&*(handle as *const VpiHandle))
     }
-}
+}}
 
 /// The `$systf` invocation currently on the stack. `vpi_handle(vpiSysTfCall,
 /// NULL)` names the innermost one; `vpi_iterate(vpiArgument, ..)` walks its
@@ -79925,7 +79925,7 @@ fn vpi_slice_write(sim: &Simulator, h: &VpiHandle, val: &Value) -> Option<Value>
 /// §35.5.4 DPI export dispatch. The generated trampoline shared object calls
 /// this from C to run an exported SystemVerilog subroutine. `id` is the
 /// subroutine's declaration-order index; `n` args are 64-bit integer slots.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __xezim_dpi_export_dispatch(
     id: libc::c_longlong,
     n: libc::c_longlong,
@@ -79937,7 +79937,7 @@ pub extern "C" fn __xezim_dpi_export_dispatch(
     .unwrap_or(0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_handle_by_name(
     name: *mut libc::c_char,
     _scope: *mut libc::c_void,
@@ -80011,7 +80011,7 @@ fn vpi_memory_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
 }
 
 /// Select one word of a `vpiMemory`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_handle_by_index(
     handle: *mut libc::c_void,
     index: libc::c_int,
@@ -80044,7 +80044,7 @@ pub extern "C" fn vpi_handle_by_index(
 /// `vpi_scan(vpi_iterate(vpiModule, NULL))` — but enough VPI code in the
 /// wild spells it this way that supporting it is worth more than the
 /// purity of returning NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_handle(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
     // The currently executing $systf. A `NULL` reference is the idiomatic
     // spelling; the standard also allows passing the call handle itself.
@@ -80154,7 +80154,7 @@ fn vpi_scope_members(sim: &Simulator, scope: &str) -> Vec<(String, usize)> {
 
 /// Iterate a one-to-many relationship. Returns NULL when the relationship
 /// yields nothing, as the standard requires (callers test for it).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
     // The arguments of a $systf call. Handled before the design traversal
     // below because it needs no simulator, only the call frame.
@@ -80265,7 +80265,7 @@ fn vpi_make_iterator(items: Vec<VpiHandle>) -> *mut libc::c_void {
 /// Hand out the next object of an iterator. When the iterator is exhausted
 /// it is FREED and NULL returned — the caller must not free it itself, per
 /// IEEE 1800-2017 §38.32.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_scan(iter: *mut libc::c_void) -> *mut libc::c_void {
     if iter.is_null() {
         return std::ptr::null_mut();
@@ -80285,7 +80285,7 @@ pub extern "C" fn vpi_scan(iter: *mut libc::c_void) -> *mut libc::c_void {
 
 /// String-valued properties. The returned pointer addresses simulator-owned
 /// storage valid until the next `vpi_get_str` call on this thread.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_str(
     property: libc::c_int,
     handle: *mut libc::c_void,
@@ -80318,7 +80318,7 @@ pub extern "C" fn vpi_get_str(
 }
 
 /// Register a system task or function implemented in a VPI module.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_register_systf(data: *mut s_vpi_systf_data) -> *mut libc::c_void {
     if data.is_null() {
         return std::ptr::null_mut();
@@ -80486,7 +80486,7 @@ pub struct s_vpi_error_info {
 ///
 /// `error_info_p` may be NULL — callers often use `vpi_chk_error(NULL)` purely
 /// as a "did anything fail?" probe.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_chk_error(error_info_p: *mut s_vpi_error_info) -> libc::c_int {
     let taken = VPI_LAST_ERROR.with(|c| c.borrow_mut().take());
     let Some((level, msg)) = taken else { return 0 };
@@ -80522,7 +80522,7 @@ fn vpi_err_scratch(s: &str) -> *mut libc::c_char {
 /// Only vpiStop and vpiFinish do anything: both end the run, exactly as the
 /// corresponding system tasks do. vpiReset is rejected rather than silently
 /// ignored — xezim cannot rewind a simulation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn xezim_vpi_control(operation: libc::c_int, _arg: libc::c_int) -> libc::c_int {
     match operation {
         vpi::STOP | vpi::FINISH => try_active_sim("vpi_control", |sim| {
@@ -80593,7 +80593,7 @@ pub fn vpi_run_startup_routines(libs: &mut Vec<Library>, paths: &[String]) {
 }
 
 /// Free a VPI handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_free_object(handle: *mut libc::c_void) -> libc::c_int {
     if !handle.is_null() {
         drop(unsafe { Box::from_raw(handle as *mut VpiHandle) });
@@ -80603,7 +80603,7 @@ pub extern "C" fn vpi_free_object(handle: *mut libc::c_void) -> libc::c_int {
 
 /// Get a VPI property value. Returns `vpiUndefined` (-1) for a property
 /// xezim does not model, rather than a plausible-looking 0.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> libc::c_int {
     let Some(h) = (unsafe { vpi_deref(handle) }) else {
         return vpi::UNDEFINED;
@@ -80676,7 +80676,7 @@ fn vpi_str_scratch(s: &str) -> *mut libc::c_char {
 /// `vpiVectorVal` was among the ignored ones, which is the format UVM's
 /// HDL backdoor reads with: `uvm_hdl_read` returned success having
 /// written nothing into the caller's buffer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_value) {
     if value_p.is_null() {
         return;
@@ -80892,7 +80892,7 @@ fn dispatch_vpi_cb(
 }
 
 /// Write a signal value via VPI (supports force/release).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_put_value(
     handle: *mut libc::c_void,
     value_p: *mut s_vpi_value,
@@ -81132,7 +81132,7 @@ pub extern "C" fn vpi_put_value(
 /// `time_p->type` chooses the requested representation:
 /// - `vpiSimTime`: fill `high`/`low` and also mirror into `real`
 /// - `vpiScaledRealTime`: fill `real` and also mirror into `high`/`low`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_time(_object: *mut libc::c_void, time_p: *mut s_vpi_time) {
     if time_p.is_null() {
         return;
@@ -81171,7 +81171,7 @@ pub extern "C" fn vpi_get_time(_object: *mut libc::c_void, time_p: *mut s_vpi_ti
 // static product/version string.
 //
 // `info_p` must be allocated by the caller; we fill it in place.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_vlog_info(info_p: *mut s_vpi_vlog_info) -> libc::c_int {
     if info_p.is_null() {
         return 0;
@@ -81198,7 +81198,7 @@ pub extern "C" fn vpi_get_vlog_info(info_p: *mut s_vpi_vlog_info) -> libc::c_int
 //
 // UVM calls this in some legacy code paths; semantically equivalent to
 // `vpi_free_object`. We just delegate to the existing free function.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_release_handle(handle: *mut libc::c_void) -> libc::c_int {
     vpi_free_object(handle)
 }
@@ -81214,7 +81214,7 @@ pub extern "C" fn vpi_release_handle(handle: *mut libc::c_void) -> libc::c_int {
 // returned handle must be freed by `vpi_remove_cb` (which is itself
 // implemented as `vpi_free_object` internally — we leak the `DpiCbHandle`
 // Box from the Rust side).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
     if cb_p.is_null() {
         return std::ptr::null_mut();
@@ -81310,7 +81310,7 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
 //
 // Returns callback registration information for a handle returned by
 // `vpi_register_cb`. Mirrors the fields xezim stores internally.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_cb_info(
     cb_obj: *mut libc::c_void,
     cb_data_p: *mut s_cb_data,
@@ -81362,7 +81362,7 @@ pub extern "C" fn vpi_get_cb_info(
 // Removal scans the per-signal value-change lists and the reset-callback
 // vec. Order is not preserved (UVM doesn't require it). The callback
 // Box is reclaimed here — we don't leak.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
     if cb.is_null() {
         return 0;
@@ -81426,7 +81426,7 @@ pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
 //
 // Returns the DPI version string. UVM uses this for log banners and to
 // decide which DPI features are available.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn svDpiVersion() -> *const libc::c_char {
     // Static C string — no lifetime concerns.
     b"1800-2017\0".as_ptr() as *const libc::c_char
@@ -81443,7 +81443,7 @@ pub extern "C" fn svDpiVersion() -> *const libc::c_char {
 // If the scope name is not found we still return a non-null handle
 // pointing at a new `DpiScope` — UVM is happy with synthetic scopes
 // because it only round-trips them through `svGetNameFromScope`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn svGetScopeFromName(name: *const libc::c_char) -> *mut libc::c_void {
     if name.is_null() {
         return std::ptr::null_mut();
@@ -81473,7 +81473,7 @@ pub extern "C" fn svGetScopeFromName(name: *const libc::c_char) -> *mut libc::c_
 //
 // Recovers the scope name from a handle. UVM round-trips scope handles
 // through this when emitting diagnostics.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn svGetNameFromScope(scope: *mut libc::c_void) -> *const libc::c_char {
     if scope.is_null() {
         return std::ptr::null();
@@ -81497,7 +81497,7 @@ pub extern "C" fn svGetNameFromScope(scope: *mut libc::c_void) -> *const libc::c
 // Returns the currently-active scope set by `svSetScope`. Used by UVM
 // when an import is called and the DPI runtime needs to know "where
 // am I?".
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn svGetScope() -> *mut libc::c_void {
     ACTIVE_SCOPE.with(|cell| cell.get())
 }
@@ -81507,7 +81507,7 @@ pub extern "C" fn svGetScope() -> *mut libc::c_void {
 // Updates the currently-active scope. xezim's exec_dpi_import_call
 // sets the scope to the import's declaration site before invoking the
 // C function, then restores the previous value on the way out.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn svSetScope(scope: *mut libc::c_void) -> *mut libc::c_void {
     let prev = ACTIVE_SCOPE.with(|cell| cell.get());
     ACTIVE_SCOPE.with(|cell| cell.set(scope));

@@ -131,18 +131,18 @@ impl ClockBarrier {
     /// generation number for the round just completed (useful for trace).
     pub fn wait(&self) -> usize {
         let mut state = self.state.lock().unwrap();
-        let gen = state.generation;
+        let r#gen = state.generation;
         state.count += 1;
         if state.count == self.n {
             state.count = 0;
             state.generation = state.generation.wrapping_add(1);
             self.cv.notify_all();
-            gen
+            r#gen
         } else {
-            while state.generation == gen {
+            while state.generation == r#gen {
                 state = self.cv.wait(state).unwrap();
             }
-            gen
+            r#gen
         }
     }
 }
@@ -415,14 +415,14 @@ impl<T: Clone> SignalTable<T> {
 
     /// SAFETY: caller proves no two threads write `id` concurrently.
     #[inline]
-    pub unsafe fn write(&self, id: usize, value: T) {
+    pub unsafe fn write(&self, id: usize, value: T) { unsafe {
         if id < self.len {
             // Use a raw pointer to the element so we never form an
             // `&mut Vec<T>` that aliases other threads' disjoint borrows.
             let ptr: *mut T = (*self.cells.get()).as_mut_ptr();
             std::ptr::write(ptr.add(id), value);
         }
-    }
+    }}
 
     /// Clone the value at `id` (suitable for cross-thread reads after
     /// barrier sync). For T=u64 this is a single load. For T=Value with
@@ -448,9 +448,9 @@ impl<T: Clone> SignalTable<T> {
     /// SAFETY: the slice borrow lives only across the closure call and
     /// no writer threads touch the kernel's owned IDs during that window
     /// (per the per-tick phase contract).
-    pub unsafe fn as_slice(&self) -> &[T] {
+    pub unsafe fn as_slice(&self) -> &[T] { unsafe {
         (*self.cells.get()).as_slice()
-    }
+    }}
 }
 
 // Convenience for the toy: u64 has a `0` default and is Copy, so the
