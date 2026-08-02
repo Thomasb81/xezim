@@ -285,11 +285,15 @@ Common options:
 | `--vpi-lib <path>` (`-m`) | Load a VPI module and run its `vlog_startup_routines` (system-task registration, design walk). Repeatable. |
 | `--module-timescale [mods=]<unit>/<prec>` | Assign a timescale to modules with no explicit source-level one. See [below](#module-timescale-extension). Repeatable. |
 | `--dump-timescales` | Print every module's resolved timescale before the run (no source `$printtimescale` needed); modules with no `` `timescale `` are flagged. See [below](#module-timescale-extension). |
-| `--max-time <N>` | Stop simulation at time `N` (counted in the design's finest time precision) |
+| `--max-time <N>[ps\|ns\|us\|ms\|s]` | Stop simulation after `N` of simulated time — **nanoseconds** when no unit is given. The cap is resolved to whole nanoseconds (a sub-ns value rounds to the nearest one; below half a nanosecond is rejected) and then converted to the design's tick, so the same `--max-time` covers the same simulated time whatever the precision |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
 | `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate standard delays |
-| `--sim_debug` | Print `[DEBUG]` / `[OPT]` diagnostics |
+| `--sim-debug` | Print `[DEBUG]` / `[OPT]` diagnostics (`--sim_debug` still accepted) |
+| `--verbose` | Per-file compile progress: each file as it is parsed, and the modules/blocks it contributed to the working library |
+| `--dump-files-list` | Print the fully resolved file list after `-f` expansion, then exit — confirms *which* sources a build actually reads |
+| `--dump-merged-sv <file>` | Write the sources as one preprocessed, self-contained `.sv`. With `-s <top>`, keeps only the files that top needs. See [below](#reducing-a-multi-file-build) |
+| `--artifact-compression <none\|1-22>` | Compression level for the `-o` compiled artifact (`none` writes it raw) |
 | `--cache-dir <dir>` | Select the automatic elaborated-design cache directory |
 | `--no-cache` | Disable the automatic elaborated-design cache |
 | `-l`, `--log <file>` | Redirect all stdout/stderr — including DPI/VPI C output — to a log file |
@@ -335,6 +339,39 @@ The default directory is `$XEZIM_CACHE_DIR`, then
 `--cache-dir` for a workload-local cache or `--no-cache` for a cold run. Xezim
 prints `[CACHE] miss`, `[CACHE] stored`, or `[CACHE] hit` on stderr.
 
+## Reducing a multi-file build
+
+Three flags answer the questions that come up when a large `-f` build does not
+behave: *which* files were read, *what* each contributed, and *what does the
+code look like after preprocessing*.
+
+```bash
+xezim -f build.args --dump-files-list          # the resolved file list, then exit
+xezim -f build.args -s testbench --verbose     # each file as it is parsed, and what it defined
+xezim --parse -f build.args -s testbench --dump-merged-sv repro.sv
+```
+
+`--dump-merged-sv` writes every source into one self-contained `.sv` with
+`` `ifdef `` branches resolved, macros expanded and `` `include ``s inlined — a
+125-file build becomes a single re-runnable file. Given `-s <top>` it keeps only
+the files that top actually needs, which is what makes the result small enough
+to hand to someone else.
+
+Two properties are worth knowing before relying on it:
+
+* **The reduction is per file, not per module.** A file defining both a module
+  you need and one you do not drags the second one's dependencies in too.
+* **The closure is lexical and runs before parsing**, so the dump still works on
+  a design that does not elaborate — the case the flag exists for. It is
+  conservative in the safe direction: it may keep a file more than strictly
+  needed, never one fewer. Files that declare no design unit at all (a
+  file-scope `typedef`/function, a top-level `bind`) are always kept, since
+  nothing references them by name and dropping them would change behaviour.
+
+Note `--parse` above: the dump is produced before elaboration, so a design whose
+elaboration takes minutes still dumps in seconds. Only the step that appends
+adopted `-v`/`-y` library files needs `--compile` or `--simulate`.
+
 ## Module-timescale extension
 
 `--module-timescale` is an xezim-specific command-line extension. It assigns a
@@ -372,9 +409,18 @@ an explicit timescale, is a warning (the assignment is ignored). Assignments
 apply to a definition, so every instance of it shares the timescale.
 
 Sub-nanosecond precision is honoured — the simulation tick is the finest
-precision declared anywhere in the design, down to `fs`. (`--max-time` is
-counted in that tick, so a `1ps`-precision design covers proportionally less
-wall-clock time for the same `--max-time`.)
+precision declared anywhere in the design, down to `fs`. `--max-time` is
+independent of that: it is given in nanoseconds and converted to the tick, so
+`--max-time 100` stops at 100 ns whether the design runs at `1ns` or `1fs`
+precision. What a finer precision does change is the *number of ticks* covered,
+and hence the wall-clock cost of reaching the same simulated time. Reported
+times (`$time`, the closing `Simulation finished at time …`) are in ticks, so
+the same run prints `100` at `1ns/1ns` and `100000` at `1ns/1ps`.
+
+Because the cap is held in whole nanoseconds, a sub-nanosecond `--max-time`
+(`--max-time 1ps`) is rejected rather than silently rounded to zero. To stop a
+run as early as possible, prefer `--parse` or `--compile`, which never start a
+simulation at all.
 
 ### Inspecting resolved timescales
 
