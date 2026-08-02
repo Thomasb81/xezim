@@ -2812,16 +2812,6 @@ pub struct Simulator {
     virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
     /// `uvm_config_db#(virtual X)::set/get` records the bound interface
     /// interface NAME by scope here, because config_db otherwise flows an opaque
-    /// Value and loses the interface identity (so a config_db-bound vif reads
-    /// non-null but `vif.member`/edge-waits don't resolve). Entries are
-    /// (scope_glob, field, iface_name); get matches scope via UVM glob rules.
-    vif_config_db: Vec<(String, String, String)>,
-    /// Reverse map from the sentinel hash value stored in a local virtual-
-    /// interface variable (by `pure_vif_config_db` GET) back to the bound
-    /// interface-instance name.  This lets `resolve_vif_rhs_name` propagate
-    /// the binding when the local var is later assigned to a class property
-    /// (`wr.vif = v`), without needing a class handle for the key.
-    vif_hash_to_iface: HashMap<u64, String>,
     /// UVM uvm_config_db scope-aware store (in addition to the flat
     /// `__uvm_cfgdb__` signal keys, kept as a fallback). Each set records the
     /// fully-resolved scope pattern `<cntxt.get_full_name()>.<inst_name>`, the
@@ -5613,8 +5603,6 @@ impl Simulator {
             dpi_unresolved: HashSet::default(),
             heap: vec![None], // index 0 is null
             virtual_iface_bindings: HashMap::default(),
-            vif_config_db: Vec::new(),
-            vif_hash_to_iface: HashMap::default(),
             cfgdb_scoped: Vec::new(),
             uvm_obj_count: 0,
             uvm_obj_raised: false,
@@ -54124,8 +54112,7 @@ impl Simulator {
                         // sensitize on the real interface signal.
                         if let Some(iname) = scoped_vif {
                             // Determine (handle, prop) for the destination so we can
-                            // record a virtual_iface_bindings entry — the same logic
-                            // used by the pure_vif_config_db path.
+                            // record a virtual_iface_bindings entry.
                             let hp: Option<(usize, String)> = match &dst.kind {
                                 ExprKind::Ident(h) if h.path.len() == 1 => {
                                     // Single-segment: could be `this.prop` (when inside a
@@ -62259,118 +62246,6 @@ impl Simulator {
         e == re.len()
     }
 
-    /// config_db scope = replicate uvm_config_db: cntxt==null -> uvm_top
-    /// (full_name ""); inst=="" -> cntxt.get_full_name(); else
-    /// {cntxt.get_full_name(), ".", inst} (unless cntxt full is "").
-    fn config_db_scope(&mut self, cntxt: &Expression, inst: &Expression) -> String {
-        let cntxt_h = self.eval_expr(cntxt).to_u64().unwrap_or(0) as usize;
-        let inst_s = self.eval_expr(inst).to_sv_string();
-        let cntxt_full =
-            if cntxt_h != 0 && self.heap.get(cntxt_h).and_then(|o| o.as_ref()).is_some() {
-                self.exec_method_call(cntxt_h, "get_full_name", &[])
-                    .to_sv_string()
-        } else {
-            String::new()
-        };
-        if inst_s.is_empty() {
-            cntxt_full
-        } else if cntxt_full.is_empty() {
-            inst_s
-        } else {
-            format!("{}.{}", cntxt_full, inst_s)
-        }
-    }
-
-    /// (handle, prop) for a config_db get's inout target vif expression.
-    fn vif_target_handle_prop(&self, expr: &Expression) -> Option<(usize, String)> {
-        match &expr.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 => {
-                let handle = self.this_stack.last().copied().flatten().unwrap_or(0);
-                Some((handle, h.path[0].name.name.clone()))
-            }
-            ExprKind::Ident(h) if h.path.len() == 2 => {
-                let oh = self.eval_ident_handle(&h.path[0].name.name).unwrap_or(0);
-                Some((oh, h.path[1].name.name.clone()))
-            }
-            ExprKind::MemberAccess { expr: b, member } => {
-                let oh = self.eval_handle_expr(b).unwrap_or(0);
-                Some((oh, member.name.clone()))
-            }
-            _ => None,
-        }
-    }
-
-    /// `uvm_config_db#(virtual X)::set/get` — carry the interface
-    /// binding (which config_db's value round-trip loses). Returns Some(result)
-    /// only when this is genuinely a virtual-interface set/get; None otherwise
-    /// so the real config_db handles ordinary values.
-    fn pure_vif_config_db(&mut self, is_set: bool, args: &[Expression]) -> Option<Value> {
-        if args.len() < 4 {
-            return None;
-        }
-        // Only a VIRTUAL-INTERFACE config_db (`#(virtual X)`), never an object/
-        // scalar one — gate on the specialization sig so an object config_db
-        // (`#(my_cfg)`) is left entirely to the real config_db.
-        let is_vif_spec = self
-            .current_spec
-            .as_ref()
-            .is_some_and(|(_b, sig)| sig.trim_start().starts_with("virtual"));
-        if !is_vif_spec {
-            return None;
-        }
-        if is_set {
-            // Only a vif set: args[3] resolves to an interface / bound vif.
-            let iface = self.resolve_vif_rhs_name(&args[3])?;
-            let scope = self.config_db_scope(&args[0], &args[1]);
-            let field = self.eval_expr(&args[2]).to_sv_string();
-            self.vif_config_db.push((scope, field, iface));
-            Some(Value::zero(32))
-        } else {
-            // GET: detect a vif get by a RECORDED vif set for this field+scope
-            // (the target may be a class vif PROPERTY or a plain LOCAL variable —
-            // the interrupt examples get into a local `temp_int_if`). No match →
-            // return None so the real config_db handles ordinary values.
-            let field = self.eval_expr(&args[2]).to_sv_string();
-            let query = self.config_db_scope(&args[0], &args[1]);
-            let mut found: Option<String> = None;
-            for (scope, f, iface) in &self.vif_config_db {
-                if *f == field && Self::uvm_glob_match(scope, &query) {
-                    found = Some(iface.clone());
-                }
-            }
-            let iface = found?;
-            // Record the (handle, prop) binding when the target is a declared
-            // class vif property, so `obj.vif.member` resolves. A local target
-            // has no such key; the value assignment below still satisfies
-            // existence/null checks (`vif != null`, "handle 0 not found").
-            if let Some((t_handle, t_prop)) = self.vif_target_handle_prop(&args[3]) {
-                let vif_prop = self
-                    .heap
-                    .get(t_handle)
-                    .and_then(|o| o.as_ref())
-                    .map(|i| i.class_name.clone())
-                    .and_then(|cls| self.module.classes.get(&cls))
-                    .and_then(|cd| cd.virtual_iface_properties.get(&t_prop).cloned());
-                if let Some((_t, modport)) = vif_prop {
-                    self.virtual_iface_bindings
-                        .insert((t_handle, t_prop), (iface.clone(), modport));
-                }
-            }
-            let mut h: u64 = 0xcbf29ce484222325;
-            for b in iface.bytes() {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
-            let sentinel: u64 = (h & 0x7FFF_FFFF) | 1;
-            // Record hash→iface so resolve_vif_rhs_name can propagate the
-            // binding when a local var holding this sentinel is later assigned
-            // to a class property (`wr.vif = v`).
-            self.vif_hash_to_iface.insert(sentinel, iface.clone());
-            self.assign_value(&args[3], &Value::from_u64(sentinel, 32));
-            Some(Value::from_u64(1, 32))
-        }
-    }
-
     fn resolve_vif_rhs_name(&self, rvalue: &Expression) -> Option<String> {
         match &rvalue.kind {
             // `v` — a bound vif of the current `this`, else a vif
@@ -64009,29 +63884,6 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &expr.kind {
                     if h.path.len() == 1 && h.path[0].name.name == "std" {
                         return self.exec_std_randomize(args);
-                    }
-                }
-            }
-
-            // `uvm_config_db#(T)::set/get/exists(cntxt, inst, field, value)`.
-            // Real UVM routes this through the resource pool, which the direct
-            // phaser does not fully drive; service it with a simple field-keyed
-            // store so set/get round-trips (riscv-dv passes the cfg this way).
-            // Preserve the virtual-interface binding across config_db
-            // (the value round-trip loses the iface identity).
-            if matches!(mname, "set" | "get") {
-                fn find_config_db2(e: &Expression) -> bool {
-                    match &e.kind {
-                        ExprKind::Ident(h) => {
-                            h.path.iter().any(|s| s.name.name.contains("config_db"))
-                        }
-                        ExprKind::MemberAccess { expr: b, .. } => find_config_db2(b),
-                        _ => false,
-                    }
-                }
-                if find_config_db2(expr) {
-                    if let Some(v) = self.pure_vif_config_db(mname == "set", args) {
-                        return v;
                     }
                 }
             }
