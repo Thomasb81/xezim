@@ -24809,8 +24809,9 @@ impl Simulator {
                         // above only covers a bare field on `this`.
                         if let Some(expr) = Self::event_control_single_expr(event) {
                             if let Some(key) = self.expr_handle_event_field(&expr) {
-                                let mut cont = vec![*body.clone()];
-                                cont.extend_from_slice(&stmts[i + 1..]);
+                                let cont = vec![*body.clone()];
+                                // Chain the caller's tail rather than copying it.
+                                let cont = pc.pushed(cont, pc.start + i + 1);
                                 self.instance_event_waiters.push(InstanceEventWaiter {
                                     key,
                                     pid,
@@ -24833,8 +24834,9 @@ impl Simulator {
                         if let Some(key) = self.event_control_event_key(event) {
                             let canon = self.resolve_event_key(&key);
                             if self.signal_name_to_id.contains_key(canon.as_str()) {
-                                let mut cont = vec![*body.clone()];
-                                cont.extend_from_slice(&stmts[i + 1..]);
+                                let cont = vec![*body.clone()];
+                                // Chain the caller's tail rather than copying it.
+                                let cont = pc.pushed(cont, pc.start + i + 1);
                                 let sens = vec![Sensitivity {
                                     signal_name: canon,
                                     edge: EdgeKind::AnyEdge,
@@ -26347,7 +26349,7 @@ impl Simulator {
             self.break_flag = false;
             let after_stmts: Vec<Statement> = after.to_vec();
             if !after_stmts.is_empty() {
-                self.run_process_stmts(pid, &after_stmts);
+                self.run_process_stmts(pid, &ProcCont::from_vec(after_stmts));
             }
             return;
         }
@@ -41437,7 +41439,7 @@ impl Simulator {
                         self.next_pid += 1;
                         self.process_origin
                             .insert(child, (stmt.span, "intra-assignment event NBA"));
-                        self.event_queue.schedule(self.time, child, cont);
+                        self.event_queue.schedule(self.time, child, cont.into());
                         return;
                     }
                 }
