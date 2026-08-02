@@ -139,6 +139,9 @@ fn print_usage() {
     eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)");
     eprintln!("                    (default: $XEZIM_CACHE_DIR or $XDG_CACHE_HOME/xezim/designs).");
     eprintln!("  --no-cache       Force-disable the design cache (default; XEZIM_NO_CACHE=1 too).");
+    eprintln!("  --artifact-compression <none|1-22>  -o artifact compression: 'none' writes raw");
+    eprintln!("                   bincode (larger file, fastest load); 1-22 sets the zstd level");
+    eprintln!("                   (default 3). Both kinds are auto-detected when loading.");
     eprintln!("  --cache-compression-level <1-22>  Set zstd compression level for cache files");
     eprintln!("                   (default: 3). Higher = better compression but slower.");
     eprintln!("                   Can also be set via XEZIM_CACHE_COMPRESSION_LEVEL=N.");
@@ -792,6 +795,14 @@ fn print_design_summary(
     row("Packages:", elab.packages.len(), u_pkg);
     row("UDP instances:", elab.udp_instances.len(), u_udp);
     row("Classes:", elab.classes.len(), u_cls);
+    // Distinct hierarchical scopes among the flattened signal names — the
+    // closest analogue of a vendor elaborator's "instances" count.
+    let scopes: std::collections::HashSet<&str> = elab
+        .signals
+        .keys()
+        .filter_map(|n| n.rfind('.').map(|i| &n[..i]))
+        .collect();
+    println!("  {:<28}{:>12}", "Instance scopes:", scopes.len());
     println!("  {:<28}{:>12}", "Signals:", elab.signals.len());
     println!(
         "  {:<28}{:>12}  ({} elements)",
@@ -800,13 +811,24 @@ fn print_design_summary(
         arr_elems
     );
     println!("  {:<28}{:>12}", "Named events:", elab.events.len());
-    println!("  {:<28}{:>12}", "Always blocks:", elab.always_blocks.len());
-    println!("  {:<28}{:>12}", "Initial blocks:", elab.initial_blocks.len());
+    // Inlined-instance blocks live in the lazily-materialized pending_* vecs
+    // until the bytecode compiler drains them — count BOTH, or a big design
+    // reports "1 always block" while 66k sit pending.
+    println!(
+        "  {:<28}{:>12}",
+        "Always blocks:",
+        elab.always_blocks.len() + elab.pending_always.len()
+    );
+    println!(
+        "  {:<28}{:>12}",
+        "Initial blocks:",
+        elab.initial_blocks.len() + elab.pending_initial.len()
+    );
     println!("  {:<28}{:>12}", "Final blocks:", elab.final_blocks.len());
     println!(
         "  {:<28}{:>12}",
         "Cont. assignments:",
-        elab.continuous_assigns.len()
+        elab.continuous_assigns.len() + elab.pending_cont_assign.len()
     );
     println!("  {:<28}{:>12}", "Functions:", elab.functions.len());
     println!("  {:<28}{:>12}", "Tasks:", elab.tasks.len());
@@ -849,6 +871,60 @@ fn print_resource_usage(wall_start: std::time::Instant) {
     if !peak.is_empty() || !cur.is_empty() {
         println!("xezim: Memory Usage - Current: {}, Peak: {}", cur, peak);
     }
+}
+
+/// `--dump-merged-sv` phase 2: after elaboration, append the `-v`/`-y`
+/// library files whose definitions were actually ADOPTED — with them inlined
+/// the merged file rebuilds standalone, with no -v/-y flags. Whole files are
+/// appended (a cell library groups related primitives); if one also defines a
+/// name the primary sources already define, the re-compile will say so.
+fn append_adopted_libs_to_merged(merged_out: &str) {
+    let adopted = xezim::adopted_lib_files();
+    if adopted.is_empty() {
+        return;
+    }
+    let mut extra = String::new();
+    let mut nfiles = 0usize;
+    let mut nmods = 0usize;
+    for (path, mods) in &adopted {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                nfiles += 1;
+                nmods += mods.len();
+                extra.push_str(&format!(
+                    "\n// ===== adopted library file: {} (needed for: {}) =====\n",
+                    path.display(),
+                    mods.join(", ")
+                ));
+                extra.push_str(&String::from_utf8_lossy(&bytes));
+                if !extra.ends_with('\n') {
+                    extra.push('\n');
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: --dump-merged-sv could not append library '{}': {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+    if nfiles == 0 {
+        return;
+    }
+    if let Err(e) = std::fs::OpenOptions::new()
+        .append(true)
+        .open(merged_out)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, extra.as_bytes()))
+    {
+        eprintln!("Warning: cannot append libraries to '{}': {}", merged_out, e);
+        return;
+    }
+    println!(
+        "Appended {} adopted library file(s) ({} definition(s)) to {}",
+        nfiles, nmods, merged_out
+    );
 }
 
 fn main() {
@@ -1447,6 +1523,35 @@ fn main() {
             "--cache" => {
                 // Explicit opt-in to the experimental warm-start cache.
                 design_cache_enabled = true;
+            }
+            // Artifact (-o) compression: `none` writes raw bincode (larger,
+            // instant load); a number is a zstd level. Default: zstd level 3.
+            "--artifact-compression" => {
+                i += 1;
+                let v = args.get(i).cloned().unwrap_or_default();
+                match v.as_str() {
+                    "none" | "off" | "0" => xezim_core::set_artifact_uncompressed(true),
+                    _ => match v.parse::<i32>() {
+                        Ok(n) if (1..=22).contains(&n) => xezim_core::set_zstd_level(n),
+                        _ => {
+                            eprintln!("Error: --artifact-compression takes 'none' or a zstd level 1-22");
+                            std::process::exit(1);
+                        }
+                    },
+                }
+            }
+            _ if arg.starts_with("--artifact-compression=") => {
+                let v = &arg["--artifact-compression=".len()..];
+                match v {
+                    "none" | "off" | "0" => xezim_core::set_artifact_uncompressed(true),
+                    _ => match v.parse::<i32>() {
+                        Ok(n) if (1..=22).contains(&n) => xezim_core::set_zstd_level(n),
+                        _ => {
+                            eprintln!("Error: --artifact-compression takes 'none' or a zstd level 1-22");
+                            std::process::exit(1);
+                        }
+                    },
+                }
             }
             "--cache-compression-level" => {
                 i += 1;
@@ -2062,6 +2167,14 @@ suppressed but the explicit SDF annotation still applies."
                     std::process::exit(1);
                 }
                 println!("Elaboration successful");
+                if std::env::var("XZ_INST_PROF").is_ok() {
+                    // Per-instantiation elaboration section timings (also
+                    // prints one [IPROF] line per instance).
+                    xezim::compiler::elaborate::iprof_dump();
+                }
+                if let Some(ref mo) = dump_merged_sv {
+                    append_adopted_libs_to_merged(mo);
+                }
                 print_design_summary(&_defs, &elab);
                 print_resource_usage(compile_wall_start);
                 // §6.21: keep compiled artifacts consistent with the simulate
@@ -2152,6 +2265,9 @@ suppressed but the explicit SDF annotation still applies."
     ) {
         Ok(sim) => {
             println!("------------------------------");
+            if let Some(ref mo) = dump_merged_sv {
+                append_adopted_libs_to_merged(mo);
+            }
             println!("Simulation finished at time {}", sim.time);
             if sim.finished {
                 println!("($finish called)");
