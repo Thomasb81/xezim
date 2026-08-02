@@ -3959,11 +3959,7 @@ pub struct Simulator {
     pub activity_mon: bool,
     /// Runtime plusargs passed from CLI/filelists (e.g. +FOO, +BAR=1).
     plusargs: Vec<String>,
-    /// Iteration cursor for `uvm_dpi_get_next_arg` — command line processors
-    /// drain the arg list one entry per call (resetting when its `init` arg is
-    /// non-zero). Backed by `plusargs` so `cmdline_processor::get_arg_value`
-    /// (e.g. `+num_of_tests=`) works under non-DPI modes.
-    dpi_arg_cursor: usize,
+
     /// Owned copies of every CLI arg as `CString`s. Required so that
     /// `vpi_argv` (raw `*mut c_char` pointers into these buffers) stays
     /// valid for the lifetime of the simulator — `vpi_get_vlog_info` hands
@@ -5905,7 +5901,7 @@ impl Simulator {
             signal_toggle_counts: Vec::new(),
             activity_mon: false,
             plusargs: Vec::new(),
-            dpi_arg_cursor: 0,
+
             // Default to a single-element argv so vpi_get_vlog_info
             // always returns at least argc=1 / argv[0]="xezim" even
             // when callers forget to call set_args. Real callers
@@ -23709,16 +23705,7 @@ impl Simulator {
                 }
             }
 
-            // Bridge an objection sync call `objn.wait_for(evt, obj)`
-            // to a condition-wait on the objection total (see
-            // bridge_objection_wait_for). Must run BEFORE Stage 1b would
-            // inline wait_for's real body.
-            if let Some(wait_stmts) = self.bridge_objection_wait_for(stmt) {
-                let mut cont = wait_stmts;
-                cont.extend_from_slice(&stmts[i + 1..]);
-                self.run_process_stmts(pid, &cont);
-                return;
-            }
+
 
             // Stage 0: normalize a parenless task/method call (LRM §13.5
             // footnote 42 + §13.5.5: parentheses may be omitted for tasks, void
@@ -23868,38 +23855,7 @@ impl Simulator {
                                 .then(|| self.module.tasks.get(&h.path[0].name.name).cloned())
                                 .flatten()
                             {
-                                // A bare `run_test(name)` call resolves (via
-                                // module.tasks) to `uvm_root::run_test`'s body,
-                                // which is a METHOD — the uvm_globals.svh wrapper
-                                // does `top = cs.get_root(); top.run_test(name)`.
-                                // Inline it WITH `this` bound to the uvm_root
-                                // singleton; without a `this`, its member
-                                // accesses (m_children, m_phase_*) resolve
-                                // against nothing, so `m_children.num()==0` and
-                                // the body bails at the NOCOMP fatal before
-                                // ever reaching the phase-runner fork.
-                                if td.name.name.name == "run_test"
-                                    && self.stmts_have_blocking(&td.items)
-                                {
-                                    let root_h = self
-                                        .exec_static_method("uvm_root", "get", &[])
-                                        .and_then(|v| v.to_u64())
-                                        .map(|h| h as usize)
-                                        .filter(|h| *h != 0);
-                                    if let Some(rh) = root_h {
-                                        let mut cleanup = self.bind_task_frame(&td, args);
-                                        self.push_task_method_this(Some(rh), "uvm_root".to_string(), &mut cleanup);
-                                        self.task_cleanup.push(cleanup);
-                                        let mut cont: Vec<Statement> = td.items.clone();
-                                        cont.push(Statement::new(
-                                            StatementKind::ScopePop,
-                                            stmt.span,
-                                        ));
-                                        cont.extend_from_slice(&stmts[i + 1..]);
-                                        self.run_process_stmts(pid, &cont);
-                                        return;
-                                    }
-                                }
+
                                 if self.stmts_have_blocking(&td.items) {
                                     let cleanup = self.bind_task_frame(&td, args);
                                     self.task_cleanup.push(cleanup);
@@ -25655,160 +25611,7 @@ impl Simulator {
         )
     }
 
-    /// Bridge: rewrite a genuine-UVM objection sync call
-    /// `objn.wait_for(evt, obj)` into condition-wait(s) on the objection total.
-    ///
-    /// The real `uvm_objection::wait_for` blocks on
-    /// `@(m_events[obj].all_dropped)` — a plain SV `event` MEMBER of an
-    /// assoc-array-indexed object — which xezim can't key (only
-    /// simple-Identifier named events resolve to a signal), so the `@`
-    /// returns immediately and the phase-end loop spins at t0. Bridging to a
-    /// condition-wait on the (working) objection total lets the calling process
-    /// PARK (so time advances to the drop) and wake when the total moves.
-    ///
-    /// `evt` may be a *literal* (`UVM_ALL_DROPPED`) or a *runtime enum
-    /// variable*. The literal form appears in `execute_phase`
-    /// (`phase_done.wait_for(UVM_ALL_DROPPED, top)`); the variable form appears
-    /// after `uvm_phase_hopper::wait_for_objection(objt_event, obj)` is inlined
-    /// and routes its parameter through to the inner `objection.wait_for(...)`
-    /// — which is the call that ends `run_phases`. The variable case is why a
-    /// literal-only matcher missed it and `run_phases` fell through to the
-    /// empty-sensitivity `@()` and ended the schedule at t0.
-    ///
-    /// Semantics:
-    ///   - UVM_ALL_DROPPED (4): `wait(total > 0); wait(total == 0)`. The
-    ///     two-step idiom is required because `run_phases` reaches this wait
-    ///     BEFORE the run phase has raised (total is 0 at entry); a bare
-    ///     `wait(total == 0)` would return immediately and finish at t0.
-    ///     `execute_phase`'s call is already gated on `total > 0` in the SV, so
-    ///     the first wait passes through there.
-    ///   - UVM_RAISED (1): `wait(total > 0)`.
-    ///
-    /// Returns the synthesized wait statement(s), or None if `stmt` is not an
-    /// objection `wait_for` call (so other `wait_for`-named methods —
-    /// uvm_event/barrier — are never hijacked).
-    fn bridge_objection_wait_for(&mut self, stmt: &Statement) -> Option<Vec<Statement>> {
-        let (recv, obj, evt_expr) = Self::match_objection_wait_call(stmt)?;
-        // Resolve the event: literal enum ident first, else evaluate the
-        // (inlined-parameter) variable to its enum integer.
-        let evt_int: Option<u64> = match &evt_expr.kind {
-            ExprKind::Ident(h) => match h.path.last().map(|s| s.name.name.as_str()) {
-                Some("UVM_ALL_DROPPED") => Some(4),
-                Some("UVM_DROPPED") => Some(2),
-                Some("UVM_RAISED") => Some(1),
-                _ => None,
-            },
-            _ => None,
-        };
-        let evt_int = match evt_int {
-            Some(v) => v,
-            None => self.eval_expr(&evt_expr).to_u64()?,
-        };
-        let span = stmt.span;
-        let total = Self::objection_total_call_expr(&recv, obj.as_ref(), span);
-        let zero = Expression::new(
-            ExprKind::Number(NumberLiteral::Integer {
-                size: None,
-                signed: false,
-                base: NumberBase::Decimal,
-                value: "0".to_string(),
-                cached_val: Cell::new(None),
-            }),
-            span,
-        );
-        let mk_wait = |op, span: crate::ast::Span| {
-            let cond = Expression::new(
-                ExprKind::Binary {
-                    op,
-                    left: Box::new(total.clone()),
-                    right: Box::new(zero.clone()),
-                },
-                span,
-            );
-            Statement::new(
-                StatementKind::Wait {
-                    condition: cond,
-                    stmt: Box::new(Statement::new(StatementKind::Null, span)),
-                },
-                span,
-            )
-        };
-        if evt_int == 4 {
-            // wait(total > 0); wait(total == 0);
-            Some(vec![
-                mk_wait(BinaryOp::Gt, span),
-                mk_wait(BinaryOp::Eq, span),
-            ])
-        } else {
-            // UVM_RAISED / UVM_DROPPED: wait(total > 0)
-            Some(vec![mk_wait(BinaryOp::Gt, span)])
-        }
-    }
 
-    /// Build `<recv>.get_objection_total(<obj>)` as an expression.
-    fn objection_total_call_expr(
-        recv: &Expression,
-        obj: Option<&Expression>,
-        span: crate::ast::Span,
-    ) -> Expression {
-        let func = Expression::new(
-            ExprKind::MemberAccess {
-                expr: Box::new(recv.clone()),
-                member: crate::ast::Identifier {
-                    name: "get_objection_total".to_string(),
-                    span,
-                },
-            },
-            span,
-        );
-        let args: Vec<Expression> = obj.cloned().into_iter().collect();
-        Expression::new(
-            ExprKind::Call {
-                func: Box::new(func),
-                args,
-            },
-            span,
-        )
-    }
-
-    /// Recognise an objection `objn.wait_for(evt, obj)` call statement and
-    /// return `(receiver, obj_arg, evt_expr)`. The event argument is returned
-    /// UNRESOLVED — `bridge_objection_wait_for` resolves it (literal ident OR
-    /// a runtime enum variable, after the genuine library routes
-    /// `wait_for_objection`'s parameter through). Only `wait_for`-named methods
-    /// on a receiver match; other `wait_for` methods (e.g. event/barrier) have no
-    /// receiver-shaped `objn` and are handled by their own machinery.
-    fn match_objection_wait_call(
-        stmt: &Statement,
-    ) -> Option<(Expression, Option<Expression>, Expression)> {
-        let expr = match &stmt.kind {
-            StatementKind::Expr(e) => e,
-            _ => return None,
-        };
-        let (func, args) = match &expr.kind {
-            ExprKind::Call { func, args } => (func, args),
-            _ => return None,
-        };
-        if args.is_empty() {
-            return None;
-        }
-        let (recv, method) = match &func.kind {
-            ExprKind::MemberAccess { expr: r, member } => ((**r).clone(), member.name.clone()),
-            ExprKind::Ident(h) if h.path.len() >= 2 => {
-                let mut head = h.clone();
-                let last = head.path.pop().unwrap();
-                (
-                    Expression::new(ExprKind::Ident(head), expr.span),
-                    last.name.name,
-                )
-            }
-            _ => return None,
-        };
-        if method != "wait_for" {
-            return None;
-        }
-        Some((recv, args.get(1).cloned(), args[0].clone()))
-    }
 
     /// Is `s` a (potentially blocking) mailbox `get`/`peek` call — `mb.get(v)`
     /// or `mb.peek(v)` (either MemberAccess or flattened hier-Ident form)? Such
@@ -62243,50 +62046,7 @@ impl Simulator {
     /// virtual interface yields its current target (vif-to-vif copy); a plain
     /// interface-instance ident yields its own name. Returns None when the RHS
     /// is neither (so the caller falls back to a normal value assignment).
-    /// Verilog glob match (`uvm_re_match`-style, returning 0 on match).
-    /// `*` = any run, `?` = any one char.
-    fn uvm_glob_match(pattern: &str, s: &str) -> bool {
-        let re_full: Vec<u8> = pattern.bytes().collect();
-        if re_full.is_empty() {
-            return true; // uvm: re.len()==0 -> return 0 (match)
-        }
-        let re: &[u8] = if re_full[0] == b'^' {
-            &re_full[1..]
-        } else {
-            &re_full[..]
-        };
-        let sb: Vec<u8> = s.bytes().collect();
-        let g = |v: &[u8], i: usize| -> u8 { *v.get(i).unwrap_or(&0) };
-        let (mut e, mut si, mut es, mut ss) = (0usize, 0usize, 0usize, 0usize);
-        while si != sb.len() && g(re, e) != b'*' {
-            if g(re, e) != g(&sb, si) && g(re, e) != b'?' {
-                return false;
-            }
-            e += 1;
-            si += 1;
-        }
-        while si != sb.len() {
-            if g(re, e) == b'*' {
-                e += 1;
-                if e == re.len() {
-                    return true;
-                }
-                es = e;
-                ss = si + 1;
-            } else if g(re, e) == g(&sb, si) || g(re, e) == b'?' {
-                e += 1;
-                si += 1;
-            } else {
-                e = es;
-                si = ss;
-                ss += 1;
-            }
-        }
-        while e < re.len() && g(re, e) == b'*' {
-            e += 1;
-        }
-        e == re.len()
-    }
+
 
     fn resolve_vif_rhs_name(&self, rvalue: &Expression) -> Option<String> {
         match &rvalue.kind {
@@ -66416,31 +66176,7 @@ impl Simulator {
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
         let normalized = Self::normalize_call_args(&fd.ports, args);
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
-        // Serve command-line iterator queries from `plusargs` so the
-        // application sees the real `+arg=val` list (`+num_of_tests=`, etc.).
-        if fd.name.name.name == "uvm_dpi_get_next_arg" {
-            let reset = args
-                .first()
-                .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) != 0)
-                .unwrap_or(false);
-            if reset {
-                self.dpi_arg_cursor = 0;
-            }
-            // Command-line processors iterate over ALL argv entries (binary name,
-            // flags, and plusargs) via `uvm_dpi_get_next_arg`. The C implementation
-            // uses `vpi_get_vlog_info` which returns the full argv. We must do the
-            // same — iterate over `vpi_arg_cstrings` (set by `set_args`), not just
-            // plusargs, so argument lists are populated correctly.
-            if self.dpi_arg_cursor < self.vpi_arg_cstrings.len() {
-                let s = self.vpi_arg_cstrings[self.dpi_arg_cursor]
-                    .to_str()
-                    .unwrap_or("")
-                    .to_string();
-                self.dpi_arg_cursor += 1;
-                return Value::from_string(&s);
-            }
-            return Value::from_string("");
-        }
+
 
         // Set up local scope with parameters
         let mut locals = HashMap::default();
@@ -69258,105 +68994,7 @@ impl Simulator {
             }
             return self.exec_randomize(handle);
         }
-        // Command-line processor arg queries. Command line processors fill arg lists
-        // via DPI, so serve these directly from the full argv — `m_argv` contains
-        // ALL args (binary name, flags, plusargs), not just `+` prefixed ones.
-        if matches!(
-            method_name,
-            "get_arg_value" | "get_arg_values" | "get_args" | "get_plusargs"
-        ) {
-            let cname = self
-                .heap
-                .get(handle)
-                .and_then(|o| o.as_ref())
-                .map(|i| i.class_name.clone())
-                .unwrap_or_default();
-            if cname == "uvm_cmdline_processor" {
-                // Build m_argv (all args) and m_plus_argv (only + prefixed)
-                // from vpi_arg_cstrings, mirroring uvm_cmdline_processor::new().
-                let m_argv: Vec<String> = self
-                    .vpi_arg_cstrings
-                    .iter()
-                    .map(|cs| cs.to_str().unwrap_or("").to_string())
-                    .collect();
-                let m_plus_argv: Vec<String> = m_argv
-                    .iter()
-                    .filter(|a| a.starts_with('+'))
-                    .cloned()
-                    .collect();
-                match method_name {
-                    "get_arg_value" => {
-                        let m = self.eval_expr(&args[0]).to_sv_string();
-                        let mut count = 0u64;
-                        let mut first_val: Option<String> = None;
-                        for a in &m_argv {
-                            if a.starts_with(&m) {
-                                count += 1;
-                                if first_val.is_none() {
-                                    first_val = Some(a[m.len()..].to_string());
-                                }
-                            }
-                        }
-                        if let (Some(v), Some(dst)) = (first_val, args.get(1)) {
-                            self.assign_value(dst, &Value::from_string(&v));
-                        }
-                        return Value::from_u64(count, 32);
-                    }
-                    "get_arg_values" => {
-                        let m = self.eval_expr(&args[0]).to_sv_string();
-                        let vals: Vec<String> = m_argv
-                            .iter()
-                            .filter(|a| a.starts_with(&m))
-                            .map(|a| a[m.len()..].to_string())
-                            .collect();
-                        if let Some(dst) = args.get(1) {
-                            if let ExprKind::Ident(h) = &dst.kind {
-                                let nm = self.resolve_hier_name(h);
-                                for (i, v) in vals.iter().enumerate() {
-                                    self.set_signal_value_by_name(
-                                        &format!("{}[{}]", nm, i),
-                                        Value::from_string(v),
-                                    );
-                                }
-                                self.set_queue_size(&nm, vals.len() as u64);
-                            }
-                        }
-                        return Value::from_u64(vals.len() as u64, 32);
-                    }
-                    "get_args" => {
-                        if let Some(dst) = args.first() {
-                            if let ExprKind::Ident(h) = &dst.kind {
-                                let nm = self.resolve_hier_name(h);
-                                for (i, v) in m_argv.iter().enumerate() {
-                                    self.set_signal_value_by_name(
-                                        &format!("{}[{}]", nm, i),
-                                        Value::from_string(v),
-                                    );
-                                }
-                                self.set_queue_size(&nm, m_argv.len() as u64);
-                            }
-                        }
-                        return Value::zero(32);
-                    }
-                    "get_plusargs" => {
-                        if let Some(dst) = args.first() {
-                            if let ExprKind::Ident(h) = &dst.kind {
-                                let nm = self.resolve_hier_name(h);
-                                for (i, v) in m_plus_argv.iter().enumerate() {
-                                    self.set_signal_value_by_name(
-                                        &format!("{}[{}]", nm, i),
-                                        Value::from_string(v),
-                                    );
-                                }
-                                self.set_queue_size(&nm, m_plus_argv.len() as u64);
-                            }
-                        }
-                        return Value::zero(32);
-                    }
-                    _ => {}
-                }
-            }
-        }
+
         // Built-in mailbox / semaphore methods
         if self.mailboxes.contains_key(&handle) {
             match method_name {
