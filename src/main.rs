@@ -109,11 +109,25 @@ fn print_usage() {
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
-    eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
+    eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
+    eprintln!("  --verbose        Per-file compile progress: each file as it is parsed and the");
+    eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
+    eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
+    eprintln!("                     sources in parse order, -v library files, -y library dirs");
+    eprintln!("  --dump-merged-sv <file>  Write ALL sources, fully preprocessed (`ifdef");
+    eprintln!("                     resolved, macros expanded, `includes inlined), into one");
+    eprintln!("                     self-contained .sv file — a standalone repro for");
+    eprintln!("                     debugging parse/elaboration problems in -f builds");
     eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
+    eprintln!("  --x-warn         Warn when a signal holding a valid 0/1 value takes an x bit");
+    eprintln!("                   after time 0, naming the signal, its instance/module and its");
+    eprintln!("                   drivers. Signals x/z from the start are never reported.");
+    eprintln!("                   Also enabled by +X_WARN or X_WARN=1 in the environment.");
+    eprintln!("  --x-warn-limit N Cap --x-warn reports at N (default 50, 0 = unlimited).");
+    eprintln!("                   Also settable as X_WARN_LIMIT=N.");
     eprintln!("  --module-timescale <unit>/<prec>            Timescale for every module with no");
     eprintln!("                     [mod1,mod2=]<unit>/<prec>   explicit source-level timescale (the");
     eprintln!("                     named form limits it to the listed modules). Repeatable. Never");
@@ -125,6 +139,9 @@ fn print_usage() {
     eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)");
     eprintln!("                    (default: $XEZIM_CACHE_DIR or $XDG_CACHE_HOME/xezim/designs).");
     eprintln!("  --no-cache       Force-disable the design cache (default; XEZIM_NO_CACHE=1 too).");
+    eprintln!("  --artifact-compression <none|1-22>  -o artifact compression: 'none' writes raw");
+    eprintln!("                   bincode (larger file, fastest load); 1-22 sets the zstd level");
+    eprintln!("                   (default 3). Both kinds are auto-detected when loading.");
     eprintln!("  --cache-compression-level <1-22>  Set zstd compression level for cache files");
     eprintln!("                   (default: 3). Higher = better compression but slower.");
     eprintln!("                   Can also be set via XEZIM_CACHE_COMPRESSION_LEVEL=N.");
@@ -742,7 +759,176 @@ fn redirect_stdio_to_log(path: &str) -> std::io::Result<()> {
     ))
 }
 
+/// Post-elaboration design summary (vendor-elaborator style). xezim inlines
+/// the hierarchy into one flat module, so the left column counts FLATTENED
+/// runtime objects and the right column counts unique parsed definitions —
+/// a sanity check that the whole design was analyzed.
+fn print_design_summary(
+    defs: &std::collections::HashMap<
+        String,
+        xezim::SourceDefinition,
+        impl std::hash::BuildHasher,
+    >,
+    elab: &xezim::compiler::ElaboratedModule,
+) {
+    use xezim::SourceDefinition as SD;
+    let uniq = |f: &dyn Fn(&SD) -> bool| defs.values().filter(|d| f(d)).count();
+    let u_mod = uniq(&|d| matches!(d, SD::Module(_)));
+    let u_ifc = uniq(&|d| matches!(d, SD::Interface(_)));
+    let u_prog = uniq(&|d| matches!(d, SD::Program(_)));
+    let u_pkg = uniq(&|d| matches!(d, SD::Package(_)));
+    let u_cls = uniq(&|d| matches!(d, SD::Class(_)));
+    let u_udp = uniq(&|d| matches!(d, SD::Udp(_)));
+    let arr_elems: i64 = elab
+        .arrays
+        .values()
+        .map(|&(lo, hi, _)| (hi - lo + 1).max(0))
+        .sum();
+    println!("Design summary (flattened / unique definitions):");
+    let row = |label: &str, inst: usize, uniqn: usize| {
+        println!("  {:<28}{:>12}  {:>8}", label, inst, uniqn);
+    };
+    println!("  {:<28}{:>12}  {:>8}", "", "flattened", "unique");
+    row("Modules:", elab.src_file_of_module.len(), u_mod);
+    row("Interfaces:", elab.interfaces.len(), u_ifc);
+    row("Programs:", u_prog, u_prog);
+    row("Packages:", elab.packages.len(), u_pkg);
+    row("UDP instances:", elab.udp_instances.len(), u_udp);
+    row("Classes:", elab.classes.len(), u_cls);
+    // Distinct hierarchical scopes among the flattened signal names — the
+    // closest analogue of a vendor elaborator's "instances" count.
+    let scopes: std::collections::HashSet<&str> = elab
+        .signals
+        .keys()
+        .filter_map(|n| n.rfind('.').map(|i| &n[..i]))
+        .collect();
+    println!("  {:<28}{:>12}", "Instance scopes:", scopes.len());
+    println!("  {:<28}{:>12}", "Signals:", elab.signals.len());
+    println!(
+        "  {:<28}{:>12}  ({} elements)",
+        "Unpacked arrays:",
+        elab.arrays.len(),
+        arr_elems
+    );
+    println!("  {:<28}{:>12}", "Named events:", elab.events.len());
+    // Inlined-instance blocks live in the lazily-materialized pending_* vecs
+    // until the bytecode compiler drains them — count BOTH, or a big design
+    // reports "1 always block" while 66k sit pending.
+    println!(
+        "  {:<28}{:>12}",
+        "Always blocks:",
+        elab.always_blocks.len() + elab.pending_always.len()
+    );
+    println!(
+        "  {:<28}{:>12}",
+        "Initial blocks:",
+        elab.initial_blocks.len() + elab.pending_initial.len()
+    );
+    println!("  {:<28}{:>12}", "Final blocks:", elab.final_blocks.len());
+    println!(
+        "  {:<28}{:>12}",
+        "Cont. assignments:",
+        elab.continuous_assigns.len() + elab.pending_cont_assign.len()
+    );
+    println!("  {:<28}{:>12}", "Functions:", elab.functions.len());
+    println!("  {:<28}{:>12}", "Tasks:", elab.tasks.len());
+    println!(
+        "  {:<28}{:>9} ns",
+        "Simulation time unit:",
+        elab.tick_s * 1e9
+    );
+}
+
+/// Peak/current memory and CPU usage, vendor-tool style, so long builds can
+/// be compared against other tools' footers.
+fn print_resource_usage(wall_start: std::time::Instant) {
+    let mut peak = String::new();
+    let mut cur = String::new();
+    if let Ok(st) = std::fs::read_to_string("/proc/self/status") {
+        for line in st.lines() {
+            if let Some(v) = line.strip_prefix("VmHWM:") {
+                peak = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("VmRSS:") {
+                cur = v.trim().to_string();
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0 {
+            let user = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 / 1e6;
+            let sys = ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 / 1e6;
+            println!(
+                "xezim: CPU Usage - {:.1}s system + {:.1}s user = {:.1}s total (wall {:.1}s)",
+                sys,
+                user,
+                sys + user,
+                wall_start.elapsed().as_secs_f64()
+            );
+        }
+    }
+    if !peak.is_empty() || !cur.is_empty() {
+        println!("xezim: Memory Usage - Current: {}, Peak: {}", cur, peak);
+    }
+}
+
+/// `--dump-merged-sv` phase 2: after elaboration, append the `-v`/`-y`
+/// library files whose definitions were actually ADOPTED — with them inlined
+/// the merged file rebuilds standalone, with no -v/-y flags. Whole files are
+/// appended (a cell library groups related primitives); if one also defines a
+/// name the primary sources already define, the re-compile will say so.
+fn append_adopted_libs_to_merged(merged_out: &str) {
+    let adopted = xezim::adopted_lib_files();
+    if adopted.is_empty() {
+        return;
+    }
+    let mut extra = String::new();
+    let mut nfiles = 0usize;
+    let mut nmods = 0usize;
+    for (path, mods) in &adopted {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                nfiles += 1;
+                nmods += mods.len();
+                extra.push_str(&format!(
+                    "\n// ===== adopted library file: {} (needed for: {}) =====\n",
+                    path.display(),
+                    mods.join(", ")
+                ));
+                extra.push_str(&String::from_utf8_lossy(&bytes));
+                if !extra.ends_with('\n') {
+                    extra.push('\n');
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: --dump-merged-sv could not append library '{}': {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+    if nfiles == 0 {
+        return;
+    }
+    if let Err(e) = std::fs::OpenOptions::new()
+        .append(true)
+        .open(merged_out)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, extra.as_bytes()))
+    {
+        eprintln!("Warning: cannot append libraries to '{}': {}", merged_out, e);
+        return;
+    }
+    println!(
+        "Appended {} adopted library file(s) ({} definition(s)) to {}",
+        nfiles, nmods, merged_out
+    );
+}
+
 fn main() {
+    let compile_wall_start = std::time::Instant::now();
     spawn_memory_watchdog();
     // Install the SIGUSR1 hang-report handler before compile: a user poking a
     // seemingly-hung run during a long elaboration must not kill it (the
@@ -830,6 +1016,8 @@ fn main() {
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
+    let mut dump_files_list = false;
+    let mut dump_merged_sv: Option<String> = None;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
@@ -1013,6 +1201,20 @@ fn main() {
             }
             _ if handle_gls_flag(arg) => {}
             _ if arg.starts_with('+') => {
+                // `+X_WARN` is both a plusarg (so `$test$plusargs` can see it)
+                // and the switch itself — this arm runs before the explicit
+                // match below, so handle it here too or the flag is swallowed.
+                if arg.eq_ignore_ascii_case("+X_WARN") {
+                    xezim::compiler::simulator::set_warn_x(true);
+                }
+                if let Some(n) = arg
+                    .strip_prefix("+X_WARN_LIMIT=")
+                    .or_else(|| arg.strip_prefix("+x_warn_limit="))
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    xezim::compiler::simulator::set_warn_x(true);
+                    xezim::compiler::simulator::set_warn_x_limit(n);
+                }
                 plusargs.push(arg.clone());
             }
             // `-v <file>` — a library FILE (Verilog-XL/VCS semantics): its
@@ -1090,6 +1292,35 @@ fn main() {
             "--strict" => {
                 sv_parser::set_strict_checks(true);
                 strict_checks = true;
+            }
+            // X_WARN: warn the first time each signal takes an x bit after
+            // time 0, naming the signal, its instance/module and its drivers.
+            // Accepted as a flag, as `+X_WARN` (plusarg), and as `X_WARN=1`
+            // in the environment — same switch, three spellings, because run
+            // scripts reach for different ones.
+            "--x-warn" | "--X_WARN" | "-X_WARN" | "+X_WARN" => {
+                xezim::compiler::simulator::set_warn_x(true);
+            }
+            "--x-warn-limit" | "--X_WARN_LIMIT" => {
+                i += 1;
+                if i < args.len() {
+                    match args[i].parse::<usize>() {
+                        Ok(n) => xezim::compiler::simulator::set_warn_x_limit(n),
+                        Err(_) => {
+                            eprintln!("Error: --x-warn-limit requires a number (0 = unlimited)");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            _ if arg.starts_with("--x-warn-limit=") => {
+                match arg["--x-warn-limit=".len()..].parse::<usize>() {
+                    Ok(n) => xezim::compiler::simulator::set_warn_x_limit(n),
+                    Err(_) => {
+                        eprintln!("Error: --x-warn-limit requires a number (0 = unlimited)");
+                        std::process::exit(1);
+                    }
+                }
             }
             "--no-strict" | "--lenient" => {
                 sv_parser::set_strict_checks(false);
@@ -1245,8 +1476,24 @@ fn main() {
             _ if arg.starts_with("--fst-scope=") => {
                 fst_scopes.push(arg["--fst-scope=".len()..].to_string());
             }
-            "--sim_debug" => {
+            // `--sim_debug` kept as a compatibility alias for existing scripts.
+            "--sim-debug" | "--sim_debug" => {
                 sim_debug = true;
+            }
+            "--dump-files-list" => {
+                dump_files_list = true;
+            }
+            "--dump-merged-sv" => {
+                i += 1;
+                if i < args.len() {
+                    dump_merged_sv = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: --dump-merged-sv requires an output file name");
+                    std::process::exit(1);
+                }
+            }
+            _ if arg.starts_with("--dump-merged-sv=") => {
+                dump_merged_sv = Some(arg["--dump-merged-sv=".len()..].to_string());
             }
             "--threads" => {
                 i += 1;
@@ -1276,6 +1523,35 @@ fn main() {
             "--cache" => {
                 // Explicit opt-in to the experimental warm-start cache.
                 design_cache_enabled = true;
+            }
+            // Artifact (-o) compression: `none` writes raw bincode (larger,
+            // instant load); a number is a zstd level. Default: zstd level 3.
+            "--artifact-compression" => {
+                i += 1;
+                let v = args.get(i).cloned().unwrap_or_default();
+                match v.as_str() {
+                    "none" | "off" | "0" => xezim_core::set_artifact_uncompressed(true),
+                    _ => match v.parse::<i32>() {
+                        Ok(n) if (1..=22).contains(&n) => xezim_core::set_zstd_level(n),
+                        _ => {
+                            eprintln!("Error: --artifact-compression takes 'none' or a zstd level 1-22");
+                            std::process::exit(1);
+                        }
+                    },
+                }
+            }
+            _ if arg.starts_with("--artifact-compression=") => {
+                let v = &arg["--artifact-compression=".len()..];
+                match v {
+                    "none" | "off" | "0" => xezim_core::set_artifact_uncompressed(true),
+                    _ => match v.parse::<i32>() {
+                        Ok(n) if (1..=22).contains(&n) => xezim_core::set_zstd_level(n),
+                        _ => {
+                            eprintln!("Error: --artifact-compression takes 'none' or a zstd level 1-22");
+                            std::process::exit(1);
+                        }
+                    },
+                }
             }
             "--cache-compression-level" => {
                 i += 1;
@@ -1418,6 +1694,46 @@ fn main() {
             }
         }
         i += 1;
+    }
+
+    if verbose {
+        xezim::set_compile_verbose(true);
+    }
+
+    // `--dump-files-list`: the fully resolved compilation file set, after every
+    // `-f` args file has been expanded. Printed BEFORE the files are read so
+    // the list still appears when a file is missing or fails to parse — that
+    // is exactly the situation the flag exists to debug.
+    if dump_files_list {
+        println!("=== files list: {} source file(s) ===", source_files.len());
+        for (i, sf) in source_files.iter().enumerate() {
+            let exists = Path::new(sf).exists();
+            println!(
+                "  {:>4}. {}{}",
+                i + 1,
+                sf,
+                if exists { "" } else { "   [NOT FOUND]" }
+            );
+        }
+        if !lib_files.is_empty() {
+            println!("--- -v library file(s): {} ---", lib_files.len());
+            for lf in &lib_files {
+                println!("  {}", lf);
+            }
+        }
+        if !lib_dirs.is_empty() {
+            println!("--- -y library dir(s): {} ---", lib_dirs.len());
+            for ld in &lib_dirs {
+                println!("  {}", ld);
+            }
+        }
+        if !include_dirs.is_empty() {
+            println!("--- include dir(s): {} ---", include_dirs.len());
+            for id in &include_dirs {
+                println!("  {}", id);
+            }
+        }
+        println!("=== end files list ===");
     }
 
     if source_files.is_empty() {
@@ -1644,6 +1960,61 @@ suppressed but the explicit SDF annotation still applies."
             }
         };
 
+    // `--dump-merged-sv <file>`: one self-contained .sv with every source in
+    // parse order, fully preprocessed — `ifdef branches resolved, macros
+    // expanded, `includes inlined. A 125-file `-f` build becomes a single
+    // re-runnable repro for parse/elaboration debugging. Blank lines left by
+    // the preprocessor are kept so line numbers inside each section still
+    // match the per-file diagnostics.
+    if let Some(ref merged_out) = dump_merged_sv {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "// Merged preprocessed sources — xezim {} ({} file(s))\n\
+             // Defines, `ifdef selection and `include expansion already applied.\n\
+             // NOTE: `timescale directives are consumed by the preprocessor and\n\
+             // not re-emitted; pass --module-timescale when re-running this file.\n",
+            env!("CARGO_PKG_VERSION"),
+            preprocessed_sources.len()
+        ));
+        for (i, (label, text)) in file_labels
+            .iter()
+            .zip(preprocessed_sources.iter())
+            .enumerate()
+        {
+            out.push_str(&format!(
+                "\n// ===== file {}/{}: {} =====\n",
+                i + 1,
+                preprocessed_sources.len(),
+                label
+            ));
+            out.push_str(text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        match std::fs::write(merged_out, &out) {
+            Ok(()) => println!(
+                "Wrote merged preprocessed SV to {} ({} files, {} bytes)",
+                merged_out,
+                preprocessed_sources.len(),
+                out.len()
+            ),
+            Err(e) => {
+                eprintln!("Error: cannot write '{}': {}", merged_out, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Version banner for every mode except --preprocess, whose stdout must
+    // stay pure source text. The simulate path adds its own Max-time lines
+    // below. Build identity in --compile/--parse logs matters for exactly the
+    // situation those modes are used in: debugging with a specific build.
+    if mode != Mode::Preprocess {
+        println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
+        println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
+    }
+
     if mode == Mode::Preprocess {
         // IEEE 1800-2017 §22: preprocess-only mode. The preprocessor has
         // already run (expanding macros and `\`include`s, evaluating
@@ -1678,7 +2049,14 @@ suppressed but the explicit SDF annotation still applies."
         let mut total_desc = 0;
         let mut total_err = 0;
         let mut total_warn = 0;
-        for (label, source) in file_labels.iter().zip(preprocessed_sources.iter()) {
+        for (fi, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
+            xezim::progress_status(&format!(
+                "[{}] parsing {}/{}: {}",
+                if mode == Mode::Parse { "parse" } else { "compile" },
+                fi + 1,
+                file_labels.len(),
+                label.rsplit('/').next().unwrap_or(label)
+            ));
             let tokens = xezim::lexer::Lexer::new(source).tokenize();
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
@@ -1704,6 +2082,7 @@ suppressed but the explicit SDF annotation still applies."
                 println!("{:#?}", source_ast);
             }
         }
+        xezim::progress_clear();
         println!(
             "Parsed {} file(s): {} descriptions, {} errors, {} warnings",
             preprocessed_sources.len(),
@@ -1722,7 +2101,14 @@ suppressed but the explicit SDF annotation still applies."
         let mut total_err = 0;
         let mut total_warn = 0;
 
-        for (label, source) in file_labels.iter().zip(preprocessed_sources.iter()) {
+        for (fi, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
+            xezim::progress_status(&format!(
+                "[{}] parsing {}/{}: {}",
+                if mode == Mode::Parse { "parse" } else { "compile" },
+                fi + 1,
+                file_labels.len(),
+                label.rsplit('/').next().unwrap_or(label)
+            ));
             let tokens = xezim::lexer::Lexer::new(source).tokenize();
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
@@ -1744,6 +2130,7 @@ suppressed but the explicit SDF annotation still applies."
                 .filter(|d| d.severity == xezim::diagnostics::Severity::Warning)
                 .count();
         }
+        xezim::progress_clear();
         println!(
             "Parsed {} file(s): {} descriptions, {} errors, {} warnings",
             preprocessed_sources.len(),
@@ -1780,6 +2167,16 @@ suppressed but the explicit SDF annotation still applies."
                     std::process::exit(1);
                 }
                 println!("Elaboration successful");
+                if std::env::var("XZ_INST_PROF").is_ok() {
+                    // Per-instantiation elaboration section timings (also
+                    // prints one [IPROF] line per instance).
+                    xezim::compiler::elaborate::iprof_dump();
+                }
+                if let Some(ref mo) = dump_merged_sv {
+                    append_adopted_libs_to_merged(mo);
+                }
+                print_design_summary(&_defs, &elab);
+                print_resource_usage(compile_wall_start);
                 // §6.21: keep compiled artifacts consistent with the simulate
                 // path — re-issue static initializers that call simulation-time
                 // system functions as time-0 assignments (issue #26).
@@ -1807,8 +2204,6 @@ suppressed but the explicit SDF annotation still applies."
         return;
     }
 
-    println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-    println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
     println!("Max time: {} ns", max_time);
     println!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
@@ -1870,6 +2265,9 @@ suppressed but the explicit SDF annotation still applies."
     ) {
         Ok(sim) => {
             println!("------------------------------");
+            if let Some(ref mo) = dump_merged_sv {
+                append_adopted_libs_to_merged(mo);
+            }
             println!("Simulation finished at time {}", sim.time);
             if sim.finished {
                 println!("($finish called)");

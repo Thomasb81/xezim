@@ -31,8 +31,17 @@ module tb;
       `CK("stream unpack bytes", b[0] == 8'h11 && b[3] == 8'h44)
       {<<byte{b}} = w;
       `CK("stream reverse unpack", b[0] == 8'h44 && b[3] == 8'h11)
+      // §11.4.14.2: a 16-bit stream into a 32-bit target is LEFT-justified
+      // (`bit [99:0] d = {>>{a,b,c}}; // d[3:0] = 0` in the LRM), so the
+      // reversed nibbles land in w[31:16] and w[15:0] is zero. This check
+      // used to assert the opposite, right-justified, result.
       w = {<<4{16'hABCD}};
-      `CK("nibble reverse", w[15:0] == 16'hDCBA)
+      `CK("nibble reverse", w == 32'hDCBA0000)
+      begin
+        logic [15:0] exact;
+        exact = {<<4{16'hABCD}};
+        `CK("nibble reverse exact width", exact == 16'hDCBA)
+      end
     end
     begin // const ref
       int a3[3];
