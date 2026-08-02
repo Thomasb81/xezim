@@ -31647,6 +31647,20 @@ impl Simulator {
                         }
                     }
                 } else if hier.path.len() > 1 {
+                    // Property write through a class handle evaluated from the prefix
+                    // (e.g. `stor.handle.val = 777`).
+                    if hier.path.len() >= 2 {
+                        let prop_name = &hier.path.last().unwrap().name.name;
+                        let mut head_hier = hier.clone();
+                        head_hier.path.pop();
+                        let head_expr = Expression::new(ExprKind::Ident(head_hier), lhs.span);
+                        let base_val = self.eval_expr(&head_expr);
+                        let handle = base_val.to_u64().unwrap_or(0) as usize;
+                        if handle != 0 && handle < self.heap.len() && self.heap[handle].is_some() {
+                            let fitted = self.fit_class_prop(handle, prop_name, val);
+                            return self.set_prop_if_changed(handle, prop_name, fitted);
+                        }
+                    }
                     // `ClassName::static_prop` — explicit static property write.
                     if hier.path.len() == 2 {
                         let cls = hier.path[0].name.name.clone();
@@ -33817,40 +33831,40 @@ impl Simulator {
                         }
                     }
                 }
-                // Local struct variable member write: `result.field1 = ...`
+                // Struct variable member write: `result.field1 = ...`
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if hier.path.len() == 1 {
                         let base_name = hier.path[0].name.name.as_str();
-                        if !self.local_stack.is_empty() {
-                            let last_idx = self.local_stack.len() - 1;
-                            if self.local_stack[last_idx].contains_key(base_name) {
-                                let type_name =
-                                    self.var_typedef_types.get(base_name).map(|s| s.as_str());
-                                let dt: Option<DataType> = type_name
-                                    .and_then(|tn| self.module.typedef_types.get(tn).cloned());
-                                if let Some(dt) = dt {
-                                    let resolved =
-                                        Self::resolve_type_ref(&dt, &self.module.typedef_types);
-                                    if let Some(fields) = Self::struct_field_layout(&resolved) {
-                                        if let Some((_, off, w, _real)) = fields
-                                            .iter()
-                                            .find(|(m, _, _, _)| m == &member.name)
-                                            .cloned()
-                                        {
-                                            let mut cur = self.local_stack[last_idx]
-                                                .get(base_name)
-                                                .cloned()
-                                                .unwrap_or_else(|| Value::zero(65));
-                                            let piece = val.resize(w);
-                                            for i in 0..w {
-                                                let bit = piece.get_bit(i as usize);
-                                                cur.set_bit((off + i) as usize, bit);
-                                            }
-                                            self.local_stack[last_idx]
-                                                .insert(base_name.to_string(), cur);
-                                            return true;
-                                        }
+                        let type_name = self
+                            .var_typedef_types
+                            .get(base_name)
+                            .cloned()
+                            .or_else(|| self.get_expr_type_name(expr));
+                        let dt: Option<DataType> = type_name
+                            .as_deref()
+                            .and_then(|tn| self.module.typedef_types.get(tn).cloned());
+                        if let Some(dt) = dt {
+                            let resolved =
+                                Self::resolve_type_ref(&dt, &self.module.typedef_types);
+                            if let Some(fields) = Self::struct_field_layout(&resolved) {
+                                if let Some((_, off, w, _real)) = fields
+                                    .iter()
+                                    .find(|(m, _, _, _)| m == &member.name)
+                                    .cloned()
+                                {
+                                    let mut cur = self
+                                        .get_local_or_signal(base_name)
+                                        .unwrap_or_else(|| Value::zero(off + w));
+                                    if (off + w) as usize > cur.width as usize {
+                                        cur = cur.resize(off + w);
                                     }
+                                    let piece = val.resize(w);
+                                    for i in 0..w {
+                                        let bit = piece.get_bit(i as usize);
+                                        cur.set_bit((off + i) as usize, bit);
+                                    }
+                                    self.set_local_or_signal(base_name, cur);
+                                    return true;
                                 }
                             }
                         }
@@ -34723,12 +34737,7 @@ impl Simulator {
                         let mname = hier.path[1].name.name.as_str();
                         if self.is_associative_array(obj_name) {
                             if mname == "size" || mname == "num" {
-                                let prefix = format!("{}[", obj_name);
-                                let count = self
-                                    .signals
-                                    .keys()
-                                    .filter(|k| k.starts_with(&prefix))
-                                    .count();
+                                let count = self.assoc_top_level_keys(obj_name).len();
                                 return Value::from_u64(count as u64, 32);
                             }
                             if mname == "delete" {
@@ -38376,22 +38385,26 @@ impl Simulator {
                         // matching the base_val width (handles queue elements
                         // where the element type isn't directly registered for
                         // the queue variable name).
-                        for td in self.module.typedef_types.values() {
-                            let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
-                            if let Some(fields) = Self::struct_field_layout(&resolved) {
-                                let total_w: u32 = fields.iter().map(|(_, _, w, _)| w).sum();
-                                if total_w == base_val.width {
-                                    if let Some((_, off, w, fr)) = fields
-                                        .iter()
-                                        .find(|(m, _, _, _)| m == &member.name)
-                                        .cloned()
-                                    {
-                                        let mut v = base_val
-                                            .range_select((off + w - 1) as usize, off as usize);
-                                        if fr {
-                                            v.is_real = true;
+                        let base_h = base_val.to_u64().unwrap_or(0) as usize;
+                        let is_heap_obj = base_h != 0 && base_h < self.heap.len() && self.heap[base_h].is_some();
+                        if !is_heap_obj {
+                            for td in self.module.typedef_types.values() {
+                                let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
+                                if let Some(fields) = Self::struct_field_layout(&resolved) {
+                                    let total_w: u32 = fields.iter().map(|(_, _, w, _)| w).sum();
+                                    if total_w == base_val.width {
+                                        if let Some((_, off, w, fr)) = fields
+                                            .iter()
+                                            .find(|(m, _, _, _)| m == &member.name)
+                                            .cloned()
+                                        {
+                                            let mut v = base_val
+                                                .range_select((off + w - 1) as usize, off as usize);
+                                            if fr {
+                                                v.is_real = true;
+                                            }
+                                            return v;
                                         }
-                                        return v;
                                     }
                                 }
                             }
@@ -38598,12 +38611,7 @@ impl Simulator {
                     if self.is_associative_array(&name) {
                         let mname = member.name.as_str();
                         if mname == "size" || mname == "num" {
-                            let prefix = format!("{}[", name);
-                            let count = self
-                                .signals
-                                .keys()
-                                .filter(|k| k.starts_with(&prefix))
-                                .count();
+                            let count = self.assoc_top_level_keys(&name).len();
                             return Value::from_u64(count as u64, 32);
                         }
                         if mname == "delete" {
@@ -38641,12 +38649,7 @@ impl Simulator {
                                 // Associative array: count live keys
                                 // (`<h>#<name>[<key>` prefix).
                                 if self.is_associative_array(&scoped) {
-                                    let prefix = format!("{}[", scoped);
-                                    let count = self
-                                        .signals
-                                        .keys()
-                                        .filter(|k| k.starts_with(&prefix))
-                                        .count();
+                                    let count = self.assoc_top_level_keys(&scoped).len();
                                     return Value::from_u64(count as u64, 32);
                                 }
                                 // Queue / dynamic array: read `.size` signal.
@@ -39492,9 +39495,42 @@ impl Simulator {
                                         }
                                     }
                                     None
-                                })
-                                .filter(|cn| self.module.classes.contains_key(cn));
-                            if let Some(cn) = elem_cls {
+                                });
+                            // The element type is often a TYPEDEF alias (UVM's
+                            // `uvm_sev_override_array` = `uvm_pool#(sev,sev)`, or
+                            // a plain `typedef sev_pool pool_t;`). The maps
+                            // above record the TYPEDEF name, which isn't a key in
+                            // `module.classes` — so filtering by `contains_key`
+                            // alone rejected it, `new` was dropped, and the
+                            // stored element had no resolvable class. Method calls
+                            // on it (`add`/`num`/`exists`) then silently no-op'd,
+                            // breaking every assoc-array-of-typedef'd-class
+                            // construction (UVM severity-id overrides store
+                            // `uvm_pool#(sev,sev)` handles this way).
+                            // Resolve the typedef to the underlying class, and
+                            // carry a `(base, sig)` spec for parameterized
+                            // typedefs so the element's type-param members bind.
+                            let elem_cls: Option<(String, Option<(String, String)>)> =
+                                match elem_cls {
+                                    Some(cn)
+                                        if self.module.classes.contains_key(&cn) =>
+                                    {
+                                        Some((cn, None))
+                                    }
+                                    Some(cn) => self
+                                        .resolve_simple_typedef_class(&cn)
+                                        .filter(|c| self.module.classes.contains_key(c))
+                                        .map(|c| (c, None))
+                                        .or_else(|| {
+                                            self.resolve_typedef_spec(&cn)
+                                                .filter(|(b, _)| {
+                                                    self.module.classes.contains_key(b)
+                                                })
+                                                .map(|(b, s)| (b.clone(), Some((b, s))))
+                                        }),
+                                    None => None,
+                                };
+                            if let Some((cn, spec)) = elem_cls {
                                 let ctor_args: &[Expression] = match &rvalue.kind {
                                     ExprKind::Call { args, .. } => args,
                                     _ => &[],
@@ -39534,7 +39570,15 @@ impl Simulator {
                                     }
                                 }
                                 if let Some(cd) = self.module.classes.get(&cn).cloned() {
-                                    let v = self.instantiate_class(&cd, ctor_args);
+                                    let v = if let Some((b, s)) = spec {
+                                        let saved = self.current_spec.take();
+                                        self.current_spec = Some((b, s));
+                                        let r = self.instantiate_class(&cd, ctor_args);
+                                        self.current_spec = saved;
+                                        r
+                                    } else {
+                                        self.instantiate_class(&cd, ctor_args)
+                                    };
                                     self.assign_value(lvalue, &v);
                                     return;
                                 }
@@ -40186,8 +40230,23 @@ impl Simulator {
                                     .as_ref()
                                     .map(|r| self.module.classes.contains_key(r) || self.module.covergroups.contains_key(r))
                                     .unwrap_or_else(|| {
-                                        self.module.classes.contains_key(&tn)
+                                        if self.module.classes.contains_key(&tn)
                                             || self.module.covergroups.contains_key(&tn)
+                                        {
+                                            return true;
+                                        }
+                                        // §8.25: a type parameter may bind to
+                                        // a SPECIALIZED class name `Base#(args)`
+                                        // (e.g. `T obj` where T = `pkg#(int)` —
+                                        // the UVM factory's registry#
+                                        // (impl#(bitstream))::create_object).
+                                        // The specialized name isn't a key in
+                                        // module.classes, but its base is.
+                                        self.extract_spec_from_string(&tn)
+                                            .map(|(base, _)| {
+                                                self.module.classes.contains_key(&base)
+                                            })
+                                            .unwrap_or(false)
                                     })
                             })
                             .unwrap_or(false);
@@ -40204,6 +40263,7 @@ impl Simulator {
                 };
                 if is_new_call {
                     let type_name = self.get_expr_type_name(lvalue);
+
                     // §6.20.3 type-parameter construction: if the declared
                     // type is a class type parameter (e.g. `T obj = new;`),
                     // resolve it through the current instance's bindings to
@@ -40212,6 +40272,32 @@ impl Simulator {
                     let type_name =
                         type_name.map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn));
                     if let Some(tname) = type_name {
+                        // §8.25: the type-parameter resolved to a SPECIALIZED
+                        // class name `Base#(args)` (e.g. `T obj = new()` where
+                        // `T` is bound to `pkg#(int)` — the UVM factory's
+                        // `uvm_object_registry#(T)::create_object` does `T obj;
+                        // obj = new(name)`). The plain-name lookup below only
+                        // finds the unspecialized `Base` in module.classes, so
+                        // extract the specialization and carry it through
+                        // `current_spec`: `instantiate_class_with_type_args`
+                        // snapshots `current_spec` onto the instance's `spec`,
+                        // and later virtual dispatch on the instance restores
+                        // it (so the instance's inherited methods resolve `T`
+                        // correctly). Mirrors the factory `create` path.
+                        if let Some((base, sig)) = self.extract_spec_from_string(&tname) {
+                            if let Some(class_def) = self.module.classes.get(&base).cloned() {
+                                self.ensure_spec_statics(&base, &sig);
+                                let saved_spec = self.current_spec.clone();
+                                self.current_spec = Some((base.clone(), sig));
+                                let handle = self.instantiate_class(&class_def, ctor_args);
+                                self.current_spec = saved_spec;
+                                self.assign_value(lvalue, &handle.resize(w));
+                                if !self.in_edge_block {
+                                    self.settle_combinatorial();
+                                }
+                                return;
+                            }
+                        }
                         let cls = if self.module.classes.contains_key(&tname) {
                             tname.clone()
                         } else if let Some(resolved) = self.resolve_simple_typedef_class(&tname) {
@@ -41643,6 +41729,54 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §7.9.1/§7.10: `foreach (all[outer, inner])` over an
+                        // ASSOCIATIVE ARRAY OF QUEUES (`T all[key][$]`). The
+                        // outer index walks the (sparse) assoc keys, the inner
+                        // index walks each key's queue. Unlike the
+                        // dynamic-array-of-dynamic-arrays branch above, the
+                        // keys are not a dense [0,N) range, so iterate the
+                        // collected top-level keys and each key's `.size`.
+                        if vars.len() >= 2 {
+                            let akeys = self.assoc_top_level_keys(&an);
+                            let is_assoc_of_queue = !akeys.is_empty()
+                                && akeys.iter().all(|k| {
+                                    let qn = format!("{}[{}]", an, k);
+                                    self.module.dynamic_arrays.contains(&qn)
+                                        || self.signals.contains_key(&format!("{}.size", qn))
+                                });
+                            if is_assoc_of_queue {
+                                let ov = vars[0].as_ref().map(|v| v.name.clone());
+                                let iv = vars[1].as_ref().map(|v| v.name.clone());
+                                if let Some(n) = &ov { self.widths.insert(n.clone(), 32); }
+                                if let Some(n) = &iv { self.widths.insert(n.clone(), 32); }
+                                'akeys: for key in &akeys {
+                                    let qn = format!("{}[{}]", an, key);
+                                    let inner = self.get_queue_size(&qn);
+                                    for j in 0..inner {
+                                        if self.finished { break 'akeys; }
+                                        if let Some(n) = &ov {
+                                            let kv = if let Ok(v) = key.parse::<i64>() {
+                                                Value::from_u64(v as u64, 32)
+                                            } else {
+                                                Value::from_string(key)
+                                            };
+                                            self.set_loop_var(n, kv);
+                                        }
+                                        if let Some(n) = &iv {
+                                            self.set_loop_var(n, Value::from_u64(j, 32));
+                                        }
+                                        self.continue_flag = false;
+                                        self.exec_statement(body);
+                                        if self.break_flag { break 'akeys; }
+                                        self.continue_flag = false;
+                                    }
+                                }
+                                self.auto_loop_vars.truncate(fe_auto_len);
+                                self.restore_loop_vars(&fe_saved);
+                                if !self.return_flag { self.break_flag = false; }
+                                return;
+                            }
+                        }
                         if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                             // A queue / dynamic array carries an authoritative
                             // `<name>.size` shadow and is DENSE: iterate the
@@ -41857,6 +41991,75 @@ impl Simulator {
                                     body,
                                     var_scope.as_deref(),
                                 );
+                                self.auto_loop_vars.truncate(fe_auto_len);
+                                self.restore_loop_vars(&fe_saved);
+                                if !self.return_flag { self.break_flag = false; }
+                                return;
+                            }
+                        }
+                        // §12.7.3 / §7.9.1: `foreach (all[outer, inner])` over
+                        // an ASSOCIATIVE ARRAY OF QUEUES (`T all[key][$]`, e.g.
+                        // uvm_resource_pool's `sort_by_precedence`). The outer
+                        // var walks the sparse assoc keys (ascending for an
+                        // integer-keyed array), the inner var walks each key's
+                        // queue [0, size); higher cardinality (inner) changes
+                        // fastest. `foreach_dims` returns None for a sparse
+                        // assoc, so without this the 2-var form fell through to
+                        // the 1-var scan below and only ever bound `outer` —
+                        // `inner` stayed at its last value and the body ran
+                        // once per key (losing the queue elements).
+                        if self.is_associative_array(&name) {
+                            let akeys = self.assoc_top_level_keys(&name);
+                            let is_assoc_of_queue = !akeys.is_empty()
+                                && akeys.iter().all(|k| {
+                                    let qn = format!("{}[{}]", name, k);
+                                    self.module.dynamic_arrays.contains(&qn)
+                                        || self.signals.contains_key(&format!("{}.size", qn))
+                                });
+                            if is_assoc_of_queue {
+                                let ov = vars[0].as_ref().map(|v| v.name.clone());
+                                let iv = vars[1].as_ref().map(|v| v.name.clone());
+                                if let Some(n) = &ov { self.widths.insert(n.clone(), 32); }
+                                if let Some(n) = &iv { self.widths.insert(n.clone(), 32); }
+                                let is_str = self
+                                    .module
+                                    .associative_arrays
+                                    .get(&name)
+                                    .copied()
+                                    .unwrap_or(false);
+                                'akeys: for key in &akeys {
+                                    let qn = format!("{}[{}]", name, key);
+                                    let inner = self.get_queue_size(&qn);
+                                    for j in 0..inner {
+                                        if self.finished { break 'akeys; }
+                                        if let Some(n) = &ov {
+                                            let kv = if is_str {
+                                                Value::from_string(key)
+                                            } else {
+                                                Value::from_u64(
+                                                    key.parse::<u64>().unwrap_or(0),
+                                                    32,
+                                                )
+                                            };
+                                            self.set_loop_var_aliased(
+                                                var_scope.as_deref(),
+                                                n,
+                                                kv,
+                                            );
+                                        }
+                                        if let Some(n) = &iv {
+                                            self.set_loop_var_aliased(
+                                                var_scope.as_deref(),
+                                                n,
+                                                Value::from_u64(j, 32),
+                                            );
+                                        }
+                                        self.continue_flag = false;
+                                        self.exec_statement(body);
+                                        if self.break_flag { break 'akeys; }
+                                        self.continue_flag = false;
+                                    }
+                                }
                                 self.auto_loop_vars.truncate(fe_auto_len);
                                 self.restore_loop_vars(&fe_saved);
                                 if !self.return_flag { self.break_flag = false; }
@@ -43727,6 +43930,7 @@ impl Simulator {
                             let tn = name.name.name.clone();
                             if self.module.enum_members.contains_key(&tn)
                                 || self.module.typedefs.contains_key(&tn)
+                                || self.module.typedef_types.contains_key(&tn)
                             {
                                 self.var_typedef_types.insert(d.name.name.clone(), tn);
                             }
@@ -49492,6 +49696,21 @@ impl Simulator {
             _ => self.eval_expr(expr).width,
         }
     }
+    /// Cheaply test whether the method name of a call callee (`recv.m(...)`
+    /// as `MemberAccess`, or a 2+-segment `Ident`) satisfies `pred`, WITHOUT
+    /// running `flat_member_name` over the receiver. Used to gate the
+    /// expensive `collection_method_of` so it only runs for names it could
+    /// possibly answer (size/num/len/pop_*). See `call_return_width`.
+    fn callee_method_name_is<F: Fn(&str) -> bool>(&self, func: &Expression, pred: F) -> bool {
+        match &func.kind {
+            ExprKind::MemberAccess { member, .. } => pred(&member.name),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                pred(&h.path.last().expect("len>=2").name.name)
+            }
+            _ => false,
+        }
+    }
+
     /// Declared return width of the function `func` names, without calling it.
     /// `None` when the callee is not a plain module-scope function (a method,
     /// a class constructor, an array builtin), where the caller falls back to
@@ -49501,19 +49720,46 @@ impl Simulator {
         // fallback and EVALUATED — so `s - q.pop_back()` popped once for the
         // width probe and once for the value, silently draining the queue.
         // Answer the value-returning builtins from the element type instead.
-        if let Some((obj, mname)) = self.collection_method_of(func) {
-            match mname.as_str() {
-                "size" | "num" | "len" => return Some(32),
-                "pop_front" | "pop_back" => {
-                    let w = self
-                        .lookup_signal_width(&format!("{}[0]", obj))
-                        .or_else(|| self.module.arrays.get(&obj).map(|t| t.2));
-                    if let Some(w) = w.filter(|w| *w > 0) {
-                        return Some(w);
+        //
+        // GATE: only invoke `collection_method_of` (which runs
+        // `flat_member_name` over the receiver on EVERY call) when the
+        // callee's method name is one of the value-returning collection
+        // builtins. `infer_width` probes every arithmetic/bitwise operand
+        // each evaluation, so a class method used in a loop
+        // (`sum += e.get_a()`) drove `flat_member_name` through the receiver
+        // millions of times only to have `collection_method_of` return None.
+        // Class methods (`get_a`, `compute`, …) fall through to
+        // `class_method_return_width` below without that cost.
+        if self.callee_method_name_is(func, |m| {
+            matches!(m, "size" | "num" | "len" | "pop_front" | "pop_back")
+        }) {
+            if let Some((obj, mname)) = self.collection_method_of(func) {
+                match mname.as_str() {
+                    "size" | "num" | "len" => return Some(32),
+                    "pop_front" | "pop_back" => {
+                        let w = self
+                            .lookup_signal_width(&format!("{}[0]", obj))
+                            .or_else(|| self.module.arrays.get(&obj).map(|t| t.2));
+                        if let Some(w) = w.filter(|w| *w > 0) {
+                            return Some(w);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
+        }
+        // A class METHOD call (`recv.m(...)`): the width comes from the
+        // method's declared return type, resolved through the inheritance
+        // chain — NOT by executing the method. Without this, `infer_width`
+        // of a method call fell through to `eval_expr(expr).width` and RAN
+        // the method purely to read its width, so any method used inside an
+        // arithmetic expression (`a + obj.compute()`) executed twice — once
+        // for width, once for the value — double-firing side effects and
+        // doubling the per-call cost. `class_method_return_width` is
+        // conservative: it returns `None` for anything it can't cheaply
+        // resolve, preserving the prior fallback behaviour there.
+        if let Some(w) = self.class_method_return_width(func) {
+            return Some(w);
         }
         let ExprKind::Ident(h) = &func.kind else {
             return None;
@@ -49535,6 +49781,75 @@ impl Simulator {
             Some(&self.module.typedefs),
         );
         (w > 0).then_some(w)
+    }
+
+    /// Declared return width of a class METHOD call — `recv.m(...)` parsed as
+    /// `MemberAccess`, or `recv.m` as a 2-segment hierarchical identifier —
+    /// resolved through the inheritance chain WITHOUT executing the method.
+    /// `None` for anything not cheaply resolvable (the caller then keeps its
+    /// existing evaluation fallback), so this only ever widens the set of
+    /// calls whose width is taken statically. See `call_return_width`.
+    fn class_method_return_width(&self, func: &Expression) -> Option<u32> {
+        use crate::ast::decl::ClassMethodKind;
+        use crate::ast::types::DataType;
+        // Extract (receiver head name, method name) as BORROWED slices.
+        // `infer_width` probes every arithmetic/bitwise operand on each
+        // evaluation, so the two `String` allocations this used to do ran in
+        // every loop iteration; borrowing from `func` avoids them.
+        let (recv_head, mname): (&str, &str) = match &func.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                let head = match &expr.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 => h.path[0].name.name.as_str(),
+                    _ => return None,
+                };
+                (head, member.name.as_str())
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 => {
+                (h.path[0].name.name.as_str(), h.path[1].name.name.as_str())
+            }
+            _ => return None,
+        };
+        // Resolve the receiver's class type. Common cases only — a bare
+        // local of class type, or a class-typed signal. Subtler resolutions
+        // (properties of `this`, typedef locals, …) return None and keep the
+        // prior fallback.
+        //
+        // NOTE: `var_class_types` is a FLAT accumulator never cleared on
+        // scope/method exit (see the note at `class_prop_type`), so this
+        // binding can be stale across method calls — the result is therefore
+        // NOT memoisable by AST node. That is pre-existing behaviour.
+        let class_name: String = if let Some(cn) = self.var_class_types.get(recv_head) {
+            cn.clone()
+        } else {
+            let id = *self.signal_name_to_id.get(recv_head)?;
+            self.signal_type_names.get(&id)?.clone()
+        };
+        // Walk the inheritance chain read-only to the method's return type.
+        // `extends` must be cloned per level: the borrow of a `classes` entry
+        // can't be carried across loop iterations (the entry is dropped at
+        // each iteration end).
+        let mut cur = class_name;
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if let Some(m) = cd.methods.get(mname) {
+                if let ClassMethodKind::Function(f) = &m.kind {
+                    if matches!(f.return_type, DataType::Real { .. }) {
+                        return Some(64);
+                    }
+                    if matches!(f.return_type, DataType::Void { .. }) {
+                        return None;
+                    }
+                    let w = super::elaborate::resolve_type_width(
+                        &f.return_type,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    );
+                    return (w > 0).then_some(w);
+                }
+                return None; // task / extern / pure prototype
+            }
+            cur = cd.extends.clone()?;
+        }
+        None
     }
 
     fn infer_lhs_width(&mut self, expr: &Expression) -> u32 {
@@ -52592,14 +52907,74 @@ impl Simulator {
         None
     }
 
-    fn resolve_typedef_spec(&self, name: &str) -> Option<(String, String)> {
+    /// Resolve a TYPEDEF declared as a member of `class_name` to the target
+    /// CLASS it names — the class-scoped analogue of
+    /// `resolve_simple_typedef_class` (which is module-scoped). Used to
+    /// dispatch `Class::typedef::static_method(...)`: the middle segment is a
+    /// typedef alias (e.g. UVM's `typedef <registry>#(...) type_id;` or a plain
+    /// `typedef Holder type_id;`) rather than a class, so the static-call
+    /// dispatcher must follow the alias to the real class. Returns `None` for
+    /// parameterized aliases (those go through `resolve_typedef_spec`) or
+    /// non-class targets.
+    fn resolve_class_member_typedef_class(
+        &self,
+        class_name: &str,
+        member: &str,
+    ) -> Option<String> {
         use crate::ast::types::DataType;
+        let cd = self.module.classes.get(class_name)?;
+        let dt = cd.typedef_targets.get(member)?;
+        if let DataType::TypeReference { name: tn, type_args, .. } = dt {
+            if !type_args.is_empty() {
+                return None;
+            }
+            let synth = crate::ast::types::TypeName {
+                scope: None,
+                name: crate::ast::Identifier {
+                    name: tn.name.name.clone(),
+                    span: crate::ast::Span::dummy(),
+                },
+                span: crate::ast::Span::dummy(),
+            };
+            return self.resolve_typeref_class_name(&synth);
+        }
+        None
+    }
+
+    fn resolve_typedef_spec(&self, name: &str) -> Option<(String, String)> {
         let dt = self.lookup_typedef_target(name)?;
+        self.spec_from_typedef_dt(&dt)
+    }
+
+    /// Class-scoped analogue of `resolve_typedef_spec`: resolve a TYPEDEF
+    /// declared as a member of `class_name` (e.g. UVM's
+    /// `typedef uvm_object_registry#(T,"N") type_id;` inside class `T`) to its
+    /// specialization `(base, sig)`. Used to dispatch
+    /// `Class::typedef::static_method(...)` when the typedef is parameterized —
+    /// the middle segment names a typedef alias, not a class, so the static-call
+    /// dispatcher must follow the alias to the real specialization.
+    fn resolve_class_member_typedef_spec(
+        &self,
+        class_name: &str,
+        member: &str,
+    ) -> Option<(String, String)> {
+        let cd = self.module.classes.get(class_name)?;
+        let dt = cd.typedef_targets.get(member)?;
+        self.spec_from_typedef_dt(dt)
+    }
+
+    /// Build a specialization `(base_class, signature)` from a typedef's
+    /// `DataType` (a `TypeReference` with type args). Shared by the module-
+    /// scoped `resolve_typedef_spec` and the class-scoped
+    /// `resolve_class_member_typedef_spec`. Returns `None` for non-parameterized
+    /// typedefs or bases that don't resolve to a real class.
+    fn spec_from_typedef_dt(&self, dt: &crate::ast::types::DataType) -> Option<(String, String)> {
+        use crate::ast::types::DataType;
         if let DataType::TypeReference {
             name: tn,
             type_args,
             ..
-        } = &dt
+        } = dt
         {
             if type_args.is_empty() {
                 return None;
@@ -52764,6 +53139,38 @@ impl Simulator {
         } else {
             idx_val.to_u64().unwrap_or(0).to_string()
         }
+    }
+
+    /// Collect the TOP-LEVEL keys of an associative array `obj_name`, sorted
+    /// and de-duplicated. Correctly handles an associative array WHOSE
+    /// ELEMENTS are queues/dynamic-arrays (`T arr[key][$]`) — such arrays
+    /// store elements as `arr[KEY][IDX]`, so a naive `arr[KEY]` prefix scan
+    /// would collect the nested element keys (`KEY][IDX`) and report
+    /// `num()`/`first()` over the wrong set. The top-level assoc key is the
+    /// text between `arr[` and the FIRST `]`, uniform across plain assoc
+    /// (`arr[KEY]`), assoc-of-queue (`arr[KEY][i]`), and multidim assoc
+    /// (`arr[k1][k2]`). Returned sorted (numeric keys ascending by value,
+    /// else lexicographic) to match the LRM's first/next/last/prev order and
+    /// `num()`'s count of distinct keys.
+    fn assoc_top_level_keys(&self, obj_name: &str) -> Vec<String> {
+        let prefix = format!("{}[", obj_name);
+        let mut keys: Vec<String> = self
+            .signals
+            .keys()
+            .map(|k| k.as_str())
+            .chain(self.signal_name_to_id.keys().map(|k| &**k))
+            .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
+            .filter_map(|k| {
+                let rest = &k[prefix.len()..];
+                rest.find(']').map(|pos| rest[..pos].to_string())
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        if !keys.is_empty() && keys.iter().all(|k| k.parse::<i64>().is_ok()) {
+            keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
+        }
+        keys
     }
 
     /// `a.b.c` where `a.b` is a signal carrying a bit layout (a nested packed
@@ -60717,18 +61124,14 @@ impl Simulator {
                     return Some(Value::from_u64(q.len() as u64, 32));
                 }
             }
-            let prefix = format!("{}[", obj_name);
-            let count1 = self
-                .signals
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .count();
-            let count2 = self
-                .signal_name_to_id
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .count();
-            return Some(Value::from_u64((count1 + count2) as u64, 32));
+            // Count distinct TOP-LEVEL keys: for `obj[KEY]` storage this is
+            // just the element count (== queue/dynamic-array size), but for
+            // an assoc-of-queue `obj[KEY][IDX]` it collapses every element of
+            // a key's queue onto that one key (so `num()` reports the number
+            // of associative keys, not the total element count). The
+            // first-`]` extraction + dedup is uniform across plain assoc,
+            // assoc-of-queue, queues, and dynamic arrays.
+            return Some(Value::from_u64(self.assoc_top_level_keys(obj_name).len() as u64, 32));
         }
         if mname == "sum" {
             let cur_size = self.get_queue_size(obj_name) as usize;
@@ -60938,19 +61341,8 @@ impl Simulator {
         }
         if (mname == "first" || mname == "last" || mname == "next" || mname == "prev")
             && self.is_associative_array(obj_name) {
-                let prefix = format!("{}[", obj_name);
-                let mut keys: Vec<String> = self
-                    .signals
-                    .keys()
-                    .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
-                    .map(|k| k[prefix.len()..k.len() - 1].to_string())
-                    .collect();
+                let keys = self.assoc_top_level_keys(obj_name);
                 let all_numeric = keys.iter().all(|k| k.parse::<i64>().is_ok());
-                if all_numeric {
-                    keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
-                } else {
-                    keys.sort();
-                }
                 if keys.is_empty() {
                     return Some(Value::zero(32));
                 }
@@ -61532,10 +61924,24 @@ impl Simulator {
     /// `"DeclClass::prop"` storage key for a static property, if one of
     /// `start_class` or its ancestors declares `prop` as `static`.
     fn static_prop_key(&self, start_class: &str, prop: &str) -> Option<String> {
-        self.static_prop_key_inner(start_class, prop)
+        self.static_prop_key_spec(start_class, prop, None)
     }
 
-    fn static_prop_key_inner(&self, start_class: &str, prop: &str) -> Option<String> {
+    fn static_prop_key_spec(
+        &self,
+        start_class: &str,
+        prop: &str,
+        spec_override: Option<&(String, String)>,
+    ) -> Option<String> {
+        self.static_prop_key_inner(start_class, prop, spec_override)
+    }
+
+    fn static_prop_key_inner(
+        &self,
+        start_class: &str,
+        prop: &str,
+        spec_override: Option<&(String, String)>,
+    ) -> Option<String> {
         let mut cur = Some(start_class.to_string());
         while let Some(cname) = cur {
             if let Some(cd) = self.module.classes.get(&cname) {
@@ -61552,7 +61958,8 @@ impl Simulator {
                     // AND inherited from parameterized ancestors (the common
                     // UVM pattern: `uvm_registry_common::m__initialized` is
                     // inherited by `uvm_object_registry#(T,Tname)`).
-                    let key = match &self.current_spec {
+                    let active_spec = spec_override.or(self.current_spec.as_ref());
+                    let key = match active_spec {
                         Some((base, sig))
                             if (base == &cname
                                 || self.class_extends(base.as_str(), &cname))
@@ -62667,20 +63074,13 @@ impl Simulator {
     /// first, then the instance's CLASS static cell. Mirrors `member_handle`
     /// for the value-reading path used by `eval_expr`.
     fn read_member_value(&self, handle: usize, member: &str) -> Option<Value> {
-        if let Some(v) = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
-            .and_then(|i| i.properties.get(member).cloned())
-        {
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref());
+        if let Some(v) = inst.and_then(|i| i.properties.get(member).cloned()) {
             return Some(v);
         }
-        let cn = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
-            .map(|i| i.class_name.clone())?;
-        let key = self.static_prop_key(&cn, member)?;
+        let cn = inst.map(|i| i.class_name.clone())?;
+        let spec = inst.and_then(|i| i.spec.as_ref());
+        let key = self.static_prop_key_spec(&cn, member, spec)?;
         self.class_statics.get(&key).cloned()
     }
 
@@ -62689,22 +63089,17 @@ impl Simulator {
     /// property accessed through an instance handle refers to the class's
     /// shared static). Returns None if neither holds a handle.
     fn member_handle(&self, handle: usize, member: &str) -> Option<usize> {
-        if let Some(h) = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref());
+        if let Some(h) = inst
             .and_then(|i| i.properties.get(member))
             .and_then(|v| v.to_u64())
             .map(|h| h as usize)
         {
             return Some(h);
         }
-        let cn = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
-            .map(|i| i.class_name.clone())?;
-        let key = self.static_prop_key(&cn, member)?;
+        let cn = inst.map(|i| i.class_name.clone())?;
+        let spec = inst.and_then(|i| i.spec.as_ref());
+        let key = self.static_prop_key_spec(&cn, member, spec)?;
         self.class_statics
             .get(&key)
             .and_then(|v| v.to_u64())
@@ -63442,6 +63837,57 @@ impl Simulator {
                             if mname == "new" {
                                 if let Some(cd) = self.module.classes.get(&cls).cloned() {
                                     return self.instantiate_class(&cd, args);
+                                }
+                            }
+                        }
+                        // §8.23 / §6.18: `Class::typedef_alias::method(args)` —
+                        // the middle segment is a TYPEDEF declared inside
+                        // `Class` (e.g. UVM's `typedef <registry>#(...) type_id;`,
+                        // or a plain `typedef Holder type_id;`), not a class
+                        // itself. Resolve the alias to its target class and
+                        // dispatch the static method there. Without this,
+                        // `base_class::type_id::get()` (and `type_id::create`)
+                        // never reached the registry's `get()`, so the factory's
+                        // singleton lookup returned null and `type_id::get() !=
+                        // get()` identity checks failed.
+                        else if !self
+                            .local_stack
+                            .last()
+                            .is_some_and(|m| m.contains_key(pkg.as_str()))
+                            && !self.signal_name_to_id.contains_key(pkg.as_str())
+                            && self.module.classes.contains_key(pkg.as_str())
+                        {
+                            // Non-parameterized class-scoped typedef alias.
+                            if let Some(resolved) =
+                                self.resolve_class_member_typedef_class(pkg, &cls)
+                            {
+                                if let Some(res) = self.exec_static_method(&resolved, mname, args)
+                                {
+                                    return res;
+                                }
+                                if mname == "new" {
+                                    if let Some(cd) = self.module.classes.get(&resolved).cloned() {
+                                        return self.instantiate_class(&cd, args);
+                                    }
+                                }
+                            }
+                            // Parameterized class-scoped typedef alias — e.g.
+                            // UVM `typedef uvm_object_registry#(T,"N") type_id;`
+                            // inside class T, called as `T::type_id::get()`. The
+                            // broken generic fallback lost the return value for
+                            // class-typed returns, so the factory's singleton
+                            // identity check failed. Dispatch on the resolved
+                            // specialization with its statics materialised.
+                            if let Some((base, sig)) =
+                                self.resolve_class_member_typedef_spec(pkg, &cls)
+                            {
+                                self.ensure_spec_statics(&base, &sig);
+                                let saved = self.current_spec.take();
+                                self.current_spec = Some((base.clone(), sig));
+                                let res = self.exec_static_method(&base, mname, args);
+                                self.current_spec = saved;
+                                if let Some(v) = res {
+                                    return v;
                                 }
                             }
                         }
@@ -64665,6 +65111,70 @@ impl Simulator {
                 }
             }
 
+            // §6.16 string methods (len/size/getc/substr) and §6.16.6
+            // (compare/icompare/atoreal) on a hierarchical-ident receiver
+            // (`u_if.data.len()`, `top.dut.cfg.substr(0,3)`). They were
+            // excluded from `is_array_builtin_method`'s collection block
+            // above (a string field is not a collection) and from the
+            // no-arg string block below (its `args.is_empty()` gate), so
+            // they fell through to the generic tail, which mis-derived the
+            // receiver as just `path[0]` instead of the full
+            // `path[0..len-1]` (IEEE 1800-2023 §23.6 — the receiver of
+            // `a.b.m()` is `a.b`, not `a`; the parser flattens the call
+            // into `Ident([a, b, m])`).
+            //
+            // `len`/`size`/`getc`/`substr` dispatch by the resolved
+            // hierarchical name (their handlers read the value via
+            // `get_local_signal_or_static`, which finds the hierarchical
+            // signal); `compare`/`icompare`/`atoreal` evaluate the receiver
+            // by value. The USER-METHOD guard is essential: a class instance
+            // whose class defines a same-named method (e.g. a `container`
+            // with its own `len()`) must dispatch to the real method, not
+            // the string builtin — without it `c.len()` on a container
+            // local returned the byte length of the handle instead of
+            // calling `container::len`. The guard evaluates the receiver to
+            // a handle and asks `class_has_method` (value-based, mirroring
+            // the MemberAccess `len`/`size` fallback).
+            if len >= 2
+                && matches!(
+                    path[len - 1].name.name.as_str(),
+                    "len" | "size" | "getc" | "substr"
+                        | "compare" | "icompare" | "atoreal"
+                )
+            {
+                let m = path[len - 1].name.name.clone();
+                let base = HierarchicalIdentifier {
+                    root: hier.root.clone(),
+                    path: path[..len - 1].to_vec(),
+                    span: hier.span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                let recv = self.eval_expr(&base_expr);
+                let recv_h = recv.to_u64().unwrap_or(0) as usize;
+                let is_user_method = recv_h != 0
+                    && self
+                        .heap
+                        .get(recv_h)
+                        .and_then(|o| o.as_ref())
+                        .is_some_and(|i| self.class_has_method(&i.class_name, &m));
+                if !is_user_method {
+                    if matches!(m.as_str(), "len" | "size" | "getc" | "substr") {
+                        if let ExprKind::Ident(bh) = &base_expr.kind {
+                            let bn = self.resolve_hier_name(bh);
+                            if self.get_local_signal_or_static(&bn).is_some() {
+                                if let Some(res) = self.eval_builtin_method(&bn, &m, args) {
+                                    return res;
+                                }
+                            }
+                        }
+                    } else if let Some(v) = self.string_method(&base_expr, &m, args) {
+                        return v;
+                    }
+                }
+            }
+
             // Enum `.name()` / string `.tolower()`/`.toupper()` where the
             // receiver flattened into the ident path (`v.name()` ->
             // Ident([v, name])). The MemberAccess form is handled earlier; this
@@ -65592,6 +66102,40 @@ impl Simulator {
                 if self.class_has_method(&ctx, name) {
                     let this_handle = self.this_stack.last().copied().flatten().unwrap_or(0);
                     if this_handle != 0 {
+                        // IEEE 1800-2017 §8.20: a NON-virtual method (which
+                        // includes every `local` method — `local` methods
+                        // cannot be overridden, so a subclass same-name method
+                        // HIDES rather than overrides) binds STATICALLY to the
+                        // lexical class that owns the call site, NOT the
+                        // runtime class of `this`. Without this, a per-class
+                        // `local` helper that shares a name across an inheritance
+                        // chain (e.g. a field-op dispatcher generated by class
+                        // utility macros) was dispatched virtually: a call to it
+                        // inside the BASE class's body ran the DERIVED class's
+                        // copy, so base-class field macros never executed for a
+                        // subclass instance. That broke the whole field-op chain
+                        // (print/copy/compare/set): inherited fields were
+                        // invisible and field-driven auto-configuration of
+                        // inherited fields silently no-op'd. `ctx` is the
+                        // lexical class (pushed by
+                        // exec_method_in_class_hierarchy / super-call), so this
+                        // is the unqualified analogue of the qualified
+                        // `obj.m()` non-virtual binding above.
+                        if let Some(target) = self.nonvirtual_target_class(&ctx, name) {
+                            let runtime = self
+                                .heap
+                                .get(this_handle)
+                                .and_then(|o| o.as_ref())
+                                .map(|i| i.class_name.clone());
+                            if runtime.as_deref() != Some(target.as_str()) {
+                                return self.exec_method_in_class_hierarchy(
+                                    this_handle,
+                                    &target,
+                                    name,
+                                    args,
+                                );
+                            }
+                        }
                         return self.exec_method_call(this_handle, name, args);
                     }
                     if let Some(v) = self.exec_static_method(&ctx, name, args) {
@@ -66264,6 +66808,22 @@ impl Simulator {
             Value::new(ret_w)
         };
         locals.insert(ret_name.clone(), ret_init);
+        // Register the return variable's declared type (mirroring the port
+        // loop above) so a bare `funcname = new(...)` assignment can resolve
+        // the class to construct: `get_expr_type_name` / the generic `new`
+        // path key off `var_class_types` / `var_typedef_types`. Without this,
+        // an implicit `function C f(); ... f = new();` returns null because
+        // the `new` falls through to a context-free eval that yields 0.
+        if let DataType::TypeReference { name: tn, .. } = &fd.return_type {
+            let type_name = tn.name.name.clone();
+            if self.module.enum_members.contains_key(&type_name)
+                || self.module.typedefs.contains_key(&type_name)
+            {
+                self.var_typedef_types.insert(ret_name.clone(), type_name);
+            } else if self.module.classes.contains_key(&type_name) {
+                self.var_class_types.insert(ret_name.clone(), type_name);
+            }
+        }
         // Mark string-typed return var / params for character indexing.
         if Self::is_string_data_type(&fd.return_type) {
             self.string_signals.insert(ret_name.clone());
@@ -67434,6 +67994,15 @@ impl Simulator {
             // form a type-parameter DEFAULT uses, so both routes name the type
             // identically.
             ExprKind::TypeLiteral(dt) => crate::elaborate::data_type_to_spec_fragment(dt),
+            // A SPECIALIZED class name `C#(int)` used as a type argument.
+            // Render the full `base#(args)` string (whitespace-normalized to
+            // match `current_spec`/`extract_spec_from_string`), so the
+            // recorded type binding can later drive a `T obj; obj = new()`
+            // construction of the SPECIALIZED class — not just the base.
+            ExprKind::Specialization { base, type_args_text } => {
+                let bn = Self::leaf_ident_name(base)?;
+                Some(format!("{}#({})", bn, Self::normalize_spec_ws(type_args_text)))
+            }
             _ => None,
         }
     }
@@ -67480,6 +68049,24 @@ impl Simulator {
                 if h.path.len() == 1 && h.path[0].selects.is_empty())
             {
                 return self.is_known_type_leaf(&member.name);
+            }
+        }
+        // A SPECIALIZED class name used as a type argument — `C#(int)` in
+        // `registry#(C#(int))` (UVM's
+        // `uvm_object_registry#(impl#(bitstream))`). The bare Ident /
+        // MemberAccess arms above only see unspecialized names; without this
+        // the specialized arg was classed as a VALUE, breaking positional
+        // parameter binding — the type param went unbound and silently fell
+        // back to its declared default, so a later `T obj; obj = new()` built
+        // the default class instead of the specialized one.
+        if let ExprKind::Specialization { base, .. } = &e.kind {
+            let leaf = match &base.kind {
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                _ => None,
+            };
+            if let Some(n) = leaf {
+                return self.is_known_type_leaf(n);
             }
         }
         false
@@ -67934,7 +68521,7 @@ impl Simulator {
                         break;
                     }
                     let acd = match self.module.classes.get(&ancestor) {
-                        Some(c) => c.clone(),
+                        Some(c) => c,
                         None => break,
                     };
                     // Find `tn` in the ancestor's full param_order (type +
@@ -68570,6 +69157,11 @@ impl Simulator {
             let c_base = class_def.name.split('#').next().unwrap_or(&class_def.name);
             if b == c_base {
                 instance.spec = Some((b.clone(), sig));
+            } else if self.class_extends(&b, c_base) {
+                if let Some(anc_sig) = self.ancestor_spec(&b, &sig, c_base) {
+                    let anc_sig = self.canonicalize_spec_sig(c_base, &anc_sig);
+                    instance.spec = Some((c_base.to_string(), anc_sig));
+                }
             }
         }
         self.heap.push(Some(instance));
@@ -68618,9 +69210,19 @@ impl Simulator {
                     .get(&pname)
                     .and_then(|s| s.type_name.as_deref())
                     .and_then(Self::container_base);
-                let is_new = matches!(&init.kind, ExprKind::Call { func, .. }
-                    if matches!(&func.kind, ExprKind::Ident(h)
-                        if h.path.len() == 1 && h.path[0].name.name == "new"));
+                let (is_new, ctor_args): (bool, &[Expression]) = match &init.kind {
+                    ExprKind::Call { func, args }
+                        if matches!(&func.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new") =>
+                    {
+                        (true, args.as_slice())
+                    }
+                    ExprKind::Ident(h)
+                        if h.path.len() == 1 && h.path[0].name.name == "new" =>
+                    {
+                        (true, &[])
+                    }
+                    _ => (false, &[]),
+                };
                 if let (Some(kind), true) = (cont_kind, is_new) {
                     let ch = self.heap.len();
                     self.heap.push(Some(ClassInstance {
@@ -68656,22 +69258,27 @@ impl Simulator {
                         .get(&pname)
                         .and_then(|s| s.type_name.clone());
                     if let Some(tn) = prop_tn {
-                        if self.module.classes.contains_key(&tn) {
-                            if let ExprKind::Call { args, .. } = &init.kind {
-                                if let Some(cd2) = self.module.classes.get(&tn).cloned() {
-                                    // Resolve any type-parameter bindings the
-                                    // ctor args may need from the active spec.
-                                    let ta = self.this_property_type_args(&pname);
-                                    let v = self.instantiate_class_with_type_args(
-                                        &cd2,
-                                        args,
-                                        ta.as_deref(),
-                                    );
-                                    if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                        inst.properties.insert(pname, v);
-                                    }
-                                    continue;
+                        let concrete_tn = if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
+                            self.lookup_typedef_target(&tn)
+                        {
+                            name.name.name.clone()
+                        } else {
+                            tn
+                        };
+                        if self.module.classes.contains_key(&concrete_tn) {
+                            if let Some(cd2) = self.module.classes.get(&concrete_tn).cloned() {
+                                // Resolve any type-parameter bindings the
+                                // ctor args may need from the active spec.
+                                let ta = self.this_property_type_args(&pname);
+                                let v = self.instantiate_class_with_type_args(
+                                    &cd2,
+                                    ctor_args,
+                                    ta.as_deref(),
+                                );
+                                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                    inst.properties.insert(pname, v);
                                 }
+                                continue;
                             }
                         }
                     }
@@ -75190,550 +75797,566 @@ impl Simulator {
         method_name: &str,
         args: &[Expression],
     ) -> Value {
-        use crate::ast::decl::ClassMethodKind;
+        use crate::ast::decl::{ClassMethod, ClassMethodKind};
         let mut cur_class = Some(start_class.to_string());
         while let Some(cname) = cur_class {
-            if let Some(class_def) = self.module.classes.get(&cname).cloned() {
-                if let Some(method) = class_def.methods.get(method_name) {
-                    let (ports, body) = match &method.kind {
-                        ClassMethodKind::Function(f) => (&f.ports, &f.items),
-                        ClassMethodKind::Task(t) => (&t.ports, &t.items),
-                        _ => {
-                            cur_class = class_def.extends.clone();
+            // Resolve the matched method + parent-class pointer in a scoped
+            // borrow, cloning AT MOST the single matched method — never the
+            // whole ElaboratedClass. Cloning the entire class (every method,
+            // property, constraint, param map, …) on each lookup made method
+            // dispatch O(class_size × call_count); under heavy call load
+            // through deep inheritance hierarchies that is pathological. Now
+            // only the matched Function/Task body is ever cloned; a miss
+            // (absent / extern / pure) walks up for free.
+            let (method_opt, parent): (Option<ClassMethod>, Option<String>) =
+                match self.module.classes.get(&cname) {
+                    Some(class_def) => (
+                        class_def
+                            .methods
+                            .get(method_name)
+                            .filter(|m| matches!(
+                                m.kind,
+                                ClassMethodKind::Function(_) | ClassMethodKind::Task(_)
+                            ))
+                            .cloned(),
+                        class_def.extends.clone(),
+                    ),
+                    None => (None, None),
+                };
+            cur_class = parent;
+            if let Some(method) = method_opt {
+                let (ports, body) = match &method.kind {
+                    ClassMethodKind::Function(f) => (&f.ports, &f.items),
+                    ClassMethodKind::Task(t) => (&t.ports, &t.items),
+                    _ => unreachable!("non-Function/Task methods filtered out above"),
+                };
+                let mut locals: HashMap<String, Value> = HashMap::default();
+                // §13.5.3: reorder named args into formal order and fill any
+                // omitted (`.name()` / positional `,,`) slot from the formal's
+                // default before positional binding below.
+                let normalized = Self::normalize_call_args(ports, args);
+                let args: &[Expression] = normalized.as_deref().unwrap_or(args);
+                // A function may set its result via the implicit
+                // return variable named after the function (`f = ...`)
+                // instead of an explicit `return`.
+                let fn_ret_name: Option<String> = match &method.kind {
+                    ClassMethodKind::Function(f) => Some(f.name.name.name.clone()),
+                    _ => None,
+                };
+                let ret_is_string = matches!(&method.kind,
+                    ClassMethodKind::Function(f) if Self::is_string_data_type(&f.return_type));
+                // A packed return type whose range references a CLASS
+                // parameter (`function bit [W-1:0] mk();`) can only be
+                // sized per instance — capture it for the clamp at the
+                // return point below. Literal ranges resolve here (params
+                // = None succeeds) and stay un-clamped as before.
+                let dyn_ret_type: Option<DataType> = match &method.kind {
+                    ClassMethodKind::Function(f) => {
+                        let dims = match &f.return_type {
+                            DataType::IntegerVector { dimensions, .. } => Some(dimensions),
+                            DataType::Implicit { dimensions, .. } => Some(dimensions),
+                            _ => None,
+                        };
+                        dims.filter(|ds| {
+                            ds.iter().any(|d| {
+                                matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                                    if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
+                                        || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
+                            })
+                        })
+                        .map(|_| f.return_type.clone())
+                    }
+                    _ => None,
+                };
+                self.push_queue_frame();
+                // `output`/`inout`/`ref` formals copy back to the caller's
+                // actual on return (e.g. `randomize_instr(output riscv_instr
+                // instr, …)` writing the picked instruction to `instr_list[i]`).
+                let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+                let mut queue_writebacks: Vec<(String, String)> = Vec::new();
+                let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
+                let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
+                for (i, port) in ports.iter().enumerate() {
+                    let is_assoc = self.port_is_assoc_array(port);
+                    // An associative-array `output`/`inout`/`ref` formal
+                    // is copied back via the assoc-param signal-namespace
+                    // merge, NOT the scalar `output_bindings` path (which
+                    // can't represent an AA). §13.5.2.
+                    if matches!(
+                        port.direction,
+                        PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                    ) && i < args.len()
+                        && !is_assoc
+                    {
+                        output_bindings.push((port.name.name.clone(), args[i].clone()));
+                    }
+                    if i < args.len() {
+                        if let Some((param, caller)) = self.bind_assoc_param(port, &args[i]) {
+                            let is_out = matches!(
+                                port.direction,
+                                PortDirection::Output
+                                    | PortDirection::Inout
+                                    | PortDirection::Ref
+                            );
+                            assoc_params.push((param, caller, is_out));
                             continue;
                         }
-                    };
-                    let mut locals: HashMap<String, Value> = HashMap::default();
-                    // §13.5.3: reorder named args into formal order and fill any
-                    // omitted (`.name()` / positional `,,`) slot from the formal's
-                    // default before positional binding below.
-                    let normalized = Self::normalize_call_args(ports, args);
-                    let args: &[Expression] = normalized.as_deref().unwrap_or(args);
-                    // A function may set its result via the implicit
-                    // return variable named after the function (`f = ...`)
-                    // instead of an explicit `return`.
-                    let fn_ret_name: Option<String> = match &method.kind {
-                        ClassMethodKind::Function(f) => Some(f.name.name.name.clone()),
-                        _ => None,
-                    };
-                    let ret_is_string = matches!(&method.kind,
-                        ClassMethodKind::Function(f) if Self::is_string_data_type(&f.return_type));
-                    // A packed return type whose range references a CLASS
-                    // parameter (`function bit [W-1:0] mk();`) can only be
-                    // sized per instance — capture it for the clamp at the
-                    // return point below. Literal ranges resolve here (params
-                    // = None succeeds) and stay un-clamped as before.
-                    let dyn_ret_type: Option<DataType> = match &method.kind {
-                        ClassMethodKind::Function(f) => {
-                            let dims = match &f.return_type {
-                                DataType::IntegerVector { dimensions, .. } => Some(dimensions),
-                                DataType::Implicit { dimensions, .. } => Some(dimensions),
-                                _ => None,
-                            };
-                            dims.filter(|ds| {
-                                ds.iter().any(|d| {
-                                    matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
-                                        if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
-                                            || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
-                                })
-                            })
-                            .map(|_| f.return_type.clone())
+                        if self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals) {
+                            continue;
                         }
-                        _ => None,
-                    };
-                    self.push_queue_frame();
-                    // `output`/`inout`/`ref` formals copy back to the caller's
-                    // actual on return (e.g. `randomize_instr(output riscv_instr
-                    // instr, …)` writing the picked instruction to `instr_list[i]`).
-                    let mut output_bindings: Vec<(String, Expression)> = Vec::new();
-                    let mut queue_writebacks: Vec<(String, String)> = Vec::new();
-                    let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
-                    let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
-                    for (i, port) in ports.iter().enumerate() {
-                        let is_assoc = self.port_is_assoc_array(port);
-                        // An associative-array `output`/`inout`/`ref` formal
-                        // is copied back via the assoc-param signal-namespace
-                        // merge, NOT the scalar `output_bindings` path (which
-                        // can't represent an AA). §13.5.2.
-                        if matches!(
-                            port.direction,
-                            PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-                        ) && i < args.len()
-                            && !is_assoc
-                        {
-                            output_bindings.push((port.name.name.clone(), args[i].clone()));
-                        }
-                        if i < args.len() {
-                            if let Some((param, caller)) = self.bind_assoc_param(port, &args[i]) {
-                                let is_out = matches!(
-                                    port.direction,
-                                    PortDirection::Output
-                                        | PortDirection::Inout
-                                        | PortDirection::Ref
-                                );
-                                assoc_params.push((param, caller, is_out));
-                                continue;
-                            }
-                            if self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals) {
-                                continue;
-                            }
-                            // §6.18/§6.20.3: typedef'd / type-param-bound
-                            // formal — dims live on the type (see the same
-                            // resolution in exec_function_call).
-                            if std::env::var("XZ_BD_DBG").is_ok() {
-                                if let crate::ast::types::DataType::TypeReference { name, .. } =
-                                    &port.data_type
-                                {
-                                    eprintln!(
-                                        "[BDDBG] port={} tn={} in_tud={} tud_keys={:?}",
-                                        port.name.name,
-                                        name.name.name,
-                                        self.module
-                                            .typedef_unpacked_dims
-                                            .contains_key(&name.name.name),
-                                        self.module
-                                            .typedef_unpacked_dims
-                                            .keys()
-                                            .collect::<Vec<_>>()
-                                    );
-                                }
-                            }
-                            let eff_dims: Vec<crate::ast::types::UnpackedDimension> = if port
-                                .dimensions
-                                .is_empty()
-                            {
-                                if let crate::ast::types::DataType::TypeReference { name, .. } =
-                                    &port.data_type
-                                    {
-                                        let tn = &name.name.name;
-                                        // Resolve against the CALLEE's own
-                                        // type bindings — `this` isn't pushed
-                                        // yet while formals bind.
-                                        let concrete = self
-                                            .heap
-                                            .get(handle)
-                                            .and_then(|o| o.as_ref())
-                                            .and_then(|i| i.type_bindings.get(tn).cloned())
-                                            .or_else(|| self.resolve_type_param_binding(tn))
-                                            .unwrap_or_else(|| tn.clone());
-                                        // CLASS-LOCAL typedef (`typedef int
-                                        // q_t[$];` inside the class): the dims
-                                        // live on the callee class's own
-                                        // typedef table, walked before the
-                                        // module's — a `ref q_t out_q` formal
-                                        // was bound as a scalar, so the
-                                        // callee's push_backs never reached
-                                        // the caller (§13.5.2).
-                                    Self::typedef_dims_via_tables(&self.module, &cname, &concrete)
-                                        .unwrap_or_default()
-                                    } else {
-                                        Vec::new()
-                                    }
-                                } else {
-                                    port.dimensions.clone()
-                                };
-                            if let Some(caller) = self.bind_queue_param(
-                                &port.name.name,
-                                &eff_dims,
-                                &args[i],
-                                &port.data_type,
-                            ) {
-                                let is_out = matches!(
-                                    port.direction,
-                                    PortDirection::Output
-                                        | PortDirection::Inout
-                                        | PortDirection::Ref
-                                );
-                                if is_out && !caller.is_empty() {
-                                    queue_writebacks.push((port.name.name.clone(), caller));
-                                }
-                                continue;
-                            }
-                            // §13.5.2 / §18.5.12: a FIXED unpacked-array formal
-                            // (`function bit [7:0] parity(bit [7:0] a[4])`) is
-                            // passed BY VALUE. Only the free-function path bound
-                            // one; a class method bound it as a scalar, so the
-                            // body read X and a user function taking an array —
-                            // legal in a constraint — always returned 0.
-                            if let Some(info) = self.bind_array_arg(port, &args[i]) {
-                                if matches!(
-                                    port.direction,
-                                    PortDirection::Output
-                                        | PortDirection::Inout
-                                        | PortDirection::Ref
-                                ) {
-                                    array_writebacks.push(info);
-                                }
-                                continue;
-                            }
-                        }
-                        let mut val = if i < args.len() {
-                            self.eval_expr(&args[i])
-                        } else if let Some(def) = &port.default {
-                            // Caller omitted this arg → apply the formal's
-                            // default (was using 0). UVM uvm_sequence_base::
-                            // start(..., int this_priority = -1): missing arg
-                            // must be -1, not 0, else `this_priority < -1`
-                            // (read unsigned) fatals SEQPRI.
-                            self.eval_expr(def)
-                        } else {
-                            Value::zero(32)
-                        };
-                        if super::elaborate::is_type_signed(&port.data_type) {
-                            val.is_signed = true;
-                        }
-                        if let DataType::TypeReference { name: tn, .. } = &port.data_type {
-                            let type_name = tn.name.name.clone();
-                            if self.module.enum_members.contains_key(&type_name)
-                                || self.module.typedefs.contains_key(&type_name)
-                            {
-                                self.var_typedef_types.insert(port.name.name.clone(), type_name);
-                            } else if self.module.classes.contains_key(&type_name) {
-                                self.var_class_types.insert(port.name.name.clone(), type_name.clone());
-                            }
-                        }
-                        locals.insert(port.name.name.clone(), val);
-                    }
-                    if let Some(rn) = &fn_ret_name {
-                        // Initialise the implicit return variable to match its
-                        // declared type. A STRING return must start as an empty
-                        // string Value, not a 32-bit int — otherwise an implicit
-                        // `funcname = {a, "b", ...}` string-concat assignment
-                        // coerces to the int's 32-bit width and reads back empty
-                        // (uvm_default_report_server::compose_report_message uses
-                        // exactly this form, so its composed line came out blank).
-                        let init = if let ClassMethodKind::Function(f) = &method.kind {
-                            if Self::is_string_data_type(&f.return_type) {
-                                Value::from_string("")
-                            } else {
-                                // Size the implicit return cell to the declared
-                                // return width so a bit-select write
-                                // `retname[i] = ...` for i >= 32 (uvm_packer's
-                                // unpack_field_int filling a 64-bit
-                                // uvm_integral_t) lands; a 32-bit cell dropped
-                                // the upper half. Register the width too so a
-                                // later `retname = <narrow>` zero-extends back,
-                                // mirroring a typed VarDecl.
-                                let rw = super::elaborate::resolve_type_width(
-                                    &f.return_type,
-                                    Some(&self.module.parameters),
-                                    Some(&self.module.typedefs),
-                                )
-                                .max(1);
-                                self.widths.insert(rn.clone(), rw);
-                                // §13.4.1: type default — x for 4-state (see
-                                // the module-function twin above).
-                                if super::elaborate::is_type_real(&f.return_type) {
-                                    Value::from_f64(0.0)
-                                } else if super::elaborate::is_type_two_state(&f.return_type) {
-                                    Value::zero(rw)
-                                } else {
-                                    Value::new(rw)
-                                }
-                            }
-                        } else {
-                            Value::zero(32)
-                        };
-                        locals.entry(rn.clone()).or_insert(init);
-                        // Register the return variable's class type so an
-                        // implicit-return `funcname = new()` knows WHICH class to
-                        // construct — exactly as a typed local `T t = new()` does
-                        // (var_class_types is consulted when a bare `new()` has no
-                        // explicit class). Without this the bare `new()` can't
-                        // resolve its class and yields a broken instance whose
-                        // method calls bind the wrong `this`/params. This is the
-                        // `uvm_report_message::new_report_message` form
-                        // (`new_report_message = new(name)`); fixing it makes the
-                        // real report message's set_action/get_action persist so
-                        // the report-server `$display` fires natively.
-                        if let ClassMethodKind::Function(f) = &method.kind {
+                        // §6.18/§6.20.3: typedef'd / type-param-bound
+                        // formal — dims live on the type (see the same
+                        // resolution in exec_function_call).
+                        if std::env::var("XZ_BD_DBG").is_ok() {
                             if let crate::ast::types::DataType::TypeReference { name, .. } =
-                                &f.return_type
+                                &port.data_type
                             {
-                                let cn = name.name.name.clone();
-                                if self.module.classes.contains_key(&cn) {
-                                    self.var_class_types.insert(rn.clone(), cn);
+                                eprintln!(
+                                    "[BDDBG] port={} tn={} in_tud={} tud_keys={:?}",
+                                    port.name.name,
+                                    name.name.name,
+                                    self.module
+                                        .typedef_unpacked_dims
+                                        .contains_key(&name.name.name),
+                                    self.module
+                                        .typedef_unpacked_dims
+                                        .keys()
+                                        .collect::<Vec<_>>()
+                                );
+                            }
+                        }
+                        let eff_dims: Vec<crate::ast::types::UnpackedDimension> = if port
+                            .dimensions
+                            .is_empty()
+                        {
+                            if let crate::ast::types::DataType::TypeReference { name, .. } =
+                                &port.data_type
+                                {
+                                    let tn = &name.name.name;
+                                    // Resolve against the CALLEE's own
+                                    // type bindings — `this` isn't pushed
+                                    // yet while formals bind.
+                                    let concrete = self
+                                        .heap
+                                        .get(handle)
+                                        .and_then(|o| o.as_ref())
+                                        .and_then(|i| i.type_bindings.get(tn).cloned())
+                                        .or_else(|| self.resolve_type_param_binding(tn))
+                                        .unwrap_or_else(|| tn.clone());
+                                    // CLASS-LOCAL typedef (`typedef int
+                                    // q_t[$];` inside the class): the dims
+                                    // live on the callee class's own
+                                    // typedef table, walked before the
+                                    // module's — a `ref q_t out_q` formal
+                                    // was bound as a scalar, so the
+                                    // callee's push_backs never reached
+                                    // the caller (§13.5.2).
+                                Self::typedef_dims_via_tables(&self.module, &cname, &concrete)
+                                    .unwrap_or_default()
+                                } else {
+                                    Vec::new()
                                 }
+                            } else {
+                                port.dimensions.clone()
+                            };
+                        if let Some(caller) = self.bind_queue_param(
+                            &port.name.name,
+                            &eff_dims,
+                            &args[i],
+                            &port.data_type,
+                        ) {
+                            let is_out = matches!(
+                                port.direction,
+                                PortDirection::Output
+                                    | PortDirection::Inout
+                                    | PortDirection::Ref
+                            );
+                            if is_out && !caller.is_empty() {
+                                queue_writebacks.push((port.name.name.clone(), caller));
                             }
+                            continue;
                         }
-                    }
-                    // Mark string-typed return variable and params so `s[i]`
-                    // does byte (character) indexing instead of bit-select.
-                    // `string_signals` is a global set; re-inserting is harmless.
-                    if let ClassMethodKind::Function(f) = &method.kind {
-                        if Self::is_string_data_type(&f.return_type) {
-                            self.string_signals.insert(f.name.name.name.clone());
-                        }
-                    }
-                    for port in ports.iter() {
-                        if Self::is_string_data_type(&port.data_type) {
-                            self.string_signals.insert(port.name.name.clone());
-                        }
-                    }
-                    // Loop-control flags (`break`/`continue`) are frame-local:
-                    // save the caller's, clear them for this body, and restore
-                    // afterward so a `continue`/`break` inside the callee can't
-                    // leak out and poison the caller's subsequent statements
-                    // (exec_statement bails when either flag is set).
-                    let saved_break = self.break_flag;
-                    let saved_continue = self.continue_flag;
-                    let saved_return = self.return_flag;
-                    self.break_flag = false;
-                    self.continue_flag = false;
-                    self.return_flag = false;
-                    // LRM §25.9 virtual-interface formal-arg aliasing
-                    // (class-method dispatch). Resolve the actuals' vif bindings
-                    // NOW, while `this_stack` is still the CALLER's context
-                    // (the bound vif lives there), before pushing the callee's.
-                    let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
-                    for (i, port) in ports.iter().enumerate() {
-                        if i < args.len() {
-                            if let Some((f, b)) =
-                                self.vif_formal_alias(&port.data_type, &port.name.name, &args[i])
-                            {
-                                iface_alias_frame.insert(f, b);
+                        // §13.5.2 / §18.5.12: a FIXED unpacked-array formal
+                        // (`function bit [7:0] parity(bit [7:0] a[4])`) is
+                        // passed BY VALUE. Only the free-function path bound
+                        // one; a class method bound it as a scalar, so the
+                        // body read X and a user function taking an array —
+                        // legal in a constraint — always returned 0.
+                        if let Some(info) = self.bind_array_arg(port, &args[i]) {
+                            if matches!(
+                                port.direction,
+                                PortDirection::Output
+                                    | PortDirection::Inout
+                                    | PortDirection::Ref
+                            ) {
+                                array_writebacks.push(info);
                             }
+                            continue;
                         }
                     }
-                    // §8.25: a `static` member of a parameterized
-                    // class is per-SPECIALIZATION. Reached from an INSTANCE method
-                    // (e.g. `uvm_resource#(T)::my_type` via `r.get_type_handle()->
-                    // get_type()`) there is no `#(spec)` on the call, so
-                    // `current_spec` is None and static_prop_key uses the shared
-                    // `Class::member` cell — while an explicit `Class#(spec)::member`
-                    // uses `Class#spec::member`. That made get_type() !=
-                    // get_type_handle(), breaking the resource-pool type match
-                    // (config_db GET). Seed current_spec from the instance's own
-                    // type bindings so both paths key the same per-spec cell. Sig =
-                    // the type params' bound leaf names in declaration order (the
-                    // parser now captures builtin type args as Ident leaf names, so
-                    // this matches extract_call_spec's type_args_text).
-                    let saved_spec = self.current_spec.clone();
-                    if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
-                        let cn = inst.class_name.clone();
-                        let bindings = inst.type_bindings.clone();
-                        // Override the active spec with THIS instance's own
-                        // specialization when it differs from the active
-                        // spec's class. Prefer the instance's captured full
-                        // specialization (`spec`), which carries BOTH type
-                        // and value params as a complete sig (unlike the
-                        // type_bindings-only rebuild below). The full `spec`
-                        // is what restores the specialization a
-                        // typedef-specialization singleton was constructed
-                        // under, so a later virtual call can answer
-                        // value-param lookups (the UVM factory
-                        // get_type_name chain). The type_bindings rebuild is
-                        // the legacy fallback: an instance method of
-                        // `uvm_resource#(int)` must key uvm_resource's
-                        // per-spec cell even when called while an UNRELATED
-                        // spec is active (e.g. the enclosing
-                        // `uvm_config_db#(int)`, whose base `uvm_config_db`
-                        // wouldn't match `uvm_resource` in static_prop_key
-                        // and would fall back to the shared unspec'd cell →
-                        // the get_type/get_type_handle mismatch).
-                        let differs = match self.current_spec.as_ref() {
-                            None => true,
-                            // Switch when the base class differs OR the
-                            // instance's own specialization (same base,
-                            // different sig) differs. The latter is the
-                            // UVM callback typewide-recursion case:
-                            // `base_comp.m_add_tw_cbs` calls
-                            // `cb_pair.m_add_tw_cbs(cb)` where cb_pair is a
-                            // DIFFERENT specialization's instance (e.g.
-                            // uvm_callbacks#(b_comp)). Without restoring
-                            // the instance's spec, the recursed method's
-                            // `m_t_inst.m_tw_cb_q` static access keys off
-                            // the caller's (base_comp) cell, so typewide
-                            // callbacks never propagate to derived types.
-                            Some((b, s)) => {
-                                *b != cn
-                                    || inst
-                                        .spec
-                                        .as_ref()
-                                        .is_some_and(|(ib, is)| {
-                                            ib != b || is != s
-                                        })
-                            }
-                        };
-                        if differs {
-                            if inst.spec.is_some() {
-                                self.current_spec = inst.spec.clone();
-                            } else if let Some(cd) = self.module.classes.get(&cn) {
-                                let mut param_names = cd.param_order.clone();
-                                if param_names.is_empty() {
-                                    param_names = cd.type_param_names.clone();
-                                }
-                                if !param_names.is_empty() {
-                                    let sig_frags: Vec<String> = param_names
-                                        .iter()
-                                        .filter_map(|p| {
-                                            if let Some(b) = bindings.get(p) {
-                                                Some(b.clone())
-                                            } else if let Some(v) = inst.properties.get(p) {
-                                                Some(v.to_string())
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect();
-                                    if sig_frags.len() == param_names.len() {
-                                        self.current_spec = Some((cn.clone(), sig_frags.join(",")));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    self.this_stack.push(Some(handle));
-                    self.local_stack.push(locals);
-                    // Record the `local_stack` depth BEFORE this method's own
-                    // frame (i.e. the count of caller frames) so that
-                    // `get_expr_type_name`'s `in_any_frame` check only considers
-                    // the current method's locals — not a caller's same-named
-                    // local that leaked into the flat `var_class_types` map.
-                    self.method_local_base.push(self.local_stack.len() - 1);
-                    self.class_context_stack.push(Some(cname.clone()));
-                    self.local_iface_aliases.push(iface_alias_frame);
-                    // §6.21: open a static-local sync frame so a `static`
-                    // local declared in the method body persists across calls.
-                    // (Class methods previously never opened one — only free
-                    // functions/tasks did — so a `static this_type m_inst;`
-                    // inside `get()` was re-initialized every call and the
-                    // UVM factory singleton never survived.) The key itself is
-                    // made class/spec-aware at the declaration site above.
-                    self.static_local_syncs
-                        .push((method_name.to_string(), Vec::new()));
-                    for stmt in body {
-                        self.exec_statement(stmt);
-                        if self.break_flag || self.return_flag {
-                            break;
-                        }
-                    }
-                    // Write back any static locals declared in this body before
-                    // the locals frame is dropped.
-                    self.sync_static_locals();
-                    self.current_spec = saved_spec;
-                    self.local_iface_aliases.pop();
-                    if self.parked_from_exec {
-                        // The process was parked by exec_statement's Wait handler.
-                        // Keep break/return flags set so they propagate up to
-                        // run_process_stmts. Don't restore the saved values.
+                    let mut val = if i < args.len() {
+                        self.eval_expr(&args[i])
+                    } else if let Some(def) = &port.default {
+                        // Caller omitted this arg → apply the formal's
+                        // default (was using 0). UVM uvm_sequence_base::
+                        // start(..., int this_priority = -1): missing arg
+                        // must be -1, not 0, else `this_priority < -1`
+                        // (read unsigned) fatals SEQPRI.
+                        self.eval_expr(def)
                     } else {
-                        self.break_flag = saved_break;
-                        self.continue_flag = saved_continue;
-                        self.return_flag = saved_return;
+                        Value::zero(32)
+                    };
+                    if super::elaborate::is_type_signed(&port.data_type) {
+                        val.is_signed = true;
                     }
-                    self.class_context_stack.pop();
-                    self.method_local_base.pop();
-                    let implicit = fn_ret_name.as_ref().and_then(|rn| {
-                        let lv = self.local_stack.last().and_then(|m| m.get(rn).cloned());
-                        // A `funcname = {a, b, ...}` string-concat assignment is
-                        // serviced by the string-concat path, which writes the
-                        // result via set_signal_value_by_name (the SIGNAL store),
-                        // not the local frame — so a string return whose local is
-                        // still empty has its real value in the signal store
-                        // (this is uvm_default_report_server::compose_report_message,
-                        // whose composed line was coming back blank).
-                        if ret_is_string
-                            && lv.as_ref().is_none_or(|v| v.to_sv_string().is_empty())
+                    if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+                        let type_name = tn.name.name.clone();
+                        if self.module.enum_members.contains_key(&type_name)
+                            || self.module.typedefs.contains_key(&type_name)
                         {
-                            self.get_signal_value_by_name(rn).or(lv)
+                            self.var_typedef_types.insert(port.name.name.clone(), type_name);
+                        } else if self.module.classes.contains_key(&type_name) {
+                            self.var_class_types.insert(port.name.name.clone(), type_name.clone());
+                        }
+                    }
+                    locals.insert(port.name.name.clone(), val);
+                }
+                if let Some(rn) = &fn_ret_name {
+                    // Initialise the implicit return variable to match its
+                    // declared type. A STRING return must start as an empty
+                    // string Value, not a 32-bit int — otherwise an implicit
+                    // `funcname = {a, "b", ...}` string-concat assignment
+                    // coerces to the int's 32-bit width and reads back empty
+                    // (uvm_default_report_server::compose_report_message uses
+                    // exactly this form, so its composed line came out blank).
+                    let init = if let ClassMethodKind::Function(f) = &method.kind {
+                        if Self::is_string_data_type(&f.return_type) {
+                            Value::from_string("")
                         } else {
-                            lv
-                        }
-                    });
-                    let mut ret = self
-                        .return_value
-                        .take()
-                        .or(implicit)
-                        .unwrap_or(Value::zero(32));
-                    // Per-instance return clamp for a class-parameter-sized
-                    // return type: `box#(4)` with `function bit [W-1:0] mk()`
-                    // must hand back 4 bits, not whatever width the body's
-                    // last assignment happened to carry.
-                    if let Some(rt) = &dyn_ret_type {
-                        if !ret.is_real {
-                            let scope = self.instance_param_scope(handle);
-                            let w = resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs));
-                            if w > 0 && w != ret.width {
-                                ret = ret.resize_for_assign(w);
-                            }
-                        }
-                    }
-                    // §13.4.1: a class method's return takes its DECLARED type,
-                    // exactly as a module-level function's does. Only the
-                    // parameter-sized case above was handled, so
-                    // `function bit [15:0] u; return -1;` handed back the
-                    // literal's signedness and `c.u() > 0` read it as -1.
-                    if let ClassMethodKind::Function(f) = &method.kind {
-                        // Only PLAINLY integral declared types are stamped — a
-                        // TypeReference may name a class (the return is a heap
-                        // HANDLE whose "width" is meaningless and whose value
-                        // must pass through untouched), and Implicit means no
-                        // declared type at all. The first version of this stamp
-                        // resized those and broke handle-returning methods.
-                        let plainly_integral = matches!(
-                            f.return_type,
-                            DataType::IntegerVector { .. } | DataType::IntegerAtom { .. }
-                        );
-                        if plainly_integral
-                            && !ret.is_real
-                            && !ret_is_string
-                            && dyn_ret_type.is_none()
-                        {
-                            let w = resolve_type_width(
+                            // Size the implicit return cell to the declared
+                            // return width so a bit-select write
+                            // `retname[i] = ...` for i >= 32 (uvm_packer's
+                            // unpack_field_int filling a 64-bit
+                            // uvm_integral_t) lands; a 32-bit cell dropped
+                            // the upper half. Register the width too so a
+                            // later `retname = <narrow>` zero-extends back,
+                            // mirroring a typed VarDecl.
+                            let rw = super::elaborate::resolve_type_width(
                                 &f.return_type,
                                 Some(&self.module.parameters),
                                 Some(&self.module.typedefs),
-                            );
-                            if w > 0 && w != ret.width {
-                                ret = ret.resize(w);
+                            )
+                            .max(1);
+                            self.widths.insert(rn.clone(), rw);
+                            // §13.4.1: type default — x for 4-state (see
+                            // the module-function twin above).
+                            if super::elaborate::is_type_real(&f.return_type) {
+                                Value::from_f64(0.0)
+                            } else if super::elaborate::is_type_two_state(&f.return_type) {
+                                Value::zero(rw)
+                            } else {
+                                Value::new(rw)
                             }
-                            ret.is_signed = super::elaborate::is_type_signed(&f.return_type);
+                        }
+                    } else {
+                        Value::zero(32)
+                    };
+                    locals.entry(rn.clone()).or_insert(init);
+                    // Register the return variable's class type so an
+                    // implicit-return `funcname = new()` knows WHICH class to
+                    // construct — exactly as a typed local `T t = new()` does
+                    // (var_class_types is consulted when a bare `new()` has no
+                    // explicit class). Without this the bare `new()` can't
+                    // resolve its class and yields a broken instance whose
+                    // method calls bind the wrong `this`/params. This is the
+                    // `uvm_report_message::new_report_message` form
+                    // (`new_report_message = new(name)`); fixing it makes the
+                    // real report message's set_action/get_action persist so
+                    // the report-server `$display` fires natively.
+                    if let ClassMethodKind::Function(f) = &method.kind {
+                        if let crate::ast::types::DataType::TypeReference { name, .. } =
+                            &f.return_type
+                        {
+                            let cn = name.name.name.clone();
+                            if self.module.classes.contains_key(&cn) {
+                                self.var_class_types.insert(rn.clone(), cn);
+                            }
                         }
                     }
-                    // Snapshot output/ref formal values before dropping locals.
-                    let writebacks: Vec<(Value, Expression)> = output_bindings
-                        .iter()
-                        .filter_map(|(pn, caller)| {
-                            self.local_stack
-                                .last()
-                                .and_then(|l| l.get(pn).cloned())
-                                .map(|v| (v, caller.clone()))
-                        })
-                        .collect();
-                    self.local_stack.pop();
-                    self.this_stack.pop();
-                    self.pop_and_restore_queue_frame();
-                    for (param, caller) in &queue_writebacks {
-                        self.writeback_queue_param(param, caller);
-                    }
-                    // §13.5.2: copy `output`/`inout`/`ref` fixed-array formals
-                    // back onto the caller's array (a plain `input` formal is
-                    // by value and must NOT write back — §18.5.12 relies on
-                    // that for array args to constraint functions).
-                    if !array_writebacks.is_empty() {
-                        self.writeback_array_args(&array_writebacks);
-                    }
-                    for (v, caller) in writebacks {
-                        self.assign_value(&caller, &v);
-                    }
-                    // §13.5.2: copy `output`/`inout`/`ref` associative-array
-                    // formals back onto the caller's AA (signal-namespace
-                    // merge), then drop the formal's temporary copy.
-                    for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
-                        if param == caller {
-                            continue;
-                        }
-                        if is_out {
-                            self.writeback_assoc_param(&param, &caller);
-                        }
-                        self.purge_assoc_param(&param);
-                    }
-                    return ret;
                 }
-                cur_class = class_def.extends.clone();
-            } else {
-                break;
+                // Mark string-typed return variable and params so `s[i]`
+                // does byte (character) indexing instead of bit-select.
+                // `string_signals` is a global set; re-inserting is harmless.
+                if let ClassMethodKind::Function(f) = &method.kind {
+                    if Self::is_string_data_type(&f.return_type) {
+                        self.string_signals.insert(f.name.name.name.clone());
+                    }
+                }
+                for port in ports.iter() {
+                    if Self::is_string_data_type(&port.data_type) {
+                        self.string_signals.insert(port.name.name.clone());
+                    }
+                }
+                // Loop-control flags (`break`/`continue`) are frame-local:
+                // save the caller's, clear them for this body, and restore
+                // afterward so a `continue`/`break` inside the callee can't
+                // leak out and poison the caller's subsequent statements
+                // (exec_statement bails when either flag is set).
+                let saved_break = self.break_flag;
+                let saved_continue = self.continue_flag;
+                let saved_return = self.return_flag;
+                self.break_flag = false;
+                self.continue_flag = false;
+                self.return_flag = false;
+                // LRM §25.9 virtual-interface formal-arg aliasing
+                // (class-method dispatch). Resolve the actuals' vif bindings
+                // NOW, while `this_stack` is still the CALLER's context
+                // (the bound vif lives there), before pushing the callee's.
+                let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
+                for (i, port) in ports.iter().enumerate() {
+                    if i < args.len() {
+                        if let Some((f, b)) =
+                            self.vif_formal_alias(&port.data_type, &port.name.name, &args[i])
+                        {
+                            iface_alias_frame.insert(f, b);
+                        }
+                    }
+                }
+                // PURE_SV_LRM §8.25: a `static` member of a parameterized
+                // class is per-SPECIALIZATION. Reached from an INSTANCE method
+                // (e.g. `uvm_resource#(T)::my_type` via `r.get_type_handle()->
+                // get_type()`) there is no `#(spec)` on the call, so
+                // `current_spec` is None and static_prop_key uses the shared
+                // `Class::member` cell — while an explicit `Class#(spec)::member`
+                // uses `Class#spec::member`. That made get_type() !=
+                // get_type_handle(), breaking the resource-pool type match
+                // (config_db GET). Seed current_spec from the instance's own
+                // type bindings so both paths key the same per-spec cell. Sig =
+                // the type params' bound leaf names in declaration order (the
+                // parser now captures builtin type args as Ident leaf names, so
+                // this matches extract_call_spec's type_args_text).
+                let saved_spec = self.current_spec.clone();
+                if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
+                    let cn = inst.class_name.clone();
+                    let bindings = inst.type_bindings.clone();
+                    // Override the active spec with THIS instance's own
+                    // specialization when it differs from the active
+                    // spec's class. Prefer the instance's captured full
+                    // specialization (`spec`), which carries BOTH type
+                    // and value params as a complete sig (unlike the
+                    // type_bindings-only rebuild below). The full `spec`
+                    // is what restores the specialization a
+                    // typedef-specialization singleton was constructed
+                    // under, so a later virtual call can answer
+                    // value-param lookups (the UVM factory
+                    // get_type_name chain). The type_bindings rebuild is
+                    // the legacy fallback: an instance method of
+                    // `uvm_resource#(int)` must key uvm_resource's
+                    // per-spec cell even when called while an UNRELATED
+                    // spec is active (e.g. the enclosing
+                    // `uvm_config_db#(int)`, whose base `uvm_config_db`
+                    // wouldn't match `uvm_resource` in static_prop_key
+                    // and would fall back to the shared unspec'd cell →
+                    // the get_type/get_type_handle mismatch).
+                    let differs = match self.current_spec.as_ref() {
+                        None => true,
+                        // Switch when the base class differs OR the
+                        // instance's own specialization (same base,
+                        // different sig) differs. The latter is the
+                        // UVM callback typewide-recursion case:
+                        // `base_comp.m_add_tw_cbs` calls
+                        // `cb_pair.m_add_tw_cbs(cb)` where cb_pair is a
+                        // DIFFERENT specialization's instance (e.g.
+                        // uvm_callbacks#(b_comp)). Without restoring
+                        // the instance's spec, the recursed method's
+                        // `m_t_inst.m_tw_cb_q` static access keys off
+                        // the caller's (base_comp) cell, so typewide
+                        // callbacks never propagate to derived types.
+                        Some((b, s)) => {
+                            *b != cn
+                                || inst
+                                    .spec
+                                    .as_ref()
+                                    .is_some_and(|(ib, is)| {
+                                        ib != b || is != s
+                                    })
+                        }
+                    };
+                    if differs {
+                        if inst.spec.is_some() {
+                            self.current_spec = inst.spec.clone();
+                        } else if let Some(cd) = self.module.classes.get(&cn) {
+                            let mut param_names = cd.param_order.clone();
+                            if param_names.is_empty() {
+                                param_names = cd.type_param_names.clone();
+                            }
+                            if !param_names.is_empty() {
+                                let sig_frags: Vec<String> = param_names
+                                    .iter()
+                                    .filter_map(|p| {
+                                        if let Some(b) = bindings.get(p) {
+                                            Some(b.clone())
+                                        } else if let Some(v) = inst.properties.get(p) {
+                                            Some(v.to_string())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+                                if sig_frags.len() == param_names.len() {
+                                    self.current_spec = Some((cn.clone(), sig_frags.join(",")));
+                                }
+                            }
+                        }
+                    }
+                }
+                self.this_stack.push(Some(handle));
+                self.local_stack.push(locals);
+                // Record the `local_stack` depth BEFORE this method's own
+                // frame (i.e. the count of caller frames) so that
+                // `get_expr_type_name`'s `in_any_frame` check only considers
+                // the current method's locals — not a caller's same-named
+                // local that leaked into the flat `var_class_types` map.
+                self.method_local_base.push(self.local_stack.len() - 1);
+                self.class_context_stack.push(Some(cname.clone()));
+                self.local_iface_aliases.push(iface_alias_frame);
+                // §6.21: open a static-local sync frame so a `static`
+                // local declared in the method body persists across calls.
+                // (Class methods previously never opened one — only free
+                // functions/tasks did — so a `static this_type m_inst;`
+                // inside `get()` was re-initialized every call and the
+                // UVM factory singleton never survived.) The key itself is
+                // made class/spec-aware at the declaration site above.
+                self.static_local_syncs
+                    .push((method_name.to_string(), Vec::new()));
+                for stmt in body {
+                    self.exec_statement(stmt);
+                    if self.break_flag || self.return_flag {
+                        break;
+                    }
+                }
+                // Write back any static locals declared in this body before
+                // the locals frame is dropped.
+                self.sync_static_locals();
+                self.current_spec = saved_spec;
+                self.local_iface_aliases.pop();
+                if self.parked_from_exec {
+                    // The process was parked by exec_statement's Wait handler.
+                    // Keep break/return flags set so they propagate up to
+                    // run_process_stmts. Don't restore the saved values.
+                } else {
+                    self.break_flag = saved_break;
+                    self.continue_flag = saved_continue;
+                    self.return_flag = saved_return;
+                }
+                self.class_context_stack.pop();
+                self.method_local_base.pop();
+                let implicit = fn_ret_name.as_ref().and_then(|rn| {
+                    let lv = self.local_stack.last().and_then(|m| m.get(rn).cloned());
+                    // A `funcname = {a, b, ...}` string-concat assignment is
+                    // serviced by the string-concat path, which writes the
+                    // result via set_signal_value_by_name (the SIGNAL store),
+                    // not the local frame — so a string return whose local is
+                    // still empty has its real value in the signal store
+                    // (this is uvm_default_report_server::compose_report_message,
+                    // whose composed line was coming back blank).
+                    if ret_is_string
+                        && lv.as_ref().is_none_or(|v| v.to_sv_string().is_empty())
+                    {
+                        self.get_signal_value_by_name(rn).or(lv)
+                    } else {
+                        lv
+                    }
+                });
+                let mut ret = self
+                    .return_value
+                    .take()
+                    .or(implicit)
+                    .unwrap_or(Value::zero(32));
+                // Per-instance return clamp for a class-parameter-sized
+                // return type: `box#(4)` with `function bit [W-1:0] mk()`
+                // must hand back 4 bits, not whatever width the body's
+                // last assignment happened to carry.
+                if let Some(rt) = &dyn_ret_type {
+                    if !ret.is_real {
+                        let scope = self.instance_param_scope(handle);
+                        let w = resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs));
+                        if w > 0 && w != ret.width {
+                            ret = ret.resize_for_assign(w);
+                        }
+                    }
+                }
+                // §13.4.1: a class method's return takes its DECLARED type,
+                // exactly as a module-level function's does. Only the
+                // parameter-sized case above was handled, so
+                // `function bit [15:0] u; return -1;` handed back the
+                // literal's signedness and `c.u() > 0` read it as -1.
+                if let ClassMethodKind::Function(f) = &method.kind {
+                    // Only PLAINLY integral declared types are stamped — a
+                    // TypeReference may name a class (the return is a heap
+                    // HANDLE whose "width" is meaningless and whose value
+                    // must pass through untouched), and Implicit means no
+                    // declared type at all. The first version of this stamp
+                    // resized those and broke handle-returning methods.
+                    let plainly_integral = matches!(
+                        f.return_type,
+                        DataType::IntegerVector { .. } | DataType::IntegerAtom { .. }
+                    );
+                    if plainly_integral
+                        && !ret.is_real
+                        && !ret_is_string
+                        && dyn_ret_type.is_none()
+                    {
+                        let w = resolve_type_width(
+                            &f.return_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        );
+                        if w > 0 && w != ret.width {
+                            ret = ret.resize(w);
+                        }
+                        ret.is_signed = super::elaborate::is_type_signed(&f.return_type);
+                    }
+                }
+                // Snapshot output/ref formal values before dropping locals.
+                let writebacks: Vec<(Value, Expression)> = output_bindings
+                    .iter()
+                    .filter_map(|(pn, caller)| {
+                        self.local_stack
+                            .last()
+                            .and_then(|l| l.get(pn).cloned())
+                            .map(|v| (v, caller.clone()))
+                    })
+                    .collect();
+                self.local_stack.pop();
+                self.this_stack.pop();
+                self.pop_and_restore_queue_frame();
+                for (param, caller) in &queue_writebacks {
+                    self.writeback_queue_param(param, caller);
+                }
+                // §13.5.2: copy `output`/`inout`/`ref` fixed-array formals
+                // back onto the caller's array (a plain `input` formal is
+                // by value and must NOT write back — §18.5.12 relies on
+                // that for array args to constraint functions).
+                if !array_writebacks.is_empty() {
+                    self.writeback_array_args(&array_writebacks);
+                }
+                for (v, caller) in writebacks {
+                    self.assign_value(&caller, &v);
+                }
+                // §13.5.2: copy `output`/`inout`/`ref` associative-array
+                // formals back onto the caller's AA (signal-namespace
+                // merge), then drop the formal's temporary copy.
+                for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+                    if param == caller {
+                        continue;
+                    }
+                    if is_out {
+                        self.writeback_assoc_param(&param, &caller);
+                    }
+                    self.purge_assoc_param(&param);
+                }
+                return ret;
             }
         }
         Value::zero(32)
@@ -75847,6 +76470,30 @@ impl Simulator {
         self.get_expr_type_name(lvalue)
             .as_deref()
             .and_then(Self::container_base)
+    }
+
+    fn lookup_type_member(&self, type_name: &str, member: &str) -> Option<String> {
+        if let Some(t) = self.class_prop_type_named(type_name, member) {
+            return Some(t);
+        }
+        if let Some(dt) = self.module.typedef_types.get(type_name).cloned() {
+            let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
+            if let DataType::Struct(su) = resolved {
+                for m in &su.members {
+                    for d in &m.declarators {
+                        if d.name.name == member {
+                            if let DataType::TypeReference { name, .. } = &m.data_type {
+                                return Some(name.name.name.clone());
+                            }
+                            if let DataType::TypeReference { name, .. } = self.resolve_dt(&m.data_type) {
+                                return Some(name.name.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn class_prop_type_named(&self, class_name: &str, prop: &str) -> Option<String> {
@@ -76069,31 +76716,24 @@ impl Simulator {
                         }
                     }
                 }
-                // `ClassName::static_prop` (2-segment): look up the static
-                // property's declared type. Needed for bare `new` type
-                // inference (`container::the_obj = new`) — without this,
-                // get_expr_type_name returns None and the construction is
-                // skipped, leaving the static property null.
-                if hier.path.len() == 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
-                    let cls = &hier.path[0].name.name;
-                    let prop = &hier.path[1].name.name;
-                    if let Some(t) = self.class_prop_type_named(cls, prop) {
-                        return Some(t);
-                    }
-                }
-                // `ClassName::static_obj_handle.member...` (3+ segments):
-                // resolve the static property's declared type, then walk the
-                // remaining segments through class property types. Needed for
-                // `ClassName::obj.member = new(...)` type inference — e.g.
-                // UVM's `the_pool.inst = new` where `the_pool` is a static
-                // holding an object whose `member` is itself a class handle.
-                if hier.path.len() >= 3 && hier.path.iter().all(|s| s.selects.is_empty()) {
-                    let cls = &hier.path[0].name.name;
-                    let prop = &hier.path[1].name.name;
-                    if let Some(mut tn) = self.class_prop_type_named(cls, prop) {
+                // Multi-segment path resolution (e.g. `stor.handle`, `ClassName::static_prop`, `obj.field.subfield`)
+                if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    let root = &hier.path[0].name.name;
+                    let curr_type = if let Some(t) = self.var_class_types.get(root) {
+                        Some(t.clone())
+                    } else if let Some(t) = self.var_typedef_types.get(root) {
+                        Some(t.clone())
+                    } else if self.module.classes.contains_key(root) {
+                        Some(root.clone())
+                    } else if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                        self.class_prop_type_named(&ctx, root)
+                    } else {
+                        None
+                    };
+                    if let Some(mut tn) = curr_type {
                         let mut ok = true;
-                        for seg in &hier.path[2..] {
-                            if let Some(next) = self.class_prop_type_named(&tn, &seg.name.name) {
+                        for seg in &hier.path[1..] {
+                            if let Some(next) = self.lookup_type_member(&tn, &seg.name.name) {
                                 tn = next;
                             } else {
                                 ok = false;
@@ -76190,6 +76830,26 @@ impl Simulator {
                         if let Some(tn) = self.get_expr_type_name(base) {
                             if let Some(mt) = self.class_prop_type_named(&tn, &member.name) {
                                 return Some(mt);
+                            }
+                        }
+                    }
+                }
+                if let Some(base_type) = self.get_expr_type_name(base) {
+                    let dt_opt = self.module.typedef_types.get(&base_type).cloned();
+                    if let Some(dt) = dt_opt {
+                        let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
+                        if let DataType::Struct(su) = resolved {
+                            for m in &su.members {
+                                for d in &m.declarators {
+                                    if d.name.name == member.name {
+                                        if let DataType::TypeReference { name, .. } = &m.data_type {
+                                            return Some(name.name.name.clone());
+                                        }
+                                        if let DataType::TypeReference { name, .. } = self.resolve_dt(&m.data_type) {
+                                            return Some(name.name.name.clone());
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
