@@ -244,3 +244,14 @@ fn out_of_class_new_and_explicitly_typed_methods_still_parse() {
     );
     assert!(r.errors.is_empty(), "unexpected errors: {:?}", r.errors);
 }
+
+/// §22.5.1: `` is DELETED, not whitespace-eating glue. A `` with real
+/// whitespace next to it keeps that whitespace (ivtest br979:
+/// `localparam `` i``a``b``j` must yield `localparam i01j`, not
+/// `localparami01j`); gluing only happens where the tokens were already
+/// adjacent.
+#[test]
+fn double_backtick_does_not_eat_surrounding_whitespace() {
+    let out = pp("`define my_macro(a,b) localparam `` i``a``b``j = 8'h``a``b;\n`my_macro(0,1)\n");
+    assert_eq!(squash(&out), "localparam i01j = 8'h01;", "got {out:?}");
+}

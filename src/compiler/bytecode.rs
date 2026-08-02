@@ -1705,15 +1705,50 @@ impl<'a> BytecodeCompiler<'a> {
                         | BinaryOp::LogImplies
                         | BinaryOp::LogEquiv
                 );
+                // §11.6.1: for the operators whose operands are
+                // CONTEXT-determined, the context width is the MAXIMUM of the
+                // surrounding context and the operands' own widths — it must
+                // never NARROW an operand. Propagating a narrow LHS width down
+                // truncated the left operand before the operation, which is
+                // observably wrong wherever the low bits are not preserved:
+                // `logic [4:0] r; r <= (1 << s) >> 3;` computed `1 << 5` at 5
+                // bits (0) instead of 32 bits (32), so r read 0 instead of 4.
+                // (For +/-/*/&/|/^ the low bits are the same either way, which
+                // is why only the shift/divide family showed it.)
+                let widens_operands = matches!(
+                    op,
+                    BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ArithShiftRight
+                        | BinaryOp::Div
+                        | BinaryOp::Mod
+                        | BinaryOp::Power
+                );
                 let sub_ctx = if is_self_determined {
                     let lw = self.expr_max_width(left);
                     let rw = self.expr_max_width(right);
                     lw.max(rw)
+                } else if widens_operands {
+                    ctx_width.max(self.expr_max_width(left))
                 } else {
                     ctx_width
                 };
                 let l = self.compile_expr(left, sub_ctx)?;
-                let r = self.compile_expr(right, sub_ctx)?;
+                // §11.4.10: a shift's RIGHT operand is SELF-DETERMINED — its
+                // width never affects the result, so it keeps its own.
+                let is_shift = matches!(
+                    op,
+                    BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ArithShiftRight
+                );
+                let r = if is_shift {
+                    self.compile_expr(right, self.expr_max_width(right))?
+                } else {
+                    self.compile_expr(right, sub_ctx)?
+                };
                 // Context width resizing for arithmetic / bitwise ops only.
                 // For self-determined comparisons we must NOT resize to
                 // ctx_width — that would clobber the operands.
