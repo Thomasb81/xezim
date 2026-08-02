@@ -14512,7 +14512,12 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     // Const pre-resized at fuse time: compare, clone only on change.
-                    if signal_table[*sig_id] != **k {
+                    // §10.4.2 last-write-wins: an entry already queued for this
+                    // signal supersedes signal_table, so compare against it
+                    // rather than eliding against a stale current value.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = (**k).clone();
+                    } else if signal_table[*sig_id] != **k {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: (**k).clone(),
@@ -14579,7 +14584,10 @@ impl Simulator {
                     // entry; doing it here saves the push + queue traversal
                     // + ~70% of apply_nba's per-entry work on c910 (flop Q
                     // outputs reload the same value most cycles).
-                    if signal_table[*sig_id] != val {
+                    // §10.4.2 last-write-wins: see the NbaAssignConst arm.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = val;
+                    } else if signal_table[*sig_id] != val {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: val,
@@ -14939,7 +14947,11 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     // Const pre-resized at fuse time: compare, clone only on change.
-                    if view[*sig_id] != **k {
+                    // §10.4.2 last-write-wins: an entry already queued for this
+                    // signal supersedes the snapshot view.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = (**k).clone();
+                    } else if view[*sig_id] != **k {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: (**k).clone(),
@@ -15137,7 +15149,10 @@ impl Simulator {
                 // ── Deferred (non-blocking) writes — queued like settle ──
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
-                    if view[*sig_id] != val {
+                    // §10.4.2 last-write-wins: see the NbaAssignConst arm.
+                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                        nba_out[i].value = val;
+                    } else if view[*sig_id] != val {
                         nba_out.push(NbaFast {
                             signal_id: *sig_id,
                             value: val,
@@ -15538,7 +15553,16 @@ impl Simulator {
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
                     // Const pre-resized at fuse time: compare, clone only on change.
-                    if self.signal_table[*sig_id] != **k {
+                    if let Some(i) = self.nba_fast_index.get(*sig_id) {
+                        // §10.4.2 last-write-wins. A value already QUEUED for
+                        // this signal in this time step is what it will become,
+                        // so the elision below must not compare against
+                        // signal_table — that is the stale pre-update value.
+                        // Eliding here let an earlier NBA survive a later one
+                        // that happened to match the old value, which is how
+                        // `x <= a; if (rst) {x,y} <= 0;` kept `a` under reset.
+                        self.nba_fast[i].value = (**k).clone();
+                    } else if self.signal_table[*sig_id] != **k {
                         self.nba_fast_index.insert(*sig_id, self.nba_fast.len());
                         self.nba_fast.push(NbaFast {
                             block_index: 0,
@@ -15605,7 +15629,14 @@ impl Simulator {
                     // Eval-time elision: skip the queue push when the
                     // value already matches signal_table.  See the
                     // exec_insns_isolated sibling.  Bumps prof_nba_elided.
-                    if self.signal_table[*sig_id] != val {
+                    //
+                    // §10.4.2 last-write-wins: an entry already QUEUED for this
+                    // signal is what it will become, so the elision must not
+                    // compare against the stale signal_table value — overwrite
+                    // the queued entry instead.
+                    if let Some(i) = self.nba_fast_index.get(*sig_id) {
+                        self.nba_fast[i].value = val;
+                    } else if self.signal_table[*sig_id] != val {
                         // Update nba_fast_index too so a follow-up partial-range
                         // or bit NBA to the same signal merges into THIS new
                         // whole-value entry, not into a stale earlier partial.
@@ -19931,6 +19962,36 @@ impl Simulator {
         out
     }
 
+    /// §15.5.3: does `head` name an EVENT for the purposes of
+    /// `@(<head>.triggered)` / `wait(<head>.triggered)`?
+    ///
+    /// `module.events` only holds events declared at MODULE scope — an event
+    /// inside an INTERFACE (the standard UVM `@(vif.evt.triggered)` sync
+    /// pattern) is absent from it, which is why keying solely on that set left
+    /// hierarchical waits with an empty sensitivity that fired at t=0. Every
+    /// event is backed by a 1-bit toggle signal, so an existing signal under
+    /// the head name is the reliable evidence. `full` (the `<head>.triggered`
+    /// name) guards the one ambiguous case: a real struct member literally
+    /// called `triggered`, which resolves as a signal in its own right.
+    fn hier_event_key(&self, head: &str, leaf: &str, full: &str) -> Option<String> {
+        if self.module.events.contains(head) {
+            return Some(head.to_string());
+        }
+        if self.module.events.contains(leaf) {
+            return Some(leaf.to_string());
+        }
+        if self.signal_name_to_id.contains_key(full) {
+            return None; // a genuine member named `triggered`
+        }
+        let resolved = self.resolve_event_key(head);
+        if self.signal_name_to_id.contains_key(resolved.as_str())
+            || self.signal_name_to_id.contains_key(head)
+        {
+            return Some(head.to_string());
+        }
+        None
+    }
+
     fn event_to_sens(&self, event: &EventControl) -> Vec<Sensitivity> {
         // Walk past Paren / RangeSelect / BitSelect / Concatenation wrappers
         // to find the underlying Ident(s). For E902 etc. that use
@@ -20032,14 +20093,8 @@ impl Simulator {
                         if segs.len() >= 2 && *segs.last().unwrap() == "triggered" {
                             let head = segs[..segs.len() - 1].join(".");
                             let leaf = segs[segs.len() - 2];
-                            if self.module.events.contains(&head)
-                                || self.module.events.contains(leaf)
-                            {
-                                let key = if self.module.events.contains(&head) {
-                                    head
-                                } else {
-                                    leaf.to_string()
-                                };
+                            let full = segs.join(".");
+                            if let Some(key) = self.hier_event_key(&head, leaf, &full) {
                                 out.push(Sensitivity {
                                     signal_name: self.resolve_event_key(&key),
                                     edge,
@@ -20086,6 +20141,27 @@ impl Simulator {
                     // always block fired once at t=0 and never again.
                     if idents.is_empty() && ee.edge.is_none() {
                         if let Some(segs) = Self::flatten_member_path(&ee.expr) {
+                            // §15.5.3 `@(<hier>.<event>.triggered)` — the
+                            // MemberAccess shape the parser produces for an
+                            // event reached through a hierarchical path
+                            // (`@(u_if.set_opt_reg.triggered)`). The flattened
+                            // Ident shape is handled in the ident loop above;
+                            // this form never reached it (collect_ident_names
+                            // does not walk MemberAccess), so the sensitivity
+                            // came out empty and the wait returned at t=0.
+                            if segs.len() >= 2 && segs[segs.len() - 1] == "triggered" {
+                                let ev = segs[..segs.len() - 1].join(".");
+                                let leaf = segs[segs.len() - 2].clone();
+                                let full = segs.join(".");
+                                if let Some(k) = self.hier_event_key(&ev, &leaf, &full) {
+                                    out.push(Sensitivity {
+                                        signal_name: self.resolve_event_key(&k),
+                                        edge: EdgeKind::AnyEdge,
+                                        iff: ee.iff.clone(),
+                                    });
+                                    continue;
+                                }
+                            }
                             if segs.len() >= 2 {
                                 let refs: Vec<&str> =
                                     segs.iter().map(|x| x.as_str()).collect();
