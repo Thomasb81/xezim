@@ -35510,6 +35510,11 @@ impl Simulator {
                     if let Some(r) = self.class_agg_member(expr) {
                         return self.read_class_agg(&r);
                     }
+                    // Whole unpacked-struct class-property read (`c.first`
+                    // where `first` is a struct): assemble the member cells.
+                    if let Some(v) = self.try_read_whole_struct_class_prop(expr) {
+                        return v;
+                    }
                 }
                 // §7.3.2 tagged-union member read (`t.Valid`).
                 if hier.path.len() == 2 {
@@ -35709,14 +35714,22 @@ impl Simulator {
                         })
                         .unwrap_or(false);
                     if !is_static_prop {
-                        if let Some(Some(handle)) = self.this_stack.last() {
+                        if let Some(Some(handle)) = self.this_stack.last().copied() {
                             // §8.10: a shadowed property resolves to the copy
                             // the EXECUTING method's class declares, not the
                             // leaf's.
                             let key = self
                                 .shadowed_prop_key(name, false)
                                 .unwrap_or_else(|| name.clone());
-                            if let Some(Some(instance)) = self.heap.get(*handle) {
+                            // An unpacked-struct property is stored member-wise
+                            // (`<prop>.<member>` cells); any container cell is
+                            // stale, so assemble the members on a whole read.
+                            if let Some(v) =
+                                self.read_whole_struct_class_prop(handle, &key)
+                            {
+                                return v;
+                            }
+                            if let Some(Some(instance)) = self.heap.get(handle) {
                                 if let Some(val) = instance.properties.get(&key) {
                                     return val.clone();
                                 }
@@ -35896,13 +35909,27 @@ impl Simulator {
                                 if h != 0 && h < self.heap.len() {
                                     if let Some(inst) = self.heap.get(h).and_then(|x| x.as_ref()) {
                                         let mut cur_props = &inst.properties;
+                                        let mut cur_handle = h;
                                         let mut found: Option<Value> = None;
                                         let mut sub_handle: Option<usize> = None;
                                         let tail = &segs[split..];
                                         for (i, seg) in tail.iter().enumerate() {
                                             if let Some(val) = cur_props.get(*seg) {
                                                 if i + 1 == tail.len() {
-                                                    found = Some(val.clone());
+                                                    // The leaf may be a whole
+                                                    // unpacked-struct property
+                                                    // stored member-wise: any
+                                                    // container cell is stale,
+                                                    // so assemble the member
+                                                    // cells from the CURRENT
+                                                    // object handle (§10.6/§18.4).
+                                                    if let Some(v) = self
+                                                        .read_whole_struct_class_prop(cur_handle, seg)
+                                                    {
+                                                        found = Some(v);
+                                                    } else {
+                                                        found = Some(val.clone());
+                                                    }
                                                 } else {
                                                     sub_handle =
                                                         Some(val.to_u64().unwrap_or(0) as usize);
@@ -35918,6 +35945,7 @@ impl Simulator {
                                                     self.heap.get(sh).and_then(|x| x.as_ref())
                                                 {
                                                     cur_props = &next_inst.properties;
+                                                    cur_handle = sh;
                                                 } else {
                                                     break;
                                                 }
@@ -39527,6 +39555,13 @@ impl Simulator {
                 if let Some(r) = self.class_agg_member_parts(expr, &member.name) {
                     return self.read_class_agg(&r);
                 }
+                // Whole unpacked-struct class-property read in MemberAccess
+                // shape (`rhs.first` inside a method): assemble the member
+                // cells. class_agg_member_parts returns None for the whole
+                // property (only field accesses match), so this catches it.
+                if let Some(v) = self.try_read_whole_struct_class_prop(expr) {
+                    return v;
+                }
                 // §7.3.2 tagged-union member read (`t.Valid`).
                 if let ExprKind::Ident(h) = &expr.kind {
                     if h.path.len() == 1 && self.active_union_tag.contains_key(&h.path[0].name.name)
@@ -40857,6 +40892,17 @@ impl Simulator {
                             return;
                         }
                     }
+                }
+                // IEEE 1800-2023 §10.6: whole-struct assignment whose TARGET
+                // is an unpacked-struct CLASS property (`c.first = rhs`,
+                // `first = rhs.first` inside `copy`). Decompose member-wise so
+                // each side is read/written by its (working) field path — the
+                // RHS is never materialized as a single (broken) struct Value.
+                if self.try_decompose_struct_class_prop_assign(lvalue, rvalue).is_some() {
+                    if !self.in_edge_block {
+                        self.settle_combinatorial();
+                    }
+                    return;
                 }
                 // IEEE 1800-2017 §7.2: assigning one unpacked struct to another
                 // copies every member. Their leaves live in separate signals, so
@@ -60439,6 +60485,113 @@ impl Simulator {
     }
 
     /// §18.4: resolve `e` — `<agg_prop>.<member>` on a class object, in either
+    /// Append a member segment to an expression: `obj.prop` -> `obj.prop.m`
+    /// (pushes a path segment for an `Ident`, wraps in `MemberAccess`
+    /// otherwise). Used to decompose a whole-struct assignment into per-field
+    /// assignments that reuse the (working) field read/write machinery.
+    fn append_member_expr(expr: &Expression, member: &str) -> Expression {
+        let span = expr.span;
+        match &expr.kind {
+            ExprKind::Ident(h) => {
+                let mut h2 = h.clone();
+                h2.path.push(crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: member.to_string(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                });
+                h2.cached_signal_id = std::cell::Cell::new(None);
+                h2.cached_resolved_name = std::cell::OnceCell::new();
+                Expression::new(ExprKind::Ident(h2), span)
+            }
+            _ => Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(expr.clone()),
+                    member: crate::ast::Identifier {
+                        name: member.to_string(),
+                        span,
+                    },
+                },
+                span,
+            ),
+        }
+    }
+
+    /// Whole-value read of an UNPACKED-STRUCT class property: assemble the
+    /// member cells (`<prop>.<member>`) into one packed integral blob, first
+    /// member at the MSB (matching SV packed layout). Field reads/writes
+    /// already work member-wise; this bridges the whole-value view needed for
+    /// `==`, `%p`/`convert2string`, and passing the struct by value. Returns
+    /// `None` unless `prop` is an unpacked struct on the instance's class
+    /// chain. (IEEE 1800-2023 §7.3.1, §18.4, §10.6)
+    fn read_whole_struct_class_prop(&self, handle: usize, prop: &str) -> Option<Value> {
+        let su = self.class_prop_struct(handle, prop)?;
+        if !Self::spreads_member_wise(&su) {
+            return None;
+        }
+        let fields = Self::struct_field_layout(&DataType::Struct(su))?;
+        let total_w: u32 = fields.iter().map(|(_, _, w, _)| *w).sum();
+        if total_w == 0 {
+            return None;
+        }
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let mut res = Value::zero(total_w);
+        for (fname, off, w, _fr) in &fields {
+            let key = format!("{}.{}", prop, fname);
+            if let Some(fv) = inst.properties.get(&key) {
+                let fw = (*w).max(1);
+                for b in 0..fw {
+                    res.set_bit((off + b) as usize, fv.get_bit(b as usize));
+                }
+            }
+        }
+        Some(res)
+    }
+
+    /// Resolve `expr` (an `obj.prop` or implicit-`this` `prop`) to its instance
+    /// handle + property name, then assemble the whole unpacked-struct value.
+    /// `None` for anything that is not a whole unpacked-struct class property.
+    fn try_read_whole_struct_class_prop(&mut self, expr: &Expression) -> Option<Value> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let (handle, prop_name) = self.class_prop_receiver(expr)?;
+        self.read_whole_struct_class_prop(handle, &prop_name)
+    }
+
+    /// Decompose a whole-struct assignment whose TARGET is an unpacked-struct
+    /// class property (`c.first = rhs`, `first = rhs.first` inside `copy`)
+    /// into per-member field assignments `target.m = eval(rhs.m)`. This reuses
+    /// the already-correct field read/write paths for BOTH signals and class
+    /// properties, so the RHS is read member-by-member (`s0.a`, not the
+    /// whole `s0`) and never needs a (broken) whole-struct Value. Returns
+    /// `Some(())` if it handled the assignment. (IEEE 1800-2023 §10.6)
+    fn try_decompose_struct_class_prop_assign(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> Option<()> {
+        let (handle, prop) = self.class_prop_receiver(lvalue)?;
+        let su = self.class_prop_struct(handle, &prop)?;
+        if !Self::spreads_member_wise(&su) {
+            return None;
+        }
+        // Member-wise assign. Nested struct/array members recurse naturally:
+        // `lhs.m = eval(rhs.m)` re-enters this path (for a nested struct
+        // class-property target) or the existing signal paths.
+        for m in &su.members {
+            for md in &m.declarators {
+                let mname = md.name.name.as_str();
+                let lhs_f = Self::append_member_expr(lvalue, mname);
+                let rhs_f = Self::append_member_expr(rvalue, mname);
+                let v = self.eval_expr(&rhs_f);
+                self.assign_value(&lhs_f, &v);
+            }
+        }
+        Some(())
+    }
+
     /// parse shape — to the storage it aliases. `None` when `e` is not an
     /// aggregate class-property member.
     fn class_agg_member(&mut self, e: &Expression) -> Option<ClassAggRef> {
@@ -62569,12 +62722,58 @@ impl Simulator {
     /// LRM §7.12.2: in-place sort/rsort/unique on `arr` with the
     /// per-element key expression `filter` (binds `item` to each
     /// element). Mirrors `reduce_with`'s `item` plumbing.
+    /// The unpacked-struct type of `e` IF it names a class-property struct
+    /// (members stored in the heap). `None` for non-class-property operands
+    /// (those are handled by the signal-namespace struct path).
+    fn class_prop_struct_of(&mut self, e: &Expression) -> Option<crate::ast::types::StructUnionType> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let (h, p) = self.class_prop_receiver(e)?;
+        let su = self.class_prop_struct(h, &p)?;
+        Self::spreads_member_wise(&su).then_some(su)
+    }
+
     /// IEEE 1800-2017 §11.4.5 / §7.2: `==` and `!=` on unpacked structs compare
     /// them member by member. Their leaves live in separate signals, so the
     /// packed-value path compared two container signals that do not exist and
     /// always yielded X. An X in any leaf makes the result X, as for vectors.
     /// `None` when either side is not an unpacked struct with storage.
     fn compare_unpacked_structs(&mut self, lhs: &Expression, rhs: &Expression) -> Option<Value> {
+        // If EITHER operand is a class-property unpacked struct (members in
+        // the heap, not the signal namespace), compare member-wise by
+        // appending a member segment and evaluating through the field-read
+        // paths — uniform for class-prop vs class-prop and class-prop vs
+        // signal. (IEEE 1800-2023 §11.4.5, §7.2, §10.6)
+        let l_cp = self.class_prop_struct_of(lhs);
+        let r_cp = self.class_prop_struct_of(rhs);
+        if l_cp.is_some() || r_cp.is_some() {
+            let su = l_cp.or(r_cp)?;
+            let mut equal = true;
+            for m in &su.members {
+                for md in &m.declarators {
+                    let lf = Self::append_member_expr(lhs, &md.name.name);
+                    let rf = Self::append_member_expr(rhs, &md.name.name);
+                    let lv = self.eval_expr(&lf);
+                    let rv = self.eval_expr(&rf);
+                    if lv.has_unknown() || rv.has_unknown() {
+                        return Some(Value::new(1)); // X
+                    }
+                    if lv != rv {
+                        equal = false;
+                    }
+                }
+            }
+            return Some(if equal {
+                Value::ones(1)
+            } else {
+                Value::zero(1)
+            });
+        }
+        // Signal-namespace unpacked structs (members are separate signals):
+        // flatten to leaves and compare each, so a nested struct / string
+        // member is read by its own leaf signal rather than a whole-struct
+        // container that does not exist. An X in any leaf makes the result X.
         let (a, b) = (self.flat_member_name(lhs)?, self.flat_member_name(rhs)?);
         let dt = self.p_elem_type(&a)?;
         let DataType::Struct(su) = self.resolve_dt(&dt) else {
