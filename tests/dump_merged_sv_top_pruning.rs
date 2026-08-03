@@ -268,3 +268,62 @@ fn comments_and_strings_do_not_create_dependencies() {
     let (merged, _log) = dump("comments", files, Some("small_tb"));
     assert_eq!(sections(&merged), vec!["small_tb.sv"], "comment pulled a file in");
 }
+
+/// A file that declares NO design unit is never referenced by name, so a pure
+/// reachability walk drops it — but it may carry §3.12 compilation-unit
+/// declarations (a file-scope `typedef`/function) or a top-level `bind`, which
+/// the rest of the design uses without ever naming the file.
+///
+/// This is the failure mode that matters most: dropping them does not simply
+/// fail to compile, it can leave a dump that still runs and reports a
+/// DIFFERENT answer. Here the $unit `typedef`/function are needed for the
+/// design to behave at all, and the bind pulls in a checker module nothing
+/// else mentions.
+#[test]
+fn unit_scope_and_bind_files_are_never_dropped() {
+    let bin = xezim_bin();
+    if !bin.exists() {
+        return;
+    }
+    let files: &[(&str, &str)] = &[
+        (
+            "unit_scope.sv",
+            "typedef logic [15:0] word_t;\n\
+             function automatic word_t dbl(input word_t a); return a << 1; endfunction\n",
+        ),
+        (
+            "checker_mod.sv",
+            "module chk (input logic clk, input word_t v);\n\
+             always @(posedge clk) if (v === 16'hFFFF) $display(\"CHK\");\nendmodule\n",
+        ),
+        ("bindfile.sv", "bind dut_a chk u_chk (.clk(clk), .v(val));\n"),
+        (
+            "dut_a.sv",
+            "module dut_a (input logic clk, output word_t val);\n\
+             always_ff @(posedge clk) val <= dbl(val) + 16'd1;\nendmodule\n",
+        ),
+        (
+            "tb2.sv",
+            "module tb2;\n  logic clk = 0;\n  word_t val;\n\
+             dut_a u (.clk(clk), .val(val));\n  always #5 clk = ~clk;\n\
+             initial begin #40; $display(\"VAL %0d\", val); $finish; end\nendmodule\n",
+        ),
+    ];
+    let (merged, _log) = dump("unitscope", files, Some("tb2"));
+    let got = sections(&merged);
+    for needed in ["unit_scope.sv", "bindfile.sv", "tb2.sv", "dut_a.sv"] {
+        assert!(got.contains(&needed.to_string()), "{} dropped: {:?}", needed, got);
+    }
+    // Reachable ONLY through the bind directive.
+    assert!(got.contains(&"checker_mod.sv".to_string()), "bind target dropped: {:?}", got);
+
+    // The decisive check: same answer as the unpruned build, not merely "it
+    // compiles". Without the $unit file this printed VAL 1 instead of VAL x.
+    let out = Command::new(&bin)
+        .args(["--simulate", "-s", "tb2", "--max-time", "100ns"])
+        .arg(&merged)
+        .output()
+        .expect("rerun");
+    let log = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(log.contains("VAL x"), "pruned dump changed the answer: {}", log);
+}
