@@ -43623,11 +43623,23 @@ impl Simulator {
                         // Packed multi-D local (`logic [1:0][3:0] m;`): record
                         // the per-element width so `m[i]` is an element slice,
                         // not a bit-select — module-scope decls already do.
+                        // The packed dims may live in the TYPEDEF rather than on
+                        // the declaration (`typedef T1 [3:0] T2; T2 v;`) — see
+                        // `typedef_one_step`. Without this the element width was
+                        // never recorded and `v[i]` degraded to a BIT select.
+                        let dt1_local = self.typedef_one_step(data_type);
                         if let Some(elem_w) = super::elaborate::packed_inner_elem_width(
                             data_type,
                             &self.module.parameters,
                             &self.module.typedefs,
-                        ) {
+                        )
+                        .or_else(|| {
+                            super::elaborate::packed_inner_elem_width(
+                                &dt1_local,
+                                &self.module.parameters,
+                                &self.module.typedefs,
+                            )
+                        }) {
                             self.module
                                 .packed_signal_elem_widths
                                 .insert(d.name.name.clone(), elem_w);
@@ -43637,7 +43649,20 @@ impl Simulator {
                         if let Some(fdims) = super::elaborate::packed_full_dims_of(
                             data_type,
                             &self.module.parameters,
-                        ) {
+                        )
+                        .or_else(|| {
+                            super::elaborate::packed_full_dims_of(
+                                &dt1_local,
+                                &self.module.parameters,
+                            )
+                        })
+                        .or_else(|| {
+                            super::elaborate::packed_full_dims_chained(
+                                data_type,
+                                &self.module.parameters,
+                                &self.module.typedef_types,
+                            )
+                        }) {
                             self.module
                                 .packed_full_dims
                                 .insert(d.name.name.clone(), fdims);
@@ -68171,6 +68196,12 @@ impl Simulator {
                     self.var_class_types.insert(port.name.name.clone(), type_name);
                 }
             }
+            // Same §13.3 metadata registration as the task path.
+            self.register_formal_type_metadata(
+                &port.name.name,
+                &port.data_type,
+                port.dimensions.is_empty(),
+            );
             locals.insert(port.name.name.clone(), val);
         }
         // Initialize return variable (function name). Size it to the
@@ -68431,6 +68462,73 @@ impl Simulator {
         self.pop_and_restore_queue_frame();
     }
 
+    /// Register the structural metadata a task/function FORMAL needs so that
+    /// member and element selects on it resolve — the same registration a
+    /// local `VarDecl` performs (see the packed-struct local path). Formals
+    /// were bound as a flat `Value` in `local_stack` with NO metadata, so
+    /// `p.field` on a struct-typed formal found no layout and read 0, while
+    /// the identical struct declared as a LOCAL worked. Applies to ANSI and
+    /// non-ANSI formals alike (both land here), and only to formals with no
+    /// unpacked dimensions — unpacked-array formals own a separate copy-in
+    /// path.
+    /// ONE step through the typedef table. `resolve_typedef_chain` walks to the
+    /// end and discards intermediate PACKED DIMENSIONS, so `typedef T1 [3:0] T2;`
+    /// would collapse to `logic [7:0]` and the array-ness would be lost. The
+    /// immediate definition is what carries the dims.
+    fn typedef_one_step(&self, dt: &DataType) -> DataType {
+        if let DataType::TypeReference { name, .. } = dt {
+            if let Some(inner) = self.module.typedef_types.get(&name.name.name) {
+                return inner.clone();
+            }
+        }
+        dt.clone()
+    }
+
+    fn register_formal_type_metadata(&mut self, name: &str, dt: &DataType, no_unpacked_dims: bool) {
+        self.module.var_decl_types.insert(name.to_string(), dt.clone());
+        if !no_unpacked_dims {
+            return;
+        }
+        let dt1 = self.typedef_one_step(dt);
+        if let Some(ew) = super::elaborate::packed_inner_elem_width(
+            dt, &self.module.parameters, &self.module.typedefs,
+        )
+        .or_else(|| {
+            super::elaborate::packed_inner_elem_width(
+                &dt1, &self.module.parameters, &self.module.typedefs,
+            )
+        }) {
+            self.module.packed_signal_elem_widths.insert(name.to_string(), ew);
+        }
+        if let Some(fdims) = super::elaborate::packed_full_dims_of(dt, &self.module.parameters)
+            .or_else(|| super::elaborate::packed_full_dims_of(&dt1, &self.module.parameters))
+            .or_else(|| super::elaborate::packed_full_dims_chained(
+                dt, &self.module.parameters, &self.module.typedef_types))
+        {
+            self.module.packed_full_dims.insert(name.to_string(), fdims);
+        }
+        if let DataType::Struct(su) = self.resolve_dt(dt) {
+            for m in &su.members {
+                if let Some(ew) = super::elaborate::packed_inner_elem_width(
+                    &m.data_type, &self.module.parameters, &self.module.typedefs,
+                ) {
+                    for mdecl in &m.declarators {
+                        self.module
+                            .packed_signal_elem_widths
+                            .insert(format!("{}.{}", name, mdecl.name.name), ew);
+                    }
+                }
+            }
+        }
+        if let Some(fields) = super::elaborate::packed_struct_field_layout(
+            dt, &self.module.parameters, &self.module.typedefs, &self.module.typedef_types,
+        ) {
+            if !fields.is_empty() {
+                self.module.packed_struct_fields.insert(name.to_string(), fields);
+            }
+        }
+    }
+
     fn bind_task_frame(&mut self, td: &TaskDeclaration, args: &[Expression]) -> TaskCleanup {
         use crate::ast::types::PortDirection;
         let normalized = Self::normalize_call_args(&td.ports, args);
@@ -68443,6 +68541,14 @@ impl Simulator {
         self.push_queue_frame();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
+            // §13.3: a formal is a variable of its declared type — give it the
+            // same structural metadata a local declaration gets, or member and
+            // element selects on it silently read 0.
+            self.register_formal_type_metadata(
+                &port.name.name,
+                &port.data_type,
+                port.dimensions.is_empty(),
+            );
             // Unpacked array formal (`int a[2:0]` or `int a[3]`): copy the
             // caller's elements in, and copy them back for an out/inout/ref.
             if i < args.len() {
