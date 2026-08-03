@@ -926,6 +926,9 @@ struct ParallelBlockSlice {
     ptr: *const super::bytecode::Insn,
     len: usize,
     num_regs: usize,
+    /// CompiledBlock::nba_dup_targets, carried across the thread boundary
+    /// because the raw slice loses the owning block.
+    nba_dup: bool,
 }
 
 unsafe impl Send for ParallelBlockSlice {}
@@ -1186,6 +1189,7 @@ fn exec_parallel_chunk(
             array_first_id,
             &mut vm_regs,
             *bi as u32,
+            bs.nba_dup,
         );
         thread_nba.append(&mut nba);
     }
@@ -1439,6 +1443,22 @@ struct ProcCont {
     next: Option<Arc<ProcCont>>,
 }
 
+/// Defense in depth for the chain length: the derived drop for a linked list
+/// recurses once per link, so a long chain aborts the process instead of
+/// returning memory. Unlink iteratively, stopping as soon as a node is still
+/// shared (someone else owns the rest).
+impl Drop for ProcCont {
+    fn drop(&mut self) {
+        let mut cur = self.next.take();
+        while let Some(arc) = cur {
+            match Arc::try_unwrap(arc) {
+                Ok(mut node) => cur = node.next.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 impl ProcCont {
     /// A continuation over a freshly synthesized statement list.
     fn from_vec(stmts: Vec<Statement>) -> Self {
@@ -1463,11 +1483,22 @@ impl ProcCont {
     /// Run `stmts` first, then this continuation from `resume_at`. Replaces
     /// "copy the caller's tail onto the end of the spliced body".
     fn pushed(&self, stmts: Vec<Statement>, resume_at: usize) -> Self {
-        ProcCont {
-            stmts: Arc::from(stmts),
-            start: 0,
-            next: Some(Arc::new(self.resume_at(resume_at))),
-        }
+        // A frame with nothing left contributes NOTHING but a link. Splice the
+        // rest of the chain in directly instead of wrapping it.
+        //
+        // This is what made suspend-aware `while`/`for` unbounded: the loop
+        // re-pushes its continuation from the LAST statement of its own frame,
+        // so every iteration wrapped an already-exhausted frame and the chain
+        // grew by one link per iteration — O(N) memory, and a recursive `Drop`
+        // of that list overflowed the stack at ~2000 iterations
+        // (`for (int i=0;i<2000;i++) @(posedge clk);`). `repeat`/`forever` were
+        // unaffected only because they have their own counted-waiter path.
+        let next = if resume_at >= self.stmts.len() {
+            self.next.clone()
+        } else {
+            Some(Arc::new(self.resume_at(resume_at)))
+        };
+        ProcCont { stmts: Arc::from(stmts), start: 0, next }
     }
 
     /// This frame only, from the cursor.
@@ -10502,6 +10533,7 @@ impl Simulator {
             &self.array_first_id,
             vm_regs,
             bi as u32,
+            cb.nba_dup_targets,
         );
         nbas.into_iter()
             .map(|nba| (nba.signal_id, nba.value))
@@ -10750,6 +10782,7 @@ impl Simulator {
                 &mut vm_regs,
                 &mut dirtied,
                 0,
+                compiled.nba_dup_targets,
             );
             if unsup {
                 unsupported += 1;
@@ -11075,6 +11108,7 @@ impl Simulator {
                     vm_regs,
                     dirtied,
                     0,
+                    compiled.nba_dup_targets,
                 );
                 // Deferred NBAs from comb blocks (rare; deferred_nba=0 on
                 // c910) would be applied at end-of-tick by the coordinator;
@@ -11229,6 +11263,7 @@ impl Simulator {
                     vm_regs,
                     dirtied,
                     0,
+                    compiled.nba_dup_targets,
                 );
                 !unsupported
             }
@@ -14330,6 +14365,10 @@ impl Simulator {
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
         vm_regs: &mut Vec<Value>,
         block_index: u32,
+        // CompiledBlock::nba_dup_targets — false for the overwhelming majority
+        // of blocks, which lets the whole-value NBA arms skip the linear
+        // last-write-wins scan entirely.
+        nba_dup: bool,
     ) -> Vec<NbaFast> {
         use super::bytecode::Insn;
         let mut nba_out: Vec<NbaFast> = Vec::new();
@@ -14515,7 +14554,11 @@ impl Simulator {
                     // §10.4.2 last-write-wins: an entry already queued for this
                     // signal supersedes signal_table, so compare against it
                     // rather than eliding against a stale current value.
-                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                    if let Some(i) = if nba_dup {
+                        nba_out.iter().rposition(|n| n.signal_id == *sig_id)
+                    } else {
+                        None
+                    } {
                         nba_out[i].value = (**k).clone();
                     } else if signal_table[*sig_id] != **k {
                         nba_out.push(NbaFast {
@@ -14585,7 +14628,11 @@ impl Simulator {
                     // + ~70% of apply_nba's per-entry work on c910 (flop Q
                     // outputs reload the same value most cycles).
                     // §10.4.2 last-write-wins: see the NbaAssignConst arm.
-                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                    if let Some(i) = if nba_dup {
+                        nba_out.iter().rposition(|n| n.signal_id == *sig_id)
+                    } else {
+                        None
+                    } {
                         nba_out[i].value = val;
                     } else if signal_table[*sig_id] != val {
                         nba_out.push(NbaFast {
@@ -14754,6 +14801,8 @@ impl Simulator {
         vm_regs: &mut Vec<Value>,
         dirtied: &mut Vec<u32>,
         block_index: u32,
+        // See `exec_insns_isolated`: CompiledBlock::nba_dup_targets.
+        nba_dup: bool,
     ) -> (Vec<NbaFast>, bool) {
         use super::bytecode::Insn;
         let mut nba_out: Vec<NbaFast> = Vec::new();
@@ -14949,7 +14998,11 @@ impl Simulator {
                     // Const pre-resized at fuse time: compare, clone only on change.
                     // §10.4.2 last-write-wins: an entry already queued for this
                     // signal supersedes the snapshot view.
-                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                    if let Some(i) = if nba_dup {
+                        nba_out.iter().rposition(|n| n.signal_id == *sig_id)
+                    } else {
+                        None
+                    } {
                         nba_out[i].value = (**k).clone();
                     } else if view[*sig_id] != **k {
                         nba_out.push(NbaFast {
@@ -15150,7 +15203,11 @@ impl Simulator {
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
                     // §10.4.2 last-write-wins: see the NbaAssignConst arm.
-                    if let Some(i) = nba_out.iter().rposition(|n| n.signal_id == *sig_id) {
+                    if let Some(i) = if nba_dup {
+                        nba_out.iter().rposition(|n| n.signal_id == *sig_id)
+                    } else {
+                        None
+                    } {
                         nba_out[i].value = val;
                     } else if view[*sig_id] != val {
                         nba_out.push(NbaFast {
@@ -24037,6 +24094,18 @@ impl Simulator {
                 continue;
             }
 
+            // §12.7.2 for-step barrier (see `StatementKind::LoopStep`). Checked
+            // HERE, ahead of the generic dispatch, because `exec_statement`
+            // skips every statement while `continue_flag` is set — which is
+            // exactly the flag this sentinel exists to consume.
+            if let StatementKind::LoopStep = &stmt.kind {
+                if !self.break_flag && !self.return_flag {
+                    self.continue_flag = false;
+                }
+                i += 1;
+                continue;
+            }
+
             // Expand SeqBlocks: flatten begin/end so that timing controls and waits
             // inside them are properly handled with process suspension.
             if let StatementKind::SeqBlock { stmts: inner, .. } = &stmt.kind {
@@ -25332,6 +25401,14 @@ impl Simulator {
                         StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
                         _ => vec![(**body).clone()],
                     };
+                    // §12.7.2: a `continue` skips the rest of the body but the
+                    // step STILL runs. Without this barrier the step — appended
+                    // to the body by this very lowering — was skipped along
+                    // with it, so the index never advanced and the loop hung.
+                    if !step.is_empty() {
+                        body_stmts
+                            .push(Statement::new(StatementKind::LoopStep, stmt.span));
+                    }
                     for s in step {
                         body_stmts.push(Statement::new(StatementKind::Expr(s.clone()), stmt.span));
                     }
@@ -28965,6 +29042,7 @@ impl Simulator {
                                 ptr: cb.instructions.as_ptr(),
                                 len: cb.instructions.len(),
                                 num_regs: cb.num_regs as usize,
+                                nba_dup: cb.nba_dup_targets,
                             },
                         ));
                     }
@@ -29249,6 +29327,7 @@ impl Simulator {
                                     array_first_id,
                                     &mut vm_regs,
                                     *bi as u32,
+                                    bs.nba_dup,
                                 );
                                 thread_nba.append(&mut nba);
                             }
@@ -29278,6 +29357,7 @@ impl Simulator {
                                             array_first_id,
                                             &mut vm_regs,
                                             *bi as u32,
+                                            bs.nba_dup,
                                         );
                                         thread_nba.append(&mut nba);
                                     }
@@ -39496,6 +39576,11 @@ impl Simulator {
             // (synchronous exec), it is a no-op.
             StatementKind::ForeachTail { .. } => {}
             StatementKind::ForeverTail { .. } => {}
+            // Same: the synchronous `for` runs its own step, so the barrier
+            // has nothing to do here. (It cannot even be reached with a
+            // pending `continue` — the guard above returns first, which is
+            // precisely why `run_process_stmts` handles it itself.)
+            StatementKind::LoopStep => {}
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
                 // §15.5.5: `event_var = other_event / null / q[i]` re-binds
@@ -78958,6 +79043,7 @@ impl CombSettleCtx {
                     vm_regs,
                     dirtied,
                     0,
+                    compiled.nba_dup_targets,
                 );
                 !unsupported
             }
@@ -79160,6 +79246,7 @@ impl SendExecContext {
             &self.array_first_id,
             vm_regs,
             bi as u32,
+            cb.nba_dup_targets,
         );
         nbas.into_iter()
             .map(|nba| (nba.signal_id, nba.value))
