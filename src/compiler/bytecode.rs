@@ -202,6 +202,18 @@ pub struct CompiledBlock {
     /// signal ids and don't. Precomputed here so the settle hot loop pays one
     /// bool test instead of scanning the insn stream.
     pub has_fallback: bool,
+    /// True when some signal is the target of MORE THAN ONE nonblocking write
+    /// in this block — the only situation in which §10.4.2 last-write-wins can
+    /// be observed within a single block, and so the only one where a queued
+    /// NBA entry has to be located and overwritten instead of the value simply
+    /// being compared against the signal table.
+    ///
+    /// Precomputed because the isolated executors have no O(1) index into
+    /// their per-block queue and would otherwise pay a linear scan on EVERY
+    /// nonblocking write; measured at ~6.5% on an NBA-heavy design. The
+    /// overwhelming majority of blocks write each target once and take the
+    /// plain push path.
+    pub nba_dup_targets: bool,
 }
 
 /// Compiler state for converting AST → bytecode.
@@ -725,7 +737,20 @@ impl<'a> BytecodeCompiler<'a> {
         self.local_var_regs
             .insert(fd.name.name.name.clone(), (ret_slot, ret_w));
         self.inlining_stack.push(name);
+        // AST fallback MUST be off inside an inlined body. `emit_fallback`
+        // defers a statement to the AST interpreter, which resolves names
+        // through the signal tables — but this body's locals (and the return
+        // variable) live in REGISTERS that the interpreter cannot see. A
+        // deferred statement therefore reads and writes the wrong storage and
+        // its effect is silently lost: a pure helper whose accumulator is
+        // updated in a `for` loop returned its initial value instead of the
+        // sum, with no fallback counted and no diagnostic. If any statement
+        // will not compile, the whole inline has to fail so the caller uses
+        // the ordinary (correct) call path.
+        let saved_fallback = self.allow_ast_fallback;
+        self.allow_ast_fallback = false;
         let ok = self.compile_pure_body(&items, ret_slot, ret_w, ctx_width);
+        self.allow_ast_fallback = saved_fallback;
         self.inlining_stack.pop();
         self.local_var_regs = saved_locals;
         if !ok {
@@ -3655,10 +3680,29 @@ impl<'a> BytecodeCompiler<'a> {
             .insns
             .iter()
             .any(|i| matches!(i, Insn::StmtFallback(..)));
+        // Any signal written nonblockingly twice — counting the partial forms,
+        // since `v[3:0] <= ..; v <= ..` is the same hazard as two whole writes.
+        let mut nba_targets: Vec<u32> = Vec::new();
+        for i in &self.insns {
+            let id = match i {
+                Insn::NbaAssign(id, _, _)
+                | Insn::NbaAssignConst(id, _, _)
+                | Insn::NbaAssignRange(id, _, _, _)
+                | Insn::NbaAssignRangeDyn(id, _, _, _)
+                | Insn::NbaAssignBitDyn(id, _, _) => Some(*id as u32),
+                _ => None,
+            };
+            if let Some(id) = id {
+                nba_targets.push(id);
+            }
+        }
+        nba_targets.sort_unstable();
+        let nba_dup_targets = nba_targets.windows(2).any(|w| w[0] == w[1]);
         CompiledBlock {
             num_regs: self.next_reg,
             instructions: self.insns,
             has_fallback,
+            nba_dup_targets,
         }
     }
 
