@@ -1443,6 +1443,22 @@ struct ProcCont {
     next: Option<Arc<ProcCont>>,
 }
 
+/// Defense in depth for the chain length: the derived drop for a linked list
+/// recurses once per link, so a long chain aborts the process instead of
+/// returning memory. Unlink iteratively, stopping as soon as a node is still
+/// shared (someone else owns the rest).
+impl Drop for ProcCont {
+    fn drop(&mut self) {
+        let mut cur = self.next.take();
+        while let Some(arc) = cur {
+            match Arc::try_unwrap(arc) {
+                Ok(mut node) => cur = node.next.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 impl ProcCont {
     /// A continuation over a freshly synthesized statement list.
     fn from_vec(stmts: Vec<Statement>) -> Self {
@@ -1467,11 +1483,22 @@ impl ProcCont {
     /// Run `stmts` first, then this continuation from `resume_at`. Replaces
     /// "copy the caller's tail onto the end of the spliced body".
     fn pushed(&self, stmts: Vec<Statement>, resume_at: usize) -> Self {
-        ProcCont {
-            stmts: Arc::from(stmts),
-            start: 0,
-            next: Some(Arc::new(self.resume_at(resume_at))),
-        }
+        // A frame with nothing left contributes NOTHING but a link. Splice the
+        // rest of the chain in directly instead of wrapping it.
+        //
+        // This is what made suspend-aware `while`/`for` unbounded: the loop
+        // re-pushes its continuation from the LAST statement of its own frame,
+        // so every iteration wrapped an already-exhausted frame and the chain
+        // grew by one link per iteration — O(N) memory, and a recursive `Drop`
+        // of that list overflowed the stack at ~2000 iterations
+        // (`for (int i=0;i<2000;i++) @(posedge clk);`). `repeat`/`forever` were
+        // unaffected only because they have their own counted-waiter path.
+        let next = if resume_at >= self.stmts.len() {
+            self.next.clone()
+        } else {
+            Some(Arc::new(self.resume_at(resume_at)))
+        };
+        ProcCont { stmts: Arc::from(stmts), start: 0, next }
     }
 
     /// This frame only, from the cursor.
@@ -24067,6 +24094,18 @@ impl Simulator {
                 continue;
             }
 
+            // §12.7.2 for-step barrier (see `StatementKind::LoopStep`). Checked
+            // HERE, ahead of the generic dispatch, because `exec_statement`
+            // skips every statement while `continue_flag` is set — which is
+            // exactly the flag this sentinel exists to consume.
+            if let StatementKind::LoopStep = &stmt.kind {
+                if !self.break_flag && !self.return_flag {
+                    self.continue_flag = false;
+                }
+                i += 1;
+                continue;
+            }
+
             // Expand SeqBlocks: flatten begin/end so that timing controls and waits
             // inside them are properly handled with process suspension.
             if let StatementKind::SeqBlock { stmts: inner, .. } = &stmt.kind {
@@ -25362,6 +25401,14 @@ impl Simulator {
                         StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
                         _ => vec![(**body).clone()],
                     };
+                    // §12.7.2: a `continue` skips the rest of the body but the
+                    // step STILL runs. Without this barrier the step — appended
+                    // to the body by this very lowering — was skipped along
+                    // with it, so the index never advanced and the loop hung.
+                    if !step.is_empty() {
+                        body_stmts
+                            .push(Statement::new(StatementKind::LoopStep, stmt.span));
+                    }
                     for s in step {
                         body_stmts.push(Statement::new(StatementKind::Expr(s.clone()), stmt.span));
                     }
@@ -39529,6 +39576,11 @@ impl Simulator {
             // (synchronous exec), it is a no-op.
             StatementKind::ForeachTail { .. } => {}
             StatementKind::ForeverTail { .. } => {}
+            // Same: the synchronous `for` runs its own step, so the barrier
+            // has nothing to do here. (It cannot even be reached with a
+            // pending `continue` — the guard above returns first, which is
+            // precisely why `run_process_stmts` handles it itself.)
+            StatementKind::LoopStep => {}
             StatementKind::Expr(expr) => self.exec_expr_stmt(expr),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
                 // §15.5.5: `event_var = other_event / null / q[i]` re-binds
