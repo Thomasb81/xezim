@@ -17,7 +17,6 @@ libffi = "3"
 libc = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }
 bincode = "1.3"
-mimalloc = "0.1"
 once_cell = "1.18"
 # JIT: enabled with `--features jit`. Kept optional to avoid adding the
 # cranelift build dependency to users who only want the interpreter.
