@@ -91,7 +91,9 @@ fn the_toa_family_writes_the_receiver() {
     assert_eq!(text(&sim, "s_hex"), "ff");
     assert_eq!(text(&sim, "s_oct"), "10");
     assert_eq!(text(&sim, "s_bin"), "101");
-    assert_eq!(text(&sim, "s_real"), "3.500000");
+    // §6.16.10: the DECIMAL representation is `%g` (trailing zeros stripped),
+    // not `%f` — reference-validated, and what ivtest sv_string6 expects.
+    assert_eq!(text(&sim, "s_real"), "3.5");
     // The receiver may live in a procedural frame.
     assert_eq!(text(&sim, "s_local"), "-42");
 }

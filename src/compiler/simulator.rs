@@ -34733,6 +34733,22 @@ impl Simulator {
                     && !self.signals.contains_key(&hier.path[0].name.name)
                     && !self.module.classes.contains_key(&hier.path[0].name.name)
                 {
+                    // §26.3: `P::x` (len 2) resolved through the BARE-name
+                    // fallback, so two packages declaring the same parameter
+                    // name collided and the reference read whichever package
+                    // elaborated last (`p1::step` gave p2's value — ivtest
+                    // sv_package2). Prefer the package's own qualified
+                    // registration; the bare fallback still covers everything
+                    // that has no qualified entry.
+                    if hier.path.len() == 2 && hier.path[1].selects.is_empty() {
+                        let qual = format!(
+                            "{}::{}",
+                            hier.path[0].name.name, hier.path[1].name.name
+                        );
+                        if let Some(v) = self.module.parameters.get(&qual) {
+                            return v.clone();
+                        }
+                    }
                     // Keep `P::x` (len 2) on the existing paths — those work
                     // via the bare-name fallbacks; only deeper paths need the
                     // reshape.
@@ -37792,6 +37808,21 @@ impl Simulator {
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(1));
                     Value::from_u64(v.has_xz() as u64, 1)
+                }
+                // §20.5: 1 when the operand is SIGNED. Was not implemented at
+                // all, so it silently answered 0 for everything — which made
+                // `!$is_signed(x)` pass by accident and `$is_signed(x)` fail
+                // for genuinely signed operands (ivtest struct_signed,
+                // struct_member_signed). Reads already stamp the declared
+                // signedness onto the value (§7.2.1 covers a `struct packed
+                // signed` and a `logic signed` member), so the evaluated
+                // operand is the authority.
+                "$is_signed" => {
+                    let signed = args
+                        .first()
+                        .map(|a| self.eval_expr(a).is_signed)
+                        .unwrap_or(false);
+                    Value::from_u64(signed as u64, 1)
                 }
                 "$realtobits" => {
                     // §20.5: return the 64-bit IEEE-754 pattern of the real as an
@@ -45013,7 +45044,12 @@ impl Simulator {
                 "hextoa" => format!("{:x}", v.to_u64().unwrap_or(0)),
                 "octtoa" => format!("{:o}", v.to_u64().unwrap_or(0)),
                 "bintoa" => format!("{:b}", v.to_u64().unwrap_or(0)),
-                _ => format!("{:.6}", v.to_f64()),
+                // §6.16.10 `realtoa`: the ASCII DECIMAL representation, which
+                // is `%g` (6 significant digits, trailing zeros stripped,
+                // exponent form when needed) — not `%f`. It printed
+                // "11.100000" for 11.1, and "100000000000000000000.000000"
+                // where 1e+20 was wanted (ivtest sv_string6).
+                _ => Self::format_g(v.to_f64(), 6, false),
             };
             let sv = Value::from_string(&text);
             self.assign_value(recv, &sv);
@@ -45263,7 +45299,8 @@ impl Simulator {
                 | "$urandom" | "$urandom_range" | "$random"
                 | "$dist_uniform" | "$dist_normal" | "$dist_exponential"
                 | "$dist_poisson" | "$dist_chi_square" | "$dist_t" | "$dist_erlang"
-                | "$isunknown" | "$realtobits" | "$bitstoreal" | "$itor" | "$rtoi"
+                | "$isunknown" | "$is_signed"
+                | "$realtobits" | "$bitstoreal" | "$itor" | "$rtoi"
                 | "$ceil" | "$floor" | "$sqrt" | "$pow" | "$log10" | "$exp"
                 | "$ln" | "$log2"
                 | "$sin" | "$cos" | "$tan" | "$asin" | "$acos" | "$atan"
@@ -61474,18 +61511,33 @@ impl Simulator {
                         .get(members[0].0.as_str())
                         .and_then(|id| self.signal_widths.get(*id).copied())
                         .unwrap_or(32);
+                    // §6.19: the result carries the ENUM's signedness (base
+                    // type; default `int` is signed), so `es.first()` on
+                    // `enum shortint {A=-1,...}` reads -1, not 65535.
+                    let esigned = self.lookup_signal_signed(obj_name);
+                    let emask: u64 = if mw >= 64 { u64::MAX } else { (1u64 << mw) - 1 };
+                    let mk = |raw: u64| {
+                        let mut v = Value::from_u64(raw & emask, mw);
+                        v.is_signed = esigned;
+                        v
+                    };
                     return Some(match mname {
                         "num"   => Value::from_u64(members.len() as u64, 32),
-                        "first" => Value::from_u64(members[0].1, mw),
-                        "last"  => Value::from_u64(members[members.len()-1].1, mw),
+                        "first" => mk(members[0].1),
+                        "last"  => mk(members[members.len()-1].1),
                         "next" | "prev" => {
                             let cur_v = self.get_signal_value_by_name(obj_name);
                             let cur_xz = cur_v.as_ref().is_some_and(|v| v.has_xz());
                             let cur = cur_v.map(|v| v.to_u64().unwrap_or(0)).unwrap_or(0);
+                            // Compare at the enum's WIDTH: the member table and
+                            // the variable can hold the same value at different
+                            // widths (a signed enum sign-extends on read), so a
+                            // raw u64 compare never matched and every next/prev
+                            // fell through to the invalid-value default.
                             let pos = if cur_xz {
                                 None
                             } else {
-                                members.iter().position(|(_, v)| *v == cur)
+                                members.iter().position(|(_, v)| (*v & emask) == (cur & emask))
                             };
                             if let Some(p) = pos {
                                 // LRM §6.19.6: next(N)/prev(N) step N places with
@@ -61498,7 +61550,7 @@ impl Simulator {
                                 } else {
                                     (p + members.len() - step) % members.len()
                                 };
-                                Value::from_u64(members[new_p].1, mw)
+                                mk(members[new_p].1)
                             } else if self.module.two_state_signals.contains(obj_name) {
                                 // §6.19.6: an invalid value maps to the base
                                 // type's DEFAULT — 0 for 2-state.
@@ -65246,10 +65298,25 @@ impl Simulator {
                             .get(members[0].0.as_str())
                             .and_then(|id| self.signal_widths.get(*id).copied())
                             .unwrap_or(32);
+                        // Same §6.19 signedness + width-masked matching as the
+                        // by-name dispatch site above.
+                        let esigned = self
+                            .module
+                            .enum_members
+                            .get(&tn)
+                            .and_then(|ms| ms.first())
+                            .map(|(n, _)| self.lookup_signal_signed(n))
+                            .unwrap_or(false);
+                        let emask: u64 = if mw >= 64 { u64::MAX } else { (1u64 << mw) - 1 };
+                        let mk = |raw: u64| {
+                            let mut v = Value::from_u64(raw & emask, mw);
+                            v.is_signed = esigned;
+                            v
+                        };
                         match mname {
                             "num" => return Value::from_u64(members.len() as u64, 32),
-                            "first" => return Value::from_u64(members[0].1, mw),
-                            "last"  => return Value::from_u64(members[members.len()-1].1, mw),
+                            "first" => return mk(members[0].1),
+                            "last"  => return mk(members[members.len()-1].1),
                             "next" | "prev" => {
                                 let step = args
                                     .first()
@@ -65260,7 +65327,7 @@ impl Simulator {
                                 let pos = if cur_v.has_xz() {
                                     None
                                 } else {
-                                    members.iter().position(|(_, v)| *v == cur)
+                                    members.iter().position(|(_, v)| (*v & emask) == (cur & emask))
                                 };
                                 if let Some(p) = pos {
                                     let n = members.len();
@@ -65269,7 +65336,7 @@ impl Simulator {
                                     } else {
                                         (p + n - (step % n)) % n
                                     };
-                                    return Value::from_u64(members[next_p].1, mw);
+                                    return mk(members[next_p].1);
                                 }
                                 // §6.19.6: next/prev of a value NOT in the
                                 // enum returns the base type's DEFAULT initial
