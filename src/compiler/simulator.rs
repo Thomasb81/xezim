@@ -34747,6 +34747,36 @@ impl Simulator {
                             }
                         }
                     }
+                    // A struct FORMAL bound member-wise lives in the call
+                    // frame under its dotted key (`o.a`), not the signal
+                    // table — the `Ident([o,a])` shape already checks
+                    // `local_stack` (the dotted-local arm above), but the
+                    // `MemberAccess{Ident(o),a}` shape missed and the body's
+                    // `o.a = v` write was silently dropped. Gated on the
+                    // dotted key actually being in the frame, so an ordinary
+                    // top-level struct member (in `signal_name_to_id`) and a
+                    // class property (handled by `class_agg_member`) never
+                    // reach here.
+                    if flat.contains('.') && !self.local_stack.is_empty() {
+                        let last_idx = self.local_stack.len() - 1;
+                        if self.local_stack[last_idx].contains_key(flat.as_str()) {
+                            let fitted = if !val.is_real {
+                                if let Some(&target_w) = self.widths.get(flat.as_str()) {
+                                    if val.width < target_w {
+                                        val.resize_for_assign(target_w)
+                                    } else {
+                                        val.clone()
+                                    }
+                                } else {
+                                    val.clone()
+                                }
+                            } else {
+                                val.clone()
+                            };
+                            self.local_stack[last_idx].insert(flat, fitted);
+                            return true;
+                        }
+                    }
                 }
                 // A nested PACKED struct member inside an unpacked aggregate
                 // (`arr[i].tag.vlan`): slice the parent's own signal.
@@ -34944,6 +34974,35 @@ impl Simulator {
                         {
                             return true;
                         }
+                    }
+                }
+                // A procedural-local unpacked struct whose members were
+                // materialised individually — by the dotted `Ident([s,a])`
+                // lvalue arm above, or by foreach/randomize element
+                // construction — lives in the runtime `signals` map as
+                // standalone dotted keys (`s.a`, `s.b`), NOT as a single
+                // packed whole. The whole-struct splice arm below reads the
+                // (empty) whole value, splices the field into it, and writes
+                // a phantom whole `s` that no member read ever consults — so
+                // the actual `s.a` leaf stays at its pre-call value.
+                //
+                // When the dotted leaf already exists as its own key, write
+                // it directly. A struct stored whole (case 1: `output`
+                // formal whose actual was never pre-touched) has no such key
+                // and correctly falls through to the whole-struct arm.
+                if let Some(flat) = self.flat_member_name(lhs) {
+                    if flat.contains('.') && self.signals.contains_key(flat.as_str()) {
+                        let prev = self.signals.get(flat.as_str()).cloned();
+                        let fitted = match prev.as_ref() {
+                            Some(p) if p.is_real && !val.is_real => {
+                                Value::from_f64(val.to_f64())
+                            }
+                            Some(p) if !p.is_real && !val.is_real => val.resize(p.width),
+                            _ => val.clone(),
+                        };
+                        let changed = prev.as_ref() != Some(&fitted);
+                        self.signals.insert(flat, fitted);
+                        return changed;
                     }
                 }
                 // Struct variable member write: `result.field1 = ...`
@@ -70469,7 +70528,11 @@ impl Simulator {
         arg: &Expression,
         locals: &mut HashMap<String, Value>,
         handle: Option<usize>,
-    ) -> bool {
+    ) -> Option<Vec<(String, Expression)>> {
+        // Returns the per-member bindings — each `(local_key, caller_lvalue)` —
+        // so an `output`/`inout`/`ref` formal can be written back member-wise
+        // (the whole-value `output_bindings` path can't see per-member locals
+        // `o.a`, `o.b`). `None` ⇒ not a member-wise struct formal.
         let dt_resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
         let dt_resolved = match dt_resolved {
             DataType::TypeReference { name, .. } => {
@@ -70503,11 +70566,12 @@ impl Simulator {
             other => other,
         };
         let DataType::Struct(su) = dt_resolved else {
-            return false;
+            return None;
         };
         if !Self::spreads_member_wise(&su) {
-            return false;
+            return None;
         }
+        let mut entries = Vec::new();
         for m in &su.members {
             for md in &m.declarators {
                 let fname = &md.name.name;
@@ -70522,10 +70586,54 @@ impl Simulator {
                     arg.span,
                 );
                 let v = self.eval_expr(&member_expr);
-                locals.insert(format!("{}.{}", port_name, fname), v);
+                let local_key = format!("{}.{}", port_name, fname);
+                locals.insert(local_key.clone(), v);
+                // Write-back lvalue: for a plain-identifier actual emit the
+                // hierarchical `Ident([s, a])` form (how source `s.a` parses)
+                // so assign_value's Ident arm handles it whether the member
+                // lives in the compact signal table or the runtime map; the
+                // `MemberAccess` form misses the runtime-map case. Other
+                // actuals (class-property `obj.prop`) wrap in `MemberAccess`,
+                // which the aggregate-property path resolves.
+                entries.push((local_key, Self::struct_member_lvalue(arg, fname)));
             }
         }
-        true
+        Some(entries)
+    }
+
+    /// Build a member-access lvalue for the write-back of a struct formal.
+    /// See `bind_unpacked_struct_arg` for why the `Ident` form is preferred.
+    fn struct_member_lvalue(base: &Expression, member: &str) -> Expression {
+        if let ExprKind::Ident(hier) = &base.kind {
+            let mut path = hier.path.clone();
+            path.push(crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: member.to_string(),
+                    span: base.span,
+                },
+                selects: Vec::new(),
+            });
+            return Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: hier.root.clone(),
+                    path,
+                    span: base.span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
+                base.span,
+            );
+        }
+        Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(base.clone()),
+                member: crate::ast::Identifier {
+                    name: member.to_string(),
+                    span: base.span,
+                },
+            },
+            base.span,
+        )
     }
 
     fn bind_assoc_param(
@@ -70866,6 +70974,11 @@ impl Simulator {
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
+        // `output`/`inout`/`ref` STRUCT formals are bound member-wise (locals
+        // `o.a`, `o.b`), so they bypass the whole-value `output_bindings`
+        // path — collect their `(local_key, caller_lvalue)` pairs to copy
+        // each member back to the caller's actual on return.
+        let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
         for (i, port) in fd.ports.iter().enumerate() {
             let is_out = matches!(
                 port.direction,
@@ -70878,7 +70991,6 @@ impl Simulator {
                     assoc_params.push((param, caller, is_out));
                     continue;
                 }
-<<<<<<< HEAD
                 // §13.5.2: bind member-wise, and for an output/inout/ref struct
                 // formal record the copy-back — only the copy-IN existed, so a
                 // function taking `output pkt_t p` left the caller's variable
@@ -71231,9 +71343,24 @@ impl Simulator {
                     .map(|v| (v, caller.clone()))
             })
             .collect();
+        // Member-wise struct output formals: snapshot each member local
+        // (`o.a`, `o.b`) before the frame is popped, then write it back to
+        // the caller's actual member.
+        let struct_wb: Vec<(Expression, Value)> = struct_output_writebacks
+            .iter()
+            .filter_map(|(local_key, caller_lval)| {
+                self.local_stack
+                    .last()
+                    .and_then(|l| l.get(local_key).cloned())
+                    .map(|v| (caller_lval.clone(), v))
+            })
+            .collect();
         self.local_stack.pop();
         for (v, caller) in writebacks {
             self.assign_value(&caller, &v);
+        }
+        for (caller_lval, v) in struct_wb {
+            self.assign_value(&caller_lval, &v);
         }
         // `return`/`break`/`continue` are frame-local — restore the caller's
         // flags so the function body can't terminate the caller's loop/block.
@@ -81306,6 +81433,9 @@ impl Simulator {
                 let mut queue_writebacks: Vec<(String, String)> = Vec::new();
                 let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
                 let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
+                // Member-wise struct `output`/`inout`/`ref` formals bypass the
+                // whole-value `output_bindings` path (see exec_function_call).
+                let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
                 for (i, port) in ports.iter().enumerate() {
                     let is_assoc = self.port_is_assoc_array(port);
                     // An associative-array `output`/`inout`/`ref` formal
@@ -81331,7 +81461,15 @@ impl Simulator {
                             assoc_params.push((param, caller, is_out));
                             continue;
                         }
-                        if self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals, Some(handle)) {
+                        if let Some(struct_entries) = self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals, Some(handle)) {
+                            if matches!(
+                                port.direction,
+                                PortDirection::Output
+                                    | PortDirection::Inout
+                                    | PortDirection::Ref
+                            ) {
+                                struct_output_writebacks.extend(struct_entries);
+                            }
                             continue;
                         }
                         // §6.18/§6.20.3: typedef'd / type-param-bound
@@ -81791,6 +81929,17 @@ impl Simulator {
                             .map(|v| (v, caller.clone()))
                     })
                     .collect();
+                // Member-wise struct output formals: snapshot each member
+                // local (`o.a`, `o.b`) before the frame is popped.
+                let struct_wb: Vec<(Expression, Value)> = struct_output_writebacks
+                    .iter()
+                    .filter_map(|(local_key, caller_lval)| {
+                        self.local_stack
+                            .last()
+                            .and_then(|l| l.get(local_key).cloned())
+                            .map(|v| (caller_lval.clone(), v))
+                    })
+                    .collect();
                 self.local_stack.pop();
                 self.this_stack.pop();
                 self.pop_and_restore_queue_frame();
@@ -81806,6 +81955,9 @@ impl Simulator {
                 }
                 for (v, caller) in writebacks {
                     self.assign_value(&caller, &v);
+                }
+                for (caller_lval, v) in struct_wb {
+                    self.assign_value(&caller_lval, &v);
                 }
                 // §13.5.2: copy `output`/`inout`/`ref` associative-array
                 // formals back onto the caller's AA (signal-namespace
