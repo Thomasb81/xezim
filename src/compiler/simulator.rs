@@ -25085,7 +25085,7 @@ impl Simulator {
             // body ran even once. The sentinel split (first entry vs re-entry)
             // is what makes `break` safe now. (§9.3.3)
             if let StatementKind::Forever { body } = &stmt.kind {
-                self.exec_forever_sched(pid, body, &stmts[i + 1..]);
+                self.exec_forever_sched(pid, body, pc, i);
                 return;
             }
 
@@ -25115,7 +25115,7 @@ impl Simulator {
                 // iteration. exec_forever_sched re-appends another
                 // ForeverTail, so this gate runs again on the next resume.
                 self.continue_flag = false;
-                self.exec_forever_sched(pid, body, &stmts[i + 1..]);
+                self.exec_forever_sched(pid, body, pc, i);
                 return;
             }
 
@@ -25514,6 +25514,16 @@ impl Simulator {
                     }
                     self.process_origin
                         .insert(pid_child, (s.span, "fork child"));
+                    // §9.6.2: `disable <label>` where the label names this
+                    // child's own top-level `begin : name` block terminates
+                    // the child. `disable_labels` was populated ONLY for
+                    // initial blocks at start-up, so a fork child's label was
+                    // unknown: the disable found no target, fell through to
+                    // the self-unwind path, and the child kept running — a
+                    // later `wait fork` then blocked on it forever.
+                    if let StatementKind::SeqBlock { name: Some(n), .. } = &s.kind {
+                        self.disable_labels.insert(n.name.clone(), pid_child);
+                    }
                     self.inherit_fork_child_context(pid_child);
                     // §9.4.5: a child that IS an intra-assignment delay
                     // (`fork lhs = #d rhs; join_none`) captures its RHS at the
@@ -26337,7 +26347,14 @@ impl Simulator {
         false
     }
 
-    fn exec_forever_sched(&mut self, pid: usize, body: &Statement, after: &[Statement]) {
+    /// `after` used to be a flat slice of the CURRENT frame's remainder, so
+    /// everything behind that frame in the continuation chain was dropped:
+    /// a `forever` nested inside a `begin...end` lost every statement after
+    /// the enclosing block (its `$finish` included) the moment it broke out,
+    /// which presented as a hang. Take the chain and splice with
+    /// `ProcCont::pushed`, exactly like the other suspend-aware arms.
+    fn exec_forever_sched(&mut self, pid: usize, body: &Statement, pc: &ProcCont, idx: usize) {
+        let resume_at = pc.start + idx + 1;
         let body_stmts = match &body.kind {
             StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
             _ => vec![body.clone()],
@@ -26377,8 +26394,7 @@ impl Simulator {
                                 },
                                 body.span,
                             )];
-                            restart.extend_from_slice(after);
-                            self.inactive_queue.push((pid, ProcCont::from_vec(restart)));
+                            self.inactive_queue.push((pid, pc.pushed(restart, resume_at)));
                             return;
                         }
                         let mut cont = vec![*tbody.clone()];
@@ -26389,15 +26405,15 @@ impl Simulator {
                             },
                             body.span,
                         ));
-                        cont.extend_from_slice(after);
                         if delay == 0 {
                             // `forever begin ... #0 ... end` — same §4.4.2.3
                             // Inactive-region parking as the run_process_stmts
                             // Delay handler above: resume only after this
                             // tick's NBA region (commercial consensus).
-                            self.inactive_queue.push((pid, cont.into()));
+                            self.inactive_queue.push((pid, pc.pushed(cont, resume_at)));
                         } else {
-                            self.event_queue.schedule(self.time + delay, pid, cont.into());
+                            self.event_queue
+                                .schedule(self.time + delay, pid, pc.pushed(cont, resume_at));
                         }
                         return;
                     }
@@ -26413,9 +26429,13 @@ impl Simulator {
                                 },
                                 body.span,
                             ));
-                            cont.extend_from_slice(after);
                             self.event_waiters
-                                .push(self.make_event_waiter_kind(pid, sens, cont.into(), is_clk_ev));
+                                .push(self.make_event_waiter_kind(
+                                    pid,
+                                    sens,
+                                    pc.pushed(cont, resume_at),
+                                    is_clk_ev,
+                                ));
                             return;
                         }
                     }
@@ -26439,7 +26459,6 @@ impl Simulator {
                     },
                     body.span,
                 ));
-                cont.extend_from_slice(after);
 
                 // The statement is only POTENTIALLY blocking: `wait (cond)` with
                 // cond already true runs straight through, reaches the Forever
@@ -26450,12 +26469,13 @@ impl Simulator {
                 // continuation to the scheduler as a delta at the current time.
                 // The loop then spins through the event loop, where it is bounded,
                 // and the stall detector can see it and name it.
+                let contp = pc.pushed(cont, resume_at);
                 if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
-                    self.event_queue.schedule(self.time, pid, cont.into());
+                    self.event_queue.schedule(self.time, pid, contp);
                     return;
                 }
                 self.forever_depth += 1;
-                self.run_process_stmts(pid, &ProcCont::from_vec(cont));
+                self.run_process_stmts(pid, &contp);
                 self.forever_depth -= 1;
                 return;
             }
@@ -26500,9 +26520,9 @@ impl Simulator {
         if broke {
             // The loop is done; the statements AFTER it still have to run.
             self.break_flag = false;
-            let after_stmts: Vec<Statement> = after.to_vec();
-            if !after_stmts.is_empty() {
-                self.run_process_stmts(pid, &ProcCont::from_vec(after_stmts));
+            let rest = pc.resume_at(resume_at);
+            if !rest.is_exhausted() {
+                self.run_process_stmts(pid, &rest);
             }
             return;
         }
@@ -42732,7 +42752,25 @@ impl Simulator {
                         break;
                     }
                     i += 1;
+                    // §9.3.3 / §12.7.2 loop control, exactly as `while` does
+                    // above. This arm honoured NO flag: a `break` left the
+                    // body no-opping for the rest of the cap, and — the real
+                    // damage — the flag SURVIVED the loop, so every statement
+                    // after the `forever` (including `$finish`) was skipped
+                    // and the run looked like a hang. Only reachable when the
+                    // `forever` is nested inside a block, which is why a
+                    // top-level one always worked.
+                    self.break_flag = false;
+                    self.continue_flag = false;
                     self.exec_statement(body);
+                    if self.break_flag {
+                        // Keep the flag set while a `disable` unwinds to an
+                        // enclosing named block.
+                        if self.disable_target.is_none() {
+                            self.break_flag = false;
+                        }
+                        break;
+                    }
                 }
             }
             StatementKind::SeqBlock { stmts, name } => {
