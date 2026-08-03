@@ -17,11 +17,6 @@ libffi = "3"
 libc = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }
 bincode = "1.3"
-# Installed as the global allocator in src/main.rs. 0.1.52 is the newest
-# published release; it bundles the mimalloc v3 C library (v3.3.2) and builds
-# v3 unless the `v2` feature is enabled. Pinned to the exact patch so a fresh
-# lockfile cannot silently resolve to an older v2-era release.
-mimalloc = "0.1.52"
 once_cell = "1.18"
 # JIT: enabled with `--features jit`. Kept optional to avoid adding the
 # cranelift build dependency to users who only want the interpreter.
