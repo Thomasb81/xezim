@@ -70468,14 +70468,30 @@ impl Simulator {
         dt: &DataType,
         arg: &Expression,
         locals: &mut HashMap<String, Value>,
+        handle: Option<usize>,
     ) -> bool {
         let dt_resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
         let dt_resolved = match dt_resolved {
             DataType::TypeReference { name, .. } => {
                 let tn = &name.name.name;
+                // A TYPE-PARAMETER formal (`class C #(type T); new(T f)`, or a
+                // method `function int rd(T f)`) names the parameter, not a
+                // typedef. Resolve it to the concrete bound type, preferring
+                // the CALLEE instance's own `type_bindings` (authoritative for
+                // regular method calls, where no class specialization is on
+                // `current_spec`) and falling back to `current_spec` (set for
+                // a constructor call). Without this the struct actual is never
+                // bound member-wise and the body reads every member as x.
+                let concrete = self
+                    .heap
+                    .get(handle.unwrap_or(0))
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.type_bindings.get(tn).cloned())
+                    .or_else(|| self.resolve_type_param_binding(tn))
+                    .unwrap_or_else(|| tn.clone());
                 self.module
                     .typedef_types
-                    .get(tn.as_str())
+                    .get(concrete.as_str())
                     .cloned()
                     .unwrap_or_else(|| DataType::TypeReference {
                         name: name.clone(),
@@ -70862,6 +70878,7 @@ impl Simulator {
                     assoc_params.push((param, caller, is_out));
                     continue;
                 }
+<<<<<<< HEAD
                 // §13.5.2: bind member-wise, and for an output/inout/ref struct
                 // formal record the copy-back — only the copy-IN existed, so a
                 // function taking `output pkt_t p` left the caller's variable
@@ -81314,7 +81331,7 @@ impl Simulator {
                             assoc_params.push((param, caller, is_out));
                             continue;
                         }
-                        if self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals) {
+                        if self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals, Some(handle)) {
                             continue;
                         }
                         // §6.18/§6.20.3: typedef'd / type-param-bound
