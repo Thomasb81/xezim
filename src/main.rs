@@ -1,6 +1,14 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+// EXPERIMENT: `mimalloc` was already a declared dependency but no
+// `#[global_allocator]` existed anywhere, so every allocation went to glibc
+// malloc. A perf profile of a UVM example puts ~41% of self time in allocator
+// machinery (malloc/_int_malloc/_int_free/malloc_consolidate/cfree/
+// unlink_chunk), driven by AST clone traffic.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn default_design_cache_dir() -> PathBuf {
     if let Some(path) = env::var_os("XEZIM_CACHE_DIR").filter(|p| !p.is_empty()) {
         return PathBuf::from(path);
