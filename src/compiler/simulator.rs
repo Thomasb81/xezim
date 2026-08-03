@@ -81556,15 +81556,27 @@ pub extern "C" fn svGetNameFromScope(scope: *mut libc::c_void) -> *const libc::c
     }
     unsafe {
         let s = &*(scope as *const DpiScope);
-        // The name is stored as fixed-size [u8; 256] with a length
-        // prefix; hand back a pointer to the first byte (NOT
-        // NUL-terminated in our storage — the CStr assumption in UVM
-        // is wrong here, so we leak a fresh CString via a thread_local).
-        // Simpler: allocate a CString once per call. UVM calls this
-        // sparingly so the allocation overhead is negligible.
-        std::ffi::CString::new(std::str::from_utf8_unchecked(&s.name[..s.name_len]))
-            .unwrap_or_default()
-            .into_raw()
+        // The name is stored as fixed-size [u8; 256] with a length prefix, so
+        // it is not NUL-terminated in our storage and we must hand back a
+        // fresh buffer. The CALLER FREES IT WITH libc `free` (see
+        // tests/dpi/uvm_dpi_test.c), so the buffer MUST come from libc
+        // `malloc`. Returning a Rust-allocated `CString::into_raw()` only
+        // worked while Rust's global allocator happened to BE glibc malloc;
+        // installing any other global allocator turned it into an invalid
+        // free. UVM calls this sparingly, so the copy is negligible.
+        let bytes = &s.name[..s.name_len];
+        // Preserve the previous `CString::new(..).unwrap_or_default()`
+        // behaviour: an interior NUL yields an empty string.
+        let n = if bytes.contains(&0) { 0 } else { bytes.len() };
+        let buf = libc::malloc(n + 1) as *mut u8;
+        if buf.is_null() {
+            return std::ptr::null();
+        }
+        if n > 0 {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
+        }
+        *buf.add(n) = 0;
+        buf as *const libc::c_char
     }
 }
 
