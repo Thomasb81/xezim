@@ -1415,6 +1415,22 @@ impl<'a> BytecodeCompiler<'a> {
     /// When `allow_ast_fallback` is set, any nested failure rolls back and
     /// emits a single `StmtFallback` for the whole statement.
     pub fn compile_stmt(&mut self, stmt: &Statement) -> bool {
+        // §6.21: a block-local declaration that SHADOWS a module signal needs
+        // the whole enclosing block interpreted as one unit — the AST path
+        // pushes a shadow frame for the block's duration, which per-statement
+        // StmtFallback insns cannot reproduce (the local would clobber the
+        // module variable). Failing WITHOUT fallback here makes the enclosing
+        // SeqBlock's own wrapper roll back and emit a single whole-block
+        // StmtFallback instead.
+        if let StatementKind::VarDecl { declarators, .. } = &stmt.kind {
+            if declarators
+                .iter()
+                .any(|d| self.signal_name_to_id.contains_key(d.name.name.as_str()))
+            {
+                self.bail("VarDecl_shadows_signal");
+                return false;
+            }
+        }
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let saved_reason = self.bail_reason;

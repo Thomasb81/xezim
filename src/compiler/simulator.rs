@@ -4985,6 +4985,27 @@ impl Simulator {
         // — elaborate_class only saw the class's OWN local typedefs.
         Self::classify_typedef_collection_properties(&mut module);
         Self::register_struct_member_packed_dims(&mut module);
+        // §9.2.2.2: give every dynamic array / queue a REAL `<q>.size` signal.
+        // It doubles as the queue's change proxy in the comb dependency graph:
+        // sensitivity registration resolves it to an id, and every mutation
+        // (push/pop/delete, element write) marks it dirty — without it a comb
+        // block reading `q.size()` or `q[0]` never re-fired on queue changes.
+        let queue_names: Vec<String> = module.dynamic_arrays.iter().cloned().collect();
+        for q in queue_names {
+            let sz_name = format!("{}.size", q);
+            module.signals.entry(sz_name.clone()).or_insert_with(|| {
+                super::elaborate::Signal {
+                    name: sz_name,
+                    width: 32,
+                    is_signed: false,
+                    is_real: false,
+                    is_const: false,
+                    direction: None,
+                    value: Value::zero(32),
+                    type_name: None,
+                }
+            });
+        }
         let materialize_ms = phase_materialize.elapsed().as_secs_f64() * 1000.0;
 
         // Collect just *names* from the two source maps and sort them
@@ -19324,7 +19345,12 @@ impl Simulator {
             ExprKind::Index { expr: base, index } => {
                 if let ExprKind::Ident(hier) = &base.kind {
                     let name = Self::resolve_hier_name_static(hier, module);
-                    if let Some((lo, hi, _)) = module.arrays.get(&name) {
+                    // A dynamic array / queue keeps its elements in the runtime
+                    // map with no per-element id — depend on the `.size` proxy,
+                    // which every mutation marks dirty (see Simulator::new).
+                    if module.dynamic_arrays.contains(&name) {
+                        reads.insert(format!("{}.size", name));
+                    } else if let Some((lo, hi, _)) = module.arrays.get(&name) {
                         if let Some(i) = Self::constant_array_index(index, module) {
                             if (*lo..=*hi).contains(&i) {
                                 reads.insert(format!("{}[{}]", name, i));
@@ -19452,6 +19478,23 @@ impl Simulator {
                 }
             }
             ExprKind::Paren(e) => Self::collect_expr_reads(e, module, reads),
+            // §11.4.13: `v inside {a, [lo:hi]}` reads the tested expression
+            // AND every set member — none were collected, so a comb/cont
+            // assign with an `inside` RHS never re-fired and kept its time-0
+            // value forever.
+            ExprKind::Inside { expr: e, ranges } => {
+                Self::collect_expr_reads(e, module, reads);
+                for r in ranges {
+                    Self::collect_expr_reads(r, module, reads);
+                }
+            }
+            ExprKind::Range(a, b) => {
+                Self::collect_expr_reads(a, module, reads);
+                Self::collect_expr_reads(b, module, reads);
+            }
+            ExprKind::Matches { expr: e, .. } => {
+                Self::collect_expr_reads(e, module, reads);
+            }
             // Interface-member access (`intf.member`) and other dotted refs.
             // Recursing only into the base loses the actual signal name —
             // writes to `intf.member` would not re-fire combinational blocks
@@ -19500,6 +19543,37 @@ impl Simulator {
                     }
                 }
                 if !flattened {
+                    // `arr[i].field` (and deeper member chains): the leaves are
+                    // per-element FIELD signals (`arr[0].field`), and a write
+                    // dirties exactly those — register them, for every element
+                    // when the index is not constant. Without this the only
+                    // registered read was the elementless base and a field
+                    // write never re-fired the block. A dynamic array's
+                    // elements have no ids; depend on its `.size` proxy.
+                    if let ExprKind::Index { expr: ib, index } = &cur.kind {
+                        if let ExprKind::Ident(h) = &ib.kind {
+                            let name = Self::resolve_hier_name_static(h, module);
+                            let suffix = parts
+                                .iter()
+                                .rev()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(".");
+                            if module.dynamic_arrays.contains(&name) {
+                                reads.insert(format!("{}.size", name));
+                            } else if let Some(&(lo, hi, _)) = module.arrays.get(&name) {
+                                if let Some(i) = Self::constant_array_index(index, module) {
+                                    if (lo..=hi).contains(&i) {
+                                        reads.insert(format!("{}[{}].{}", name, i, suffix));
+                                    }
+                                } else {
+                                    for i in lo..=hi {
+                                        reads.insert(format!("{}[{}].{}", name, i, suffix));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Non-Ident base (`(expr).member`, indexed-member, etc.) —
                     // fall back to the prior behavior of recursing into the
                     // base expression so its inner reads get registered.
@@ -42952,6 +43026,24 @@ impl Simulator {
                 }
             }
             StatementKind::SeqBlock { stmts, name } => {
+                // §6.21: a block-local declaration SHADOWS a same-named module
+                // signal — without a frame the frameless VarDecl exec lands on
+                // the signal itself and the block's writes clobber the module
+                // variable (`begin logic [7:0] v; v = 8'hF0; end` overwrote
+                // module `v`). Push a throwaway frame for the block's duration,
+                // exactly like the for-loop shadow frame. Only when a direct
+                // child declaration actually collides, so the common case pays
+                // one scan and no allocation.
+                let shadow_frame = self.local_stack.last().is_none()
+                    && stmts.iter().any(|s| match &s.kind {
+                        StatementKind::VarDecl { declarators, .. } => declarators.iter().any(|d| {
+                            self.signal_name_to_id.contains_key(d.name.name.as_str())
+                        }),
+                        _ => false,
+                    });
+                if shadow_frame {
+                    self.local_stack.push(HashMap::default());
+                }
                 // `automatic` locals declared in this block (see the VarDecl
                 // arm) are fork-capturable only while the block is in scope
                 // (§6.21): each entry — e.g. each loop iteration — is a fresh
@@ -42972,6 +43064,9 @@ impl Simulator {
                 }
                 if m_pushed {
                     self.m_scope_stack.pop();
+                }
+                if shadow_frame {
+                    self.local_stack.pop();
                 }
                 self.auto_loop_vars.truncate(seq_auto_len);
                 // A `disable` naming THIS block ends here; execution resumes
@@ -54275,6 +54370,17 @@ impl Simulator {
         if self.forced_names.contains(name) {
             return;
         }
+        // A queue/dynamic-array ELEMENT (or element member) lives only in the
+        // runtime map — mark the queue's `.size` comb proxy dirty so readers
+        // re-fire (see Simulator::new).
+        if let Some(base) = name.find('[').map(|i| &name[..i]) {
+            if !base.is_empty() && self.module.dynamic_arrays.contains(base) {
+                let base = base.to_string();
+                self.signals.insert(name.to_string(), val);
+                self.touch_queue(&base);
+                return;
+            }
+        }
         self.signals.insert(name.to_string(), val);
     }
 
@@ -54305,8 +54411,30 @@ impl Simulator {
     }
 
     fn set_queue_size(&mut self, obj_name: &str, size: u64) {
-        self.signals
-            .insert(format!("{}.size", obj_name), Value::from_u64(size, 32));
+        let key = format!("{}.size", obj_name);
+        // The `.size` signal is the queue's comb-dependency proxy (see
+        // Simulator::new): route through the table write so a size change
+        // marks it dirty and re-fires comb readers of `q.size()` / `q[i]`.
+        if let Some(&id) = self.signal_name_to_id.get(key.as_str()) {
+            let v = Value::from_u64(size, 32);
+            if self.signal_table[id] != v {
+                write_sig!(self, id, v);
+                self.table_modified = true;
+                self.mark_dirty_id(id);
+            }
+        }
+        self.signals.insert(key, Value::from_u64(size, 32));
+    }
+
+    /// Mark a queue's `.size` proxy dirty WITHOUT changing the size — used by
+    /// element-level mutations (`q[i] = v`, `q[i].member = v`) so comb readers
+    /// of the queue re-evaluate.
+    fn touch_queue(&mut self, obj_name: &str) {
+        let key = format!("{}.size", obj_name);
+        if let Some(&id) = self.signal_name_to_id.get(key.as_str()) {
+            self.mark_dirty_id(id);
+            self.dirty_any = true;
+        }
     }
 
     /// Resolve a whole fixed-size (unpacked) array operand — used by unpacked-
