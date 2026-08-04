@@ -38410,6 +38410,13 @@ impl Simulator {
 
                 "$dimensions" | "$unpacked_dimensions" => {
                     if let Some(arg) = args.first() {
+                        // §20.7: a TYPE operand — `$dimensions(int)` is 1,
+                        // `$dimensions(logic)` 0 (a scalar has no dimension),
+                        // `$dimensions(bit [3:0][7:0])` 2.
+                        if let Some(q) = self.type_query_operand(arg) {
+                            let n = super::elaborate::type_query_bound(name, &q, 1).unwrap_or(0);
+                            return Value::from_u64(n as u64, 32);
+                        }
                         if let ExprKind::Ident(hier) = &arg.kind {
                             let aname = self.resolve_hier_name(hier);
                             // §20.7: EVERY unpacked dimension counts, not just
@@ -38447,23 +38454,31 @@ impl Simulator {
                 }
                 sn @ ("$left" | "$high" | "$right" | "$low" | "$size" | "$increment") => {
                     let sn = sn.to_string();
-                    // §20.7: a TYPE operand — the query describes the type's
-                    // packed dimension (`$size(logic [7:0])` == 8).
-                    if let Some(ExprKind::TypeLiteral(dt)) = args.first().map(|a| &a.kind) {
-                        let w = super::elaborate::resolve_type_width(
-                            dt,
-                            Some(&self.module.parameters),
-                            Some(&self.module.typedefs),
-                        )
-                        .max(1);
-                        let r = match sn.as_str() {
-                            "$size" => w as u64,
-                            "$left" | "$high" => (w - 1) as u64,
-                            "$right" | "$low" => 0,
-                            "$increment" => 1,
-                            _ => 0,
+                    // §20.7: a TYPE operand — the query describes THAT TYPE's
+                    // dimensions, so it must report the DECLARED bounds of the
+                    // selected one (`$size(int)` 32, `$left(byte)` 7,
+                    // `$left(logic [15:4])` 15, `$size(bit [3:0][7:0], 2)` 8).
+                    // Only the whole type's width was consulted, which is wrong
+                    // for any non-zero-based or multi-dimensional shape — and a
+                    // bare type keyword / typedef NAME parses as an Ident (see
+                    // `parse_call_args`), so it missed this branch entirely and
+                    // fell through to the signal path, reporting the bounds of
+                    // a nonexistent signal (-1:0).
+                    if let Some(q) = args.first().and_then(|a| self.type_query_operand(a)) {
+                        let dim = args
+                            .get(1)
+                            .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
+                            .unwrap_or(1) as usize;
+                        // §20.7: an out-of-range dimension has no bounds to
+                        // report — the result is x, not 0.
+                        let Some(r) = super::elaborate::type_query_bound(&sn, &q, dim) else {
+                            let mut xv = Value::new(32);
+                            xv.is_signed = true;
+                            return xv;
                         };
-                        return Value::from_u64(r, 32);
+                        let mut rv = Value::from_u64((r as u64) & 0xFFFF_FFFF, 32);
+                        rv.is_signed = true;
+                        return rv;
                     }
                     let dim = args
                         .get(1)
@@ -46210,11 +46225,15 @@ impl Simulator {
             }
             "$dumpfile" => {
                 if let Some(arg) = args.first() {
-                    if let ExprKind::StringLiteral(s) = &arg.kind {
-                        self.vcd_file = Some(s.clone());
+                    // §21.7.2.1: the file name is any string-valued expression
+                    // — a `string` VARIABLE (`$dumpfile(vcdfn)`) must use its
+                    // value, not silently fall back to "dump.vcd".
+                    let path = self.system_string_arg(arg);
+                    self.vcd_file = if path.is_empty() {
+                        Some("dump.vcd".to_string())
                     } else {
-                        self.vcd_file = Some("dump.vcd".to_string());
-                    }
+                        Some(path)
+                    };
                 }
             }
             // Verdi's FSDB dump tasks mapped onto xezim's native FST dump
@@ -55925,6 +55944,49 @@ impl Simulator {
             .arrays
             .get(name)
             .map(|&(lo, hi, _)| vec![(lo, hi)])
+    }
+
+    /// §20.7: the array query functions also accept a TYPE as their operand
+    /// (`$size(int)`, `$left(my_vec_t)`, `$size(logic [7:0])`). A bare type
+    /// keyword or a typedef name in an argument list parses as a plain Ident
+    /// (see `parse_call_args`), so it has to be recognised here. Returns None
+    /// unless the operand really names a type — a signal of the same name is
+    /// the ordinary array-query operand and keeps the signal path.
+    fn type_query_operand(&self, arg: &Expression) -> Option<super::elaborate::TypeQueryDims> {
+        if let ExprKind::TypeLiteral(dt) = &arg.kind {
+            return Some(super::elaborate::type_query_dims_of(
+                dt,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+                Some(&self.module.typedef_types),
+            ));
+        }
+        let ExprKind::Ident(hier) = &arg.kind else {
+            return None;
+        };
+        let seg = hier.path.last()?;
+        if !seg.selects.is_empty() {
+            return None;
+        }
+        let resolved = self.resolve_hier_name(hier);
+        if self.signal_name_to_id.contains_key(resolved.as_str())
+            || self.module.arrays.contains_key(&resolved)
+            || self.module.arrays_2d.contains_key(&resolved)
+            || self.module.arrays_nd.contains_key(&resolved)
+            || self.module.dynamic_arrays.contains(&resolved)
+            || self.module.associative_arrays.contains_key(&resolved)
+            || self.lookup_signal_width(&resolved).is_some()
+            || self.get_signal_value_by_name(&seg.name.name).is_some()
+        {
+            return None;
+        }
+        super::elaborate::type_query_dims_by_name(
+            &seg.name.name,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+            Some(&self.module.typedef_types),
+            Some(&self.module.typedef_unpacked_dims),
+        )
     }
 
     /// A `foreach` index variable is implicitly `int` (signed, §12.7.3), so a
