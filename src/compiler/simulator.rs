@@ -4191,6 +4191,10 @@ pub struct Simulator {
     signal_toggle_counts: Vec<u64>,
     /// Whether activity monitoring is enabled.
     pub activity_mon: bool,
+    /// XEZIM_TRACE_ALWAYS: per-fire trace of always blocks. None = off;
+    /// Some("") = trace every block; Some(s) = only blocks whose label
+    /// (kind, scope, written signal names) contains `s`.
+    trace_always: Option<String>,
     /// Runtime plusargs passed from CLI/filelists (e.g. +FOO, +BAR=1).
     plusargs: Vec<String>,
     /// Iteration cursor for `uvm_dpi_get_next_arg` — UVM's cmdline processor
@@ -4990,6 +4994,44 @@ impl Simulator {
         // sensitivity registration resolves it to an id, and every mutation
         // (push/pop/delete, element write) marks it dirty — without it a comb
         // block reading `q.size()` or `q[0]` never re-fired on queue changes.
+        // §6.21: rename process-body block locals that shadow a module-scope
+        // name — the flattening process executor has no block-scope boundary,
+        // so a frameless local landed on the module signal itself (see
+        // `rename_process_shadowed_locals`).
+        {
+            let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+            taken.extend(module.signals.keys().cloned());
+            taken.extend(module.arrays.keys().cloned());
+            taken.extend(module.dynamic_arrays.iter().cloned());
+            taken.extend(module.associative_arrays.keys().cloned());
+            for (i, ib) in module.initial_blocks.iter_mut().enumerate() {
+                if let Some(new_stmt) = super::elaborate::rename_process_shadowed_locals(
+                    &ib.stmt,
+                    &taken,
+                    &format!("i{}", i),
+                ) {
+                    ib.stmt = new_stmt;
+                }
+            }
+            for (i, ab) in module.always_blocks.iter_mut().enumerate() {
+                if let Some(new_stmt) = super::elaborate::rename_process_shadowed_locals(
+                    &ab.stmt,
+                    &taken,
+                    &format!("a{}", i),
+                ) {
+                    ab.stmt = new_stmt;
+                }
+            }
+            for (i, fb) in module.final_blocks.iter_mut().enumerate() {
+                if let Some(new_stmt) = super::elaborate::rename_process_shadowed_locals(
+                    &fb.stmt,
+                    &taken,
+                    &format!("f{}", i),
+                ) {
+                    fb.stmt = new_stmt;
+                }
+            }
+        }
         let queue_names: Vec<String> = module.dynamic_arrays.iter().cloned().collect();
         for q in queue_names {
             let sz_name = format!("{}.size", q);
@@ -6180,6 +6222,9 @@ impl Simulator {
             // already gated by self.activity_mon.
             signal_toggle_counts: Vec::new(),
             activity_mon: false,
+            trace_always: std::env::var("XEZIM_TRACE_ALWAYS").ok().map(|v| {
+                if v == "1" { String::new() } else { v }
+            }),
             plusargs: Vec::new(),
             dpi_arg_cursor: 0,
             // Default to a single-element argv so vpi_get_vlog_info
@@ -15342,7 +15387,59 @@ impl Simulator {
 
     /// Execute a compiled bytecode block. Returns true if executed successfully.
     #[inline]
+    /// XEZIM_TRACE_ALWAYS: emit one line per always-block firing. `label`
+    /// is built lazily by the caller only when tracing is on.
+    fn trace_always_fire(&self, label: &str) {
+        if let Some(filter) = &self.trace_always {
+            if filter.is_empty() || label.contains(filter.as_str()) {
+                eprintln!("[AWTRACE] t={} {}", self.time, label);
+            }
+        }
+    }
+
+    /// Label for a comb entry: kind, index, scope, first written signals.
+    fn comb_entry_trace_label(&self, eidx: usize, entry: &CombEntry) -> String {
+        let kind = match &entry.item {
+            CombItem::AlwaysBlock { is_always_comb, .. }
+            | CombItem::CompiledAlwaysBlock { is_always_comb, .. } => {
+                if *is_always_comb { "always_comb" } else { "always@*" }
+            }
+            CombItem::ContAssign { .. } | CombItem::CompiledContAssign { .. } => "assign",
+            _ => "comb",
+        };
+        let writes: Vec<&str> = entry
+            .write_signal_ids
+            .iter()
+            .take(3)
+            .filter_map(|&id| self.id_to_name.get(id).map(|n| n.as_ref()))
+            .collect();
+        format!(
+            "{}#{} scope={} writes={}",
+            kind,
+            eidx,
+            entry.scope_hint.as_deref().unwrap_or("-"),
+            writes.join(",")
+        )
+    }
+
     fn exec_bytecode(&mut self, block_idx: usize) -> bool {
+        if self.trace_always.is_some() {
+            let label = {
+                let blk = &self.edge_blocks[block_idx];
+                let mut writes: HashSet<String> = HashSet::default();
+                let mut reads: HashSet<String> = HashSet::default();
+                Self::collect_stmt_reads(&blk.stmt, &self.module, &mut reads, &mut writes);
+                let mut ws: Vec<String> = writes.into_iter().take(3).collect();
+                ws.sort();
+                format!(
+                    "always_ff#{} scope={} writes={}",
+                    block_idx,
+                    if blk.scope.is_empty() { "-" } else { blk.scope.as_str() },
+                    ws.join(",")
+                )
+            };
+            self.trace_always_fire(&label);
+        }
         // Fast path: if we JIT-compiled this block, call the native fn
         // directly. Zero-cost when the jit feature is off (jit_fns stays
         // empty; index returns None which short-circuits).
@@ -31219,6 +31316,10 @@ impl Simulator {
                     if let Some(slot) = self.activity_counts.get_mut(eidx) {
                         *slot += 1;
                     }
+                }
+                if self.trace_always.is_some() {
+                    let label = self.comb_entry_trace_label(eidx, &entries[eidx]);
+                    self.trace_always_fire(&label);
                 }
                 match &entries[eidx].item {
                     CombItem::Noop => {}
@@ -58158,10 +58259,22 @@ impl Simulator {
     fn trim_radix_zeros(s: &str) -> String {
         let t = s.trim_start_matches('0');
         if t.is_empty() {
-            "0".to_string()
-        } else {
-            t.to_string()
+            return "0".to_string();
         }
+        // §21.2.1.3 automatic sizing: a leading RUN of x (or z) digits
+        // collapses to one, like leading zeros — `%0h` of 8'hxx is "x",
+        // of 16'hxx3f is "x3f". Mixed-case runs (X vs x) keep the first.
+        let mut chars = t.chars();
+        if let Some(first) = chars.next() {
+            if matches!(first, 'x' | 'X' | 'z' | 'Z') {
+                let rest: &str = chars.as_str();
+                let trimmed = rest.trim_start_matches(|c: char| {
+                    c.eq_ignore_ascii_case(&first)
+                });
+                return format!("{}{}", first, trimmed);
+            }
+        }
+        t.to_string()
     }
 
     /// Full-width octal rendering from a binary string, x/z-aware: a digit is
