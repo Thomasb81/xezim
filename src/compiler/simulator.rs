@@ -37222,6 +37222,26 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §20.6.2: `$bits(s.arr)` on a struct member declared
+                        // with UNPACKED dimensions is the WHOLE array —
+                        // element_bits × element count. An unpacked struct is
+                        // stored as per-element leaf signals (`s.arr[0]`, …)
+                        // with no `s.arr` of its own, so neither the array
+                        // tables above nor the width fallback below could see
+                        // past one element.
+                        if let Some(flat) = self.flat_member_name(arg) {
+                            if flat.contains('.') {
+                                if let Some((elem_dt, Some(idxs))) = self.flat_path_type(&flat) {
+                                    let ew = super::elaborate::resolve_type_width(
+                                        &elem_dt,
+                                        Some(&self.module.parameters),
+                                        Some(&self.module.typedefs),
+                                    )
+                                    .max(1);
+                                    return Value::from_u64(ew as u64 * idxs.len() as u64, 32);
+                                }
+                            }
+                        }
                         Value::from_u64(self.eval_expr(arg).width as u64, 32)
                     } else {
                         Value::zero(32)
