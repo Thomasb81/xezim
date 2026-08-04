@@ -94,3 +94,38 @@ endmodule
     assert_eq!(u(&sim, "cmp"), 1, "MP > 100 must be true");
     assert_eq!(u(&sim, "wid"), 8, "width still comes from the literal");
 }
+
+/// §6.19.1 (grammar A.2.2.1): `enum_base_type` may be a `type_identifier`, and
+/// there is NO enum name between `enum` and `{`. The parser was discarding
+/// that identifier as a supposed enum name, so the enum silently fell back to
+/// the 32-bit `int` default: `$bits` read 32 instead of the base's width, and
+/// a signed base lost its sign.
+#[test]
+fn enum_base_type_may_be_a_typedef() {
+    let src = r#"
+module tb;
+  typedef logic [3:0] nib_t;
+  typedef byte        sb_t;
+  typedef enum nib_t { A0, A1 } en_t;
+  typedef enum sb_t  { B0 = -2, B1 } eb_t;
+  typedef enum logic [3:0] { C0, C1 } inline_t;   // control: inline base
+  eb_t e2;
+  en_t e1;
+  int b_en, b_eb, b_in, v_b0, lt0, v_a1;
+  initial begin
+    b_en = $bits(en_t);
+    b_eb = $bits(eb_t);
+    b_in = $bits(inline_t);
+    e2 = B0; v_b0 = e2; lt0 = (e2 < 0);
+    e1 = A1; v_a1 = e1;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "b_en"), 4, "base type nib_t is 4 bits, not int");
+    assert_eq!(u(&sim, "b_eb"), 8, "base type sb_t (byte) is 8 bits");
+    assert_eq!(u(&sim, "b_in"), 4, "inline base still works");
+    assert_eq!(u(&sim, "v_b0") as i32, -2, "signed base keeps its sign");
+    assert_eq!(u(&sim, "lt0"), 1, "e2 < 0 must be true");
+    assert_eq!(u(&sim, "v_a1"), 1);
+}
