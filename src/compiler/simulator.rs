@@ -17165,6 +17165,23 @@ impl Simulator {
                             }
                         }
                     }
+                    // The block's own INSTANCE scope is authoritative even
+                    // when the read/write leaf inference above found nothing
+                    // (e.g. every leaf is a loop variable). A port named like
+                    // its connected signal ("grant" → tb `grant`) resolves at
+                    // runtime to the instance's port copy `dut.grant`, which
+                    // updates a settle-cascade step LATER than the top signal
+                    // — without the scoped id in the dep graph the block reads
+                    // one NBA application behind (a FIFO level tracker lagged
+                    // its reference model by one clock).
+                    if !ab.scope.is_empty() && Some(&ab.scope) != scope_hint.as_ref() {
+                        let q = format!("{}.{}", ab.scope, r);
+                        if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
+                            if !rids.contains(&id) {
+                                rids.push(id);
+                            }
+                        }
+                    }
                     if let Some(id) = resolve_one(r.as_str()) {
                         if !rids.contains(&id) {
                             rids.push(id);
@@ -19152,15 +19169,34 @@ impl Simulator {
             return;
         }
         let mut scratch_writes: HashSet<String> = HashSet::default();
+        let mut body_reads: HashSet<String> = HashSet::default();
         // §13.4.3: a default-argument expression is evaluated at call time, so
         // its reads are part of the caller's sensitivity too.
         for port in &fdecl.ports {
             if let Some(def) = &port.default {
-                Self::collect_expr_reads(def, module, reads);
+                Self::collect_expr_reads(def, module, &mut body_reads);
             }
         }
         for item in &fdecl.items {
-            Self::collect_stmt_reads(item, module, reads, &mut scratch_writes);
+            Self::collect_stmt_reads(item, module, &mut body_reads, &mut scratch_writes);
+        }
+        // A bare read in the body of an INSTANCE's function names that
+        // instance's variable (`internal_func_dep` inside
+        // `dut.eval_with_hidden_dep` is `dut.internal_func_dep`) — the bare
+        // spelling resolves to a nonexistent top-level signal and drops out of
+        // the sensitivity set. Qualify it wherever only the scoped one exists.
+        let scope = name.rsplit_once('.').map(|(s, _)| s);
+        for r in body_reads {
+            if let Some(scope) = scope {
+                // The body may be unrewritten (bare spellings), and a same-named
+                // bare signal can exist at top level too — register BOTH names;
+                // a superset sensitivity is always safe, and the sensitivity
+                // builder drops whichever spelling resolves to no signal.
+                if !r.contains('.') {
+                    reads.insert(format!("{}.{}", scope, r));
+                }
+            }
+            reads.insert(r);
         }
         ACTIVE.with(|a| {
             a.borrow_mut().remove(name);
@@ -19395,7 +19431,18 @@ impl Simulator {
                 // list; without this the block never re-fires when they change.
                 if let ExprKind::Ident(hier) = &func.kind {
                     if let Some(seg) = hier.path.last() {
-                        Self::collect_function_reads(&seg.name.name, module, reads);
+                        // Prefer the fully-scoped registration: an inlined
+                        // instance's call site resolves to `<inst>.<name>`, and
+                        // only under THAT key do the body's bare reads get the
+                        // instance prefix (see `collect_function_reads`). The
+                        // bare key may also exist (from the module definition)
+                        // and would collect unprefixed, unresolvable reads.
+                        let full = Self::resolve_hier_name_static(hier, module);
+                        if full != seg.name.name && module.functions.contains_key(&full) {
+                            Self::collect_function_reads(&full, module, reads);
+                        } else {
+                            Self::collect_function_reads(&seg.name.name, module, reads);
+                        }
                     }
                 }
             }
@@ -19650,6 +19697,23 @@ impl Simulator {
             | StatementKind::Repeat { body, .. }
             | StatementKind::Foreach { body, .. } => {
                 Self::collect_stmt_reads(body, module, reads, writes);
+            }
+            // §9.2.2.2: a function body reached through `collect_function_reads`
+            // usually ends in `return <expr>` — dropping it hid every module
+            // variable the function reads only there, so an always_comb calling
+            // it never re-fired on those variables.
+            StatementKind::Return(Some(e)) => {
+                Self::collect_expr_reads(e, module, reads);
+            }
+            StatementKind::VarDecl { declarators, .. } => {
+                for d in declarators {
+                    // A block-local is written by this block, never an external
+                    // trigger — but its INITIALIZER reads are real inputs.
+                    writes.insert(d.name.name.clone());
+                    if let Some(init) = &d.init {
+                        Self::collect_expr_reads(init, module, reads);
+                    }
+                }
             }
             _ => {}
         }
@@ -32869,7 +32933,9 @@ impl Simulator {
                 if let Some((base, lo_opt, w)) = self.packed_nested_select(expr, index) {
                     let lo = match lo_opt {
                         Some(lo) => lo,
-                        None => return false, // out-of-range write dropped §11.5.1
+                        None => {
+                            return false; // out-of-range write dropped §11.5.1
+                        }
                     };
                     if let Some(cur_sig) = self.get_signal_value_by_name(&base) {
                         let total_w = cur_sig.width as usize;
@@ -33005,12 +33071,6 @@ impl Simulator {
                     _ => (None, None),
                 };
                 if let Some(mut name) = base_name {
-                    if std::env::var("XEZIM_A1_DBG").is_ok() {
-                        eprintln!("[A1DBG] idx-write base={:?} hint={:?} in_arrays={} scoped_in_arrays={:?}",
-                            name, self.name_resolve_hint.borrow().clone(),
-                            self.module.arrays.contains_key(&name),
-                            self.name_resolve_hint.borrow().as_ref().map(|h| self.module.arrays.contains_key(&format!("{}.{}", h, name))));
-                    }
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
                     }
@@ -34071,6 +34131,34 @@ impl Simulator {
                         let changed = prev.as_ref() != Some(&resized);
                         self.set_signal_value_by_name(&flat, resized);
                         return changed;
+                    }
+                    // Same leaf-per-member write for an element of a QUEUE /
+                    // dynamic / associative collection whose element type is an
+                    // unpacked struct. A top-level container happens to have
+                    // table ids for its member leaves (caught above), an
+                    // INSTANCE one does not — `u.q[0].latency = v` fell through
+                    // every arm and vanished, so a router's per-element
+                    // `q[i].latency--` never drained its queue.
+                    if let Some((parent, _)) = flat.rsplit_once('.') {
+                        if let Some(cont) = parent.rfind('[').map(|i| &parent[..i]) {
+                            if (self.module.dynamic_arrays.contains(cont)
+                                || self.module.arrays.contains_key(cont)
+                                || self.module.associative_arrays.contains_key(cont))
+                                && self.queue_elem_struct(cont).is_some()
+                            {
+                                let prev = self.get_signal_value_by_name(&flat);
+                                let fitted = match prev.as_ref() {
+                                    Some(p) if p.is_real && !val.is_real => {
+                                        Value::from_f64(val.to_f64())
+                                    }
+                                    Some(p) if !p.is_real && !val.is_real => val.resize(p.width),
+                                    _ => val.clone(),
+                                };
+                                let changed = prev.as_ref() != Some(&fitted);
+                                self.set_signal_value_by_name(&flat, fitted);
+                                return changed;
+                            }
+                        }
                     }
                 }
                 // A nested PACKED struct member inside an unpacked aggregate
@@ -38647,7 +38735,30 @@ impl Simulator {
                     // A leaf may live in the compact table OR the runtime map (a
                     // LOCAL unpacked-struct array element is only in the latter),
                     // so consult both — `sa[1].a` read 0 while `%p` showed 2.
-                    if let Some(v) = self.get_signal_value_by_name(&flat) {
+                    if let Some(mut v) = self.get_signal_value_by_name(&flat) {
+                        // §6.11.1: a collection element's member leaf carries no
+                        // declared metadata — stamp the member's declared
+                        // signedness so `q[0].latency <= 0` on an `integer`
+                        // member compares signed (it read -3 as 4294967293 and
+                        // a FIFO whose latency went negative never drained).
+                        if !v.is_real {
+                            if let Some(cont) = base_flat
+                                .rfind('[')
+                                .map(|i| &base_flat[..i])
+                                .filter(|c| !c.is_empty())
+                            {
+                                if let Some(su) = self.queue_elem_struct(cont) {
+                                    for m in &su.members {
+                                        if m.declarators.iter().any(|d| d.name.name == member.name)
+                                        {
+                                            v.is_signed =
+                                                super::elaborate::is_type_signed(&m.data_type);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         return v;
                     }
                     if let Some(fields) = self.module.packed_struct_fields.get(&base_flat).cloned()
@@ -42008,6 +42119,21 @@ impl Simulator {
                 // value: `logic idx` outer vs `for (int idx...)` spun forever on
                 // a 1-bit counter). Push a throwaway frame so the loop var gets
                 // its own declared-width storage; pop it at the arm's end.
+                // §12.7.1 / §6.21: for-init-declared variables are scoped to
+                // the loop — like foreach index vars, save the outer value and
+                // restore it on exit. Without this, a comb block's
+                // `for (int i...)` executed by a settle triggered MID-ITERATION
+                // of another block's same-named loop (blocking assigns settle
+                // synchronously) clobbered the interrupted loop's counter, and
+                // that loop silently exited after one iteration.
+                let fv_names: Vec<String> = init
+                    .iter()
+                    .filter_map(|fi| match fi {
+                        ForInit::VarDecl { name, .. } => Some(name.name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let fv_saved = self.snapshot_loop_vars(&fv_names);
                 let shadow_frame = self.local_stack.last().is_none()
                     && init.iter().any(|fi| match fi {
                         ForInit::VarDecl { name, .. } => {
@@ -42142,6 +42268,7 @@ impl Simulator {
                 if shadow_frame {
                     self.local_stack.pop();
                 }
+                self.restore_loop_vars(&fv_saved);
             }
             StatementKind::Foreach { array, vars, body } => {
                 // foreach index variables are loop-scoped (SV): save the outer
@@ -74043,6 +74170,33 @@ impl Simulator {
         // element-wise inequalities it denotes.
         Self::expand_unique_slices(&mut constraints, &self.module.parameters);
 
+        // §18.3: a constraint may read a state variable of the module the
+        // class is declared in. Statements get instance-qualified when the
+        // module is inlined, but the class's constraint expressions do not —
+        // so from inside an instance, `mode` named a nonexistent top-level
+        // signal, read x, and the solve failed. Qualify a bare ident with the
+        // calling process's instance scope when ONLY the scoped signal exists.
+        // Class members never match (they are skipped explicitly, and have no
+        // scoped signal), so only genuine module-scope state is touched.
+        if !self.current_scope.is_empty() {
+            let scope = self.current_scope.clone();
+            let mut member_names: HashSet<String> = HashSet::default();
+            let mut cn = Some(class_name.clone());
+            while let Some(c) = cn {
+                if let Some(cd) = self.module.classes.get(&c) {
+                    member_names.extend(cd.properties.keys().cloned());
+                    cn = cd.extends.clone();
+                } else {
+                    break;
+                }
+            }
+            for con in &mut constraints {
+                for it in &mut con.items {
+                    self.scope_qualify_constraint_item(it, &scope, &member_names);
+                }
+            }
+        }
+
         // Rand collection members (dynamic arrays, queues, associative arrays).
         let rand_colls =
             self.collect_rand_colls(handle, &rand_disabled, rand_all_off, &constraints);
@@ -77258,6 +77412,140 @@ impl Simulator {
     /// Rewrite each such inequality into
     ///   `other != arr[i]` for every i in the slice, plus
     ///   `arr[i] != arr[j]` for every pair inside the slice (emitted once).
+    /// §18.3 — see the call site in `exec_randomize_inner`: rewrite a bare
+    /// ident in a constraint to `<scope>.<ident>` when the bare spelling names
+    /// no signal but the scoped one does. `skip` holds the class hierarchy's
+    /// property names, which always resolve through the object instead.
+    fn scope_qualify_constraint_item(
+        &self,
+        item: &mut ConstraintItem,
+        scope: &str,
+        skip: &HashSet<String>,
+    ) {
+        match item {
+            ConstraintItem::Expr(e) => self.scope_qualify_expr(e, scope, skip),
+            ConstraintItem::Inside { expr, range, .. } => {
+                self.scope_qualify_expr(expr, scope, skip);
+                for r in range {
+                    match r {
+                        ConstraintRange::Value(e) => self.scope_qualify_expr(e, scope, skip),
+                        ConstraintRange::Range { lo, hi } => {
+                            self.scope_qualify_expr(lo, scope, skip);
+                            self.scope_qualify_expr(hi, scope, skip);
+                        }
+                    }
+                }
+            }
+            ConstraintItem::Implication { condition, constraint, .. } => {
+                self.scope_qualify_expr(condition, scope, skip);
+                self.scope_qualify_constraint_item(constraint, scope, skip);
+            }
+            ConstraintItem::IfElse { condition, then_item, else_item, .. } => {
+                self.scope_qualify_expr(condition, scope, skip);
+                self.scope_qualify_constraint_item(then_item, scope, skip);
+                if let Some(ei) = else_item {
+                    self.scope_qualify_constraint_item(ei, scope, skip);
+                }
+            }
+            ConstraintItem::Foreach { array, vars, item, .. } => {
+                self.scope_qualify_expr(array, scope, skip);
+                // Iterator variables shadow everything inside the body.
+                let mut inner = skip.clone();
+                inner.extend(vars.iter().flatten().map(|v| v.name.clone()));
+                self.scope_qualify_constraint_item(item, scope, &inner);
+            }
+            ConstraintItem::Soft(inner) => self.scope_qualify_constraint_item(inner, scope, skip),
+            ConstraintItem::Block(items) => {
+                for it in items {
+                    self.scope_qualify_constraint_item(it, scope, skip);
+                }
+            }
+            ConstraintItem::Unique { exprs, .. } => {
+                for e in exprs {
+                    self.scope_qualify_expr(e, scope, skip);
+                }
+            }
+            ConstraintItem::Solve { .. } => {}
+        }
+    }
+
+    fn scope_qualify_expr(&self, e: &mut Expression, scope: &str, skip: &HashSet<String>) {
+        match &mut e.kind {
+            ExprKind::Ident(hier) => {
+                if hier.root.is_none() && hier.path.len() == 1 {
+                    let n = hier.path[0].name.name.clone();
+                    if !n.starts_with('$')
+                        && !skip.contains(&n)
+                        && !self.signal_name_to_id.contains_key(n.as_str())
+                        && !self.module.parameters.contains_key(&n)
+                    {
+                        let scoped = format!("{}.{}", scope, n);
+                        if self.signal_name_to_id.contains_key(scoped.as_str()) {
+                            hier.path[0].name.name = scoped;
+                            hier.cached_signal_id.set(None);
+                            hier.cached_resolved_name = std::cell::OnceCell::new();
+                        }
+                    }
+                }
+                for seg in &mut hier.path {
+                    for sel in &mut seg.selects {
+                        self.scope_qualify_expr(sel, scope, skip);
+                    }
+                }
+            }
+            ExprKind::Unary { operand, .. } => self.scope_qualify_expr(operand, scope, skip),
+            ExprKind::Binary { left, right, .. } => {
+                self.scope_qualify_expr(left, scope, skip);
+                self.scope_qualify_expr(right, scope, skip);
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                self.scope_qualify_expr(condition, scope, skip);
+                self.scope_qualify_expr(then_expr, scope, skip);
+                self.scope_qualify_expr(else_expr, scope, skip);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    self.scope_qualify_expr(p, scope, skip);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                self.scope_qualify_expr(count, scope, skip);
+                for x in exprs {
+                    self.scope_qualify_expr(x, scope, skip);
+                }
+            }
+            ExprKind::Call { args, .. } | ExprKind::SystemCall { args, .. } => {
+                // The callee name is left alone — only its arguments can name
+                // state variables.
+                for a in args {
+                    self.scope_qualify_expr(a, scope, skip);
+                }
+            }
+            ExprKind::Inside { expr, ranges } => {
+                self.scope_qualify_expr(expr, scope, skip);
+                for r in ranges {
+                    self.scope_qualify_expr(r, scope, skip);
+                }
+            }
+            ExprKind::MemberAccess { expr, .. } => self.scope_qualify_expr(expr, scope, skip),
+            ExprKind::Index { expr, index } => {
+                self.scope_qualify_expr(expr, scope, skip);
+                self.scope_qualify_expr(index, scope, skip);
+            }
+            ExprKind::RangeSelect { expr, left, right, .. } => {
+                self.scope_qualify_expr(expr, scope, skip);
+                self.scope_qualify_expr(left, scope, skip);
+                self.scope_qualify_expr(right, scope, skip);
+            }
+            ExprKind::Range(a, b) => {
+                self.scope_qualify_expr(a, scope, skip);
+                self.scope_qualify_expr(b, scope, skip);
+            }
+            ExprKind::Paren(inner) => self.scope_qualify_expr(inner, scope, skip),
+            _ => {}
+        }
+    }
+
     fn expand_unique_slices(
         constraints: &mut [ClassConstraint],
         params: &HashMap<String, Value>,
