@@ -192,3 +192,52 @@ endmodule
     assert_eq!((u(&sim, "ioa"), u(&sim, "iob")), (0x30, 0x31), "inout reads in and writes back");
     assert_eq!((u(&sim, "foa"), u(&sim, "fob")), (0x6a, 0x6b), "function output formal");
 }
+
+/// §13.4.1 — struct RETURN types. The return variable is a variable of the
+/// return type but had none of the structural metadata a declaration gets: for
+/// a PACKED struct return, `f.a = ...` found no field layout and the write was
+/// dropped (an identical write to a local of that type worked); for an UNPACKED
+/// one there is no container at all, so the result came back x however the body
+/// produced it — member writes, a whole pattern, or `return s;`.
+#[test]
+fn struct_return_types() {
+    let src = r#"
+typedef struct packed { logic [7:0] a; logic [7:0] b; } sp_t;
+typedef struct        { logic [7:0] a; logic [7:0] b; } su_t;
+module tb;
+  function automatic sp_t p_member(input sp_t x);
+    p_member.a = x.a + 8'h10; p_member.b = x.b + 8'h10;
+  endfunction
+  function automatic sp_t p_whole(input sp_t x);
+    p_whole = '{a: x.a + 8'h10, b: x.b + 8'h10};
+  endfunction
+  function automatic su_t u_member(input su_t x);
+    u_member.a = x.a + 8'h10; u_member.b = x.b + 8'h10;
+  endfunction
+  function automatic su_t u_whole(input su_t x);
+    u_whole = '{a: x.a + 8'h10, b: x.b + 8'h10};
+  endfunction
+  function automatic su_t u_local(input su_t x);
+    su_t t; t.a = x.a + 8'h10; t.b = x.b + 8'h10; return t;
+  endfunction
+  sp_t pi, r_pm, r_pw;
+  su_t ui, r_um, r_uw, r_ul;
+  int pma, pmb, pwa, pwb, uma, umb, uwa, uwb, ula, ulb;
+  initial begin
+    pi = '{a:8'h01, b:8'h02};
+    ui = '{a:8'h01, b:8'h02};
+    r_pm = p_member(pi); pma = r_pm.a; pmb = r_pm.b;
+    r_pw = p_whole(pi);  pwa = r_pw.a; pwb = r_pw.b;
+    r_um = u_member(ui); uma = r_um.a; umb = r_um.b;
+    r_uw = u_whole(ui);  uwa = r_uw.a; uwb = r_uw.b;
+    r_ul = u_local(ui);  ula = r_ul.a; ulb = r_ul.b;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!((u(&sim, "pma"), u(&sim, "pmb")), (0x11, 0x12), "packed return, member writes");
+    assert_eq!((u(&sim, "pwa"), u(&sim, "pwb")), (0x11, 0x12), "packed return, whole pattern");
+    assert_eq!((u(&sim, "uma"), u(&sim, "umb")), (0x11, 0x12), "unpacked return, member writes");
+    assert_eq!((u(&sim, "uwa"), u(&sim, "uwb")), (0x11, 0x12), "unpacked return, whole pattern");
+    assert_eq!((u(&sim, "ula"), u(&sim, "ulb")), (0x11, 0x12), "unpacked return of a local");
+}
