@@ -32216,6 +32216,9 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
+        if let Some(rewritten) = Self::super_as_this(lhs) {
+            return self.assign_value(&rewritten, val);
+        }
         // §11.4.12: `$` in an index is the last valid index of the collection
         // being indexed. The READ paths install `dollar_bound` before
         // evaluating; no lvalue path did, so `$` fell through to its
@@ -35086,6 +35089,9 @@ impl Simulator {
         // OWNS — `s.a`, `s.inner.x`, `s.arr[2]`. Read it from the frame, as the
         // write path does; otherwise the lookups below reach module scope and
         // return an unrelated same-named variable's member.
+        if let Some(rewritten) = Self::super_as_this(expr) {
+            return self.eval_expr_ctx(&rewritten, ctx_width);
+        }
         if !self.local_stack.is_empty() {
             if let Some(key) = self.frame_leaf_key_of(expr) {
                 if let Some(v) = self.local_stack.last().and_then(|l| l.get(&key)) {
@@ -45670,7 +45676,7 @@ impl Simulator {
         if recv.contains('.') {
             return None; // deeper chains are not modelled
         }
-        let handle = if recv == "this" {
+        let handle = if recv == "this" || recv == "super" {
             self.this_stack.last().copied().flatten()?
         } else {
             self.eval_ident_handle(recv)?
@@ -47533,7 +47539,7 @@ impl Simulator {
             _ => return None,
         };
         // Get the heap index: from the local frame, or from `this_stack`.
-        let handle: usize = if name == "this" {
+        let handle: usize = if name == "this" || name == "super" {
             self.this_stack.last().copied().flatten()?
         } else {
             let v = self.local_stack.last().and_then(|m| m.get(name))?;
@@ -65081,7 +65087,7 @@ impl Simulator {
             // queue write (`this.m_successors[k]=1`, as UVM's phase graph and
             // many class methods use) fails to resolve to `<handle>#member` and
             // is silently dropped, while the bare `member[k]=1` form works.
-            let handle = if obj == "this" {
+            let handle = if obj == "this" || obj == "super" {
                 sim.this_stack.last().copied().flatten().unwrap_or(0)
             } else {
                 sim.eval_ident_handle(obj).unwrap_or(0)
@@ -68315,7 +68321,7 @@ impl Simulator {
                     // handle and falls to the plain-name dispatch.
                     if hier.path.len() >= 3 {
                         let head = hier.path[0].name.name.as_str();
-                        let mut handle = if head == "this" {
+                        let mut handle = if head == "this" || head == "super" {
                             self.this_stack.last().copied().flatten().unwrap_or(0)
                         } else {
                             self.eval_ident_handle(head).unwrap_or(0)
@@ -68693,7 +68699,7 @@ impl Simulator {
                 // only catches ordinary user methods on nested objects.)
                 if hier.path.len() >= 3 {
                     let head = hier.path[0].name.name.as_str();
-                    let (mut handle, loop_start) = if head == "this" {
+                    let (mut handle, loop_start) = if head == "this" || head == "super" {
                         (self.this_stack.last().copied().flatten().unwrap_or(0), 1)
                     } else if self.module.classes.contains_key(head) {
                         // `ClassName::static_prop.method()`: path[0] is a
@@ -74484,6 +74490,34 @@ impl Simulator {
                 }
             }
             ConstraintItem::Soft(i) => out.append(&mut self.size_cons_in_item(i, prop, row)),
+            // §18.5.6/§18.5.7: a `.size()` constraint nested under an
+            // implication or if/else never reached the size solver — only
+            // Block/Soft/Inside/Expr had arms, so the queue got an arbitrary
+            // size and `randomize()` still returned 1. Descend into the guarded
+            // branches and take the size bound from whichever the condition
+            // selects; an unevaluable condition contributes nothing rather than
+            // guessing.
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
+                if self.eval_expr(condition).is_true() {
+                    out.append(&mut self.size_cons_in_item(constraint, prop, row));
+                }
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                if self.eval_expr(condition).is_true() {
+                    out.append(&mut self.size_cons_in_item(then_item, prop, row));
+                } else if let Some(e) = else_item {
+                    out.append(&mut self.size_cons_in_item(e, prop, row));
+                }
+            }
             ConstraintItem::Inside {
                 expr,
                 range,
@@ -81280,7 +81314,61 @@ impl Simulator {
 
     /// Resolve a bare identifier to a class handle, if it currently
     /// holds one (local variable, `this` property, or static property).
+    /// §8.15: `super.<prop>` names the SAME storage as `this.<prop>` — only
+    /// METHOD lookup differs, and a method call is an `ExprKind::Call`, never
+    /// this shape. Rewriting the leading segment here (a read or an lvalue, so
+    /// never a call's callee) keeps `super.foo()` dispatching to the base while
+    /// fixing property access, which otherwise flattened to the phantom name
+    /// "super.p": reads returned 0 and writes vanished silently.
+    fn super_as_this(e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            // Flat form, as written outside a subroutine body.
+            // `super.new` / `super.new(...)` is a CONSTRUCTOR call, and the
+            // parenthesis-less form parses as this very shape — rewriting it to
+            // `this.new` recursed into construction until the stack blew.
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.path[0].name.name == "super"
+                    && h.path[h.path.len() - 1].name.name != "new" =>
+            {
+                let mut nh = h.clone();
+                nh.path[0].name.name = "this".to_string();
+                nh.cached_signal_id = std::cell::Cell::new(None);
+                nh.cached_resolved_name = std::cell::OnceCell::new();
+                Some(Expression::new(ExprKind::Ident(nh), e.span))
+            }
+            // Inside a method body the same text is a MemberAccess chain.
+            ExprKind::MemberAccess { expr: base, member } => {
+                let ExprKind::Ident(bh) = &base.kind else {
+                    return None;
+                };
+                if bh.path.len() != 1
+                    || bh.path[0].name.name != "super"
+                    || member.name == "new"
+                {
+                    return None;
+                }
+                Some(Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(Expression::new(ExprKind::This, base.span)),
+                        member: member.clone(),
+                    },
+                    e.span,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     fn eval_ident_handle(&self, name: &str) -> Option<usize> {
+        // §8.15: `super` names the SAME object as `this` — only the method
+        // lookup differs, and property storage is not per-class here. Without
+        // this, `super.p` resolved to no handle and flattened to a phantom
+        // name: reads returned 0 and writes vanished with no diagnostic, even
+        // for a uniquely-named inherited property.
+        if name == "super" {
+            return self.this_stack.last().copied().flatten();
+        }
         if let Some(locals) = self.local_stack.last() {
             if let Some(v) = locals.get(name) {
                 return v.to_u64().map(|h| h as usize);
