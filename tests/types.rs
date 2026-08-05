@@ -91,6 +91,8 @@ mod lrm_struct_union_dims;
 mod module_type_param_behavioral;
 #[path = "types/multi_dim_elem_read_and_param_dims.rs"]
 mod multi_dim_elem_read_and_param_dims;
+#[path = "types/ascending_indexed_part_select.rs"]
+mod ascending_indexed_part_select;
 #[path = "types/nested_packed_typedefs.rs"]
 mod nested_packed_typedefs;
 #[path = "types/packed_2d_net_element_assign.rs"]

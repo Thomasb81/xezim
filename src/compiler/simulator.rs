@@ -33836,11 +33836,16 @@ impl Simulator {
                 // Ascending packed vector part-write (`logic [0:7] pa; pa[0:3]=v`):
                 // labels index from the MSB end → internal [(W-1)-lsb : (W-1)-msb]
                 // (LRM §7.4.1, §11.5.1).
-                if !elem_scaled && matches!(kind, RangeKind::Constant) {
+                if !elem_scaled {
                     if let ExprKind::Ident(h) = &expr.kind {
                         let nm = self.resolve_hier_name(h);
                         if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
                             let top = w as usize - 1;
+                            // The bounds reaching here are already resolved to a
+                            // [msb:lsb] pair for every RangeKind, so one mapping
+                            // serves the constant and indexed forms alike.
+                            // Restricting it to the constant form wrote
+                            // `aw[4 +: 4]` at the DESCENDING position.
                             let (new_msb, new_lsb) =
                                 (top.saturating_sub(lsb), top.saturating_sub(msb));
                             msb = new_msb;
@@ -37304,6 +37309,26 @@ impl Simulator {
                             let hi = (w - 1).saturating_sub(a.min(b)) as usize;
                             let lo = (w - 1).saturating_sub(a.max(b)) as usize;
                             return base.range_select(hi, lo);
+                        }
+                        // §11.5.1: the INDEXED forms need the same mapping. Only
+                        // the constant form was remapped, so `av[4 +: 4]` on a
+                        // `logic [0:15]` read the bits a DESCENDING vector would
+                        // have — the labels run from the MSB end, and a bit
+                        // select on the same vector already honoured that, so
+                        // the two disagreed about what `av[4]` meant.
+                        let a = self.eval_expr(left).to_i64().unwrap_or(0);
+                        let n = self.eval_expr(right).to_i64().unwrap_or(0);
+                        if n > 0 {
+                            let top = w as i64 - 1;
+                            let (hi, lo) = match kind {
+                                RangeKind::IndexedUp => (top - a, top - a - (n - 1)),
+                                RangeKind::IndexedDown => (top - a + (n - 1), top - a),
+                                RangeKind::Constant => unreachable!(),
+                            };
+                            if lo >= 0 && hi < w as i64 {
+                                let base = self.eval_expr(expr);
+                                return base.range_select(hi as usize, lo as usize);
+                            }
                         }
                     }
                 }
