@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "scheduling/computed_edge_expressions.rs"]
+mod computed_edge_expressions;
 #[path = "scheduling/active_region_fifo.rs"]
 mod active_region_fifo;
 #[path = "scheduling/adaptive_edge_skip.rs"]
