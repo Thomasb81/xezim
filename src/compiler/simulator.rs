@@ -44694,14 +44694,28 @@ impl Simulator {
                             if let crate::ast::types::DataType::TypeReference { name, .. } =
                                 data_type
                             {
-                                // Resolve a typedef/scoped alias (e.g.
-                                // `uvm_resource_types::rsrc_q_t`) to its concrete
-                                // class so `name = new()` constructs it; fall back
-                                // to the bare name otherwise.
-                                Some(
-                                    self.resolve_typeref_class_name(name)
-                                        .unwrap_or_else(|| name.name.name.clone()),
-                                )
+                                // §8.25: the declared type may be a TYPE
+                                // PARAMETER of the enclosing parameterized class
+                                // (e.g. `T obj = new(...)` inside
+                                // `class C #(type T=int);`). Resolve it through
+                                // the active specialization FIRST so the
+                                // constructor form constructs the bound class,
+                                // not a broken instance of the literal "T".
+                                if let Some(bound) =
+                                    self.resolve_type_param_binding(&name.name.name)
+                                {
+                                    Some(bound)
+                                } else {
+                                    // Resolve a typedef/scoped alias (e.g.
+                                    // `uvm_resource_types::rsrc_q_t`) to its
+                                    // concrete class so `name = new()`
+                                    // constructs it; fall back to the bare
+                                    // name otherwise.
+                                    Some(
+                                        self.resolve_typeref_class_name(name)
+                                            .unwrap_or_else(|| name.name.name.clone()),
+                                    )
+                                }
                             } else {
                                 None
                             };
@@ -44893,9 +44907,20 @@ impl Simulator {
                         // instantiate_covergroup — they just never saw it
                         // for a procedural local.
                         if let Some(cn) = &class_name {
-                            if self.module.classes.contains_key(cn)
+                            // §8.25: `class_name` may be a resolved
+                            // VALUE-PARAMETERIZED specialization (e.g. `T me;`
+                            // where T → `base#(1)`), which is NOT a bare key in
+                            // `module.classes`. Accept it when its base class
+                            // is real, so the var's type is recorded and
+                            // `$cast`/`new` resolve the specialization later.
+                            let cn_is_class = self.module.classes.contains_key(cn)
                                 || self.module.covergroups.contains_key(cn)
-                            {
+                                || (cn.contains('#')
+                                    && self
+                                        .module
+                                        .classes
+                                        .contains_key(cn.split('#').next().unwrap_or(cn)));
+                            if cn_is_class {
                                 self.var_class_types
                                     .insert(d.name.name.clone(), cn.clone());
                                 // A typedef'd local (e.g. `table_q_t rq` where
@@ -59061,6 +59086,17 @@ impl Simulator {
             if self.module.classes.contains_key(c) {
                 return Some(c.clone());
             }
+            // The VarDecl may have already resolved a type parameter to a
+            // value-parameterized specialization (`T me;` where T → `base#(1)`).
+            // The base is a real class, so the specialization IS the var's
+            // class — otherwise `class_of_var` returns None and `$cast`
+            // degenerates to the permissive path (§8.25 value-param identity).
+            if c.contains('#') {
+                let base = c.split('#').next().unwrap_or(c);
+                if self.module.classes.contains_key(base) {
+                    return Some(c.clone());
+                }
+            }
             // A local declared with a TYPE PARAMETER as its type
             // (`T me;` inside a parameterized-class method). Resolve T
             // to its concrete specialization via the active
@@ -67944,6 +67980,7 @@ impl Simulator {
                 if hier.path.len() >= 3 {
                     let pkg = hier.path[0].name.name.as_str();
                     let cls = &hier.path[1].name.name;
+                    let mname3 = hier.path.last().unwrap().name.name.clone();
                     if !self
                         .local_stack
                         .last()
@@ -67951,13 +67988,51 @@ impl Simulator {
                         && !self.signal_name_to_id.contains_key(pkg)
                         && self.module.classes.contains_key(cls)
                     {
-                        let mname3 = hier.path.last().unwrap().name.name.clone();
                         if let Some(res) = self.exec_static_method(cls, &mname3, args) {
                             return res;
                         }
                         if mname3 == "new" {
                             if let Some(cd) = self.module.classes.get(cls).cloned() {
                                 return self.instantiate_class(&cd, args);
+                            }
+                        }
+                    } else if !self
+                        .local_stack
+                        .last()
+                        .is_some_and(|m| m.contains_key(pkg))
+                        && !self.signal_name_to_id.contains_key(pkg)
+                        && self.module.classes.contains_key(pkg)
+                    {
+                        // §6.18/§8.23: `Class::typedef_alias::method(args)` —
+                        // the middle segment is a TYPEDEF declared inside
+                        // `Class`, not a class itself. Resolve the alias to
+                        // its target class/specialization and dispatch the
+                        // static method there — generic for any alias name.
+                        // Non-parameterized alias: `typedef base alias;`.
+                        if let Some(resolved) =
+                            self.resolve_class_member_typedef_class(pkg, cls)
+                        {
+                            if let Some(res) = self.exec_static_method(&resolved, &mname3, args)
+                            {
+                                return res;
+                            }
+                            if mname3 == "new" {
+                                if let Some(cd) = self.module.classes.get(&resolved).cloned() {
+                                    return self.instantiate_class(&cd, args);
+                                }
+                            }
+                        }
+                        // Parameterized alias: `typedef registry#(T,N) alias;`.
+                        if let Some((base, sig)) =
+                            self.resolve_class_member_typedef_spec(pkg, cls)
+                        {
+                            self.ensure_spec_statics(&base, &sig);
+                            let saved = self.current_spec.take();
+                            self.current_spec = Some((base.clone(), sig));
+                            let res = self.exec_static_method(&base, &mname3, args);
+                            self.current_spec = saved;
+                            if let Some(v) = res {
+                                return v;
                             }
                         }
                     }
@@ -79618,6 +79693,45 @@ impl Simulator {
         match &expr.kind {
             ExprKind::Ident(hier) => {
                 let name = self.resolve_hier_name(hier);
+                // A genuine local of the CURRENT scope must resolve before the
+                // module-signal table: `signal_name_to_id` holds module-scope
+                // declarations, and a method-local shadows a same-named module
+                // signal (§23.7 name resolution). Without this, a module-scope
+                // `C obj;` shadowed `T obj;` inside a parameterized class
+                // method, so `obj = new(...)` constructed `C` instead of `T`.
+                let in_any_frame = hier.path.len() == 1
+                    && self
+                        .method_local_base
+                        .last()
+                        .map(|&base| {
+                            self.local_stack
+                                .get(base..)
+                                .unwrap_or(&[])
+                                .iter()
+                                .rev()
+                                .any(|m| m.contains_key(&name))
+                        })
+                        // Outside any class method (initial/always blocks):
+                        // locals live as signals/flat-map entries with no
+                        // method base recorded, so any frame counts (there
+                        // is no class property they could shadow).
+                        .unwrap_or_else(|| {
+                            self.local_stack
+                                .iter()
+                                .rev()
+                                .any(|m| m.contains_key(&name))
+                        });
+                if in_any_frame {
+                    // A class-typed procedural local declared in this scope.
+                    if let Some(t) = self.var_class_types.get(&name) {
+                        return Some(t.clone());
+                    }
+                    // LRM §6.19.6: typedef-typed local — used by
+                    // `local.next/.first/.last/.num/.prev` resolution.
+                    if let Some(t) = self.var_typedef_types.get(&name) {
+                        return Some(t.clone());
+                    }
+                }
                 if let Some(t) = self
                     .signal_name_to_id
                     .get(name.as_str())
@@ -79662,28 +79776,9 @@ impl Simulator {
                 // Inside a class method, a bare name that is NOT a frame
                 // local is a class property and must resolve through
                 // `class_prop_type_named`, ignoring any stale entry.
-                let in_any_frame = hier.path.len() == 1
-                    && self
-                        .method_local_base
-                        .last()
-                        .map(|&base| {
-                            self.local_stack
-                                .get(base..)
-                                .unwrap_or(&[])
-                                .iter()
-                                .rev()
-                                .any(|m| m.contains_key(&name))
-                        })
-                        // Outside any class method (initial/always blocks):
-                        // locals live as signals/flat-map entries with no
-                        // method base recorded, so any frame counts (there
-                        // is no class property they could shadow).
-                        .unwrap_or_else(|| {
-                            self.local_stack
-                                .iter()
-                                .rev()
-                                .any(|m| m.contains_key(&name))
-                        });
+                // (`in_any_frame` was already computed above, before the
+                // signal-table lookups, so a current-scope local wins over a
+                // same-named module signal.)
                 let in_class_method = self.class_context_stack.last().is_some();
                 let trust_flat_maps = in_any_frame || !in_class_method;
                 if trust_flat_maps {
