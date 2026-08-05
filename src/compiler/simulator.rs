@@ -68839,6 +68839,78 @@ impl Simulator {
         false
     }
 
+    /// The resolved struct type when `dt` is an UNPACKED struct whose members
+    /// are stored one-per-leaf (§7.2), else `None`.
+    fn unpacked_struct_of(&self, dt: &DataType) -> Option<crate::ast::types::StructUnionType> {
+        match self.resolve_dt(dt) {
+            DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
+            _ => None,
+        }
+    }
+
+    /// §13.5.2: bind an UNPACKED-struct formal member-wise. Inputs copy the
+    /// caller's members in; a pure output starts its members unwritten. Returns
+    /// the `(frame_key, caller_member_expr)` pairs an out/inout/ref formal must
+    /// copy back on return, which ride the ordinary output-binding path.
+    fn bind_unpacked_struct_formal(
+        &mut self,
+        port_name: &str,
+        dt: &DataType,
+        dir: PortDirection,
+        arg: &Expression,
+        locals: &mut HashMap<String, Value>,
+    ) -> Option<Vec<(String, Expression)>> {
+        let su = self.unpacked_struct_of(dt)?;
+        let copies_in = matches!(
+            dir,
+            PortDirection::Input | PortDirection::Inout | PortDirection::Ref
+        );
+        let copies_out = matches!(
+            dir,
+            PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+        );
+        if copies_in {
+            self.bind_unpacked_struct_arg(port_name, dt, arg, locals);
+        }
+        let mut backs = Vec::new();
+        for m in &su.members {
+            let mw = super::elaborate::resolve_type_width(
+                &m.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            );
+            for md in &m.declarators {
+                let key = format!("{}.{}", port_name, md.name.name);
+                if !copies_in {
+                    let seed = if super::elaborate::is_type_real(&m.data_type) {
+                        Value::from_f64(0.0)
+                    } else if super::elaborate::is_type_two_state(&m.data_type) {
+                        Value::zero(mw)
+                    } else {
+                        Value::new(mw)
+                    };
+                    locals.insert(key.clone(), seed);
+                }
+                if copies_out {
+                    backs.push((
+                        key,
+                        Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(arg.clone()),
+                                member: crate::ast::Identifier {
+                                    name: md.name.name.clone(),
+                                    span: arg.span,
+                                },
+                            },
+                            arg.span,
+                        ),
+                    ));
+                }
+            }
+        }
+        Some(backs)
+    }
+
     /// §13.4.2: the call-frame key for `<base>.<member>` when the innermost
     /// frame owns that member. Members of a subroutine-local or formal UNPACKED
     /// struct live in the frame under their dotted name — that is where formal
@@ -69240,7 +69312,18 @@ impl Simulator {
                     assoc_params.push((param, caller, is_out));
                     continue;
                 }
-                if self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals) {
+                // §13.5.2: bind member-wise, and for an output/inout/ref struct
+                // formal record the copy-back — only the copy-IN existed, so a
+                // function taking `output pkt_t p` left the caller's variable
+                // untouched.
+                if let Some(backs) = self.bind_unpacked_struct_formal(
+                    &port.name.name,
+                    &port.data_type,
+                    port.direction,
+                    &args[i],
+                    &mut locals,
+                ) {
+                    output_bindings.extend(backs);
                     continue;
                 }
             }
@@ -69732,6 +69815,23 @@ impl Simulator {
                         array_writebacks.push(info.clone());
                     }
                     array_params.push(info.0);
+                    continue;
+                }
+            }
+            // §13.5.2: an UNPACKED-struct formal. Tasks bound nothing at all —
+            // the member leaves live in the frame under `<formal>.<member>`
+            // (functions already bind them that way), so the body read x from
+            // every member of an input, and an output/inout/ref struct formal
+            // copied nothing back to the caller's variable.
+            if i < args.len() && port.dimensions.is_empty() {
+                if let Some(backs) = self.bind_unpacked_struct_formal(
+                    &port.name.name,
+                    &port.data_type,
+                    port.direction,
+                    &args[i],
+                    &mut locals,
+                ) {
+                    output_bindings.extend(backs);
                     continue;
                 }
             }

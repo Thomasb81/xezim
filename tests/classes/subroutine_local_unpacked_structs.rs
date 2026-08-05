@@ -150,3 +150,45 @@ endmodule
     assert_eq!(u(&sim, "first"), 0x20);
     assert_eq!(u(&sim, "second_unwritten"), 1, "a fresh call must not see the previous one's member");
 }
+
+/// §13.5.2 — UNPACKED-struct FORMALS. A task bound none of them, so its body
+/// read x from every member of an input; and an output/inout/ref struct formal
+/// of either a task or a function copied nothing back, leaving the caller's
+/// variable untouched. Function INPUT formals already worked, which is what
+/// made the gap look narrower than it was.
+#[test]
+fn unpacked_struct_formals_bind_and_copy_back() {
+    let src = r#"
+typedef struct { logic [7:0] a; logic [7:0] b; } su_t;
+module tb;
+  task automatic t_in (input su_t x, output logic [7:0] r1, output logic [7:0] r2);
+    r1 = x.a; r2 = x.b;
+  endtask
+  function automatic logic [7:0] f_in(input su_t x);
+    return x.a;
+  endfunction
+  task automatic t_out(output su_t o); o.a = 8'h7a; o.b = 8'h7b; endtask
+  task automatic t_ref(ref    su_t r); r.a = 8'hF0; endtask
+  task automatic t_inout(inout su_t io); io.b = io.a + 8'h01; endtask
+  function automatic void f_out(output su_t o); o.a = 8'h6a; o.b = 8'h6b; endfunction
+  su_t ui, o_u, ref_u, io_u, fo_u;
+  int i1, i2, fi, oa, ob, ra, rb, ioa, iob, foa, fob;
+  initial begin
+    ui = '{a:8'h01, b:8'h02};
+    t_in(ui, i1, i2);
+    fi = f_in(ui);
+    t_out(o_u);         oa = o_u.a;   ob = o_u.b;
+    ref_u = '{a:8'h00, b:8'h0b}; t_ref(ref_u); ra = ref_u.a; rb = ref_u.b;
+    io_u  = '{a:8'h30, b:8'h00};  t_inout(io_u); ioa = io_u.a; iob = io_u.b;
+    f_out(fo_u);        foa = fo_u.a; fob = fo_u.b;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!((u(&sim, "i1"), u(&sim, "i2")), (0x01, 0x02), "task input formal");
+    assert_eq!(u(&sim, "fi"), 0x01, "function input formal");
+    assert_eq!((u(&sim, "oa"), u(&sim, "ob")), (0x7a, 0x7b), "task output formal");
+    assert_eq!((u(&sim, "ra"), u(&sim, "rb")), (0xF0, 0x0b), "ref formal writes through");
+    assert_eq!((u(&sim, "ioa"), u(&sim, "iob")), (0x30, 0x31), "inout reads in and writes back");
+    assert_eq!((u(&sim, "foa"), u(&sim, "fob")), (0x6a, 0x6b), "function output formal");
+}
