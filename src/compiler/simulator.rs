@@ -34171,6 +34171,21 @@ impl Simulator {
                             from_local.or(from_this).or(from_sig).or(from_table)
                         };
                         if let Some(handle) = root_handle {
+                            // §7.4.1: an ASCENDING property (`bit [0:15] a`)
+                            // labels its bits from the MSB end, so a part-write
+                            // has to be mapped the way the module-signal path
+                            // already maps one. Without it `a[4:7] = 4'hF`
+                            // spliced the bits a DESCENDING vector would have,
+                            // even though a single-bit write to the same
+                            // property landed correctly. Resolved before the
+                            // mutable borrow below.
+                            let (msb, lsb) = match self.class_prop_packed_shape(handle, &fname) {
+                                Some((_, total, left, right)) if left < right && total > 0 => {
+                                    let top = total as usize - 1;
+                                    (top.saturating_sub(lsb), top.saturating_sub(msb))
+                                }
+                                _ => (msb, lsb),
+                            };
                             if let Some(Some(inst)) = self.heap.get_mut(handle) {
                                 if let Some(cur) = inst.properties.get(&fname).cloned() {
                                     let width = cur.width as usize;
@@ -60415,7 +60430,14 @@ impl Simulator {
             crate::ast::types::DataType::Implicit { dimensions, .. } => dimensions,
             _ => return None,
         };
-        if dims.len() < 2 {
+        // A SINGLE packed dimension is a plain vector, whose element is one
+        // bit. Reads of `obj.v[i]` fell through to a generic bit-select and
+        // were fine, but the WRITE had no handler at all and was silently
+        // dropped — `obj.v[15] = 1'b1` left the property unchanged while the
+        // part-select `obj.v[15:8] = ...` beside it worked. Resolving it here
+        // gives the write a target, and the slot arithmetic below already
+        // honours an ascending declaration.
+        if dims.is_empty() {
             return None;
         }
         let bounds = |d: &PackedDimension| -> Option<(i64, i64)> {
@@ -72624,6 +72646,70 @@ impl Simulator {
                 if let Some(e) = expr_opt {
                     let v = self.eval_expr(&e);
                     instance.properties.insert(pname.clone(), v);
+                }
+            }
+        }
+        // §8.25: a property whose packed range references a class PARAMETER was
+        // seeded from the class's elaborated signature — that is, at the
+        // class's DEFAULT parameter value, so `bit [W-1:0] pw` in a `P#(16)`
+        // came out 8 bits wide. A later WHOLE assignment re-widened it, which
+        // is why this only showed as silent data loss on bit- and part-select
+        // writes above the default width (and a wrong `$bits` until the first
+        // whole write). The bindings this instance actually carries are only
+        // complete now, after the loop above, so re-resolve those ranges here.
+        for cdef in &classes_to_init {
+            for (prop, dt) in &cdef.property_types {
+                let dims = match dt {
+                    DataType::IntegerVector { dimensions, .. } if !dimensions.is_empty() => {
+                        dimensions
+                    }
+                    DataType::Implicit { dimensions, .. } if !dimensions.is_empty() => dimensions,
+                    _ => continue,
+                };
+                // Only ranges that are NOT constant on their own can move with
+                // a parameter; a literal range already elaborated correctly.
+                let param_dependent = dims.iter().any(|d| {
+                    matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                        if super::elaborate::const_eval_i64_with_params(left, None).is_none()
+                            || super::elaborate::const_eval_i64_with_params(right, None).is_none())
+                });
+                if !param_dependent {
+                    continue;
+                }
+                // Bindings visible to this declaring class, leaf first so a
+                // derived class's parameter shadows an ancestor's.
+                let mut params: HashMap<String, Value> = HashMap::default();
+                let mut cur = Some(cdef.name.clone());
+                let mut seen: HashSet<String> = HashSet::default();
+                while let Some(cn) = cur {
+                    if !seen.insert(cn.clone()) {
+                        break;
+                    }
+                    let Some(c) = self.module.classes.get(&cn) else {
+                        break;
+                    };
+                    for (pname, _) in &c.param_defaults {
+                        if let Some(v) = instance.properties.get(pname) {
+                            params.entry(pname.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                    cur = c.extends.clone();
+                }
+                if params.is_empty() {
+                    continue;
+                }
+                let w = super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&params),
+                    Some(&self.module.typedefs),
+                );
+                if w == 0 {
+                    continue;
+                }
+                if let Some(v) = instance.properties.get_mut(prop) {
+                    if !v.is_real && v.width != w {
+                        *v = v.clone().resize(w);
+                    }
                 }
             }
         }
