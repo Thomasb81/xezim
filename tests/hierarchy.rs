@@ -31,6 +31,8 @@ mod foreach_over_submodule_array;
 mod foreach_in_inlined_child;
 #[path = "hierarchy/generate_scope_names.rs"]
 mod generate_scope_names;
+#[path = "hierarchy/interface_array_element_ports.rs"]
+mod interface_array_element_ports;
 #[path = "hierarchy/interface_default_clocking.rs"]
 mod interface_default_clocking;
 #[path = "hierarchy/generic_interface_ports.rs"]
