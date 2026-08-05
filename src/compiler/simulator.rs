@@ -40195,9 +40195,10 @@ impl Simulator {
                 // what makes a DECLARATION initializer work — elaboration
                 // lowers `T v[int] = '{...}` to `v = '{...}` in an initial block.
                 if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
-                    let spread = if let ExprKind::Ident(lh) = &lvalue.kind {
-                        let lname = self.resolve_hier_name(lh);
-                        self.assign_pattern_aggregate(&lname, items)
+                    let spread = if matches!(&lvalue.kind, ExprKind::Ident(_)) {
+                        self.pattern_aggregate_names(lvalue)
+                            .into_iter()
+                            .any(|n| self.assign_pattern_aggregate(&n, items))
                     } else {
                         // `assoc[key] = '{...}` resolves its key precisely;
                         // everything else goes through the flattened path.
@@ -42189,9 +42190,10 @@ impl Simulator {
                     if self.packed_pattern_for_lhs(lvalue, items).is_none()
                         && self.eval_packed_struct_pattern(lvalue, items).is_none()
                     {
-                        let spread = if let ExprKind::Ident(lh) = &lvalue.kind {
-                            let lname = self.resolve_hier_name(lh);
-                            self.assign_pattern_aggregate(&lname, items)
+                        let spread = if matches!(&lvalue.kind, ExprKind::Ident(_)) {
+                            self.pattern_aggregate_names(lvalue)
+                                .into_iter()
+                                .any(|n| self.assign_pattern_aggregate(&n, items))
                         } else {
                             self.assign_pattern_element(lvalue, rvalue)
                                 || match self.flat_member_name(lvalue) {
@@ -60677,6 +60679,34 @@ impl Simulator {
         self.packed_pattern_value(items, &dims, total_w)
     }
 
+    /// The names an assignment-pattern lvalue may be registered under. An
+    /// unpacked aggregate has no signal of its own — only member leaves — so
+    /// `resolve_hier_name` cannot find `bi.us` and collapses it to the leaf
+    /// `us`, which owns no type. Try the fully-joined path too.
+    fn pattern_aggregate_names(&mut self, lvalue: &Expression) -> Vec<String> {
+        let mut out = Vec::new();
+        if let ExprKind::Ident(h) = &lvalue.kind {
+            out.push(self.resolve_hier_name(h));
+            if h.path.len() > 1 {
+                let joined = h
+                    .path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if !out.contains(&joined) {
+                    out.push(joined);
+                }
+            }
+        }
+        if let Some(flat) = self.flat_member_name(lvalue) {
+            if !out.contains(&flat) {
+                out.push(flat);
+            }
+        }
+        out
+    }
+
     fn assign_pattern_aggregate(&mut self, base: &str, items: &[AssignmentPatternItem]) -> bool {
         if items.is_empty() {
             return false;
@@ -60968,6 +60998,20 @@ impl Simulator {
             .get(name)
             .cloned()
             .or_else(|| self.flat_path_type(name).map(|(d, _)| d))
+            .or_else(|| {
+                // An ELEMENT (`arr[2]`) carries no type of its own, but
+                // `var_decl_types` holds the container's ELEMENT type — so the
+                // element's type is the container's entry. Without this an
+                // instance-scoped `arr[2] = arr[0]` found no struct type and
+                // copied a packed container nobody reads, leaving the members
+                // x, while the same statement at top level resolved through
+                // `flat_path_type`.
+                let base = name.rfind('[').map(|i| &name[..i])?;
+                if base.is_empty() {
+                    return None;
+                }
+                self.module.var_decl_types.get(base).cloned()
+            })
     }
 
     /// Nested element list for a multi-dimensional unpacked array. The innermost
