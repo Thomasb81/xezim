@@ -121,6 +121,8 @@ mod preprocessor_diagnostic_location;
 mod preprocessor_github_issues;
 #[path = "scheduling/process_block_local_shadowing.rs"]
 mod process_block_local_shadowing;
+#[path = "scheduling/procedural_loop_stall.rs"]
+mod procedural_loop_stall;
 #[path = "scheduling/pure_inline_loop_body.rs"]
 mod pure_inline_loop_body;
 #[path = "scheduling/ranged_port_connections_and_nba_freeze.rs"]
