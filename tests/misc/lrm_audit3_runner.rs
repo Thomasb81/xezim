@@ -31,15 +31,15 @@ fn run_chapter(name: &str, src: &str, expected_fails: usize) {
 
 #[test]
 fn lrm3_ch18_constraints_deep() {
-    run_chapter("ch18", include_str!("lrm_audit3/ch18_deep.sv"), 0);
+    run_chapter("ch18", include_str!("../lrm_audit3/ch18_deep.sv"), 0);
 }
 
 #[test]
 fn lrm3_ch20_system_functions() {
-    run_chapter("ch20", include_str!("lrm_audit3/ch20_misc.sv"), 0);
+    run_chapter("ch20", include_str!("../lrm_audit3/ch20_misc.sv"), 0);
 }
 
 #[test]
 fn lrm3_ch23_hierarchy_generate() {
-    run_chapter("ch23", include_str!("lrm_audit3/ch23_24_hier.sv"), 0);
+    run_chapter("ch23", include_str!("../lrm_audit3/ch23_24_hier.sv"), 0);
 }

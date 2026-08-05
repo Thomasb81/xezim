@@ -44,55 +44,55 @@ fn run_chapter(name: &str, src: &str, expected_fails: usize) {
 
 #[test]
 fn lrm_ch6_data_types() {
-    run_chapter("ch6", include_str!("lrm_audit/ch6_types.sv"), 0);
+    run_chapter("ch6", include_str!("../lrm_audit/ch6_types.sv"), 0);
 }
 
 #[test]
 fn lrm_ch7_aggregates() {
-    run_chapter("ch7", include_str!("lrm_audit/ch7_aggregates.sv"), 0);
+    run_chapter("ch7", include_str!("../lrm_audit/ch7_aggregates.sv"), 0);
 }
 
 #[test]
 fn lrm_ch7_packed_module_scope() {
-    run_chapter("ch7b", include_str!("lrm_audit/ch7b_packed_scope.sv"), 0);
+    run_chapter("ch7b", include_str!("../lrm_audit/ch7b_packed_scope.sv"), 0);
 }
 
 #[test]
 fn lrm_ch7_packed_local_scope() {
-    run_chapter("ch7c", include_str!("lrm_audit/ch7c_local_typedef.sv"), 0);
+    run_chapter("ch7c", include_str!("../lrm_audit/ch7c_local_typedef.sv"), 0);
 }
 
 #[test]
 fn lrm_ch8_classes() {
-    run_chapter("ch8", include_str!("lrm_audit/ch8_classes.sv"), 0);
+    run_chapter("ch8", include_str!("../lrm_audit/ch8_classes.sv"), 0);
 }
 
 #[test]
 fn lrm_ch9_processes() {
-    run_chapter("ch9", include_str!("lrm_audit/ch9_processes.sv"), 0);
+    run_chapter("ch9", include_str!("../lrm_audit/ch9_processes.sv"), 0);
 }
 
 #[test]
 fn lrm_ch10_assignments() {
-    run_chapter("ch10", include_str!("lrm_audit/ch10_assignments.sv"), 0);
+    run_chapter("ch10", include_str!("../lrm_audit/ch10_assignments.sv"), 0);
 }
 
 #[test]
 fn lrm_ch11_operators() {
-    run_chapter("ch11", include_str!("lrm_audit/ch11_operators.sv"), 0);
+    run_chapter("ch11", include_str!("../lrm_audit/ch11_operators.sv"), 0);
 }
 
 #[test]
 fn lrm_ch12_procedural() {
-    run_chapter("ch12", include_str!("lrm_audit/ch12_procedural.sv"), 0);
+    run_chapter("ch12", include_str!("../lrm_audit/ch12_procedural.sv"), 0);
 }
 
 #[test]
 fn lrm_ch13_subroutines() {
-    run_chapter("ch13", include_str!("lrm_audit/ch13_subroutines.sv"), 0);
+    run_chapter("ch13", include_str!("../lrm_audit/ch13_subroutines.sv"), 0);
 }
 
 #[test]
 fn lrm_ch15_18_20_ipc_rand_sysfns() {
-    run_chapter("chX", include_str!("lrm_audit/ch15_18_20.sv"), 0);
+    run_chapter("chX", include_str!("../lrm_audit/ch15_18_20.sv"), 0);
 }
