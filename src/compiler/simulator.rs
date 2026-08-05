@@ -40226,6 +40226,18 @@ impl Simulator {
                         }
                         return;
                     }
+                    // §10.9.2: the same per-ELEMENT expansion the continuous
+                    // and nonblocking paths already do. Without it a BLOCKING
+                    // `v = '{default:1'b1};` on a packed target fell through to
+                    // the generic concat, which built a value out of the items'
+                    // own widths (one bit) instead of one item per element.
+                    if let Some(v) = self.packed_pattern_for_lhs(lvalue, items) {
+                        self.assign_value(lvalue, &v);
+                        if !self.in_edge_block {
+                            self.settle_combinatorial();
+                        }
+                        return;
+                    }
                 }
                 // `d[i] = new[n]` on an array of dynamic arrays (§7.5.1): the
                 // ELEMENT is the dynamic array. Only a bare-identifier lvalue ever
@@ -60597,8 +60609,7 @@ impl Simulator {
             }
             _ => return None,
         };
-        let elem_w = *self.module.packed_signal_elem_widths.get(&name)?;
-        let _ = elem_w;
+        let packed_elem_w = self.module.packed_signal_elem_widths.get(&name).copied();
         let total_w = if is_elem {
             self.module.arrays.get(&name).map(|t| t.2)?
         } else {
@@ -60607,15 +60618,36 @@ impl Simulator {
             }
             self.lookup_signal_width(&name)?
         };
-        let dims: Vec<(i64, i64)> = self
-            .module
-            .packed_full_dims
-            .get(&name)
-            .cloned()
-            .unwrap_or_else(|| {
-                let ew = self.module.packed_signal_elem_widths[&name] as i64;
-                vec![((total_w as i64 / ew) - 1, 0)]
-            });
+        let dims: Vec<(i64, i64)> = match packed_elem_w {
+            Some(ew) => self
+                .module
+                .packed_full_dims
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| vec![((total_w as i64 / ew as i64) - 1, 0)]),
+            None => {
+                // §10.9.2: a plain packed VECTOR is a packed array of 1-bit
+                // elements, so `'{default:1'b1}` sets EVERY bit — `logic [15:0]
+                // v = '{default:1'b1};` is 16'hffff. With no entry in
+                // `packed_signal_elem_widths` this used to bail to the generic
+                // concat-the-items fallback, which produced a ONE-BIT 1 and
+                // zero-extended it to 16'h0001 (a reset that armed only bank 0).
+                // Aggregates with their own pattern path must not be diverted
+                // here.
+                if self.module.packed_struct_fields.contains_key(&name)
+                    || self.module.associative_arrays.contains_key(&name)
+                    || self.module.dynamic_arrays.contains(&name)
+                    || self.module.arrays_2d.contains_key(&name)
+                    || self.module.arrays_nd.contains_key(&name)
+                    || self.module.string_signals.contains(&name)
+                    || self.real_signals.contains(&name)
+                    || total_w <= 1
+                {
+                    return None;
+                }
+                vec![(total_w as i64 - 1, 0)]
+            }
+        };
         self.packed_pattern_value(items, &dims, total_w)
     }
 
