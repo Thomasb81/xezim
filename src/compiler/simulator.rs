@@ -35803,6 +35803,31 @@ impl Simulator {
                         return v;
                     }
                 }
+                // §7.2: a bare UNPACKED-struct name evaluated as a VALUE — the
+                // struct has no container signal, only member leaves, so every
+                // lookup above misses and the read came back x. That is what
+                // `return s;` from a struct-returning function produced. Last
+                // resort, so a real signal always wins.
+                if hier.path.len() == 1
+                    && hier.path[0].selects.is_empty()
+                    && !self
+                        .signal_name_to_id
+                        .contains_key(hier.path[0].name.name.as_str())
+                    && !self.signals.contains_key(&hier.path[0].name.name)
+                    && self
+                        .local_stack
+                        .last()
+                        .is_none_or(|l| !l.contains_key(&hier.path[0].name.name))
+                {
+                    let base = &hier.path[0].name.name;
+                    if let Some(dt) = self.p_elem_type(base) {
+                        if let Some(su) = self.unpacked_struct_of(&dt) {
+                            if let Some(v) = self.pack_unpacked_struct(base, &su) {
+                                return v;
+                            }
+                        }
+                    }
+                }
                 self.fast_signal_read(hier)
             }
             ExprKind::Unary { op, operand } => {
@@ -40475,6 +40500,19 @@ impl Simulator {
                                         return;
                                     }
                                 }
+                                // §13.4.1: the RHS is a VALUE, not a set of
+                                // named leaves — a call returning a struct, the
+                                // usual case. Scatter it across the members
+                                // rather than storing a container nobody reads.
+                                if matches!(&rvalue.kind, ExprKind::Call { .. }) {
+                                    let v = self.eval_expr(rvalue);
+                                    if self.spread_into_unpacked_struct(&dst, &su.clone(), &v) {
+                                        if !self.in_edge_block {
+                                            self.settle_combinatorial();
+                                        }
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
@@ -44946,11 +44984,13 @@ impl Simulator {
                         // variable's member: the callee read the CALLER's value
                         // back and its own writes vanished. Seeding also makes
                         // each call's local FRESH, as `automatic` requires.
+                        let mut unpacked_struct_local = false;
                         if !self.local_stack.is_empty() && d.dimensions.is_empty() {
                             if let crate::ast::types::DataType::Struct(su) =
                                 self.resolve_dt(data_type)
                             {
                                 if Self::spreads_member_wise(&su) {
+                                    unpacked_struct_local = true;
                                     let base = d.name.name.clone();
                                     let mut seeds: Vec<(String, Value)> = Vec::new();
                                     for m in &su.members {
@@ -44981,7 +45021,17 @@ impl Simulator {
                                 }
                             }
                         }
-                        if let Some(frame) = self.local_stack.last_mut() {
+                        if unpacked_struct_local {
+                            // An unpacked struct has no container of its own —
+                            // its leaves ARE the storage. Seeding one anyway
+                            // shadowed them: reading the bare name returned the
+                            // container's x instead of the packed members, so
+                            // `return s;` from a struct-returning function
+                            // yielded x even though every member was set.
+                            self.local_stack
+                                .last_mut()
+                                .map(|frame| frame.remove(&d.name.name));
+                        } else if let Some(frame) = self.local_stack.last_mut() {
                             frame.insert(d.name.name.clone(), v);
                         } else {
                             self.signals.insert(d.name.name.clone(), v);
@@ -68839,6 +68889,65 @@ impl Simulator {
         false
     }
 
+    /// §7.2: collapse an unpacked struct's member leaves into one packed value,
+    /// laid out exactly like the packed form of the same type. Needed wherever
+    /// a struct has to travel as a VALUE rather than as a set of named leaves —
+    /// a function return being the case that matters: the callee's frame is
+    /// gone by the time the caller assigns the result, so a name-to-name member
+    /// copy is impossible.
+    fn pack_unpacked_struct(
+        &self,
+        base: &str,
+        su: &crate::ast::types::StructUnionType,
+    ) -> Option<Value> {
+        let fields = Self::struct_field_layout(&DataType::Struct(su.clone()))?;
+        let total = fields.iter().map(|(_, o, w, _)| o + w).max().unwrap_or(0);
+        if total == 0 {
+            return None;
+        }
+        let mut out = Value::new(total);
+        let mut any = false;
+        for (fname, off, w, _is_real) in fields {
+            let Some(v) = self.get_signal_value_by_name(&format!("{}.{}", base, fname)) else {
+                continue;
+            };
+            any = true;
+            for i in 0..w {
+                out.set_bit((off + i) as usize, v.get_bit(i as usize));
+            }
+        }
+        any.then_some(out)
+    }
+
+    /// The inverse: scatter a packed value across an unpacked struct's leaves.
+    fn spread_into_unpacked_struct(
+        &mut self,
+        dst: &str,
+        su: &crate::ast::types::StructUnionType,
+        v: &Value,
+    ) -> bool {
+        let Some(fields) = Self::struct_field_layout(&DataType::Struct(su.clone())) else {
+            return false;
+        };
+        if fields.is_empty() {
+            return false;
+        }
+        for (fname, off, w, is_real) in fields {
+            let mut mv = Value::new(w);
+            for i in 0..w {
+                mv.set_bit(i as usize, v.get_bit((off + i) as usize));
+            }
+            let leaf = format!("{}.{}", dst, fname);
+            if is_real {
+                let f = mv.to_u64().unwrap_or(0) as f64;
+                self.write_leaf_by_name(&leaf, Value::from_f64(f));
+            } else {
+                self.write_leaf_by_name(&leaf, mv);
+            }
+        }
+        true
+    }
+
     /// The resolved struct type when `dt` is an UNPACKED struct whose members
     /// are stored one-per-leaf (§7.2), else `None`.
     fn unpacked_struct_of(&self, dt: &DataType) -> Option<crate::ast::types::StructUnionType> {
@@ -69475,6 +69584,32 @@ impl Simulator {
             Value::new(ret_w)
         };
         locals.insert(ret_name.clone(), ret_init);
+        // §13.4.1: the return variable is a variable of the return type, so it
+        // needs the same structural metadata a declaration gets. It had none:
+        // a `function pkt_t f(); f.a = ...;` member write found no field layout
+        // for the function name and was dropped, while the identical write to a
+        // local of that type worked. For an UNPACKED return type the members
+        // live in the frame under `<fn>.<member>`, like any other local.
+        self.register_formal_type_metadata(&ret_name, &fd.return_type, true);
+        if let Some(su) = self.unpacked_struct_of(&fd.return_type) {
+            for m in &su.members {
+                let mw = super::elaborate::resolve_type_width(
+                    &m.data_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                let seed = if super::elaborate::is_type_real(&m.data_type) {
+                    Value::from_f64(0.0)
+                } else if super::elaborate::is_type_two_state(&m.data_type) {
+                    Value::zero(mw)
+                } else {
+                    Value::new(mw)
+                };
+                for md in &m.declarators {
+                    locals.insert(format!("{}.{}", ret_name, md.name.name), seed.clone());
+                }
+            }
+        }
         // Register the return variable's declared type (mirroring the port
         // loop above) so a bare `funcname = new(...)` assignment can resolve
         // the class to construct: `get_expr_type_name` / the generic `new`
@@ -69542,6 +69677,15 @@ impl Simulator {
         self.class_context_stack.pop();
         let mut result = if let Some(rv) = self.return_value.take() {
             rv
+        } else if let Some(su) = self.unpacked_struct_of(&fd.return_type) {
+            // §13.4.1: an UNPACKED-struct return type has no single container —
+            // the function-name variable's members live in the frame as leaves.
+            // Reading the bare name yielded x, so a function assigning
+            // `f.a = ...` or `f = '{...}` returned nothing at all. Collapse the
+            // leaves into the packed form while the frame is still live; the
+            // caller's assignment scatters them back.
+            self.pack_unpacked_struct(&ret_name, &su)
+                .unwrap_or_else(|| Value::new(32))
         } else {
             // Return value from function-name variable
             self.local_stack
