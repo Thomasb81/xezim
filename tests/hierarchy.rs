@@ -29,6 +29,8 @@ mod final_blocks_hierarchy;
 mod foreach_over_submodule_array;
 #[path = "hierarchy/generate_scope_names.rs"]
 mod generate_scope_names;
+#[path = "hierarchy/generic_interface_ports.rs"]
+mod generic_interface_ports;
 #[path = "hierarchy/ifu_ibuf_32_instances_c910.rs"]
 mod ifu_ibuf_32_instances_c910;
 #[path = "hierarchy/implicit_net_gate_port.rs"]
