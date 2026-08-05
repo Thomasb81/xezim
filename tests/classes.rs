@@ -97,6 +97,8 @@ mod randomize_inside_range;
 mod scope_randomize_dist_and_foreach;
 #[path = "classes/class_unpacked_struct_properties.rs"]
 mod class_unpacked_struct_properties;
+#[path = "classes/class_property_packed_selects.rs"]
+mod class_property_packed_selects;
 #[path = "classes/module_scope_derived_constraints.rs"]
 mod module_scope_derived_constraints;
 #[path = "classes/super_property_access.rs"]
