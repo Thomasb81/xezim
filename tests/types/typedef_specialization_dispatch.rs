@@ -79,7 +79,7 @@ endmodule
 
 #[test]
 fn class_local_typedef_specialization_factory_delegation() {
-    // Faithful pure-SV reproducer of the UVM factory get_type_name delegation:
+    // Faithful reproducer of the UVM factory get_type_name delegation:
     // Wrapper::get().get_type_name() where the body calls common_type::get() —
     // a static call on a class-local typedef'd specialization whose first arg
     // is `this_type` (the enclosing typedef) and whose second arg is a string

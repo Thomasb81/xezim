@@ -12,7 +12,7 @@
 //!
 //! The fix routes the queued statements through `run_process_stmts` with a
 //! fresh pid — exactly the executor module initials use — so a `program top`
-//! behaves like a `module top`. These pure-SV regressions pin that:
+//! behaves like a `module top`. These regressions pin that:
 //!
 //!   1. A bare-name blocking task (with a `wait` body) called from a program
 //!      initial SUSPENDS until the condition holds, then runs its
