@@ -2290,11 +2290,17 @@ struct TaskCleanup {
     /// (`active_task_pids`). None for frames without a stable name.
     task_name: Option<String>,
     output_bindings: Vec<(String, crate::ast::expr::Expression)>,
-    assoc_params: Vec<(String, String)>,
+    assoc_params: Vec<(String, String, bool)>,
     array_params: Vec<String>,
     /// `(formal, actual, lo, hi)` for an `output`/`inout`/`ref` ARRAY formal:
     /// its elements are copied back to the caller's array on return.
     array_writebacks: Vec<(String, String, i64, i64)>,
+    /// `(formal, actual)` for an `output`/`inout`/`ref` QUEUE / dynamic-array
+    /// formal: the callee's collection is copied back to the caller's on
+    /// return. Functions always did this; tasks bound no collection formal at
+    /// all, so a `task push(ref int q[$])` pushed into storage named after the
+    /// FORMAL and the caller's queue never changed.
+    queue_writebacks: Vec<(String, String)>,
     saved_break: bool,
     saved_continue: bool,
     saved_return: bool,
@@ -32308,6 +32314,25 @@ impl Simulator {
                 }
             }
         }
+        // §7.2/§13.4.2: a leaf of a frame-owned unpacked struct — at any depth,
+        // and through an index. The arms below all resolve against the module
+        // signal table, so without this the write left the frame's copy alone
+        // and the matching read returned an outer scope's value.
+        if !self.local_stack.is_empty() {
+            if let Some(key) = self.frame_leaf_key_of(lhs) {
+                let prev = self.local_stack.last().and_then(|l| l.get(&key)).cloned();
+                let fitted = match prev.as_ref() {
+                    Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
+                    Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    _ => val.clone(),
+                };
+                let changed = prev.as_ref() != Some(&fitted);
+                if let Some(frame) = self.local_stack.last_mut() {
+                    frame.insert(key, fitted);
+                }
+                return changed;
+            }
+        }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 // LRM §25.9: virtual-interface alias (task/function
@@ -34373,19 +34398,6 @@ impl Simulator {
                 // and every branch below looks in the module signal table — so
                 // the write left the frame's copy untouched and the matching
                 // read returned an outer scope's value.
-                if let Some(key) = self.frame_member_key_of(expr, &member.name) {
-                    let prev = self.local_stack.last().and_then(|l| l.get(&key)).cloned();
-                    let fitted = match prev.as_ref() {
-                        Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
-                        Some(p) if !p.is_real && !val.is_real => val.resize(p.width),
-                        _ => val.clone(),
-                    };
-                    let changed = prev.as_ref() != Some(&fitted);
-                    if let Some(frame) = self.local_stack.last_mut() {
-                        frame.insert(key, fitted);
-                    }
-                    return changed;
-                }
                 // LRM §25.9: virtual-interface alias (formal frame or
                 // plain `virtual <iface>` variable). Same as the
                 // hier-Ident path above but for the MemberAccess shape.
@@ -35062,6 +35074,17 @@ impl Simulator {
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
+        // §7.2/§13.4.2: a leaf of an unpacked struct the innermost call frame
+        // OWNS — `s.a`, `s.inner.x`, `s.arr[2]`. Read it from the frame, as the
+        // write path does; otherwise the lookups below reach module scope and
+        // return an unrelated same-named variable's member.
+        if !self.local_stack.is_empty() {
+            if let Some(key) = self.frame_leaf_key_of(expr) {
+                if let Some(v) = self.local_stack.last().and_then(|l| l.get(&key)) {
+                    return v.clone();
+                }
+            }
+        }
         // A parameterized-class specialization (`C#(...)`) in value context
         // evaluates as its base reference — strip the `Specialization`
         // wrapper(s) from the member/ident chain so resolution sees the same
@@ -39048,11 +39071,6 @@ impl Simulator {
                 // struct is owned by the call frame; read it there before any
                 // module-scope lookup, mirroring the write path. Otherwise a
                 // callee saw an outer scope's same-named variable.
-                if let Some(key) = self.frame_member_key_of(expr, &member.name) {
-                    if let Some(v) = self.local_stack.last().and_then(|l| l.get(&key)) {
-                        return v.clone();
-                    }
-                }
                 // §11.5.1: member of an element selected THROUGH a ranged
                 // port connection — `p[11].hi` over `.p(arr[15:0])` arrives
                 // as MemberAccess{Index{RangeSelect{arr},11},hi}. Rebuild over
@@ -44992,29 +45010,14 @@ impl Simulator {
                                 if Self::spreads_member_wise(&su) {
                                     unpacked_struct_local = true;
                                     let base = d.name.name.clone();
-                                    let mut seeds: Vec<(String, Value)> = Vec::new();
-                                    for m in &su.members {
-                                        let mw = super::elaborate::resolve_type_width(
-                                            &m.data_type,
-                                            Some(&self.module.parameters),
-                                            Some(&self.module.typedefs),
-                                        );
-                                        let mv = if super::elaborate::is_type_real(&m.data_type) {
-                                            Value::from_f64(0.0)
-                                        } else if super::elaborate::is_type_two_state(&m.data_type) {
-                                            Value::zero(mw)
-                                        } else {
-                                            Value::new(mw)
-                                        };
-                                        for md in &m.declarators {
-                                            seeds.push((
-                                                format!("{}.{}", base, md.name.name),
-                                                mv.clone(),
-                                            ));
-                                        }
-                                    }
+                                    let seeds = self.unpacked_struct_leaf_keys(&base, &su);
                                     if let Some(frame) = self.local_stack.last_mut() {
-                                        for (k, sv) in seeds {
+                                        for (k, w, is_real) in seeds {
+                                            let sv = if is_real {
+                                                Value::from_f64(0.0)
+                                            } else {
+                                                Value::new(w)
+                                            };
                                             frame.insert(k, sv);
                                         }
                                     }
@@ -62481,6 +62484,22 @@ impl Simulator {
         }
         self.module.arrays.insert(caller.to_string(), (0, -1, w));
         self.module.dynamic_arrays.insert(caller.to_string());
+        // §7.2: an element of an UNPACKED-struct queue is a set of member
+        // leaves, not one value — copying `q[j]` alone moved nothing, so a
+        // `ref pkt_t q[$]` came back with the right SIZE and every member
+        // zero. Copy those elements member-wise.
+        let elem_su = self
+            .p_elem_type(param)
+            .or_else(|| self.p_elem_type(caller))
+            .and_then(|dt| self.unpacked_struct_of(&dt));
+        if let Some(su) = elem_su {
+            for j in 0..size {
+                let (d, s) = (format!("{}[{}]", caller, j), format!("{}[{}]", param, j));
+                self.copy_unpacked_struct(&d, &s, &su);
+            }
+            self.set_queue_size(caller, size);
+            return;
+        }
         for (j, v) in vals.into_iter().enumerate() {
             self.set_signal_value_by_name(&format!("{}[{}]", caller, j), v);
         }
@@ -68889,6 +68908,133 @@ impl Simulator {
         false
     }
 
+    /// §7.2: every storage LEAF of an unpacked struct, as
+    /// `(key_suffix, caller_expr, width, is_real)`. Recurses into nested
+    /// unpacked structs and expands fixed member dimensions, matching the
+    /// traversal `copy_unpacked_struct` uses — a struct's storage is its leaves,
+    /// and anything that seeds, binds or copies one has to walk all of them.
+    /// `base` is the expression the suffixes hang off; pass the actual argument
+    /// to get caller-side expressions, or the formal's own name when only the
+    /// keys matter.
+    fn unpacked_struct_leaves(
+        &mut self,
+        key_prefix: &str,
+        base: &Expression,
+        su: &crate::ast::types::StructUnionType,
+        depth: u32,
+        out: &mut Vec<(String, Expression, u32, bool)>,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        let mk_member = |b: &Expression, name: &str| {
+            Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(b.clone()),
+                    member: crate::ast::Identifier {
+                        name: name.to_string(),
+                        span: b.span,
+                    },
+                },
+                b.span,
+            )
+        };
+        for m in &su.members {
+            let mw = super::elaborate::resolve_type_width(
+                &m.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            );
+            let is_real = super::elaborate::is_type_real(&m.data_type);
+            let nested = self.unpacked_struct_of(&m.data_type);
+            for md in &m.declarators {
+                let mkey = format!("{}.{}", key_prefix, md.name.name);
+                let mexpr = mk_member(base, &md.name.name);
+                let idxs = if md.dimensions.is_empty() {
+                    None
+                } else {
+                    self.member_dim_indices(&md.dimensions)
+                };
+                match idxs {
+                    Some(list) => {
+                        for i in list {
+                            let ekey = format!("{}[{}]", mkey, i);
+                            let eexpr = Expression::new(
+                                ExprKind::Index {
+                                    expr: Box::new(mexpr.clone()),
+                                    index: Box::new(Expression::new(
+                                        ExprKind::Number(NumberLiteral::Integer {
+                                            size: None,
+                                            signed: true,
+                                            base: NumberBase::Decimal,
+                                            value: i.to_string(),
+                                            cached_val: std::cell::Cell::new(None),
+                                        }),
+                                        base.span,
+                                    )),
+                                },
+                                base.span,
+                            );
+                            match &nested {
+                                Some(inner) => self.unpacked_struct_leaves(
+                                    &ekey,
+                                    &eexpr,
+                                    &inner.clone(),
+                                    depth + 1,
+                                    out,
+                                ),
+                                None => out.push((ekey, eexpr, mw, is_real)),
+                            }
+                        }
+                    }
+                    None => match &nested {
+                        Some(inner) => self.unpacked_struct_leaves(
+                            &mkey,
+                            &mexpr,
+                            &inner.clone(),
+                            depth + 1,
+                            out,
+                        ),
+                        None => out.push((mkey, mexpr, mw, is_real)),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Leaf keys only, for seeding a frame where there is no caller expression.
+    fn unpacked_struct_leaf_keys(
+        &mut self,
+        base_name: &str,
+        su: &crate::ast::types::StructUnionType,
+    ) -> Vec<(String, u32, bool)> {
+        let span = crate::ast::Span::dummy();
+        let base = Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: base_name.to_string(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        );
+        let mut out = Vec::new();
+        self.unpacked_struct_leaves(base_name, &base, su, 0, &mut out);
+        // The `<base>.` marker (no real leaf can be named that) lets the read
+        // and write paths reject an unrelated expression with one hash lookup,
+        // before flattening a name.
+        let mut keys: Vec<(String, u32, bool)> = vec![(format!("{}.", base_name), 0, false)];
+        keys.extend(out.into_iter().map(|(k, _, w, r)| (k, w, r)));
+        keys
+    }
+
     /// §7.2: collapse an unpacked struct's member leaves into one packed value,
     /// laid out exactly like the packed form of the same type. Needed wherever
     /// a struct has to travel as a VALUE rather than as a set of named leaves —
@@ -68896,19 +69042,19 @@ impl Simulator {
     /// gone by the time the caller assigns the result, so a name-to-name member
     /// copy is impossible.
     fn pack_unpacked_struct(
-        &self,
+        &mut self,
         base: &str,
         su: &crate::ast::types::StructUnionType,
     ) -> Option<Value> {
-        let fields = Self::struct_field_layout(&DataType::Struct(su.clone()))?;
+        let fields = self.struct_leaf_layout(base, su);
         let total = fields.iter().map(|(_, o, w, _)| o + w).max().unwrap_or(0);
         if total == 0 {
             return None;
         }
         let mut out = Value::new(total);
         let mut any = false;
-        for (fname, off, w, _is_real) in fields {
-            let Some(v) = self.get_signal_value_by_name(&format!("{}.{}", base, fname)) else {
+        for (key, off, w, _is_real) in fields {
+            let Some(v) = self.get_signal_value_by_name(&key) else {
                 continue;
             };
             any = true;
@@ -68919,6 +69065,26 @@ impl Simulator {
         any.then_some(out)
     }
 
+    /// Bit layout over an unpacked struct's LEAVES, as `(key, offset, width,
+    /// is_real)`. Reverse declaration order with ascending offsets, matching
+    /// `struct_field_layout` for a flat struct, and extended to nested members
+    /// and member dimensions — which have no field of their own to lay out.
+    fn struct_leaf_layout(
+        &mut self,
+        base: &str,
+        su: &crate::ast::types::StructUnionType,
+    ) -> Vec<(String, u32, u32, bool)> {
+        let mut leaves = self.unpacked_struct_leaf_keys(base, su);
+        leaves.retain(|(k, _, _)| !k.ends_with('.'));
+        let mut out = Vec::with_capacity(leaves.len());
+        let mut off = 0u32;
+        for (k, w, is_real) in leaves.into_iter().rev() {
+            out.push((k, off, w, is_real));
+            off += w;
+        }
+        out
+    }
+
     /// The inverse: scatter a packed value across an unpacked struct's leaves.
     fn spread_into_unpacked_struct(
         &mut self,
@@ -68926,18 +69092,15 @@ impl Simulator {
         su: &crate::ast::types::StructUnionType,
         v: &Value,
     ) -> bool {
-        let Some(fields) = Self::struct_field_layout(&DataType::Struct(su.clone())) else {
-            return false;
-        };
+        let fields = self.struct_leaf_layout(dst, su);
         if fields.is_empty() {
             return false;
         }
-        for (fname, off, w, is_real) in fields {
+        for (leaf, off, w, is_real) in fields {
             let mut mv = Value::new(w);
             for i in 0..w {
                 mv.set_bit(i as usize, v.get_bit((off + i) as usize));
             }
-            let leaf = format!("{}.{}", dst, fname);
             if is_real {
                 let f = mv.to_u64().unwrap_or(0) as f64;
                 self.write_leaf_by_name(&leaf, Value::from_f64(f));
@@ -68978,43 +69141,28 @@ impl Simulator {
             dir,
             PortDirection::Output | PortDirection::Inout | PortDirection::Ref
         );
-        if copies_in {
-            self.bind_unpacked_struct_arg(port_name, dt, arg, locals);
-        }
+        // Walk LEAVES, not top-level members: a member that is itself an
+        // unpacked struct, or that carries an unpacked dimension, has no
+        // storage of its own — only the leaves beneath it do. Binding only the
+        // top level left `p.inner.x` and `p.arr[i]` unbound in the callee.
+        let mut leaves = Vec::new();
+        self.unpacked_struct_leaves(port_name, arg, &su, 0, &mut leaves);
+        locals.insert(format!("{}.", port_name), Value::zero(1));
         let mut backs = Vec::new();
-        for m in &su.members {
-            let mw = super::elaborate::resolve_type_width(
-                &m.data_type,
-                Some(&self.module.parameters),
-                Some(&self.module.typedefs),
-            );
-            for md in &m.declarators {
-                let key = format!("{}.{}", port_name, md.name.name);
-                if !copies_in {
-                    let seed = if super::elaborate::is_type_real(&m.data_type) {
-                        Value::from_f64(0.0)
-                    } else if super::elaborate::is_type_two_state(&m.data_type) {
-                        Value::zero(mw)
-                    } else {
-                        Value::new(mw)
-                    };
-                    locals.insert(key.clone(), seed);
-                }
-                if copies_out {
-                    backs.push((
-                        key,
-                        Expression::new(
-                            ExprKind::MemberAccess {
-                                expr: Box::new(arg.clone()),
-                                member: crate::ast::Identifier {
-                                    name: md.name.name.clone(),
-                                    span: arg.span,
-                                },
-                            },
-                            arg.span,
-                        ),
-                    ));
-                }
+        for (key, caller_expr, w, is_real) in leaves {
+            if copies_in {
+                let v = self.eval_expr(&caller_expr);
+                locals.insert(key.clone(), v);
+            } else {
+                let seed = if is_real {
+                    Value::from_f64(0.0)
+                } else {
+                    Value::new(w)
+                };
+                locals.insert(key.clone(), seed);
+            }
+            if copies_out {
+                backs.push((key, caller_expr));
             }
         }
         Some(backs)
@@ -69033,16 +69181,48 @@ impl Simulator {
         locals.contains_key(&key).then_some(key)
     }
 
-    /// The frame key for a member-access lvalue/rvalue whose base is a plain
-    /// identifier, or `None` when the frame does not own it.
-    fn frame_member_key_of(&self, base: &Expression, member: &str) -> Option<String> {
-        let ExprKind::Ident(h) = &base.kind else {
-            return None;
-        };
-        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+    /// The frame key for a struct-member reference of ANY depth — `s.a`,
+    /// `s.inner.x`, `s.arr[2]`, `s.arr[2].x` — or `None` when the innermost
+    /// frame does not own that leaf. Keyed on the flattened name, because a
+    /// nested or indexed member is not a single `base.member` pair: matching
+    /// only that shape left every deeper leaf reading module scope.
+    fn frame_leaf_key_of(&mut self, e: &Expression) -> Option<String> {
+        if !matches!(
+            e.kind,
+            ExprKind::MemberAccess { .. } | ExprKind::Index { .. }
+        ) {
             return None;
         }
-        self.frame_struct_member_key(&h.path[0].name.name, member)
+        // Cheap gate before the (index-evaluating) flatten: the frame records a
+        // `<base>.` marker for each unpacked-struct variable it owns, so an
+        // expression rooted anywhere else costs one hash lookup.
+        let root = Self::expr_root_ident(e)?;
+        let marker = format!("{}.", root);
+        if !self
+            .local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(&marker))
+        {
+            return None;
+        }
+        let flat = self.flat_member_name(e)?;
+        self.local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(&flat))
+            .then_some(flat)
+    }
+
+    /// The leading identifier of a member/index chain (`s` in `s.arr[2].x`).
+    fn expr_root_ident(e: &Expression) -> Option<&str> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                Some(h.path[0].name.name.as_str())
+            }
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
+                Self::expr_root_ident(expr)
+            }
+            _ => None,
+        }
     }
 
     fn bind_unpacked_struct_arg(
@@ -69237,7 +69417,19 @@ impl Simulator {
             return None;
         }
         let param = port.name.name.clone();
+        // §7.2: an element of an UNPACKED-struct array is a set of member
+        // leaves. Copying `a[i]` alone brought nothing across, so a
+        // `pkt_t arr[3]` formal read zero from every member.
+        let elem_su = self
+            .p_elem_type(&caller)
+            .or_else(|| self.p_elem_type(&param))
+            .and_then(|dt| self.unpacked_struct_of(&dt));
         for idx in lo..=hi {
+            if let Some(su) = &elem_su {
+                let (d, s) = (format!("{}[{}]", param, idx), format!("{}[{}]", caller, idx));
+                self.copy_unpacked_struct(&d, &s, &su.clone());
+                continue;
+            }
             if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", caller, idx)) {
                 self.signals.insert(format!("{}[{}]", param, idx), v);
             }
@@ -69251,7 +69443,19 @@ impl Simulator {
     /// the formal's element signals.
     fn writeback_array_args(&mut self, wb: &[(String, String, i64, i64)]) {
         for (param, caller, lo, hi) in wb {
+            // §7.2: elements of an UNPACKED-struct array are member leaves, so
+            // copying `a[i]` alone wrote nothing back — an `output pkt_t a[3]`
+            // formal left every member of the caller's array untouched.
+            let elem_su = self
+                .p_elem_type(param)
+                .or_else(|| self.p_elem_type(caller))
+                .and_then(|dt| self.unpacked_struct_of(&dt));
             for idx in *lo..=*hi {
+                if let Some(su) = &elem_su {
+                    let (d, s) = (format!("{}[{}]", caller, idx), format!("{}[{}]", param, idx));
+                    self.copy_unpacked_struct(&d, &s, &su.clone());
+                    continue;
+                }
                 if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", param, idx)) {
                     self.set_signal_value_by_name(&format!("{}[{}]", caller, idx), v);
                 }
@@ -69424,7 +69628,9 @@ impl Simulator {
                 // §13.5.2: bind member-wise, and for an output/inout/ref struct
                 // formal record the copy-back — only the copy-IN existed, so a
                 // function taking `output pkt_t p` left the caller's variable
-                // untouched.
+                // untouched. An ARRAY of structs is not this case: it belongs to
+                // the array binder below, which copies element by element.
+                if port.dimensions.is_empty() {
                 if let Some(backs) = self.bind_unpacked_struct_formal(
                     &port.name.name,
                     &port.data_type,
@@ -69434,6 +69640,7 @@ impl Simulator {
                 ) {
                     output_bindings.extend(backs);
                     continue;
+                }
                 }
             }
             if i < args.len() {
@@ -69592,22 +69799,13 @@ impl Simulator {
         // live in the frame under `<fn>.<member>`, like any other local.
         self.register_formal_type_metadata(&ret_name, &fd.return_type, true);
         if let Some(su) = self.unpacked_struct_of(&fd.return_type) {
-            for m in &su.members {
-                let mw = super::elaborate::resolve_type_width(
-                    &m.data_type,
-                    Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
-                );
-                let seed = if super::elaborate::is_type_real(&m.data_type) {
+            for (k, w, is_real) in self.unpacked_struct_leaf_keys(&ret_name, &su) {
+                let seed = if is_real {
                     Value::from_f64(0.0)
-                } else if super::elaborate::is_type_two_state(&m.data_type) {
-                    Value::zero(mw)
                 } else {
-                    Value::new(mw)
+                    Value::new(w)
                 };
-                for md in &m.declarators {
-                    locals.insert(format!("{}.{}", ret_name, md.name.name), seed.clone());
-                }
+                locals.insert(k, seed);
             }
         }
         // Register the return variable's declared type (mirroring the port
@@ -69699,7 +69897,13 @@ impl Simulator {
         // narrowed, so `s_sum = a + b` returned the full-width sum. Resize
         // integral returns to the declared width/signedness (skip real, string,
         // and void — those aren't width-narrowed scalars).
+        // An UNPACKED-struct return is already the exact width of its packed
+        // leaves. `resolve_type_width` does not count a member's unpacked
+        // dimensions, so resizing to it truncated a struct with an array member
+        // and dropped the members laid out above the cut.
+        let unpacked_struct_ret = self.unpacked_struct_of(&fd.return_type).is_some();
         if !result.is_real
+            && !unpacked_struct_ret
             && !Self::is_string_data_type(&fd.return_type)
             && !matches!(
                 fd.return_type,
@@ -69828,9 +70032,19 @@ impl Simulator {
                 self.assign_value(caller_expr, val);
             }
         }
+        for (param, caller) in &c.queue_writebacks.clone() {
+            self.writeback_queue_param(param, caller);
+        }
         let wb = c.array_writebacks.clone();
         self.writeback_array_args(&wb);
-        for (param_name, _caller_name) in &c.assoc_params {
+        for (param_name, caller_name, is_out) in &c.assoc_params.clone() {
+            // §13.5.2: an out/inout/ref ASSOCIATIVE-array formal copies back,
+            // exactly as the function path does. The task path only ever
+            // purged the formal's entries, so `task set(ref int a[string])`
+            // left the caller's array empty.
+            if *is_out && param_name != caller_name {
+                self.writeback_assoc_param(param_name, caller_name);
+            }
             let prefix = format!("{}[", param_name);
             let keys: Vec<String> = self
                 .signals
@@ -69935,10 +70149,11 @@ impl Simulator {
         // Evaluate input args and collect output/ref arg expressions
         let mut locals = HashMap::default();
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
-        let mut assoc_params: Vec<(String, String)> = Vec::new(); // (param_name, caller_array_name)
+        let mut assoc_params: Vec<(String, String, bool)> = Vec::new(); // (param_name, caller_array_name)
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
         self.push_queue_frame();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
+        let mut queue_writebacks: Vec<(String, String)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
             // §13.3: a formal is a variable of its declared type — give it the
             // same structural metadata a local declaration gets, or member and
@@ -69959,6 +70174,47 @@ impl Simulator {
                         array_writebacks.push(info.clone());
                     }
                     array_params.push(info.0);
+                    continue;
+                }
+            }
+            // §7.10 / §13.5.2: a QUEUE or DYNAMIC-ARRAY formal. Only functions
+            // bound one; a task bound nothing, so the body operated on storage
+            // named after the FORMAL and an output/inout/ref never reached the
+            // caller's collection — `task push(ref int q[$]); q.push_back(v);`
+            // left the caller's queue empty. Worse, that formal-named storage
+            // persisted across calls, so the next call saw the previous one's
+            // elements.
+            if i < args.len() {
+                let eff_dims: Vec<crate::ast::types::UnpackedDimension> =
+                    if port.dimensions.is_empty() {
+                        if let crate::ast::types::DataType::TypeReference { name, .. } =
+                            &port.data_type
+                        {
+                            let tn = &name.name.name;
+                            let concrete = self
+                                .resolve_type_param_binding(tn)
+                                .unwrap_or_else(|| tn.clone());
+                            self.module
+                                .typedef_unpacked_dims
+                                .get(&concrete)
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        port.dimensions.clone()
+                    };
+                if let Some(caller) =
+                    self.bind_queue_param(&port.name.name, &eff_dims, &args[i], &port.data_type)
+                {
+                    if matches!(
+                        port.direction,
+                        PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                    ) && !caller.is_empty()
+                    {
+                        queue_writebacks.push((port.name.name.clone(), caller));
+                    }
                     continue;
                 }
             }
@@ -69987,6 +70243,10 @@ impl Simulator {
                 if let ExprKind::Ident(hier) = &args[i].kind {
                     let caller_name = self.resolve_hier_name(hier);
                     let param_name = port.name.name.clone();
+                    let assoc_is_out = matches!(
+                        port.direction,
+                        PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                    );
                     let prefix = format!("{}[", caller_name);
                     let entries: Vec<(String, Value)> = self
                         .signals
@@ -70004,7 +70264,7 @@ impl Simulator {
                     self.module
                         .associative_arrays
                         .insert(param_name.clone(), is_string_key);
-                    assoc_params.push((param_name, caller_name));
+                    assoc_params.push((param_name, caller_name, assoc_is_out));
                 }
                 continue;
             }
@@ -70153,6 +70413,7 @@ impl Simulator {
             saved_m_scope,
             task_name: Some(tname),
             array_writebacks,
+            queue_writebacks,
             output_bindings,
             assoc_params,
             array_params,
