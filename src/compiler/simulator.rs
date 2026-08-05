@@ -32252,7 +32252,10 @@ impl Simulator {
         // the whole/field views (and a union's overlaid members) stay coherent.
         // Both parse shapes (`MemberAccess` and a flattened `Ident([a, b])`)
         // route here, so this sits ahead of the per-kind arms.
-        if matches!(lhs.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_)) {
+        if matches!(
+            lhs.kind,
+            ExprKind::MemberAccess { .. } | ExprKind::Ident(_) | ExprKind::Index { .. }
+        ) {
             if let Some(r) = self.class_agg_member(lhs) {
                 return self.write_class_agg(&r, val);
             }
@@ -35083,6 +35086,54 @@ impl Simulator {
                 if let Some(v) = self.local_stack.last().and_then(|l| l.get(&key)) {
                     return v.clone();
                 }
+            }
+        }
+        // §7.2/§18.4: a leaf of an unpacked-struct CLASS PROPERTY at any
+        // depth — `o.n.inner.a`, `o.s.arr[1]`, `o.arr[0].a`. The member-access
+        // read arm resolves only ONE level below the property, and the ident
+        // arm sees just the base of an index, so anything deeper fell through
+        // to a bit-select or a stale module-scope leaf.
+        if matches!(
+            expr.kind,
+            ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+        ) && !self.heap.is_empty()
+            && Self::chain_maybe_class_agg(expr, self.this_stack.last().copied().flatten().is_some())
+        {
+            if let Some(r) = self.class_agg_member(expr) {
+                return self.read_class_agg(&r);
+            }
+        }
+        // §7.2/§18.4: a WHOLE unpacked-struct class property read as a value —
+        // `return s;` from a method, `v = obj.s;`. Its members are per-instance
+        // cells with no container, so the lookups further down returned the
+        // property's unused scalar cell (zero) instead of the members.
+        if !self.heap.is_empty() {
+            if let ExprKind::Ident(h) = &expr.kind {
+                if (h.path.len() >= 2 || self.this_stack.last().copied().flatten().is_some())
+                    && h.path.iter().all(|p| p.selects.is_empty())
+                {
+                    if let Some((handle, prop)) = self.class_prop_receiver(expr) {
+                        if let Some(su) = self.class_prop_struct(handle, &prop) {
+                            if Self::spreads_member_wise(&su) {
+                                if let Some(v) = self.pack_class_unpacked(handle, &prop, &su) {
+                                    return v;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // §13.4.1: a member of a call result whose return type is an unpacked
+        // struct. Gated on the chain actually ending in a call, so nothing else
+        // pays for the walk.
+        if matches!(
+            expr.kind,
+            ExprKind::MemberAccess { .. } | ExprKind::Index { .. }
+        ) && Self::chain_has_call_base(expr)
+        {
+            if let Some(v) = self.eval_unpacked_call_member(expr) {
+                return v;
             }
         }
         // A parameterized-class specialization (`C#(...)`) in value context
@@ -40519,10 +40570,30 @@ impl Simulator {
                                     }
                                 }
                                 // §13.4.1: the RHS is a VALUE, not a set of
-                                // named leaves — a call returning a struct, the
-                                // usual case. Scatter it across the members
-                                // rather than storing a container nobody reads.
-                                if matches!(&rvalue.kind, ExprKind::Call { .. }) {
+                                // named leaves — a call returning a struct, or
+                                // a CLASS PROPERTY whose members live in the
+                                // instance rather than the signal table.
+                                // Scatter it across the members rather than
+                                // storing a container nobody reads.
+                                // A COLLECTION target is not a single struct:
+                                // `q2 = q1` copies elements, and spreading one
+                                // packed value into `q2.<member>` would destroy
+                                // that.
+                                let dst_is_collection = self
+                                    .module
+                                    .dynamic_arrays
+                                    .contains(&dst)
+                                    || self.module.arrays.contains_key(&dst)
+                                    || self.module.associative_arrays.contains_key(&dst);
+                                if !dst_is_collection
+                                    && matches!(
+                                        &rvalue.kind,
+                                        ExprKind::Call { .. }
+                                            | ExprKind::Ident(_)
+                                            | ExprKind::MemberAccess { .. }
+                                            | ExprKind::Index { .. }
+                                    )
+                                {
                                     let v = self.eval_expr(rvalue);
                                     if self.spread_into_unpacked_struct(&dst, &su.clone(), &v) {
                                         if !self.in_edge_block {
@@ -59816,6 +59887,68 @@ impl Simulator {
     /// a CALL (`mk().n`, `mk().n.hi`): the call's return struct, descended
     /// through each named member. `None` when the root is not a call or any
     /// step is not a packed struct — callers fall through unchanged.
+    /// Cheap screen for an expression that could address a class-property
+    /// aggregate: a member access, or an index/ident path that could name a
+    /// property (a dotted name, or any name at all under an implicit `this`).
+    fn chain_maybe_class_agg(e: &Expression, has_this: bool) -> bool {
+        match &e.kind {
+            ExprKind::MemberAccess { .. } => true,
+            ExprKind::Index { expr, .. } => Self::chain_maybe_class_agg(expr, has_this),
+            ExprKind::Ident(h) => h.path.len() >= 2 || has_this,
+            _ => false,
+        }
+    }
+
+    /// True when the base of a member/index chain is a CALL — a cheap check
+    /// that evaluates nothing, used to gate the projection below.
+    fn chain_has_call_base(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
+                matches!(expr.kind, ExprKind::Call { .. }) || Self::chain_has_call_base(expr)
+            }
+            _ => false,
+        }
+    }
+
+    /// §13.4.1 / §7.2: project a member out of a call result whose return type
+    /// is an UNPACKED struct — `f().i.a`, `f().arr[1]`. Such a result has no
+    /// storage to name (the callee's frame is gone by now), so the member is
+    /// sliced out of the packed form the return produced, using the very leaf
+    /// layout that produced it. The packed-aggregate path cannot serve this:
+    /// it declines member-wise structs, so these reads returned 0.
+    fn eval_unpacked_call_member(&mut self, e: &Expression) -> Option<Value> {
+        let mut suffix: Vec<String> = Vec::new();
+        let mut cur = e;
+        let call = loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    suffix.push(format!(".{}", member.name));
+                    cur = expr;
+                }
+                ExprKind::Index { expr, index } => {
+                    let i = self.eval_expr(index).to_i64()?;
+                    suffix.push(format!("[{}]", i));
+                    cur = expr;
+                }
+                ExprKind::Call { func, .. } => break func,
+                _ => return None,
+            }
+        };
+        if suffix.is_empty() {
+            return None;
+        }
+        let ret = self.call_return_type(call)?;
+        let su = self.unpacked_struct_of(&ret)?;
+        suffix.reverse();
+        let want = format!("X{}", suffix.concat());
+        let (_, off, w, _) = self
+            .struct_leaf_layout("X", &su)
+            .into_iter()
+            .find(|(k, ..)| *k == want)?;
+        let v = self.eval_expr(cur);
+        Some(v.range_select((off + w - 1) as usize, off as usize))
+    }
+
     fn chain_base_packed_struct(
         &mut self,
         e: &Expression,
@@ -59908,8 +60041,168 @@ impl Simulator {
         if self.heap.is_empty() {
             return None;
         }
+        // §7.2: a member of an UNPACKED-struct property at ANY depth, and
+        // through an index — `o.n.inner.a`, `o.s.arr[1]`, `o.arr[0].a`. The
+        // one-level resolution below keys such a reference on the wrong pair,
+        // which left every deeper leaf sharing one cell BETWEEN OBJECTS: two
+        // instances read each other's `n.inner.a`.
+        if let Some(r) = self.class_unpacked_leaf(e) {
+            return Some(r);
+        }
         let (base, field) = Self::split_trailing_member(e)?;
         self.class_agg_member_parts(&base, &field)
+    }
+
+    /// Resolve `<receiver>.<prop><suffix>` where `prop` is an unpacked struct
+    /// (or an array of them) and `<suffix>` is any chain of `.member` / `[i]`.
+    /// Each leaf gets its own per-instance cell keyed `<prop><suffix>`.
+    fn class_unpacked_leaf(&mut self, e: &Expression) -> Option<ClassAggRef> {
+        // A dotted reference is an IDENT with a multi-segment path outside a
+        // method body and a MemberAccess/Index chain inside one; both shapes
+        // reach here, and both used to resolve only one level below the
+        // property.
+        if let ExprKind::Ident(h) = &e.kind {
+            return self.class_unpacked_leaf_ident(h, e.span, "");
+        }
+        if !matches!(
+            e.kind,
+            ExprKind::MemberAccess { .. } | ExprKind::Index { .. }
+        ) {
+            return None;
+        }
+        // Descend to the receiver, recording each candidate base with the
+        // suffix that hangs off it.
+        let mut chain: Vec<(&Expression, String)> = Vec::new();
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    parts.push(format!(".{}", member.name));
+                    cur = expr;
+                }
+                ExprKind::Index { expr, index } => {
+                    let i = self.eval_expr(index).to_i64()?;
+                    parts.push(format!("[{}]", i));
+                    cur = expr;
+                }
+                _ => break,
+            }
+            let mut p = parts.clone();
+            p.reverse();
+            chain.push((cur, p.concat()));
+        }
+        // Innermost receiver first: `obj` alone only names a property under an
+        // implicit `this`, and that candidate is rejected when its type is not
+        // an unpacked struct.
+        for (base, suffix) in chain.into_iter().rev() {
+            if let Some(r) = self.class_unpacked_leaf_at(base, &suffix) {
+                return Some(r);
+            }
+            // The chain may bottom out at a DOTTED ident (`c.am.arr` beneath a
+            // trailing `[1]`), whose own segments still need splitting into
+            // receiver / property / leaf path.
+            if let ExprKind::Ident(h) = &base.kind {
+                if let Some(r) = self.class_unpacked_leaf_ident(h, base.span, &suffix) {
+                    return Some(r);
+                }
+            }
+        }
+        None
+    }
+
+    /// Candidate splits of a dotted identifier: each segment in turn is taken
+    /// as the property, with everything after it (plus `extra`) as the leaf
+    /// path. Segment 0 covers an implicit `this`.
+    fn class_unpacked_leaf_ident(
+        &mut self,
+        h: &crate::ast::expr::HierarchicalIdentifier,
+        span: crate::ast::Span,
+        extra: &str,
+    ) -> Option<ClassAggRef> {
+        for k in 0..h.path.len() {
+            if k + 1 == h.path.len() && extra.is_empty() && h.path[k].selects.is_empty() {
+                continue; // nothing left to address below the property
+            }
+            let mut suffix = String::new();
+            let mut ok = true;
+            for sel in &h.path[k].selects {
+                match self.eval_expr(sel).to_i64() {
+                    Some(i) => suffix.push_str(&format!("[{}]", i)),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            for seg in &h.path[k + 1..] {
+                if !ok {
+                    break;
+                }
+                suffix.push_str(&format!(".{}", seg.name.name));
+                for sel in &seg.selects {
+                    match self.eval_expr(sel).to_i64() {
+                        Some(i) => suffix.push_str(&format!("[{}]", i)),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            suffix.push_str(extra);
+            if suffix.is_empty() {
+                continue;
+            }
+            let mut base_h = h.clone();
+            base_h.path.truncate(k + 1);
+            if let Some(seg) = base_h.path.last_mut() {
+                seg.selects.clear();
+            }
+            base_h.cached_signal_id = std::cell::Cell::new(None);
+            base_h.cached_resolved_name = std::cell::OnceCell::new();
+            let base = Expression::new(ExprKind::Ident(base_h), span);
+            if let Some(r) = self.class_unpacked_leaf_at(&base, &suffix) {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+
+    /// One candidate split: `base` names the property, `suffix` addresses a
+    /// leaf beneath it. `None` when the property is not an unpacked struct or
+    /// the suffix names no leaf of it — which is what lets the caller try
+    /// successive split points without guessing.
+    fn class_unpacked_leaf_at(
+        &mut self,
+        base: &Expression,
+        suffix: &str,
+    ) -> Option<ClassAggRef> {
+        let (handle, prop) = self.class_prop_receiver(base)?;
+        let su = self.class_prop_struct(handle, &prop)?;
+        if !Self::spreads_member_wise(&su) {
+            return None;
+        }
+        // An ARRAY-of-structs property indexes the element first; the rest of
+        // the suffix addresses a leaf of the element's type.
+        let probe = if suffix.starts_with('[') {
+            format!("X{}", &suffix[suffix.find(']')? + 1..])
+        } else {
+            format!("X{}", suffix)
+        };
+        let (_, w, _) = self
+            .unpacked_struct_leaf_keys("X", &su)
+            .into_iter()
+            .find(|(k, ..)| *k == probe)?;
+        Some(ClassAggRef::Unpacked {
+            handle,
+            key: format!("{}{}", prop, suffix),
+            w: w.max(1),
+        })
     }
 
     /// `<obj>.<prop>[i]` where `prop` is a MULTI-DIMENSIONAL packed array
@@ -69083,6 +69376,41 @@ impl Simulator {
             off += w;
         }
         out
+    }
+
+    /// §7.2/§18.4: collapse an unpacked-struct class property's per-instance
+    /// cells into one packed value, laid out like `pack_unpacked_struct` so the
+    /// two are interchangeable at a call boundary.
+    fn pack_class_unpacked(
+        &mut self,
+        handle: usize,
+        prop: &str,
+        su: &crate::ast::types::StructUnionType,
+    ) -> Option<Value> {
+        let fields = self.struct_leaf_layout("X", su);
+        let total = fields.iter().map(|(_, o, w, _)| o + w).max().unwrap_or(0);
+        if total == 0 {
+            return None;
+        }
+        let mut out = Value::new(total);
+        let mut any = false;
+        for (key, off, w, _is_real) in fields {
+            let cell = format!("{}{}", prop, &key[1..]);
+            let Some(v) = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(&cell))
+                .cloned()
+            else {
+                continue;
+            };
+            any = true;
+            for i in 0..w {
+                out.set_bit((off + i) as usize, v.get_bit(i as usize));
+            }
+        }
+        any.then_some(out)
     }
 
     /// The inverse: scatter a packed value across an unpacked struct's leaves.
@@ -79896,6 +80224,24 @@ impl Simulator {
                     locals.insert(port.name.name.clone(), val);
                 }
                 if let Some(rn) = &fn_ret_name {
+                    // An UNPACKED-struct return type keeps its members in the
+                    // frame under `<fn>.<member>`, like any other local of that
+                    // type; without them a member write inside the body escaped
+                    // the frame.
+                    if let ClassMethodKind::Function(f) = &method.kind {
+                        if let Some(su) = self.unpacked_struct_of(&f.return_type) {
+                            for (k, w, is_real) in
+                                self.unpacked_struct_leaf_keys(&rn.clone(), &su)
+                            {
+                                let seed = if is_real {
+                                    Value::from_f64(0.0)
+                                } else {
+                                    Value::new(w)
+                                };
+                                locals.insert(k, seed);
+                            }
+                        }
+                    }
                     // Initialise the implicit return variable to match its
                     // declared type. A STRING return must start as an empty
                     // string Value, not a 32-bit int — otherwise an implicit
@@ -80125,6 +80471,21 @@ impl Simulator {
                 }
                 self.class_context_stack.pop();
                 self.method_local_base.pop();
+                // §13.4.1: a method returning an UNPACKED struct has no single
+                // return cell — its members are frame leaves, so the bare name
+                // read back x. Collapse them into the packed form while the
+                // frame is still live, exactly as a free function does.
+                let unpacked_ret_su = match &method.kind {
+                    ClassMethodKind::Function(f) => self.unpacked_struct_of(&f.return_type),
+                    _ => None,
+                };
+                if let (Some(rn), Some(su)) = (fn_ret_name.as_ref(), unpacked_ret_su.as_ref()) {
+                    if self.return_value.is_none() {
+                        if let Some(v) = self.pack_unpacked_struct(&rn.clone(), &su.clone()) {
+                            self.return_value = Some(v);
+                        }
+                    }
+                }
                 let implicit = fn_ret_name.as_ref().and_then(|rn| {
                     let lv = self.local_stack.last().and_then(|m| m.get(rn).cloned());
                     // A `funcname = {a, b, ...}` string-concat assignment is

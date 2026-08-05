@@ -95,6 +95,8 @@ mod process_class_9_7;
 mod randomize_inside_range;
 #[path = "classes/scope_randomize_dist_and_foreach.rs"]
 mod scope_randomize_dist_and_foreach;
+#[path = "classes/class_unpacked_struct_properties.rs"]
+mod class_unpacked_struct_properties;
 #[path = "classes/subroutine_local_unpacked_structs.rs"]
 mod subroutine_local_unpacked_structs;
 #[path = "classes/std_randomize_struct.rs"]
