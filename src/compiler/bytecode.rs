@@ -2307,6 +2307,27 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Paren(inner) => self.compile_expr(inner, ctx_width),
             ExprKind::Index { expr, index } => {
+                // §11.5.1: `(X[a:b])[i]` on a packed ARRAY selects ELEMENT i
+                // (labels pass through a constant part-select). This shape
+                // comes from port inlining of `.p(arr[15:0])`-style
+                // connections; the bit-select compilation below would read
+                // bit i of a bit-slice. Bail to the AST interpreter, which
+                // normalizes it to a plain element select.
+                if let ExprKind::RangeSelect { expr: rs_base, .. } = &expr.kind {
+                    if let ExprKind::Ident(h) = &rs_base.kind {
+                        let nm = Self::hier_raw_name(h);
+                        let elemish = self
+                            .packed_elem_widths
+                            .is_some_and(|m| m.get(&nm).is_some_and(|&ew| ew > 1))
+                            || self
+                                .packed_full_dims
+                                .is_some_and(|m| m.get(&nm).is_some_and(|d| d.len() > 1));
+                        if elemish {
+                            self.bail("Index_of_ranged_packed_array");
+                            return None;
+                        }
+                    }
+                }
                 // Element of a MULTI-dimensional unpacked array (`grid[i][j]`).
                 // The base of the outer Index is itself an Index, so none of
                 // the arms below match and the whole thing fell through to the

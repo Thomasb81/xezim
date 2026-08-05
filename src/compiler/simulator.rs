@@ -3265,6 +3265,22 @@ pub struct Simulator {
     /// (matching real simulators) rather than the top-module name. Pushed in
     /// `exec_function_call` / `exec_task_call` around the body and popped after.
     func_call_stack: Vec<String>,
+    /// §26.3: the package whose subroutine body is running, innermost last
+    /// (`None` for a module-level subroutine). A package subroutine resolves
+    /// its free names in ITS OWN package, but package-scope declarations are
+    /// hoisted into the shared tables under their bare name — last writer wins
+    /// — so a name two packages both declare has to be read back through
+    /// `<pkg>::<name>`. See `pkg_ambiguous_names` and `resolve_hier_name`.
+    pkg_scope_stack: Vec<Option<String>>,
+    /// Package scope for the NEXT `exec_function_call` / `exec_task_call`, set
+    /// by a scoped `pkg::f(...)` dispatch (which is the only site that knows
+    /// which package was named). Taken on entry, before argument evaluation, so
+    /// a call nested in an argument cannot inherit it.
+    pending_pkg_scope: Option<String>,
+    /// §26.3: package-scope names that MORE THAN ONE package declares — the
+    /// only ones whose bare hoisted entry is ambiguous. Empty for a design
+    /// without such a collision, which short-circuits the qualified lookup.
+    pkg_ambiguous_names: HashSet<String>,
     /// §21.2.1.7 `%m` lexical-scope hierarchy WITHIN the current instance:
     /// task / function / named-block / fork-block names, innermost last.
     /// Pushed on subroutine/named-block entry, popped on exit.
@@ -5069,6 +5085,43 @@ impl Simulator {
         names.dedup();
         let names_ms = phase_names.elapsed().as_secs_f64() * 1000.0;
 
+        // §26.3: package-scope names that MORE THAN ONE package declares. Such
+        // a name is hoisted into the shared tables under its bare spelling as
+        // well as `<pkg>::<name>`, and the bare key is last-writer-wins across
+        // packages — so inside a package subroutine it has to be read (or
+        // called) through the running package's own entry. Every other name
+        // resolves identically either way, so the set stays empty for
+        // practically every design and both lookups short-circuit.
+        let mut pkg_ambiguous_names: HashSet<String> = HashSet::default();
+        {
+            let mut first_owner: HashMap<&str, &str> = HashMap::default();
+            for key in module.parameters.keys() {
+                let Some((pkg, base)) = key.split_once("::") else { continue };
+                // `::` also keys class-scoped entries; only a package prefix
+                // counts here.
+                if !module.packages.contains(pkg) {
+                    continue;
+                }
+                match first_owner.get(base) {
+                    None => {
+                        first_owner.insert(base, pkg);
+                    }
+                    Some(prev) if *prev != pkg => {
+                        pkg_ambiguous_names.insert(base.to_string());
+                    }
+                    Some(_) => {}
+                }
+            }
+            // Elaboration only mints a qualified subroutine key when a second
+            // package claims the name, so every one of these is contested.
+            for key in module.functions.keys().chain(module.tasks.keys()) {
+                let Some((pkg, base)) = key.split_once("::") else { continue };
+                if module.packages.contains(pkg) {
+                    pkg_ambiguous_names.insert(base.to_string());
+                }
+            }
+        }
+
         let n = names.len();
         let mut signal_name_to_id: HashMap<Arc<str>, usize> =
             HashMap::with_capacity_and_hasher(n, Default::default());
@@ -5922,6 +5975,9 @@ impl Simulator {
             pending_ret_collection: None,
             current_scope: String::new(),
             func_call_stack: Vec::new(),
+            pkg_scope_stack: Vec::new(),
+            pending_pkg_scope: None,
+            pkg_ambiguous_names,
             m_scope_stack: Vec::new(),
             static_local_vars: HashMap::default(),
             static_local_syncs: Vec::new(),
@@ -9851,6 +9907,20 @@ impl Simulator {
         mark_compile_phase("structural delay setup", &mut compile_phase_start);
         self.build_comb_entries();
         mark_compile_phase("build combinational entries", &mut compile_phase_start);
+        if let Ok(w) = std::env::var("XEZIM_DUMP_ENTRY") {
+            let want: usize = w.parse().unwrap_or(0);
+            for probe in [want, want + 1] {
+                if let Some(e) = self.comb_entries.get(probe) {
+                    let rn: Vec<&str> = e.read_signal_ids.iter().filter_map(|&i| self.id_to_name.get(i).map(|s| s.as_ref())).collect();
+                    let wn: Vec<&str> = e.write_signal_ids.iter().filter_map(|&i| self.id_to_name.get(i).map(|s| s.as_ref())).collect();
+                    eprintln!("[ENTRY] #{} kind={} unresolved={} reads={:?} writes={:?}", probe,
+                        match &e.item { CombItem::CompiledContAssign{..} => "cca", CombItem::ContAssign{..} => "ca",
+                            CombItem::DirectCopy{..} => "dc", CombItem::FastDirectCopy{..} => "fdc",
+                            CombItem::CompiledAlwaysBlock{..} => "cab", CombItem::AlwaysBlock{..} => "ab", _ => "other" },
+                        e.has_unresolved_reads, rn, wn);
+                }
+            }
+        }
         if std::env::var_os("XEZIM_SETTLE_LEVELS").is_some() || self.bsp_settle || self.bsp_shadow {
             self.report_comb_levels();
         }
@@ -13887,11 +13957,33 @@ impl Simulator {
             let scope_hint = if !block.scope.is_empty() {
                 Some(block.scope.clone())
             } else {
-                block
+                // An EMPTY scope means the block belongs to the TOP module —
+                // its bare names are top names. Deriving a scope from the
+                // first sensitivity signal mis-scoped a top-level block to a
+                // SUB-instance whenever the clock resolved to an instance's
+                // same-named port copy ("clk" → "d.clk"): every bare NBA
+                // target then wrote the instance's copy and the top signal
+                // was never written at all (a TB grant strobe stayed x
+                // forever and its whole datapath wedged). Derive only when
+                // the derived scope can also account for the block's OWN
+                // first write target; a top-resolvable target keeps None.
+                let derived = block
                     .resolved_sensitivities
                     .first()
                     .and_then(|sid| self.id_to_name.get(sid.signal_id))
-                    .and_then(|full| full.rsplit_once('.').map(|(p, _)| p.to_string()))
+                    .and_then(|full| full.rsplit_once('.').map(|(p, _)| p.to_string()));
+                match derived {
+                    Some(d) => {
+                        let mut reads: HashSet<String> = HashSet::default();
+                        let mut writes: HashSet<String> = HashSet::default();
+                        Self::collect_stmt_reads(&block.stmt, &self.module, &mut reads, &mut writes);
+                        let top_resolvable = writes.iter().any(|w| {
+                            !w.contains('.') && self.signal_name_to_id.contains_key(w.as_str())
+                        });
+                        if top_resolvable { None } else { Some(d) }
+                    }
+                    None => None,
+                }
             };
             let mut compiler = BytecodeCompiler::new(
                 &self.signal_name_to_id,
@@ -17253,8 +17345,17 @@ impl Simulator {
                 };
                 let scope_hint = self.infer_scope_from_rw_sets(&writes, &reads);
                 if std::env::var("XEZIM_AB_DBG").is_ok() {
-                    eprintln!("[ABDBG] always-block writes={:?} reads={:?} -> scope={:?}",
-                        writes, reads, scope_hint);
+                    let unresolved: Vec<&String> = reads
+                        .iter()
+                        .filter(|r| {
+                            !self.signal_name_to_id.contains_key(r.as_str())
+                                && !self
+                                    .signal_name_to_id
+                                    .contains_key(format!("{}.{}", self.module.name, r).as_str())
+                        })
+                        .collect();
+                    eprintln!("[ABDBG] always-block writes={:?} reads={:?} -> scope={:?} unresolved={:?}",
+                        writes, reads, scope_hint, unresolved);
                 }
                 let wids: Vec<usize> = writes
                     .iter()
@@ -27041,6 +27142,17 @@ impl Simulator {
                     e.span,
                 )
             }
+            // §10.4.2: a MEMBER of an indexed element (`arr[t].hi <= v`) needs
+            // its element index captured NOW too — the catch-all cloned the
+            // lvalue unfrozen, so a loop-variable index was stale (or gone) by
+            // the NBA region and every such write was silently dropped.
+            ExprKind::MemberAccess { expr, member } => Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.freeze_lvalue_indices(expr)),
+                    member: member.clone(),
+                },
+                e.span,
+            ),
             _ => e.clone(),
         }
     }
@@ -36302,6 +36414,39 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // §11.5.1: a constant part-select of a packed ARRAY keeps the
+                // original element labels, so `(X[15:0])[11]` selects ELEMENT
+                // 11 of X — not bit 11 of a 16-bit slice. Port connections
+                // like `.p(arr[15:0])` produce exactly this shape after
+                // inlining grafts the port's select onto the connection; the
+                // slice-of-bits reading returned a single widened bit (0/x)
+                // and the consumer never saw the element. Normalize to a plain
+                // element select of the underlying signal.
+                if let ExprKind::RangeSelect { expr: rs_base, .. } = &expr.kind {
+                    if let ExprKind::Ident(h) = &rs_base.kind {
+                        let nm = self.resolve_hier_name(h);
+                        let elemish = self
+                            .module
+                            .packed_signal_elem_widths
+                            .get(&nm)
+                            .is_some_and(|&ew| ew > 1)
+                            || self
+                                .module
+                                .packed_full_dims
+                                .get(&nm)
+                                .is_some_and(|d| d.len() > 1);
+                        if elemish {
+                            let norm = Expression::new(
+                                ExprKind::Index {
+                                    expr: rs_base.clone(),
+                                    index: index.clone(),
+                                },
+                                expr.span,
+                            );
+                            return self.eval_expr_ctx(&norm, ctx_width);
+                        }
+                    }
+                }
                 if std::env::var("XEZIM_EV_DBG").is_ok() {
                     eprintln!(
                         "[EVDBG] idx-eval base_fmn={:?} qb={:?} ean={:?} nin={:?}",
@@ -38833,6 +38978,44 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §11.5.1: member of an element selected THROUGH a ranged
+                // port connection — `p[11].hi` over `.p(arr[15:0])` arrives
+                // as MemberAccess{Index{RangeSelect{arr},11},hi}. Rebuild over
+                // the plain element select so the flat member paths below
+                // resolve (labels pass through a constant part-select).
+                if let ExprKind::Index { expr: ib, index } = &expr.kind {
+                    if let ExprKind::RangeSelect { expr: rs_base, .. } = &ib.kind {
+                        if let ExprKind::Ident(h) = &rs_base.kind {
+                            let nm = self.resolve_hier_name(h);
+                            let elemish = self
+                                .module
+                                .packed_signal_elem_widths
+                                .get(&nm)
+                                .is_some_and(|&ew| ew > 1)
+                                || self
+                                    .module
+                                    .packed_full_dims
+                                    .get(&nm)
+                                    .is_some_and(|d| d.len() > 1);
+                            if elemish {
+                                let norm = Expression::new(
+                                    ExprKind::MemberAccess {
+                                        expr: Box::new(Expression::new(
+                                            ExprKind::Index {
+                                                expr: rs_base.clone(),
+                                                index: index.clone(),
+                                            },
+                                            expr.span,
+                                        )),
+                                        member: member.clone(),
+                                    },
+                                    expr.span,
+                                );
+                                return self.eval_expr_ctx(&norm, ctx_width);
+                            }
+                        }
+                    }
+                }
                 // §14.3 clocking-block signal read. Inside a task/function the
                 // parser yields MemberAccess for `cb.sig` (module scope yields
                 // a flat hier Ident), so this arm needs the same handling.
@@ -48590,6 +48773,30 @@ impl Simulator {
                 return uq.to_string();
             }
         }
+        // §26.3: a free name inside a package subroutine names THAT package's
+        // declaration. Package-scope declarations are hoisted into the shared
+        // tables under their bare name as well as `<pkg>::<name>`, and the bare
+        // key is last-writer-wins across packages — so `p1::next_step`'s body
+        // read p2's `step`. Redirect to the running package's own entry. Only
+        // names more than one package declares are ambiguous (the set is empty
+        // otherwise), a local of that name still wins, and the result is
+        // deliberately NOT memoized: it depends on the call frame, not the node.
+        if !self.pkg_ambiguous_names.is_empty() && hier.path.len() == 1 {
+            let leaf = hier.path[0].name.name.as_str();
+            if self.pkg_ambiguous_names.contains(leaf)
+                && !self
+                    .local_stack
+                    .last()
+                    .is_some_and(|l| l.contains_key(leaf))
+            {
+                if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
+                    let qual = format!("{}::{}", pkg, leaf);
+                    if self.signal_name_to_id.contains_key(qual.as_str()) {
+                        return qual;
+                    }
+                }
+            }
+        }
         // Per-hier cache: first call resolves and memoizes the result on the
         // AST node; every subsequent call on the same node returns in O(1)
         // without HashMap lookups, path-join allocation, or hint bookkeeping.
@@ -48622,11 +48829,49 @@ impl Simulator {
             let _ = hier.cached_resolved_name.set(stripped.clone());
             return stripped;
         }
+        // §3.12.1: `$unit::x` is carried as the reserved name "$unit::x", which
+        // only EXISTS where a local declaration shadows the compilation-unit
+        // variable. Unshadowed, the $unit variable lives under its plain name,
+        // so drop the qualifier — going through the generic resolver instead
+        // would let the suffix scan bind the reference to some *other*
+        // module's shadow copy.
+        if let Some(bare) = hier
+            .path
+            .first()
+            .and_then(|s| crate::sv_parser::strip_unit_scope_name(&s.name.name))
+        {
+            if !self.unit_scope_decl_exists(&hier.path[0].name.name) {
+                let mut stripped = hier.clone();
+                stripped.path[0].name.name = bare.to_string();
+                stripped.cached_signal_id = std::cell::Cell::new(None);
+                stripped.cached_resolved_name = std::cell::OnceCell::new();
+                let resolved = self.resolve_hier_name_uncached(&stripped);
+                let _ = hier.cached_resolved_name.set(resolved.clone());
+                return resolved;
+            }
+        }
         let resolved = self.resolve_hier_name_uncached(hier);
         // OnceCell::set returns Err if already set (race) — ignore; value
         // would be identical anyway.
         let _ = hier.cached_resolved_name.set(resolved.clone());
         resolved
+    }
+
+    /// Whether the reserved `$unit::<name>` storage really exists here — i.e.
+    /// this scope shadows the compilation-unit declaration, so the qualified
+    /// reference has its own object. An unpacked array / queue / assoc array
+    /// lives in its own table rather than in `signals`, so all of them have to
+    /// be consulted: missing one made `$unit::arr[i]` fall back to the bare
+    /// name and read the module's own array.
+    fn unit_scope_decl_exists(&self, name: &str) -> bool {
+        self.signal_name_to_id.contains_key(name)
+            || self.signals.contains_key(name)
+            || self.module.arrays.contains_key(name)
+            || self.module.arrays_2d.contains_key(name)
+            || self.module.arrays_nd.contains_key(name)
+            || self.module.dynamic_arrays.contains(name)
+            || self.module.associative_arrays.contains_key(name)
+            || self.module.struct_members.contains_key(name)
     }
 
     #[inline]
@@ -65934,10 +66179,32 @@ impl Simulator {
                 // Package scope resolution: `pkg::func(args)`. Only when LHS is an
                 // explicitly known package name — not a class, signal, or handle.
                 if hier.path.len() == 1 && self.module.packages.contains(&name) {
-                    if let Some(fd) = self.module.functions.get(mname).cloned() {
+                    // §26.3: `pkg::f(...)` calls THAT package's subroutine.
+                    // Package subroutines are hoisted under their BARE name, so
+                    // two packages declaring the same one collided and whichever
+                    // body landed there answered for both. Elaboration gives
+                    // each colliding declaration a `pkg::name` key — prefer it,
+                    // and run the body with its own package as the scope its
+                    // free names resolve in.
+                    let qual = format!("{}::{}", name, mname);
+                    let fd = self
+                        .module
+                        .functions
+                        .get(&qual)
+                        .or_else(|| self.module.functions.get(mname))
+                        .cloned();
+                    if let Some(fd) = fd {
+                        self.pending_pkg_scope = Some(name.clone());
                         return self.exec_function_call(&fd, args);
                     }
-                    if let Some(td) = self.module.tasks.get(mname).cloned() {
+                    let td = self
+                        .module
+                        .tasks
+                        .get(&qual)
+                        .or_else(|| self.module.tasks.get(mname))
+                        .cloned();
+                    if let Some(td) = td {
+                        self.pending_pkg_scope = Some(name.clone());
                         self.exec_task_call(&td, args);
                         return Value::zero(32);
                     }
@@ -68012,8 +68279,72 @@ impl Simulator {
                     }
                 }
             }
+            // §26.3: `pkg::f(...)` — the parser flattens the scope chain, so it
+            // arrives here as Ident([pkg, f]) and used to be resolved by the
+            // bare leaf below. Package subroutines are hoisted under their BARE
+            // name, so two packages declaring the same one collided and a
+            // single body answered for both spellings. Elaboration gives each
+            // colliding declaration a `pkg::name` key — prefer it. Either way
+            // the body runs with its own package as the scope its free names
+            // resolve in (`pending_pkg_scope`).
+            if hier.path.len() == 2
+                && hier.path.iter().all(|s| s.selects.is_empty())
+                && self.module.packages.contains(&hier.path[0].name.name)
+                && !self
+                    .signal_name_to_id
+                    .contains_key(hier.path[0].name.name.as_str())
+                && !self.signals.contains_key(&hier.path[0].name.name)
+            {
+                let pkg = hier.path[0].name.name.clone();
+                let qual = format!("{}::{}", pkg, name);
+                let fd = self
+                    .module
+                    .functions
+                    .get(&qual)
+                    .or_else(|| self.module.functions.get(name))
+                    .cloned();
+                if let Some(fd) = fd {
+                    self.pending_pkg_scope = Some(pkg);
+                    return self.exec_function_call(&fd, args);
+                }
+                let td = self
+                    .module
+                    .tasks
+                    .get(&qual)
+                    .or_else(|| self.module.tasks.get(name))
+                    .cloned();
+                if let Some(td) = td {
+                    self.pending_pkg_scope = Some(pkg);
+                    self.exec_task_call(&td, args);
+                    return Value::zero(32);
+                }
+            }
+            // §26.3: a BARE call inside a package subroutine binds to the
+            // enclosing package's own subroutine first — `p2::twice` calling
+            // `next_step` must reach p2's copy, not whichever package's body
+            // holds the shared bare key. Only contested names have a qualified
+            // entry; an uncontested bare key already is the right body.
+            if hier.path.len() == 1
+                && !self.pkg_ambiguous_names.is_empty()
+                && self.pkg_ambiguous_names.contains(name.as_str())
+            {
+                if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
+                    let pkg = pkg.clone();
+                    let qual = format!("{}::{}", pkg, name);
+                    if let Some(fd) = self.module.functions.get(&qual).cloned() {
+                        self.pending_pkg_scope = Some(pkg);
+                        return self.exec_function_call(&fd, args);
+                    }
+                    if let Some(td) = self.module.tasks.get(&qual).cloned() {
+                        self.pending_pkg_scope = Some(pkg);
+                        self.exec_task_call(&td, args);
+                        return Value::zero(32);
+                    }
+                }
+            }
             // Module-level function call
             if let Some(fd) = self.module.functions.get(name).cloned() {
+                self.pending_pkg_scope = self.bare_call_pkg_scope(name, hier.path.len());
                 return self.exec_function_call(&fd, args);
             }
             // Module-level let call
@@ -68022,6 +68353,7 @@ impl Simulator {
             }
             // Module-level task call
             if let Some(td) = self.module.tasks.get(name).cloned() {
+                self.pending_pkg_scope = self.bare_call_pkg_scope(name, hier.path.len());
                 self.exec_task_call(&td, args);
                 return Value::zero(32);
             }
@@ -68479,7 +68811,33 @@ impl Simulator {
         }
     }
 
+    /// §26.3: the package a BARE call from inside a package subroutine runs in.
+    /// A sibling subroutine of the SAME package keeps that package as the scope
+    /// its free names resolve in; anything else is left to its own declaring
+    /// scope. Costs nothing unless some package-scope name is contested.
+    fn bare_call_pkg_scope(&self, name: &str, path_len: usize) -> Option<String> {
+        if path_len != 1 || self.pkg_ambiguous_names.is_empty() {
+            return None;
+        }
+        let pkg = self.pkg_scope_stack.last()?.as_ref()?;
+        if self.module.pkg_subr_owner.get(name).is_some_and(|o| o == pkg) {
+            return Some(pkg.clone());
+        }
+        None
+    }
+
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
+        // §26.3: the package this body belongs to. Taken before anything else
+        // runs, so a call appearing in an argument (evaluated below, in the
+        // CALLER's scope) cannot pick it up. A scoped `pkg::f()` dispatch names
+        // the package outright; a bare call to an imported one is recovered
+        // from its declaring scope.
+        let pkg_scope = self.pending_pkg_scope.take().or_else(|| {
+            self.module
+                .func_decl_scope
+                .get(&fd.name.name.name)
+                .cloned()
+        });
         let normalized = Self::normalize_call_args(&fd.ports, args);
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
         // Serve UVM's command-line iterator from `plusargs` regardless of the
@@ -68729,6 +69087,7 @@ impl Simulator {
         // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
         // body; recursion keeps the stack ordered.
         self.func_call_stack.push(fd.name.name.name.clone());
+        self.pkg_scope_stack.push(pkg_scope);
         let m_fn_leaf = fd.name.name.name.rsplit('.').next().unwrap_or(&fd.name.name.name).to_string();
         let saved_m_scope_fn = std::mem::replace(&mut self.m_scope_stack, vec![m_fn_leaf]);
         // §6.21: open a static-local sync frame keyed by this subroutine name.
@@ -68743,6 +69102,7 @@ impl Simulator {
         }
         self.sync_static_locals();
         self.func_call_stack.pop();
+        self.pkg_scope_stack.pop();
         self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
         self.class_context_stack.pop();
@@ -68834,7 +69194,17 @@ impl Simulator {
 
     /// Execute a module-level task call with arguments.
     fn exec_task_call(&mut self, td: &TaskDeclaration, args: &[Expression]) {
+        // §26.3: the package this body belongs to — see `exec_function_call`.
+        // Taken before the arguments are bound, which happens in the CALLER's
+        // scope.
+        let pkg_scope = self.pending_pkg_scope.take().or_else(|| {
+            self.module
+                .func_decl_scope
+                .get(&td.name.name.name)
+                .cloned()
+        });
         let cleanup = self.bind_task_frame(td, args);
+        self.pkg_scope_stack.push(pkg_scope);
         // Execute task body
         for stmt in &td.items {
             self.exec_statement(stmt);
@@ -68842,6 +69212,7 @@ impl Simulator {
                 break;
             }
         }
+        self.pkg_scope_stack.pop();
         // §9.6.2: `disable <task>` terminates this invocation and no more —
         // the caller resumes. Clear the unwind signal here, or it would leak
         // out and keep later loops from clearing `break_flag`.
