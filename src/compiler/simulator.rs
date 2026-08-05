@@ -5054,6 +5054,92 @@ impl Simulator {
                 }
             }
         }
+        // §9.4.2: `always @(posedge <expression>)`. Sensitivity is built from
+        // the identifier NAMES appearing in the event expression, so a COMPUTED
+        // term (`a & 1'b1`, `~b`, `c ? x : y`) contributed no names at all: the
+        // block armed on nothing and never ran, silently. Sensitizing its leaf
+        // identifiers instead would be wrong — `posedge (~b)` must fire when
+        // `~b` RISES, i.e. when `b` falls — so give each computed term a hidden
+        // 1-bit net driven by a continuous assign and put the edge on that. The
+        // net carries the expression's own value, which is exactly what the
+        // edge is defined against; truncating it to one bit also matches
+        // §9.4.2's rule that an edge on a multi-bit expression tracks its LSB.
+        {
+            use crate::ast::stmt::{EventControl as EC, TimingControl as TC};
+            fn computed_edge_term(e: &crate::ast::expr::Expression) -> bool {
+                match &e.kind {
+                    ExprKind::Paren(inner) => computed_edge_term(inner),
+                    ExprKind::Binary { .. }
+                    | ExprKind::Unary { .. }
+                    | ExprKind::Conditional { .. } => true,
+                    _ => false,
+                }
+            }
+            let mk_ident = |nm: &str, span| {
+                Expression::new(
+                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: vec![crate::ast::expr::HierPathSegment {
+                            name: crate::ast::Identifier {
+                                name: nm.to_string(),
+                                span,
+                            },
+                            selects: Vec::new(),
+                        }],
+                        span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    }),
+                    span,
+                )
+            };
+            let mut synth: Vec<(String, Expression)> = Vec::new();
+            for (bi, ab) in module.always_blocks.iter_mut().enumerate() {
+                let control = match &mut ab.stmt.kind {
+                    StatementKind::TimingControl { control, .. } => Some(control),
+                    StatementKind::SeqBlock { stmts, .. } => {
+                        match stmts.first_mut().map(|st| &mut st.kind) {
+                            Some(StatementKind::TimingControl { control, .. }) => Some(control),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(TC::Event(EC::EventExpr(exprs))) = control else {
+                    continue;
+                };
+                for (ei, ee) in exprs.iter_mut().enumerate() {
+                    if ee.edge.is_none() || !computed_edge_term(&ee.expr) {
+                        continue;
+                    }
+                    let nm = format!("__xz_edge_{}_{}", bi, ei);
+                    let span = ee.expr.span;
+                    synth.push((nm.clone(), ee.expr.clone()));
+                    ee.expr = mk_ident(&nm, span);
+                }
+            }
+            for (nm, rhs) in synth {
+                module.signals.entry(nm.clone()).or_insert_with(|| {
+                    super::elaborate::Signal {
+                        name: nm.clone(),
+                        width: 1,
+                        is_signed: false,
+                        is_real: false,
+                        is_const: false,
+                        direction: None,
+                        value: Value::new(1),
+                        type_name: None,
+                    }
+                });
+                module
+                    .continuous_assigns
+                    .push(super::elaborate::ContinuousAssignment {
+                        lhs: mk_ident(&nm, rhs.span),
+                        rhs,
+                        delay: 0,
+                    });
+            }
+        }
         let queue_names: Vec<String> = module.dynamic_arrays.iter().cloned().collect();
         for q in queue_names {
             let sz_name = format!("{}.size", q);
