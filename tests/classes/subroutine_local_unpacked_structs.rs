@@ -1,0 +1,152 @@
+//! §7.2 / §13.4.2 — UNPACKED-struct variables declared inside a function or
+//! task. Reference-validated.
+//!
+//! Members of such a variable belong to the call frame, stored under their
+//! dotted name — the convention formal binding already used. Nothing seeded
+//! those keys for a LOCAL declaration, and neither the read nor the write path
+//! for a member consulted the frame, so a member reference escaped to the
+//! module signal table and resolved to whatever unrelated variable happened to
+//! share the bare name.
+//!
+//! The result was silent cross-scope corruption, and it corrupted in the
+//! READER: a function that wrote `s.a = 8'h32` and returned `s.a` returned the
+//! CALLER's `s.a` instead, while its own write went somewhere neither side read.
+//! The caller's value was not clobbered, so nothing looked wrong from outside —
+//! the function just quietly computed with someone else's data. It only
+//! appeared when some other scope declared a struct of the same name, which is
+//! why the same function tested in isolation was correct.
+//!
+//! Shadowing a MODULE-scope name already worked (those locals are alpha-renamed);
+//! it was process-block locals elsewhere in the design that collided.
+
+use xezim::simulate;
+
+fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
+    sim.get_signal(n)
+        .or_else(|| sim.get_signal(&format!("tb.{}", n)))
+        .unwrap_or_else(|| panic!("signal not found: {}", n))
+        .to_u64()
+        .unwrap_or_else(|| panic!("{} not u64-able (x/z?)", n))
+}
+
+/// A function's local must not read another scope's same-named struct, and must
+/// not write it either.
+#[test]
+fn function_local_struct_does_not_alias_a_process_local() {
+    let src = r#"
+typedef struct { logic [7:0] a; logic [7:0] b; } su_t;
+module tb;
+  int callee_reads, caller_after;
+  function automatic logic [7:0] f();
+    su_t ss;
+    ss.a = 8'h32;
+    callee_reads = ss.a;
+    return 8'h00;
+  endfunction
+  initial begin
+    su_t ss;
+    ss.a = 8'h88;
+    void'(f());
+    caller_after = ss.a;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "callee_reads"), 0x32, "the callee must read back its OWN write");
+    assert_eq!(u(&sim, "caller_after"), 0x88, "and must not disturb the caller's");
+}
+
+/// The collision can come from any scope: the calling block, another block, or
+/// module scope.
+#[test]
+fn locals_shadow_every_outer_scope() {
+    let src = r#"
+typedef struct { logic [7:0] a; logic [7:0] b; } su_t;
+module tb;
+  su_t mt;
+  int r_mod, r_same, r_other;
+  function automatic logic [7:0] f_mod();   su_t mt; mt.a = 8'h31; return mt.a; endfunction
+  function automatic logic [7:0] f_same();  su_t ss; ss.a = 8'h32; return ss.a; endfunction
+  function automatic logic [7:0] f_other(); su_t oo; oo.a = 8'h33; return oo.a; endfunction
+  initial begin
+    su_t oo;
+    oo.a = 8'h99;
+  end
+  initial begin
+    su_t ss;
+    ss.a = 8'h88;
+    mt.a = 8'h77;
+    r_mod = f_mod(); r_same = f_same(); r_other = f_other();
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "r_mod"), 0x31, "shadowing a module-scope struct");
+    assert_eq!(u(&sim, "r_same"), 0x32, "shadowing a local of the CALLING block");
+    assert_eq!(u(&sim, "r_other"), 0x33, "shadowing a local of another block");
+}
+
+/// Tasks too, and a whole-struct pattern write into a subroutine local must
+/// reach the same storage its member reads use.
+#[test]
+fn task_locals_and_whole_pattern_writes() {
+    let src = r#"
+typedef struct { logic [7:0] a; logic [7:0] b; } su_t;
+module tb;
+  int fn_a, tk_a, tk_b, pat_a, pat_b;
+  function automatic logic [7:0] fn_local();
+    su_t t;
+    t.a = 8'h31; t.b = 8'h32;
+    return t.a;
+  endfunction
+  task automatic tk_local(output logic [7:0] oa, output logic [7:0] ob);
+    su_t t;
+    t.a = 8'h41; t.b = 8'h42;
+    oa = t.a; ob = t.b;
+  endtask
+  function automatic logic [7:0] pattern_then_member(output logic [7:0] second);
+    su_t w;
+    w = '{a:8'h51, b:8'h52};
+    second = w.b;
+    return w.a;
+  endfunction
+  initial begin
+    su_t t;
+    logic [7:0] a1, b1, p2;
+    t.a = 8'h21; t.b = 8'h22;
+    fn_a = fn_local();
+    tk_local(a1, b1); tk_a = a1; tk_b = b1;
+    pat_a = pattern_then_member(p2); pat_b = p2;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "fn_a"), 0x31, "function local");
+    assert_eq!((u(&sim, "tk_a"), u(&sim, "tk_b")), (0x41, 0x42), "task local");
+    assert_eq!((u(&sim, "pat_a"), u(&sim, "pat_b")), (0x51, 0x52), "whole pattern into a local");
+}
+
+/// Each call gets a FRESH automatic local — a member left unwritten by the
+/// second call must not still hold the first call's value.
+#[test]
+fn automatic_locals_are_fresh_per_call() {
+    let src = r#"
+typedef struct { logic [7:0] a; logic [7:0] b; } su_t;
+module tb;
+  int first, second_unwritten;
+  function automatic logic [7:0] f(input bit write_b);
+    su_t s;
+    s.a = 8'h10;
+    if (write_b) s.b = 8'h20;
+    return s.b;
+  endfunction
+  initial begin
+    first = f(1'b1);
+    second_unwritten = $isunknown(f(1'b0));
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "first"), 0x20);
+    assert_eq!(u(&sim, "second_unwritten"), 1, "a fresh call must not see the previous one's member");
+}
