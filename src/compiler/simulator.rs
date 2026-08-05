@@ -42178,6 +42178,32 @@ impl Simulator {
                 // ELEMENT (`cdts <= '{default: v}` on logic [1:0][9:0] filled
                 // only element 0 through the generic eval) — same route the
                 // CA and blocking paths already take.
+                // §10.9.2/§10.10: a pattern written to an aggregate whose
+                // leaves are SEPARATE signals (unpacked struct, unpacked array
+                // of them, associative array) must be spread member-wise, not
+                // collapsed into one packed value. Only the blocking path did
+                // this, so `s <= '{a:8'h77, b:8'h88};` on an unpacked struct
+                // left every member x while the identical blocking assignment
+                // was correct.
+                if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+                    if self.packed_pattern_for_lhs(lvalue, items).is_none()
+                        && self.eval_packed_struct_pattern(lvalue, items).is_none()
+                    {
+                        let spread = if let ExprKind::Ident(lh) = &lvalue.kind {
+                            let lname = self.resolve_hier_name(lh);
+                            self.assign_pattern_aggregate(&lname, items)
+                        } else {
+                            self.assign_pattern_element(lvalue, rvalue)
+                                || match self.flat_member_name(lvalue) {
+                                    Some(flat) => self.assign_pattern_flat(&flat, items),
+                                    None => false,
+                                }
+                        };
+                        if spread {
+                            return;
+                        }
+                    }
+                }
                 let val = match &rvalue.kind {
                     ExprKind::AssignmentPattern(items) => self
                         .packed_pattern_for_lhs(lvalue, items)
@@ -60695,7 +60721,16 @@ impl Simulator {
 
         // Struct-field sub-path queue that is NOT yet registered in
         // `dynamic_arrays` (first write): detect via the type system.
-        if !self.module.dynamic_arrays.contains(base) {
+        // An UNPACKED STRUCT is never a queue — the member-wise branch at the
+        // bottom owns it. Without this the dotted-name heuristic below fired on
+        // an INSTANCE-qualified struct (`u.inl` contains a dot just like a
+        // struct sub-path does), registered it in `dynamic_arrays` and wrote
+        // `u.inl[0]`/`u.inl[1]`, so every member stayed x.
+        let dt_is_unpacked_struct = match self.resolve_dt(&dt) {
+            DataType::Struct(su) => Self::spreads_member_wise(&su),
+            _ => false,
+        };
+        if !dt_is_unpacked_struct && !self.module.dynamic_arrays.contains(base) {
             // Only register SUB-PATHS (dotted, like `info.addr`) in
             // `dynamic_arrays` — a bare variable like `src` is NOT a queue
             // even if `p_elem_type` finds an element type for it.
