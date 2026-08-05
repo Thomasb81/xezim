@@ -1,29 +1,46 @@
 //! config_db scope-matching regression tests (pure in-process).
 //!
-//! These exercise xezim's `uvm_config_db#(T)::set/get` interception (scope-aware
-//! instance-name matching, wildcards, and misses) by running the real 1800.2
-//! UVM library *in-process* via `simulate_multi` — no subprocess, no hardcoded
-//! binary path, no reference simulator. Reference comparison belongs in the dev
-//! workflow, not in the committed suite.
+//! These exercise xezim's `uvm_config_db#(T)::set/get` interception
+//! (scope-aware instance-name matching, wildcards, and misses) entirely
+//! in-process via `simulate_multi` — no subprocess, no external UVM library,
+//! no reference simulator.
+//!
+//! The interception fires once the parser resolves `uvm_config_db#(int)` as a
+//! defined parameterized class, so instead of pulling in the full 1800.2
+//! library (which is not shipped in this repo and is absent in CI) we prepend a
+//! minimal stub: a `uvm_component` shell that answers `get_full_name()`, and a
+//! `uvm_config_db` shell whose empty static methods xezim intercepts by name.
 
 use xezim::simulate_multi;
 
-/// Run a UVM-using top module in-process and return the joined `$display`
-/// output. The real UVM library (`uvm_pkg.sv`) is compiled alongside the test
-/// source, with its `src/` on the include path — exactly the command shape the
-/// CLI uses, but without shelling out.
-fn run_in_process(src: &str) -> String {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let uvm_dir = format!("{}/../1800.2-2020.3.1", manifest);
-    let uvm_pkg = std::fs::read_to_string(format!("{}/src/uvm_pkg.sv", uvm_dir))
-        .expect("could not read 1800.2 uvm_pkg.sv");
-    let inc = format!("{}/src", uvm_dir);
+/// Minimal UVM class shells. `uvm_config_db`'s static `set`/`get`/`exists`
+/// bodies are empty because xezim intercepts them by class name — the real
+/// logic lives in `Simulator::exec_config_db`. `uvm_component` only needs to
+/// satisfy `get_full_name()` for the interception's scope resolution.
+const STUB: &str = r#"
+class uvm_component;
+  string m_name;
+  function new(string name); m_name = name; endfunction
+  function string get_full_name(); return m_name; endfunction
+endclass
 
+class uvm_config_db #(type T = int);
+  static function void set(uvm_component cntxt, string inst, string field, T val); endfunction
+  static function bit get(uvm_component cntxt, string inst, string field, ref T val); endfunction
+  static function bit exists(uvm_component cntxt, string inst, string field); endfunction
+endclass
+"#;
+
+/// Run `src` (a `module top`) in-process and return the joined `$display`
+/// output. The UVM stub is prepended so the interception recognises
+/// `uvm_config_db`; no external files are read.
+fn run_in_process(src: &str) -> String {
+    let full = format!("{}\n{}", STUB, src);
     let sim = simulate_multi(
-        &[uvm_pkg, src.to_string()],
+        &[full],
         50_000,
         Some("top"),
-        &[inc],
+        &[],
         &[],
         None,
         false,
@@ -59,9 +76,7 @@ fn run_in_process(src: &str) -> String {
 #[test]
 fn test_config_db_inst_name() {
     let src = r#"
-`include "uvm_macros.svh"
 module top;
-  import uvm_pkg::*;
   initial begin
     #1;
     uvm_config_db#(int)::set(null, "tc", "my_int", 42);
@@ -98,9 +113,7 @@ endmodule
 #[test]
 fn test_config_db_wildcard() {
     let src = r#"
-`include "uvm_macros.svh"
 module top;
-  import uvm_pkg::*;
   initial begin
     #1;
     uvm_config_db#(int)::set(null, "*", "my_int", 99);
@@ -130,9 +143,7 @@ endmodule
 #[test]
 fn test_config_db_hit_wildcard_and_miss() {
     let src = r#"
-`include "uvm_macros.svh"
 module top;
-  import uvm_pkg::*;
   initial begin
     #1;
     uvm_config_db#(int)::set(null, "tc", "my_int", 42);
