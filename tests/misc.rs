@@ -165,6 +165,8 @@ mod sva_action_firing;
 mod sva_preponed_sampling;
 #[path = "misc/timescale.rs"]
 mod timescale;
+#[path = "misc/struct_arrays_and_interface_members.rs"]
+mod struct_arrays_and_interface_members;
 #[path = "misc/unpacked_struct_in_instance.rs"]
 mod unpacked_struct_in_instance;
 #[path = "misc/unsized_literal_keeps_its_digits.rs"]
