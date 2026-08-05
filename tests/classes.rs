@@ -97,6 +97,8 @@ mod randomize_inside_range;
 mod scope_randomize_dist_and_foreach;
 #[path = "classes/class_unpacked_struct_properties.rs"]
 mod class_unpacked_struct_properties;
+#[path = "classes/super_property_access.rs"]
+mod super_property_access;
 #[path = "classes/subroutine_local_unpacked_structs.rs"]
 mod subroutine_local_unpacked_structs;
 #[path = "classes/std_randomize_struct.rs"]
