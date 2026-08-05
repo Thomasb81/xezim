@@ -34366,6 +34366,26 @@ impl Simulator {
                 changed
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §13.4.2: a member of a subroutine-local / formal unpacked
+                // struct is owned by the call frame. Inside a subroutine body
+                // `s.a = v` parses as MemberAccess (at module level the same
+                // text is a dotted Ident, which the arm above already frames),
+                // and every branch below looks in the module signal table — so
+                // the write left the frame's copy untouched and the matching
+                // read returned an outer scope's value.
+                if let Some(key) = self.frame_member_key_of(expr, &member.name) {
+                    let prev = self.local_stack.last().and_then(|l| l.get(&key)).cloned();
+                    let fitted = match prev.as_ref() {
+                        Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
+                        Some(p) if !p.is_real && !val.is_real => val.resize(p.width),
+                        _ => val.clone(),
+                    };
+                    let changed = prev.as_ref() != Some(&fitted);
+                    if let Some(frame) = self.local_stack.last_mut() {
+                        frame.insert(key, fitted);
+                    }
+                    return changed;
+                }
                 // LRM §25.9: virtual-interface alias (formal frame or
                 // plain `virtual <iface>` variable). Same as the
                 // hier-Ident path above but for the MemberAccess shape.
@@ -35176,6 +35196,27 @@ impl Simulator {
                 // Prefer the separate-signal read so VPI-forced values stay
                 // in sync with the SV-visible value. Skip short idents and
                 // the dotted name `Class::static_prop` (handled below).
+                // §13.4.2: a member of a SUBROUTINE-LOCAL struct lives in the
+                // call frame under its dotted name — that is exactly where the
+                // write path puts it. The global lookup just below has no frame
+                // check, so a callee whose local shares a bare name with any
+                // process-block local elsewhere read back THAT variable's
+                // member and its own write appeared to vanish: a function
+                // writing `s.a = 8'h32` returned the caller's `s.a`. The frame
+                // check further down never ran, because this returned first.
+                if hier.path.len() > 1 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    if let Some(locals) = self.local_stack.last() {
+                        let dotted = hier
+                            .path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        if let Some(v) = locals.get(&dotted) {
+                            return v.clone();
+                        }
+                    }
+                }
                 if hier.path.len() == 2 {
                     let dotted = format!("{}.{}", hier.path[0].name.name, hier.path[1].name.name);
                     if let Some(v) = self.get_signal_value_by_name(&dotted) {
@@ -38978,6 +39019,15 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §13.4.2: a member of a subroutine-local / formal unpacked
+                // struct is owned by the call frame; read it there before any
+                // module-scope lookup, mirroring the write path. Otherwise a
+                // callee saw an outer scope's same-named variable.
+                if let Some(key) = self.frame_member_key_of(expr, &member.name) {
+                    if let Some(v) = self.local_stack.last().and_then(|l| l.get(&key)) {
+                        return v.clone();
+                    }
+                }
                 // §11.5.1: member of an element selected THROUGH a ranged
                 // port connection — `p[11].hi` over `.p(arr[15:0])` arrives
                 // as MemberAccess{Index{RangeSelect{arr},11},hi}. Rebuild over
@@ -44887,6 +44937,50 @@ impl Simulator {
                         // consult `local_stack.last()` before signals, so the
                         // method still sees its own local. No frame → module/
                         // initial scope → signal table as before.
+                        // §7.2/§13.4.2: an UNPACKED-struct local declared inside
+                        // a subroutine keeps each member in the frame under
+                        // `<name>.<member>` — the convention formal binding
+                        // already uses. Nothing seeded those keys for a local,
+                        // so its member references escaped to the module signal
+                        // table and landed on an unrelated same-named
+                        // variable's member: the callee read the CALLER's value
+                        // back and its own writes vanished. Seeding also makes
+                        // each call's local FRESH, as `automatic` requires.
+                        if !self.local_stack.is_empty() && d.dimensions.is_empty() {
+                            if let crate::ast::types::DataType::Struct(su) =
+                                self.resolve_dt(data_type)
+                            {
+                                if Self::spreads_member_wise(&su) {
+                                    let base = d.name.name.clone();
+                                    let mut seeds: Vec<(String, Value)> = Vec::new();
+                                    for m in &su.members {
+                                        let mw = super::elaborate::resolve_type_width(
+                                            &m.data_type,
+                                            Some(&self.module.parameters),
+                                            Some(&self.module.typedefs),
+                                        );
+                                        let mv = if super::elaborate::is_type_real(&m.data_type) {
+                                            Value::from_f64(0.0)
+                                        } else if super::elaborate::is_type_two_state(&m.data_type) {
+                                            Value::zero(mw)
+                                        } else {
+                                            Value::new(mw)
+                                        };
+                                        for md in &m.declarators {
+                                            seeds.push((
+                                                format!("{}.{}", base, md.name.name),
+                                                mv.clone(),
+                                            ));
+                                        }
+                                    }
+                                    if let Some(frame) = self.local_stack.last_mut() {
+                                        for (k, sv) in seeds {
+                                            frame.insert(k, sv);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if let Some(frame) = self.local_stack.last_mut() {
                             frame.insert(d.name.name.clone(), v);
                         } else {
@@ -54691,6 +54785,14 @@ impl Simulator {
     }
 
     fn get_signal_value_by_name(&self, name: &str) -> Option<Value> {
+        // Mirror of the write path: a dotted name the innermost frame owns is a
+        // member of a subroutine-local / formal unpacked struct and is read from
+        // the frame, never from the module signal table.
+        if name.contains('.') {
+            if let Some(v) = self.local_stack.last().and_then(|l| l.get(name)) {
+                return Some(v.clone());
+            }
+        }
         if !name.contains('.') {
             if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
                 let scoped = format!("{}.{}", hint, name);
@@ -54740,6 +54842,29 @@ impl Simulator {
     }
 
     fn set_signal_value_by_name(&mut self, name: &str, val: Value) {
+        // §13.4.2: a dotted name the innermost call frame OWNS is a member of a
+        // subroutine-local / formal unpacked struct. It must not fall through to
+        // the module signal table, where an outer scope's same-named variable
+        // lives. Only keys the frame already holds are diverted — formal binding
+        // and local declaration are the only things that put them there — so
+        // module-scope names are untouched.
+        if name.contains('.') {
+            if self
+                .local_stack
+                .last()
+                .is_some_and(|l| l.contains_key(name))
+            {
+                let fitted = match self.local_stack.last().and_then(|l| l.get(name)) {
+                    Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
+                    Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    _ => val,
+                };
+                if let Some(frame) = self.local_stack.last_mut() {
+                    frame.insert(name.to_string(), fitted);
+                }
+                return;
+            }
+        }
         if let Some(&id) = self.signal_name_to_id.get(name) {
             let w = self.signal_widths[id];
             // A width-0 signal (e.g. an untracked module-scope class handle)
@@ -68712,6 +68837,31 @@ impl Simulator {
             return false;
         }
         false
+    }
+
+    /// §13.4.2: the call-frame key for `<base>.<member>` when the innermost
+    /// frame owns that member. Members of a subroutine-local or formal UNPACKED
+    /// struct live in the frame under their dotted name — that is where formal
+    /// binding puts them (see `bind_unpacked_struct_arg`) and where a local
+    /// declaration now seeds them. Without consulting the frame, a member
+    /// reference fell through to the module signal table and found an outer
+    /// scope's same-named variable instead.
+    fn frame_struct_member_key(&self, base: &str, member: &str) -> Option<String> {
+        let locals = self.local_stack.last()?;
+        let key = format!("{}.{}", base, member);
+        locals.contains_key(&key).then_some(key)
+    }
+
+    /// The frame key for a member-access lvalue/rvalue whose base is a plain
+    /// identifier, or `None` when the frame does not own it.
+    fn frame_member_key_of(&self, base: &Expression, member: &str) -> Option<String> {
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        self.frame_struct_member_key(&h.path[0].name.name, member)
     }
 
     fn bind_unpacked_struct_arg(
