@@ -27,6 +27,8 @@ mod dump_merged_sv_top_pruning;
 mod final_blocks_hierarchy;
 #[path = "hierarchy/foreach_over_submodule_array.rs"]
 mod foreach_over_submodule_array;
+#[path = "hierarchy/foreach_in_inlined_child.rs"]
+mod foreach_in_inlined_child;
 #[path = "hierarchy/generate_scope_names.rs"]
 mod generate_scope_names;
 #[path = "hierarchy/generic_interface_ports.rs"]
