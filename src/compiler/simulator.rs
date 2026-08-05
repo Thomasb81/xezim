@@ -75625,10 +75625,7 @@ impl Simulator {
                                 val = Value::from_u64(mv, *width);
                             }
                         } else {
-                            if *width <= 64 {
-                                let r: u64 = self.cur_rng().r#gen();
-                                val = Value::from_u64(r, *width);
-                            }
+                            val = self.random_value_of_width(*width);
                         }
                         val.is_signed = sgn;
                         solved_props.insert(name.clone(), val.clone());
@@ -75671,6 +75668,8 @@ impl Simulator {
                     }
                 } else if *width <= 64 {
                     val = Value::from_u64(self.cur_rng().r#gen(), *width);
+                } else {
+                    val = self.random_value_of_width(*width);
                 }
                 val.is_signed = signed_rand_props.contains(name);
                 solved_props.insert(name.clone(), val);
@@ -76901,6 +76900,35 @@ impl Simulator {
     }
 
     /// Uniformly pick a value from one of `choices` (an exact `[lo:hi]` list).
+    /// §18.5: a uniformly random value of ANY width. `Value::from_u64` tops
+    /// out at 64 bits, so wider fields are filled 64 bits at a time — the
+    /// callers previously had a bare `if width <= 64` with no else, leaving a
+    /// wide rand field at `Value::zero(width)` while `randomize()` still
+    /// reported success (a `rand logic [127:0]` was always 0).
+    fn random_value_of_width(&mut self, width: u32) -> Value {
+        use rand::Rng;
+        if width == 0 {
+            return Value::zero(0);
+        }
+        if width <= 64 {
+            let r: u64 = self.cur_rng().r#gen();
+            return Value::from_u64(r, width);
+        }
+        let mut acc = Value::zero(width);
+        let mut bit = 0u32;
+        while bit < width {
+            let chunk: u64 = self.cur_rng().r#gen();
+            let n = (width - bit).min(64);
+            for k in 0..n {
+                if (chunk >> k) & 1 == 1 {
+                    acc.set_bit((bit + k) as usize, LogicBit::One);
+                }
+            }
+            bit += n;
+        }
+        acc
+    }
+
     fn pick_i128_range(
         &mut self,
         choices: &[(i128, i128)],
