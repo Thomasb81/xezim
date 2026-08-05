@@ -5,8 +5,11 @@
 //! `cargo test` wall-clock (the tests themselves run in milliseconds).
 //! The cases now live one directory down and are included here as
 //! modules, so this group links ONCE. Tests, names and assertions are
-//! unchanged — only the link unit is. `#[path]` is required because a
-//! crate root resolves `mod x;` beside itself, not into `tests/<group>/`.
+//! unchanged — only the link unit is.
+//!
+//! The explicit module paths below are required: a crate root resolves a
+//! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
+//! drop the file in this group's directory and add one entry here.
 
 #[path = "types/ansi_port_name_with_unpacked_dim.rs"]
 mod ansi_port_name_with_unpacked_dim;
