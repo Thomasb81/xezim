@@ -54669,10 +54669,25 @@ impl Simulator {
     }
 
     fn packed_leaf_of_hier(&self, full: &str) -> Option<(String, u32, u32)> {
-        let (base, field) = full.rsplit_once('.')?;
-        let fields = self.module.packed_struct_fields.get(base)?;
-        let (_, off, w) = fields.iter().find(|(m, _, _)| m == field)?;
-        Some((base.to_string(), *off, *w))
+        // §7.2.1: try EVERY split point, longest base first. `a.b.c.d` may be
+        // the signal `a.b` with the field path `c.d` — the layout records a
+        // nested member under its dotted path — and not only the signal `a.b.c`
+        // with the field `d`. Splitting at the last dot alone was enough at top
+        // level, where each nested sub-struct also gets a layout of its own
+        // under `s.inner`; through an instance no such key exists, so
+        // `u.s.inner.hi` resolved to nothing and read x while the identical
+        // `s.inner.hi` at top level read correctly.
+        let mut idx = full.len();
+        while let Some(pos) = full[..idx].rfind('.') {
+            let (base, field) = (&full[..pos], &full[pos + 1..]);
+            if let Some(fields) = self.module.packed_struct_fields.get(base) {
+                if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == field) {
+                    return Some((base.to_string(), *off, *w));
+                }
+            }
+            idx = pos;
+        }
+        None
     }
 
     fn get_signal_value_by_name(&self, name: &str) -> Option<Value> {
