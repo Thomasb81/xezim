@@ -31,7 +31,7 @@ fn assert_contains(sim: &xezim::compiler::Simulator, needle: &str) {
     );
 }
 
-const STR_PARAM_SPEC: &str = include_str!("lrm_9_value_param/str_param_spec.sv");
+const STR_PARAM_SPEC: &str = include_str!("../lrm_9_value_param/str_param_spec.sv");
 
 #[test]
 fn value_param_from_specialization_static() {

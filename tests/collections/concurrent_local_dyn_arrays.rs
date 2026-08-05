@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! IEEE 1800-2023 §9.3.2 / §6.21: automatic (default) task/method locals are
 //! per-invocation. Two concurrent task invocations (fork/join siblings) each
 //! declaring `int edges[$]` must NOT share storage. xezim now isolates

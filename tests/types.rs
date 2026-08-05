@@ -1,0 +1,178 @@
+//! Integration-test group: types.
+//!
+//! Every `tests/*.rs` used to build its own ~66 MB binary that statically
+//! links the whole simulator; 374 of them cost 24 GB and dominated
+//! `cargo test` wall-clock (the tests themselves run in milliseconds).
+//! The cases now live one directory down and are included here as
+//! modules, so this group links ONCE. Tests, names and assertions are
+//! unchanged — only the link unit is. `#[path]` is required because a
+//! crate root resolves `mod x;` beside itself, not into `tests/<group>/`.
+
+#[path = "types/ansi_port_name_with_unpacked_dim.rs"]
+mod ansi_port_name_with_unpacked_dim;
+#[path = "types/array_element_declared_signedness.rs"]
+mod array_element_declared_signedness;
+#[path = "types/array_parameter.rs"]
+mod array_parameter;
+#[path = "types/array_query_multidim_packed.rs"]
+mod array_query_multidim_packed;
+#[path = "types/assoc_of_queue_enumeration.rs"]
+mod assoc_of_queue_enumeration;
+#[path = "types/bits_of_signal_in_const_expr.rs"]
+mod bits_of_signal_in_const_expr;
+#[path = "types/bits_package_scoped_type_width.rs"]
+mod bits_package_scoped_type_width;
+#[path = "types/callback_typedef_static.rs"]
+mod callback_typedef_static;
+#[path = "types/cast_typeparam.rs"]
+mod cast_typeparam;
+#[path = "types/cast_valparam_typeparam_static.rs"]
+mod cast_valparam_typeparam_static;
+#[path = "types/cast_value_param_specs.rs"]
+mod cast_value_param_specs;
+#[path = "types/circular_typedef_diagnostics.rs"]
+mod circular_typedef_diagnostics;
+#[path = "types/conditional_real_x_select.rs"]
+mod conditional_real_x_select;
+#[path = "types/const_function_params.rs"]
+mod const_function_params;
+#[path = "types/constructor_new_not_static.rs"]
+mod constructor_new_not_static;
+#[path = "types/constructor_new_property_type.rs"]
+mod constructor_new_property_type;
+#[path = "types/constructor_typedef_dispatch.rs"]
+mod constructor_typedef_dispatch;
+#[path = "types/copy_constructor_decl_init.rs"]
+mod copy_constructor_decl_init;
+#[path = "types/copy_ctor_type_mismatch.rs"]
+mod copy_ctor_type_mismatch;
+#[path = "types/declared_signedness_wins.rs"]
+mod declared_signedness_wins;
+#[path = "types/default_assignment_pattern_packed.rs"]
+mod default_assignment_pattern_packed;
+#[path = "types/defparam_override.rs"]
+mod defparam_override;
+#[path = "types/dollar_lvalue_and_assoc_width.rs"]
+mod dollar_lvalue_and_assoc_width;
+#[path = "types/enum_name_formal_param.rs"]
+mod enum_name_formal_param;
+#[path = "types/enum_next_prev_count.rs"]
+mod enum_next_prev_count;
+#[path = "types/enum_signedness_and_pkg_scope.rs"]
+mod enum_signedness_and_pkg_scope;
+#[path = "types/enum_xz_and_package_shapes.rs"]
+mod enum_xz_and_package_shapes;
+#[path = "types/formal_type_metadata_and_typedef_packed_array.rs"]
+mod formal_type_metadata_and_typedef_packed_array;
+#[path = "types/forward_referenced_parameter.rs"]
+mod forward_referenced_parameter;
+#[path = "types/function_return_width.rs"]
+mod function_return_width;
+#[path = "types/implicit_port_net_and_packed_typedef_array.rs"]
+mod implicit_port_net_and_packed_typedef_array;
+#[path = "types/instance_queue_structs_and_loop_scope.rs"]
+mod instance_queue_structs_and_loop_scope;
+#[path = "types/ivtest_cast_cluster.rs"]
+mod ivtest_cast_cluster;
+#[path = "types/local_localparam_width.rs"]
+mod local_localparam_width;
+#[path = "types/local_packed_struct_alias.rs"]
+mod local_packed_struct_alias;
+#[path = "types/lrm_dynamic_cast.rs"]
+mod lrm_dynamic_cast;
+#[path = "types/lrm_real_cast_case_inside.rs"]
+mod lrm_real_cast_case_inside;
+#[path = "types/lrm_struct_union_dims.rs"]
+mod lrm_struct_union_dims;
+#[path = "types/module_type_param_behavioral.rs"]
+mod module_type_param_behavioral;
+#[path = "types/multi_dim_elem_read_and_param_dims.rs"]
+mod multi_dim_elem_read_and_param_dims;
+#[path = "types/packed_2d_net_element_assign.rs"]
+mod packed_2d_net_element_assign;
+#[path = "types/packed_array_typedef_element_width.rs"]
+mod packed_array_typedef_element_width;
+#[path = "types/packed_assignment_patterns.rs"]
+mod packed_assignment_patterns;
+#[path = "types/packed_element_range_select.rs"]
+mod packed_element_range_select;
+#[path = "types/packed_multidim_unpacked_select.rs"]
+mod packed_multidim_unpacked_select;
+#[path = "types/param_cb_isolation.rs"]
+mod param_cb_isolation;
+#[path = "types/param_signedness_and_generate_scope.rs"]
+mod param_signedness_and_generate_scope;
+#[path = "types/param_sized_array.rs"]
+mod param_sized_array;
+#[path = "types/param_struct_widths_and_nba_patterns.rs"]
+mod param_struct_widths_and_nba_patterns;
+#[path = "types/parameter_const_eval_corners.rs"]
+mod parameter_const_eval_corners;
+#[path = "types/pattern_params_and_call_member.rs"]
+mod pattern_params_and_call_member;
+#[path = "types/power_operator_signedness.rs"]
+mod power_operator_signedness;
+#[path = "types/property_value_param_binding.rs"]
+mod property_value_param_binding;
+#[path = "types/range_select_param_arith.rs"]
+mod range_select_param_arith;
+#[path = "types/real_literal_comb_eval.rs"]
+mod real_literal_comb_eval;
+#[path = "types/real_valued_delay.rs"]
+mod real_valued_delay;
+#[path = "types/shift_context_width.rs"]
+mod shift_context_width;
+#[path = "types/shift_width_and_scope_hint.rs"]
+mod shift_width_and_scope_hint;
+#[path = "types/size_cast_context_and_fn_return_default.rs"]
+mod size_cast_context_and_fn_return_default;
+#[path = "types/static_typedef_singleton.rs"]
+mod static_typedef_singleton;
+#[path = "types/streaming_and_typedef_array_width.rs"]
+mod streaming_and_typedef_array_width;
+#[path = "types/struct_copy_and_queue_ops.rs"]
+mod struct_copy_and_queue_ops;
+#[path = "types/struct_named_patterns.rs"]
+mod struct_named_patterns;
+#[path = "types/struct_unpacked_array_member.rs"]
+mod struct_unpacked_array_member;
+#[path = "types/submodule_packed_struct_member_contassign.rs"]
+mod submodule_packed_struct_member_contassign;
+#[path = "types/tagged_union_matches.rs"]
+mod tagged_union_matches;
+#[path = "types/task_formal_param_width.rs"]
+mod task_formal_param_width;
+#[path = "types/type_param_bound_to_specialization.rs"]
+mod type_param_bound_to_specialization;
+#[path = "types/type_param_static_property.rs"]
+mod type_param_static_property;
+#[path = "types/typedef_declaring_scope.rs"]
+mod typedef_declaring_scope;
+#[path = "types/typedef_specialization_dispatch.rs"]
+mod typedef_specialization_dispatch;
+#[path = "types/typedef_two_state_and_untyped_param_sign.rs"]
+mod typedef_two_state_and_untyped_param_sign;
+#[path = "types/typeparam_default_resolution.rs"]
+mod typeparam_default_resolution;
+#[path = "types/typeparam_typeid_create.rs"]
+mod typeparam_typeid_create;
+#[path = "types/typeref_param_static_local.rs"]
+mod typeref_param_static_local;
+#[path = "types/union_shared_storage.rs"]
+mod union_shared_storage;
+#[path = "types/unit_scope_user_type_var.rs"]
+mod unit_scope_user_type_var;
+#[path = "types/unpacked_array_ports_and_vif_arrays.rs"]
+mod unpacked_array_ports_and_vif_arrays;
+#[path = "types/unpacked_struct_array_members.rs"]
+mod unpacked_struct_array_members;
+#[path = "types/unpacked_struct_func_arg.rs"]
+mod unpacked_struct_func_arg;
+#[path = "types/valparam_spec_cycle.rs"]
+mod valparam_spec_cycle;
+#[path = "types/value_param_specialization.rs"]
+mod value_param_specialization;
+#[path = "types/vcd_param_as_wire.rs"]
+mod vcd_param_as_wire;
+#[path = "types/wide_signed_arith_and_power.rs"]
+mod wide_signed_arith_and_power;
