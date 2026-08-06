@@ -51937,6 +51937,18 @@ impl Simulator {
             _ => self.infer_width(expr),
         }
     }
+    /// Work counters for performance REGRESSION testing.
+    ///
+    /// `(comb entry evaluations, bytecode instructions executed)`. Both are
+    /// deterministic for a given design and run length, which is what makes
+    /// them testable — wall-clock is not. A change that makes the simulator
+    /// do more work to reach the same answer (a broken dirty-set, a
+    /// re-introduced dead instruction, a lost fusion) moves these even when
+    /// every functional test still passes.
+    pub fn work_counters(&self) -> (u64, u64) {
+        (self.entry_evals, self.prof_insns_executed)
+    }
+
     pub fn get_signal(&self, name: &str) -> Option<&Value> {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             return Some(&self.signal_table[id]);
