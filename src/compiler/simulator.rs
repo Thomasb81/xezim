@@ -766,16 +766,15 @@ enum FusedGate {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CombEntry {
     item: CombItem,
-    /// Preferred hierarchical scope for resolving unqualified identifiers.
-    scope_hint: Option<String>,
-    /// Pre-resolved signal IDs for reads (for fast dependency lookup).
-    read_signal_ids: Vec<usize>,
-    /// Pre-resolved signal IDs for writes. The original layout
-    /// stored a `(usize, String)` tuple but every read site
-    /// destructures the String with `_` — name was dead weight.
-    /// At c910 scale (~467K entries × ~5 writes each) the dropped
-    /// String per write reclaims tens of MB.
-    write_signal_ids: Vec<usize>,
+    /// Everything the settle HOT LOOP does not read, behind one pointer.
+    ///
+    /// The eval loop's `entries[eidx]` is an indirect access; at 144 bytes an
+    /// entry straddled 2–3 cache lines and every evaluation paid the extra
+    /// misses (4.5k evals per simulated cycle on the C906 SoC). With the
+    /// three cold containers boxed the entry is 64 bytes — the match on
+    /// `item` plus the two flags touch one line. `cold` is dereferenced only
+    /// during entry construction, diagnostics, and rebuild passes.
+    cold: Box<CombEntryCold>,
     /// True when dependency extraction could not resolve all read signals.
     /// Such entries are conservatively re-evaluated each settle pass.
     has_unresolved_reads: bool,
@@ -791,6 +790,21 @@ struct CombEntry {
     /// stimulus. So: don't seed these from the time-0 dirty set; let the
     /// first real sensitivity transition trigger them.
     defer_at_time0: bool,
+}
+
+/// Cold half of a `CombEntry` — see `CombEntry::cold`.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CombEntryCold {
+    /// Preferred hierarchical scope for resolving unqualified identifiers.
+    scope_hint: Option<String>,
+    /// Pre-resolved signal IDs for reads (for fast dependency lookup).
+    read_signal_ids: Vec<usize>,
+    /// Pre-resolved signal IDs for writes. The original layout
+    /// stored a `(usize, String)` tuple but every read site
+    /// destructures the String with `_` — name was dead weight.
+    /// At c910 scale (~467K entries × ~5 writes each) the dropped
+    /// String per write reclaims tens of MB.
+    write_signal_ids: Vec<usize>,
     /// Source span of the originating construct (cont-assign LHS or always
     /// block statement) so diagnostics — notably the settle-limit warning —
     /// can name file:line for a non-converging driver. `Span::dummy()` when
@@ -10139,8 +10153,8 @@ impl Simulator {
             let want: usize = w.parse().unwrap_or(0);
             for probe in [want, want + 1] {
                 if let Some(e) = self.comb_entries.get(probe) {
-                    let rn: Vec<&str> = e.read_signal_ids.iter().filter_map(|&i| self.id_to_name.get(i).map(|s| s.as_ref())).collect();
-                    let wn: Vec<&str> = e.write_signal_ids.iter().filter_map(|&i| self.id_to_name.get(i).map(|s| s.as_ref())).collect();
+                    let rn: Vec<&str> = e.cold.read_signal_ids.iter().filter_map(|&i| self.id_to_name.get(i).map(|s| s.as_ref())).collect();
+                    let wn: Vec<&str> = e.cold.write_signal_ids.iter().filter_map(|&i| self.id_to_name.get(i).map(|s| s.as_ref())).collect();
                     eprintln!("[ENTRY] #{} kind={} unresolved={} reads={:?} writes={:?}", probe,
                         match &e.item { CombItem::CompiledContAssign{..} => "cca", CombItem::ContAssign{..} => "ca",
                             CombItem::DirectCopy{..} => "dc", CombItem::FastDirectCopy{..} => "fdc",
@@ -10292,9 +10306,10 @@ impl Simulator {
             }
             for entry in &self.comb_entries {
                 for &sid in entry
+                    .cold
                     .read_signal_ids
                     .iter()
-                    .chain(entry.write_signal_ids.iter())
+                    .chain(entry.cold.write_signal_ids.iter())
                 {
                     if sid < total_signals && !is_hot[sid] {
                         is_hot[sid] = true;
@@ -10685,13 +10700,14 @@ impl Simulator {
         // within any level are then guaranteed.
         let mut comb_writer_count: HashMap<usize, u32> = HashMap::default();
         for e in &self.comb_entries {
-            for &w in &e.write_signal_ids {
+            for &w in &e.cold.write_signal_ids {
                 *comb_writer_count.entry(w).or_insert(0) += 1;
             }
         }
         for i in 0..n {
             let e = &self.comb_entries[i];
             let single_writer = e
+                .cold
                 .write_signal_ids
                 .iter()
                 .all(|w| comb_writer_count.get(w).copied().unwrap_or(0) <= 1);
@@ -10745,14 +10761,14 @@ impl Simulator {
                 unresolved += 1;
             }
             let mut lvl = 0u32;
-            for &rs in &e.read_signal_ids {
+            for &rs in &e.cold.read_signal_ids {
                 if let Some(&pl) = sig_prod_level.get(&rs) {
                     if pl + 1 > lvl {
                         lvl = pl + 1;
                     }
                 }
             }
-            for &ws in &e.write_signal_ids {
+            for &ws in &e.cold.write_signal_ids {
                 let cur = sig_prod_level.entry(ws).or_insert(0);
                 if lvl > *cur {
                     *cur = lvl;
@@ -11081,9 +11097,9 @@ impl Simulator {
     pub fn comb_entry_io_at(&self, idx: usize) -> Option<(Option<&str>, &[usize], &[usize])> {
         self.comb_entries.get(idx).map(|e| {
             (
-                e.scope_hint.as_deref(),
-                e.read_signal_ids.as_slice(),
-                e.write_signal_ids.as_slice(),
+                e.cold.scope_hint.as_deref(),
+                e.cold.read_signal_ids.as_slice(),
+                e.cold.write_signal_ids.as_slice(),
             )
         })
     }
@@ -12767,7 +12783,7 @@ impl Simulator {
         for (eidx, e) in self.comb_entries.iter().enumerate() {
             let mut lp: Option<u8> = None;
             let mut straddles = false;
-            for &w in &e.write_signal_ids {
+            for &w in &e.cold.write_signal_ids {
                 if w >= n_signals {
                     continue;
                 }
@@ -12832,7 +12848,7 @@ impl Simulator {
         let mut signal_owner_lp = vec![0xFFu8; n_signals];
         for lp in 0..2usize {
             for &eidx in &lp_entries[lp] {
-                for &wid in &self.comb_entries[eidx].write_signal_ids {
+                for &wid in &self.comb_entries[eidx].cold.write_signal_ids {
                     if wid < n_signals {
                         signal_owner_lp[wid] = lp as u8;
                     }
@@ -12887,7 +12903,7 @@ impl Simulator {
 
         // Class of an entry = class of its (first) write target.
         let entry_class = |e: &CombEntry| -> u8 {
-            e.write_signal_ids
+            e.cold.write_signal_ids
                 .first()
                 .and_then(|&w| {
                     if w < n_signals {
@@ -12905,7 +12921,7 @@ impl Simulator {
         for e in &self.comb_entries {
             let ec = entry_class(e);
             if ec == C0 || ec == C1 {
-                for &r in &e.read_signal_ids {
+                for &r in &e.cold.read_signal_ids {
                     if r < n_signals && sig_class[r] == UNCORE {
                         if ec == C0 {
                             readby_c0[r] = true;
@@ -12955,7 +12971,7 @@ impl Simulator {
                 // Uncore: owner of its write target(s). Disagreement → straddle.
                 let mut chosen: Option<u8> = None;
                 let mut straddles = false;
-                for &w in &e.write_signal_ids {
+                for &w in &e.cold.write_signal_ids {
                     if w >= n_signals {
                         continue;
                     }
@@ -12990,7 +13006,7 @@ impl Simulator {
         let mut signal_owner_lp = vec![0xFFu8; n_signals];
         for lp in 0..2usize {
             for &eidx in &lp_entries[lp] {
-                for &wid in &self.comb_entries[eidx].write_signal_ids {
+                for &wid in &self.comb_entries[eidx].cold.write_signal_ids {
                     if wid < n_signals {
                         signal_owner_lp[wid] = lp as u8;
                     }
@@ -13085,7 +13101,7 @@ impl Simulator {
             }
         }
         for e in &self.comb_entries {
-            for &w in &e.write_signal_ids {
+            for &w in &e.cold.write_signal_ids {
                 if w < n_signals {
                     comb_written[w] = true;
                 }
@@ -13099,8 +13115,8 @@ impl Simulator {
         let mut read_comb = vec![0u8; n_signals];
         let mut read_edge = vec![0u8; n_signals];
         for e in &self.comb_entries {
-            let elp = e.write_signal_ids.first().map(|&w| sig_lp(w)).unwrap_or(B);
-            for &r in &e.read_signal_ids {
+            let elp = e.cold.write_signal_ids.first().map(|&w| sig_lp(w)).unwrap_or(B);
+            for &r in &e.cold.read_signal_ids {
                 if r < n_signals {
                     read_comb[r] |= 1 << elp;
                 }
@@ -13199,7 +13215,7 @@ impl Simulator {
             })
             .collect();
         let entry_lp = |e: &CombEntry| -> u8 {
-            e.write_signal_ids
+            e.cold.write_signal_ids
                 .first()
                 .map(|&w| if w < n_signals { sig_lp[w] } else { 1 })
                 .unwrap_or(1)
@@ -13243,16 +13259,16 @@ impl Simulator {
             rounds += 1;
             let mut changed = false;
             for e in &self.comb_entries {
-                if e.write_signal_ids.is_empty() {
+                if e.cold.write_signal_ids.is_empty() {
                     continue;
                 }
-                for &out in &e.write_signal_ids {
+                for &out in &e.cold.write_signal_ids {
                     if out >= n_signals {
                         continue;
                     }
                     let olp = sig_lp[out];
                     let mut nl = 0u32;
-                    for &r in &e.read_signal_ids {
+                    for &r in &e.cold.read_signal_ids {
                         if r < n_signals {
                             let c = cross[r] + if sig_lp[r] != olp { 1 } else { 0 };
                             if c > nl {
@@ -15815,6 +15831,7 @@ impl Simulator {
             _ => "comb",
         };
         let writes: Vec<&str> = entry
+            .cold
             .write_signal_ids
             .iter()
             .take(3)
@@ -15824,7 +15841,7 @@ impl Simulator {
             "{}#{} scope={} writes={}",
             kind,
             eidx,
-            entry.scope_hint.as_deref().unwrap_or("-"),
+            entry.cold.scope_hint.as_deref().unwrap_or("-"),
             writes.join(",")
         )
     }
@@ -16953,9 +16970,10 @@ impl Simulator {
             && cache.time0_idx.iter().all(|&idx| idx < entry_count)
             && cache.entries.iter().chain(cache.time0_deferred.iter()).all(|entry| {
                 entry
+                    .cold
                     .read_signal_ids
                     .iter()
-                    .chain(entry.write_signal_ids.iter())
+                    .chain(entry.cold.write_signal_ids.iter())
                     .all(|&id| id < signal_count)
             })
             && cache.cont_driven.iter().all(|&id| id < signal_count)
@@ -17577,12 +17595,14 @@ impl Simulator {
             }
             entries.push(CombEntry {
                 item,
-                scope_hint,
-                read_signal_ids: rids,
-                write_signal_ids: wids,
+                cold: Box::new(CombEntryCold {
+                    scope_hint,
+                    read_signal_ids: rids,
+                    write_signal_ids: wids,
+                    span: ca_span,
+                }),
                 has_unresolved_reads,
                 defer_at_time0: false,
-                span: ca_span,
             });
         }
 
@@ -17760,9 +17780,12 @@ impl Simulator {
                 let is_pure_observer = wids.is_empty();
                 entries.push(CombEntry {
                     item,
-                    scope_hint,
-                    read_signal_ids: rids,
-                    write_signal_ids: wids,
+                    cold: Box::new(CombEntryCold {
+                        scope_hint,
+                        read_signal_ids: rids,
+                        write_signal_ids: wids,
+                        span: ab.stmt.span,
+                    }),
                     has_unresolved_reads,
                     // §9.2.2.1: a level-only `always @(sensitivity)` block
                     // suspends at its event control initially and runs only on
@@ -17778,7 +17801,6 @@ impl Simulator {
                     // reference simulator does not produce — defer it.
                     defer_at_time0: !is_always_comb
                         && (is_pure_observer || stmt_has_finish_or_stop(&ab.stmt)),
-                    span: ab.stmt.span,
                 });
             }
         }
@@ -17814,7 +17836,7 @@ impl Simulator {
             // HashMap drops to a few hundred MB at most.
             let mut writers_by_sig: HashMap<usize, Vec<usize>> = HashMap::default();
             for (idx, entry) in entries.iter().enumerate() {
-                for &sig_id in &entry.write_signal_ids {
+                for &sig_id in &entry.cold.write_signal_ids {
                     if sig_id < num_signals {
                         writers_by_sig.entry(sig_id).or_default().push(idx);
                     }
@@ -17840,7 +17862,7 @@ impl Simulator {
             const MAX_WRITERS_PER_NET: usize = 1024;
             let mut capped_warned = false;
             for b in 0..n {
-                for &sid in &entries[b].read_signal_ids {
+                for &sid in &entries[b].cold.read_signal_ids {
                     if sid >= num_signals {
                         continue;
                     }
@@ -17992,7 +18014,7 @@ impl Simulator {
         // that amortizes the boxed destination list and fanout dispatch.
         let mut writer_counts = vec![0u32; num_signals];
         for entry in &entries {
-            for &dst in &entry.write_signal_ids {
+            for &dst in &entry.cold.write_signal_ids {
                 if dst < writer_counts.len() {
                     writer_counts[dst] = writer_counts[dst].saturating_add(1);
                 }
@@ -18034,12 +18056,12 @@ impl Simulator {
                     continue;
                 }
                 if let Some((src_id, dst_ids)) = fanout_replacement[eidx].take() {
-                    entry.read_signal_ids.clear();
-                    entry.read_signal_ids.push(src_id);
-                    entry.write_signal_ids.clear();
-                    entry.write_signal_ids.extend_from_slice(&dst_ids);
+                    entry.cold.read_signal_ids.clear();
+                    entry.cold.read_signal_ids.push(src_id);
+                    entry.cold.write_signal_ids.clear();
+                    entry.cold.write_signal_ids.extend_from_slice(&dst_ids);
                     entry.has_unresolved_reads = false;
-                    entry.scope_hint = None;
+                    entry.cold.scope_hint = None;
                     entry.item = CombItem::FastDirectFanout { src_id, dst_ids };
                 }
                 grouped.push(entry);
@@ -18054,7 +18076,7 @@ impl Simulator {
 
         writer_counts.fill(0);
         for entry in &entries {
-            for &dst in &entry.write_signal_ids {
+            for &dst in &entry.cold.write_signal_ids {
                 if dst < writer_counts.len() {
                     writer_counts[dst] = writer_counts[dst].saturating_add(1);
                 }
@@ -18100,14 +18122,15 @@ impl Simulator {
                     continue;
                 }
                 if let Some((src, dsts, invert)) = buf_replacement[eidx].take() {
-                    entry.read_signal_ids.clear();
-                    entry.read_signal_ids.push(src.sig_id as usize);
-                    entry.write_signal_ids.clear();
+                    entry.cold.read_signal_ids.clear();
+                    entry.cold.read_signal_ids.push(src.sig_id as usize);
+                    entry.cold.write_signal_ids.clear();
                     entry
+                        .cold
                         .write_signal_ids
                         .extend(dsts.iter().map(|dst| dst.sig_id as usize));
                     entry.has_unresolved_reads = false;
-                    entry.scope_hint = None;
+                    entry.cold.scope_hint = None;
                     entry.item = CombItem::FusedBufFanout { src, dsts, invert };
                 }
                 grouped.push(entry);
@@ -18210,20 +18233,21 @@ impl Simulator {
                     continue;
                 }
                 if let Some((common, branches, invert)) = and_replacement[eidx].take() {
-                    entry.read_signal_ids.clear();
-                    entry.read_signal_ids.push(common.sig_id as usize);
+                    entry.cold.read_signal_ids.clear();
+                    entry.cold.read_signal_ids.push(common.sig_id as usize);
                     for branch in branches.iter() {
                         let id = branch.other.sig_id as usize;
-                        if !entry.read_signal_ids.contains(&id) {
-                            entry.read_signal_ids.push(id);
+                        if !entry.cold.read_signal_ids.contains(&id) {
+                            entry.cold.read_signal_ids.push(id);
                         }
                     }
-                    entry.write_signal_ids.clear();
+                    entry.cold.write_signal_ids.clear();
                     entry
+                        .cold
                         .write_signal_ids
                         .extend(branches.iter().map(|branch| branch.dst.sig_id as usize));
                     entry.has_unresolved_reads = false;
-                    entry.scope_hint = None;
+                    entry.cold.scope_hint = None;
                     entry.item = CombItem::FusedAndFanout {
                         common,
                         branches,
@@ -18246,7 +18270,7 @@ impl Simulator {
         // separate small allocations.
         let mut counts: Vec<u32> = vec![0u32; num_signals + 1];
         for entry in entries.iter() {
-            for &sig_id in &entry.read_signal_ids {
+            for &sig_id in &entry.cold.read_signal_ids {
                 if sig_id < num_signals {
                     counts[sig_id + 1] += 1;
                 }
@@ -18263,7 +18287,7 @@ impl Simulator {
         // initialized to the start-offset and bumped per insert.
         let mut cursor: Vec<u32> = dep_offsets[..num_signals].to_vec();
         for (idx, entry) in entries.iter().enumerate() {
-            for &sig_id in &entry.read_signal_ids {
+            for &sig_id in &entry.cold.read_signal_ids {
                 if sig_id < num_signals {
                     let pos = cursor[sig_id] as usize;
                     dep_entries[pos] = idx as u32;
@@ -18379,10 +18403,10 @@ impl Simulator {
                 // `comb_time0_deferred`). always_comb blocks WITH inputs still
                 // settle at time 0 via normal dirty propagation, so excluding
                 // the empty ones here changes nothing for them.
-                if always_comb && e.read_signal_ids.is_empty() {
+                if always_comb && e.cold.read_signal_ids.is_empty() {
                     return None;
                 }
-                if e.read_signal_ids.is_empty() || always_comb {
+                if e.cold.read_signal_ids.is_empty() || always_comb {
                     Some(i)
                 } else {
                     None
@@ -18404,10 +18428,19 @@ impl Simulator {
                         ..
                     }
                 );
-                always_comb && e.read_signal_ids.is_empty()
+                always_comb && e.cold.read_signal_ids.is_empty()
             })
             .cloned()
             .collect();
+        if std::env::var("XEZIM_LAYOUT").is_ok() {
+            eprintln!(
+                "[LAYOUT] CombEntry={}B CombItem={}B Value={}B entries={}",
+                std::mem::size_of::<CombEntry>(),
+                std::mem::size_of::<CombItem>(),
+                std::mem::size_of::<Value>(),
+                entries.len()
+            );
+        }
         self.comb_entries = entries;
         self.write_prepared_comb_cache();
         // Drop AST storage for items we've consumed into comb_entries.
@@ -18730,12 +18763,14 @@ impl Simulator {
                                 table,
                             },
                         },
-                        scope_hint: None,
-                        read_signal_ids: read_ids,
-                        write_signal_ids: write_ids,
+                        cold: Box::new(CombEntryCold {
+                            scope_hint: None,
+                            read_signal_ids: read_ids,
+                            write_signal_ids: write_ids,
+                            span: inst.span,
+                        }),
                         has_unresolved_reads: false,
                         defer_at_time0: false,
-                        span: inst.span,
                     });
                     continue;
                 }
@@ -18782,12 +18817,14 @@ impl Simulator {
             }
             entries.push(CombEntry {
                 item: CombItem::Udp { idx },
-                scope_hint: None,
-                read_signal_ids: read_ids,
-                write_signal_ids: write_ids,
+                cold: Box::new(CombEntryCold {
+                    scope_hint: None,
+                    read_signal_ids: read_ids,
+                    write_signal_ids: write_ids,
+                    span: inst.span,
+                }),
                 has_unresolved_reads: false,
                 defer_at_time0: false,
-                span: inst.span,
             });
             self.has_udp = true;
         }
@@ -18803,12 +18840,14 @@ impl Simulator {
                     event_ref,
                     indices: indices.into_boxed_slice(),
                 },
-                scope_hint: None,
-                read_signal_ids: vec![event_ref.sig_id as usize],
-                write_signal_ids,
+                cold: Box::new(CombEntryCold {
+                    scope_hint: None,
+                    read_signal_ids: vec![event_ref.sig_id as usize],
+                    write_signal_ids,
+                    span: crate::ast::Span::dummy(),
+                }),
                 has_unresolved_reads: false,
                 defer_at_time0: false,
-                span: crate::ast::Span::dummy(),
             });
         }
         if pv && pv_total > 0 {
@@ -21116,11 +21155,12 @@ impl Simulator {
         }
         // Combinational entry writing it: reads are the fan-in.
         for e in &self.comb_entries {
-            if !e.write_signal_ids.contains(&sig_id) {
+            if !e.cold.write_signal_ids.contains(&sig_id) {
                 continue;
             }
             found = true;
             let reads: Vec<String> = e
+                .cold
                 .read_signal_ids
                 .iter()
                 .take(6)
@@ -21132,9 +21172,9 @@ impl Simulator {
                 self.name_for_id(sig_id),
                 self.hang_sig_value(sig_id),
                 reads.join(", "),
-                if e.read_signal_ids.len() > 6 { ", ..." } else { "" }
+                if e.cold.read_signal_ids.len() > 6 { ", ..." } else { "" }
             );
-            for &r in e.read_signal_ids.iter().take(4) {
+            for &r in e.cold.read_signal_ids.iter().take(4) {
                 self.describe_driver_chain(r, indent + 4, depth - 1, visited);
             }
             break;
@@ -23031,9 +23071,9 @@ impl Simulator {
             // Per-entry heap (read/write id vecs, scope_hint strings).
             let mut entry_heap = 0usize;
             for e in &self.comb_entries {
-                entry_heap += e.read_signal_ids.capacity() * 8
-                    + e.write_signal_ids.capacity() * 8
-                    + e.scope_hint.as_ref().map_or(0, |s| s.capacity());
+                entry_heap += e.cold.read_signal_ids.capacity() * 8
+                    + e.cold.write_signal_ids.capacity() * 8
+                    + e.cold.scope_hint.as_ref().map_or(0, |s| s.capacity());
             }
             let st = self.signal_table.capacity() * vs;
             let ceb = self.comb_entries.capacity() * ce;
@@ -23809,14 +23849,14 @@ impl Simulator {
                         self.name_for_id(branch.dst.sig_id as usize)
                     }
                     CombItem::ContAssign { .. } | CombItem::CompiledContAssign { .. } => {
-                        if let Some(&id) = entry.write_signal_ids.first() {
+                        if let Some(&id) = entry.cold.write_signal_ids.first() {
                             self.name_for_id(id)
                         } else {
                             continue;
                         }
                     }
                     CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. } => {
-                        if let Some(&id) = entry.write_signal_ids.first() {
+                        if let Some(&id) = entry.cold.write_signal_ids.first() {
                             self.name_for_id(id)
                         } else {
                             continue;
@@ -24223,10 +24263,11 @@ impl Simulator {
     /// that inline evaluation gets wrong — the process later overwrote what the
     /// block computed — and re-run the block once the process suspends.
     fn note_comb_ran_in_process(&mut self, eidx: usize, entry: &CombEntry) {
-        if entry.write_signal_ids.is_empty() {
+        if entry.cold.write_signal_ids.is_empty() {
             return;
         }
         let snap: Vec<(usize, Value)> = entry
+            .cold
             .write_signal_ids
             .iter()
             .filter(|id| **id < self.signal_table.len())
@@ -24275,10 +24316,10 @@ impl Simulator {
                         )
                     };
                     let saved_ts = self.timescale_scope_override.take();
-                    self.timescale_scope_override = entry.scope_hint.clone();
+                    self.timescale_scope_override = entry.cold.scope_hint.clone();
                     let saved_hint = if compiled.has_fallback {
                         let prev = self.name_resolve_hint.borrow().clone();
-                        if let Some(sc) = entry.scope_hint.as_ref() {
+                        if let Some(sc) = entry.cold.scope_hint.as_ref() {
                             *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
                         }
                         Some(prev)
@@ -28479,7 +28520,7 @@ impl Simulator {
 
         let mut writer_count: Vec<u32> = vec![0u32; nsig];
         for entry in &self.comb_entries {
-            for &d in &entry.write_signal_ids {
+            for &d in &entry.cold.write_signal_ids {
                 if d < nsig {
                     writer_count[d] = writer_count[d].saturating_add(1);
                 }
@@ -30633,14 +30674,14 @@ impl Simulator {
                 continue;
             };
             // Snapshot write targets to detect real changes for the reseed.
-            let write_ids = &entries[eidx].write_signal_ids;
+            let write_ids = &entries[eidx].cold.write_signal_ids;
             self.settle_prev_values.clear();
             for &id in write_ids {
                 self.settle_prev_values
                     .push((id, self.signal_table[id].clone()));
             }
 
-            let scope_hint = entries[eidx].scope_hint.clone();
+            let scope_hint = entries[eidx].cold.scope_hint.clone();
             let saved_hint = self.name_resolve_hint.borrow().clone();
             if let Some(hint) = &scope_hint {
                 *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
@@ -31558,7 +31599,7 @@ impl Simulator {
                 rhs,
                 delay: explicit_delay,
             } => {
-                let scope_hint = entry.scope_hint.clone();
+                let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
                 if let Some(hint) = &scope_hint {
@@ -31630,14 +31671,14 @@ impl Simulator {
                 self.prof_settle_ca_count += 1;
             }
             CombItem::AlwaysBlock { stmt, .. } => {
-                let scope_hint = entry.scope_hint.clone();
+                let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
                 if let Some(hint) = &scope_hint {
                     *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
                 }
                 self.settle_prev_values.clear();
-                for &id in &entry.write_signal_ids {
+                for &id in &entry.cold.write_signal_ids {
                     self.settle_prev_values
                         .push((id, self.signal_table[id].clone()));
                 }
@@ -32234,7 +32275,7 @@ impl Simulator {
                         // $time/%t in a fallback stmt scales to the BLOCK's
                         // module timescale (mirrors the edge-block dispatch).
                         let saved_ts = self.timescale_scope_override.take();
-                        self.timescale_scope_override = entries[eidx].scope_hint.clone();
+                        self.timescale_scope_override = entries[eidx].cold.scope_hint.clone();
                         // A StmtFallback insn re-enters the AST interpreter,
                         // which resolves bare names through the hint — without
                         // it a `foreach (m[i]) m[i] = v;` in a SUBMODULE
@@ -32243,7 +32284,7 @@ impl Simulator {
                         // their ids, so this costs them one bool test.
                         let saved_hint = if compiled.has_fallback {
                             let prev = self.name_resolve_hint.borrow().clone();
-                            if let Some(sc) = entries[eidx].scope_hint.as_ref() {
+                            if let Some(sc) = entries[eidx].cold.scope_hint.as_ref() {
                                 *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
                             }
                             Some(prev)
@@ -32411,12 +32452,12 @@ impl Simulator {
                 };
                 line.push_str(" — driven by ");
                 line.push_str(kind);
-                let src_file = self.scope_src_file(entry.scope_hint.as_deref());
-                if let Some(loc) = self.span_file_line_in(entry.span, src_file) {
+                let src_file = self.scope_src_file(entry.cold.scope_hint.as_deref());
+                if let Some(loc) = self.span_file_line_in(entry.cold.span, src_file) {
                     line.push_str(" at ");
                     line.push_str(&loc);
                 }
-                if let Some(scope) = entry.scope_hint.as_deref().filter(|s| !s.is_empty()) {
+                if let Some(scope) = entry.cold.scope_hint.as_deref().filter(|s| !s.is_empty()) {
                     match self.scope_def_module(Some(scope)) {
                         Some(m) if m != self.module.name => {
                             line.push_str(&format!(" ({}, module {})", scope, m));
@@ -44880,8 +44921,8 @@ impl Simulator {
                             // finds nothing and the value is retained.
                             let mut sources: Vec<usize> = Vec::new();
                             for entry in self.comb_entries.iter() {
-                                if entry.write_signal_ids.contains(&id) {
-                                    sources.extend(entry.read_signal_ids.iter().copied());
+                                if entry.cold.write_signal_ids.contains(&id) {
+                                    sources.extend(entry.cold.read_signal_ids.iter().copied());
                                 }
                             }
                             for src_id in sources {
@@ -50898,20 +50939,21 @@ impl Simulator {
                     CombItem::Noop => continue,
                 };
                 let src_file = e
+                    .cold
                     .scope_hint
                     .as_deref()
                     .and_then(|sc| self.scope_def_module(Some(sc)))
                     .and_then(|m| self.module.src_file_of_module.get(&m).copied());
                 let at = self
-                    .span_file_line_in(e.span, src_file)
+                    .span_file_line_in(e.cold.span, src_file)
                     .map(|l| format!(" at {}", l))
                     .unwrap_or_default();
-                let scope = match e.scope_hint.as_deref() {
+                let scope = match e.cold.scope_hint.as_deref() {
                     Some(sc) if !sc.is_empty() => format!(" [in {}]", sc),
                     _ => String::new(),
                 };
                 let line = format!("{}{}{}", kind, at, scope);
-                for &wid in e.write_signal_ids.iter() {
+                for &wid in e.cold.write_signal_ids.iter() {
                     map.entry(wid).or_default().push(line.clone());
                 }
             }
@@ -85414,8 +85456,8 @@ pub extern "C" fn vpi_put_value(
             // signals to dirty_list. This ensures settle sees the source as dirty
             // and triggers the comb entry through the dep_entries mechanism.
             for entry in sim.comb_entries.iter() {
-                if entry.write_signal_ids.contains(&sig_id) {
-                    for &src_id in &entry.read_signal_ids {
+                if entry.cold.write_signal_ids.contains(&sig_id) {
+                    for &src_id in &entry.cold.read_signal_ids {
                         if src_id < sim.dirty_signals.len() && !sim.dirty_signals[src_id] {
                             sim.dirty_signals[src_id] = true;
                             sim.dirty_list.push(src_id);
