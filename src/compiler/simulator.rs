@@ -3330,6 +3330,11 @@ pub struct Simulator {
     /// (a stack — a constraint/post_randomize may randomize another object).
     /// `cur_rng` consults the top of this stack first.
     obj_rng_stack: Vec<usize>,
+    /// §8.10: property names declared by MORE than one class of some object's
+    /// inheritance chain. Non-leaf declarers' copies are stored under
+    /// `"<Class>::<name>"`; the set is the cheap gate that keeps every
+    /// unshadowed access on the bare-name fast path.
+    shadowed_prop_names: HashSet<String>,
     /// §18.11: when `obj.randomize(a, b)` names a MEMBER SUBSET, only those
     /// properties are solved; every other rand member keeps its current value
     /// and acts as state. Empty/None means the ordinary whole-object form.
@@ -6155,6 +6160,7 @@ impl Simulator {
             obj_rng: HashMap::default(),
             obj_rng_stack: Vec::new(),
             randomize_subset: None,
+            shadowed_prop_names: HashSet::default(),
             settling: false,
             in_edge_block: false,
             edge_pass_depth: 0,
@@ -32398,7 +32404,7 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
-        if let Some(rewritten) = Self::super_as_this(lhs) {
+        if let Some(rewritten) = self.super_rewrite(lhs) {
             return self.assign_value(&rewritten, val);
         }
         // §25.8/§25.9: a write through a bound virtual interface lands on the
@@ -32635,15 +32641,21 @@ impl Simulator {
                     // Check 'this' properties
                     if let Some(Some(handle)) = self.this_stack.last() {
                         let handle = *handle;
+                        // §8.10: a base method's write to a shadowed name must
+                        // land in the base's own copy, or it silently leaks
+                        // into the derived's.
+                        let key = self
+                            .shadowed_prop_key(name, false)
+                            .unwrap_or_else(|| name.clone());
                         let holds = self
                             .heap
                             .get(handle)
                             .and_then(|o| o.as_ref())
-                            .is_some_and(|i| i.properties.contains_key(name));
+                            .is_some_and(|i| i.properties.contains_key(&key));
                         if holds {
-                            let fitted = self.fit_class_prop(handle, name, val);
+                            let fitted = self.fit_class_prop(handle, &key, val);
                             if let Some(Some(instance)) = self.heap.get_mut(handle) {
-                                instance.properties.insert(name.clone(), fitted);
+                                instance.properties.insert(key, fitted);
                                 return true;
                             }
                         }
@@ -35334,7 +35346,7 @@ impl Simulator {
         // OWNS — `s.a`, `s.inner.x`, `s.arr[2]`. Read it from the frame, as the
         // write path does; otherwise the lookups below reach module scope and
         // return an unrelated same-named variable's member.
-        if let Some(rewritten) = Self::super_as_this(expr) {
+        if let Some(rewritten) = self.super_rewrite(expr) {
             return self.eval_expr_ctx(&rewritten, ctx_width);
         }
         // §25.8/§25.9: any chain rooted at a bound virtual interface reads as
@@ -35698,8 +35710,14 @@ impl Simulator {
                         .unwrap_or(false);
                     if !is_static_prop {
                         if let Some(Some(handle)) = self.this_stack.last() {
+                            // §8.10: a shadowed property resolves to the copy
+                            // the EXECUTING method's class declares, not the
+                            // leaf's.
+                            let key = self
+                                .shadowed_prop_key(name, false)
+                                .unwrap_or_else(|| name.clone());
                             if let Some(Some(instance)) = self.heap.get(*handle) {
-                                if let Some(val) = instance.properties.get(name) {
+                                if let Some(val) = instance.properties.get(&key) {
                                     return val.clone();
                                 }
                             }
@@ -55672,6 +55690,25 @@ impl Simulator {
                 return Some(v);
             }
         }
+        // §8.10/§6.16: an INSTANCE property as a built-in method receiver —
+        // `n.len()` inside a class method fetches its receiver by NAME through
+        // here, and nothing consulted the heap: every string builtin on a
+        // property read an empty string and the `.len()` tail returned a
+        // silent 0. Shadow-resolved, so a base method's `n` names the base's
+        // copy.
+        if let Some(Some(handle)) = self.this_stack.last() {
+            let key = self
+                .shadowed_prop_key(name, false)
+                .unwrap_or_else(|| name.to_string());
+            if let Some(v) = self
+                .heap
+                .get(*handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(&key))
+            {
+                return Some(v.clone());
+            }
+        }
         None
     }
 
@@ -59668,6 +59705,59 @@ impl Simulator {
 
     /// Clamp `val` to a class property's declared width. Values that already
     /// fit are returned unchanged, so nothing is disturbed for the common case.
+    /// §8.10: the storage key a reference to `name` must use when the property
+    /// is SHADOWED — declared by more than one class in the current object's
+    /// chain. Each declaration is its own variable: a base method's `s` names
+    /// the base's copy even when the object's leaf class re-declares `s`. The
+    /// viewing class is the executing method's DECLARING class (the context
+    /// stack); `from_super` starts one class higher, which is what makes
+    /// `super.s` skip the leaf's declaration. `None` keeps the bare-name path:
+    /// unshadowed names, external accesses, and the leaf-most declarer's own
+    /// methods all store under the bare key.
+    fn shadowed_prop_key(&self, name: &str, from_super: bool) -> Option<String> {
+        if self.shadowed_prop_names.is_empty() || !self.shadowed_prop_names.contains(name) {
+            return None;
+        }
+        let ctx = self.class_context_stack.last().cloned().flatten()?;
+        let viewing = if from_super {
+            self.module.classes.get(&ctx)?.extends.clone()?
+        } else {
+            ctx
+        };
+        // Nearest declarer at or above the viewing class.
+        let mut cur = Some(viewing);
+        let mut target: Option<String> = None;
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if cd.properties.contains_key(name) {
+                target = Some(cn);
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        let target = target?;
+        // The leaf-most declarer for the CURRENT object.
+        let handle = self.this_stack.last().copied().flatten()?;
+        let leaf = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let mut cur = Some(leaf);
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if cd.properties.contains_key(name) {
+                return if cn == target {
+                    None
+                } else {
+                    Some(format!("{}::{}", target, name))
+                };
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
     fn fit_class_prop(&self, handle: usize, prop: &str, val: &Value) -> Value {
         // The property's DECLARED signedness governs the stored value when a
         // resize is needed — not the RHS literal's. A `bit` field is unsigned,
@@ -73081,6 +73171,24 @@ impl Simulator {
             }
             out
         };
+        // §8.10: a property redeclared in a derived class is a SEPARATE
+        // variable — the chain has one copy per declaring class. Seeding
+        // everything under the bare name collapsed them into one slot (the
+        // loop runs root-to-leaf, so the derived silently overwrote the
+        // base's), and a base method's write became visible to the derived —
+        // including across TYPES, where a base `string` read back a derived
+        // `int`'s bits. The leaf-most declarer keeps the bare key; every
+        // other declarer stores under `"<Class>::<name>"`.
+        let leaf_declarer: HashMap<String, String> = {
+            let mut m: HashMap<String, String> = HashMap::default();
+            for cdef in &classes_to_init {
+                // leaf-first: the first declarer seen is the leaf-most.
+                for p in cdef.properties.keys() {
+                    m.entry(p.clone()).or_insert_with(|| cdef.name.clone());
+                }
+            }
+            m
+        };
         for cdef in classes_to_init.iter().rev() {
             for (prop_name, prop_sig) in &cdef.properties {
                 // Static properties live in the shared `class_statics`
@@ -73092,9 +73200,15 @@ impl Simulator {
                 {
                     continue;
                 }
+                let key = if leaf_declarer.get(prop_name).is_some_and(|l| *l != cdef.name) {
+                    self.shadowed_prop_names.insert(prop_name.clone());
+                    format!("{}::{}", cdef.name, prop_name)
+                } else {
+                    prop_name.clone()
+                };
                 instance
                     .properties
-                    .insert(prop_name.clone(), prop_sig.value.clone());
+                    .insert(key, prop_sig.value.clone());
             }
             // Bind class VALUE parameters (§8.25): each parameter gets the
             // specialization's argument (on the leaf class only, matched by
@@ -82159,6 +82273,51 @@ impl Simulator {
     /// never a call's callee) keeps `super.foo()` dispatching to the base while
     /// fixing property access, which otherwise flattened to the phantom name
     /// "super.p": reads returned 0 and writes vanished silently.
+    /// §8.10 + §8.15: `super.<p>` where `p` is SHADOWED must reach the
+    /// nearest strict-ancestor declarer's copy. Rewriting to `this.<p>` (what
+    /// the unshadowed path correctly does) would re-resolve from the executing
+    /// class and find the wrong copy, so the member is renamed to the
+    /// qualified storage key outright.
+    fn super_rewrite(&self, e: &Expression) -> Option<Expression> {
+        if !self.shadowed_prop_names.is_empty() {
+            let member: Option<(&str, crate::ast::Span)> = match &e.kind {
+                ExprKind::Ident(h)
+                    if h.path.len() == 2
+                        && h.path[0].name.name == "super"
+                        && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    Some((h.path[1].name.name.as_str(), e.span))
+                }
+                ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+                    ExprKind::Ident(bh)
+                        if bh.path.len() == 1 && bh.path[0].name.name == "super" =>
+                    {
+                        Some((member.name.as_str(), e.span))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((m, span)) = member {
+                if m != "new" {
+                    if let Some(qkey) = self.shadowed_prop_key(m, true) {
+                        return Some(Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(Expression::new(ExprKind::This, span)),
+                                member: crate::ast::Identifier {
+                                    name: qkey,
+                                    span,
+                                },
+                            },
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        Self::super_as_this(e)
+    }
+
     fn super_as_this(e: &Expression) -> Option<Expression> {
         match &e.kind {
             // Flat form, as written outside a subroutine body.

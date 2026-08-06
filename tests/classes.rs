@@ -105,6 +105,8 @@ mod randomize_member_subset;
 mod class_property_packed_selects;
 #[path = "classes/module_scope_derived_constraints.rs"]
 mod module_scope_derived_constraints;
+#[path = "classes/shadowed_property_storage.rs"]
+mod shadowed_property_storage;
 #[path = "classes/super_property_access.rs"]
 mod super_property_access;
 #[path = "classes/subroutine_local_unpacked_structs.rs"]
