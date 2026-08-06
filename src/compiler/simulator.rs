@@ -40893,6 +40893,29 @@ impl Simulator {
                 // at X. Covers struct variables, array/queue elements and
                 // struct members, in any combination.
                 if let Some(dst) = self.flat_member_name(lvalue) {
+                    // §7.2/§23.10: inside an INLINED child's process the lvalue
+                    // may still carry the child's own spelling — a reference
+                    // through a nested instance (`li.us2` in a non-top holder)
+                    // is not in `local_names`, so the inlining rewrite leaves
+                    // it unprefixed. Reads survive via the runtime scope hint;
+                    // this type lookup bypassed it, so the whole-struct copy
+                    // silently declined and every member stayed x — while the
+                    // identical code at top level worked.
+                    let dst = if self.p_elem_type(&dst).is_none() {
+                        match self.name_resolve_hint.borrow().clone() {
+                            Some(h) => {
+                                let scoped = format!("{}.{}", h, dst);
+                                if self.p_elem_type(&scoped).is_some() {
+                                    scoped
+                                } else {
+                                    dst
+                                }
+                            }
+                            None => dst,
+                        }
+                    } else {
+                        dst
+                    };
                     if let Some(dt) = self.p_elem_type(&dst) {
                         if let DataType::Struct(su) = self.resolve_dt(&dt) {
                             if Self::spreads_member_wise(&su) {
