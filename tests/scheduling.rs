@@ -13,6 +13,8 @@
 
 #[path = "scheduling/wait_fork_immediate_children.rs"]
 mod wait_fork_immediate_children;
+#[path = "scheduling/comb_collection_element_sensitivity.rs"]
+mod comb_collection_element_sensitivity;
 #[path = "scheduling/computed_edge_expressions.rs"]
 mod computed_edge_expressions;
 #[path = "scheduling/active_region_fifo.rs"]

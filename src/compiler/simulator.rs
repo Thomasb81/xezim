@@ -5193,7 +5193,29 @@ impl Simulator {
                     });
             }
         }
-        let queue_names: Vec<String> = module.dynamic_arrays.iter().cloned().collect();
+        // The `.size` signal doubles as a collection's comb-dependency proxy —
+        // associative arrays need one too, or element reads have nothing to
+        // depend on (§9.2.2.2).
+        let queue_names: Vec<String> = module
+            .dynamic_arrays
+            .iter()
+            .cloned()
+            .chain(
+                module
+                    .associative_arrays
+                    .keys()
+                    // A `[N]` unpacked dim first registers as associative and
+                    // may ALSO be a fixed array by now — those have per-element
+                    // ids and need no proxy, and giving one a `.size` signal
+                    // broke the fixed array's own name resolution.
+                    .filter(|n| {
+                        !module.arrays.contains_key(*n)
+                            && !module.arrays_2d.contains_key(*n)
+                            && !module.arrays_nd.contains_key(*n)
+                    })
+                    .cloned(),
+            )
+            .collect();
         for q in queue_names {
             let sz_name = format!("{}.size", q);
             module.signals.entry(sz_name.clone()).or_insert_with(|| {
@@ -19692,7 +19714,16 @@ impl Simulator {
                     // A dynamic array / queue keeps its elements in the runtime
                     // map with no per-element id — depend on the `.size` proxy,
                     // which every mutation marks dirty (see Simulator::new).
-                    if module.dynamic_arrays.contains(&name) {
+                    if module.dynamic_arrays.contains(&name)
+                        || (module.associative_arrays.contains_key(&name)
+                            && !module.arrays.contains_key(&name)
+                            && !module.arrays_2d.contains_key(&name)
+                            && !module.arrays_nd.contains_key(&name))
+                    {
+                        // §9.2.2.2: an ASSOCIATIVE array had no proxy at all,
+                        // so a comb block reading `aa[k]` recorded NO
+                        // dependency and never re-fired. It now shares the
+                        // `.size` proxy the dynamic/queue case uses.
                         reads.insert(format!("{}.size", name));
                     } else if let Some((lo, hi, _)) = module.arrays.get(&name) {
                         if let Some(i) = Self::constant_array_index(index, module) {
@@ -32989,6 +33020,7 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k] = v` writes
                 // element k of the queue `q[i]` (§7.4.5), not a bit of a scalar.
                 if let Some(qn) = self.indexed_queue_base(expr) {
@@ -33182,6 +33214,9 @@ impl Simulator {
                     };
                     let changed = self.signals.get(&elem_name) != Some(&fitted);
                     self.signals.insert(elem_name, fitted);
+                    if changed {
+                        self.touch_queue(&an);
+                    }
                     return changed;
                 }
                 // N-dimensional (N >= 3) unpacked array element assignment
@@ -33389,6 +33424,19 @@ impl Simulator {
                             if changed {
                                 self.signals.insert(elem_name.clone(), val.clone());
                                 self.mark_dirty(&elem_name);
+                                // §9.2.2.2: a queue/dyn/assoc ELEMENT has no
+                                // signal id of its own — comb readers depend on
+                                // the collection's `.size` proxy, so mark it or
+                                // `always_comb` blocks reading `q[i]` never
+                                // re-fire on an element write.
+                                if let Some(b) = elem_name.find('[').map(|i| &elem_name[..i]) {
+                                    if self.module.dynamic_arrays.contains(b)
+                                        || self.module.associative_arrays.contains_key(b)
+                                    {
+                                        let b = b.to_string();
+                                        self.touch_queue(&b);
+                                    }
+                                }
                             }
                             return changed;
                         }
@@ -33656,6 +33704,14 @@ impl Simulator {
                             sim_dbg_eprintln!("[DEBUG] signal {} changed to {:?}", elem_name, fitted);
                             self.signals.insert(elem_name.clone(), fitted);
                             self.mark_dirty(&elem_name);
+                            // §9.2.2.2: comb readers of `aa[k]` depend on the
+                            // collection's `.size` proxy, not the per-key
+                            // entry — mark it or they never re-fire.
+                            if self.is_associative_array(&name)
+                                || self.module.dynamic_arrays.contains(&name)
+                            {
+                                self.touch_queue(&name);
+                            }
                         }
                         return changed;
                     }
@@ -55220,6 +55276,21 @@ impl Simulator {
                 self.dirty_any = true;
                 write_sig!(self, id, resized);
                 self.table_modified = true;
+                // §9.2.2.2: a queue / dynamic / associative ELEMENT that
+                // happens to own a table id still isn't what comb readers
+                // depend on — a variable-index read (`q[i]`) registers the
+                // collection's `.size` proxy instead. Marking only the
+                // element's own id left such a block permanently stale after
+                // `q[0] = v`, while `push_back` (which resizes) woke it fine.
+                if let Some(base) = name.find('[').map(|i| &name[..i]) {
+                    if !base.is_empty()
+                        && (self.module.dynamic_arrays.contains(base)
+                            || self.module.associative_arrays.contains_key(base))
+                    {
+                        let base = base.to_string();
+                        self.touch_queue(&base);
+                    }
+                }
             }
             return;
         }
@@ -55271,7 +55342,10 @@ impl Simulator {
         // runtime map — mark the queue's `.size` comb proxy dirty so readers
         // re-fire (see Simulator::new).
         if let Some(base) = name.find('[').map(|i| &name[..i]) {
-            if !base.is_empty() && self.module.dynamic_arrays.contains(base) {
+            if !base.is_empty()
+                && (self.module.dynamic_arrays.contains(base)
+                    || self.module.associative_arrays.contains_key(base))
+            {
                 let base = base.to_string();
                 self.signals.insert(name.to_string(), val);
                 self.touch_queue(&base);
