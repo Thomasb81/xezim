@@ -33023,6 +33023,24 @@ impl Simulator {
 
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k] = v` writes
                 // element k of the queue `q[i]` (§7.4.5), not a bit of a scalar.
+                // §7.4.2: a write to an N-D fixed-array class-property
+                // element lands in its per-instance cell, like the read.
+                if !self.heap.is_empty() {
+                    if let Some(nm) = self.class_nd_elem_name(expr, index) {
+                        let prev = self.get_signal_value_by_name(&nm);
+                        let fitted = match prev.as_ref() {
+                            Some(p) if !p.is_real && !val.is_real && p.width > 0 => {
+                                val.resize(p.width)
+                            }
+                            _ => val.clone(),
+                        };
+                        let changed = prev.as_ref() != Some(&fitted);
+                        if changed {
+                            self.signals.insert(nm, fitted);
+                        }
+                        return changed;
+                    }
+                }
                 if let Some(qn) = self.indexed_queue_base(expr) {
                     // `$` is the last valid index of THIS queue.
                     self.dollar_bound.push(self.get_queue_size(&qn) as i64 - 1);
@@ -36922,6 +36940,15 @@ impl Simulator {
                     return self
                         .get_signal_value_by_name(&format!("{}[{}]", arr_name, src_i))
                         .unwrap_or_else(|| Value::new(32));
+                }
+                // §7.4.2: an element of an N-D fixed-array CLASS property —
+                // `obj.m[i][j]` — resolves to its per-instance cell.
+                if !self.heap.is_empty() {
+                    if let Some(nm) = self.class_nd_elem_name(expr, index) {
+                        if let Some(v) = self.get_signal_value_by_name(&nm) {
+                            return v;
+                        }
+                    }
                 }
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k]` selects
                 // element k of the queue `q[i]` (§7.4.5). Without this the base
@@ -65201,6 +65228,85 @@ impl Simulator {
     /// If `name` is a bare identifier naming an associative-array property
     /// of the current class context (and `this` is a live handle), return
     /// the instance-scoped storage name `<handle>#<name>`.
+    /// §7.4.2: the flat storage name of an N-D fixed-array CLASS-property
+    /// element — `obj.m[i][j]` → `<handle>#m[i][j]`, any depth, `this`/bare
+    /// receivers included. Every per-element cell exists (construction seeds
+    /// the whole shape), but no read or write path resolved the chain: the
+    /// property fell through to a packed bit-select of its unused scalar cell,
+    /// so `[0][0]` read a stray bit and everything else read x — while the 1-D
+    /// `obj.m[i]` beside it worked (`expr_assoc_name` covers 1-D).
+    fn class_nd_elem_name(
+        &mut self,
+        base: &Expression,
+        outer_index: &Expression,
+    ) -> Option<String> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        // Collect the index chain innermost-first: base may be
+        // Index{Index{recv, i}, j} for deeper shapes.
+        let mut idxs: Vec<i64> = vec![self.eval_expr(outer_index).to_i64()?];
+        let mut cur = base;
+        while let ExprKind::Index { expr: b, index } = &cur.kind {
+            idxs.push(self.eval_expr(index).to_i64()?);
+            cur = b;
+        }
+        // The receiver: `obj.m` / `this.m` (MemberAccess or 2-seg Ident), or a
+        // bare `m` inside a method.
+        let (handle, member) = match &cur.kind {
+            ExprKind::MemberAccess { expr: recv, member } => {
+                let h = match &recv.kind {
+                    ExprKind::This => self.this_stack.last().copied().flatten()?,
+                    _ => self.eval_expr(recv).to_u64().map(|h| h as usize)?,
+                };
+                (h, member.name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) => {
+                let obj = &h.path[0].name.name;
+                let hh = if obj == "this" || obj == "super" {
+                    self.this_stack.last().copied().flatten()?
+                } else {
+                    self.eval_ident_handle(obj)?
+                };
+                (hh, h.path[1].name.name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let hh = self.this_stack.last().copied().flatten()?;
+                (hh, h.path[0].name.name.clone())
+            }
+            _ => return None,
+        };
+        if handle == 0 {
+            return None;
+        }
+        let cn = self
+            .heap
+            .get(handle)
+            .and_then(|x| x.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let mut cur_cn = Some(cn);
+        let mut found = false;
+        while let Some(c) = cur_cn {
+            let cd = self.module.classes.get(&c)?;
+            if let Some((shape, _)) = cd.array_nd_properties.get(&member) {
+                if shape.len() != idxs.len() {
+                    return None;
+                }
+                found = true;
+                break;
+            }
+            cur_cn = cd.extends.clone();
+        }
+        if !found {
+            return None;
+        }
+        let mut name = format!("{}#{}", handle, member);
+        for i in idxs.iter().rev() {
+            name.push_str(&format!("[{}]", i));
+        }
+        Some(name)
+    }
+
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
         if name.contains('#') || name.contains('.') || name.contains('[') {
             return None;
@@ -76287,6 +76393,11 @@ impl Simulator {
         // elem_width, enum_type). Randomized element-by-element after the scalar
         // fields they may exclude (sp/tp/scratch_reg) are solved.
         let mut rand_arrays: Vec<(String, String, i64, i64, u32, Option<String>)> = Vec::new();
+        // §18.4: N-D fixed rand arrays. These lived in NEITHER element pipeline
+        // — not in `rand_arrays` (built from the 1-D table only) and skipped by
+        // the collection pipeline (`CollKind::Fixed`) — so nothing seeded them
+        // and nothing coordinated a foreach constraint with a baseline.
+        let mut rand_nd_arrays: Vec<(String, String, Vec<(i64, i64)>, u32)> = Vec::new();
         // §18.4 classification input: rand prop -> its declared type name.
         let mut prop_type_names: HashMap<String, String> = HashMap::default();
 
@@ -76326,6 +76437,14 @@ impl Simulator {
                             hi,
                             w,
                             enum_t.clone(),
+                        ));
+                    }
+                    if let Some((shape, w)) = class_def.array_nd_properties.get(prop) {
+                        rand_nd_arrays.push((
+                            prop.clone(),
+                            format!("{}#{}", handle, prop),
+                            shape.clone(),
+                            *w,
                         ));
                     }
                     // A dynamic array / queue / associative member has no
@@ -77572,6 +77691,50 @@ impl Simulator {
                     };
                     self.signals
                         .insert(format!("{}[{}]", scoped, i), Value::from_u64(v, *width));
+                }
+            }
+
+            // N-D fixed rand arrays: fresh per-element baseline over the whole
+            // shape, unless a positive foreach body owns the array (same
+            // skip-set as the 1-D pool pass above).
+            for (prop, scoped, shape, width) in &rand_nd_arrays {
+                if foreach_constrained_arrays.contains(prop) {
+                    continue; // solve_forced will handle this in the next pass
+                }
+                if shape.iter().any(|&(lo, hi)| hi < lo) {
+                    continue;
+                }
+                let mut idx: Vec<i64> = shape.iter().map(|d| d.0).collect();
+                loop {
+                    let suffix: String =
+                        idx.iter().map(|i| format!("[{}]", i)).collect();
+                    let v = if *width <= 64 {
+                        let mask = if *width >= 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << *width) - 1
+                        };
+                        self.cur_rng().r#gen::<u64>() & mask
+                    } else {
+                        0
+                    };
+                    self.signals
+                        .insert(format!("{}{}", scoped, suffix), Value::from_u64(v, *width));
+                    let mut k = shape.len();
+                    loop {
+                        if k == 0 {
+                            break;
+                        }
+                        k -= 1;
+                        idx[k] += 1;
+                        if idx[k] <= shape[k].1 {
+                            break;
+                        }
+                        idx[k] = shape[k].0;
+                    }
+                    if idx.iter().zip(shape.iter()).all(|(i, d)| *i == d.0) {
+                        break;
+                    }
                 }
             }
 
@@ -79333,43 +79496,90 @@ impl Simulator {
                 }
                     }
                 }
-                let (lo, hi, _w) = match range {
-                    Some(r) => r,
-                    None => return false,
+                // §18.5.8: the shape may be MULTI-dimensional. Only the 1-D
+                // table was consulted and only vars[0] was bound, so a
+                // `foreach (m[i,j])` constraint found no range and was dropped
+                // silently — randomize() still returned 1 and every element
+                // came out unconstrained.
+                let dims: Vec<(i64, i64)> = match range {
+                    Some((lo, hi, _w)) => vec![(lo, hi)],
+                    None => {
+                        let mut nd: Option<Vec<(i64, i64)>> = None;
+                        if let Some(mut cn) = self
+                            .heap
+                            .get(handle)
+                            .and_then(|x| x.as_ref())
+                            .map(|i| i.class_name.clone())
+                        {
+                            loop {
+                                let Some(cd) = self.module.classes.get(&cn) else {
+                                    break;
+                                };
+                                if let Some((shape, _)) = cd.array_nd_properties.get(&arr_name) {
+                                    nd = Some(shape.clone());
+                                    break;
+                                }
+                                match cd.extends.clone() {
+                                    Some(p) => cn = p,
+                                    None => break,
+                                }
+                            }
+                        }
+                        match nd {
+                            Some(sh) => sh,
+                            None => return false,
+                        }
+                    }
                 };
-                let idx_var: Option<String> = vars
-                    .first()
-                    .and_then(|v| v.as_ref().map(|id| id.name.clone()));
-                let idx_name = match idx_var {
-                    Some(n) => n,
-                    None => return false,
-                };
+                // One loop variable per leading dimension (§12.7.3).
+                let idx_names: Vec<String> = vars
+                    .iter()
+                    .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
+                    .collect();
+                if idx_names.is_empty() || idx_names.len() > dims.len() {
+                    return false;
+                }
+                let used = &dims[..idx_names.len()];
+                if used.iter().any(|&(lo, hi)| hi < lo) {
+                    return false;
+                }
                 let mut changed = false;
-                // For each index value, evaluate the body with `i` bound.
-                for i in lo..=hi {
-                    // Bind the genvar-like index into local_stack as a u64.
+                let mut idx: Vec<i64> = used.iter().map(|d| d.0).collect();
+                loop {
+                    // Bind every index and address the element by its full
+                    // index path — `arr[i][j]`, not just the first dimension.
                     let mut frame: HashMap<String, Value> = HashMap::default();
-                    frame.insert(idx_name.clone(), Value::from_u64(i as u64, 32));
+                    let mut suffix = String::new();
+                    for (k, nm) in idx_names.iter().enumerate() {
+                        frame.insert(nm.clone(), Value::from_u64(idx[k] as u64, 32));
+                        suffix.push_str(&format!("[{}]", idx[k]));
+                    }
                     self.local_stack.push(frame);
-                    // Substitute `arr[i]` → `arr[<concrete>]` doesn't need to
-                    // happen explicitly: rand_lvalue_name etc. walk the
-                    // current local_stack first. We just need solve_forced
-                    // on the body, using a rand_set that includes the
-                    // per-element name `arr[i]`.
                     let mut elem_rand_set = rand_set.clone();
-                    elem_rand_set.insert(format!("{}[{}]", arr_name, i));
+                    elem_rand_set.insert(format!("{}{}", arr_name, suffix));
                     if self.solve_forced_array_elem(
                         handle,
                         body.as_ref(),
                         &elem_rand_set,
                         &arr_name,
-                        i,
+                        &suffix,
                     ) {
                         changed = true;
                     }
                     self.local_stack.pop();
+                    let mut k = used.len();
+                    loop {
+                        if k == 0 {
+                            return changed;
+                        }
+                        k -= 1;
+                        idx[k] += 1;
+                        if idx[k] <= used[k].1 {
+                            break;
+                        }
+                        idx[k] = used[k].0;
+                    }
                 }
-                changed
             }
             // §18.5.5 `unique {arr}` over a whole rand fixed array: make the
             // elements pairwise distinct. (Multi-expression `unique` lists
@@ -79476,13 +79686,26 @@ impl Simulator {
     /// Foreach helper: given the loop index already bound on the local frame,
     /// solve a constraint body for `arr[i]`. The element's flat name
     /// `arr[<i>]` is the target rather than the bare `arr`.
+    /// True when `e` is a chain of index selects rooted at the bare name
+    /// `arr` — `m[i]` and `m[i][j]` alike. One level of `Index` was not enough
+    /// for a 2-D foreach body.
+    fn index_chain_root_is(e: &Expression, arr: &str) -> bool {
+        match &e.kind {
+            ExprKind::Index { expr: b, .. } => match &b.kind {
+                ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].name.name == arr,
+                _ => Self::index_chain_root_is(b, arr),
+            },
+            _ => false,
+        }
+    }
+
     fn solve_forced_array_elem(
         &mut self,
         handle: usize,
         item: &ConstraintItem,
         rand_set: &HashSet<String>,
         arr_name: &str,
-        idx: i64,
+        idx: &str,
     ) -> bool {
         // Handle `arr[i] inside { lo:hi }` directly so the range is
         // evaluated with the bound `i`. Other shapes can be added later.
@@ -79491,18 +79714,22 @@ impl Simulator {
             expr: inner, range, ..
         } = item
         {
-            let inside_arr = matches!(&inner.kind, ExprKind::Index { expr: b, .. }
-                if matches!(&b.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == arr_name));
+            let inside_arr = Self::index_chain_root_is(inner, arr_name);
             if inside_arr {
-                let elem_name = format!("{}[{}]", arr_name, idx);
+                let elem_name = format!("{}{}", arr_name, idx);
+                // A CLASS array element lives under the instance-scoped key;
+                // the bare name only exists for a module-level array.
+                let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
                 let cur = self
-                    .get_signal_value_by_name(&elem_name)
+                    .get_signal_value_by_name(&scoped_key)
+                    .or_else(|| self.get_signal_value_by_name(&elem_name))
                     .unwrap_or_else(|| Value::zero(32));
                 if self.value_in_ranges(&cur, range) {
                     return false;
                 }
                 let width = cur.width.max(32);
                 if let Some(picked) = self.pick_from_ranges(range, width, cur.is_signed) {
+                    self.signals.insert(scoped_key, picked.clone());
                     self.set_signal_value_by_name(&elem_name, picked.clone());
                     return true;
                 }
@@ -79514,12 +79741,11 @@ impl Simulator {
                     expr: inner,
                     ranges,
                 } => {
-                    let inside_arr = matches!(&inner.kind, ExprKind::Index { expr: b, .. }
-                        if matches!(&b.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == arr_name));
+                    let inside_arr = Self::index_chain_root_is(inner, arr_name);
                     if !inside_arr {
                         return false;
                     }
-                    let elem_name = format!("{}[{}]", arr_name, idx);
+                    let elem_name = format!("{}{}", arr_name, idx);
                     let cr: Vec<ConstraintRange> = ranges
                         .iter()
                         .map(|r| match &r.kind {
@@ -79530,8 +79756,10 @@ impl Simulator {
                             _ => ConstraintRange::Value(r.clone()),
                         })
                         .collect();
+                    let scoped_cur = format!("{}#{}{}", handle, arr_name, idx);
                     let cur = self
-                        .get_signal_value_by_name(&elem_name)
+                        .get_signal_value_by_name(&scoped_cur)
+                        .or_else(|| self.get_signal_value_by_name(&elem_name))
                         .unwrap_or_else(|| Value::zero(32));
                     if self.value_in_ranges(&cur, &cr) {
                         return false;
@@ -79540,7 +79768,7 @@ impl Simulator {
                     if let Some(picked) = self.pick_from_ranges(&cr, width, cur.is_signed) {
                         // Write to the scoped per-element key (`<handle>#arr[i]`)
                         // — the place exec_randomize wrote the random baseline.
-                        let scoped_key = format!("{}#{}[{}]", handle, arr_name, idx);
+                        let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
                         self.signals.insert(scoped_key, picked.clone());
                         // Also try the unscoped form for module-level arrays.
                         self.set_signal_value_by_name(&elem_name, picked);
@@ -79555,22 +79783,28 @@ impl Simulator {
                 // evaluate with the concrete `i`.
                 ExprKind::Binary { op, left, right } => {
                     // Element ref: `arr[<index-expr that evals to idx>]`.
+                    // The full index PATH of an element ref rooted at `arr`,
+                    // matching the `[i]`/`[i][j]` suffix the caller iterates.
                     fn elem_index(
                         s: &mut Simulator,
                         e: &Expression,
                         arr_name: &str,
-                    ) -> Option<i64> {
-                        if let ExprKind::Index { expr: b, index } = &e.kind {
-                            if matches!(&b.kind, ExprKind::Ident(h)
-                                if h.path.len() == 1 && h.path[0].name.name == arr_name)
+                    ) -> Option<String> {
+                        let ExprKind::Index { expr: b, index } = &e.kind else {
+                            return None;
+                        };
+                        let here = format!("[{}]", s.eval_expr(index).to_i64()?);
+                        match &b.kind {
+                            ExprKind::Ident(h)
+                                if h.path.len() == 1 && h.path[0].name.name == arr_name =>
                             {
-                                return s.eval_expr(index).to_i64();
+                                Some(here)
                             }
+                            _ => elem_index(s, b, arr_name).map(|outer| outer + &here),
                         }
-                        None
                     }
-                    let on_l = elem_index(self, left, arr_name) == Some(idx);
-                    let on_r = elem_index(self, right, arr_name) == Some(idx);
+                    let on_l = elem_index(self, left, arr_name).as_deref() == Some(idx);
+                    let on_r = elem_index(self, right, arr_name).as_deref() == Some(idx);
                     if on_l == on_r {
                         return false; // cross-element or unrelated — skip
                     }
@@ -79587,8 +79821,8 @@ impl Simulator {
                         };
                         (left, m)
                     };
-                    let elem_name = format!("{}[{}]", arr_name, idx);
-                    let scoped_key = format!("{}#{}[{}]", handle, arr_name, idx);
+                    let elem_name = format!("{}{}", arr_name, idx);
+                    let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
                     let cur = self
                         .get_signal_value_by_name(&elem_name)
                         .or_else(|| self.signals.get(&scoped_key).cloned());

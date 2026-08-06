@@ -97,6 +97,8 @@ mod randomize_inside_range;
 mod scope_randomize_dist_and_foreach;
 #[path = "classes/class_unpacked_struct_properties.rs"]
 mod class_unpacked_struct_properties;
+#[path = "classes/nd_array_properties_and_foreach_constraints.rs"]
+mod nd_array_properties_and_foreach_constraints;
 #[path = "classes/randomize_member_subset.rs"]
 mod randomize_member_subset;
 #[path = "classes/class_property_packed_selects.rs"]
