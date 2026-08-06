@@ -26267,9 +26267,20 @@ impl Simulator {
 
             // Check for WaitFork
             if let StatementKind::WaitFork = &stmt.kind {
-                // LRM §9.6.1: block until ALL forked descendants (children and
-                // their descendants), not just direct children, have completed.
-                let children: HashSet<usize> = self.collect_fork_descendants(pid);
+                // §9.6.1: `wait fork` blocks until the IMMEDIATE child
+                // subprocesses of the calling process complete — and no
+                // further. The asymmetry with `disable fork` (which kills all
+                // DESCENDANTS) is the LRM's, not an accident. Waiting on the
+                // transitive closure made a `join_none` grandchild extend the
+                // wait arbitrarily — or forever, for a persistent monitor
+                // spawned by a child, which is exactly the shape UVM drivers
+                // use.
+                let children: HashSet<usize> = self
+                    .process_parents
+                    .iter()
+                    .filter(|&(_, &parent)| parent == pid)
+                    .map(|(&child, _)| child)
+                    .collect();
 
                 if children.is_empty() {
                     i += 1;
@@ -53220,7 +53231,7 @@ impl Simulator {
         // (mutable pass), deferring the wake decision so the `wait fork`
         // re-check below can borrow `self` immutably.
         for waiter in self.join_waiters.iter_mut() {
-            if !waiter.wait_fork && waiter.child_pids.contains(&child_pid) {
+            if waiter.child_pids.contains(&child_pid) {
                 waiter.finished_children.insert(child_pid);
             }
         }
@@ -53229,10 +53240,16 @@ impl Simulator {
         for i in 0..self.join_waiters.len() {
             let w = &self.join_waiters[i];
             let should_wake = if w.wait_fork {
-                // §9.6.1: `wait fork` blocks until the parent has NO live
-                // descendants — re-evaluated against the current tree so that
-                // grandchildren spawned after the `wait fork` are also awaited.
-                self.collect_fork_descendants(w.parent_pid).is_empty()
+                // §9.6.1: `wait fork` waits on the IMMEDIATE children captured
+                // when it ran — never on grandchildren. Recomputing the
+                // descendant set here was doubly wrong: a `join_none`
+                // grandchild extended the wait past every child's completion,
+                // and completed children REPARENT their grandkids to this very
+                // parent (see above), so the wait could chase the tree forever
+                // — a persistent monitor spawned by a child hung it for good.
+                w.child_pids
+                    .iter()
+                    .all(|p| w.finished_children.contains(p))
             } else if w.child_pids.contains(&child_pid) {
                 match w.join_type {
                     JoinType::Join => w.finished_children.len() == w.child_pids.len(),
