@@ -5098,29 +5098,78 @@ impl Simulator {
                 )
             };
             let mut synth: Vec<(String, Expression)> = Vec::new();
-            for (bi, ab) in module.always_blocks.iter_mut().enumerate() {
-                let control = match &mut ab.stmt.kind {
-                    StatementKind::TimingControl { control, .. } => Some(control),
-                    StatementKind::SeqBlock { stmts, .. } => {
-                        match stmts.first_mut().map(|st| &mut st.kind) {
-                            Some(StatementKind::TimingControl { control, .. }) => Some(control),
-                            _ => None,
+            // An event control is not only an always HEADER: `@(posedge (~b))`
+            // also appears mid-block, inside a fork arm, a loop body, or a
+            // branch. Rewriting only the header left every one of those armed
+            // on nothing, so walk the whole process body.
+            fn rewrite_edges(
+                stmt: &mut Statement,
+                tag: &str,
+                n: &mut usize,
+                synth: &mut Vec<(String, Expression)>,
+                mk_ident: &dyn Fn(&str, crate::ast::Span) -> Expression,
+                computed: &dyn Fn(&Expression) -> bool,
+            ) {
+                use crate::ast::stmt::{EventControl as EC, TimingControl as TC};
+                match &mut stmt.kind {
+                    StatementKind::TimingControl { control, stmt: inner } => {
+                        if let TC::Event(EC::EventExpr(exprs)) = control {
+                            for ee in exprs.iter_mut() {
+                                if ee.edge.is_none() || !computed(&ee.expr) {
+                                    continue;
+                                }
+                                let nm = format!("__xz_edge_{}_{}", tag, *n);
+                                *n += 1;
+                                let span = ee.expr.span;
+                                synth.push((nm.clone(), ee.expr.clone()));
+                                ee.expr = mk_ident(&nm, span);
+                            }
+                        }
+                        rewrite_edges(inner, tag, n, synth, mk_ident, computed);
+                    }
+                    StatementKind::SeqBlock { stmts, .. }
+                    | StatementKind::ParBlock { stmts, .. } => {
+                        for st in stmts.iter_mut() {
+                            rewrite_edges(st, tag, n, synth, mk_ident, computed);
                         }
                     }
-                    _ => None,
-                };
-                let Some(TC::Event(EC::EventExpr(exprs))) = control else {
-                    continue;
-                };
-                for (ei, ee) in exprs.iter_mut().enumerate() {
-                    if ee.edge.is_none() || !computed_edge_term(&ee.expr) {
-                        continue;
+                    StatementKind::If { then_stmt, else_stmt, .. } => {
+                        rewrite_edges(then_stmt, tag, n, synth, mk_ident, computed);
+                        if let Some(e) = else_stmt {
+                            rewrite_edges(e, tag, n, synth, mk_ident, computed);
+                        }
                     }
-                    let nm = format!("__xz_edge_{}_{}", bi, ei);
-                    let span = ee.expr.span;
-                    synth.push((nm.clone(), ee.expr.clone()));
-                    ee.expr = mk_ident(&nm, span);
+                    StatementKind::For { body, .. }
+                    | StatementKind::Foreach { body, .. }
+                    | StatementKind::While { body, .. }
+                    | StatementKind::DoWhile { body, .. }
+                    | StatementKind::Repeat { body, .. }
+                    | StatementKind::Forever { body, .. } => {
+                        rewrite_edges(body, tag, n, synth, mk_ident, computed);
+                    }
+                    StatementKind::Wait { stmt: inner, .. } => {
+                        rewrite_edges(inner, tag, n, synth, mk_ident, computed);
+                    }
+                    StatementKind::Case { items, .. } => {
+                        for it in items.iter_mut() {
+                            rewrite_edges(&mut it.stmt, tag, n, synth, mk_ident, computed);
+                        }
+                    }
+                    _ => {}
                 }
+            }
+            let mut n = 0usize;
+            for (bi, ab) in module.always_blocks.iter_mut().enumerate() {
+                let tag = format!("a{}", bi);
+                rewrite_edges(&mut ab.stmt, &tag, &mut n, &mut synth, &mk_ident, &computed_edge_term);
+            }
+            for (bi, ib) in module.initial_blocks.iter_mut().enumerate() {
+                let tag = format!("i{}", bi);
+                rewrite_edges(&mut ib.stmt, &tag, &mut n, &mut synth, &mk_ident, &computed_edge_term);
+            }
+            for (bi, fb) in module.final_blocks.iter_mut().enumerate() {
+                let tag = format!("f{}", bi);
+                rewrite_edges(&mut fb.stmt, &tag, &mut n, &mut synth, &mk_ident, &computed_edge_term);
             }
             for (nm, rhs) in synth {
                 module.signals.entry(nm.clone()).or_insert_with(|| {

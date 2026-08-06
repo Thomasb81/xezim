@@ -98,3 +98,43 @@ endmodule
     assert_eq!(u(&sim, "n_iff"), 1, "the iff guard still gates the computed term");
     assert_eq!(u(&sim, "n_cond"), 3, "a conditional term");
 }
+
+/// A computed edge in a MID-BLOCK event control — inside a fork arm, a loop, or
+/// a branch — not just an always header. The rewrite originally covered only
+/// the header, so every one of these was still armed on nothing.
+#[test]
+fn computed_edge_in_a_mid_block_event_control() {
+    let src = r#"
+module tb;
+  logic a, b, c;
+  int t_plain, t_and, t_not, t_loop, t_if;
+  initial begin
+    a = 0; b = 1; c = 0;
+    t_plain = -1; t_and = -1; t_not = -1; t_loop = -1; t_if = -1;
+    fork
+      begin @(posedge a);          t_plain = $time; end
+      begin @(posedge (a & 1'b1)); t_and   = $time; end
+      begin @(posedge (~b));       t_not   = $time; end
+      begin
+        for (int i = 0; i < 1; i++) begin
+          @(posedge (a | 1'b0));   t_loop = $time;
+        end
+      end
+      begin
+        if (1) begin @(posedge (c ^ 1'b0)); t_if = $time; end
+      end
+    join_none
+    #1 a = 1;
+    #1 b = 0;
+    #1 c = 1;
+    #1;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "t_plain"), 1, "plain signal");
+    assert_eq!(u(&sim, "t_and"), 1, "computed term in a fork arm");
+    assert_eq!(u(&sim, "t_not"), 2, "inversion fires when its operand falls");
+    assert_eq!(u(&sim, "t_loop"), 1, "computed term inside a loop body");
+    assert_eq!(u(&sim, "t_if"), 3, "computed term inside a branch");
+}
