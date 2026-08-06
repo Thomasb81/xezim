@@ -74972,6 +74972,22 @@ impl Simulator {
                     out.push(SizeCon::In(self.eval_range_list(&rs)));
                 }
             ConstraintItem::Expr(e) => match &e.kind {
+                // §18.5.6: `guard -> q.size() == N`. The parser's expression
+                // grammar consumes `->` as the LOW-precedence LogImplies
+                // OPERATOR before the constraint parser can see it, so this
+                // arrives as one Expr — never as ConstraintItem::Implication —
+                // and the size bound under it was silently dropped: the queue
+                // got an arbitrary size and randomize() still returned 1.
+                ExprKind::Binary {
+                    op: BinaryOp::LogImplies,
+                    left,
+                    right,
+                } => {
+                    if self.eval_expr(left).is_true() {
+                        let inner = ConstraintItem::Expr((**right).clone());
+                        out.append(&mut self.size_cons_in_item(&inner, prop, row));
+                    }
+                }
                 ExprKind::Binary { op, left, right } => {
                     let (sz_side, other, flip) = if Self::is_size_call(left, prop, row) {
                         (true, right, false)

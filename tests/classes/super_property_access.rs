@@ -122,3 +122,42 @@ endmodule
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "got"), 7);
 }
+
+/// §18.5.6 — a `.size()` constraint under an IMPLICATION. The parser's
+/// expression grammar consumes `->` as the low-precedence LogImplies OPERATOR
+/// before the constraint parser can see it, so `sel -> q.size() == 2` arrives
+/// as one Expr item — never as ConstraintItem::Implication — and the size
+/// bound under it was silently dropped. Worse, the resulting mismatch made the
+/// solver force `sel` to 0 on every draw, so the guard never even varied.
+#[test]
+fn queue_size_constraint_under_implication() {
+    let src = r#"
+class Q3;
+  rand bit [7:0] q[$];
+  rand bit sel;
+  constraint c { sel -> q.size() == 2; !sel -> q.size() == 4; }
+endclass
+module tb;
+  Q3 x;
+  int ok, saw_sel1, saw_sel0;
+  initial begin
+    ok = 1;
+    x = new();
+    for (int i = 0; i < 40; i++) begin
+      if (!x.randomize()) ok = 0;
+      if (x.sel) begin
+        saw_sel1 = 1;
+        if (x.q.size() != 2) ok = 0;
+      end else begin
+        saw_sel0 = 1;
+        if (x.q.size() != 4) ok = 0;
+      end
+    end
+  end
+endmodule
+"#;
+    let sim = simulate(src, 200).expect("simulate failed");
+    assert_eq!(u(&sim, "ok"), 1, "the guarded size holds on every draw");
+    assert_eq!(u(&sim, "saw_sel1"), 1, "the guard actually varies (was pinned 0)");
+    assert_eq!(u(&sim, "saw_sel0"), 1);
+}
