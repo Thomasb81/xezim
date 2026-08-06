@@ -14449,6 +14449,11 @@ impl Simulator {
                                 }
                             }
                         }
+                        // Diagnostic only. It used to print unconditionally,
+                        // which leaked into tests that compare whole-run
+                        // output (`dump_merged_sv_top_pruning`) the moment the
+                        // JIT was enabled.
+                        if std::env::var("XEZIM_JIT_VERBOSE").is_ok() {
                         eprintln!(
                             "[JIT] backend=cranelift compiled {}/{} edge blocks in {:.1}s (inline_bits={})",
                             jit_count,
@@ -14456,6 +14461,7 @@ impl Simulator {
                             jit_compile_start.elapsed().as_secs_f64(),
                             if inline_len > 0 { "on" } else { "off" },
                         );
+                        }
                     } else {
                         eprintln!("[JIT] cranelift init failed; interpreter only");
                     }
@@ -51239,6 +51245,41 @@ impl Simulator {
     /// dirty + propagate if changed. Preserves `is_signed` from the
     /// signal's declared sign so readers get correct arithmetic.
     #[inline]
+    /// JIT bridge: the X/Z plane of a signal (see `xezim_jit_load_signal_xz`).
+    pub(crate) fn jit_load_signal_xz(&self, id: usize) -> u64 {
+        if id >= self.signal_table.len() {
+            return 0;
+        }
+        self.signal_table[id].raw_bits().1
+    }
+
+    /// JIT bridge: 4-state blocking write. Mirrors `jit_store_signal` but
+    /// carries the X/Z plane instead of forcing the value 2-state.
+    pub(crate) fn jit_store_signal_4s(
+        &mut self,
+        id: usize,
+        val_bits: u64,
+        xz_bits: u64,
+        width: u32,
+    ) {
+        if id >= self.signal_table.len() {
+            return;
+        }
+        let sig_w = self.signal_widths[id];
+        let w = if width == 0 { sig_w } else { width };
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let mut new_val = Value::from_inline(val_bits & mask, xz_bits & mask, w);
+        if w != sig_w {
+            new_val = new_val.resize(sig_w);
+        }
+        new_val.is_signed = self.signal_signed[id];
+        if self.signal_table[id] != new_val {
+            self.mark_dirty_id(id);
+            write_sig!(self, id, new_val);
+            self.table_modified = true;
+        }
+    }
+
     pub(crate) fn jit_store_signal(&mut self, id: usize, val_bits: u64, width: u32) {
         if id >= self.signal_table.len() {
             return;
@@ -51260,6 +51301,36 @@ impl Simulator {
     /// JIT bridge: mirror `Insn::NbaAssign` — push an `NbaFast` entry.
     /// `apply_nba` later commits to `signal_table` at the end-of-cycle.
     #[inline]
+    /// JIT bridge: 4-STATE non-blocking schedule. Mirrors `jit_schedule_nba`
+    /// but carries the X/Z plane. Without it the JIT dropped every unknown on
+    /// its way to `signal_table` — an uninitialised `val <= (val << 1) + 1`
+    /// settled to a concrete number instead of staying x.
+    pub(crate) fn jit_schedule_nba_4s(
+        &mut self,
+        id: usize,
+        val_bits: u64,
+        xz_bits: u64,
+        width: u32,
+    ) {
+        if id >= self.signal_table.len() {
+            return;
+        }
+        let sig_w = self.signal_widths[id];
+        let w = if width == 0 { sig_w } else { width };
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let mut val = Value::from_inline(val_bits & mask, xz_bits & mask, w);
+        if w != sig_w {
+            val = val.resize(sig_w);
+        }
+        val.is_signed = self.signal_signed[id];
+        self.nba_fast_index.insert(id, self.nba_fast.len());
+        self.nba_fast.push(NbaFast {
+            block_index: 0,
+            signal_id: id,
+            value: val,
+        });
+    }
+
     pub(crate) fn jit_schedule_nba(&mut self, id: usize, val_bits: u64, width: u32) {
         if id >= self.signal_table.len() {
             return;
