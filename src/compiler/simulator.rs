@@ -4199,6 +4199,8 @@ pub struct Simulator {
     prof_settle_ca_ns: u64,
     prof_settle_ab_ns: u64,
     prof_settle_dc_count: u64,
+    /// Per-CombItem-variant evaluation histogram (XEZIM_ENTRY_HIST=1).
+    prof_entry_hist: [u64; 12],
     prof_settle_ca_count: u64,
     prof_settle_ab_count: u64,
     /// Persistent buffers for settle_combinatorial (avoid repeated allocation)
@@ -6464,6 +6466,7 @@ impl Simulator {
             prof_settle_ca_ns: 0,
             prof_settle_ab_ns: 0,
             prof_settle_dc_count: 0,
+            prof_entry_hist: [0; 12],
             prof_settle_ca_count: 0,
             prof_settle_ab_count: 0,
             t_prevclone: std::time::Duration::ZERO,
@@ -23053,6 +23056,20 @@ impl Simulator {
         eprintln!("[PROF] settle_calls={} settle_iters={} max_iters={} entry_evals={} unresolved_entries={}/{}",
             self.settle_calls, self.settle_iters, self.max_settle_iters, self.entry_evals,
             unresolved, self.comb_entries.len());
+            {
+                const NAMES: [&str; 12] = ["noop","fastcopy","dircopy","fastfanout","busfanout",
+                    "andfanout","gate","udp","contassign_c","alwaysblk_c","contassign_ast","other"];
+                let tot: u64 = self.prof_entry_hist.iter().sum();
+                if tot > 0 {
+                    let mut v: Vec<(usize, u64)> = self.prof_entry_hist.iter().copied()
+                        .enumerate().filter(|(_, c)| *c > 0).collect();
+                    v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                    let parts: Vec<String> = v.iter()
+                        .map(|(i, c)| format!("{}={} ({:.1}%)", NAMES[*i], c, *c as f64 * 100.0 / tot as f64))
+                        .collect();
+                    eprintln!("[PROF] entry_hist {}", parts.join(" "));
+                }
+            }
         eprintln!(
             "[PROF] simulation_loop={:.1}ms iters={} avg={:.2}µs/iter",
             sim_elapsed.as_secs_f64() * 1000.0,
@@ -31663,6 +31680,28 @@ impl Simulator {
                 let dirty_before = self.dirty_list.len();
 
                 self.entry_evals += 1;
+                // Which CombItem shapes actually dominate evaluation — the
+                // number that says whether to attack the interpreter or the
+                // worklist. Gated: `profile_timing` is already an opt-in slow
+                // mode (it adds Instant::now() on these paths), so a normal
+                // run does not pay for this match.
+                if self.profile_timing {
+                    let k = match &entries[eidx].item {
+                        CombItem::Noop => 0,
+                        CombItem::FastDirectCopy { .. } => 1,
+                        CombItem::DirectCopy { .. } => 2,
+                        CombItem::FastDirectFanout { .. } => 3,
+                        CombItem::FusedBufFanout { .. } => 4,
+                        CombItem::FusedAndFanout { .. } => 5,
+                        CombItem::FusedGate { .. } => 6,
+                        CombItem::Udp { .. } => 7,
+                        CombItem::CompiledContAssign { .. } => 8,
+                        CombItem::CompiledAlwaysBlock { .. } => 9,
+                        CombItem::ContAssign { .. } => 10,
+                        _ => 11,
+                    };
+                    self.prof_entry_hist[k] += 1;
+                }
                 if self.activity_mon {
                     if let Some(slot) = self.activity_counts.get_mut(eidx) {
                         *slot += 1;
