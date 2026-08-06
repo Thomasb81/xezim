@@ -32401,6 +32401,11 @@ impl Simulator {
         if let Some(rewritten) = Self::super_as_this(lhs) {
             return self.assign_value(&rewritten, val);
         }
+        // §25.8/§25.9: a write through a bound virtual interface lands on the
+        // bound instance, whatever the chain shape.
+        if let Some(rewritten) = self.vif_rebase_expr(lhs) {
+            return self.assign_value(&rewritten, val);
+        }
         // §11.4.12: `$` in an index is the last valid index of the collection
         // being indexed. The READ paths install `dollar_bound` before
         // evaluating; no lvalue path did, so `$` fell through to its
@@ -35330,6 +35335,11 @@ impl Simulator {
         // write path does; otherwise the lookups below reach module scope and
         // return an unrelated same-named variable's member.
         if let Some(rewritten) = Self::super_as_this(expr) {
+            return self.eval_expr_ctx(&rewritten, ctx_width);
+        }
+        // §25.8/§25.9: any chain rooted at a bound virtual interface reads as
+        // a direct access to the bound instance.
+        if let Some(rewritten) = self.vif_rebase_expr(expr) {
             return self.eval_expr_ctx(&rewritten, ctx_width);
         }
         if !self.local_stack.is_empty() {
@@ -65084,8 +65094,10 @@ impl Simulator {
             return Some(raw);
         }
         // §25.9 virtual interface: rewrite the head through the vif alias
-        // (`vif.cb_main` → `master_if.cb_main`).
-        if let Some(bound) = self.iface_alias_for(segs[0]) {
+        // (`vif.cb_main` → `master_if.cb_main`). The CENTRAL binding, so a
+        // class-property vif (`@(vif.cb)` in a driver's run task) resolves
+        // too — `iface_alias_for` alone never saw those.
+        if let Some(bound) = self.vif_bound_for_root(segs[0]) {
             let mut aliased = bound;
             for seg in &segs[1..] {
                 aliased.push('.');
@@ -65151,6 +65163,187 @@ impl Simulator {
         let (_, sigs) = self.clocking_meta.get(&cb)?;
         let (net, _) = sigs.iter().find(|(n, is_in)| *is_in && matches_sig(n))?;
         self.get_signal_value_by_name(net)
+    }
+
+    /// §25.8/§25.9: the interface INSTANCE a bare name is bound to, through
+    /// every alias kind — a subroutine's vif formal (frame alias), a plain
+    /// `virtual <iface>` variable, or a class property of the current `this`.
+    /// One resolver, so every consumer sees every binding: the per-shape arms
+    /// each knew about a subset, and the shapes they missed fell through to a
+    /// phantom signal keyed by the literal source text.
+    fn vif_bound_for_root(&self, root: &str) -> Option<String> {
+        if let Some(b) = self.iface_alias_for(root) {
+            return Some(b);
+        }
+        if self.virtual_iface_bindings.is_empty() {
+            return None;
+        }
+        let this_h = self.this_stack.last().copied().flatten()?;
+        let cn = self
+            .heap
+            .get(this_h)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let has = self
+            .module
+            .classes
+            .get(&cn)
+            .is_some_and(|c| c.virtual_iface_properties.contains_key(root));
+        if !has {
+            return None;
+        }
+        self.virtual_iface_bindings
+            .get(&(this_h, root.to_string()))
+            .map(|(b, _mp)| b.clone())
+    }
+
+    /// Rewrite the ROOT of an expression chain whose leading name is a bound
+    /// virtual interface, so everything downstream sees a DIRECT interface
+    /// access — which already works in every shape. Inside a subroutine body
+    /// the parser emits `MemberAccess`/`Index`/`Call` chains rather than one
+    /// flat `Ident`, and the ad-hoc arms matched only single-level shapes: a
+    /// nested member (`v.us.a`), a queue op (`v.q.push_back(x)`), or an
+    /// interface subroutine (`v.dbl(4)`) silently read 0 / wrote nowhere.
+    /// `None` when the root is not a bound vif — the common case, gated to a
+    /// few empty-map checks.
+    fn vif_rebase_expr(&self, e: &Expression) -> Option<Expression> {
+        if self
+            .local_iface_aliases
+            .last()
+            .is_none_or(|m| m.is_empty())
+            && self.viface_var_aliases.is_empty()
+            && self.virtual_iface_bindings.is_empty()
+        {
+            return None;
+        }
+        // Only CHAINS are rebased: a bare `v` read/write is a HANDLE
+        // operation (`v2 = v;`, `v == null`) and must stay untouched.
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 => self.vif_rebase_ident(h, e.span),
+            // A top-level Index is a chain when its base is one (`v.q[0]`).
+            // An index on a BARE name (`varr[0]`) is a vif-ARRAY element —
+            // its binding is keyed per-element, so the bare root never
+            // resolves and the rebase correctly declines.
+            ExprKind::MemberAccess { .. }
+            | ExprKind::Call { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. } => self.vif_rebase_chain(e),
+            _ => None,
+        }
+    }
+
+    fn vif_rebase_ident(
+        &self,
+        h: &crate::ast::expr::HierarchicalIdentifier,
+        span: crate::ast::Span,
+    ) -> Option<Expression> {
+        if !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let bound = self.vif_bound_for_root(&h.path[0].name.name)?;
+        let mut segs: Vec<crate::ast::expr::HierPathSegment> = bound
+            .split('.')
+            .map(|part| crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: part.to_string(),
+                    span,
+                },
+                selects: Vec::new(),
+            })
+            .collect();
+        segs.extend(h.path[1..].iter().cloned());
+        Some(Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: h.root.clone(),
+                path: segs,
+                span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        ))
+    }
+
+    /// Recursive half of [`vif_rebase_expr`]: inside a chain, a SINGLE-segment
+    /// `Ident(v)` base is rebased too (the chain itself provides the member
+    /// context a bare read lacks).
+    fn vif_rebase_chain(&self, e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    let bound = self.vif_bound_for_root(&h.path[0].name.name)?;
+                    let segs: Vec<crate::ast::expr::HierPathSegment> = bound
+                        .split('.')
+                        .map(|part| crate::ast::expr::HierPathSegment {
+                            name: crate::ast::Identifier {
+                                name: part.to_string(),
+                                span: e.span,
+                            },
+                            selects: Vec::new(),
+                        })
+                        .collect();
+                    return Some(Expression::new(
+                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                            root: h.root.clone(),
+                            path: segs,
+                            span: e.span,
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        e.span,
+                    ));
+                }
+                self.vif_rebase_ident(h, e.span)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let nb = self.vif_rebase_chain(expr)?;
+                Some(Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(nb),
+                        member: member.clone(),
+                    },
+                    e.span,
+                ))
+            }
+            ExprKind::Index { expr, index } => {
+                let nb = self.vif_rebase_chain(expr)?;
+                Some(Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(nb),
+                        index: index.clone(),
+                    },
+                    e.span,
+                ))
+            }
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => {
+                let nb = self.vif_rebase_chain(expr)?;
+                Some(Expression::new(
+                    ExprKind::RangeSelect {
+                        expr: Box::new(nb),
+                        left: left.clone(),
+                        right: right.clone(),
+                        kind: *kind,
+                    },
+                    e.span,
+                ))
+            }
+            ExprKind::Call { func, args } => {
+                let nf = self.vif_rebase_chain(func)?;
+                Some(Expression::new(
+                    ExprKind::Call {
+                        func: Box::new(nf),
+                        args: args.clone(),
+                    },
+                    e.span,
+                ))
+            }
+            _ => None,
+        }
     }
 
     fn iface_alias_for(&self, name: &str) -> Option<String> {
@@ -66452,6 +66645,43 @@ impl Simulator {
                                 self.exec_task_call(&td, args);
                                 return Value::zero(32);
                             }
+                        }
+                    }
+                }
+            }
+        }
+        // §25.7/§7.10: a call whose callee is a plain dotted MemberAccess
+        // chain — an INTERFACE subroutine (`bi.dbl(4)`) or a collection
+        // builtin on an interface/instance member (`bi.q.push_back(7)`) —
+        // exactly as written inside a subroutine body. At module scope the
+        // same source arrives as one flat Ident (elaboration rewrites it) and
+        // the flat dispatch joins the names, so it worked; the MemberAccess
+        // spelling had no handler and silently evaluated to 0 / dropped the
+        // mutation.
+        if let ExprKind::MemberAccess { expr: recv, member } = &func.kind {
+            if let Some(mut segs) = Self::flatten_member_path(recv) {
+                segs.push(member.name.clone());
+                let joined = segs.join(".");
+                // Interface (or generate-scope) subroutine under its
+                // hierarchical key.
+                if let Some(fd) = self.module.functions.get(&joined).cloned() {
+                    return self.exec_function_call(&fd, args);
+                }
+                if let Some(td) = self.module.tasks.get(&joined).cloned() {
+                    self.exec_task_call(&td, args);
+                    return Value::zero(32);
+                }
+                // Collection builtin on the flattened receiver name.
+                if segs.len() >= 2 {
+                    let recv_name = segs[..segs.len() - 1].join(".");
+                    if self.module.dynamic_arrays.contains(&recv_name)
+                        || self.module.associative_arrays.contains_key(&recv_name)
+                        || self.module.arrays.contains_key(&recv_name)
+                    {
+                        if let Some(res) =
+                            self.eval_builtin_method(&recv_name, &member.name, args)
+                        {
+                            return res;
                         }
                     }
                 }
@@ -70551,6 +70781,21 @@ impl Simulator {
                 self.string_signals.insert(port.name.name.clone());
             }
         }
+        // §25.9: virtual-interface FORMALS of a free FUNCTION. Only the
+        // task and class-method paths registered these aliases, so a
+        // `virtual bus_if v` formal of a function was never bound — `v.data`
+        // inside the body resolved to a phantom and every access read 0.
+        let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
+        for (i, port) in fd.ports.iter().enumerate() {
+            if i < args.len() {
+                if let Some((f, b)) =
+                    self.vif_formal_alias(&port.data_type, &port.name.name, &args[i])
+                {
+                    iface_alias_frame.insert(f, b);
+                }
+            }
+        }
+        self.local_iface_aliases.push(iface_alias_frame);
         self.local_stack.push(locals);
         self.return_value = None;
         let saved_break = self.break_flag;
@@ -70586,6 +70831,7 @@ impl Simulator {
             }
         }
         self.sync_static_locals();
+        self.local_iface_aliases.pop();
         self.func_call_stack.pop();
         self.pkg_scope_stack.pop();
         self.m_scope_stack = saved_m_scope_fn;
