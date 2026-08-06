@@ -3330,6 +3330,10 @@ pub struct Simulator {
     /// (a stack — a constraint/post_randomize may randomize another object).
     /// `cur_rng` consults the top of this stack first.
     obj_rng_stack: Vec<usize>,
+    /// §18.11: when `obj.randomize(a, b)` names a MEMBER SUBSET, only those
+    /// properties are solved; every other rand member keeps its current value
+    /// and acts as state. Empty/None means the ordinary whole-object form.
+    randomize_subset: Option<HashSet<String>>,
     settling: bool,
     in_edge_block: bool,
     /// Nesting depth of `check_edges_inner`. A `#delay` inside an edge block's
@@ -6079,6 +6083,7 @@ impl Simulator {
             proc_rng: HashMap::default(),
             obj_rng: HashMap::default(),
             obj_rng_stack: Vec::new(),
+            randomize_subset: None,
             settling: false,
             in_edge_block: false,
             edge_pass_depth: 0,
@@ -73232,7 +73237,27 @@ impl Simulator {
             if Self::is_randomize_check_args(args) {
                 return self.exec_randomize_check(handle, &[]);
             }
-            return self.exec_randomize(handle);
+            // §18.11: a member subset — `obj.randomize(a, b)`. Each argument
+            // names a property of the object, so restrict the solve to those
+            // and leave the rest as state.
+            let subset: Option<HashSet<String>> = if args.is_empty() {
+                None
+            } else {
+                let mut names: HashSet<String> = HashSet::default();
+                for a in args {
+                    match &a.kind {
+                        ExprKind::Ident(h) if h.path.len() == 1 => {
+                            names.insert(h.path[0].name.name.clone());
+                        }
+                        _ => return self.exec_randomize(handle),
+                    }
+                }
+                Some(names)
+            };
+            let saved = std::mem::replace(&mut self.randomize_subset, subset);
+            let r = self.exec_randomize(handle);
+            self.randomize_subset = saved;
+            return r;
         }
         // uvm_component::sprint(printer) — the real UVM printer machinery
         // (uvm_printer field stack / m_uvm_status_container) isn't driven by the
@@ -76388,6 +76413,12 @@ impl Simulator {
         let unpacked_names: HashSet<String> =
             unpacked_agg_props.iter().map(|(p, _)| p.clone()).collect();
         rand_props.retain(|(n, _)| !rand_obj_props.contains(n) && !unpacked_names.contains(n));
+        // §18.11 member subset: everything not named keeps its current value.
+        if let Some(sub) = self.randomize_subset.clone() {
+            rand_props.retain(|(n, _)| sub.contains(n));
+            rand_obj_props.retain(|n| sub.contains(n));
+            unpacked_agg_props.retain(|(p, _)| sub.contains(p));
+        }
         for (n, w) in rand_props.iter_mut() {
             if let Some(tw) = packed_agg_props.get(n) {
                 *w = *tw;
