@@ -20622,6 +20622,23 @@ impl Simulator {
             EventControl::EventExpr(exprs) => {
                 let mut out: Vec<Sensitivity> = Vec::with_capacity(exprs.len());
                 for ee in exprs {
+                    // §14.13: normalize a plain dotted chain (`@(vif.cb)` in a
+                    // subroutine body) to the flat Ident every arm below
+                    // expects — the chain form collected no identifiers and
+                    // armed the wait on nothing.
+                    let ee_norm;
+                    let ee = match Self::member_chain_as_flat_ident(&ee.expr) {
+                        Some(flat) => {
+                            ee_norm = crate::ast::stmt::EventExpr {
+                                edge: ee.edge,
+                                expr: flat,
+                                iff: ee.iff.clone(),
+                                span: ee.span,
+                            };
+                            &ee_norm
+                        }
+                        None => ee,
+                    };
                     let edge = match ee.edge {
                         Some(Edge::Posedge) => EdgeKind::Posedge,
                         Some(Edge::Negedge) => EdgeKind::Negedge,
@@ -42633,6 +42650,19 @@ impl Simulator {
                 delay,
                 rvalue,
             } => {
+                // §14.4: normalize a plain dotted-chain lvalue (`vif.cb.data`
+                // inside a method) to the flat Ident the clocking-drive check
+                // below expects — the chain shape skipped the check and the
+                // drive landed on a phantom name instead of the clocking
+                // output net.
+                let lvalue_norm;
+                let lvalue: &Expression = match Self::member_chain_as_flat_ident(lvalue) {
+                    Some(flat) => {
+                        lvalue_norm = flat;
+                        &lvalue_norm
+                    }
+                    None => lvalue,
+                };
                 // §9.4.5 intra-assignment delay on an NBA (`lhs <= #d rhs`,
                 // canonicalized to `$__xz_intra_delay(d, rhs)`): the RHS is
                 // evaluated now; the update is scheduled d ticks out.
@@ -65274,6 +65304,56 @@ impl Simulator {
     /// `vif.cb` through a virtual-interface alias) to its `clocking_meta`
     /// key. `segs` is the dotted path WITHOUT the trailing signal segment
     /// (for `cb.sig` forms) or the full path (for `@(cb)` forms).
+    /// §14.13/§25.9: a plain dotted MemberAccess chain (`vif.cb`,
+    /// `vif.cb.data`) as the FLAT Ident the module-scope paths expect. Inside
+    /// a subroutine body the parser emits the chain form, and both the
+    /// event-sensitivity collector and the clocking-drive arm matched only the
+    /// flat spelling — so `@(vif.cb)` armed on nothing (returned immediately)
+    /// and `vif.cb.data <= v` missed the clocking check and drove a phantom.
+    /// `None` for any shape with indexing or calls.
+    fn member_chain_as_flat_ident(e: &Expression) -> Option<Expression> {
+        fn collect(e: &Expression, out: &mut Vec<crate::ast::Identifier>) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                    out.extend(h.path.iter().map(|s| s.name.clone()));
+                    true
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    if !collect(expr, out) {
+                        return false;
+                    }
+                    out.push(member.clone());
+                    true
+                }
+                _ => false,
+            }
+        }
+        if !matches!(e.kind, ExprKind::MemberAccess { .. }) {
+            return None;
+        }
+        let mut names = Vec::new();
+        if !collect(e, &mut names) || names.len() < 2 {
+            return None;
+        }
+        let span = e.span;
+        Some(Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: names
+                    .into_iter()
+                    .map(|name| crate::ast::expr::HierPathSegment {
+                        name,
+                        selects: Vec::new(),
+                    })
+                    .collect(),
+                span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        ))
+    }
+
     fn resolve_clocking_key(&self, segs: &[&str]) -> Option<String> {
         if segs.is_empty() {
             return None;
