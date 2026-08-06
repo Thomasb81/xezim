@@ -37028,6 +37028,60 @@ impl Simulator {
                         }
                     }
                 }
+                // §7.4.1: an ELEMENT select of a multi-dimensional PACKED
+                // array (`logic [3:0][1:0] arr; arr[1]`) has a self-determined
+                // width — the ELEMENT width. This context-width evaluator had
+                // no case for it and fell through to a one-BIT read, so the
+                // value came back X.
+                //
+                // Only an explicit size cast routes through here, which is why
+                // it hid for so long: `arr[1]`, `{6'b0, arr[1]}` and a plain
+                // widening assignment were all correct, while `8'(arr[1])` was
+                // X. In real RTL the symptom was `1 << arr[i]` and
+                // `arr[i] + 1` going X inside a submodule, poisoning
+                // everything downstream while the array itself printed fine.
+                //
+                // Guarded on the base NOT being an unpacked array: for
+                // `wire [1:0][7:0] w [0:1]`, `w[0]` indexes the UNPACKED
+                // dimension first and must stay on the existing path.
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let nm = self.resolve_hier_name(h);
+                    if !self.module.arrays.contains_key(&nm)
+                        && self.signal_name_to_id.contains_key(nm.as_str())
+                    {
+                        if let Some(&ew) = self.module.packed_signal_elem_widths.get(&nm) {
+                            // `ew == 1` is a real element width when the inner
+                            // packed dimension collapses (`[N-1:0][0:0]`, which
+                            // a parameterized design produces when
+                            // `$clog2(2) - 1 == 0`); accept it only when the
+                            // declared packed dims really are multi-dimensional.
+                            let multi_packed = self
+                                .module
+                                .packed_full_dims
+                                .get(&nm)
+                                .is_some_and(|d| d.len() > 1);
+                            if ew > 1 || multi_packed {
+                                // Extract here rather than delegating to
+                                // `eval_expr`: that path routes multi-dim
+                                // packed reads back through this function, so
+                                // delegating recurses forever.
+                                if let Some(i) = self.eval_expr(index).to_u64() {
+                                    let base_v = self.eval_expr(expr);
+                                    if base_v.width as usize > ew as usize {
+                                        if let Some(lo) =
+                                            self.packed_elem_lsb(&nm, i as i64, ew)
+                                        {
+                                            let hi = lo + ew as usize - 1;
+                                            if hi < base_v.width as usize {
+                                                return base_v.range_select(hi, lo);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if std::env::var("XEZIM_EV_DBG").is_ok() {
                     eprintln!(
                         "[EVDBG] idx-eval base_fmn={:?} qb={:?} ean={:?} nin={:?}",

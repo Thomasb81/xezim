@@ -95,6 +95,8 @@ mod multi_dim_elem_read_and_param_dims;
 mod ascending_indexed_part_select;
 #[path = "types/nested_packed_typedefs.rs"]
 mod nested_packed_typedefs;
+#[path = "types/packed_2d_element_in_size_cast.rs"]
+mod packed_2d_element_in_size_cast;
 #[path = "types/packed_2d_net_element_assign.rs"]
 mod packed_2d_net_element_assign;
 #[path = "types/packed_array_typedef_element_width.rs"]
