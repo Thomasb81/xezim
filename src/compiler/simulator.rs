@@ -4201,6 +4201,8 @@ pub struct Simulator {
     prof_settle_dc_count: u64,
     /// Per-CombItem-variant evaluation histogram (XEZIM_ENTRY_HIST=1).
     prof_entry_hist: [u64; 12],
+    /// Per-entry eval counts (XEZIM_PROFILE_TIMING) for shape attribution.
+    prof_entry_counts: Vec<u64>,
     prof_settle_ca_count: u64,
     prof_settle_ab_count: u64,
     /// Persistent buffers for settle_combinatorial (avoid repeated allocation)
@@ -6467,6 +6469,7 @@ impl Simulator {
             prof_settle_ab_ns: 0,
             prof_settle_dc_count: 0,
             prof_entry_hist: [0; 12],
+            prof_entry_counts: Vec::new(),
             prof_settle_ca_count: 0,
             prof_settle_ab_count: 0,
             t_prevclone: std::time::Duration::ZERO,
@@ -23070,6 +23073,77 @@ impl Simulator {
                     eprintln!("[PROF] entry_hist {}", parts.join(" "));
                 }
             }
+            if !self.prof_entry_counts.is_empty() {
+                // Attribute CompiledContAssign evaluations to RHS SHAPES, so
+                // the fusion work targets what actually runs rather than what
+                // is common in the netlist. Key = opcode sequence.
+                let mut by_shape: std::collections::HashMap<String, (u64, usize)> =
+                    std::collections::HashMap::new();
+                let mut cc_total = 0u64;
+                for (eidx, ent) in self.comb_entries.iter().enumerate() {
+                    let n = self.prof_entry_counts.get(eidx).copied().unwrap_or(0);
+                    if n == 0 {
+                        continue;
+                    }
+                    if let CombItem::CompiledContAssign { compiled } = &ent.item {
+                        cc_total += n;
+                        let sig = compiled
+                            .instructions
+                            .iter()
+                            .map(super::bytecode::insn_opcode_name)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let e = by_shape.entry(sig).or_insert((0, 0));
+                        e.0 += n;
+                        e.1 += 1;
+                    }
+                }
+                // Aggregate OPCODE execution counts (eval-weighted, all
+                // entries). Shapes say what is common; this says where the
+                // interpreter actually spends its dispatches — the two rank
+                // very differently, and only this one predicts a speedup.
+                {
+                    let mut by_op: std::collections::HashMap<&'static str, u64> =
+                        std::collections::HashMap::new();
+                    let mut total_insns = 0u64;
+                    for (eidx, ent) in self.comb_entries.iter().enumerate() {
+                        let n = self.prof_entry_counts.get(eidx).copied().unwrap_or(0);
+                        if n == 0 {
+                            continue;
+                        }
+                        let blk = match &ent.item {
+                            CombItem::CompiledContAssign { compiled } => Some(compiled),
+                            CombItem::CompiledAlwaysBlock { compiled, .. } => Some(compiled),
+                            _ => None,
+                        };
+                        if let Some(b) = blk {
+                            for i in b.instructions.iter() {
+                                *by_op.entry(super::bytecode::insn_opcode_name(i)).or_insert(0) += n;
+                                total_insns += n;
+                            }
+                        }
+                    }
+                    let mut ov: Vec<(&str, u64)> = by_op.into_iter().collect();
+                    ov.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                    eprintln!("[PROF] opcode_exec total={} (static-estimate, straight-line)", total_insns);
+                    let line: Vec<String> = ov.iter().take(14)
+                        .map(|(k, c)| format!("{}={:.1}%", k, *c as f64 * 100.0 / total_insns.max(1) as f64))
+                        .collect();
+                    eprintln!("[PROF]   {}", line.join(" "));
+                }
+                let mut v: Vec<(String, (u64, usize))> = by_shape.into_iter().collect();
+                v.sort_by_key(|(_, (c, _))| std::cmp::Reverse(*c));
+                eprintln!("[PROF] contassign_shapes total_evals={} distinct={}", cc_total, v.len());
+                for (sig, (c, ents)) in v.iter().take(15) {
+                    eprintln!(
+                        "[PROF]   {:>6.2}% n={} entries={} :: {}",
+                        *c as f64 * 100.0 / cc_total.max(1) as f64,
+                        c,
+                        ents,
+                        sig
+                    );
+                }
+            }
         eprintln!(
             "[PROF] simulation_loop={:.1}ms iters={} avg={:.2}µs/iter",
             sim_elapsed.as_secs_f64() * 1000.0,
@@ -31686,6 +31760,10 @@ impl Simulator {
                 // mode (it adds Instant::now() on these paths), so a normal
                 // run does not pay for this match.
                 if self.profile_timing {
+                    if self.prof_entry_counts.len() != num_entries {
+                        self.prof_entry_counts.resize(num_entries, 0);
+                    }
+                    self.prof_entry_counts[eidx] += 1;
                     let k = match &entries[eidx].item {
                         CombItem::Noop => 0,
                         CombItem::FastDirectCopy { .. } => 1,
