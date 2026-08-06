@@ -31,6 +31,8 @@ mod foreach_over_submodule_array;
 mod foreach_in_inlined_child;
 #[path = "hierarchy/generate_scope_names.rs"]
 mod generate_scope_names;
+#[path = "hierarchy/nested_interface_struct_ports.rs"]
+mod nested_interface_struct_ports;
 #[path = "hierarchy/param_typedef_instance_isolation.rs"]
 mod param_typedef_instance_isolation;
 #[path = "hierarchy/vif_arrays_and_null_default.rs"]
