@@ -5198,6 +5198,34 @@ impl Simulator {
                     });
             }
         }
+        // §8.4/§25.9: an unassigned `virtual <iface>` VARIABLE holds the null
+        // handle, like any handle type — not x. Registered as an ordinary
+        // 4-state signal it defaulted to x, so the standard guard
+        // `if (vif == null) $fatal(...)` evaluated x, took the else branch,
+        // and the "not connected" check silently passed. (Class properties
+        // already default to 0, which is why only the module/block-scope
+        // variable form misbehaved.)
+        {
+            let vif_vars: Vec<String> = module
+                .var_decl_types
+                .iter()
+                .filter(|(_, dt)| match dt {
+                    crate::ast::types::DataType::Interface { .. } => true,
+                    crate::ast::types::DataType::TypeReference { name, .. } => {
+                        module.interfaces.contains(&name.name.name)
+                    }
+                    _ => false,
+                })
+                .map(|(n, _)| n.clone())
+                .collect();
+            for n in vif_vars {
+                if let Some(sig) = module.signals.get_mut(&n) {
+                    if sig.value.has_xz() {
+                        sig.value = Value::zero(sig.value.width.max(1));
+                    }
+                }
+            }
+        }
         // The `.size` signal doubles as a collection's comb-dependency proxy —
         // associative arrays need one too, or element reads have nothing to
         // depend on (§9.2.2.2).
@@ -64772,6 +64800,46 @@ impl Simulator {
                 }
             }
         }
+        // §25.10: ELEMENT-wise binding of a module/block-scope vif ARRAY —
+        // `varr[0] = b0;`. Only the whole-array form was recorded, so the
+        // per-element alias `indexed_iface_alias_for` looks up never existed:
+        // the bind silently became a value copy and every later
+        // `varr[0].data` access read x.
+        if let ExprKind::Index { expr: base, index } = &lvalue.kind {
+            if let ExprKind::Ident(h) = &base.kind {
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    let name = h.path[0].name.name.as_str();
+                    let is_viface_var = self
+                        .module
+                        .var_decl_types
+                        .get(name)
+                        .is_some_and(|dt| self.is_virtual_iface_type(dt));
+                    if is_viface_var {
+                        if let Some(idx) = self.eval_expr(index).to_i64() {
+                            let key = format!("{}[{}]", name, idx);
+                            if matches!(&rvalue.kind, ExprKind::Null) {
+                                self.viface_var_aliases.remove(&key);
+                                // fall through: the value path stores null.
+                            } else if let Some(bound) = self.resolve_vif_rhs_name(rvalue) {
+                                if self.is_interface_instance(&bound) {
+                                    let mut hsh: u64 = 0xcbf29ce484222325;
+                                    for b in bound.bytes() {
+                                        hsh ^= b as u64;
+                                        hsh = hsh.wrapping_mul(0x100000001b3);
+                                    }
+                                    self.viface_var_aliases.insert(key, bound);
+                                    self.assign_value(
+                                        lvalue,
+                                        &Value::from_u64((hsh & 0x7FFF_FFFF) | 1, 32),
+                                    );
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // (handle, prop) for the target. `prop` for arrays encodes the
         // index as `"vif_arr[<idx>]"` so existing single-key storage
         // can stash per-index bindings (LRM §25.10).
@@ -64846,6 +64914,14 @@ impl Simulator {
                             0
                         };
                         (h, member.name.clone())
+                    }
+                    // Bare `va[i] = bus;` inside a method — `va` is a class
+                    // vif-array property of the implicit `this`. The bare
+                    // spelling had no arm at all, so a driver binding its own
+                    // array never recorded anything.
+                    ExprKind::Ident(h) if h.path.len() == 1 => {
+                        let hh = self.this_stack.last().copied().flatten().unwrap_or(0);
+                        (hh, h.path[0].name.name.clone())
                     }
                     // d.vif_arr in hier-Ident form: Ident([d, vif_arr])
                     ExprKind::Ident(h) if h.path.len() == 2 => {
@@ -65274,11 +65350,14 @@ impl Simulator {
             .get(this_h)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.clone())?;
+        // An ELEMENT key (`va[0]`) checks the BASE property name but binds
+        // per element (§25.10).
+        let prop_base = root.split('[').next().unwrap_or(root);
         let has = self
             .module
             .classes
             .get(&cn)
-            .is_some_and(|c| c.virtual_iface_properties.contains_key(root));
+            .is_some_and(|c| c.virtual_iface_properties.contains_key(prop_base));
         if !has {
             return None;
         }
@@ -65327,6 +65406,34 @@ impl Simulator {
         h: &crate::ast::expr::HierarchicalIdentifier,
         span: crate::ast::Span,
     ) -> Option<Expression> {
+        // `varr[0].data` in flat form carries the index in the first
+        // segment's selects — resolve the per-element key (§25.10).
+        if h.path[0].selects.len() == 1 {
+            let idx = self.eval_scalar_self(&h.path[0].selects[0])?;
+            let key = format!("{}[{}]", h.path[0].name.name, idx);
+            let bound = self.vif_bound_for_root(&key)?;
+            let mut segs: Vec<crate::ast::expr::HierPathSegment> = bound
+                .split('.')
+                .map(|part| crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: part.to_string(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                })
+                .collect();
+            segs.extend(h.path[1..].iter().cloned());
+            return Some(Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: h.root.clone(),
+                    path: segs,
+                    span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
+                span,
+            ));
+        }
         if !h.path[0].selects.is_empty() {
             return None;
         }
@@ -65396,6 +65503,38 @@ impl Simulator {
                 ))
             }
             ExprKind::Index { expr, index } => {
+                // §25.10: a vif-ARRAY element (`varr[0]`) is bound per
+                // element, so the whole `name[idx]` key resolves where the
+                // bare base never will.
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        if let Some(idx) = self.eval_scalar_self(index) {
+                            let key = format!("{}[{}]", h.path[0].name.name, idx);
+                            if let Some(bound) = self.vif_bound_for_root(&key) {
+                                let segs: Vec<crate::ast::expr::HierPathSegment> = bound
+                                    .split('.')
+                                    .map(|part| crate::ast::expr::HierPathSegment {
+                                        name: crate::ast::Identifier {
+                                            name: part.to_string(),
+                                            span: e.span,
+                                        },
+                                        selects: Vec::new(),
+                                    })
+                                    .collect();
+                                return Some(Expression::new(
+                                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                        root: None,
+                                        path: segs,
+                                        span: e.span,
+                                        cached_signal_id: std::cell::Cell::new(None),
+                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                    }),
+                                    e.span,
+                                ));
+                            }
+                        }
+                    }
+                }
                 let nb = self.vif_rebase_chain(expr)?;
                 Some(Expression::new(
                     ExprKind::Index {

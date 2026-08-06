@@ -31,6 +31,8 @@ mod foreach_over_submodule_array;
 mod foreach_in_inlined_child;
 #[path = "hierarchy/generate_scope_names.rs"]
 mod generate_scope_names;
+#[path = "hierarchy/vif_arrays_and_null_default.rs"]
+mod vif_arrays_and_null_default;
 #[path = "hierarchy/vif_in_subroutines.rs"]
 mod vif_in_subroutines;
 #[path = "hierarchy/interface_array_element_ports.rs"]
