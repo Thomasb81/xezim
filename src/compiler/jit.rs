@@ -163,9 +163,10 @@ pub unsafe extern "C" fn xezim_jit_schedule_nba_range_dyn(
     hi_bits: u64,
     lo_bits: u64,
     val_bits: u64,
+    xz_bits: u64,
 ) { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
-    sim.jit_schedule_nba_range(id as usize, hi_bits as u32, lo_bits as u32, val_bits);
+    sim.jit_schedule_nba_range(id as usize, hi_bits as u32, lo_bits as u32, val_bits, xz_bits);
 }}
 
 /// Schedule a non-blocking assign to a dynamic bit-index.
@@ -175,9 +176,10 @@ pub unsafe extern "C" fn xezim_jit_schedule_nba_bit_dyn(
     id: u32,
     idx: u64,
     val_bits: u64,
+    xz_bits: u64,
 ) { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
-    sim.jit_schedule_nba_bit(id as usize, idx as usize, val_bits != 0);
+    sim.jit_schedule_nba_bit(id as usize, idx as usize, val_bits, xz_bits);
 }}
 
 /// Perform a blocking assign to a dynamic bit-range.
@@ -188,9 +190,10 @@ pub unsafe extern "C" fn xezim_jit_blocking_assign_range_dyn(
     hi_bits: u64,
     lo_bits: u64,
     val_bits: u64,
+    xz_bits: u64,
 ) { unsafe {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
-    sim.jit_blocking_assign_range(id as usize, hi_bits as u32, lo_bits as u32, val_bits);
+    sim.jit_blocking_assign_range(id as usize, hi_bits as u32, lo_bits as u32, val_bits, xz_bits);
 }}
 
 /// Load an array element value as u64.
@@ -524,15 +527,17 @@ mod enabled {
             nba_bit_sig.params.push(AbiParam::new(types::I32));
             nba_bit_sig.params.push(AbiParam::new(types::I64));
             nba_bit_sig.params.push(AbiParam::new(types::I64));
+            nba_bit_sig.params.push(AbiParam::new(types::I64)); // xz_bits (4-state)
 
             // nba_range / blk_range bridge ABI:
-            // (sim, id: u32, hi: u64, lo: u64, val_bits: u64).
+            // (sim, id: u32, hi: u64, lo: u64, val_bits: u64, xz_bits: u64).
             let mut nba_range_sig = self.module.make_signature();
             nba_range_sig.params.push(AbiParam::new(pointer_type));
             nba_range_sig.params.push(AbiParam::new(types::I32));
             nba_range_sig.params.push(AbiParam::new(types::I64));
             nba_range_sig.params.push(AbiParam::new(types::I64));
             nba_range_sig.params.push(AbiParam::new(types::I64));
+            nba_range_sig.params.push(AbiParam::new(types::I64)); // xz_bits (4-state)
 
             // Path B: xz_check (sim, ids_ptr, n_ids) -> u32 (1 if any X/Z, else 0).
             let mut xz_check_sig = self.module.make_signature();
@@ -844,6 +849,8 @@ mod enabled {
             // checked xz_bits for input ids).
             let inline_storage = self.inline_bits_ptr;
             let mut live = true;
+            // Static per-register widths for the post-op masking pass.
+            let mut reg_widths: Vec<u32> = vec![0; num_regs as usize];
             for (i, insn) in insns.iter().enumerate() {
                 if i != 0 && is_leader[i] {
                     let new_b = pc_to_block[i].unwrap();
@@ -984,6 +991,25 @@ mod enabled {
                             blk_range_ref,
                             load_array_ref,
                         )?;
+                        // Width mask: keep the result within the width the
+                        // interpreter's `Value` would have had (see
+                        // `insn_result_width`). Both planes — the whole-X
+                        // paths write -1 into the xz plane.
+                        if let Some((d, w)) =
+                            insn_result_width(other, &reg_widths, signal_widths)
+                        {
+                            let mask = (1u64 << w) - 1;
+                            let mc = builder.ins().iconst(types::I64, mask as i64);
+                            let v =
+                                builder.ins().stack_load(types::I64, reg_slots[d as usize], 0);
+                            let mv = builder.ins().band(v, mc);
+                            builder.ins().stack_store(mv, reg_slots[d as usize], 0);
+                            let x =
+                                builder.ins().stack_load(types::I64, xz_slots[d as usize], 0);
+                            let mx = builder.ins().band(x, mc);
+                            builder.ins().stack_store(mx, xz_slots[d as usize], 0);
+                        }
+                        update_reg_width(other, &mut reg_widths, signal_widths);
                     }
                 }
             }
@@ -1257,14 +1283,19 @@ mod enabled {
                 let _ = (d, cond, t, e);
             }
             CaseEq(d, l, r) => {
-                // SV `===`: with Path B's X-free guarantee, equivalent to
-                // ordinary Eq. (CaseEq differs from Eq only when X/Z is
-                // present in either operand.)
-                let lv = builder.ins().stack_load(types::I64, regs[*l as usize], 0);
-                let rv = builder.ins().stack_load(types::I64, regs[*r as usize], 0);
-                let eq = builder.ins().icmp(IntCC::Equal, lv, rv);
-                let ext = builder.ins().uextend(types::I64, eq);
-                builder.ins().stack_store(ext, regs[*d as usize], 0);
+                // SV `===` compares X/Z LITERALLY (§11.4.6): both planes must
+                // match, and the result is always a known 0/1. The old
+                // val-plane-only compare was correct solely because the X/Z
+                // pre-check kept unknowns out; with 4-state registers it
+                // would have called `4'bxxxx === 4'b0000` equal.
+                let (lv, lx) = ld2(builder, regs, xz, *l);
+                let (rv, rx) = ld2(builder, regs, xz, *r);
+                let veq = builder.ins().icmp(IntCC::Equal, lv, rv);
+                let xeq = builder.ins().icmp(IntCC::Equal, lx, rx);
+                let both = builder.ins().band(veq, xeq);
+                let ext = builder.ins().uextend(types::I64, both);
+                let zero = builder.ins().iconst(types::I64, 0);
+                st2(builder, regs, xz, *d, ext, zero);
             }
             SetSigned(_) => {
                 // No-op in 2-state JIT: signedness is a per-Value flag the
@@ -1279,9 +1310,7 @@ mod enabled {
                 builder.ins().call(store_4s_ref, &[sim_ptr, id, v, x, w]);
             }
             BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
-                let v = builder
-                    .ins()
-                    .stack_load(types::I64, regs[*val_reg as usize], 0);
+                let (v, x) = ld2(builder, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let hi = builder
                     .ins()
@@ -1291,7 +1320,29 @@ mod enabled {
                     .stack_load(types::I64, regs[*lo_reg as usize], 0);
                 builder
                     .ins()
-                    .call(blk_range_ref, &[sim_ptr, id, hi, lo, v]);
+                    .call(blk_range_ref, &[sim_ptr, id, hi, lo, v, x]);
+            }
+            // Constant-bounds forms of the same stores: materialize the
+            // bounds and share the dynamic bridges.
+            BlockingAssignRange(sig_id, hi, lo, val_reg) => {
+                let (v, x) = ld2(builder, regs, xz, *val_reg);
+                let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                let hi_v = builder.ins().iconst(types::I64, *hi as i64);
+                let lo_v = builder.ins().iconst(types::I64, *lo as i64);
+                builder
+                    .ins()
+                    .call(blk_range_ref, &[sim_ptr, id, hi_v, lo_v, v, x]);
+            }
+            BlockingAssignBitDyn(sig_id, idx_reg, val_reg) => {
+                let (v, x) = ld2(builder, regs, xz, *val_reg);
+                let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                let idx = builder
+                    .ins()
+                    .stack_load(types::I64, regs[*idx_reg as usize], 0);
+                // A 1-bit write at [idx:idx] — same semantics, same bridge.
+                builder
+                    .ins()
+                    .call(blk_range_ref, &[sim_ptr, id, idx, idx, v, x]);
             }
             NbaAssign(sig_id, val_reg, width) => {
                 let (nv, nx) = ld2(builder, regs, xz, *val_reg);
@@ -1308,20 +1359,16 @@ mod enabled {
                 builder.ins().call(nba_ref, &[sim_ptr, id, v, w]);
             }
             NbaAssignRange(sig_id, hi, lo, val_reg) => {
-                let v = builder
-                    .ins()
-                    .stack_load(types::I64, regs[*val_reg as usize], 0);
+                let (v, x) = ld2(builder, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let hi_v = builder.ins().iconst(types::I64, *hi as i64);
                 let lo_v = builder.ins().iconst(types::I64, *lo as i64);
                 builder
                     .ins()
-                    .call(nba_range_ref, &[sim_ptr, id, hi_v, lo_v, v]);
+                    .call(nba_range_ref, &[sim_ptr, id, hi_v, lo_v, v, x]);
             }
             NbaAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
-                let v = builder
-                    .ins()
-                    .stack_load(types::I64, regs[*val_reg as usize], 0);
+                let (v, x) = ld2(builder, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let hi = builder
                     .ins()
@@ -1331,21 +1378,80 @@ mod enabled {
                     .stack_load(types::I64, regs[*lo_reg as usize], 0);
                 builder
                     .ins()
-                    .call(nba_range_ref, &[sim_ptr, id, hi, lo, v]);
+                    .call(nba_range_ref, &[sim_ptr, id, hi, lo, v, x]);
             }
             NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
-                let v = builder
-                    .ins()
-                    .stack_load(types::I64, regs[*val_reg as usize], 0);
+                let (v, x) = ld2(builder, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let idx = builder
                     .ins()
                     .stack_load(types::I64, regs[*idx_reg as usize], 0);
-                builder.ins().call(nba_bit_ref, &[sim_ptr, id, idx, v]);
+                builder.ins().call(nba_bit_ref, &[sim_ptr, id, idx, v, x]);
             }
             // NbaAssignRangeDyn / NbaAssignBitDyn still left out — they
             // need dynamic hi/lo from VM regs, requiring extra value
             // shuffling. Tractable next step but not in this slice.
+            // Fused load+select forms: two bridge calls then shift/mask on
+            // both planes. The block-level width filter guarantees the source
+            // signal fits u64, so the extraction is pure register math.
+            LoadSignalBit(dest, sig_id, bit) => {
+                let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                let call = builder.ins().call(load_ref, &[sim_ptr, id]);
+                let v = builder.inst_results(call)[0];
+                let id2 = builder.ins().iconst(types::I32, *sig_id as i64);
+                let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, id2]);
+                let x = builder.inst_results(xcall)[0];
+                let sh = builder.ins().iconst(types::I64, *bit as i64);
+                let one = builder.ins().iconst(types::I64, 1);
+                let vs = builder.ins().ushr(v, sh);
+                let vb = builder.ins().band(vs, one);
+                let xs = builder.ins().ushr(x, sh);
+                let xb = builder.ins().band(xs, one);
+                st2(builder, regs, xz, *dest, vb, xb);
+            }
+            LoadSignalRange(dest, sig_id, left, right) => {
+                let lo = (*left).min(*right);
+                let w = left.abs_diff(*right) + 1;
+                if w >= 64 {
+                    return Err(());
+                }
+                let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                let call = builder.ins().call(load_ref, &[sim_ptr, id]);
+                let v = builder.inst_results(call)[0];
+                let id2 = builder.ins().iconst(types::I32, *sig_id as i64);
+                let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, id2]);
+                let x = builder.inst_results(xcall)[0];
+                let sh = builder.ins().iconst(types::I64, lo as i64);
+                let mask = builder.ins().iconst(types::I64, ((1u64 << w) - 1) as i64);
+                let vs = builder.ins().ushr(v, sh);
+                let vm = builder.ins().band(vs, mask);
+                let xs = builder.ins().ushr(x, sh);
+                let xm = builder.ins().band(xs, mask);
+                st2(builder, regs, xz, *dest, vm, xm);
+            }
+            // §11.4.11: `c ? t : e` — a definitely-true condition takes t, a
+            // definitely-false one takes e, and an UNKNOWN condition merges:
+            // bits where both branches are known and agree keep their value,
+            // every other bit reads x.
+            Select(dest, c, t, e) => {
+                let (cv, cx) = ld2(builder, regs, xz, *c);
+                let (tv, tx) = ld2(builder, regs, xz, *t);
+                let (ev, ex) = ld2(builder, regs, xz, *e);
+                let (ct, cf) = truthiness(builder, cv, cx);
+                let ntx = builder.ins().bnot(tx);
+                let nex = builder.ins().bnot(ex);
+                let both_known = builder.ins().band(ntx, nex);
+                let diff = builder.ins().bxor(tv, ev);
+                let ndiff = builder.ins().bnot(diff);
+                let agree = builder.ins().band(both_known, ndiff);
+                let mv = builder.ins().band(tv, agree);
+                let mx = builder.ins().bnot(agree);
+                let sel_ve = builder.ins().select(cf, ev, mv);
+                let sel_xe = builder.ins().select(cf, ex, mx);
+                let out_v = builder.ins().select(ct, tv, sel_ve);
+                let out_x = builder.ins().select(ct, tx, sel_xe);
+                st2(builder, regs, xz, *dest, out_v, out_x);
+            }
             Resize(reg, width) => {
                 // Mask the value to the target width. Loads from stack,
                 // applies mask, stores back. Emulates Value::resize for
@@ -1467,6 +1573,81 @@ mod enabled {
         let out_x = builder.ins().select(unknown, one, zero);
         builder.ins().stack_store(out_v, regs[d as usize], 0);
         builder.ins().stack_store(out_x, xz[d as usize], 0);
+    }
+
+    /// Static width propagation for the masking pass in `codegen_block`.
+    ///
+    /// The interpreter's `Value` carries its width intrinsically, so `~a` on a
+    /// 1-bit operand IS 1 bit. A JIT register is a bare u64 pair — after
+    /// `BitNot`, the 63 bits above the operand's width are garbage ones, and
+    /// the bytecode does NOT always follow with a `Resize` (the interpreter
+    /// never needed one). `if (~rst_b)` then read those garbage bits as TRUE
+    /// and a c910-shaped FSM held itself in reset forever. Returns
+    /// `(dest reg, result width)` for the ops whose result can EXCEED the
+    /// width the interpreter would have kept — the codegen masks both planes
+    /// after emitting them. Width 0 = unknown; no mask.
+    fn insn_result_width(insn: &Insn, reg_w: &[u32], sig_w: &[u32]) -> Option<(u16, u32)> {
+        use Insn::*;
+        let rw = |r: &u16| reg_w.get(*r as usize).copied().unwrap_or(0);
+        let need_mask = |d: u16, w: u32| if w >= 1 && w < 64 { Some((d, w)) } else { None };
+        match insn {
+            BitNot(d, s) | Negate(d, s) => need_mask(*d, rw(s)),
+            BitXnor(d, l, r) | Add(d, l, r) | Sub(d, l, r) | Mul(d, l, r) => {
+                let (lw, rw_) = (rw(l), rw(r));
+                if lw == 0 || rw_ == 0 {
+                    None
+                } else {
+                    need_mask(*d, lw.max(rw_))
+                }
+            }
+            Shl(d, l, _) | AShr(d, l, _) => need_mask(*d, rw(l)),
+            _ => None,
+        }
+    }
+
+    /// Track the width each register holds, in program order. Regs are
+    /// allocated fresh per value by the bytecode compiler, so a linear walk is
+    /// sound; anything not understood records width 0 (= unknown, no mask).
+    fn update_reg_width(insn: &Insn, reg_w: &mut [u32], sig_w: &[u32]) {
+        use Insn::*;
+        let set = |reg_w: &mut [u32], d: &u16, w: u32| {
+            if let Some(slot) = reg_w.get_mut(*d as usize) {
+                *slot = w;
+            }
+        };
+        let get = |reg_w: &[u32], r: &u16| reg_w.get(*r as usize).copied().unwrap_or(0);
+        match insn {
+            LoadConst(d, v) => set(reg_w, d, v.width),
+            LoadSignal(d, sid) | LoadSignalSigned(d, sid) => {
+                set(reg_w, d, sig_w.get(*sid).copied().unwrap_or(0))
+            }
+            LoadSignalBit(d, _, _) => set(reg_w, d, 1),
+            LoadSignalRange(d, _, hi, lo) => set(reg_w, d, hi.abs_diff(*lo) + 1),
+            Move(d, s) => {
+                let w = get(reg_w, s);
+                set(reg_w, d, w)
+            }
+            Resize(d, w) => set(reg_w, d, *w),
+            BitNot(d, s) | Negate(d, s) => {
+                let w = get(reg_w, s);
+                set(reg_w, d, w)
+            }
+            BitAnd(d, l, r) | BitOr(d, l, r) | BitXor(d, l, r) | BitXnor(d, l, r)
+            | Add(d, l, r) | Sub(d, l, r) | Mul(d, l, r) => {
+                let (lw, rw) = (get(reg_w, l), get(reg_w, r));
+                set(reg_w, d, if lw == 0 || rw == 0 { 0 } else { lw.max(rw) })
+            }
+            Shl(d, l, _) | Shr(d, l, _) | AShr(d, l, _) => {
+                let w = get(reg_w, l);
+                set(reg_w, d, w)
+            }
+            Eq(d, ..) | Neq(d, ..) | CaseEq(d, ..) | CasezEq(d, ..) | CasexEq(d, ..)
+            | Lt(d, ..) | Leq(d, ..) | Gt(d, ..) | Geq(d, ..) | LogAnd(d, ..)
+            | LogOr(d, ..) | LogNot(d, _) | ReduceAnd(d, _) | ReduceOr(d, _)
+            | ReduceXor(d, _) => set(reg_w, d, 1),
+            BitSelect(d, ..) | BitSelectConst(d, ..) => set(reg_w, d, 1),
+            _ => {}
+        }
     }
 
     /// §11.4.7 truthiness of a 4-state word: `(definitely_true,
@@ -1620,6 +1801,11 @@ mod enabled {
                 | NbaAssignBitDyn(..)
                 | NbaAssignRangeDyn(..)
                 | BlockingAssignRangeDyn(..)
+                | BlockingAssignRange(..)
+                | BlockingAssignBitDyn(..)
+                | LoadSignalBit(..)
+                | LoadSignalRange(..)
+                | Select(..)
                 | Nop
         )
     }

@@ -3421,6 +3421,18 @@ pub struct Simulator {
     /// holds the native function pointer for the block. `exec_bytecode`
     /// calls it in place of the interpreter loop. None = use interpreter.
     jit_fns: Vec<Option<super::jit::JitFn>>,
+    /// Native code for COMB (settle) entries, by comb-entry index. Settle is
+    /// ~70% of the loop on DUT-heavy RTL while edge blocks are ~25%, so this
+    /// is where the JIT pays. cfg-gated: an earlier runtime-checked version
+    /// cost +2.0% in the DEFAULT build from the hot-loop check alone.
+    #[cfg(feature = "jit")]
+    comb_jit_fns: Vec<Option<super::jit::JitFn>>,
+    /// Consecutive X/Z-bail strikes per entry (retires the fn past a limit).
+    #[cfg(feature = "jit")]
+    comb_jit_strikes: Vec<u8>,
+    /// (ran natively, bailed on X/Z) under XEZIM_PROFILE_TIMING.
+    #[cfg(feature = "jit")]
+    prof_comb_jit: [u64; 2],
     /// The `JitModule` owns the JIT'd code's memory — it must outlive
     /// all compiled function pointers. Kept on Simulator so the mmapped
     /// code pages stay mapped for the life of the simulation.
@@ -6216,6 +6228,12 @@ impl Simulator {
             edge_blocks: Arc::new(Vec::new()),
             compiled_edge_blocks: Vec::new(),
             jit_fns: Vec::new(),
+            #[cfg(feature = "jit")]
+            comb_jit_fns: Vec::new(),
+            #[cfg(feature = "jit")]
+            comb_jit_strikes: Vec::new(),
+            #[cfg(feature = "jit")]
+            prof_comb_jit: [0; 2],
             jit_module: None,
             edge_block_parallel: Vec::new(),
             edge_block_partition: Vec::new(),
@@ -10114,6 +10132,8 @@ impl Simulator {
         }
         mark_compile_phase("structural delay setup", &mut compile_phase_start);
         self.build_comb_entries();
+        #[cfg(feature = "jit")]
+        self.jit_compile_comb_entries();
         mark_compile_phase("build combinational entries", &mut compile_phase_start);
         if let Ok(w) = std::env::var("XEZIM_DUMP_ENTRY") {
             let want: usize = w.parse().unwrap_or(0);
@@ -14150,6 +14170,64 @@ impl Simulator {
     /// Build pre-computed combinatorial entries with sensitivity sets.
     /// Called once after classify_always_blocks.
     /// Compile edge blocks to bytecode where possible.
+    /// JIT-compile COMB (settle) entries. Runs AFTER `build_comb_entries` —
+    /// `compile_edge_blocks` (where the JIT module is created) runs before the
+    /// comb entries exist. Comb blocks are the same `CompiledBlock` type as
+    /// edge blocks, and their writes go through `jit_store_signal*`, which
+    /// calls `mark_dirty_id` — so settle's worklist propagation observes JIT
+    /// writes exactly as it observes interpreter ones.
+    #[cfg(feature = "jit")]
+    fn jit_compile_comb_entries(&mut self) {
+        let enable_jit = std::env::var("XEZIM_JIT")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
+        self.comb_jit_fns = vec![None; self.comb_entries.len()];
+        self.comb_jit_strikes = vec![0; self.comb_entries.len()];
+        if !enable_jit || self.jit_module.is_none() {
+            return;
+        }
+        let blocks: Vec<Option<super::bytecode::CompiledBlock>> = self
+            .comb_entries
+            .iter()
+            .map(|e| match &e.item {
+                CombItem::CompiledContAssign { compiled }
+                | CombItem::CompiledAlwaysBlock { compiled, .. } => Some(compiled.clone()),
+                _ => None,
+            })
+            .collect();
+        // Same >64-bit rule as edge blocks: the bridges move u64 planes and
+        // would silently truncate anything wider.
+        let safe: Vec<bool> = blocks
+            .iter()
+            .map(|b| b.as_ref().map(|cb| self.block_signals_fit_u64(cb)).unwrap_or(false))
+            .collect();
+        let xz_ptr = self.signal_has_xz.as_ptr() as u64;
+        let xz_len = self.signal_has_xz.len() as u32;
+        let mut n = 0usize;
+        if let Some(jm) = self.jit_module.as_mut() {
+            for (idx, b) in blocks.iter().enumerate() {
+                let Some(cb) = b else { continue };
+                if !safe[idx] {
+                    continue;
+                }
+                if let Some(f) =
+                    jm.try_compile_with_xz(&cb.instructions, cb.num_regs, xz_ptr, xz_len)
+                {
+                    self.comb_jit_fns[idx] = Some(f);
+                    n += 1;
+                }
+            }
+        }
+        if std::env::var("XEZIM_JIT_VERBOSE").is_ok() {
+            eprintln!(
+                "[JIT] comb entries compiled {}/{} (width-safe candidates {})",
+                n,
+                self.comb_entries.len(),
+                safe.iter().filter(|b| **b).count()
+            );
+        }
+    }
+
     fn compile_edge_blocks(&mut self) {
         use super::bytecode::BytecodeCompiler;
         let mut compiled = Vec::with_capacity(self.edge_blocks.len());
@@ -14433,10 +14511,33 @@ impl Simulator {
                                 self.jit_nba_side_queue.len() as u32,
                             );
                         }
+                        // Bisection aid: XEZIM_JIT_ONLY="3,17" compiles just
+                        // those block indices; XEZIM_JIT_SKIP_IDX skips listed.
+                        let jit_only: Option<Vec<usize>> = std::env::var("XEZIM_JIT_ONLY")
+                            .ok()
+                            .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect());
+                        let jit_skip: Vec<usize> = std::env::var("XEZIM_JIT_SKIP_IDX")
+                            .ok()
+                            .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+                            .unwrap_or_default();
                         for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
                             if let Some(cb) = cb_opt {
                                 if !block_jit_safe[idx] {
                                     continue;
+                                }
+                                if let Some(only) = &jit_only {
+                                    if !only.contains(&idx) {
+                                        continue;
+                                    }
+                                }
+                                if jit_skip.contains(&idx) {
+                                    continue;
+                                }
+                                if std::env::var("XEZIM_JIT_DUMP_BLOCKS").is_ok() {
+                                    eprintln!("[JITBLK] idx={} insns:", idx);
+                                    for i in cb.instructions.iter() {
+                                        eprintln!("[JITBLK]   {:?}", i);
+                                    }
                                 }
                                 if let Some(f) = jm.try_compile_with_xz(
                                     &cb.instructions,
@@ -17435,11 +17536,9 @@ impl Simulator {
                 // even though the simulator stores top-level instance
                 // signals without that prefix.
                 if !found {
-                    if let Some(stripped) = r.strip_prefix(&top_prefix) {
-                        if let Some(&id) = self.signal_name_to_id.get(stripped) {
-                            rids.push(id);
-                            found = true;
-                        }
+                    if let Some(id) = self.resolve_read_name(r, &top_prefix) {
+                        rids.push(id);
+                        found = true;
                     }
                 }
                 if !found {
@@ -17546,17 +17645,8 @@ impl Simulator {
                 // 2 instructions because the bus-arbiter always_ff
                 // doesn't re-fire when its sensitivity inputs change.
                 let top_prefix = format!("{}.", self.module.name);
-                let resolve_one = |name: &str| -> Option<usize> {
-                    if let Some(&id) = self.signal_name_to_id.get(name) {
-                        return Some(id);
-                    }
-                    if let Some(stripped) = name.strip_prefix(&top_prefix) {
-                        if let Some(&id) = self.signal_name_to_id.get(stripped) {
-                            return Some(id);
-                        }
-                    }
-                    None
-                };
+                let resolve_one =
+                    |name: &str| -> Option<usize> { self.resolve_read_name(name, &top_prefix) };
                 let scope_hint = self.infer_scope_from_rw_sets(&writes, &reads);
                 if std::env::var("XEZIM_AB_DBG").is_ok() {
                     let unresolved: Vec<&String> = reads
@@ -19708,6 +19798,41 @@ impl Simulator {
             }
         }
         Some(out)
+    }
+
+    /// Resolve a collected READ name to a signal id, falling back to
+    /// stripping trailing member segments.
+    ///
+    /// §7.2: a packed struct is ONE signal (`st`), but a member read collects
+    /// as `st.m` — a name nothing in the table matches. The entry then simply
+    /// lost the dependency, so an `always_comb` whose only input was a struct
+    /// member (`bc = st.m[8];`) computed once at time 0 and froze: stale but
+    /// KNOWN values, with no X anywhere to flag the miss. Stripping from the
+    /// RIGHT (`u.bus.m` → `u.bus`) finds the signal that actually carries the
+    /// member's bits — a write to any part of it marks it dirty, which is
+    /// exactly the §9.2.2.2 longest-static-prefix sensitivity.
+    fn resolve_read_name(&self, name: &str, top_prefix: &str) -> Option<usize> {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return Some(id);
+        }
+        if let Some(stripped) = name.strip_prefix(top_prefix) {
+            if let Some(&id) = self.signal_name_to_id.get(stripped) {
+                return Some(id);
+            }
+        }
+        let mut rest = name;
+        while let Some(cut) = rest.rfind('.') {
+            rest = &rest[..cut];
+            if let Some(&id) = self.signal_name_to_id.get(rest) {
+                return Some(id);
+            }
+            if let Some(stripped) = rest.strip_prefix(top_prefix) {
+                if let Some(&id) = self.signal_name_to_id.get(stripped) {
+                    return Some(id);
+                }
+            }
+        }
+        None
     }
 
     fn collect_expr_reads(
@@ -23131,7 +23256,12 @@ impl Simulator {
                     }
                     let mut ov: Vec<(&str, u64)> = by_op.into_iter().collect();
                     ov.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-                    eprintln!("[PROF] opcode_exec total={} (static-estimate, straight-line)", total_insns);
+                    #[cfg(feature = "jit")]
+            eprintln!(
+                "[PROF] comb_jit native={} xz_bail={}",
+                self.prof_comb_jit[0], self.prof_comb_jit[1]
+            );
+            eprintln!("[PROF] opcode_exec total={} (static-estimate, straight-line)", total_insns);
                     let line: Vec<String> = ov.iter().take(14)
                         .map(|(k, c)| format!("{}={:.1}%", k, *c as f64 * 100.0 / total_insns.max(1) as f64))
                         .collect();
@@ -32022,17 +32152,61 @@ impl Simulator {
                         self.prof_settle_dc_count += 1;
                     }
                     CombItem::CompiledContAssign { compiled, .. } => {
-                        if self.vm_regs.len() < compiled.num_regs as usize {
-                            self.vm_regs
-                                .resize(compiled.num_regs as usize, Value::zero(1));
+                        // Native path (cfg-gated: compiled out of the default
+                        // build entirely — a runtime check here measured
+                        // +2.0%). rc 0 = ran; 1 = bailed pre-side-effect
+                        // (interpret this eval, count a strike); >=2 = disable.
+                        // A `continue` here would skip the worklist
+                        // propagation after this match, so JIT-dirtied
+                        // signals would never trigger their dependents —
+                        // route through a flag and fall through instead.
+                        #[cfg(feature = "jit")]
+                        let mut ran_native = false;
+                        #[cfg(feature = "jit")]
+                        {
+                            if let Some(Some(f)) = self.comb_jit_fns.get(eidx).copied() {
+                                let sp: *mut u8 = self as *mut Self as *mut u8;
+                                match unsafe { f(sp) } {
+                                    0 => {
+                                        self.comb_jit_strikes[eidx] = 0;
+                                        ran_native = true;
+                                        if self.profile_timing {
+                                            self.prof_comb_jit[0] += 1;
+                                        }
+                                    }
+                                    1 => {
+                                        if self.profile_timing {
+                                            self.prof_comb_jit[1] += 1;
+                                        }
+                                        const XZ_STRIKE_LIMIT: u8 = 8;
+                                        let st = &mut self.comb_jit_strikes[eidx];
+                                        *st = st.saturating_add(1);
+                                        if *st >= XZ_STRIKE_LIMIT {
+                                            self.comb_jit_fns[eidx] = None;
+                                        }
+                                    }
+                                    _ => self.comb_jit_fns[eidx] = None,
+                                }
+                            }
                         }
-                        let insns = unsafe {
-                            std::slice::from_raw_parts(
-                                compiled.instructions.as_ptr(),
-                                compiled.instructions.len(),
-                            )
-                        };
-                        self.exec_insns(insns);
+                        // `!ran_native` is a compile-time constant false in
+                        // the default build, so this folds to the plain
+                        // interpreter path with zero added cost.
+                        #[cfg(not(feature = "jit"))]
+                        let ran_native = false;
+                        if !ran_native {
+                            if self.vm_regs.len() < compiled.num_regs as usize {
+                                self.vm_regs
+                                    .resize(compiled.num_regs as usize, Value::zero(1));
+                            }
+                            let insns = unsafe {
+                                std::slice::from_raw_parts(
+                                    compiled.instructions.as_ptr(),
+                                    compiled.instructions.len(),
+                                )
+                            };
+                            self.exec_insns(insns);
+                        }
                         self.prof_settle_dc_count += 1;
                     }
                     CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
@@ -51373,13 +51547,23 @@ impl Simulator {
     /// the latest in-flight NbaFast entry) with `val_bits` occupying
     /// the low `(hi-lo+1)` bits.
     #[inline]
-    pub(crate) fn jit_schedule_nba_range(&mut self, id: usize, hi: u32, lo: u32, val_bits: u64) {
+    pub(crate) fn jit_schedule_nba_range(
+        &mut self,
+        id: usize,
+        hi: u32,
+        lo: u32,
+        val_bits: u64,
+        xz_bits: u64,
+    ) {
         if id >= self.signal_table.len() {
             return;
         }
         let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
         let w = high - low + 1;
-        let val = Value::from_u64(val_bits, w);
+        // 4-state: the X/Z plane rides along — dropping it here silently
+        // forced every JIT-stored unknown to 0 the moment the block ran
+        // (the old 2-state pre-check masked this by never running on X).
+        let val = Value::from_inline(val_bits, xz_bits, w);
         // Compose onto latest nba_fast entry if any, else onto
         // signal_table's current value — exactly matches the
         // interpreter's NbaAssignRange read-modify-write pattern.
@@ -51406,18 +51590,22 @@ impl Simulator {
 
     /// JIT bridge: schedule non-blocking assignment to a dynamic bit-index.
     #[inline]
-    pub(crate) fn jit_schedule_nba_bit(&mut self, id: usize, idx: usize, bit: bool) {
+    pub(crate) fn jit_schedule_nba_bit(&mut self, id: usize, idx: usize, v: u64, x: u64) {
         if id >= self.signal_table.len() {
             return;
         }
+        let bit = match (v & 1, x & 1) {
+            (0, 0) => LogicBit::Zero,
+            (1, 0) => LogicBit::One,
+            (0, _) => LogicBit::X,
+            _ => LogicBit::Z,
+        };
         if let Some(i) = self.nba_fast_index.get(id) {
-            self.nba_fast[i]
-                .value
-                .set_bit(idx, if bit { LogicBit::One } else { LogicBit::Zero });
+            self.nba_fast[i].value.set_bit(idx, bit);
             return;
         }
         let mut new_val = self.signal_table[id].clone();
-        new_val.set_bit(idx, if bit { LogicBit::One } else { LogicBit::Zero });
+        new_val.set_bit(idx, bit);
         self.nba_fast_index.insert(id, self.nba_fast.len());
         self.nba_fast.push(NbaFast {
             block_index: 0,
@@ -51428,13 +51616,20 @@ impl Simulator {
 
     /// JIT bridge: perform a blocking assign to a dynamic bit-range.
     #[inline]
-    pub(crate) fn jit_blocking_assign_range(&mut self, id: usize, hi: u32, lo: u32, val_bits: u64) {
+    pub(crate) fn jit_blocking_assign_range(
+        &mut self,
+        id: usize,
+        hi: u32,
+        lo: u32,
+        val_bits: u64,
+        xz_bits: u64,
+    ) {
         if id >= self.signal_table.len() {
             return;
         }
         let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
         let w = high - low + 1;
-        let val = Value::from_u64(val_bits, w);
+        let val = Value::from_inline(val_bits, xz_bits, w);
         let sig_w = self.signal_widths[id];
         let high_eff = high.min(sig_w.saturating_sub(1));
         let mut changed = false;
