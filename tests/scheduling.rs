@@ -33,6 +33,8 @@ mod audit_ports_disable_drivers;
 mod bare_clocking_event;
 #[path = "scheduling/blocking_loop_break_continue.rs"]
 mod blocking_loop_break_continue;
+#[path = "scheduling/struct_member_read_sensitivity.rs"]
+mod struct_member_read_sensitivity;
 #[path = "scheduling/c910_biu_bresp_capture_race.rs"]
 mod c910_biu_bresp_capture_race;
 #[path = "scheduling/c910_settle_miri.rs"]
