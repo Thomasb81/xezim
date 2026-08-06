@@ -193,6 +193,7 @@ impl ArrayOperand {
 
 /// A compiled bytecode program for one always block or continuous assign.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+
 pub struct CompiledBlock {
     pub instructions: Vec<Insn>,
     pub num_regs: u32,
@@ -214,6 +215,78 @@ pub struct CompiledBlock {
     /// overwhelming majority of blocks write each target once and take the
     /// plain push path.
     pub nba_dup_targets: bool,
+}
+
+/// Opcode name only (no operands) — used by the settle profiler to aggregate
+/// continuous-assignment RHS shapes across entries. Operands differ per
+/// instance; the SHAPE is what a fused fast path would have to match.
+pub fn insn_opcode_name(i: &Insn) -> &'static str {
+    match i {
+        Insn::LoadConst(..) => "Const",
+        Insn::LoadSignal(..) => "Load",
+        Insn::LoadSignalSigned(..) => "LoadS",
+        Insn::Resize(..) => "Resize",
+        Insn::Add(..) => "Add",
+        Insn::Sub(..) => "Sub",
+        Insn::Mul(..) => "Mul",
+        Insn::Div(..) => "Div",
+        Insn::Mod(..) => "Mod",
+        Insn::BitAnd(..) => "And",
+        Insn::BitOr(..) => "Or",
+        Insn::BitXor(..) => "Xor",
+        Insn::BitXnor(..) => "Xnor",
+        Insn::LogAnd(..) => "LAnd",
+        Insn::LogOr(..) => "LOr",
+        Insn::Eq(..) => "Eq",
+        Insn::Neq(..) => "Neq",
+        Insn::CaseEq(..) => "CaseEq",
+        Insn::CasezEq(..) => "CasezEq",
+        Insn::CasexEq(..) => "CasexEq",
+        Insn::Lt(..) => "Lt",
+        Insn::Leq(..) => "Leq",
+        Insn::Gt(..) => "Gt",
+        Insn::Geq(..) => "Geq",
+        Insn::Shl(..) => "Shl",
+        Insn::Shr(..) => "Shr",
+        Insn::AShr(..) => "AShr",
+        Insn::BitNot(..) => "Not",
+        Insn::LogNot(..) => "LNot",
+        Insn::Negate(..) => "Neg",
+        Insn::ReduceAnd(..) => "RedAnd",
+        Insn::ReduceOr(..) => "RedOr",
+        Insn::ReduceXor(..) => "RedXor",
+        Insn::BitSelect(..) => "BitSel",
+        Insn::BitSelectConst(..) => "BitSelC",
+        Insn::RangeSelect(..) => "RngSel",
+        Insn::RangeSelectConst(..) => "RngSelC",
+        Insn::Concat(..) => "Concat",
+        Insn::Replicate(..) => "Repl",
+        Insn::Select(..) => "Select",
+        Insn::Move(..) => "Move",
+        Insn::SetSigned(..) => "SetSigned",
+        Insn::Nop => "Nop",
+        Insn::Jump(..) => "Jump",
+        Insn::BranchIfFalse(..) => "Br",
+        Insn::BranchIfSignalFalse(..) => "BrSig",
+        Insn::BranchUnlessZero(..) => "BrNz",
+        Insn::LoadSignalBit(..) => "LoadBit",
+        Insn::LoadSignalRange(..) => "LoadRng",
+        Insn::LoadArrayElem(..) => "LoadArr",
+        Insn::BlockingAssign(..) => "Assign",
+        Insn::BlockingAssignRange(..) => "AssignRng",
+        Insn::BlockingAssignRangeDyn(..) => "AssignRngDyn",
+        Insn::BlockingAssignBitDyn(..) => "AssignBitDyn",
+        Insn::BlockingAssignArray(..) => "AssignArr",
+        Insn::BlockingAssignArrayRange(..) => "AssignArrRng",
+        Insn::NbaAssign(..) => "Nba",
+        Insn::NbaAssignConst(..) => "NbaC",
+        Insn::NbaAssignRange(..) => "NbaRng",
+        Insn::NbaAssignRangeDyn(..) => "NbaRngDyn",
+        Insn::NbaAssignBitDyn(..) => "NbaBitDyn",
+        Insn::NbaAssignArray(..) => "NbaArr",
+        Insn::NbaAssignArrayRange(..) => "NbaArrRng",
+        Insn::StmtFallback(..) => "Fallback",
+    }
 }
 
 /// Compiler state for converting AST → bytecode.
@@ -3707,6 +3780,7 @@ impl<'a> BytecodeCompiler<'a> {
     pub fn finish(mut self) -> CompiledBlock {
         debug_assert!(!self.register_overflow);
         Self::fuse_load_selects(&mut self.insns);
+        Self::compact_nops(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
         // up to ~50% slack capacity. With ~100K CompiledBlocks on
@@ -3936,6 +4010,51 @@ impl<'a> BytecodeCompiler<'a> {
             }
             insns[i] = repl;
             insns[i + 1] = Insn::Nop;
+        }
+    }
+
+    /// Drop `Nop`s left behind by pair fusion above, rewriting branch targets.
+    ///
+    /// Every fusion in this pass replaces a two-instruction pair with one real
+    /// instruction plus a `Nop` placeholder, because collapsing the vector
+    /// mid-pass would invalidate the indices the loops and `is_target` use.
+    /// Those placeholders were never removed afterwards, so each one cost a
+    /// dispatch on EVERY execution for the life of the run. On the C906 SoC
+    /// running CoreMark they are 15-20% of the instructions in a compiled
+    /// continuous assignment (e.g. the second most-executed RHS shape is
+    /// `LoadRng,Nop,Resize,Move,Resize,AssignRng` — one of six).
+    ///
+    /// A branch target is an index into this vector, so removal must remap it.
+    /// A target that pointed AT a removed `Nop` moves to the next surviving
+    /// instruction, which is exactly where control would have arrived anyway;
+    /// `len` (one past the end, used by loop exits) maps to the new length.
+    fn compact_nops(insns: &mut Vec<Insn>) {
+        if !insns.iter().any(|i| matches!(i, Insn::Nop)) {
+            return;
+        }
+        // old index -> new index; `map[len]` is the new one-past-the-end.
+        let mut map = vec![0u32; insns.len() + 1];
+        let mut new_idx = 0u32;
+        for (old, insn) in insns.iter().enumerate() {
+            map[old] = new_idx;
+            if !matches!(insn, Insn::Nop) {
+                new_idx += 1;
+            }
+        }
+        map[insns.len()] = new_idx;
+        insns.retain(|i| !matches!(i, Insn::Nop));
+        for insn in insns.iter_mut() {
+            match insn {
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t)
+                | Insn::Jump(t) => {
+                    if let Some(&m) = map.get(*t as usize) {
+                        *t = m;
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
