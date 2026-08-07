@@ -195,3 +195,5 @@ mod vcd_param_as_wire;
 mod wide_signed_arith_and_power;
 #[path = "types/byte_local_narrow.rs"]
 mod byte_local_narrow;
+#[path = "types/packed_struct_array_elem_write.rs"]
+mod packed_struct_array_elem_write;
