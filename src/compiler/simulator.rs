@@ -3332,6 +3332,19 @@ pub struct Simulator {
     /// Updated in place (`clear` + `push_str`) rather than assigned, so the
     /// settle hot loop reuses one allocation and pays only a short memcmp.
     m_block_scope: String,
+    /// Interned scope id per edge block, parallel to `edge_blocks`. Two blocks
+    /// in the same instance share an id, so the `%m` bookkeeping in
+    /// `exec_bytecode` is a `u32` compare against a contiguous array instead
+    /// of a `String` compare that also had to deref the `edge_blocks` `Arc`
+    /// and reach into a 3607-entry struct vector. That comparison runs on
+    /// every one of ~189 M block fires and measured 3.5% of retired
+    /// instructions on the c906 memcpy workload.
+    edge_block_scope_id: Vec<u32>,
+    /// Which interned scope `m_block_scope` currently holds, or `u32::MAX`
+    /// when its contents did not come from `edge_block_scope_id` (any
+    /// non-edge-block writer sets it back to `MAX`, so the next block fire
+    /// re-syncs rather than trusting a stale id).
+    m_block_scope_id: u32,
     /// Stack of the names of the functions/tasks currently executing (innermost
     /// last), so `%m` inside a package subroutine resolves to `<pkg>.<name>`
     /// (matching real simulators) rather than the top-module name. Pushed in
@@ -6350,6 +6363,8 @@ impl Simulator {
             pending_ret_collection: None,
             current_scope: String::new(),
             m_block_scope: String::new(),
+            edge_block_scope_id: Vec::new(),
+            m_block_scope_id: u32::MAX,
             func_call_stack: Vec::new(),
             pkg_scope_stack: Vec::new(),
             pending_pkg_scope: None,
@@ -10280,6 +10295,20 @@ impl Simulator {
             self.jit_nba_side_len = 0;
         }
         self.compile_edge_blocks();
+        // Intern each edge block's instance scope to a dense u32 so the `%m`
+        // tracking in `exec_bytecode` compares integers, not strings. Blocks
+        // sharing an instance share an id, which is what lets consecutive
+        // fires in one scope skip the buffer copy entirely.
+        {
+            let mut ids = Vec::with_capacity(self.edge_blocks.len());
+            let mut intern: HashMap<&str, u32> = HashMap::default();
+            for b in self.edge_blocks.iter() {
+                let next = intern.len() as u32;
+                let id = *intern.entry(b.scope.as_str()).or_insert(next);
+                ids.push(id);
+            }
+            self.edge_block_scope_id = ids;
+        }
         mark_compile_phase("compile edge blocks", &mut compile_phase_start);
         // Apply SDF / specify delays BEFORE building comb entries — the fused-gate
         // fast path bails out on signals with nonzero delay, so the delay must be
@@ -16272,6 +16301,8 @@ impl Simulator {
     /// scope. See the `m_block_scope` field doc.
     #[inline]
     fn set_m_block_scope(&mut self, scope: Option<&str>) {
+        // Contents no longer correspond to an interned edge-block scope.
+        self.m_block_scope_id = u32::MAX;
         match scope {
             Some(s) => {
                 if self.m_block_scope != s {
@@ -16292,11 +16323,17 @@ impl Simulator {
         // usually falls through; only a genuine scope CHANGE touches the
         // buffer, and then `take`/put-back reuses the existing allocation
         // (the borrow checker needs the buffer out of `self` to copy into it).
-        if self.m_block_scope != self.edge_blocks[block_idx].scope {
+        let scope_id = self
+            .edge_block_scope_id
+            .get(block_idx)
+            .copied()
+            .unwrap_or(u32::MAX);
+        if self.m_block_scope_id != scope_id {
             let mut mbs = std::mem::take(&mut self.m_block_scope);
             mbs.clear();
             mbs.push_str(&self.edge_blocks[block_idx].scope);
             self.m_block_scope = mbs;
+            self.m_block_scope_id = scope_id;
         }
         // Fast path: if we JIT-compiled this block, call the native fn
         // directly. Zero-cost when the jit feature is off (jit_fns stays
@@ -25376,6 +25413,7 @@ impl Simulator {
         // A process is not a comb/edge block, so the scope the settle loop
         // last recorded must not leak into this process's `%m`.
         self.m_block_scope.clear();
+        self.m_block_scope_id = u32::MAX;
         // This retained payload is one non-suspending blocking assignment.
         // Isolate it from a caller task's locals by moving that context aside;
         // the generic path clones the entire context because arbitrary
