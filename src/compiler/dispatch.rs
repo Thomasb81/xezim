@@ -3,7 +3,7 @@
 //! This module demonstrates infrastructure for optimized instruction dispatch.
 //! Full integration with Simulator is left for future work.
 
-use super::bytecode::Insn;
+use super::bytecode::{BinOpConstKind, Insn};
 
 /// Opcodes for each instruction variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -74,6 +74,9 @@ pub enum Opcode {
     BranchUnlessZero,
     BranchIfSignalFalse,
     NbaAssignArrayRead,
+    BinOpConstAdd,
+    BinOpConstEq,
+    BinOpConstCaseEq,
 }
 
 impl Opcode {
@@ -145,6 +148,13 @@ impl Opcode {
             Insn::BranchUnlessZero(_, _) => Self::BranchUnlessZero,
             Insn::BranchIfSignalFalse(_, _, _) => Self::BranchIfSignalFalse,
             Insn::NbaAssignArrayRead(_, _, _, _) => Self::NbaAssignArrayRead,
+            // One `Insn` variant, three census buckets: the kind is what
+            // makes the pair-census readable, and `Opcode` is census-only.
+            Insn::BinOpConst(_, _, _, k) => match k {
+                BinOpConstKind::Add => Self::BinOpConstAdd,
+                BinOpConstKind::Eq => Self::BinOpConstEq,
+                BinOpConstKind::CaseEq => Self::BinOpConstCaseEq,
+            },
         }
     }
 
@@ -154,7 +164,12 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 65;
+pub const NUM_OPCODES: usize = 68;
+
+/// Sizes the opcode-census arrays, which are indexed by `Opcode as usize`. A
+/// stale value panics at run time under `XEZIM_OPCODE_CENSUS=1`, so pin it to
+/// the last discriminant at compile time instead.
+const _: () = assert!(NUM_OPCODES == Opcode::BinOpConstCaseEq as usize + 1);
 
 /// Dispatch table - proof of concept.
 #[derive(Debug, Clone)]
