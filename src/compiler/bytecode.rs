@@ -58,6 +58,44 @@ pub fn array_read_nba_fusions() -> u64 {
     FUSED_ARRAY_READ_NBA.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Per-kind count of `LoadConst ; <binop>` pairs collapsed into
+/// `Insn::BinOpConst`, indexed by `BinOpConstKind as usize`. See
+/// [`BytecodeCompiler::fuse_binop_const`].
+static FUSED_BINOP_CONST: [std::sync::atomic::AtomicU64; BinOpConstKind::COUNT] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Static count of constant-operand ALU fusions performed, per
+/// [`BinOpConstKind`] (same index order as the enum).
+pub fn binop_const_fusions() -> [u64; BinOpConstKind::COUNT] {
+    std::array::from_fn(|i| FUSED_BINOP_CONST[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Which binary operator an [`Insn::BinOpConst`] applies to its register
+/// operand and its embedded constant.
+///
+/// Deliberately tiny and closed: one fused variant covering the three
+/// constant-fed ALU ops the census actually shows (`Add`, `Eq`, `CaseEq`)
+/// keeps the `Insn` enum — and the ~25 analysis sites that match on it — with
+/// a single new case to reason about instead of three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum BinOpConstKind {
+    /// `dst = src + K` — same `Value` semantics as [`Insn::Add`].
+    Add = 0,
+    /// `dst = (src == K)` — same `Value` semantics as [`Insn::Eq`].
+    Eq = 1,
+    /// `dst = (src === K)` — same `Value` semantics as [`Insn::CaseEq`].
+    CaseEq = 2,
+}
+
+impl BinOpConstKind {
+    /// Number of kinds; sizes the static fusion-count array.
+    pub const COUNT: usize = 3;
+}
+
 /// Bytecode instruction set. Stack-free, register-based design.
 /// Each instruction specifies source and destination registers explicitly,
 /// enabling the VM to iterate a flat Vec<Insn> with predictable memory access.
@@ -240,6 +278,30 @@ pub enum Insn {
     /// `LoadArrayElem` this variant makes an edge block non-gateable in
     /// `build_event_measure_state`.
     NbaAssignArrayRead(SigId, Box<ArrayOperand>, SigId, u32), // (dst_sig, array, idx_sig, width)
+
+    /// Fused `LoadConst` + a binary ALU op that consumes it as its RIGHT
+    /// operand:
+    ///
+    ///   LoadConst(c, K)                    ; c = K
+    ///   Add|Eq|CaseEq(d, l, c)             ; d = l <op> c
+    ///       → BinOpConst(d, l, K, kind)
+    ///
+    /// `LoadConst` is the #2 opcode on the C906 memcpy census (49.7 M, 12.0%)
+    /// and 32.5 M of those feed exactly these three operators — 7.9% of the
+    /// whole executed stream. Each fusion removes one dispatch and one 32-byte
+    /// VM register write.
+    ///
+    /// ONE variant, not three: the enum's known silent-failure mode is the
+    /// ~25 analysis sites that match `Insn` with a catch-all `_ =>` to pull
+    /// out SIGNAL IDs. This variant carries no signal id — only two register
+    /// ids and a constant — so `_ =>` is the correct answer at every one of
+    /// them, and there is one thing to audit rather than three.
+    ///
+    /// Field order is (dest, src, K, kind). The exec arms substitute `&**K`
+    /// for what would have been `&vm_regs[c]` and are otherwise character-for-
+    /// character the unfused arms, so the 4-state, signedness and §5.7.1
+    /// `is_fill` rules cannot drift.
+    BinOpConst(RegId, RegId, Box<Value>, BinOpConstKind), // (dest, src, const, kind)
 }
 
 /// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
@@ -359,6 +421,9 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::NbaAssignArray(..) => "NbaArr",
         Insn::NbaAssignArrayRange(..) => "NbaArrRng",
         Insn::NbaAssignArrayRead(..) => "NbaArrRd",
+        Insn::BinOpConst(_, _, _, BinOpConstKind::Add) => "AddC",
+        Insn::BinOpConst(_, _, _, BinOpConstKind::Eq) => "EqC",
+        Insn::BinOpConst(_, _, _, BinOpConstKind::CaseEq) => "CaseEqC",
         Insn::StmtFallback(..) => "Fallback",
     }
 }
@@ -3948,6 +4013,11 @@ impl<'a> BytecodeCompiler<'a> {
         // the array read and the NBA would otherwise hide the triple. Still
         // before `compact_nops`, which removes the `Nop`s it leaves behind.
         Self::fuse_array_read_nba(&mut self.insns);
+        // Also after `elide_redundant_resizes`: a `Resize` that pass deletes
+        // is what most often separates a `LoadConst` from its consumer. Its
+        // pattern is disjoint from `fuse_array_read_nba`'s, so the order
+        // between the two does not matter.
+        Self::fuse_binop_const(&mut self.insns);
         Self::compact_nops(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
@@ -4037,6 +4107,8 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::ReduceXor(_, s)
             | Insn::Move(_, s)
             | Insn::Replicate(_, s, _) => *s == r,
+            // Its other operand is the embedded constant, not a register.
+            Insn::BinOpConst(_, s, _, _) => *s == r,
             Insn::BitSelect(_, b, i) => *b == r || *i == r,
             Insn::BitSelectConst(_, b, _) => *b == r,
             Insn::RangeSelect(_, b, l, rr) => *b == r || *l == r || *rr == r,
@@ -4347,6 +4419,114 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Peephole: absorb a constant load into the ALU op that consumes it.
+    ///
+    ///   LoadConst(c, K)          ; c = K
+    ///   Add|Eq|CaseEq(d, l, c)   ; d = l <op> c
+    ///       → BinOpConst(d, l, K, kind)
+    ///
+    /// `LoadConst` is the #2 opcode on the C906 memcpy census (49.7 M, 12.0%
+    /// of executed bytecode) and 32.5 M of those — 7.9% of the whole stream —
+    /// feed exactly these three operators. Each fusion removes one dispatch
+    /// and one 32-byte VM register write. It also dissolves the `Add;LoadConst`
+    /// pairs of an address-increment chain, whose `LoadConst` half is the same
+    /// instruction seen from the other side.
+    ///
+    /// Only the RIGHT operand is fused, and that costs nothing: the compiler
+    /// emits the left operand's code, then the right's, then the operator, so
+    /// an IMMEDIATELY PRECEDING `LoadConst` is by construction the right
+    /// operand. (A left-hand constant has the right operand's code in between
+    /// and so is not an adjacent pair at all.) `l == c` — both operands the
+    /// same constant register — is rejected, since the fused form no longer
+    /// loads `c` for the left side to read.
+    ///
+    /// The census only proves ADJACENCY; the operand chain is verified HERE:
+    /// the operator's right register must be exactly the `LoadConst`'s
+    /// destination, and — since the fused form does not write `c` — `c` must
+    /// not be read anywhere else in the block. Registers are allocated fresh
+    /// per value (`alloc_reg` never reuses an id within a block), so any read
+    /// of `c` outside the pair consumes THIS constant; the scan covers the
+    /// whole block, not just the suffix, so a backward jump cannot smuggle one
+    /// past it.
+    ///
+    /// Runs after `elide_redundant_resizes` — a `Resize` that pass is about to
+    /// delete would otherwise hide the pair, and a `Resize` it KEEPS must
+    /// still block the fusion (only `Nop`s are skipped) because the constant
+    /// would then need resizing before use. Before `compact_nops`, which
+    /// removes the `Nop`s left behind. `XEZIM_FUSE_CONST=0` disables the pass
+    /// (A/B escape hatch).
+    fn fuse_binop_const(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_FUSE_CONST").as_deref(), Ok("0"))
+        }) || insns.len() < 2
+        {
+            return;
+        }
+        // Branch targets: fusing must not change what a jump lands on.
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() =>
+                {
+                    is_target[*t as usize] = true;
+                }
+                _ => {}
+            }
+        }
+        for i in 0..insns.len() - 1 {
+            let Insn::LoadConst(c, _) = &insns[i] else {
+                continue;
+            };
+            let c = *c;
+            // Index of the next instruction that survives `compact_nops`.
+            let mut j = i + 1;
+            while j < insns.len() && matches!(insns[j], Insn::Nop) {
+                j += 1;
+            }
+            if j >= insns.len() {
+                continue;
+            }
+            let (d, l, kind) = match insns[j] {
+                Insn::Add(d, l, r) if r == c => (d, l, BinOpConstKind::Add),
+                Insn::Eq(d, l, r) if r == c => (d, l, BinOpConstKind::Eq),
+                Insn::CaseEq(d, l, r) if r == c => (d, l, BinOpConstKind::CaseEq),
+                _ => continue,
+            };
+            // `op(d, c, c)`: the left operand is the constant register too,
+            // and the fused form no longer materialises it.
+            if l == c {
+                continue;
+            }
+            // Control must fall through i → j: nothing from i+1 through j may
+            // be a branch target, or the fused form would swallow an entry
+            // point.
+            if (i + 1..=j).any(|x| is_target[x]) {
+                continue;
+            }
+            let consumed = insns
+                .iter()
+                .enumerate()
+                .any(|(x, ins)| x != i && x != j && Self::insn_reads_reg(ins, c));
+            if consumed {
+                continue;
+            }
+            // Take the boxed constant out of the `LoadConst` rather than
+            // cloning a possibly-`Wide` `Value`.
+            let Insn::LoadConst(_, k) = std::mem::replace(&mut insns[i], Insn::Nop) else {
+                unreachable!("just matched LoadConst")
+            };
+            insns[i] = Insn::BinOpConst(d, l, k, kind);
+            insns[j] = Insn::Nop;
+            FUSED_BINOP_CONST[kind as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Static width inference over the emitted stream: delete every
     /// `Resize(r, w)` whose register is already provably `w` bits wide.
     ///
@@ -4568,6 +4748,33 @@ impl<'a> BytecodeCompiler<'a> {
                             ok(a.max(b)).map(|w| (w, true))
                         }
                         _ => None,
+                    };
+                    store(&mut rw, *d, f);
+                }
+
+                // Same rules as the unfused pair, with the constant's fact
+                // read straight off the boxed `Value` instead of looked up —
+                // which is strictly MORE inferable than the register form,
+                // since `K` can never be unknown. The `Add` kind reuses the
+                // arithmetic rule above verbatim (`max` of the operand widths,
+                // both operands required non-real because `Value::add`
+                // special-cases a real operand into a 64-bit `from_f64`, and
+                // non-fill because §5.7.1 widening renormalises them);
+                // `Eq`/`CaseEq` land in the 1-bit comparison rule, since
+                // `is_equal`/`case_eq` return `from_u64(_, 1)` on every path.
+                Insn::BinOpConst(d, s, k, kind) => {
+                    let f = match kind {
+                        BinOpConstKind::Eq | BinOpConstKind::CaseEq => Some((1, true)),
+                        BinOpConstKind::Add => {
+                            // Identical to the `Insn::LoadConst` arm's fact.
+                            let kf = ok(k.width).map(|w| (w, !k.is_real && !k.is_fill));
+                            match (fact(&rw, *s), kf) {
+                                (Some((a, true)), Some((b, true))) => {
+                                    ok(a.max(b)).map(|w| (w, true))
+                                }
+                                _ => None,
+                            }
+                        }
                     };
                     store(&mut rw, *d, f);
                 }

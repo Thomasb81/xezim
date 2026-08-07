@@ -15167,6 +15167,20 @@ impl Simulator {
                 Insn::CaseEq(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].case_eq(&vm_regs[*r as usize]);
                 }
+                // Fused `LoadConst` + binop. Character-for-character the
+                // `Add`/`Eq`/`CaseEq` arms above with `&vm_regs[r]` replaced by
+                // the embedded constant, which the elided `LoadConst` would
+                // have cloned into `vm_regs[r]` verbatim — so the 4-state,
+                // signedness and §5.7.1 `is_fill` rules cannot drift.
+                Insn::BinOpConst(d, s, k, kind) => {
+                    use super::bytecode::BinOpConstKind as K;
+                    let (d, s) = (*d as usize, *s as usize);
+                    match kind {
+                        K::Add => vm_regs[d] = vm_regs[s].add(&**k),
+                        K::Eq => vm_regs[d] = vm_regs[s].is_equal(&**k),
+                        K::CaseEq => vm_regs[d] = vm_regs[s].case_eq(&**k),
+                    }
+                }
                 Insn::CasezEq(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].casez_eq(&vm_regs[*r as usize]);
                 }
@@ -15664,6 +15678,20 @@ impl Simulator {
                 }
                 Insn::CaseEq(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].case_eq(&vm_regs[*r as usize]);
+                }
+                // Fused `LoadConst` + binop. Character-for-character the
+                // `Add`/`Eq`/`CaseEq` arms above with `&vm_regs[r]` replaced by
+                // the embedded constant, which the elided `LoadConst` would
+                // have cloned into `vm_regs[r]` verbatim — so the 4-state,
+                // signedness and §5.7.1 `is_fill` rules cannot drift.
+                Insn::BinOpConst(d, s, k, kind) => {
+                    use super::bytecode::BinOpConstKind as K;
+                    let (d, s) = (*d as usize, *s as usize);
+                    match kind {
+                        K::Add => vm_regs[d] = vm_regs[s].add(&**k),
+                        K::Eq => vm_regs[d] = vm_regs[s].is_equal(&**k),
+                        K::CaseEq => vm_regs[d] = vm_regs[s].case_eq(&**k),
+                    }
                 }
                 Insn::CasezEq(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].casez_eq(&vm_regs[*r as usize]);
@@ -16505,6 +16533,31 @@ impl Simulator {
                     match vm_case_eq(&self.vm_regs[l], &self.vm_regs[r]) {
                         Some(e) => vm_store(&mut self.vm_regs[d], e as u64, 0, 1, false),
                         None => self.vm_regs[d] = self.vm_regs[l].case_eq(&self.vm_regs[r]),
+                    }
+                }
+                // Fused `LoadConst` + binop. Character-for-character the
+                // `Add`/`Eq`/`CaseEq` arms above with `&self.vm_regs[r]`
+                // replaced by the embedded constant, which the elided
+                // `LoadConst` would have `copy_from`'d into `vm_regs[r]`
+                // verbatim (width/is_signed/is_real/is_fill included) — same
+                // `vm_*` fast helper, same `Value` fallback, so the 4-state,
+                // signedness and §5.7.1 `is_fill` rules cannot drift.
+                Insn::BinOpConst(d, s, k, kind) => {
+                    use super::bytecode::BinOpConstKind as K;
+                    let (d, s) = (*d as usize, *s as usize);
+                    match kind {
+                        K::Add => match vm_add_sub(&self.vm_regs[s], &**k, false) {
+                            Some((v, x, w, sg)) => vm_store(&mut self.vm_regs[d], v, x, w, sg),
+                            None => self.vm_regs[d] = self.vm_regs[s].add(&**k),
+                        },
+                        K::Eq => match vm_is_equal(&self.vm_regs[s], &**k) {
+                            Some(e) => vm_store(&mut self.vm_regs[d], e as u64, 0, 1, false),
+                            None => self.vm_regs[d] = self.vm_regs[s].is_equal(&**k),
+                        },
+                        K::CaseEq => match vm_case_eq(&self.vm_regs[s], &**k) {
+                            Some(e) => vm_store(&mut self.vm_regs[d], e as u64, 0, 1, false),
+                            None => self.vm_regs[d] = self.vm_regs[s].case_eq(&**k),
+                        },
                     }
                 }
                 Insn::CasezEq(d, l, r) => {
@@ -23915,6 +23968,18 @@ impl Simulator {
             "[FUSE] array-read-NBA fusions (static sites): {}",
             super::bytecode::array_read_nba_fusions()
         );
+        // Static count of `LoadConst;<binop>` pairs the peephole collapsed
+        // into `Insn::BinOpConst` (see `BytecodeCompiler::fuse_binop_const`).
+        {
+            let f = super::bytecode::binop_const_fusions();
+            eprintln!(
+                "[FUSE] const-operand ALU fusions (static sites): Add={} Eq={} CaseEq={} total={}",
+                f[0],
+                f[1],
+                f[2],
+                f.iter().sum::<u64>()
+            );
+        }
         // XEZIM_OPCODE_CENSUS=1: dynamic opcode + adjacent-pair histogram for
         // fusion planning. Top-20 of each, with % of total executed insns.
         if self.census_enabled && !self.census_counts.is_empty() {
@@ -24533,6 +24598,13 @@ impl Simulator {
             Insn::LoadSignalRange(..) => "LoadSignalRange",
             Insn::LoadSignalBit(..) => "LoadSignalBit",
             Insn::NbaAssignArrayRead(..) => "NbaAssignArrayRead",
+            // Split by kind: the pair census is only useful if the three
+            // fused ALU ops stay distinguishable.
+            Insn::BinOpConst(_, _, _, k) => match k {
+                super::bytecode::BinOpConstKind::Add => "BinOpConstAdd",
+                super::bytecode::BinOpConstKind::Eq => "BinOpConstEq",
+                super::bytecode::BinOpConstKind::CaseEq => "BinOpConstCaseEq",
+            },
         }
     }
 
@@ -52481,6 +52553,18 @@ impl Simulator {
             // payloads — both are `Value` behaviors the register file cannot
             // express. Blocks carrying either fall back to the interpreter.
             if let Insn::LoadConst(_, v) = insn {
+                if v.is_fill || v.is_real {
+                    return false;
+                }
+            }
+            // Same constant, just folded into the ALU op that consumes it —
+            // the peephole moves the `Value` out of the `LoadConst` and into
+            // `BinOpConst`, where the check above no longer sees it.
+            // Unreachable today (`JitModule::is_supported` rejects
+            // `BinOpConst` outright, as it does `NbaAssignArrayRead`), but
+            // keeping the guard here means this invariant does not silently
+            // depend on that allowlist.
+            if let Insn::BinOpConst(_, _, v, _) = insn {
                 if v.is_fill || v.is_real {
                     return false;
                 }
