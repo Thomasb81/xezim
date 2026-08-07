@@ -1390,6 +1390,41 @@ impl<'a> BytecodeCompiler<'a> {
             .filter(|&w| w > 1)
     }
 
+    /// §7.4.1: physical LSB offset of declared bit index 0 does not exist for
+    /// a non-zero-based vector — `logic [3:1] w` stores declared bit 1 at
+    /// physical offset 0. Returns the declared range's LOW bound when it is
+    /// non-zero (descending ranges only; ascending is handled elsewhere), so
+    /// write emission can rebase declared indices the way the read path
+    /// already does. Every `*AssignRange`/`*AssignBitDyn` the compiler emits
+    /// carries PHYSICAL offsets by contract — the interpreter and the JIT
+    /// both index raw bits.
+    /// Emit `idx_reg - declared_low_bound` when the vector is non-zero-based;
+    /// pass-through otherwise. Used by every dynamic-index WRITE emission.
+    fn emit_rebased_index(
+        &mut self,
+        hier: &HierarchicalIdentifier,
+        idx_reg: RegId,
+    ) -> RegId {
+        let base_lo = self.declared_low_bound(hier);
+        if base_lo == 0 {
+            return idx_reg;
+        }
+        let base_reg = self.alloc_reg();
+        self.emit(Insn::LoadConst(
+            base_reg,
+            Box::new(Value::from_u64(base_lo as u64, 32)),
+        ));
+        let adj = self.alloc_reg();
+        self.emit(Insn::Sub(adj, idx_reg, base_reg));
+        adj
+    }
+
+    fn declared_low_bound(&self, hier: &HierarchicalIdentifier) -> i64 {
+        self.packed_outer_dim(hier)
+            .map(|(dl, dr)| dl.min(dr))
+            .unwrap_or(0)
+    }
+
     fn flattened_const_range_target(
         &self,
         expr: &Expression,
@@ -2755,6 +2790,8 @@ impl<'a> BytecodeCompiler<'a> {
                             }
                         }
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
+                            // §7.4.1: rebase for non-zero-based vectors.
+                            let idx_reg = self.emit_rebased_index(hier, idx_reg);
                             self.emit(Insn::NbaAssignBitDyn(id, idx_reg, val_reg));
                             return true;
                         }
@@ -2777,11 +2814,16 @@ impl<'a> BytecodeCompiler<'a> {
             } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(id) = self.lookup_signal_id(hier) {
+                        // §7.4.1: rebase declared indices to physical offsets
+                        // for a non-zero-based vector (see the blocking arm).
+                        let base_lo = self.declared_low_bound(hier);
                         match kind {
                             RangeKind::Constant => {
                                 if let (Some(hi), Some(lo)) =
                                     (self.eval_const_expr(left), self.eval_const_expr(right))
                                 {
+                                    let hi = (hi as i64 - base_lo).max(0) as u32;
+                                    let lo = (lo as i64 - base_lo).max(0) as u32;
                                     self.emit(Insn::NbaAssignRange(id, hi, lo, val_reg));
                                     return true;
                                 }
@@ -2801,6 +2843,8 @@ impl<'a> BytecodeCompiler<'a> {
                                     self.bail("nba_range_base");
                                     return false;
                                 };
+                                // §7.4.1: rebase for non-zero-based vectors.
+                                let idx = self.emit_rebased_index(hier, idx);
                                 let (hi_reg, lo_reg) = if width == 1 {
                                     (idx, idx)
                                 } else {
@@ -3064,6 +3108,22 @@ impl<'a> BytecodeCompiler<'a> {
                             }
                         }
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
+                            // §7.4.1: rebase a declared bit index to a
+                            // physical offset on a non-zero-based vector
+                            // (`logic [3:1] w; w[3] = …` writes offset 2).
+                            let base_lo = self.declared_low_bound(hier);
+                            let idx_reg = if base_lo != 0 {
+                                let base_reg = self.alloc_reg();
+                                self.emit(Insn::LoadConst(
+                                    base_reg,
+                                    Box::new(Value::from_u64(base_lo as u64, 32)),
+                                ));
+                                let adj = self.alloc_reg();
+                                self.emit(Insn::Sub(adj, idx_reg, base_reg));
+                                adj
+                            } else {
+                                idx_reg
+                            };
                             self.emit(Insn::BlockingAssignBitDyn(id, idx_reg, val_reg));
                             return true;
                         }
@@ -3093,11 +3153,19 @@ impl<'a> BytecodeCompiler<'a> {
                         return false;
                     }
                     if let Some(id) = self.lookup_signal_id(hier) {
+                        // §7.4.1: declared indices on a non-zero-based vector
+                        // (`logic [3:1] w; assign w[2:1] = …`) must be rebased
+                        // to physical offsets — the read path already does
+                        // this; the write path never did, so the write landed
+                        // one position high and the low bit stayed x.
+                        let base_lo = self.declared_low_bound(hier);
                         match kind {
                             RangeKind::Constant => {
                                 if let (Some(hi), Some(lo)) =
                                     (self.eval_const_expr(left), self.eval_const_expr(right))
                                 {
+                                    let hi = (hi as i64 - base_lo).max(0) as u32;
+                                    let lo = (lo as i64 - base_lo).max(0) as u32;
                                     let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
                                     if let Some(range_w) =
                                         high.checked_sub(low).and_then(|w| w.checked_add(1))
@@ -3133,6 +3201,8 @@ impl<'a> BytecodeCompiler<'a> {
                                     self.bail("blocking_range_base");
                                     return false;
                                 };
+                                // §7.4.1: rebase for non-zero-based vectors.
+                                let idx = self.emit_rebased_index(hier, idx);
                                 let (hi_reg, lo_reg) = if width == 1 {
                                     (idx, idx)
                                 } else {
