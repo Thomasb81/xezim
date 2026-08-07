@@ -5907,7 +5907,38 @@ impl Simulator {
         // bare declaration names, while signal_name_to_id keys are scoped and
         // array elements carry `[idx]`; match on the leaf base of each name.
         let mut signal_two_state = vec![false; num_signals];
-        if !module.two_state_signals.is_empty() {
+        // §6.16: mark string-typed ids so assignment does not clamp them to the
+        // placeholder width the elaborator assigns a dynamic type.
+        let mut signal_is_string = vec![false; num_signals];
+        // §28.4 vs §10.3: mark ids driven by a lowered gate primitive, so only
+        // those get the `buf` truth table's z->x. Same leaf/base matching as
+        // the 2-state pass.
+        let mut signal_gate_driven = vec![false; num_signals];
+        let want_two_state = !module.two_state_signals.is_empty();
+        let want_string = !module.string_signals.is_empty();
+        let want_gate = !module.gate_driven_nets.is_empty();
+        // ONE walk of `signal_name_to_id` (1.56 M entries on c906) instead of
+        // three. The three marking passes asked independent questions about the
+        // same name but each re-walked the map — chasing every `Arc<str>` out
+        // of cache again — and each recomputed the identical `leaf`/`base`
+        // split, i.e. a `memrchr` plus a `memchr` per name PER PASS. The
+        // per-name predicates below are byte-for-byte the ones each pass used
+        // (note the 2-state test deliberately does not consult `leaf`), and the
+        // `array_first_id` fixups that follow are unchanged.
+        //
+        // An ELEMENT of a string collection is a string too. `string_signals`
+        // holds the base name (`q`, `aa`), while the table holds `q[2]`, so the
+        // subscript is stripped before matching — otherwise a `string q[$]`
+        // element kept being clamped to the placeholder width while a plain
+        // `string` variable no longer was.
+        let is_str_name = |n: &str| -> bool {
+            let leaf = n.rsplit('.').next().unwrap_or(n);
+            let base = leaf.split('[').next().unwrap_or(leaf);
+            module.string_signals.contains(n)
+                || module.string_signals.contains(leaf)
+                || module.string_signals.contains(base)
+        };
+        if want_two_state || want_string || want_gate {
             for (name, &id) in signal_name_to_id.iter() {
                 if id >= num_signals {
                     continue;
@@ -5915,12 +5946,29 @@ impl Simulator {
                 let name_ref: &str = name.as_ref();
                 let leaf = name_ref.rsplit('.').next().unwrap_or(name_ref);
                 let base = leaf.split('[').next().unwrap_or(leaf);
-                if module.two_state_signals.contains(name_ref)
-                    || module.two_state_signals.contains(base)
+                if want_two_state
+                    && (module.two_state_signals.contains(name_ref)
+                        || module.two_state_signals.contains(base))
                 {
                     signal_two_state[id] = true;
                 }
+                if want_string
+                    && (module.string_signals.contains(name_ref)
+                        || module.string_signals.contains(leaf)
+                        || module.string_signals.contains(base))
+                {
+                    signal_is_string[id] = true;
+                }
+                if want_gate
+                    && (module.gate_driven_nets.contains(name_ref)
+                        || module.gate_driven_nets.contains(leaf)
+                        || module.gate_driven_nets.contains(base))
+                {
+                    signal_gate_driven[id] = true;
+                }
             }
+        }
+        if want_two_state {
             for (base_name, &(first_id, lo, hi)) in array_first_id.iter() {
                 let base_ref: &str = base_name.as_ref();
                 let leaf = base_ref.rsplit('.').next().unwrap_or(base_ref);
@@ -5940,17 +5988,24 @@ impl Simulator {
         // key for the concrete signal, `ref_pipe[i].wdata[j]` degraded from a
         // lane slice to a 1-BIT select — silently comparing one bit against a
         // whole lane. Alias every element name to its declaration's entry.
-        {
+        //
+        // Skipped wholesale when the width map is empty: with nothing to alias
+        // TO, every lookup below misses and no alias is ever produced, so the
+        // walk over all 1.56 M names is pure cost. The `]`-shape test also
+        // moved ahead of the `contains_key` probe — both outcomes are the same
+        // `continue`, and a name with no `]` can never alias, so it no longer
+        // pays for a full-name hash.
+        if !module.packed_signal_elem_widths.is_empty() {
             let mut aliases: Vec<(String, u32)> = Vec::new();
             for name in signal_name_to_id.keys() {
                 let name_ref: &str = name.as_ref();
-                if module.packed_signal_elem_widths.contains_key(name_ref) {
-                    continue;
-                }
                 // `base[i].member…` -> `base.member…`
                 let Some(br) = name_ref.find(']') else { continue };
                 let Some(bl) = name_ref[..br].rfind('[') else { continue };
                 if !name_ref[br..].starts_with("].") {
+                    continue;
+                }
+                if module.packed_signal_elem_widths.contains_key(name_ref) {
                     continue;
                 }
                 let deindexed = format!("{}{}", &name_ref[..bl], &name_ref[br + 1..]);
@@ -5976,30 +6031,7 @@ impl Simulator {
                 module.packed_signal_elem_widths.insert(k, ew);
             }
         }
-        // §6.16: mark string-typed ids so assignment does not clamp them to the
-        // placeholder width the elaborator assigns a dynamic type.
-        let mut signal_is_string = vec![false; num_signals];
-        if !module.string_signals.is_empty() {
-            // An ELEMENT of a string collection is a string too. `string_signals`
-            // holds the base name (`q`, `aa`), while the table holds `q[2]`, so
-            // the subscript is stripped before matching — otherwise a
-            // `string q[$]` element kept being clamped to the placeholder width
-            // while a plain `string` variable no longer was.
-            let is_str_name = |n: &str| -> bool {
-                let leaf = n.rsplit('.').next().unwrap_or(n);
-                let base = leaf.split('[').next().unwrap_or(leaf);
-                module.string_signals.contains(n)
-                    || module.string_signals.contains(leaf)
-                    || module.string_signals.contains(base)
-            };
-            for (name, &id) in signal_name_to_id.iter() {
-                if id >= num_signals {
-                    continue;
-                }
-                if is_str_name(name.as_ref()) {
-                    signal_is_string[id] = true;
-                }
-            }
+        if want_string {
             // Compact-allocated array elements have no per-element name entry;
             // mark their whole id range from the base.
             for (base_name, &(first_id, lo, hi)) in array_first_id.iter() {
@@ -6009,26 +6041,6 @@ impl Simulator {
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..(first_id + n).min(num_signals) {
                     signal_is_string[id] = true;
-                }
-            }
-        }
-        // §28.4 vs §10.3: mark ids driven by a lowered gate primitive, so only
-        // those get the `buf` truth table's z->x. Same leaf/base matching as
-        // the 2-state pass above.
-        let mut signal_gate_driven = vec![false; num_signals];
-        if !module.gate_driven_nets.is_empty() {
-            for (name, &id) in signal_name_to_id.iter() {
-                if id >= num_signals {
-                    continue;
-                }
-                let name_ref: &str = name.as_ref();
-                let leaf = name_ref.rsplit('.').next().unwrap_or(name_ref);
-                let base = leaf.split('[').next().unwrap_or(leaf);
-                if module.gate_driven_nets.contains(name_ref)
-                    || module.gate_driven_nets.contains(leaf)
-                    || module.gate_driven_nets.contains(base)
-                {
-                    signal_gate_driven[id] = true;
                 }
             }
         }
@@ -6090,7 +6102,13 @@ impl Simulator {
         instance_path_order.sort_unstable_by(|&a, &b| {
             module.instances[a].path.cmp(&module.instances[b].path)
         });
-        let mut scope_parents_by_leaf: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::default();
+        // Sized up front: this ends up with one entry per DISTINCT leaf, and on
+        // c906 nearly every one of the 1.56 M names has its own (array elements
+        // carry `[idx]` in the leaf). Growing from empty rehashes the table a
+        // dozen times, and hashbrown stores only a 7-bit tag, so each of those
+        // resizes re-hashes every `Arc<str>` key's full string.
+        let mut scope_parents_by_leaf: HashMap<Arc<str>, Vec<Arc<str>>> =
+            HashMap::with_capacity_and_hasher(named_count, Default::default());
         // PERF: this walks every named signal (1.56 M on c906) and used to
         // allocate TWO fresh `Arc<str>` per name — one for the leaf (which the
         // `entry` then throws away whenever the leaf is already present) and
@@ -6127,8 +6145,13 @@ impl Simulator {
         }
         drop(parent_intern);
         for parents in scope_parents_by_leaf.values_mut() {
-            parents.sort_unstable();
-            parents.dedup();
+            // A leaf seen under exactly one scope — the common case here, since
+            // every distinct array-element name has its own leaf — is already
+            // sorted and already unique.
+            if parents.len() > 1 {
+                parents.sort_unstable();
+                parents.dedup();
+            }
         }
 
         let mut sim = Self {
@@ -16019,23 +16042,34 @@ impl Simulator {
         )
     }
 
+    /// `--trace-always` label construction for `exec_bytecode`. Kept `#[cold]`
+    /// and out of line: it needs two `HashSet<String>`, a `Vec<String>` and a
+    /// `format!` of stack scratch, and inlining that into `exec_bytecode` — a
+    /// function whose whole job is a few loads and a call — inflated its frame
+    /// and prologue for a branch that is not taken on any production run.
+    #[cold]
+    #[inline(never)]
+    fn exec_bytecode_trace(&mut self, block_idx: usize) {
+        let label = {
+            let blk = &self.edge_blocks[block_idx];
+            let mut writes: HashSet<String> = HashSet::default();
+            let mut reads: HashSet<String> = HashSet::default();
+            Self::collect_stmt_reads(&blk.stmt, &self.module, &mut reads, &mut writes);
+            let mut ws: Vec<String> = writes.into_iter().take(3).collect();
+            ws.sort();
+            format!(
+                "always_ff#{} scope={} writes={}",
+                block_idx,
+                if blk.scope.is_empty() { "-" } else { blk.scope.as_str() },
+                ws.join(",")
+            )
+        };
+        self.trace_always_fire(&label);
+    }
+
     fn exec_bytecode(&mut self, block_idx: usize) -> bool {
         if self.trace_always.is_some() {
-            let label = {
-                let blk = &self.edge_blocks[block_idx];
-                let mut writes: HashSet<String> = HashSet::default();
-                let mut reads: HashSet<String> = HashSet::default();
-                Self::collect_stmt_reads(&blk.stmt, &self.module, &mut reads, &mut writes);
-                let mut ws: Vec<String> = writes.into_iter().take(3).collect();
-                ws.sort();
-                format!(
-                    "always_ff#{} scope={} writes={}",
-                    block_idx,
-                    if blk.scope.is_empty() { "-" } else { blk.scope.as_str() },
-                    ws.join(",")
-                )
-            };
-            self.trace_always_fire(&label);
+            self.exec_bytecode_trace(block_idx);
         }
         // Fast path: if we JIT-compiled this block, call the native fn
         // directly. Zero-cost when the jit feature is off (jit_fns stays
