@@ -21110,10 +21110,31 @@ impl Simulator {
                 }
                 let id = self.resolve_ident_id(hier, scope_hint)?;
                 let bit = Self::try_const_u64(index)?;
-                if (bit as u32) < self.signal_widths[id] {
+                // §7.4.1: `bit` is a DECLARED index but `BitRef` addresses a
+                // PHYSICAL bit, so a non-zero-based vector needs rebasing —
+                // `logic [3:1] w` keeps declared bit 1 at offset 0. Fusing
+                // `assign y = w[1]` without this read declared bit 2 instead.
+                //
+                // Only the low index was wrong: `w[3]` failed the range check
+                // below, fell through to the bytecode path (which rebases) and
+                // came out right, so the two forms disagreed with each other.
+                let base_lo = self
+                    .module
+                    .packed_full_dims
+                    .get(&name)
+                    .or_else(|| {
+                        hier.path
+                            .last()
+                            .and_then(|s| self.module.packed_full_dims.get(s.name.name.as_str()))
+                    })
+                    .and_then(|d| d.first())
+                    .map(|&(l, r)| l.min(r))
+                    .unwrap_or(0);
+                let phys = (bit as i64) - base_lo;
+                if phys >= 0 && (phys as u32) < self.signal_widths[id] {
                     Some(BitRef {
                         sig_id: id as u32,
-                        bit: bit as u32,
+                        bit: phys as u32,
                     })
                 } else {
                     None
