@@ -97,6 +97,8 @@ mod multi_dim_elem_read_and_param_dims;
 mod ascending_indexed_part_select;
 #[path = "types/nonzero_based_vector_writes.rs"]
 mod nonzero_based_vector_writes;
+#[path = "types/nonzero_based_vector_reads.rs"]
+mod nonzero_based_vector_reads;
 #[path = "types/nested_packed_typedefs.rs"]
 mod nested_packed_typedefs;
 #[path = "types/packed_2d_element_in_size_cast.rs"]
