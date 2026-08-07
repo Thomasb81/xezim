@@ -16098,11 +16098,21 @@ impl Simulator {
         // `self` on every instruction measurably inflates the hot path (it
         // cost ~2.5% of retired instructions on the c906 memcpy when read
         // per-iteration).
+        // Compile-time gated: the per-instruction census costs a load+branch
+        // on the VM's critical path (measured ~1% of the whole c906 run, for a
+        // tool that is off by default), and `perf annotate` shows this loop is
+        // a latency chain — discriminant load, jump-table index, indirect jump
+        // — where an extra dependent test is not free even when perfectly
+        // predicted. Build with `--features opcode-census` to get it back;
+        // `XEZIM_OPCODE_CENSUS=1` then still selects it at run time.
+        #[cfg(feature = "opcode-census")]
         let census_on = self.census_enabled;
         let soa_len = self.soa_read_ok.len();
+        #[cfg(feature = "opcode-census")]
         let mut census_prev: usize = usize::MAX;
         while pc < len {
             local_count += 1;
+            #[cfg(feature = "opcode-census")]
             if census_on {
                 if self.census_counts.is_empty() {
                     self.census_counts = vec![0u64; 64];
