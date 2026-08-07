@@ -15,6 +15,15 @@ fn insn_size_fits_cache_line() {
     // boxes), the enum sits at 24 B. Going back to 32 B is a 33%
     // bytecode-footprint regression on dense designs — investigate
     // which variant got fat.
+    //
+    // Narrowing the 14 signal-id fields from usize to u32 (SigId) took
+    // the count of variants that need the full 24 B from 9 down to 5,
+    // but did not move this number: the survivors are
+    //   NbaAssignConst(SigId, Box<Value>, u32)   -> 4+8+4 + tag
+    //   {Nba,Blocking}AssignArray(Box<ArrayOperand>, RegId, RegId, u32)
+    //   {Nba,Blocking}AssignArrayRange(Box<ArrayOperand>, RegId x4)
+    // Every one is pinned by an 8-byte `Box` payload, so 16 B needs the
+    // boxes replaced by u32 side-table indices — not another id squeeze.
     assert!(
         sz <= 24,
         "Insn enum grew to {} B (max-variant needs a Box?)",

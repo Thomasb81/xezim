@@ -6961,6 +6961,7 @@ impl Simulator {
                                     super::bytecode::Insn::NbaAssign(s, _, _)
                                     | super::bytecode::Insn::NbaAssignConst(s, _, _)
                                     | super::bytecode::Insn::NbaAssignRange(s, _, _, _) => {
+                                        let s = &(*s as usize);
                                         *s == sid
                                     }
                                     _ => false,
@@ -6982,7 +6983,7 @@ impl Simulator {
                                     | super::bytecode::Insn::LoadSignalSigned(_, s)
                                     | super::bytecode::Insn::LoadSignalRange(_, s, _, _)
                                     | super::bytecode::Insn::LoadSignalBit(_, s, _)
-                                    | super::bytecode::Insn::BranchIfSignalFalse(s, _, _) if *s == sid)
+                                    | super::bytecode::Insn::BranchIfSignalFalse(s, _, _) if *s as usize == sid)
                                 })
                             })
                     })
@@ -7128,16 +7129,16 @@ impl Simulator {
                     | super::bytecode::Insn::LoadSignalRange(_, sid, _, _)
                     | super::bytecode::Insn::LoadSignalBit(_, sid, _)
                     | super::bytecode::Insn::BranchIfSignalFalse(sid, _, _)
-                        if !reads_of[bi].contains(sid) => {
-                            reads_of[bi].push(*sid);
-                            readers_of_sig.entry(*sid).or_default().push(bi);
+                        if !reads_of[bi].contains(&(*sid as usize)) => {
+                            reads_of[bi].push(*sid as usize);
+                            readers_of_sig.entry(*sid as usize).or_default().push(bi);
                         }
                     super::bytecode::Insn::NbaAssign(sid, _, _)
                     | super::bytecode::Insn::NbaAssignConst(sid, _, _)
                     | super::bytecode::Insn::NbaAssignRange(sid, _, _, _)
-                        if !writes_of[bi].contains(sid) => {
-                            writes_of[bi].push(*sid);
-                            writers_of_sig.entry(*sid).or_default().push(bi);
+                        if !writes_of[bi].contains(&(*sid as usize)) => {
+                            writes_of[bi].push(*sid as usize);
+                            writers_of_sig.entry(*sid as usize).or_default().push(bi);
                         }
                     _ => {}
                 }
@@ -7340,6 +7341,7 @@ impl Simulator {
                     | Insn::NbaAssignConst(id, _, _)
                     | Insn::NbaAssignRange(id, _, _, _)
                     | Insn::NbaAssignBitDyn(id, _, _) => {
+                        let id = &(*id as usize);
                         let owner = lp_writer.get(*id).copied().unwrap_or(None);
                         if owner != Some(block_lp) {
                             all_writes_lp_local = false;
@@ -7412,6 +7414,7 @@ impl Simulator {
                     Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
                     _ => continue,
                 };
+                let sig_id = sig_id as usize;
                 if sig_id >= n_signals {
                     continue;
                 }
@@ -7560,6 +7563,7 @@ impl Simulator {
                     | super::bytecode::Insn::NbaAssignRange(sid, _, _, _) => *sid,
                     _ => continue,
                 };
+                let sid = sid as usize;
                 if !seen.contains(&sid) {
                     seen.push(sid);
                 }
@@ -11144,6 +11148,7 @@ impl Simulator {
                     _ => None,
                 };
                 if let Some(id) = touched_id {
+                    let id = id as usize;
                     if id < n_signals {
                         per_lp_signal_set[lp as usize].insert(id);
                     }
@@ -12049,6 +12054,7 @@ impl Simulator {
                         _ => None,
                     };
                     if let Some(id) = wid {
+                        let id = id as usize;
                         if id < n_signals {
                             if let Some(o) = sig_core(id) {
                                 if o != lp {
@@ -13241,6 +13247,7 @@ impl Simulator {
                     _ => None,
                 };
                 if let Some(id) = wid {
+                    let id = id as usize;
                     if id < n_signals {
                         edge_written[id] = true;
                     }
@@ -13281,6 +13288,7 @@ impl Simulator {
                     _ => None,
                 };
                 if let Some(id) = wid {
+                    let id = id as usize;
                     if id < n_signals {
                         blp = sig_lp(id);
                         break;
@@ -13294,6 +13302,7 @@ impl Simulator {
                 | Insn::LoadSignalBit(_, id, _)
                 | Insn::BranchIfSignalFalse(id, _, _) = insn
                 {
+                    let id = &(*id as usize);
                     if *id < n_signals {
                         read_edge[*id] |= 1 << blp;
                     }
@@ -14798,6 +14807,7 @@ impl Simulator {
                         | super::bytecode::Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
                         _ => continue,
                     };
+                    let id = id as usize;
                     if !seen.contains(&id) {
                         seen.push(id);
                         *nba_writer_count.entry(id).or_insert(0) += 1;
@@ -14847,7 +14857,7 @@ impl Simulator {
                         | BcInsn::NbaAssignArrayRange(..)
                         | BcInsn::BlockingAssignArrayRange(..) => return false,
                         BcInsn::NbaAssignRange(id, _, _, _) | BcInsn::NbaAssignBitDyn(id, _, _)
-                            if (!unlock_range || nba_writer_count.get(id).copied().unwrap_or(0) > 1) => {
+                            if (!unlock_range || nba_writer_count.get(&(*id as usize)).copied().unwrap_or(0) > 1) => {
                                 return false;
                             }
                         _ => {}
@@ -14963,6 +14973,7 @@ impl Simulator {
                         | Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
                         _ => continue,
                     };
+                    let id = id as usize;
                     if !v.contains(&id) {
                         v.push(id);
                     }
@@ -15050,9 +15061,11 @@ impl Simulator {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
                 Insn::LoadSignal(dest, sig_id) => {
+                    let sig_id = &(*sig_id as usize);
                     vm_regs[*dest as usize] = signal_table[*sig_id].clone();
                 }
                 Insn::LoadSignalSigned(dest, sig_id) => {
+                    let sig_id = &(*sig_id as usize);
                     let mut v = signal_table[*sig_id].clone();
                     v.is_signed = true;
                     vm_regs[*dest as usize] = v;
@@ -15186,10 +15199,12 @@ impl Simulator {
                 }
                 // Fused load+select (finish() peephole).
                 Insn::LoadSignalRange(d, sig_id, l, r) => {
+                    let sig_id = &(*sig_id as usize);
                     vm_regs[*d as usize] =
                         signal_table[*sig_id].range_select(*l as usize, *r as usize);
                 }
                 Insn::LoadSignalBit(d, sig_id, idx) => {
+                    let sig_id = &(*sig_id as usize);
                     vm_regs[*d as usize] = signal_table[*sig_id].bit_select(*idx as usize);
                 }
                 Insn::Concat(d, part_regs) => {
@@ -15220,6 +15235,7 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
+                    let sig_id = &(*sig_id as usize);
                     // Const pre-resized at fuse time: compare, clone only on change.
                     // §10.4.2 last-write-wins: an entry already queued for this
                     // signal supersedes signal_table, so compare against it
@@ -15247,6 +15263,7 @@ impl Simulator {
                     }
                 }
                 Insn::BranchIfSignalFalse(sig_id, target, bit) => {
+                    let sig_id = &(*sig_id as usize);
                     // `bit == u32::MAX` tests the whole signal; otherwise the
                     // fused form also folds in a constant bit-select. Written
                     // as `bit_select(..).is_true()` rather than open-coded bit
@@ -15300,6 +15317,7 @@ impl Simulator {
                     continue;
                 }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
+                    let sig_id = &(*sig_id as usize);
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
                     // Eval-time elision: skip the queue push when the
                     // value already matches signal_table.  apply_nba_entry
@@ -15323,6 +15341,7 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                     let w = high - low + 1;
                     let val = vm_regs[*val_reg as usize].resize(w);
@@ -15374,6 +15393,7 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
                     let bit = vm_regs[*val_reg as usize].get_bit(0);
                     let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
@@ -15505,9 +15525,11 @@ impl Simulator {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
                 Insn::LoadSignal(dest, sig_id) => {
+                    let sig_id = &(*sig_id as usize);
                     vm_regs[*dest as usize] = view[*sig_id].clone();
                 }
                 Insn::LoadSignalSigned(dest, sig_id) => {
+                    let sig_id = &(*sig_id as usize);
                     let mut v = view[*sig_id].clone();
                     v.is_signed = true;
                     vm_regs[*dest as usize] = v;
@@ -15641,10 +15663,12 @@ impl Simulator {
                 }
                 // Fused load+select (finish() peephole).
                 Insn::LoadSignalRange(d, sig_id, l, r) => {
+                    let sig_id = &(*sig_id as usize);
                     vm_regs[*d as usize] =
                         view[*sig_id].range_select(*l as usize, *r as usize);
                 }
                 Insn::LoadSignalBit(d, sig_id, idx) => {
+                    let sig_id = &(*sig_id as usize);
                     vm_regs[*d as usize] = view[*sig_id].bit_select(*idx as usize);
                 }
                 Insn::Concat(d, part_regs) => {
@@ -15675,6 +15699,7 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
+                    let sig_id = &(*sig_id as usize);
                     // Const pre-resized at fuse time: compare, clone only on change.
                     // §10.4.2 last-write-wins: an entry already queued for this
                     // signal supersedes the snapshot view.
@@ -15701,6 +15726,7 @@ impl Simulator {
                     }
                 }
                 Insn::BranchIfSignalFalse(sig_id, target, bit) => {
+                    let sig_id = &(*sig_id as usize);
                     let cond_true = if *bit == u32::MAX {
                         view[*sig_id].is_true()
                     } else {
@@ -15770,6 +15796,7 @@ impl Simulator {
                 }
                 // ── Immediate (blocking) writes — comb semantics ──
                 Insn::BlockingAssign(sig_id, val_reg, width) => {
+                    let sig_id = &(*sig_id as usize);
                     // Mirror the canonical `exec_insns` BlockingAssign exactly
                     // so the isolated evaluator is bit-identical (incl X) to
                     // the monolithic settle. The fast path MASKS v/x to the
@@ -15800,6 +15827,7 @@ impl Simulator {
                     }
                 }
                 Insn::BlockingAssignRange(sig_id, hi, lo, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                     let w = high - low + 1;
                     let val = vm_regs[*val_reg as usize].resize(w);
@@ -15829,6 +15857,7 @@ impl Simulator {
                     }
                 }
                 Insn::BlockingAssignBitDyn(sig_id, idx_reg, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
                     let bit = vm_regs[*val_reg as usize].get_bit(0);
                     if view[*sig_id].get_bit(idx) != bit {
@@ -15839,6 +15868,7 @@ impl Simulator {
                     }
                 }
                 Insn::BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     let hi = vm_regs[*hi_reg as usize].to_u64().unwrap_or(0) as u32;
                     let lo = vm_regs[*lo_reg as usize].to_u64().unwrap_or(0) as u32;
                     let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
@@ -15886,6 +15916,7 @@ impl Simulator {
                 }
                 // ── Deferred (non-blocking) writes — queued like settle ──
                 Insn::NbaAssign(sig_id, val_reg, width) => {
+                    let sig_id = &(*sig_id as usize);
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
                     // §10.4.2 last-write-wins: see the NbaAssignConst arm.
                     if let Some(i) = if nba_dup {
@@ -15903,6 +15934,7 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                     let w = high - low + 1;
                     let val = vm_regs[*val_reg as usize].resize(w);
@@ -15945,6 +15977,7 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
                     let bit = vm_regs[*val_reg as usize].get_bit(0);
                     let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
@@ -16166,7 +16199,7 @@ impl Simulator {
                 }
                 Insn::LoadSignal(dest, sig_id) => {
                     let d = *dest as usize;
-                    let s = *sig_id;
+                    let s = *sig_id as usize;
                     // Prefetch the next LoadSignal's signal_table[s'] — for
                     // c910 with 465K signals × 32 B Value = 15 MB
                     // signal_table, the access pattern misses L3 often.
@@ -16176,6 +16209,7 @@ impl Simulator {
                     if pc + 1 < len {
                         match &insns[pc + 1] {
                             Insn::LoadSignal(_, s2) | Insn::LoadSignalSigned(_, s2) => {
+                                let s2 = &(*s2 as usize);
                                 let p = self.signal_table.as_ptr().wrapping_add(*s2);
                                 unsafe {
                                     core::arch::x86_64::_mm_prefetch(
@@ -16211,11 +16245,12 @@ impl Simulator {
                 }
                 Insn::LoadSignalSigned(dest, sig_id) => {
                     let d = *dest as usize;
-                    let s = *sig_id;
+                    let s = *sig_id as usize;
                     #[cfg(target_arch = "x86_64")]
                     if pc + 1 < len {
                         match &insns[pc + 1] {
                             Insn::LoadSignal(_, s2) | Insn::LoadSignalSigned(_, s2) => {
+                                let s2 = &(*s2 as usize);
                                 let p = self.signal_table.as_ptr().wrapping_add(*s2);
                                 unsafe {
                                     core::arch::x86_64::_mm_prefetch(
@@ -16478,6 +16513,7 @@ impl Simulator {
                 // Fused load+select (finish() peephole): slice straight out of
                 // the signal — no whole-Value copy into a register first.
                 Insn::LoadSignalRange(d, sig_id, l, r) => {
+                    let sig_id = &(*sig_id as usize);
                     let (d, l, r) = (*d as usize, *l as usize, *r as usize);
                     match vm_range_select(&self.signal_table[*sig_id], l, r) {
                         Some((v, x, w)) => vm_store(&mut self.vm_regs[d], v, x, w, false),
@@ -16487,6 +16523,7 @@ impl Simulator {
                     }
                 }
                 Insn::LoadSignalBit(d, sig_id, idx) => {
+                    let sig_id = &(*sig_id as usize);
                     let (d, idx) = (*d as usize, *idx as usize);
                     match vm_bit_select(&self.signal_table[*sig_id], idx) {
                         Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
@@ -16566,6 +16603,7 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignConst(sig_id, k, _width) => {
+                    let sig_id = &(*sig_id as usize);
                     // Const pre-resized at fuse time: compare, clone only on change.
                     if let Some(i) = self.nba_fast_index.get(*sig_id) {
                         // §10.4.2 last-write-wins. A value already QUEUED for
@@ -16596,6 +16634,7 @@ impl Simulator {
                     }
                 }
                 Insn::BranchIfSignalFalse(sig_id, target, bit) => {
+                    let sig_id = &(*sig_id as usize);
                     let sv = &self.signal_table[*sig_id];
                     let cond_true = if *bit == u32::MAX {
                         sv.is_true()
@@ -16653,6 +16692,7 @@ impl Simulator {
                     continue;
                 }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
+                    let sig_id = &(*sig_id as usize);
                     let val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
                     // Eval-time elision: skip the queue push when the
                     // value already matches signal_table.  See the
@@ -16679,6 +16719,7 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     // O(1) lookup via nba_fast_index instead of the prior
                     // O(N) `iter().rposition` scan. Mutate the existing
                     // entry in-place (no clone) when we find one — falls
@@ -16763,6 +16804,7 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     let hi = self.vm_regs[*hi_reg as usize].to_u64().unwrap_or(0) as u32;
                     let lo = self.vm_regs[*lo_reg as usize].to_u64().unwrap_or(0) as u32;
                     let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
@@ -16859,6 +16901,7 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
                     let bit = self.vm_regs[*val_reg as usize].get_bit(0);
                     let id = *sig_id;
@@ -16896,6 +16939,7 @@ impl Simulator {
                     e.1 += elapsed;
                 }
                 Insn::BlockingAssign(sig_id, val_reg, width) => {
+                    let sig_id = &(*sig_id as usize);
                     let id = *sig_id;
                     // §10.6.1/§10.6.2: a `force`d or procedurally-continuously-
                     // `assign`ed target ignores ordinary procedural writes until
@@ -16954,6 +16998,7 @@ impl Simulator {
                     }
                 }
                 Insn::BlockingAssignBitDyn(sig_id, idx_reg, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     // Hot path on c910: a single bit in some packed signal
                     // (e.g. `mem[i][7:0] = 0` after parser flatten). The
                     // previous version cloned the *entire* signal_table[id]
@@ -16982,6 +17027,7 @@ impl Simulator {
                     }
                 }
                 Insn::BlockingAssignRange(sig_id, hi, lo, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                     let w = high - low + 1;
                     let val = self.vm_regs[*val_reg as usize].resize(w);
@@ -17055,6 +17101,7 @@ impl Simulator {
                     }
                 }
                 Insn::BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
+                    let sig_id = &(*sig_id as usize);
                     let hi = self.vm_regs[*hi_reg as usize].to_u64().unwrap_or(0) as u32;
                     let lo = self.vm_regs[*lo_reg as usize].to_u64().unwrap_or(0) as u32;
                     let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
@@ -21696,7 +21743,7 @@ impl Simulator {
                     | Insn::NbaAssignBitDyn(id, ..)
                     | Insn::BlockingAssign(id, ..) | Insn::BlockingAssignRange(id, ..)
                     | Insn::BlockingAssignRangeDyn(id, ..) | Insn::BlockingAssignBitDyn(id, ..)
-                        if *id == sig_id)
+                        if *id as usize == sig_id)
             });
             if !writes {
                 continue;
@@ -24345,7 +24392,7 @@ impl Simulator {
             | Insn::BlockingAssign(id, _, _)
             | Insn::BlockingAssignRange(id, _, _, _)
             | Insn::BlockingAssignRangeDyn(id, _, _, _)
-            | Insn::BlockingAssignBitDyn(id, _, _) => Some(*id),
+            | Insn::BlockingAssignBitDyn(id, _, _) => Some(*id as usize),
             _ => None,
         }
     }
@@ -52235,6 +52282,7 @@ impl Simulator {
                 _ => None,
             };
             if let Some(id) = sig_id {
+                let id = id as usize;
                 if id < self.signal_widths.len() && self.signal_widths[id] > 64 {
                     return false;
                 }

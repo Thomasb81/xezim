@@ -905,7 +905,7 @@ mod enabled {
                     Insn::NbaAssign(sig_id, val_reg, width)
                         if FOUR_STATE_NBA_FAST_OK
                             && signal_widths
-                                .get(*sig_id)
+                                .get(*sig_id as usize)
                                 .map_or(false, |&w| w == *width)
                             && nba_side_queue.is_some() =>
                     {
@@ -954,7 +954,7 @@ mod enabled {
                     Insn::NbaAssign(sig_id, val_reg, width)
                         if FOUR_STATE_NBA_FAST_OK
                             && signal_widths
-                                .get(*sig_id)
+                                .get(*sig_id as usize)
                                 .map_or(false, |&w| w == *width) =>
                     {
                         let v = builder
@@ -1432,7 +1432,7 @@ mod enabled {
             LoadSignalBit(dest, sig_id, bit) => {
                 // §11.5.1: a bit index beyond the signal's width reads x —
                 // known at compile time here, so it becomes a constant.
-                let sw = sig_w.get(*sig_id).copied().unwrap_or(0);
+                let sw = sig_w.get(*sig_id as usize).copied().unwrap_or(0);
                 if sw > 0 && *bit >= sw {
                     let zero = builder.ins().iconst(types::I64, 0);
                     let one = builder.ins().iconst(types::I64, 1);
@@ -1461,7 +1461,7 @@ mod enabled {
                     return Err(());
                 }
                 // §11.5.1: positions beyond the signal's width read x.
-                let sw = sig_w.get(*sig_id).copied().unwrap_or(0);
+                let sw = sig_w.get(*sig_id as usize).copied().unwrap_or(0);
                 let oor: u64 = if sw > 0 && lo >= sw {
                     (1u64 << w) - 1
                 } else if sw > 0 && hi >= sw {
@@ -1812,7 +1812,7 @@ mod enabled {
             LoadConst(d, v) => reg_s[*d as usize] = v.is_signed,
             LoadSignal(d, _) => reg_s[*d as usize] = false,
             LoadSignalSigned(d, sid) => {
-                reg_s[*d as usize] = sig_signed.get(*sid).copied().unwrap_or(true)
+                reg_s[*d as usize] = sig_signed.get(*sid as usize).copied().unwrap_or(true)
             }
             SetSigned(r) => reg_s[*r as usize] = true,
             Move(d, s2) => reg_s[*d as usize] = reg_s[*s2 as usize],
@@ -1849,7 +1849,7 @@ mod enabled {
         match insn {
             LoadConst(d, v) => set(reg_w, d, v.width),
             LoadSignal(d, sid) | LoadSignalSigned(d, sid) => {
-                set(reg_w, d, sig_w.get(*sid).copied().unwrap_or(0))
+                set(reg_w, d, sig_w.get(*sid as usize).copied().unwrap_or(0))
             }
             LoadSignalBit(d, _, _) => set(reg_w, d, 1),
             LoadSignalRange(d, _, hi, lo) => set(reg_w, d, hi.abs_diff(*lo) + 1),
