@@ -42231,8 +42231,26 @@ impl Simulator {
                 if let ExprKind::Tagged { tag, inner } = &rvalue.kind {
                     if let ExprKind::Ident(lh) = &lvalue.kind {
                         let lname = self.resolve_hier_name(lh);
-                        self.active_union_tag
-                            .insert(lname.clone(), tag.name.clone());
+                        // §7.3.2: the pattern literal `tagged '{ member: value }`
+                        // carries no member name between `tagged` and `'{` — the
+                        // tag IS the first named item of the pattern. Without it
+                        // `active_union_tag` stays empty and every later
+                        // `u.member` read (tagged_union_member) returns x.
+                        let tag_name = if tag.name.is_empty() {
+                            inner.as_ref().map_or(String::new(), |ie| {
+                                if let ExprKind::AssignmentPattern(items) = &ie.kind {
+                                    items.iter().find_map(|it| match it {
+                                        AssignmentPatternItem::Named(id, _) => Some(id.name.clone()),
+                                        _ => None,
+                                    }).unwrap_or_default()
+                                } else {
+                                    String::new()
+                                }
+                            })
+                        } else {
+                            tag.name.clone()
+                        };
+                        self.active_union_tag.insert(lname.clone(), tag_name);
                         if let Some(inner_expr) = inner {
                             let v = self.eval_expr(inner_expr);
                             self.set_signal_value_by_name(&lname, v);
