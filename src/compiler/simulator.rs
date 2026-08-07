@@ -16213,15 +16213,33 @@ impl Simulator {
                 // Insns this evaluator doesn't handle (dynamic-range writes,
                 // array-range writes, AST fallback) — caller runs the entry
                 // on the main thread.
-                other => {
+                // EXHAUSTIVE ON PURPOSE — do not reintroduce a `_` arm here.
+                //
+                // These are the only `Insn`s this isolated evaluator cannot
+                // run; hitting one makes the caller redo the entry on the main
+                // thread. Listing them explicitly means a NEWLY ADDED opcode
+                // fails to compile instead of silently landing here and being
+                // treated as unsupported — which would look like a correct
+                // fallback while quietly disabling parallel evaluation for
+                // every block containing it. That silent-acceptance mode is
+                // how this codebase has lost coverage before (the JIT's
+                // `is_supported` list rotted to 28% with no build error), and
+                // this match is the safety net for porting the exec loops to a
+                // new instruction representation, so it must not have a hole.
+                insn @ (Insn::NbaAssignRangeDyn(..)
+                | Insn::NbaAssignArrayRange(..)
+                | Insn::BlockingAssignArrayRange(..)
+                | Insn::StmtFallback(..)) => {
                     unsupported = true;
                     if std::env::var("XEZIM_PDES_CHK_KINDS").ok().as_deref() == Some("1") {
-                        let kind = match other {
+                        let kind = match insn {
                             Insn::StmtFallback(..) => "StmtFallback",
                             Insn::BlockingAssignArrayRange(..) => "BlockingAssignArrayRange",
                             Insn::NbaAssignRangeDyn(..) => "NbaAssignRangeDyn",
                             Insn::NbaAssignArrayRange(..) => "NbaAssignArrayRange",
-                            _ => "Other",
+                            // Unreachable: the arm pattern above admits only
+                            // the four listed variants.
+                            _ => unreachable!("exec_comb_block_isolated unsupported-arm kind"),
                         };
                         eprintln!("[PDES-CHK-UNSUP] {}", kind);
                     }
