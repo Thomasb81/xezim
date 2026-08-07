@@ -335,6 +335,10 @@ pub struct BytecodeCompiler<'a> {
     signal_name_to_id: &'a HashMap<Arc<str>, usize>,
     signal_signed: &'a [bool],
     signal_widths: &'a [u32],
+    /// Per-signal `is_real`. Optional because only the simulator has it;
+    /// absent means "assume possibly-real", which only costs missed
+    /// `Resize` elisions, never correctness.
+    signal_real: Option<&'a [bool]>,
     arrays: &'a HashMap<String, (i64, i64, u32)>,
     array_first_id: Option<&'a HashMap<Arc<str>, (usize, i64, i64)>>,
     widths: &'a HashMap<String, u32>,
@@ -454,6 +458,7 @@ impl<'a> BytecodeCompiler<'a> {
             signal_name_to_id,
             signal_signed,
             signal_widths,
+            signal_real: None,
             arrays,
             array_first_id: None,
             widths,
@@ -525,6 +530,15 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_string_signals(&mut self, s: &'a HashSet<String>) {
         self.string_signals = Some(s);
+    }
+
+    /// Supply per-signal `is_real` so `elide_redundant_resizes` can prove a
+    /// loaded signal is not real. `Value::add` and friends special-case a real
+    /// operand (returning a 64-bit `from_f64`), so without this every
+    /// arithmetic result on a signal is "possibly real" and its `Resize`
+    /// survives — measured at ~337K of the ~553K resizes still executing.
+    pub fn set_signal_real(&mut self, r: &'a [bool]) {
+        self.signal_real = Some(r);
     }
 
     pub fn set_multi_dim_arrays(&mut self, s: &'a HashSet<String>) {
@@ -3893,7 +3907,7 @@ impl<'a> BytecodeCompiler<'a> {
         // this pass leaves behind).
         let signal_widths = self.signal_widths;
         let num_regs = (self.next_reg as usize).min(u16::MAX as usize + 1);
-        Self::elide_redundant_resizes(&mut self.insns, signal_widths, num_regs);
+        Self::elide_redundant_resizes(&mut self.insns, signal_widths, self.signal_real, num_regs);
         Self::compact_nops(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
@@ -4215,7 +4229,12 @@ impl<'a> BytecodeCompiler<'a> {
     /// cleared there. That covers backward jumps too (a loop head is a target),
     /// at the cost of giving up the first iteration's worth of knowledge inside
     /// loops. `XEZIM_RESIZE_ELIDE=0` disables the pass (A/B escape hatch).
-    fn elide_redundant_resizes(insns: &mut [Insn], signal_widths: &[u32], num_regs: usize) {
+    fn elide_redundant_resizes(
+        insns: &mut [Insn],
+        signal_widths: &[u32],
+        signal_real: Option<&[bool]>,
+        num_regs: usize,
+    ) {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         if !*ENABLED.get_or_init(|| {
@@ -4293,14 +4312,21 @@ impl<'a> BytecodeCompiler<'a> {
                     store(&mut rw, *d, f);
                 }
                 // `signal_table[id].clone()`. `is_real` is a property of the
-                // signal's declared type, which is not in scope here, so a
-                // loaded signal is never `plain`.
+                // signal's DECLARED type, so it is plain exactly when
+                // `signal_real[id]` is false. Without that table (no
+                // `set_signal_real`) assume possibly-real, which only forgoes
+                // elisions. `is_fill` never reaches a stored signal value:
+                // `resize`/`resize_for_assign` clear it on the way in.
                 Insn::LoadSignal(d, s) | Insn::LoadSignalSigned(d, s) => {
+                    let plain = signal_real
+                        .and_then(|sr| sr.get(*s as usize).copied())
+                        .map(|is_real| !is_real)
+                        .unwrap_or(false);
                     let f = signal_widths
                         .get(*s as usize)
                         .copied()
                         .and_then(ok)
-                        .map(|w| (w, false));
+                        .map(|w| (w, plain));
                     store(&mut rw, *d, f);
                 }
                 // `Value::bit_select` is 1 bit on every path, including the
@@ -4702,7 +4728,7 @@ mod tests {
             Insn::Resize(0, 4),
             Insn::Resize(0, 4),
         ];
-        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], 1);
+        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], None, 1);
         assert!(matches!(
             insns.as_slice(),
             [Insn::LoadSignal(0, 0), Insn::Nop, Insn::Resize(0, 4), Insn::Nop]
@@ -4719,7 +4745,7 @@ mod tests {
             Insn::Resize(0, 8),
             Insn::Resize(0, 8),
         ];
-        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], 1);
+        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], None, 1);
         assert!(matches!(insns[2], Insn::Nop));
         assert!(matches!(insns[3], Insn::Resize(0, 8)));
     }
@@ -4738,7 +4764,7 @@ mod tests {
             Insn::BitOr(3, 0, 1),
             Insn::Resize(3, 8),
         ];
-        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], 4);
+        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], None, 4);
         assert!(matches!(insns[3], Insn::Resize(2, 8)));
         assert!(matches!(insns[5], Insn::Nop));
     }
