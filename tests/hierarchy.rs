@@ -53,6 +53,10 @@ mod generic_interface_ports;
 mod ifu_ibuf_32_instances_c910;
 #[path = "hierarchy/implicit_net_gate_port.rs"]
 mod implicit_net_gate_port;
+#[path = "hierarchy/packed_port_formal_type.rs"]
+mod packed_port_formal_type;
+#[path = "hierarchy/pct_m_block_scope.rs"]
+mod pct_m_block_scope;
 #[path = "hierarchy/implicit_net_submodule.rs"]
 mod implicit_net_submodule;
 #[path = "hierarchy/ivtest_port_cluster.rs"]
