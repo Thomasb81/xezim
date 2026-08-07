@@ -166,7 +166,17 @@ pub enum Insn {
     BranchUnlessZero(RegId, u32), // (cond_reg, jump_target)
     /// Fused `LoadSignal` + `BranchIfFalse`: jump unless
     /// signal_table[id].is_true() — no register copy of the signal.
-    BranchIfSignalFalse(usize, u32), // (signal_id, jump_target)
+    ///
+    /// The third field is a BIT INDEX, or `u32::MAX` for "test the whole
+    /// signal". The bit form additionally folds in a constant bit-select, so
+    /// `LoadSignalBit(d,sig,i) ; BranchIfFalse(d,T)` collapses to a single
+    /// instruction. That pair is the most frequent adjacent pair in the C906
+    /// memcpy opcode census — 25.4 M occurrences, 4.8% of all executed
+    /// instructions — because it is what every `if (vec[i])` in the RTL
+    /// lowers to. It only becomes adjacent AFTER the
+    /// `LoadSignal`+`BitSelectConst` fusion below runs, which is why it needs
+    /// its own pass.
+    BranchIfSignalFalse(usize, u32, u32), // (signal_id, jump_target, bit | u32::MAX)
 }
 
 /// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
@@ -3995,7 +4005,7 @@ impl<'a> BytecodeCompiler<'a> {
             match insn {
                 Insn::BranchIfFalse(_, t)
                 | Insn::BranchUnlessZero(_, t)
-                | Insn::BranchIfSignalFalse(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
                 | Insn::Jump(t)
                     if (*t as usize) < is_target.len() => {
                         is_target[*t as usize] = true;
@@ -4028,7 +4038,7 @@ impl<'a> BytecodeCompiler<'a> {
                 (&Insn::LoadSignal(r, sig), &Insn::BranchIfFalse(c, t))
                     if c == r && (mode & 8) != 0 =>
                 {
-                    (r, Insn::BranchIfSignalFalse(sig, t))
+                    (r, Insn::BranchIfSignalFalse(sig, t, u32::MAX))
                 }
                 _ => continue,
             };
@@ -4081,6 +4091,61 @@ impl<'a> BytecodeCompiler<'a> {
             insns[i] = repl;
             insns[i + 1] = Insn::Nop;
         }
+
+        // Third family — census-driven. The pass above rewrites
+        // `LoadSignal;BitSelectConst` into `LoadSignalBit`, leaving a `Nop`
+        // where the second instruction was. That newly-created `LoadSignalBit`
+        // very often feeds a branch:
+        //
+        //   LoadSignalBit(d,sig,i) ; [Nop…] ; BranchIfFalse(d,T)
+        //       → BranchIfSignalFalse(sig, T, i)
+        //
+        // On the C906 memcpy census this is the single most frequent adjacent
+        // pair (25.4 M, 4.8% of executed instructions) — it is what `if
+        // (vec[i])` lowers to. Fusing removes one dispatch and one 32-byte
+        // register write per execution. It must run AFTER that pass, since the
+        // pair does not exist in the input stream.
+        for i in 0..insns.len() {
+            let &Insn::LoadSignalBit(d, sig, idx) = &insns[i] else {
+                continue;
+            };
+            if (mode & 8) == 0 {
+                continue;
+            }
+            // Skip the `Nop` placeholders the previous pass just wrote; they
+            // are removed by `compact_nops`, so these two really are adjacent
+            // in the stream that executes.
+            let mut j = i + 1;
+            while j < insns.len() && matches!(insns[j], Insn::Nop) {
+                j += 1;
+            }
+            if j >= insns.len() {
+                continue;
+            }
+            // Control must fall through from i to j: nothing in between (nor j
+            // itself) may be a branch target, or the fused form would swallow
+            // an entry point.
+            if (i + 1..=j).any(|k| is_target[k]) {
+                continue;
+            }
+            let Insn::BranchIfFalse(c, t) = insns[j] else {
+                continue;
+            };
+            if c != d {
+                continue;
+            }
+            // The fused form has no destination register, so ANY other read of
+            // `d` in the block blocks the fusion.
+            let consumed = insns
+                .iter()
+                .enumerate()
+                .any(|(k, x)| k != i && k != j && Self::insn_reads_reg(x, d));
+            if consumed {
+                continue;
+            }
+            insns[i] = Insn::BranchIfSignalFalse(sig, t, idx);
+            insns[j] = Insn::Nop;
+        }
     }
 
     /// Drop `Nop`s left behind by pair fusion above, rewriting branch targets.
@@ -4117,7 +4182,7 @@ impl<'a> BytecodeCompiler<'a> {
             match insn {
                 Insn::BranchIfFalse(_, t)
                 | Insn::BranchUnlessZero(_, t)
-                | Insn::BranchIfSignalFalse(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
                 | Insn::Jump(t) => {
                     if let Some(&m) = map.get(*t as usize) {
                         *t = m;

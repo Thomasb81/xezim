@@ -466,8 +466,11 @@ macro_rules! write_sig {
         if !__wsig_val.is_real && __wsig_id < $self.signal_signed.len() {
             __wsig_val.is_signed = $self.signal_signed[__wsig_id];
         }
-        // LRM §9.3.1: skip writes to forced signals.
-        if !$self.forced_signals.contains_key(&__wsig_id) {
+        // LRM §9.3.1: skip writes to forced signals. The `is_empty` guard
+        // keeps the common no-force case to one branch — `contains_key`
+        // hashes the id even when the map is empty, and this macro runs on
+        // EVERY signal write (measured ~2% of c906 memcpy cycles).
+        if $self.forced_signals.is_empty() || !$self.forced_signals.contains_key(&__wsig_id) {
             if __wsig_id < $self.signal_has_xz.len() {
                 $self.signal_has_xz[__wsig_id] = if __wsig_val.raw_bits().1 != 0 {
                     1u8
@@ -1708,6 +1711,17 @@ impl NbaFastIndex {
         self.sparse_entries.clear();
     }
 
+    /// Widen the dense prefix to cover `total` signal ids. Called once the
+    /// final signal-table size is known so unnamed array elements (memories)
+    /// hit the O(1) dense path instead of hashing into `sparse_entries` on
+    /// every NBA — on c906 memcpy the sparse hash was a measurable slice of
+    /// the sim loop. 4 B/signal; freed sparse map becomes vestigial.
+    fn extend_dense(&mut self, total: usize) {
+        if total > self.dense_entries.len() {
+            self.dense_entries.resize(total, u32::MAX);
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.dirty_dense.is_empty() && self.sparse_entries.is_empty()
     }
@@ -2450,6 +2464,19 @@ fn resolve_bytecode_array_elem(
                 }
             })
             .or_else(|| {
+                // Diagnostic for the slow by-name fallback (format! + String
+                // hash per access — measured ~9% of c906 memcpy cycles when a
+                // hot array lands here). XEZIM_DEBUG_NAMED_ARRAYS=1 prints
+                // each distinct array name once.
+                if std::env::var_os("XEZIM_DEBUG_NAMED_ARRAYS").is_some() {
+                    use std::sync::{Mutex, OnceLock};
+                    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> =
+                        OnceLock::new();
+                    let seen = SEEN.get_or_init(|| Mutex::new(Default::default()));
+                    if seen.lock().unwrap().insert(name.clone()) {
+                        eprintln!("[NAMED-ARRAY] slow-path array operand: {}", name);
+                    }
+                }
                 let elem_name = format!("{}[{}]", name, idx);
                 signal_name_to_id.get(elem_name.as_str()).copied()
             }),
@@ -3370,6 +3397,12 @@ pub struct Simulator {
     /// path in the simulator: when this map is empty the extra work is a single
     /// already-hot bool test.
     bitsel_edge_sens: HashMap<(usize, usize), u32>,
+    /// Bitset over signal ids: bit set ⇔ `bitsel_edge_sens` has ≥1 entry for
+    /// that sid. Lets the edge dispatch loop skip the per-(sid, block) tuple
+    /// hash for the overwhelmingly common signals with no bit-select
+    /// sensitivity (one such entry anywhere used to put a HashMap get on
+    /// every block wake — ~1.5% of c906 memcpy cycles).
+    bitsel_sid_bits: Vec<u64>,
     /// Reusable bitmap for `check_edges`. Hoisted out of the per-iteration
     /// `vec![false; blocks.len()]` to avoid ~10 K-byte alloc/drop on every
     /// settle iter (8938 iters × ~10 K blocks = 89 MB churn on c910 hello).
@@ -3954,6 +3987,15 @@ pub struct Simulator {
     /// canonical signal_table — Stage-0 validation toward dropping the 32-byte
     /// Value array cells. signal_table stays canonical (safe).
     soa_shadow: bool,
+    /// Per-signal eligibility for the SoA read fast path: width ≤ 64, not
+    /// real, not string. Built alongside `signal_inline_bits` (empty ⇒ the
+    /// path is off and every read falls back to `signal_table`).
+    soa_read_ok: Vec<bool>,
+    /// XEZIM_OPCODE_CENSUS=1: dynamic opcode + adjacent-pair execution counts
+    /// for fusion planning. `census_counts[op]`, `census_pairs[prev*64+op]`.
+    census_enabled: bool,
+    census_counts: Vec<u64>,
+    census_pairs: Vec<u64>,
     /// Clock-tree dedup (see `build_edge_sig_groups`). `edge_group_of` is
     /// parallel to `edge_signal_ids`: the group a POSITION belongs to, or
     /// `u32::MAX` for a signal that must be checked on its own. Members of one
@@ -5531,7 +5573,12 @@ impl Simulator {
         // X-init leaks through the forwarding network; zeroing only `module.signals`
         // (the prior behavior) is insufficient.
         let array_init = if init_zero { Value::zero } else { Value::new };
-        let push_elem_named = |name: String,
+        // PERF: takes `&str`, not `String` — the callers build each element
+        // name into a reused scratch buffer, so the only allocation left per
+        // element is the `Arc<str>` the tables actually keep (previously a
+        // throwaway `format!` String was allocated and freed as well, 1.56 M
+        // times on c906).
+        let push_elem_named = |name: &str,
                                w: u32,
                                sig_table: &mut Vec<Value>,
                                widths_vec: &mut Vec<u32>,
@@ -5543,7 +5590,7 @@ impl Simulator {
                                _placeholder: &Arc<str>| {
             let id = sig_table.len();
             if register_name {
-                let arc: Arc<str> = Arc::from(name.as_str());
+                let arc: Arc<str> = Arc::from(name);
                 name_to_id.insert(arc.clone(), id);
                 names.push(arc);
             }
@@ -5554,7 +5601,7 @@ impl Simulator {
             signed_vec.push(false);
             real_vec.push(false);
         };
-        let push_elem = |name: String,
+        let push_elem = |name: &str,
                          w: u32,
                          sig_table: &mut Vec<Value>,
                          widths_vec: &mut Vec<u32>,
@@ -5599,10 +5646,20 @@ impl Simulator {
             }
         };
         let mut array_elem_count: usize = 0;
+        // How many of those elements will actually be REGISTERED by name
+        // below (1-D arrays at or under `large_array_threshold` keep their
+        // per-element names; 2-D / N-D always do). Used only to size
+        // `signal_name_to_id` / `id_to_name` up front — without it those two
+        // grow from `n` to ~1.5 M entries on c906 by repeated doubling, and
+        // every rehash re-hashes every `Arc<str>` key.
+        let mut named_elem_count: usize = 0;
         for (name, &(lo, hi, _)) in module.arrays.iter() {
             let count = (hi - lo + 1).max(0) as usize;
             check_array_size(name, count);
             array_elem_count = array_elem_count.saturating_add(count);
+            if count <= large_array_threshold {
+                named_elem_count = named_elem_count.saturating_add(count);
+            }
         }
         for (name, &((lo1, hi1), (lo2, hi2), _)) in module.arrays_2d.iter() {
             let d1 = (hi1 - lo1 + 1).max(0) as usize;
@@ -5610,6 +5667,7 @@ impl Simulator {
             let count = d1.saturating_mul(d2);
             check_array_size(name, count);
             array_elem_count = array_elem_count.saturating_add(count);
+            named_elem_count = named_elem_count.saturating_add(count);
         }
         for (name, (shape, _)) in module.arrays_nd.iter() {
             let count = shape.iter().fold(1usize, |acc, &(lo, hi)| {
@@ -5617,6 +5675,7 @@ impl Simulator {
             });
             check_array_size(name, count);
             array_elem_count = array_elem_count.saturating_add(count);
+            named_elem_count = named_elem_count.saturating_add(count);
         }
         // Free the elaboration-time `signals` map BEFORE allocating the
         // (potentially multi-GB) array-element storage below — its data
@@ -5643,6 +5702,8 @@ impl Simulator {
         signal_widths_vec.reserve(array_elem_count);
         signal_signed_vec.reserve(array_elem_count);
         signal_real_vec.reserve(array_elem_count);
+        signal_name_to_id.reserve(named_elem_count);
+        id_to_name.reserve(named_elem_count);
 
         // 1D unpacked arrays: track `(first_id, lo, hi)` per array in
         // `array_first_id` for the bytecode hot path (LoadArrayElem /
@@ -5670,6 +5731,8 @@ impl Simulator {
         // designs like c910 where many arrays share the same scope).
         let mut arrays_sorted: Vec<(&String, &(i64, i64, u32))> = module.arrays.iter().collect();
         arrays_sorted.sort_by(|a, b| a.0.cmp(b.0));
+        // Scratch buffer for per-element names (see `push_elem_named`).
+        let mut elem_name_buf = String::with_capacity(96);
         for (base, &(lo, hi, w)) in arrays_sorted {
             let first_id = signal_table.len();
             array_first_id.insert(Arc::from(base.as_str()), (first_id, lo, hi));
@@ -5680,8 +5743,18 @@ impl Simulator {
             }
             if register_names {
                 for idx in lo..=hi {
+                    // Same bytes `format!("{}[{}]", base, idx)` produced, into
+                    // a buffer reused across the whole array.
+                    elem_name_buf.clear();
+                    elem_name_buf.push_str(base);
+                    elem_name_buf.push('[');
+                    {
+                        use std::fmt::Write as _;
+                        let _ = write!(elem_name_buf, "{}", idx);
+                    }
+                    elem_name_buf.push(']');
                     push_elem_named(
-                        format!("{}[{}]", base, idx),
+                        elem_name_buf.as_str(),
                         w,
                         &mut signal_table,
                         &mut signal_widths_vec,
@@ -5751,7 +5824,7 @@ impl Simulator {
             for i in lo1..=hi1 {
                 for j in lo2..=hi2 {
                     push_elem(
-                        format!("{}[{}][{}]", base, i, j),
+                        format!("{}[{}][{}]", base, i, j).as_str(),
                         w,
                         &mut signal_table,
                         &mut signal_widths_vec,
@@ -5781,7 +5854,7 @@ impl Simulator {
             enumerate(shape, base.clone(), &mut names);
             for name in names {
                 push_elem(
-                    name,
+                    name.as_str(),
                     *w,
                     &mut signal_table,
                     &mut signal_widths_vec,
@@ -6018,6 +6091,16 @@ impl Simulator {
             module.instances[a].path.cmp(&module.instances[b].path)
         });
         let mut scope_parents_by_leaf: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::default();
+        // PERF: this walks every named signal (1.56 M on c906) and used to
+        // allocate TWO fresh `Arc<str>` per name — one for the leaf (which the
+        // `entry` then throws away whenever the leaf is already present) and
+        // one for the parent scope. Both repeat massively: there are only as
+        // many distinct parents as there are instance scopes. Intern the
+        // parents and only allocate a leaf Arc on first sight. The stored
+        // values are identical strings either way (they are compared and
+        // sorted by CONTENT below and in `best_scope_from_leaf_index`), so
+        // sharing the allocations is invisible to behaviour.
+        let mut parent_intern: HashMap<Arc<str>, Arc<str>> = HashMap::default();
         for full_name in signal_name_to_id
             .keys()
             .map(|name| name.as_ref())
@@ -6026,12 +6109,23 @@ impl Simulator {
             .chain(module.arrays_nd.keys().map(String::as_str))
         {
             if let Some((parent, leaf)) = full_name.rsplit_once('.') {
-                scope_parents_by_leaf
-                    .entry(Arc::from(leaf))
-                    .or_default()
-                    .push(Arc::from(parent));
+                let parent_arc = match parent_intern.get(parent) {
+                    Some(a) => a.clone(),
+                    None => {
+                        let a: Arc<str> = Arc::from(parent);
+                        parent_intern.insert(a.clone(), a.clone());
+                        a
+                    }
+                };
+                match scope_parents_by_leaf.get_mut(leaf) {
+                    Some(v) => v.push(parent_arc),
+                    None => {
+                        scope_parents_by_leaf.insert(Arc::from(leaf), vec![parent_arc]);
+                    }
+                }
             }
         }
+        drop(parent_intern);
         for parents in scope_parents_by_leaf.values_mut() {
             parents.sort_unstable();
             parents.dedup();
@@ -6225,6 +6319,7 @@ impl Simulator {
             in_edge_block: false,
             edge_pass_depth: 0,
             bitsel_edge_sens: HashMap::default(),
+            bitsel_sid_bits: Vec::new(),
             edge_triggered_bitmap: Vec::new(),
             edge_triggered_list: Vec::new(),
             edge_prefilter_seen: Vec::new(),
@@ -6394,6 +6489,10 @@ impl Simulator {
             edge_scan_changed: 0,
             edge_scan_stats: std::env::var_os("XEZIM_EDGE_SCAN_STATS").is_some(),
             soa_shadow: std::env::var_os("XEZIM_ARRAY_SOA_SHADOW").is_some(),
+            soa_read_ok: Vec::new(),
+            census_enabled: std::env::var_os("XEZIM_OPCODE_CENSUS").is_some(),
+            census_counts: Vec::new(),
+            census_pairs: Vec::new(),
             sig_to_edge_pos: Vec::new(),
             edge_group_of: Vec::new(),
             edge_group_memo: Vec::new(),
@@ -6860,7 +6959,7 @@ impl Simulator {
                                     | super::bytecode::Insn::LoadSignalSigned(_, s)
                                     | super::bytecode::Insn::LoadSignalRange(_, s, _, _)
                                     | super::bytecode::Insn::LoadSignalBit(_, s, _)
-                                    | super::bytecode::Insn::BranchIfSignalFalse(s, _) if *s == sid)
+                                    | super::bytecode::Insn::BranchIfSignalFalse(s, _, _) if *s == sid)
                                 })
                             })
                     })
@@ -7005,7 +7104,7 @@ impl Simulator {
                     | super::bytecode::Insn::LoadSignalSigned(_, sid)
                     | super::bytecode::Insn::LoadSignalRange(_, sid, _, _)
                     | super::bytecode::Insn::LoadSignalBit(_, sid, _)
-                    | super::bytecode::Insn::BranchIfSignalFalse(sid, _)
+                    | super::bytecode::Insn::BranchIfSignalFalse(sid, _, _)
                         if !reads_of[bi].contains(sid) => {
                             reads_of[bi].push(*sid);
                             readers_of_sig.entry(*sid).or_default().push(bi);
@@ -7432,7 +7531,7 @@ impl Simulator {
                     | super::bytecode::Insn::LoadSignalSigned(_, sid)
                     | super::bytecode::Insn::LoadSignalRange(_, sid, _, _)
                     | super::bytecode::Insn::LoadSignalBit(_, sid, _)
-                    | super::bytecode::Insn::BranchIfSignalFalse(sid, _) => *sid,
+                    | super::bytecode::Insn::BranchIfSignalFalse(sid, _, _) => *sid,
                     super::bytecode::Insn::NbaAssign(sid, _, _)
                     | super::bytecode::Insn::NbaAssignConst(sid, _, _)
                     | super::bytecode::Insn::NbaAssignRange(sid, _, _, _) => *sid,
@@ -10044,6 +10143,16 @@ impl Simulator {
         mark_compile_phase("runtime metadata and static init", &mut compile_phase_start);
         self.classify_always_blocks();
         mark_compile_phase("classify always blocks", &mut compile_phase_start);
+        // Signal table is final here: optionally widen the NBA index's dense
+        // prefix so unnamed array elements (SRAM/memory cells) take the O(1)
+        // path instead of hashing into the sparse tail. Opt-in because the
+        // prefix costs 4 B per signal — on c906 that is 35 M signals = 140 MB —
+        // and for a design whose live array-NBA set is small, a compact hash
+        // map can cache better than sparse probes into a 140 MB array. Measure
+        // per design rather than assuming.
+        if std::env::var_os("XEZIM_NBA_DENSE").is_some() {
+            self.nba_fast_index.extend_dense(self.signal_table.len());
+        }
         // JIT-redesign Stage 1: allocate `signal_inline_bits` BEFORE
         // `compile_edge_blocks` so the JIT module gets a non-empty
         // pointer in `set_inline_bits_storage`.  Otherwise Stage 2's
@@ -10058,6 +10167,17 @@ impl Simulator {
                 let (val_bits, xz_bits) = v.raw_bits();
                 self.signal_inline_bits.push([val_bits, xz_bits]);
             }
+            // SoA read eligibility: inline-width, non-real, non-string
+            // signals may be read back from `signal_inline_bits` (their
+            // declared width/signedness reconstructs the Value exactly).
+            self.soa_read_ok = (0..n)
+                .map(|i| {
+                    // width 0 = untracked class-handle placeholder — excluded.
+                    (1..=64).contains(&self.signal_widths[i])
+                        && !self.signal_real[i]
+                        && !self.signal_is_string.get(i).copied().unwrap_or(false)
+                })
+                .collect();
             // JIT Stage 4 Tier C Path C1: allocate the side queue
             // alongside signal_inline_bits since both are gated by
             // the same env var.  1M entries × 16 bytes = 16 MB.
@@ -10992,7 +11112,7 @@ impl Simulator {
                 let touched_id = match insn {
                     Insn::LoadSignal(_, id) | Insn::LoadSignalSigned(_, id) => Some(*id),
                     Insn::LoadSignalRange(_, id, _, _) | Insn::LoadSignalBit(_, id, _) => Some(*id),
-                    Insn::BranchIfSignalFalse(id, _) => Some(*id),
+                    Insn::BranchIfSignalFalse(id, _, _) => Some(*id),
                     Insn::NbaAssign(id, _, _) => Some(*id),
                     Insn::NbaAssignConst(id, _, _) => Some(*id),
                     Insn::NbaAssignRange(id, _, _, _) => Some(*id),
@@ -11400,7 +11520,7 @@ impl Simulator {
             CombItem::Udp { .. } | CombItem::UdpBatch { .. } => true,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 // LRM §9.3.1: skip if the destination is forced
-                if !self.forced_signals.contains_key(dst_id) {
+                if self.forced_signals.is_empty() || !self.forced_signals.contains_key(dst_id) {
                     let (mut sv, mut sx) = view[*src_id].raw_bits();
                     // §6.11.1/§10.7: a 2-state destination drops X/Z on every
                     // write (X/Z -> 0). The raw-bit copy would otherwise keep it.
@@ -11417,8 +11537,9 @@ impl Simulator {
             }
             CombItem::FastDirectFanout { src_id, dst_ids } => {
                 let (src_v, src_x) = view[*src_id].raw_bits();
+                let any_forced = !self.forced_signals.is_empty();
                 for &dst_id in dst_ids.iter() {
-                    if self.forced_signals.contains_key(&dst_id) {
+                    if any_forced && self.forced_signals.contains_key(&dst_id) {
                         continue;
                     }
                     let (mut sv, mut sx) = (src_v, src_x);
@@ -11441,7 +11562,7 @@ impl Simulator {
                 width,
             } => {
                 // LRM §9.3.1: skip if the destination is forced
-                if !self.forced_signals.contains_key(dst_id) {
+                if self.forced_signals.is_empty() || !self.forced_signals.contains_key(dst_id) {
                     let dst_w = self.signal_widths[*dst_id];
                     let mut handled = false;
                     // Inline raw-bit copy only when src and dst widths match;
@@ -13148,7 +13269,7 @@ impl Simulator {
                 | Insn::LoadSignalSigned(_, id)
                 | Insn::LoadSignalRange(_, id, _, _)
                 | Insn::LoadSignalBit(_, id, _)
-                | Insn::BranchIfSignalFalse(id, _) = insn
+                | Insn::BranchIfSignalFalse(id, _, _) = insn
                 {
                     if *id < n_signals {
                         read_edge[*id] |= 1 << blp;
@@ -13947,70 +14068,92 @@ impl Simulator {
                 // resolves them, and keep the fast path only when the read set
                 // adds nothing. Unresolvable reads (parameters, genvars, loop
                 // locals) can never trigger anything, so they don't count.
-                let comb_sensitivity_is_faithful = if !Self::event_terms_all_plain_idents(&ab.stmt)
-                {
-                    // Index-dependent / select / concat sensitivity: the list
-                    // does not name everything that may trigger the block, so
-                    // the read-set superset is the intended behaviour.
-                    true
-                } else {
-                    let mut b_reads: HashSet<String> = HashSet::default();
-                    let mut b_writes: HashSet<String> = HashSet::default();
-                    Self::collect_stmt_reads(&body, &self.module, &mut b_reads, &mut b_writes);
-                    let scope_hint = self.infer_scope_from_rw_sets(&b_writes, &b_reads);
-                    let name_to_id = &self.signal_name_to_id;
-                    let resolve_ids = |name: &str| -> Vec<usize> {
-                        let mut out: Vec<usize> = Vec::new();
-                        if let Some(scope) = &scope_hint {
-                            if let Some(&id) =
-                                name_to_id.get(format!("{}.{}", scope, name).as_str())
-                            {
-                                out.push(id);
-                            }
-                        }
-                        if let Some(&id) = name_to_id.get(name) {
-                            out.push(id);
-                        } else if let Some(stripped) = name.strip_prefix(&top_prefix) {
-                            if let Some(&id) = name_to_id.get(stripped) {
-                                out.push(id);
-                            }
-                        }
-                        out
-                    };
-                    let mut sens_ids: Vec<usize> = Vec::new();
-                    for s in &sens {
-                        for id in resolve_ids(s.signal_name.as_str()) {
-                            if !sens_ids.contains(&id) {
-                                sens_ids.push(id);
-                            }
-                        }
-                    }
-                    // Mirror the comb path's `sens_reads = reads - writes`.
-                    let reads_covered = b_reads
-                        .difference(&b_writes)
-                        .all(|r| resolve_ids(r.as_str()).iter().all(|id| sens_ids.contains(id)));
-                    // The reverse must hold too: every LISTED signal has to be
-                    // in the derived read set, or the comb path silently drops
-                    // it from the sensitivity. `always @(a) t = $time;` reads
-                    // no signal at all, so the containment above passes
-                    // VACUOUSLY, the entry's read set came out empty, and the
-                    // block fired exactly once (at t0) — every later edge of
-                    // `a` was missed and the captured time stayed 0. Routing
-                    // the not-equal case to the edge path costs a little speed
-                    // for an unusual shape and follows §9.4.2 exactly.
-                    let read_id_union: std::collections::HashSet<usize> = b_reads
-                        .difference(&b_writes)
-                        .flat_map(|r| resolve_ids(r.as_str()))
-                        .collect();
-                    let sens_covered =
-                        sens_ids.iter().all(|id| read_id_union.contains(id));
-                    reads_covered && sens_covered
-                };
+                // PERF: the `comb_sensitivity_is_faithful` test below costs a
+                // full `collect_stmt_reads` of the body (two HashSet<String>
+                // built from `format!`ed hierarchical names), a scope
+                // inference over them, and a per-name id resolution. It is
+                // only ever consulted when the four cheap predicates in front
+                // of it already admit the comb path, yet it used to be
+                // computed EAGERLY for every always block — including every
+                // `always @(posedge clk)` flop, where `all_level` is false and
+                // the result is thrown away. On c906 that was ~75% of the
+                // whole compile phase. Folding it into the `&&` chain as the
+                // last operand keeps the identical value and the identical
+                // evaluation for the blocks that reach it; the test is pure
+                // (`&self` + `&ab` only), so skipping it changes nothing else.
                 if all_level
                     && !has_named_event
                     && !self_ref
                     && !self.stmt_is_blocking(&body)
-                    && comb_sensitivity_is_faithful
+                    && (
+                        // Index-dependent / select / concat sensitivity: the
+                        // list does not name everything that may trigger the
+                        // block, so the read-set superset is the intended
+                        // behaviour.
+                        !Self::event_terms_all_plain_idents(&ab.stmt) || {
+                            let mut b_reads: HashSet<String> = HashSet::default();
+                            let mut b_writes: HashSet<String> = HashSet::default();
+                            Self::collect_stmt_reads(
+                                &body,
+                                &self.module,
+                                &mut b_reads,
+                                &mut b_writes,
+                            );
+                            let scope_hint = self.infer_scope_from_rw_sets(&b_writes, &b_reads);
+                            let name_to_id = &self.signal_name_to_id;
+                            let resolve_ids = |name: &str| -> Vec<usize> {
+                                let mut out: Vec<usize> = Vec::new();
+                                if let Some(scope) = &scope_hint {
+                                    if let Some(&id) =
+                                        name_to_id.get(format!("{}.{}", scope, name).as_str())
+                                    {
+                                        out.push(id);
+                                    }
+                                }
+                                if let Some(&id) = name_to_id.get(name) {
+                                    out.push(id);
+                                } else if let Some(stripped) = name.strip_prefix(&top_prefix) {
+                                    if let Some(&id) = name_to_id.get(stripped) {
+                                        out.push(id);
+                                    }
+                                }
+                                out
+                            };
+                            let mut sens_ids: Vec<usize> = Vec::new();
+                            for s in &sens {
+                                for id in resolve_ids(s.signal_name.as_str()) {
+                                    if !sens_ids.contains(&id) {
+                                        sens_ids.push(id);
+                                    }
+                                }
+                            }
+                            // Mirror the comb path's `sens_reads = reads - writes`.
+                            // The union of the resolved ids is built ONCE and
+                            // both directions are answered from it: `for all r,
+                            // for all id in resolve_ids(r)` is by construction
+                            // the same as `for all id in union` (the union is
+                            // exactly that flat_map), so this is the same test
+                            // the two separate passes used to run.
+                            let read_id_union: std::collections::HashSet<usize> = b_reads
+                                .difference(&b_writes)
+                                .flat_map(|r| resolve_ids(r.as_str()))
+                                .collect();
+                            let reads_covered =
+                                read_id_union.iter().all(|id| sens_ids.contains(id));
+                            // The reverse must hold too: every LISTED signal has to be
+                            // in the derived read set, or the comb path silently drops
+                            // it from the sensitivity. `always @(a) t = $time;` reads
+                            // no signal at all, so the containment above passes
+                            // VACUOUSLY, the entry's read set came out empty, and the
+                            // block fired exactly once (at t0) — every later edge of
+                            // `a` was missed and the captured time stayed 0. Routing
+                            // the not-equal case to the edge path costs a little speed
+                            // for an unusual shape and follows §9.4.2 exactly.
+                            let sens_covered =
+                                sens_ids.iter().all(|id| read_id_union.contains(id));
+                            reads_covered && sens_covered
+                        }
+                    )
                 {
                     return Some(AlwaysBlock {
                         kind: ab.kind,
@@ -14049,6 +14192,11 @@ impl Simulator {
                 // superset) whole-signal behaviour.
                 for (sid, bit) in self.const_bitselect_event_terms(&ab.stmt) {
                     self.bitsel_edge_sens.insert((sid, block_idx), bit);
+                    let (w, b) = (sid >> 6, sid & 63);
+                    if w >= self.bitsel_sid_bits.len() {
+                        self.bitsel_sid_bits.resize(w + 1, 0);
+                    }
+                    self.bitsel_sid_bits[w] |= 1u64 << b;
                 }
                 Arc::make_mut(&mut self.edge_blocks).push(EdgeSensitiveBlock {
                     resolved_sensitivities: resolved,
@@ -15022,11 +15170,13 @@ impl Simulator {
                     vm_regs[*d as usize] = signal_table[*sig_id].bit_select(*idx as usize);
                 }
                 Insn::Concat(d, part_regs) => {
-                    let parts: Vec<Value> = part_regs
-                        .iter()
-                        .map(|r| vm_regs[*r as usize].clone())
-                        .collect();
-                    vm_regs[*d as usize] = Value::concat(&parts);
+                    // `concat(&clones)` is literally `concat_refs(slice.iter())`
+                    // (see `Value::concat`), so the `Vec<Value>` — and the heap
+                    // allocation every `Wide` clone in it performs — was pure
+                    // overhead. Borrow the registers directly.
+                    let result =
+                        Value::concat_refs(part_regs.iter().map(|r| &vm_regs[*r as usize]));
+                    vm_regs[*d as usize] = result;
                 }
                 Insn::Replicate(d, s, n) => {
                     let val = vm_regs[*s as usize].clone();
@@ -15035,11 +15185,9 @@ impl Simulator {
                     } else if *n == 1 {
                         vm_regs[*d as usize] = val;
                     } else {
-                        let mut parts = Vec::with_capacity(*n as usize);
-                        for _ in 0..*n {
-                            parts.push(val.clone());
-                        }
-                        vm_regs[*d as usize] = Value::concat(&parts);
+                        let result =
+                            Value::concat_refs(std::iter::repeat_n(&val, *n as usize));
+                        vm_regs[*d as usize] = result;
                     }
                 }
                 Insn::BranchIfFalse(reg, target) => {
@@ -15075,8 +15223,18 @@ impl Simulator {
                         continue;
                     }
                 }
-                Insn::BranchIfSignalFalse(sig_id, target) => {
-                    if !signal_table[*sig_id].is_true() {
+                Insn::BranchIfSignalFalse(sig_id, target, bit) => {
+                    // `bit == u32::MAX` tests the whole signal; otherwise the
+                    // fused form also folds in a constant bit-select. Written
+                    // as `bit_select(..).is_true()` rather than open-coded bit
+                    // arithmetic so the 4-state X/Z rule stays exactly the one
+                    // the unfused `LoadSignalBit ; BranchIfFalse` applied.
+                    let cond_true = if *bit == u32::MAX {
+                        signal_table[*sig_id].is_true()
+                    } else {
+                        signal_table[*sig_id].bit_select(*bit as usize).is_true()
+                    };
+                    if !cond_true {
                         pc = *target as usize;
                         continue;
                     }
@@ -15467,11 +15625,13 @@ impl Simulator {
                     vm_regs[*d as usize] = view[*sig_id].bit_select(*idx as usize);
                 }
                 Insn::Concat(d, part_regs) => {
-                    let parts: Vec<Value> = part_regs
-                        .iter()
-                        .map(|r| vm_regs[*r as usize].clone())
-                        .collect();
-                    vm_regs[*d as usize] = Value::concat(&parts);
+                    // `concat(&clones)` is literally `concat_refs(slice.iter())`
+                    // (see `Value::concat`), so the `Vec<Value>` — and the heap
+                    // allocation every `Wide` clone in it performs — was pure
+                    // overhead. Borrow the registers directly.
+                    let result =
+                        Value::concat_refs(part_regs.iter().map(|r| &vm_regs[*r as usize]));
+                    vm_regs[*d as usize] = result;
                 }
                 Insn::Replicate(d, s, n) => {
                     let val = vm_regs[*s as usize].clone();
@@ -15480,11 +15640,9 @@ impl Simulator {
                     } else if *n == 1 {
                         vm_regs[*d as usize] = val;
                     } else {
-                        let mut parts = Vec::with_capacity(*n as usize);
-                        for _ in 0..*n {
-                            parts.push(val.clone());
-                        }
-                        vm_regs[*d as usize] = Value::concat(&parts);
+                        let result =
+                            Value::concat_refs(std::iter::repeat_n(&val, *n as usize));
+                        vm_regs[*d as usize] = result;
                     }
                 }
                 Insn::BranchIfFalse(reg, target) => {
@@ -15519,8 +15677,13 @@ impl Simulator {
                         continue;
                     }
                 }
-                Insn::BranchIfSignalFalse(sig_id, target) => {
-                    if !view[*sig_id].is_true() {
+                Insn::BranchIfSignalFalse(sig_id, target, bit) => {
+                    let cond_true = if *bit == u32::MAX {
+                        view[*sig_id].is_true()
+                    } else {
+                        view[*sig_id].bit_select(*bit as usize).is_true()
+                    };
+                    if !cond_true {
                         pc = *target as usize;
                         continue;
                     }
@@ -15929,8 +16092,29 @@ impl Simulator {
         let mut pc: usize = 0;
         let len = insns.len();
         let mut local_count: u64 = 0;
+        // XEZIM_OPCODE_CENSUS: dynamic opcode + adjacent-pair counts. Both
+        // this flag and the SoA-read table length are hoisted into locals:
+        // neither can change while the loop runs, and re-loading them from
+        // `self` on every instruction measurably inflates the hot path (it
+        // cost ~2.5% of retired instructions on the c906 memcpy when read
+        // per-iteration).
+        let census_on = self.census_enabled;
+        let soa_len = self.soa_read_ok.len();
+        let mut census_prev: usize = usize::MAX;
         while pc < len {
             local_count += 1;
+            if census_on {
+                if self.census_counts.is_empty() {
+                    self.census_counts = vec![0u64; 64];
+                    self.census_pairs = vec![0u64; 64 * 64];
+                }
+                let op = super::dispatch::Opcode::from_insn(&insns[pc]) as usize;
+                self.census_counts[op] += 1;
+                if census_prev < 64 {
+                    self.census_pairs[census_prev * 64 + op] += 1;
+                }
+                census_prev = op;
+            }
             match &insns[pc] {
                 Insn::LoadConst(dest, val) => {
                     // Reuse vm_regs[dest]'s buffer via copy_from — no alloc.
@@ -15959,7 +16143,27 @@ impl Simulator {
                             _ => {}
                         }
                     }
-                    self.vm_regs[d].copy_from(&self.signal_table[s]);
+                    // SoA read fast path (XEZIM_INLINE_BITS=1): rebuild the
+                    // Value from the 16-byte hot store instead of touching the
+                    // 32-byte signal_table cell. soa_read_ok is empty when the
+                    // store is off, so the default path is one bounds check.
+                    if s < soa_len && self.soa_read_ok[s] {
+                        let [v, x] = self.signal_inline_bits[s];
+                        if self.soa_shadow {
+                            let (cv, cx) = self.signal_table[s].raw_bits();
+                            if v != cv || x != cx {
+                                eprintln!(
+                                    "[SOA-SHADOW] LoadSignal mismatch sid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
+                                    s, v, x, cv, cx
+                                );
+                                self.finished = true;
+                            }
+                        }
+                        let (w, sg) = (self.signal_widths[s], self.signal_signed[s]);
+                        vm_store(&mut self.vm_regs[d], v, x, w, sg);
+                    } else {
+                        self.vm_regs[d].copy_from(&self.signal_table[s]);
+                    }
                 }
                 Insn::LoadSignalSigned(dest, sig_id) => {
                     let d = *dest as usize;
@@ -15979,23 +16183,60 @@ impl Simulator {
                             _ => {}
                         }
                     }
-                    self.vm_regs[d].copy_from(&self.signal_table[s]);
+                    if s < soa_len && self.soa_read_ok[s] {
+                        let [v, x] = self.signal_inline_bits[s];
+                        if self.soa_shadow {
+                            let (cv, cx) = self.signal_table[s].raw_bits();
+                            if v != cv || x != cx {
+                                eprintln!(
+                                    "[SOA-SHADOW] LoadSignalSigned mismatch sid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
+                                    s, v, x, cv, cx
+                                );
+                                self.finished = true;
+                            }
+                        }
+                        self.vm_regs[d] = Value::from_inline(v, x, self.signal_widths[s]);
+                    } else {
+                        self.vm_regs[d].copy_from(&self.signal_table[s]);
+                    }
                     self.vm_regs[d].is_signed = true;
                 }
+                // 10.8% of all executed bytecode — the second most frequent
+                // opcode. Rewriting the register's two words and its width in
+                // place removes the fresh 32-byte `Value`, the 32-byte move
+                // and the drop of the old contents that `= r.resize(w)` paid.
                 Insn::Resize(reg, width) => {
                     let r = *reg as usize;
-                    if self.vm_regs[r].width != *width {
-                        let resized = self.vm_regs[r].resize(*width);
-                        self.vm_regs[r] = resized;
+                    let w = *width;
+                    let vr = &mut self.vm_regs[r];
+                    if vr.width != w {
+                        let (cw, sg) = (vr.width, vr.is_signed);
+                        let bits = if vr.is_real || vr.is_fill { None } else { vr.inline_bits() };
+                        match bits.and_then(|(v, x)| vm_resize_bits(v, x, cw, sg, w)) {
+                            Some((nv, nx)) => {
+                                vr.set_inline_bits(nv, nx);
+                                vr.width = w;
+                            }
+                            None => {
+                                let resized = self.vm_regs[r].resize(w);
+                                self.vm_regs[r] = resized;
+                            }
+                        }
                     }
                 }
                 Insn::Add(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].add(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_add_sub(&self.vm_regs[l], &self.vm_regs[r], false) {
+                        Some((v, x, w, s)) => vm_store(&mut self.vm_regs[d], v, x, w, s),
+                        None => self.vm_regs[d] = self.vm_regs[l].add(&self.vm_regs[r]),
+                    }
                 }
                 Insn::Sub(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].sub(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_add_sub(&self.vm_regs[l], &self.vm_regs[r], true) {
+                        Some((v, x, w, s)) => vm_store(&mut self.vm_regs[d], v, x, w, s),
+                        None => self.vm_regs[d] = self.vm_regs[l].sub(&self.vm_regs[r]),
+                    }
                 }
                 Insn::Mul(d, l, r) => {
                     self.vm_regs[*d as usize] =
@@ -16010,41 +16251,73 @@ impl Simulator {
                         self.vm_regs[*l as usize].modulo(&self.vm_regs[*r as usize]);
                 }
                 Insn::BitAnd(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].bitwise_and(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_bitand(&self.vm_regs[l], &self.vm_regs[r]) {
+                        Some((v, x, w, s)) => vm_store(&mut self.vm_regs[d], v, x, w, s),
+                        None => {
+                            self.vm_regs[d] = self.vm_regs[l].bitwise_and(&self.vm_regs[r])
+                        }
+                    }
                 }
                 Insn::BitOr(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].bitwise_or(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_bitor(&self.vm_regs[l], &self.vm_regs[r]) {
+                        Some((v, x, w, s)) => vm_store(&mut self.vm_regs[d], v, x, w, s),
+                        None => self.vm_regs[d] = self.vm_regs[l].bitwise_or(&self.vm_regs[r]),
+                    }
                 }
                 Insn::BitXor(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].bitwise_xor(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_bitxor(&self.vm_regs[l], &self.vm_regs[r]) {
+                        Some((v, x, w, s)) => vm_store(&mut self.vm_regs[d], v, x, w, s),
+                        None => self.vm_regs[d] = self.vm_regs[l].bitwise_xor(&self.vm_regs[r]),
+                    }
                 }
                 Insn::BitXnor(d, l, r) => {
-                    self.vm_regs[*d as usize] = self.vm_regs[*l as usize]
-                        .bitwise_xor(&self.vm_regs[*r as usize])
-                        .bitwise_not();
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_bitxnor(&self.vm_regs[l], &self.vm_regs[r]) {
+                        Some((v, x, w, s)) => vm_store(&mut self.vm_regs[d], v, x, w, s),
+                        None => {
+                            self.vm_regs[d] = self.vm_regs[l]
+                                .bitwise_xor(&self.vm_regs[r])
+                                .bitwise_not()
+                        }
+                    }
                 }
                 Insn::LogAnd(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].logic_and(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_logic2(&self.vm_regs[l], &self.vm_regs[r], false) {
+                        Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[l].logic_and(&self.vm_regs[r]),
+                    }
                 }
                 Insn::LogOr(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].logic_or(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_logic2(&self.vm_regs[l], &self.vm_regs[r], true) {
+                        Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[l].logic_or(&self.vm_regs[r]),
+                    }
                 }
                 Insn::Eq(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].is_equal(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_is_equal(&self.vm_regs[l], &self.vm_regs[r]) {
+                        Some(e) => vm_store(&mut self.vm_regs[d], e as u64, 0, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[l].is_equal(&self.vm_regs[r]),
+                    }
                 }
                 Insn::Neq(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].is_not_equal(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_is_equal(&self.vm_regs[l], &self.vm_regs[r]) {
+                        Some(e) => vm_store(&mut self.vm_regs[d], !e as u64, 0, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[l].is_not_equal(&self.vm_regs[r]),
+                    }
                 }
                 Insn::CaseEq(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].case_eq(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_case_eq(&self.vm_regs[l], &self.vm_regs[r]) {
+                        Some(e) => vm_store(&mut self.vm_regs[d], e as u64, 0, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[l].case_eq(&self.vm_regs[r]),
+                    }
                 }
                 Insn::CasezEq(d, l, r) => {
                     self.vm_regs[*d as usize] =
@@ -16055,20 +16328,34 @@ impl Simulator {
                         self.vm_regs[*l as usize].casex_eq(&self.vm_regs[*r as usize]);
                 }
                 Insn::Lt(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].less_than(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_less(&self.vm_regs[l], &self.vm_regs[r], false) {
+                        Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[l].less_than(&self.vm_regs[r]),
+                    }
                 }
                 Insn::Leq(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].less_equal(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_less(&self.vm_regs[l], &self.vm_regs[r], true) {
+                        Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[l].less_equal(&self.vm_regs[r]),
+                    }
                 }
+                // `greater_than`/`greater_equal` are `other.less_*(self)` —
+                // the operands swap, nothing else.
                 Insn::Gt(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].greater_than(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_less(&self.vm_regs[r], &self.vm_regs[l], false) {
+                        Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[l].greater_than(&self.vm_regs[r]),
+                    }
                 }
                 Insn::Geq(d, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*l as usize].greater_equal(&self.vm_regs[*r as usize]);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_less(&self.vm_regs[r], &self.vm_regs[l], true) {
+                        Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[l].greater_equal(&self.vm_regs[r]),
+                    }
                 }
                 Insn::Shl(d, l, r) => {
                     self.vm_regs[*d as usize] =
@@ -16083,10 +16370,18 @@ impl Simulator {
                         self.vm_regs[*l as usize].arith_shift_right(&self.vm_regs[*r as usize]);
                 }
                 Insn::BitNot(d, s) => {
-                    self.vm_regs[*d as usize] = self.vm_regs[*s as usize].bitwise_not();
+                    let (d, s) = (*d as usize, *s as usize);
+                    match vm_bitnot(&self.vm_regs[s]) {
+                        Some((v, x, w, sg)) => vm_store(&mut self.vm_regs[d], v, x, w, sg),
+                        None => self.vm_regs[d] = self.vm_regs[s].bitwise_not(),
+                    }
                 }
                 Insn::LogNot(d, s) => {
-                    self.vm_regs[*d as usize] = self.vm_regs[*s as usize].logic_not();
+                    let (d, s) = (*d as usize, *s as usize);
+                    match vm_logic_not(&self.vm_regs[s]) {
+                        Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[s].logic_not(),
+                    }
                 }
                 Insn::Negate(d, s) => {
                     let w = self.vm_regs[*s as usize].width;
@@ -16104,12 +16399,19 @@ impl Simulator {
                     self.vm_regs[*d as usize] = self.vm_regs[*s as usize].reduce_xor();
                 }
                 Insn::BitSelect(d, base, idx) => {
+                    let (d, base) = (*d as usize, *base as usize);
                     let i = self.vm_regs[*idx as usize].to_u64().unwrap_or(0) as usize;
-                    self.vm_regs[*d as usize] = self.vm_regs[*base as usize].bit_select(i);
+                    match vm_bit_select(&self.vm_regs[base], i) {
+                        Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[base].bit_select(i),
+                    }
                 }
                 Insn::BitSelectConst(d, base, idx) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*base as usize].bit_select(*idx as usize);
+                    let (d, base, i) = (*d as usize, *base as usize, *idx as usize);
+                    match vm_bit_select(&self.vm_regs[base], i) {
+                        Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
+                        None => self.vm_regs[d] = self.vm_regs[base].bit_select(i),
+                    }
                 }
                 Insn::RangeSelect(d, base, l, r) => {
                     // §11.5.1 signed low-bound recovery — see the twin site.
@@ -16123,35 +16425,94 @@ impl Simulator {
                     };
                 }
                 Insn::RangeSelectConst(d, base, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.vm_regs[*base as usize].range_select(*l as usize, *r as usize);
+                    let (d, base, l, r) = (*d as usize, *base as usize, *l as usize, *r as usize);
+                    match vm_range_select(&self.vm_regs[base], l, r) {
+                        Some((v, x, w)) => vm_store(&mut self.vm_regs[d], v, x, w, false),
+                        None => self.vm_regs[d] = self.vm_regs[base].range_select(l, r),
+                    }
                 }
                 // Fused load+select (finish() peephole): slice straight out of
                 // the signal — no whole-Value copy into a register first.
                 Insn::LoadSignalRange(d, sig_id, l, r) => {
-                    self.vm_regs[*d as usize] =
-                        self.signal_table[*sig_id].range_select(*l as usize, *r as usize);
+                    let (d, l, r) = (*d as usize, *l as usize, *r as usize);
+                    match vm_range_select(&self.signal_table[*sig_id], l, r) {
+                        Some((v, x, w)) => vm_store(&mut self.vm_regs[d], v, x, w, false),
+                        None => {
+                            self.vm_regs[d] = self.signal_table[*sig_id].range_select(l, r)
+                        }
+                    }
                 }
                 Insn::LoadSignalBit(d, sig_id, idx) => {
-                    self.vm_regs[*d as usize] = self.signal_table[*sig_id].bit_select(*idx as usize);
+                    let (d, idx) = (*d as usize, *idx as usize);
+                    match vm_bit_select(&self.signal_table[*sig_id], idx) {
+                        Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
+                        None => self.vm_regs[d] = self.signal_table[*sig_id].bit_select(idx),
+                    }
                 }
                 Insn::Concat(d, part_regs) => {
-                    let result =
-                        Value::concat_refs(part_regs.iter().map(|r| &self.vm_regs[*r as usize]));
-                    self.vm_regs[*d as usize] = result;
+                    // `concat_refs` is a cross-crate call that walks the
+                    // iterator twice (once to sum widths, once to pack) and
+                    // returns a fresh `Value`. For a result that fits inline
+                    // — the common RTL case — do the pack here and write the
+                    // destination's two words in place. Bit-for-bit the same
+                    // fold as `concat_refs`' `total_width <= 64` arm.
+                    let d = *d as usize;
+                    let mut total: u32 = 0;
+                    for p in part_regs.iter() {
+                        total += self.vm_regs[*p as usize].width;
+                    }
+                    if total <= 64 {
+                        let (mut out_v, mut out_x, mut offset) = (0u64, 0u64, 0u32);
+                        for p in part_regs.iter().rev() {
+                            let val = &self.vm_regs[*p as usize];
+                            if val.width == 0 {
+                                continue;
+                            }
+                            let (v, x) = val.raw_bits();
+                            let mask = vm_mask(val.width);
+                            out_v |= (v & mask) << offset;
+                            out_x |= (x & mask) << offset;
+                            offset += val.width;
+                        }
+                        vm_store(&mut self.vm_regs[d], out_v, out_x, total, false);
+                    } else {
+                        let result = Value::concat_refs(
+                            part_regs.iter().map(|r| &self.vm_regs[*r as usize]),
+                        );
+                        self.vm_regs[d] = result;
+                    }
                 }
                 Insn::Replicate(d, s, n) => {
-                    let val = self.vm_regs[*s as usize].clone();
-                    if *n == 0 {
-                        self.vm_regs[*d as usize] = Value::zero(0);
-                    } else if *n == 1 {
-                        self.vm_regs[*d as usize] = val;
-                    } else {
-                        let mut parts = Vec::with_capacity(*n as usize);
-                        for _ in 0..*n {
-                            parts.push(val.clone());
+                    let (d, s, n) = (*d as usize, *s as usize, *n as usize);
+                    if n == 0 {
+                        vm_store(&mut self.vm_regs[d], 0, 0, 0, false); // Value::zero(0)
+                    } else if n == 1 {
+                        if d != s {
+                            let v = self.vm_regs[s].clone();
+                            self.vm_regs[d] = v;
                         }
-                        self.vm_regs[*d as usize] = Value::concat(&parts);
+                    } else {
+                        // `{n{x}}` used to build a `Vec<Value>` of `n` clones
+                        // (a heap allocation each, for `Wide`) and hand it to
+                        // `Value::concat`. `concat_refs` — a cross-crate call
+                        // that walks its iterator TWICE, once to sum the
+                        // widths — was still 1.8% of the whole run.
+                        // Every part here is the SAME value, so the width sum
+                        // is one multiply and the fold needs no iterator at
+                        // all. Bit-for-bit the `total_width <= 64` arm of
+                        // `concat_refs`; wider results still go there.
+                        match vm_replicate(&self.vm_regs[s], n) {
+                            Some((v, x, total)) => {
+                                vm_store(&mut self.vm_regs[d], v, x, total, false)
+                            }
+                            None => {
+                                let result = Value::concat_refs(std::iter::repeat_n(
+                                    &self.vm_regs[s],
+                                    n,
+                                ));
+                                self.vm_regs[d] = result;
+                            }
+                        }
                     }
                 }
                 Insn::BranchIfFalse(reg, target) => {
@@ -16190,8 +16551,22 @@ impl Simulator {
                         continue;
                     }
                 }
-                Insn::BranchIfSignalFalse(sig_id, target) => {
-                    if !self.signal_table[*sig_id].is_true() {
+                Insn::BranchIfSignalFalse(sig_id, target, bit) => {
+                    let sv = &self.signal_table[*sig_id];
+                    let cond_true = if *bit == u32::MAX {
+                        sv.is_true()
+                    } else {
+                        // `bit_select(..).is_true()` on a 1-bit inline result is
+                        // exactly "that bit is a DEFINITE 1" (`is_nonzero()`
+                        // returns Some(true) only for val=1,xz=0, and both
+                        // Some(false) and None end up false through
+                        // `unwrap_or(false)`). No Value is built.
+                        match vm_bit_select(sv, *bit as usize) {
+                            Some((v, x)) => v & !x != 0,
+                            None => sv.bit_select(*bit as usize).is_true(),
+                        }
+                    };
+                    if !cond_true {
                         pc = *target as usize;
                         continue;
                     }
@@ -16725,30 +17100,29 @@ impl Simulator {
                         &self.array_first_id,
                         &self.signal_name_to_id,
                     ) {
-                        // Stage-0 SoA read-redirect (shadow-validated): reconstruct
-                        // the cell from the compact signal_inline_bits store and
-                        // assert it matches canonical signal_table.
-                        if self.soa_shadow
-                            && eid < self.signal_inline_bits.len()
-                            && self.signal_widths[eid] <= 64
-                        {
+                        // SoA read fast path (XEZIM_INLINE_BITS=1); with
+                        // XEZIM_ARRAY_SOA_SHADOW=1 also assert coherence with
+                        // the canonical signal_table before trusting it.
+                        if eid < soa_len && self.soa_read_ok[eid] {
                             let [v, x] = self.signal_inline_bits[eid];
-                            let (cv, cx) = self.signal_table[eid].raw_bits();
-                            if v != cv || x != cx {
-                                eprintln!(
-                                    "[SOA-SHADOW] LoadArrayElem mismatch eid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
-                                    eid, v, x, cv, cx
-                                );
-                                self.finished = true;
+                            if self.soa_shadow {
+                                let (cv, cx) = self.signal_table[eid].raw_bits();
+                                if v != cv || x != cx {
+                                    eprintln!(
+                                        "[SOA-SHADOW] LoadArrayElem mismatch eid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
+                                        eid, v, x, cv, cx
+                                    );
+                                    self.finished = true;
+                                }
                             }
-                            let mut val = Value::from_inline(v, x, self.signal_widths[eid]);
-                            val.is_signed = self.signal_signed[eid];
-                            self.vm_regs[*dest as usize] = val;
+                            let (w, sg) = (self.signal_widths[eid], self.signal_signed[eid]);
+                            vm_store(&mut self.vm_regs[*dest as usize], v, x, w, sg);
                         } else {
                             self.vm_regs[*dest as usize].copy_from(&self.signal_table[eid]);
                         }
                     } else {
-                        self.vm_regs[*dest as usize] = Value::new(1);
+                        // `Value::new(1)` — a 1-bit X.
+                        vm_store(&mut self.vm_regs[*dest as usize], 0, 1, 1, false);
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
@@ -16923,15 +17297,29 @@ impl Simulator {
                     let d = *d as usize;
                     let s = *s as usize;
                     if d != s {
-                        // Split-borrow so we can copy_from in place without cloning.
-                        let (lo, hi) = if d < s {
-                            let (a, b) = self.vm_regs.split_at_mut(s);
-                            (&mut a[d], &b[0])
+                        // An inline source is four scalars — read them out and
+                        // the aliasing problem disappears, so neither
+                        // `split_at_mut` nor its two bounds checks are needed.
+                        let src = &self.vm_regs[s];
+                        let hdr = if src.is_real || src.is_fill {
+                            None
                         } else {
-                            let (a, b) = self.vm_regs.split_at_mut(d);
-                            (&mut b[0], &a[s])
+                            src.inline_bits().map(|(v, x)| (v, x, src.width, src.is_signed))
                         };
-                        lo.copy_from(hi);
+                        match hdr {
+                            Some((v, x, w, sg)) => vm_store(&mut self.vm_regs[d], v, x, w, sg),
+                            None => {
+                                // Split-borrow so we can copy_from in place without cloning.
+                                let (lo, hi) = if d < s {
+                                    let (a, b) = self.vm_regs.split_at_mut(s);
+                                    (&mut a[d], &b[0])
+                                } else {
+                                    let (a, b) = self.vm_regs.split_at_mut(d);
+                                    (&mut b[0], &a[s])
+                                };
+                                lo.copy_from(hi);
+                            }
+                        }
                     }
                 }
                 Insn::SetSigned(reg) => {
@@ -20005,7 +20393,15 @@ impl Simulator {
         // NOT on the underlying net — the sample only moves at the block's clock
         // edge. Registering the net instead made `always @(cb.sig)` re-fire on
         // the net's own (possibly mid-cycle) changes.
-        if let Some(segs) = Self::flatten_member_path(expr) {
+        //
+        // PERF: `flatten_member_path` clones every path segment into a fresh
+        // `Vec<String>` and the `cb` join allocates again, on EVERY expression
+        // node of the design. With no clocking block declared anywhere the
+        // `contains_key` below can never hit, so the whole probe is dead work —
+        // skip it. Behaviour is identical: an empty map answers `false`.
+        if !module.clocking_blocks.is_empty()
+            && let Some(segs) = Self::flatten_member_path(expr)
+        {
             if segs.len() >= 2 {
                 let cb = segs[..segs.len() - 1].join(".");
                 if module.clocking_blocks.contains_key(&cb) {
@@ -20530,11 +20926,27 @@ impl Simulator {
         hier: &HierarchicalIdentifier,
         _module: &ElaboratedModule,
     ) -> String {
-        hier.path
-            .iter()
-            .map(|s| s.name.name.as_str())
-            .collect::<Vec<_>>()
-            .join(".")
+        // PERF: the overwhelmingly common shape is a single segment. `join`
+        // on a one-element `Vec<&str>` still heap-allocates the Vec and walks
+        // it twice; clone the segment directly instead. Multi-segment paths
+        // build the same string the `join` did, in one pass with an exact
+        // up-front capacity. Result is byte-for-byte what `join(".")` returns.
+        let path = &hier.path;
+        match path.len() {
+            0 => String::new(),
+            1 => path[0].name.name.clone(),
+            _ => {
+                let cap = path.iter().map(|s| s.name.name.len() + 1).sum::<usize>() - 1;
+                let mut out = String::with_capacity(cap);
+                for (i, s) in path.iter().enumerate() {
+                    if i > 0 {
+                        out.push('.');
+                    }
+                    out.push_str(s.name.name.as_str());
+                }
+                out
+            }
+        }
     }
 
     /// Resolve a hier ident to its signal_id, retrying with scope_hint prefix
@@ -23256,6 +23668,40 @@ impl Simulator {
             self.prof_insns_executed,
             if self.prof_insns_executed > 0 { self.prof_edge_exec as f64 / self.prof_insns_executed as f64 } else { 0.0 },
             self.prof_fallback_insns);
+        // XEZIM_OPCODE_CENSUS=1: dynamic opcode + adjacent-pair histogram for
+        // fusion planning. Top-20 of each, with % of total executed insns.
+        if self.census_enabled && !self.census_counts.is_empty() {
+            let total: u64 = self.census_counts.iter().sum::<u64>().max(1);
+            let name = |op: usize| format!("{:?}", unsafe {
+                std::mem::transmute::<u8, super::dispatch::Opcode>(op as u8)
+            });
+            let mut singles: Vec<(usize, u64)> = self
+                .census_counts
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c > 0)
+                .map(|(i, c)| (i, *c))
+                .collect();
+            singles.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+            eprintln!("[CENSUS] total_insns={}", total);
+            for &(op, c) in singles.iter().take(20) {
+                eprintln!("[CENSUS] op {:>28} {:>14} ({:.1}%)", name(op), c, 100.0 * c as f64 / total as f64);
+            }
+            let mut pairs: Vec<(usize, u64)> = self
+                .census_pairs
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c > 0)
+                .map(|(i, c)| (i, *c))
+                .collect();
+            pairs.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+            for &(k, c) in pairs.iter().take(20) {
+                eprintln!(
+                    "[CENSUS] pair {:>26} -> {:<26} {:>13} ({:.1}%)",
+                    name(k / 64), name(k % 64), c, 100.0 * c as f64 / total as f64
+                );
+            }
+        }
         if self.event_measure && self.event_gateable_total > 0 {
             eprintln!(
                 "[EVENT-EDGE] would-skip {}/{} gateable main-clk flop-fires ({:.1}%) had NO data-input change since last posedge => event-driven edge could skip them",
@@ -23848,7 +24294,7 @@ impl Simulator {
             | Insn::LoadSignalBit(_, id, _)
             | Insn::NbaAssign(id, _, _)
             | Insn::NbaAssignConst(id, _, _)
-            | Insn::BranchIfSignalFalse(id, _)
+            | Insn::BranchIfSignalFalse(id, _, _)
             | Insn::NbaAssignRange(id, _, _, _)
             | Insn::NbaAssignRangeDyn(id, _, _, _)
             | Insn::NbaAssignBitDyn(id, _, _)
@@ -28334,15 +28780,58 @@ impl Simulator {
                 }
             }
         }
-        for &id in &self.edge_signal_ids {
-            snap_one(
-                id,
-                &self.signal_table,
-                &self.signal_widths,
-                &mut self.prev_val,
-                &mut self.prev_xz,
-                &mut self.prev_wide,
-            );
+        // Hot loop: this runs over the WHOLE edge-signal set on every snapshot
+        // (once per tick, plus once per edge/NBA cascade round), so anything
+        // constant per id is multiplied by ~|edge_signal_ids| × passes.
+        //
+        // Two costs are removed versus calling `snap_one` per id:
+        //  * `snap_one` did not actually inline (six parameters, one a
+        //    `&mut HashMap`), so every id paid a call plus a seven-register
+        //    prologue/epilogue — visible as the `push`/`pop` block at the head
+        //    of its disassembly.
+        //  * each of the four table indexings re-derived its (ptr, len) from
+        //    `self` and bounds-checked separately. Borrowing the tables once
+        //    as local slices keeps the bases in registers, and a single
+        //    `id < lim` test (lim = the shortest of the four) proves all four
+        //    accesses in range.
+        // `edge_signal_ids` is NOT guaranteed sorted — `sampled_watch_for`
+        // appends to it at run time — so `lim` is compared per id rather than
+        // once against the last element. Any id at or past `lim` falls back to
+        // the checked path, preserving the original panic-on-out-of-range.
+        {
+            let st: &[Value] = &self.signal_table;
+            let widths: &[u32] = &self.signal_widths;
+            let pv: &mut [u64] = &mut self.prev_val;
+            let px: &mut [u64] = &mut self.prev_xz;
+            let pw: &mut HashMap<usize, Value> = &mut self.prev_wide;
+            let lim = st.len().min(widths.len()).min(pv.len()).min(px.len());
+            for &id in self.edge_signal_ids.iter() {
+                if id >= lim {
+                    // Out of range for at least one table: keep the original
+                    // (indexing, therefore panicking) behavior.
+                    let (v, x) = st[id].raw_bits();
+                    pv[id] = v;
+                    px[id] = x;
+                    if widths[id] > 64 {
+                        if let Some(p) = pw.get_mut(&id) {
+                            p.copy_from(&st[id]);
+                        }
+                    }
+                    continue;
+                }
+                // SAFETY: `id < lim <= len` of each of the four slices.
+                let sv = unsafe { st.get_unchecked(id) };
+                let (v, x) = sv.raw_bits();
+                unsafe {
+                    *pv.get_unchecked_mut(id) = v;
+                    *px.get_unchecked_mut(id) = x;
+                }
+                if unsafe { *widths.get_unchecked(id) } > 64 {
+                    if let Some(p) = pw.get_mut(&id) {
+                        p.copy_from(sv);
+                    }
+                }
+            }
         }
         for i in 0..self.event_waiters.len() {
             for j in 0..self.event_waiters[i].resolved_sensitivities.len() {
@@ -29448,26 +29937,20 @@ impl Simulator {
         let mut prefiltered = 0u64;
         // edge_blocks_by_sig is parallel to edge_signal_ids (position-indexed).
         // Two scan modes: full range (default) or a caller-supplied subset of
-        // positions (clocks-only fast path).  Stack-allocated enum iterator
-        // avoids any per-iter heap allocation while keeping the hot
-        // per-position body identical for both modes.
-        enum PosIter<'a> {
-            Full(std::ops::Range<usize>),
-            Subset(std::slice::Iter<'a, usize>),
-        }
-        impl<'a> Iterator for PosIter<'a> {
-            type Item = usize;
-            #[inline]
-            fn next(&mut self) -> Option<usize> {
-                match self {
-                    PosIter::Full(r) => r.next(),
-                    PosIter::Subset(it) => it.next().copied(),
-                }
-            }
-        }
-        let positions = match detect_subset {
-            Some(subset) => PosIter::Subset(subset.iter()),
-            None => PosIter::Full(0..self.edge_signal_ids.len()),
+        // positions (clocks-only / dirty-driven fast paths).
+        //
+        // This used to be a small `Iterator` enum, but the mode is constant
+        // for the whole pass while the enum re-dispatched on its discriminant
+        // through `Iterator::next` on EVERY position — LLVM would not unswitch
+        // it out of a body this large. A loop-invariant `subset_scan` flag and
+        // a plain index give the same two modes with one predictable compare
+        // per position and no iterator state to advance.
+        let subset_positions: &[usize] = detect_subset.unwrap_or(&[]);
+        let subset_scan = detect_subset.is_some();
+        let scan_len = if subset_scan {
+            subset_positions.len()
+        } else {
+            self.edge_signal_ids.len()
         };
         // Every position that fires an edge this pass, with its value AT
         // DETECT TIME (pre-exec). After dispatch + waiter wakeup, prev is
@@ -29482,12 +29965,55 @@ impl Simulator {
         self.edge_group_generation = self.edge_group_generation.wrapping_add(1);
         let group_generation = self.edge_group_generation;
         let group_dedup_active = !self.edge_group_of.is_empty() && self.forced_signals.is_empty();
-        for pos in positions {
-            let sid = match self.edge_signal_ids.get(pos) {
-                Some(&s) => s,
-                None => continue,
+        // Hoisted views of every table the scan touches per position.
+        //
+        // The loop stores through `self` (memo slots, the trigger bitmap, the
+        // stats counters), and LLVM cannot prove those stores miss the OTHER
+        // vectors' headers, so each iteration re-materialized every base
+        // pointer and length out of `self` before it could index. Borrowing
+        // them once as local slices pins the bases in registers and turns each
+        // access back into a single indexed load. Every store in the body
+        // targets a DISJOINT field of `self`, which is what lets these borrows
+        // coexist with them.
+        let edge_sig_ids: &[usize] = &self.edge_signal_ids;
+        let by_sig: &[EdgeFanout] = &self.edge_blocks_by_sig;
+        let group_of: &[u32] = &self.edge_group_of;
+        let signal_table: &[Value] = &self.signal_table;
+        let prev_val_t: &[u64] = &self.prev_val;
+        let prev_xz_t: &[u64] = &self.prev_xz;
+        let widths_t: &[u32] = &self.signal_widths;
+        let prev_wide_t: &HashMap<usize, Value> = &self.prev_wide;
+        let group_memo: &mut [EdgeGroupMemo] = &mut self.edge_group_memo;
+        // Same treatment for the tables the DISPATCH half reads — the armed
+        // prefilter alone consults three of them on every one of ~189 M
+        // fanout events.
+        let blk_gateable: &[bool] = &self.edge_block_gateable;
+        let blk_snap_valid: &[bool] = &self.edge_block_snap_valid;
+        let blk_armed: &[u8] = &self.edge_block_armed;
+        let bitsel_sid_bits: &[u64] = &self.bitsel_sid_bits;
+        let bitsel_edge_sens: &HashMap<(usize, usize), u32> = &self.bitsel_edge_sens;
+        let prefilter_seen: &mut [u32] = &mut self.edge_prefilter_seen;
+        let stats_on = self.edge_block_stats_enabled;
+        let scan_stats = self.edge_scan_stats;
+        let clktree_probe = self.clktree_probe;
+        // Accumulated in registers and folded back after the loop — a `self`
+        // counter incremented in the body is another store LLVM has to order
+        // against the table loads.
+        let mut scanned_delta = 0u64;
+        let mut changed_delta = 0u64;
+        for scan_i in 0..scan_len {
+            let pos = if subset_scan {
+                subset_positions[scan_i]
+            } else {
+                scan_i
             };
-            let fanout = match self.edge_blocks_by_sig.get(pos) {
+            // Fanout gate first. It needs only `pos`, and a position with no
+            // sensitive block contributes nothing, so testing it before the
+            // `edge_signal_ids` load costs nothing and saves that load.
+            // (`edge_signal_ids` may be LONGER than `edge_blocks_by_sig` —
+            // `sampled_watch_for` appends to it at run time — and those extra
+            // positions were skipped by the fanout arm before this swap too.)
+            let fanout = match by_sig.get(pos) {
                 Some(e)
                     if !e.posedge.is_empty()
                         || !e.negedge.is_empty()
@@ -29506,36 +30032,54 @@ impl Simulator {
             // from its driver, which is exactly the case the grouping assumes
             // cannot happen. `forced_signals` is empty in the common case.
             let group = if group_dedup_active {
-                self.edge_group_of.get(pos).copied().unwrap_or(u32::MAX)
+                group_of.get(pos).copied().unwrap_or(u32::MAX)
             } else {
                 u32::MAX
             };
-            let memo_hit = group != u32::MAX
-                && self.edge_group_memo[group as usize].generation == group_generation;
-            let (cur_v, cur_x, prev_v, prev_x, fires_pos, fires_neg, fires_any) = if memo_hit
-                && !self.clktree_probe
+            let memo_hit =
+                group != u32::MAX && group_memo[group as usize].generation == group_generation;
+            let (sid, cur_v, cur_x, prev_v, prev_x, fires_pos, fires_neg, fires_any) = if memo_hit
+                && !clktree_probe
             {
-                let m = self.edge_group_memo[group as usize];
+                let m = group_memo[group as usize];
+                // The bulk of the scan is clock-tree members that did NOT
+                // fire. Leave here, before reading `edge_signal_ids` and
+                // before unpacking the memo's four value words — only the
+                // three fired flags are needed to decide.
+                if !m.fires_pos && !m.fires_neg && !m.fires_any {
+                    if scan_stats {
+                        scanned_delta += 1;
+                    }
+                    continue;
+                }
+                let sid = match edge_sig_ids.get(pos) {
+                    Some(&s) => s,
+                    None => continue,
+                };
                 (
-                    m.cur_v, m.cur_x, m.prev_v, m.prev_x, m.fires_pos, m.fires_neg, m.fires_any,
+                    sid, m.cur_v, m.cur_x, m.prev_v, m.prev_x, m.fires_pos, m.fires_neg, m.fires_any,
                 )
             } else {
+                let sid = match edge_sig_ids.get(pos) {
+                    Some(&s) => s,
+                    None => continue,
+                };
                 // Compute edge-fired booleans for this signal using SoA u64
                 // pairs; falls back to full Value compare for wide signals.
-                let (cur_v, cur_x) = self.signal_table[sid].raw_bits();
-                let prev_v = self.prev_val[sid];
-                let prev_x = self.prev_xz[sid];
+                let (cur_v, cur_x) = signal_table[sid].raw_bits();
+                let prev_v = prev_val_t[sid];
+                let prev_x = prev_xz_t[sid];
                 let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
                 let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
                 let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
                 let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
                 let fires_pos = !pb_one && cb_one;
                 let fires_neg = !pb_zero && cb_zero;
-                let fires_any = if self.signal_widths[sid] > 64 {
-                    self.prev_wide
+                let fires_any = if widths_t[sid] > 64 {
+                    prev_wide_t
                         .get(&sid)
                         .map_or(cur_v != prev_v || cur_x != prev_x, |p| {
-                            self.signal_table[sid] != *p
+                            signal_table[sid] != *p
                         })
                 } else {
                     cur_v != prev_v || cur_x != prev_x
@@ -29543,7 +30087,7 @@ impl Simulator {
                 if memo_hit {
                     // Probe mode: the memo was available but we recomputed.
                     // Any disagreement means the grouping is unsound.
-                    let m = self.edge_group_memo[group as usize];
+                    let m = group_memo[group as usize];
                     self.clktree_probe_hits += 1;
                     if m.cur_v != cur_v
                         || m.cur_x != cur_x
@@ -29574,7 +30118,7 @@ impl Simulator {
                         }
                     }
                 } else if group != u32::MAX {
-                    self.edge_group_memo[group as usize] = EdgeGroupMemo {
+                    group_memo[group as usize] = EdgeGroupMemo {
                         generation: group_generation,
                         fires_pos,
                         fires_neg,
@@ -29585,20 +30129,22 @@ impl Simulator {
                         prev_x,
                     };
                 }
-                (cur_v, cur_x, prev_v, prev_x, fires_pos, fires_neg, fires_any)
+                (
+                    sid, cur_v, cur_x, prev_v, prev_x, fires_pos, fires_neg, fires_any,
+                )
             };
-            if self.edge_scan_stats {
-                self.edge_scan_scanned += 1;
+            if scan_stats {
+                scanned_delta += 1;
             }
             if !fires_pos && !fires_neg && !fires_any {
                 continue;
             }
             fired_snap.push((sid, cur_v, cur_x));
-            if self.signal_widths[sid] > 64 {
-                fired_wide.push((sid, self.signal_table[sid].clone()));
+            if widths_t[sid] > 64 {
+                fired_wide.push((sid, signal_table[sid].clone()));
             }
-            if self.edge_scan_stats {
-                self.edge_scan_changed += 1;
+            if scan_stats {
+                changed_delta += 1;
             }
             // Shadow coverage check: a firing position MUST have been captured
             // in the dirty set (clocks + write hooks). If not, a write path
@@ -29611,6 +30157,8 @@ impl Simulator {
                     self.time, pos, sid
                 );
                 self.finished = true;
+                self.edge_scan_scanned += scanned_delta;
+                self.edge_scan_changed += changed_delta;
                 self.edge_pass_depth -= 1;
                 self.in_edge_block = !outermost_pass;
                 return;
@@ -29619,7 +30167,7 @@ impl Simulator {
             // changed value this delta-cycle. Bumped only when
             // stats are enabled (XEZIM_EDGE_BLOCK_STATS=1) so the
             // production hot path stays branch-free.
-            if self.edge_block_stats_enabled && sid < self.signal_toggle_count.len() {
+            if stats_on && sid < self.signal_toggle_count.len() {
                 self.signal_toggle_count[sid] += 1;
             }
             // Phase-4: track wakeups per fanout member + which signals
@@ -29630,6 +30178,12 @@ impl Simulator {
             // direction packet-flow count (B was waited on N times)
             // which is symmetric for hyperedge weight purposes.
             let mut woke_any = false;
+            // Per-sid prefilter: only signals with a registered bit-select
+            // sensitivity pay the (sid, block) tuple-hash below.
+            let sid_bitsel = bitsel_active
+                && bitsel_sid_bits
+                    .get(sid >> 6)
+                    .is_some_and(|w| w & (1u64 << (sid & 63)) != 0);
             macro_rules! dispatch_block {
                 ($block_idx:expr_2021, $kind:expr_2021) => {{
                     let block_idx = $block_idx;
@@ -29637,8 +30191,8 @@ impl Simulator {
                     // SIGNAL, so re-test the one bit this block actually watches
                     // and drop the wake when only a sibling bit moved. Mirrors
                     // the whole-signal formulas, on bit `b` instead of bit 0.
-                    let bitsel_ok = !bitsel_active
-                        || match self.bitsel_edge_sens.get(&(sid, block_idx)) {
+                    let bitsel_ok = !sid_bitsel
+                        || match bitsel_edge_sens.get(&(sid, block_idx)) {
                             None => true,
                             Some(&b) => {
                                 let cb = (cur_v >> b) & 1;
@@ -29664,18 +30218,21 @@ impl Simulator {
                         && !(iff_active && iff_denied[block_idx])
                     {
                         let skip_early = armed_prefilter
-                            && self.edge_block_gateable[block_idx]
-                            && self.edge_block_snap_valid[block_idx]
-                            && self.edge_block_armed[block_idx] == 0;
+                            && blk_gateable[block_idx]
+                            && blk_snap_valid[block_idx]
+                            && blk_armed[block_idx] == 0;
                         if skip_early {
-                            if self.edge_prefilter_seen[block_idx] != prefilter_generation {
-                                self.edge_prefilter_seen[block_idx] = prefilter_generation;
+                            if prefilter_seen[block_idx] != prefilter_generation {
+                                prefilter_seen[block_idx] = prefilter_generation;
+                                // `event_gateable_total` / `event_would_skip` /
+                                // `armed_fast_skips` all advance in lockstep
+                                // with `prefiltered` here, so they are folded
+                                // in once after the loop instead of paying
+                                // three read-modify-writes through `self` on
+                                // each of ~110 M armed skips.
                                 prefiltered += 1;
-                                self.event_gateable_total += 1;
-                                self.event_would_skip += 1;
-                                self.armed_fast_skips += 1;
                                 woke_any = true;
-                                if self.edge_block_stats_enabled
+                                if stats_on
                                     && block_idx < self.cross_block_wakeup_count.len()
                                 {
                                     self.cross_block_wakeup_count[block_idx] += 1;
@@ -29685,7 +30242,7 @@ impl Simulator {
                             triggered_bitmap[block_idx] = true;
                             triggered.push(block_idx);
                             woke_any = true;
-                            if self.edge_block_stats_enabled
+                            if stats_on
                                 && block_idx < self.cross_block_wakeup_count.len()
                             {
                                 self.cross_block_wakeup_count[block_idx] += 1;
@@ -29716,7 +30273,7 @@ impl Simulator {
                 }
             }
             if woke_any
-                && self.edge_block_stats_enabled
+                && stats_on
                 && sid < self.sensitivity_trigger_count.len()
             {
                 self.sensitivity_trigger_count[sid] += 1;
@@ -29725,6 +30282,12 @@ impl Simulator {
         if let Some(t) = t0 {
             self.prof_edge_detect += t.elapsed().as_nanos() as u64;
         }
+        // Fold back the counters the scan accumulated in registers.
+        self.edge_scan_scanned += scanned_delta;
+        self.edge_scan_changed += changed_delta;
+        self.event_gateable_total += prefiltered;
+        self.event_would_skip += prefiltered;
+        self.armed_fast_skips += prefiltered;
         self.prof_edges_fired += triggered.len() as u64 + prefiltered;
         // Return the iff-denial scratch buffer for reuse next delta-cycle.
         self.edge_iff_denied = iff_denied;
@@ -29739,17 +30302,23 @@ impl Simulator {
             const EPOCH_PROBE_WINDOW: u8 = 64;
             let now = self.event_phase;
             let mut w = 0usize;
+            // Same treatment as the detect loop: these counters advance on
+            // nearly every iteration, and a read-modify-write through `self`
+            // in the body forces the block tables' bases to be re-derived
+            // afterwards. Accumulate in registers, fold in once at the end.
+            let mut gateable_delta = 0u64;
+            let mut would_skip_delta = 0u64;
+            let mut fast_skip_delta = 0u64;
+            let mut snap_check_delta = 0u64;
             for r in 0..triggered.len() {
                 let bi = triggered[r];
                 let gate = self.edge_block_gateable.get(bi).copied().unwrap_or(false);
                 if gate {
-                    self.event_gateable_total += 1;
+                    gateable_delta += 1;
                 }
                 let mut snapshot_result = None;
                 let mut epoch_fast = false;
                 let keep = if gate && self.armed_edge {
-                    let start = self.edge_block_off[bi] as usize;
-                    let end = self.edge_block_off[bi + 1] as usize;
                     let was_armed = self.edge_block_armed[bi] != 0;
                     // Clear before execution. Any write performed by this or
                     // another block later in the delta cycle re-arms through
@@ -29757,8 +30326,15 @@ impl Simulator {
                     self.edge_block_armed[bi] = 0;
                     if !was_armed {
                         if self.armed_edge_shadow {
+                            // `start`/`end` are read HERE rather than above:
+                            // the dominant arm is the un-armed fast skip
+                            // below, which never needs the block's read span,
+                            // and hoisting them cost it two loads plus their
+                            // bounds checks on every skipped fire.
+                            let start = self.edge_block_off[bi] as usize;
+                            let end = self.edge_block_off[bi + 1] as usize;
                             self.armed_shadow_checks += 1;
-                            self.event_snapshot_checks += 1;
+                            snap_check_delta += 1;
                             let mut differ = false;
                             for k in start..end {
                                 let sid = self.edge_block_reads_flat[k] as usize;
@@ -29779,18 +30355,23 @@ impl Simulator {
                             snapshot_result = Some(differ);
                             differ
                         } else {
-                            self.armed_fast_skips += 1;
+                            fast_skip_delta += 1;
                             false
                         }
                     } else if !self.edge_block_snap_valid[bi] {
                         true
                     } else {
-                        self.event_snapshot_checks += 1;
+                        let start = self.edge_block_off[bi] as usize;
+                        let end = self.edge_block_off[bi + 1] as usize;
+                        snap_check_delta += 1;
+                        let st: &[Value] = &self.signal_table;
+                        let reads: &[u32] = &self.edge_block_reads_flat;
+                        let snaps: &[(u64, u64)] = &self.edge_block_snap_flat;
                         let mut differ = false;
                         for k in start..end {
-                            let sid = self.edge_block_reads_flat[k] as usize;
-                            let (v, x) = self.signal_table[sid].raw_bits();
-                            let (sv, sx) = self.edge_block_snap_flat[k];
+                            let sid = reads[k] as usize;
+                            let (v, x) = st[sid].raw_bits();
+                            let (sv, sx) = snaps[k];
                             if v != sv || x != sx {
                                 differ = true;
                                 break;
@@ -29824,7 +30405,7 @@ impl Simulator {
                         // value-based skip is permitted.
                         true
                     } else {
-                        self.event_snapshot_checks += 1;
+                        snap_check_delta += 1;
                         let snap = &self.edge_block_snap_flat[start..end];
                         let st = &self.signal_table;
                         let mut differ = false;
@@ -29891,10 +30472,17 @@ impl Simulator {
                         } else {
                             let start = self.edge_block_off[bi] as usize;
                             let end = self.edge_block_off[bi + 1] as usize;
-                            let st = &self.signal_table;
+                            // Store through `self.edge_block_snap_flat` forced
+                            // a reload of `edge_block_reads_flat`'s base on
+                            // every element; borrow both once (disjoint
+                            // fields) so the refresh is a straight
+                            // gather/scatter over registers-held bases.
+                            let st: &[Value] = &self.signal_table;
+                            let reads: &[u32] = &self.edge_block_reads_flat;
+                            let snaps: &mut [(u64, u64)] = &mut self.edge_block_snap_flat;
                             for k in start..end {
-                                let s = self.edge_block_reads_flat[k] as usize;
-                                self.edge_block_snap_flat[k] = st[s].raw_bits();
+                                let s = reads[k] as usize;
+                                snaps[k] = st[s].raw_bits();
                             }
                             self.edge_block_snap_valid[bi] = true;
                         }
@@ -29902,12 +30490,17 @@ impl Simulator {
                     triggered[w] = bi;
                     w += 1;
                 } else {
-                    self.event_would_skip += 1;
+                    would_skip_delta += 1;
                     if bi < triggered_bitmap.len() {
                         triggered_bitmap[bi] = false;
                     }
                 }
             }
+            // Fold the register-accumulated counters back.
+            self.event_gateable_total += gateable_delta;
+            self.event_would_skip += would_skip_delta;
+            self.armed_fast_skips += fast_skip_delta;
+            self.event_snapshot_checks += snap_check_delta;
             triggered.truncate(w);
         } else if self.event_measure {
             let now = self.event_phase;
@@ -31937,16 +32530,25 @@ impl Simulator {
         if self.settle_triggered.len() < num_entries {
             self.settle_triggered.resize(num_entries, false);
         }
+        // The trigger bitmap and the next-pass worklist move into locals for
+        // the duration of the settle, exactly like `entries`/`dep_*` above.
+        // Both are indexed by every propagation step, and as `self` fields
+        // LLVM has to reload their base pointer after each `&mut self` call in
+        // the evaluation arms. Re-entry can't observe the empty fields: both
+        // settle drivers bail on `self.settling`, which is already set, and
+        // nothing else touches them. Restored on every exit path below.
+        let mut triggered = std::mem::take(&mut self.settle_triggered);
+        let mut next_list = std::mem::take(&mut self.settle_triggered_list);
 
         let mut total_iters = 0u64;
         let limit = self.settle_limit as u64;
 
         // One-time seed: consume the initial dirty set, mark dependents.
         // settle_triggered acts as persistent "needs evaluation" across passes.
-        for &eidx in &self.settle_triggered_list {
-            self.settle_triggered[eidx] = false;
+        for &eidx in &next_list {
+            triggered[eidx] = false;
         }
-        self.settle_triggered_list.clear();
+        next_list.clear();
         // First time-0 settle pass: don't fire `always @(list)` blocks that
         // can reach `$finish`/`$stop` — they should suspend at their event
         // control until a sensitivity input actually transitions, not run
@@ -31965,9 +32567,9 @@ impl Simulator {
                         if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
                             continue;
                         }
-                        if !self.settle_triggered[eidx] {
-                            self.settle_triggered[eidx] = true;
-                            self.settle_triggered_list.push(eidx);
+                        if !triggered[eidx] {
+                            triggered[eidx] = true;
+                            next_list.push(eidx);
                         }
                     }
                 }
@@ -31983,12 +32585,12 @@ impl Simulator {
         // $time) is held back on the first t0 settle — same rule the
         // dirty-seed loop above applies (§9.2.2.1).
         for &eidx in self.comb_unresolved_idx.iter() {
-            if eidx < num_entries && !self.settle_triggered[eidx] {
+            if eidx < num_entries && !triggered[eidx] {
                 if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
                     continue;
                 }
-                self.settle_triggered[eidx] = true;
-                self.settle_triggered_list.push(eidx);
+                triggered[eidx] = true;
+                next_list.push(eidx);
             }
         }
         // Time-0 / empty-read-set fire unconditionally — but only the FIRST
@@ -31998,18 +32600,20 @@ impl Simulator {
         // c910 and dominated per-assign cost during memory-init loops.
         if self.time == 0 && !self.comb_time0_fired {
             for &eidx in self.comb_time0_idx.iter() {
-                if eidx < num_entries && !self.settle_triggered[eidx] {
-                    self.settle_triggered[eidx] = true;
-                    self.settle_triggered_list.push(eidx);
+                if eidx < num_entries && !triggered[eidx] {
+                    triggered[eidx] = true;
+                    next_list.push(eidx);
                 }
             }
             self.comb_time0_fired = true;
         }
 
-        if self.settle_triggered_list.is_empty() {
+        if next_list.is_empty() {
             self.comb_entries = entries;
             self.comb_dep_offsets = dep_offsets;
             self.comb_dep_entries = dep_entries;
+            self.settle_triggered = triggered;
+            self.settle_triggered_list = next_list;
             self.settling = false;
             return;
         }
@@ -32031,13 +32635,70 @@ impl Simulator {
         const CHURN_TAIL: u64 = 3;
         let mut churn: Vec<(usize, usize)> = Vec::new(); // (signal_id, entry_idx)
         let mut converged = false;
+
+        // Diagnostic modes are latched for the whole settle: every one of
+        // these is a construction-time / CLI flag, and `self.time` cannot
+        // advance while `settling` is set — so re-reading them from `self` on
+        // each of the ~679 entry evaluations per settle call is pure overhead.
+        let prof_on = self.profile_timing;
+        let mon_on = self.activity_mon;
+        let trace_on = self.trace_always.is_some();
+        let warn_x_on = self.warn_x && self.time > 0;
+        // Profiling counters accumulate in registers and fold back into `self`
+        // once, instead of a read-modify-write per evaluation.
+        let mut n_evals = 0u64;
+        let mut n_dc = 0u64;
+        let mut n_ab = 0u64;
+
+        // Trigger every comb entry that depends on signal `$id`, written by
+        // entry `$eidx`. This is exactly what `mark_dirty_id($id)` plus the
+        // loop's post-entry `dirty_list` rescan used to do, minus the round
+        // trip: the push onto `dirty_list`, the `dirty_signals` set/clear
+        // pair, the `dirty_any` store and a second `comb_dep_offsets` bounds
+        // test. `[XZP] dirty_prop` measured 119.1M such round trips per c906
+        // run, 93% of them from the fused arms below. Expanded inline (rather
+        // than a method) so it can borrow the settle-local `dep_*`/worklist
+        // vectors while the arms still hold `&mut self`.
+        macro_rules! trigger_deps {
+            ($id:expr, $eidx:expr) => {{
+                let __tid: usize = $id;
+                if __tid + 1 < dep_offsets.len() {
+                    let __lo = dep_offsets[__tid] as usize;
+                    let __hi = dep_offsets[__tid + 1] as usize;
+                    for &__dep_u32 in &dep_entries[__lo..__hi] {
+                        let __dep = __dep_u32 as usize;
+                        if !triggered[__dep] {
+                            triggered[__dep] = true;
+                            if __dep > $eidx {
+                                cur_list.push(__dep);
+                            } else {
+                                next_list.push(__dep);
+                            }
+                        }
+                    }
+                }
+            }};
+        }
+        // `mark_dirty_id`'s activity-monitor half, for the write paths that
+        // now propagate directly instead of going through the dirty list.
+        macro_rules! note_toggle {
+            ($id:expr) => {{
+                if mon_on {
+                    if self.signal_toggle_counts.len() != self.signal_table.len() {
+                        self.signal_toggle_counts.resize(self.signal_table.len(), 0);
+                    }
+                    self.signal_toggle_counts[$id] += 1;
+                }
+            }};
+        }
+
         for _iteration in 0..limit {
             total_iters += 1;
             let mut evaluated_any = false;
             let capture_churn = _iteration + CHURN_TAIL >= limit;
 
             // Take the current worklist and sort by eidx (topo order).
-            std::mem::swap(&mut cur_list, &mut self.settle_triggered_list);
+            std::mem::swap(&mut cur_list, &mut next_list);
             if cur_list.len() > 1 && !cur_list.windows(2).all(|w| w[0] <= w[1]) {
                 cur_list.sort_unstable();
             }
@@ -32057,23 +32718,23 @@ impl Simulator {
             while cur_pos < cur_list.len() {
                 let eidx = cur_list[cur_pos];
                 cur_pos += 1;
-                if !self.settle_triggered[eidx] {
+                if !triggered[eidx] {
                     continue;
                 }
                 // Consume the trigger now. If any signal is written AGAIN
                 // later this pass (or next), the entry is re-triggered by
                 // the worklist propagation below.
-                self.settle_triggered[eidx] = false;
+                triggered[eidx] = false;
                 evaluated_any = true;
                 let dirty_before = self.dirty_list.len();
 
-                self.entry_evals += 1;
+                n_evals += 1;
                 // Which CombItem shapes actually dominate evaluation — the
                 // number that says whether to attack the interpreter or the
                 // worklist. Gated: `profile_timing` is already an opt-in slow
                 // mode (it adds Instant::now() on these paths), so a normal
                 // run does not pay for this match.
-                if self.profile_timing {
+                if prof_on {
                     if self.prof_entry_counts.len() != num_entries {
                         self.prof_entry_counts.resize(num_entries, 0);
                     }
@@ -32094,12 +32755,12 @@ impl Simulator {
                     };
                     self.prof_entry_hist[k] += 1;
                 }
-                if self.activity_mon {
+                if mon_on {
                     if let Some(slot) = self.activity_counts.get_mut(eidx) {
                         *slot += 1;
                     }
                 }
-                if self.trace_always.is_some() {
+                if trace_on {
                     let label = self.comb_entry_trace_label(eidx, &entries[eidx]);
                     self.trace_always_fire(&label);
                 }
@@ -32124,7 +32785,7 @@ impl Simulator {
                                 sx = 0;
                             }
                             let (dv, dx) = self.signal_table[*dst_id].raw_bits();
-                            if self.warn_x && self.time > 0 {
+                            if warn_x_on {
                                 self.warn_x_note_bits(*dst_id, dv, dx, sv, sx);
                             }
                             if (sv != dv || sx != dx)
@@ -32135,31 +32796,11 @@ impl Simulator {
                                 if capture_churn {
                                     churn.push((*dst_id, eidx));
                                 }
-                                if self.activity_mon {
-                                    if self.signal_toggle_counts.len() != self.signal_table.len() {
-                                        self.signal_toggle_counts
-                                            .resize(self.signal_table.len(), 0);
-                                    }
-                                    self.signal_toggle_counts[*dst_id] += 1;
-                                }
-                                if *dst_id + 1 < dep_offsets.len() {
-                                    let lo = dep_offsets[*dst_id] as usize;
-                                    let hi = dep_offsets[*dst_id + 1] as usize;
-                                    for &dep_eidx_u32 in &dep_entries[lo..hi] {
-                                        let dep_eidx = dep_eidx_u32 as usize;
-                                        if !self.settle_triggered[dep_eidx] {
-                                            self.settle_triggered[dep_eidx] = true;
-                                            if dep_eidx > eidx {
-                                                cur_list.push(dep_eidx);
-                                            } else {
-                                                self.settle_triggered_list.push(dep_eidx);
-                                            }
-                                        }
-                                    }
-                                }
+                                note_toggle!(*dst_id);
+                                trigger_deps!(*dst_id, eidx);
                             }
                         }
-                        self.prof_settle_dc_count += 1;
+                        n_dc += 1;
                     }
                     CombItem::FastDirectFanout { src_id, dst_ids } => {
                         let (src_v, src_x) = self.signal_table[*src_id].raw_bits();
@@ -32178,7 +32819,7 @@ impl Simulator {
                                 sx = 0;
                             }
                             let (dv, dx) = self.signal_table[dst_id].raw_bits();
-                            if self.warn_x && self.time > 0 {
+                            if warn_x_on {
                                 self.warn_x_note_bits(dst_id, dv, dx, sv, sx);
                             }
                             if (sv == dv && sx == dx)
@@ -32191,29 +32832,10 @@ impl Simulator {
                             if capture_churn {
                                 churn.push((dst_id, eidx));
                             }
-                            if self.activity_mon {
-                                if self.signal_toggle_counts.len() != self.signal_table.len() {
-                                    self.signal_toggle_counts.resize(self.signal_table.len(), 0);
-                                }
-                                self.signal_toggle_counts[dst_id] += 1;
-                            }
-                            if dst_id + 1 < dep_offsets.len() {
-                                let lo = dep_offsets[dst_id] as usize;
-                                let hi = dep_offsets[dst_id + 1] as usize;
-                                for &dep_eidx_u32 in &dep_entries[lo..hi] {
-                                    let dep_eidx = dep_eidx_u32 as usize;
-                                    if !self.settle_triggered[dep_eidx] {
-                                        self.settle_triggered[dep_eidx] = true;
-                                        if dep_eidx > eidx {
-                                            cur_list.push(dep_eidx);
-                                        } else {
-                                            self.settle_triggered_list.push(dep_eidx);
-                                        }
-                                    }
-                                }
-                            }
+                            note_toggle!(dst_id);
+                            trigger_deps!(dst_id, eidx);
                         }
-                        self.prof_settle_dc_count += dst_ids.len() as u64;
+                        n_dc += dst_ids.len() as u64;
                     }
                     CombItem::DirectCopy {
                         dst_id,
@@ -32246,7 +32868,7 @@ impl Simulator {
                         {
                             let (sv, sx) = self.signal_table[*src_id].raw_bits();
                             let (dv, dx) = self.signal_table[*dst_id].raw_bits();
-                            if self.warn_x && self.time > 0 {
+                            if warn_x_on {
                                 self.warn_x_note_bits(*dst_id, dv, dx, sv, sx);
                             }
                             if sv == dv && sx == dx {
@@ -32258,28 +32880,8 @@ impl Simulator {
                                 if capture_churn {
                                     churn.push((*dst_id, eidx));
                                 }
-                                if self.activity_mon {
-                                    if self.signal_toggle_counts.len() != self.signal_table.len() {
-                                        self.signal_toggle_counts
-                                            .resize(self.signal_table.len(), 0);
-                                    }
-                                    self.signal_toggle_counts[*dst_id] += 1;
-                                }
-                                if *dst_id + 1 < dep_offsets.len() {
-                                    let lo = dep_offsets[*dst_id] as usize;
-                                    let hi = dep_offsets[*dst_id + 1] as usize;
-                                    for &dep_eidx_u32 in &dep_entries[lo..hi] {
-                                        let dep_eidx = dep_eidx_u32 as usize;
-                                        if !self.settle_triggered[dep_eidx] {
-                                            self.settle_triggered[dep_eidx] = true;
-                                            if dep_eidx > eidx {
-                                                cur_list.push(dep_eidx);
-                                            } else {
-                                                self.settle_triggered_list.push(dep_eidx);
-                                            }
-                                        }
-                                    }
-                                }
+                                note_toggle!(*dst_id);
+                                trigger_deps!(*dst_id, eidx);
                                 handled = true;
                             }
                             // If set_inline_bits returned false (Wide storage),
@@ -32300,34 +32902,12 @@ impl Simulator {
                                     if capture_churn {
                                         churn.push((*dst_id, eidx));
                                     }
-                                    if self.activity_mon {
-                                        if self.signal_toggle_counts.len()
-                                            != self.signal_table.len()
-                                        {
-                                            self.signal_toggle_counts
-                                                .resize(self.signal_table.len(), 0);
-                                        }
-                                        self.signal_toggle_counts[*dst_id] += 1;
-                                    }
-                                    if *dst_id + 1 < dep_offsets.len() {
-                                        let lo = dep_offsets[*dst_id] as usize;
-                                        let hi = dep_offsets[*dst_id + 1] as usize;
-                                        for &dep_eidx_u32 in &dep_entries[lo..hi] {
-                                            let dep_eidx = dep_eidx_u32 as usize;
-                                            if !self.settle_triggered[dep_eidx] {
-                                                self.settle_triggered[dep_eidx] = true;
-                                                if dep_eidx > eidx {
-                                                    cur_list.push(dep_eidx);
-                                                } else {
-                                                    self.settle_triggered_list.push(dep_eidx);
-                                                }
-                                            }
-                                        }
-                                    }
+                                    note_toggle!(*dst_id);
+                                    trigger_deps!(*dst_id, eidx);
                                 }
                             }
                         }
-                        self.prof_settle_dc_count += 1;
+                        n_dc += 1;
                     }
                     CombItem::CompiledContAssign { compiled, .. } => {
                         // Native path (cfg-gated: compiled out of the default
@@ -32385,7 +32965,12 @@ impl Simulator {
                             };
                             self.exec_insns(insns);
                         }
-                        self.prof_settle_dc_count += 1;
+                        // Counted in a register and folded into
+                        // `prof_settle_dc_count` after the loop, so the
+                        // per-evaluation cost is not a read-modify-write
+                        // through `self` (which also forces the entry tables'
+                        // base pointers to be re-derived on every iteration).
+                        n_dc += 1;
                     }
                     CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
                         // Factored AST eval (shared with the BSP settle driver).
@@ -32433,35 +33018,85 @@ impl Simulator {
                             *self.name_resolve_hint.borrow_mut() = prev;
                         }
                         self.timescale_scope_override = saved_ts;
-                        self.prof_settle_ab_count += 1;
+                        n_ab += 1;
                         if self.proc_depth > 0 {
                             self.note_comb_ran_in_process(eidx, &entries[eidx]);
                         }
                     }
+                    // The three fused arms are the settle loop's highest-volume
+                    // shapes on RTL netlists (c906: 57.8% / 5.8% / 0.02% of all
+                    // entry evaluations). They are expanded here rather than
+                    // calling `exec_fused_*` so a changed destination triggers
+                    // its dependents through `trigger_deps!` directly, skipping
+                    // the `mark_dirty_id` -> `dirty_list` -> post-entry rescan
+                    // round trip. Same reads, same writes, same trigger set.
                     CombItem::FusedGate { op } => {
-                        self.exec_fused_gate(op);
-                        self.prof_settle_dc_count += 1;
+                        let (dst, new_bit) = self.fused_gate_eval(op);
+                        let sdf_any = !self.sdf_delays.is_empty();
+                        if self.fused_bit_commit(dst, new_bit, sdf_any) {
+                            let id = dst.sig_id as usize;
+                            if capture_churn {
+                                churn.push((id, eidx));
+                            }
+                            note_toggle!(id);
+                            trigger_deps!(id, eidx);
+                        }
+                        n_dc += 1;
                     }
                     CombItem::FusedBufFanout { src, dsts, invert } => {
-                        self.exec_fused_buf_fanout(*src, dsts, *invert);
-                        self.prof_settle_dc_count += dsts.len() as u64;
+                        let new_bit = self.fused_buf_src_bit(*src, *invert);
+                        let sdf_any = !self.sdf_delays.is_empty();
+                        // The §28.4 z->x rule can only bite when the (single,
+                        // loop-invariant) source bit is z on a non-inverting
+                        // group — hoist that test so the common group pays
+                        // nothing per destination.
+                        let z_check = !*invert && new_bit == 3;
+                        for &dst in dsts.iter() {
+                            let bit = if z_check {
+                                self.fused_buf_dst_bit(dst, new_bit, *invert)
+                            } else {
+                                new_bit
+                            };
+                            if self.fused_bit_commit(dst, bit, sdf_any) {
+                                let id = dst.sig_id as usize;
+                                if capture_churn {
+                                    churn.push((id, eidx));
+                                }
+                                note_toggle!(id);
+                                trigger_deps!(id, eidx);
+                            }
+                        }
+                        n_dc += dsts.len() as u64;
                     }
                     CombItem::FusedAndFanout {
                         common,
                         branches,
                         invert,
                     } => {
-                        self.exec_fused_and_fanout(*common, branches, *invert);
-                        self.prof_settle_dc_count += branches.len() as u64;
+                        let common_code = self.signal_table[common.sig_id as usize]
+                            .get_bit_code(common.bit as usize);
+                        let sdf_any = !self.sdf_delays.is_empty();
+                        for branch in branches.iter() {
+                            let bit = self.fused_and_branch_bit(common_code, branch, *invert);
+                            if self.fused_bit_commit(branch.dst, bit, sdf_any) {
+                                let id = branch.dst.sig_id as usize;
+                                if capture_churn {
+                                    churn.push((id, eidx));
+                                }
+                                note_toggle!(id);
+                                trigger_deps!(id, eidx);
+                            }
+                        }
+                        n_dc += branches.len() as u64;
                     }
                     CombItem::Udp { idx } => {
                         let idx = *idx;
                         self.eval_udp(idx);
-                        self.prof_settle_dc_count += 1;
+                        n_dc += 1;
                     }
                     CombItem::UdpBatch { event_ref, indices } => {
                         self.eval_udp_batch(*event_ref, indices);
-                        self.prof_settle_dc_count += indices.len() as u64;
+                        n_dc += indices.len() as u64;
                     }
                 }
 
@@ -32483,21 +33118,7 @@ impl Simulator {
                         // If the signal gets dirtied again later, it'll be
                         // re-pushed to dirty_list with a fresh flag.
                         self.dirty_signals[sig_id] = false;
-                        if sig_id + 1 < dep_offsets.len() {
-                            let lo = dep_offsets[sig_id] as usize;
-                            let hi = dep_offsets[sig_id + 1] as usize;
-                            for &dep_eidx_u32 in &dep_entries[lo..hi] {
-                                let dep_eidx = dep_eidx_u32 as usize;
-                                if !self.settle_triggered[dep_eidx] {
-                                    self.settle_triggered[dep_eidx] = true;
-                                    if dep_eidx > eidx {
-                                        cur_list.push(dep_eidx);
-                                    } else {
-                                        self.settle_triggered_list.push(dep_eidx);
-                                    }
-                                }
-                            }
-                        }
+                        trigger_deps!(sig_id, eidx);
                     }
                 }
             }
@@ -32513,15 +33134,20 @@ impl Simulator {
             self.dirty_any = false;
             // Prepare cur_list for next pass reuse (it'll be swapped in).
             cur_list.clear();
-            if self.settle_triggered_list.is_empty() {
+            if next_list.is_empty() {
                 converged = true;
                 break;
             }
         }
 
+        self.entry_evals += n_evals;
+        self.prof_settle_dc_count += n_dc;
+        self.prof_settle_ab_count += n_ab;
         self.comb_entries = entries;
         self.comb_dep_offsets = dep_offsets;
         self.comb_dep_entries = dep_entries;
+        self.settle_triggered = triggered;
+        self.settle_triggered_list = next_list;
         self.settle_dirty_ids = cur_list;
         self.settle_iters += total_iters;
         if total_iters > self.max_settle_iters {
@@ -50530,11 +51156,48 @@ impl Simulator {
         }
     }
 
-    /// Execute a group of fused 1-bit buffers that share one source bit.
-    #[inline]
-    fn exec_fused_buf_fanout(&mut self, src: BitRef, dsts: &[BitRef], invert: bool) {
+    /// Commit one 4-state bit to a fused-gate destination. Shared by every
+    /// fused evaluator (single gate, buffer fanout, AND fanout) and by the
+    /// settle loop, which needs the *outcome* of the write so it can trigger
+    /// the destination's dependents inline instead of routing them through
+    /// `dirty_list`. Returns true when `signal_table` actually changed; an
+    /// SDF-delayed destination reschedules and reports false (the change
+    /// lands later, via the delay queue's own dirty marking).
+    ///
+    /// `sdf_any` is `!self.sdf_delays.is_empty()`, hoisted by the caller out
+    /// of its per-destination loop — SDF annotation cannot change while a
+    /// fanout group is being written.
+    #[inline(always)]
+    fn fused_bit_commit(&mut self, dst: BitRef, new_bit: u8, sdf_any: bool) -> bool {
+        let id = dst.sig_id as usize;
+        // Late (runtime $sdf_annotate) SDF delay on a fused destination:
+        // route the whole-signal updated value through schedule_delayed
+        // instead of writing the bit immediately. Build-time (CLI --sdf)
+        // annotation never fuses a delayed destination, so on that path
+        // sdf_delays is either empty (no SDF at all — the hoisted bool) or
+        // zero for every fused dst (one Vec index).
+        if sdf_any && self.sdf_delays.get(id).copied().unwrap_or(0) > 0 && self.time > 0 {
+            if self.signal_table[id].get_bit_code(dst.bit as usize) != new_bit {
+                let mut v = self.signal_table[id].clone();
+                v.set_bit_code(dst.bit as usize, new_bit);
+                self.schedule_delayed(id, v);
+            }
+            return false;
+        }
+        if self.signal_table[id].set_bit_code(dst.bit as usize, new_bit) {
+            self.table_modified = true;
+            self.after_signal_write(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Source bit of a fused buffer fanout, with the group's inversion applied.
+    #[inline(always)]
+    fn fused_buf_src_bit(&self, src: BitRef, invert: bool) -> u8 {
         let source = self.signal_table[src.sig_id as usize].get_bit_code(src.bit as usize);
-        let new_bit = if invert {
+        if invert {
             match source {
                 0 => 1,
                 1 => 0,
@@ -50542,39 +51205,65 @@ impl Simulator {
             }
         } else {
             source
-        };
+        }
+    }
+
+    /// §28.4 vs §10.3 — decided per destination: a fanout group can mix
+    /// a gate-driven net with a plain assign's target.
+    #[inline(always)]
+    fn fused_buf_dst_bit(&self, dst: BitRef, new_bit: u8, invert: bool) -> u8 {
+        if !invert
+            && new_bit == 3
+            && self
+                .signal_gate_driven
+                .get(dst.sig_id as usize)
+                .copied()
+                .unwrap_or(false)
+        {
+            2
+        } else {
+            new_bit
+        }
+    }
+
+    /// Execute a group of fused 1-bit buffers that share one source bit.
+    #[inline]
+    fn exec_fused_buf_fanout(&mut self, src: BitRef, dsts: &[BitRef], invert: bool) {
+        let new_bit = self.fused_buf_src_bit(src, invert);
+        let sdf_any = !self.sdf_delays.is_empty();
         for &dst in dsts {
-            // §28.4 vs §10.3 — decided per destination: a fanout group can mix
-            // a gate-driven net with a plain assign's target.
-            let new_bit = if !invert
-                && new_bit == 3
-                && self
-                    .signal_gate_driven
-                    .get(dst.sig_id as usize)
-                    .copied()
-                    .unwrap_or(false)
-            {
-                2
-            } else {
-                new_bit
-            };
-            let id = dst.sig_id as usize;
-            if !self.sdf_delays.is_empty()
-                && self.sdf_delays.get(id).copied().unwrap_or(0) > 0
-                && self.time > 0
-            {
-                if self.signal_table[id].get_bit_code(dst.bit as usize) != new_bit {
-                    let mut v = self.signal_table[id].clone();
-                    v.set_bit_code(dst.bit as usize, new_bit);
-                    self.schedule_delayed(id, v);
-                }
-                continue;
+            let bit = self.fused_buf_dst_bit(dst, new_bit, invert);
+            if self.fused_bit_commit(dst, bit, sdf_any) {
+                self.mark_dirty_id(dst.sig_id as usize);
             }
-            if self.signal_table[id].set_bit_code(dst.bit as usize, new_bit) {
-                self.table_modified = true;
-                self.after_signal_write(id);
-                self.mark_dirty_id(id);
+        }
+    }
+
+    /// Result bit of one branch of a fused AND/NAND fanout.
+    #[inline(always)]
+    fn fused_and_branch_bit(
+        &self,
+        common_code: u8,
+        branch: &FusedAndBranch,
+        invert: bool,
+    ) -> u8 {
+        let other = self.signal_table[branch.other.sig_id as usize]
+            .get_bit_code(branch.other.bit as usize);
+        let and = if common_code == 0 || other == 0 {
+            0
+        } else if common_code == 1 && other == 1 {
+            1
+        } else {
+            2
+        };
+        if invert {
+            match and {
+                0 => 1,
+                1 => 0,
+                _ => 2,
             }
+        } else {
+            and
         }
     }
 
@@ -50588,50 +51277,21 @@ impl Simulator {
     ) {
         let common_code =
             self.signal_table[common.sig_id as usize].get_bit_code(common.bit as usize);
+        let sdf_any = !self.sdf_delays.is_empty();
         for branch in branches {
-            let other = self.signal_table[branch.other.sig_id as usize]
-                .get_bit_code(branch.other.bit as usize);
-            let and = if common_code == 0 || other == 0 {
-                0
-            } else if common_code == 1 && other == 1 {
-                1
-            } else {
-                2
-            };
-            let new_bit = if invert {
-                match and {
-                    0 => 1,
-                    1 => 0,
-                    _ => 2,
-                }
-            } else {
-                and
-            };
-            let dst = branch.dst;
-            let id = dst.sig_id as usize;
-            if !self.sdf_delays.is_empty()
-                && self.sdf_delays.get(id).copied().unwrap_or(0) > 0
-                && self.time > 0
-            {
-                if self.signal_table[id].get_bit_code(dst.bit as usize) != new_bit {
-                    let mut v = self.signal_table[id].clone();
-                    v.set_bit_code(dst.bit as usize, new_bit);
-                    self.schedule_delayed(id, v);
-                }
-                continue;
-            }
-            if self.signal_table[id].set_bit_code(dst.bit as usize, new_bit) {
-                self.table_modified = true;
-                self.after_signal_write(id);
-                self.mark_dirty_id(id);
+            let new_bit = self.fused_and_branch_bit(common_code, branch, invert);
+            if self.fused_bit_commit(branch.dst, new_bit, sdf_any) {
+                self.mark_dirty_id(branch.dst.sig_id as usize);
             }
         }
     }
 
-    /// Execute a fused 1-bit gate. Reads operand bits from signal_table,
-    /// computes 4-state result, writes single bit back if changed.
+    /// Read-only half of `exec_fused_gate`: fetch the operand bits and compute
+    /// the 4-state result. Split out so the settle loop can decide what to do
+    /// with a successful write (trigger dependents inline) without duplicating
+    /// the gate algebra.
     #[inline(always)]
-    fn exec_fused_gate(&mut self, op: &FusedGate) {
+    fn fused_gate_eval(&self, op: &FusedGate) -> (BitRef, u8) {
         #[inline(always)]
         fn and4(a: u8, b: u8) -> u8 {
             if a == 0 || b == 0 {
@@ -50671,21 +51331,25 @@ impl Simulator {
         let (dst, new_bit) = match op {
             FusedGate::Buf1 { dst, src, invert } => {
                 let s = self.signal_table[src.sig_id as usize].get_bit_code(src.bit as usize);
+                // §28.4 `buf` primitive: a z input drives x. §10.3 continuous
+                // assign: the value passes through, z included. The two rules
+                // only ever DIFFER when the source bit is z, so test that
+                // first — `signal_gate_driven` is one bool per signal (35M on
+                // c906) and probing it on every buffer evaluation was a
+                // guaranteed miss for a decision that is almost always "no
+                // change". Same result for all four (invert, gate_driven,
+                // s) combinations.
                 let v = if *invert {
                     not4(s)
-                } else if self
-                    .signal_gate_driven
-                    .get(dst.sig_id as usize)
-                    .copied()
-                    .unwrap_or(false)
+                } else if s == 3
+                    && self
+                        .signal_gate_driven
+                        .get(dst.sig_id as usize)
+                        .copied()
+                        .unwrap_or(false)
                 {
-                    // §28.4 `buf` primitive: a z input drives x.
-                    match s {
-                        3 => 2,
-                        other => other,
-                    }
+                    2
                 } else {
-                    // §10.3 continuous assign: the value passes through, z included.
                     s
                 };
                 (dst, v)
@@ -50743,28 +51407,17 @@ impl Simulator {
                 (dst, ((table >> (lut_idx * 2)) & 3) as u8)
             }
         };
-        let id = dst.sig_id as usize;
-        // Late (runtime $sdf_annotate) SDF delay on a fused-gate destination:
-        // route the whole-signal updated value through schedule_delayed
-        // instead of writing the bit immediately. Build-time (CLI --sdf)
-        // annotation never fuses a delayed destination, so on that path
-        // sdf_delays is either empty (no SDF at all — one is_empty() check)
-        // or zero for every fused dst (one Vec index).
-        if !self.sdf_delays.is_empty()
-            && self.sdf_delays.get(id).copied().unwrap_or(0) > 0
-            && self.time > 0
-        {
-            if self.signal_table[id].get_bit_code(dst.bit as usize) != new_bit {
-                let mut v = self.signal_table[id].clone();
-                v.set_bit_code(dst.bit as usize, new_bit);
-                self.schedule_delayed(id, v);
-            }
-            return;
-        }
-        if self.signal_table[id].set_bit_code(dst.bit as usize, new_bit) {
-            self.table_modified = true;
-            self.after_signal_write(id);
-            self.mark_dirty_id(id);
+        (*dst, new_bit)
+    }
+
+    /// Execute a fused 1-bit gate. Reads operand bits from signal_table,
+    /// computes 4-state result, writes single bit back if changed.
+    #[inline(always)]
+    fn exec_fused_gate(&mut self, op: &FusedGate) {
+        let (dst, new_bit) = self.fused_gate_eval(op);
+        let sdf_any = !self.sdf_delays.is_empty();
+        if self.fused_bit_commit(dst, new_bit, sdf_any) {
+            self.mark_dirty_id(dst.sig_id as usize);
         }
     }
 
@@ -51212,8 +51865,16 @@ impl Simulator {
         if id >= self.signal_table.len() {
             return;
         }
-        let (new_v, new_x) = self.signal_table[id].raw_bits();
+        // `raw_bits()` is NOT free: its `Wide` arm (any signal over 64 bits)
+        // re-packs up to 64 `LogicBit` bytes one at a time. Its ONLY consumer
+        // here is the compact `signal_inline_bits` mirror, which is allocated
+        // solely under XEZIM_INLINE_BITS=1 and is EMPTY otherwise — so
+        // computing it before the length test ran that repack loop on every
+        // wide signal write and then threw the answer away. (LLVM cannot sink
+        // it itself: the mirror's length is a runtime value.) Moving the call
+        // inside the guard makes the disabled case a single load+compare.
         if id < self.signal_inline_bits.len() {
+            let (new_v, new_x) = self.signal_table[id].raw_bits();
             self.signal_inline_bits[id] = [new_v, new_x];
         }
         // O1 measurement: stamp fast-path (set_inline_bits) writes too.
@@ -51284,7 +51945,7 @@ impl Simulator {
                     | Insn::LoadSignalSigned(_, s)
                     | Insn::LoadSignalRange(_, s, _, _)
                     | Insn::LoadSignalBit(_, s, _)
-                    | Insn::BranchIfSignalFalse(s, _)
+                    | Insn::BranchIfSignalFalse(s, _, _)
                         if seen.insert(*s as u32) => {
                             reads.push(*s as u32);
                         }
@@ -51519,7 +52180,7 @@ impl Simulator {
                 | Insn::LoadSignalBit(_, id, _)
                 | Insn::NbaAssign(id, ..)
                 | Insn::NbaAssignConst(id, ..)
-                | Insn::BranchIfSignalFalse(id, _)
+                | Insn::BranchIfSignalFalse(id, _, _)
                 | Insn::NbaAssignRange(id, ..)
                 | Insn::NbaAssignRangeDyn(id, ..)
                 | Insn::NbaAssignBitDyn(id, ..)
@@ -86188,4 +86849,516 @@ enum SizeCon {
     In(Vec<(u64, u64)>),
     /// `a.size() < E`, `>= E`, … — E already evaluated.
     Rel(crate::ast::expr::BinaryOp, u64),
+}
+
+// ===========================================================================
+// Inline (<=64-bit) fast paths for the bytecode VM's hot ALU arms.
+//
+// `exec_insns` used to write EVERY result as
+//     self.vm_regs[d] = self.vm_regs[l].op(&self.vm_regs[r]);
+// which is a call that CONSTRUCTS a fresh 32-byte `Value`, a 32-byte move
+// into the destination register, and a `Drop` of the destination's previous
+// contents (a branch on the storage discriminant plus `free` when it was
+// `Wide`). For the overwhelmingly common case — both operands in `Inline`
+// storage — the whole result is two `u64`s plus a width and a sign flag, so
+// the destination can simply be overwritten in place.
+//
+// Each `vm_*` helper below mirrors the corresponding `Value` method EXACTLY
+// for the operand shapes it accepts, and returns `None` for every other shape
+// so the caller falls back to that same method. That keeps the 4-state
+// (0/1/X/Z) rules in one place: anything not reproduced bit-for-bit here is
+// simply not handled here. `vm_fastpath_tests` below checks the equivalence
+// exhaustively over all 4-state patterns of widths 1..=5.
+// ===========================================================================
+
+/// `Value::mask` — bit mask for the valid bits of an inline value.
+#[inline(always)]
+fn vm_mask(width: u32) -> u64 {
+    if width >= 64 { u64::MAX } else { (1u64 << width) - 1 }
+}
+
+/// `(val_bits, xz_bits, width, is_signed)` for a value eligible for an inline
+/// fast path: `Inline` storage, not a real, not a §5.7.1 fill, width <= 64.
+/// Rejecting a shape is always safe — the caller then runs the original
+/// `Value` method, which is where every rejected shape was handled before.
+#[inline(always)]
+fn vm_hdr(v: &Value) -> Option<(u64, u64, u32, bool)> {
+    if v.is_real || v.is_fill || v.width > 64 {
+        return None;
+    }
+    match v.inline_bits() {
+        Some((val, xz)) => Some((val, xz, v.width, v.is_signed)),
+        None => None,
+    }
+}
+
+/// Overwrite `dst` in place with an inline result — the whole point of this
+/// module. Only a destination that currently holds `Wide` storage needs the
+/// old construct/move/drop, and that path also frees the heap buffer.
+#[inline(always)]
+fn vm_store(dst: &mut Value, val: u64, xz: u64, width: u32, signed: bool) {
+    if dst.set_inline_bits(val, xz) {
+        dst.width = width;
+        dst.is_signed = signed;
+        dst.is_real = false;
+        dst.is_fill = false;
+    } else {
+        let mut v = Value::from_inline(val, xz, width);
+        v.is_signed = signed;
+        *dst = v;
+    }
+}
+
+/// `Value::to_u64().unwrap_or(0)` on inline bits.
+#[inline(always)]
+fn vm_to_u64(val: u64, xz: u64) -> u64 {
+    val & !xz
+}
+
+/// `Value::to_i64().unwrap_or(0) as u64` on inline bits.
+#[inline(always)]
+fn vm_to_i64(val: u64, xz: u64, width: u32, signed: bool) -> u64 {
+    let raw = val & !xz;
+    if signed && width > 0 && width < 64 && (raw >> (width - 1)) & 1 == 1 {
+        raw | !vm_mask(width)
+    } else {
+        raw
+    }
+}
+
+/// `Value::operand_bits_u64`.
+#[inline(always)]
+fn vm_operand_bits(val: u64, xz: u64, w_self: u32, signed_self: bool, signed_expr: bool, w: u32) -> u64 {
+    if signed_expr && w_self < w && w_self < 64 {
+        vm_to_i64(val, xz, w_self, signed_self)
+    } else {
+        vm_to_u64(val, xz)
+    }
+}
+
+/// `Value::resize`'s inline head, as raw bits. `None` for the shapes that
+/// head sends to `resize_slow`.
+#[inline(always)]
+fn vm_resize_bits(val: u64, xz: u64, width: u32, signed: bool, target: u32) -> Option<(u64, u64)> {
+    if target == 0 || target > 64 {
+        return None;
+    }
+    if target == width {
+        return Some((val, xz));
+    }
+    let mask = vm_mask(target);
+    if target < width {
+        return Some((val & mask, xz & mask));
+    }
+    // Widen: sign-extend only for a signed source whose MSB is a KNOWN 1
+    // (an X/Z MSB does not replicate here — that is `resize_for_assign`'s job).
+    let mut v = val;
+    if signed
+        && width > 0
+        && width <= 64
+        && (xz >> (width - 1)) & 1 == 0
+        && (val >> (width - 1)) & 1 == 1
+    {
+        v |= mask & !vm_mask(width);
+    }
+    Some((v, xz))
+}
+
+/// `Value::add` (`sub == false`) / `Value::sub` (`sub == true`).
+#[inline(always)]
+fn vm_add_sub(a: &Value, b: &Value, sub: bool) -> Option<(u64, u64, u32, bool)> {
+    let (av, ax, aw, asg) = vm_hdr(a)?;
+    let (bv, bx, bw, bsg) = vm_hdr(b)?;
+    let w = aw.max(bw);
+    if ax != 0 || bx != 0 {
+        // `Value::new(w)`: all-X, unsigned.
+        return Some((0, vm_mask(w), w, false));
+    }
+    let signed = asg && bsg;
+    let x = vm_operand_bits(av, ax, aw, asg, signed, w);
+    let y = vm_operand_bits(bv, bx, bw, bsg, signed, w);
+    let r = if sub { x.wrapping_sub(y) } else { x.wrapping_add(y) };
+    Some((r & vm_mask(w), 0, w, signed))
+}
+
+/// `Value::bitwise_and`.
+#[inline(always)]
+fn vm_bitand(a: &Value, b: &Value) -> Option<(u64, u64, u32, bool)> {
+    let (av, ax, aw, _) = vm_hdr(a)?;
+    let (bv, bx, bw, _) = vm_hdr(b)?;
+    let w = aw.max(bw);
+    if ax == 0 && bx == 0 {
+        Some((av & bv, 0, w, false))
+    } else {
+        let any_xz = ax | bx;
+        let result_val = av & bv & !any_xz;
+        let result_xz = any_xz & !((!av & !ax) | (!bv & !bx)); // known 0 kills X
+        Some((result_val, result_xz & vm_mask(w), w, false))
+    }
+}
+
+/// `Value::bitwise_or`.
+#[inline(always)]
+fn vm_bitor(a: &Value, b: &Value) -> Option<(u64, u64, u32, bool)> {
+    let (av, ax, aw, _) = vm_hdr(a)?;
+    let (bv, bx, bw, _) = vm_hdr(b)?;
+    let w = aw.max(bw);
+    if ax == 0 && bx == 0 {
+        Some((av | bv, 0, w, false))
+    } else {
+        let any_xz = ax | bx;
+        let result_val = (av | bv) & !any_xz;
+        let known_one = (av & !ax) | (bv & !bx);
+        let result_xz = any_xz & !known_one; // known 1 kills X
+        Some((result_val | known_one, result_xz & vm_mask(w), w, false))
+    }
+}
+
+/// `Value::bitwise_xor`.
+#[inline(always)]
+fn vm_bitxor(a: &Value, b: &Value) -> Option<(u64, u64, u32, bool)> {
+    let (av, ax, aw, _) = vm_hdr(a)?;
+    let (bv, bx, bw, _) = vm_hdr(b)?;
+    let w = aw.max(bw);
+    let any_xz = ax | bx;
+    Some(((av ^ bv) & !any_xz, any_xz & vm_mask(w), w, false))
+}
+
+/// `Value::bitwise_not` (keeps `is_signed`, unlike the binary bitwise ops).
+#[inline(always)]
+fn vm_bitnot(a: &Value) -> Option<(u64, u64, u32, bool)> {
+    let (av, ax, aw, asg) = vm_hdr(a)?;
+    Some(((!av & !ax) & vm_mask(aw), ax, aw, asg))
+}
+
+/// `Value::bitwise_xor(..).bitwise_not()` — the `BitXnor` arm's composition.
+#[inline(always)]
+fn vm_bitxnor(a: &Value, b: &Value) -> Option<(u64, u64, u32, bool)> {
+    let (v, x, w, s) = vm_bitxor(a, b)?;
+    Some(((!v & !x) & vm_mask(w), x, w, s))
+}
+
+/// `Value::is_equal` restricted to X-free operands. The X case returns `None`
+/// so the LRM's bit-by-bit ambiguity rule stays in the original method.
+#[inline(always)]
+fn vm_is_equal(a: &Value, b: &Value) -> Option<bool> {
+    let (av, ax, aw, asg) = vm_hdr(a)?;
+    let (bv, bx, bw, bsg) = vm_hdr(b)?;
+    if ax != 0 || bx != 0 {
+        return None;
+    }
+    // §11.4.4: if either operand is signed, both are extended to max width.
+    if (asg || bsg) && aw != bw {
+        let w = aw.max(bw);
+        let (ra, rax) = vm_resize_bits(av, ax, aw, asg, w)?;
+        let (rb, rbx) = vm_resize_bits(bv, bx, bw, bsg, w)?;
+        Some(vm_to_u64(ra, rax) == vm_to_u64(rb, rbx))
+    } else {
+        Some(vm_to_u64(av, ax) == vm_to_u64(bv, bx))
+    }
+}
+
+/// `Value::case_eq`'s own inline fast path, reproduced verbatim so the result
+/// can be stored in place instead of materialised as a `Value`.
+#[inline(always)]
+fn vm_case_eq(a: &Value, b: &Value) -> Option<bool> {
+    if a.is_fill || b.is_fill {
+        return None;
+    }
+    let (mut av, mut ax) = a.inline_bits()?;
+    let (mut bv, mut bx) = b.inline_bits()?;
+    let (aw, bw) = (a.width, b.width);
+    let w = aw.max(bw);
+    let mask = vm_mask(w);
+    if a.is_signed && b.is_signed {
+        if aw > 0 && aw < w {
+            let ext = mask & !vm_mask(aw);
+            let sign = 1u64 << (aw - 1);
+            if av & sign != 0 { av |= ext; }
+            if ax & sign != 0 { ax |= ext; }
+        }
+        if bw > 0 && bw < w {
+            let ext = mask & !vm_mask(bw);
+            let sign = 1u64 << (bw - 1);
+            if bv & sign != 0 { bv |= ext; }
+            if bx & sign != 0 { bx |= ext; }
+        }
+    }
+    Some((av & mask) == (bv & mask) && (ax & mask) == (bx & mask))
+}
+
+/// `Value::less_than` (`or_equal == false`) / `Value::less_equal`.
+/// Returns the (val_bits, xz_bits) of the 1-bit result.
+#[inline(always)]
+fn vm_less(a: &Value, b: &Value, or_equal: bool) -> Option<(u64, u64)> {
+    let (av, ax, aw, asg) = vm_hdr(a)?;
+    let (bv, bx, bw, bsg) = vm_hdr(b)?;
+    if ax != 0 || bx != 0 {
+        return Some((0, 1)); // `Value::new(1)`
+    }
+    // §5.5.1: signed compare only when BOTH operands are signed.
+    let r = if asg && bsg {
+        let x = vm_to_i64(av, ax, aw, asg) as i64;
+        let y = vm_to_i64(bv, bx, bw, bsg) as i64;
+        if or_equal { x <= y } else { x < y }
+    } else {
+        let x = vm_to_u64(av, ax);
+        let y = vm_to_u64(bv, bx);
+        if or_equal { x <= y } else { x < y }
+    };
+    Some((r as u64, 0))
+}
+
+/// `Value::is_nonzero` on inline bits: 0 = false, 1 = true, 2 = unknown.
+#[inline(always)]
+fn vm_nonzero(val: u64, xz: u64) -> u8 {
+    if val & !xz != 0 { 1 } else if xz != 0 { 2 } else { 0 }
+}
+
+/// `Value::logic_and` / `Value::logic_or`, as the 1-bit result's raw bits.
+#[inline(always)]
+fn vm_logic2(a: &Value, b: &Value, is_or: bool) -> Option<(u64, u64)> {
+    let (av, ax, _, _) = vm_hdr(a)?;
+    let (bv, bx, _, _) = vm_hdr(b)?;
+    let p = vm_nonzero(av, ax);
+    let q = vm_nonzero(bv, bx);
+    Some(if is_or {
+        if p == 1 || q == 1 { (1, 0) } else if p == 0 && q == 0 { (0, 0) } else { (0, 1) }
+    } else {
+        if p == 1 && q == 1 { (1, 0) } else if p == 0 || q == 0 { (0, 0) } else { (0, 1) }
+    })
+}
+
+/// `Value::logic_not`, as the 1-bit result's raw bits.
+#[inline(always)]
+fn vm_logic_not(a: &Value) -> Option<(u64, u64)> {
+    let (av, ax, _, _) = vm_hdr(a)?;
+    Some(match vm_nonzero(av, ax) {
+        1 => (0, 0),
+        0 => (1, 0),
+        _ => (0, 1),
+    })
+}
+
+/// `Value::bit_select`'s inline head, as the 1-bit result's raw bits.
+/// Deliberately does NOT test `is_fill`/`is_real`: neither does that head,
+/// and a divergence there would change §5.7.1 fill behaviour.
+#[inline(always)]
+fn vm_bit_select(v: &Value, index: usize) -> Option<(u64, u64)> {
+    let (val, xz) = v.inline_bits()?;
+    if index < v.width as usize && index < 64 {
+        Some(((val >> index) & 1, (xz >> index) & 1))
+    } else {
+        None
+    }
+}
+
+/// `Value::concat_refs(repeat_n(src, n))` restricted to a result that fits
+/// inline. Every part is the SAME value, so the width sum `concat_refs` walks
+/// its iterator to compute is one multiply here, and the fold needs no
+/// iterator. `None` (result wider than 64 bits, or a width multiply that
+/// overflows) falls back to `concat_refs` itself.
+#[inline(always)]
+fn vm_replicate(src: &Value, n: usize) -> Option<(u64, u64, u32)> {
+    let w = src.width;
+    let total = w.checked_mul(n as u32)?;
+    if total > 64 {
+        return None;
+    }
+    let (v, x) = src.raw_bits();
+    let mask = vm_mask(w);
+    let (mut ov, mut ox, mut off) = (0u64, 0u64, 0u32);
+    // A zero-width part is SKIPPED by `concat_refs`, leaving the accumulator
+    // untouched — so `total == 0` yields a zero-width, all-clear value.
+    if w != 0 {
+        for _ in 0..n {
+            ov |= (v & mask) << off;
+            ox |= (x & mask) << off;
+            off += w;
+        }
+    }
+    Some((ov, ox, total))
+}
+
+/// `Value::range_select`'s inline head, as (val_bits, xz_bits, width).
+#[inline(always)]
+fn vm_range_select(v: &Value, left: usize, right: usize) -> Option<(u64, u64, u32)> {
+    if v.is_fill {
+        return None;
+    }
+    let (val, xz) = v.inline_bits()?;
+    let (lo, hi) = if left >= right { (right, left) } else { (left, right) };
+    if hi < 64 && hi < v.width as usize {
+        let width = hi - lo + 1;
+        let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+        Some((((val >> lo) & mask), ((xz >> lo) & mask), width as u32))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod vm_fastpath_tests {
+    use super::*;
+
+    /// Every 4-state pattern of `width` bits, as (val_bits, xz_bits).
+    fn patterns(width: u32) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let n = width as usize;
+        for code in 0..4usize.pow(n as u32) {
+            let (mut v, mut x) = (0u64, 0u64);
+            for i in 0..n {
+                match (code >> (2 * i)) & 3 {
+                    0 => {}                       // 0
+                    1 => v |= 1 << i,             // 1
+                    2 => x |= 1 << i,             // X
+                    _ => { v |= 1 << i; x |= 1 << i; } // Z
+                }
+            }
+            out.push((v, x));
+        }
+        out
+    }
+
+    fn mk(v: u64, x: u64, w: u32, signed: bool) -> Value {
+        let mut val = Value::from_inline(v, x, w);
+        val.is_signed = signed;
+        val
+    }
+
+    /// All (value, signedness) operands over widths 1..=5.
+    fn operands() -> Vec<Value> {
+        let mut out = Vec::new();
+        for w in 1..=5u32 {
+            for (v, x) in patterns(w) {
+                out.push(mk(v, x, w, false));
+                out.push(mk(v, x, w, true));
+            }
+        }
+        out
+    }
+
+    /// A fast-path result and the reference `Value` must agree on the bits AND
+    /// on every header field the VM later reads back.
+    fn same(fast: (u64, u64, u32, bool), reference: &Value) {
+        let (fv, fx, fw, fs) = fast;
+        let (rv, rx) = reference.raw_bits();
+        let m = vm_mask(reference.width);
+        assert_eq!(fw, reference.width, "width");
+        assert_eq!(fs, reference.is_signed, "is_signed");
+        assert!(!reference.is_real && !reference.is_fill);
+        assert_eq!(fv & m, rv & m, "val_bits");
+        assert_eq!(fx & m, rx & m, "xz_bits");
+        // The unmasked words must match too — `to_u64`/`is_nonzero`/`has_xz`
+        // all read them without masking.
+        assert_eq!(fv, rv, "val_bits (unmasked)");
+        assert_eq!(fx, rx, "xz_bits (unmasked)");
+    }
+
+    #[test]
+    fn binary_ops_match_value_methods() {
+        let ops = operands();
+        for a in &ops {
+            for b in &ops {
+                if let Some(r) = vm_add_sub(a, b, false) { same(r, &a.add(b)); }
+                if let Some(r) = vm_add_sub(a, b, true) { same(r, &a.sub(b)); }
+                if let Some(r) = vm_bitand(a, b) { same(r, &a.bitwise_and(b)); }
+                if let Some(r) = vm_bitor(a, b) { same(r, &a.bitwise_or(b)); }
+                if let Some(r) = vm_bitxor(a, b) { same(r, &a.bitwise_xor(b)); }
+                if let Some(r) = vm_bitxnor(a, b) {
+                    same(r, &a.bitwise_xor(b).bitwise_not());
+                }
+                if let Some(e) = vm_is_equal(a, b) {
+                    same((e as u64, 0, 1, false), &a.is_equal(b));
+                    same((!e as u64, 0, 1, false), &a.is_not_equal(b));
+                }
+                if let Some(e) = vm_case_eq(a, b) {
+                    same((e as u64, 0, 1, false), &a.case_eq(b));
+                }
+                if let Some((v, x)) = vm_less(a, b, false) {
+                    same((v, x, 1, false), &a.less_than(b));
+                    same((v, x, 1, false), &b.greater_than(a));
+                }
+                if let Some((v, x)) = vm_less(a, b, true) {
+                    same((v, x, 1, false), &a.less_equal(b));
+                    same((v, x, 1, false), &b.greater_equal(a));
+                }
+                if let Some((v, x)) = vm_logic2(a, b, false) {
+                    same((v, x, 1, false), &a.logic_and(b));
+                }
+                if let Some((v, x)) = vm_logic2(a, b, true) {
+                    same((v, x, 1, false), &a.logic_or(b));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unary_ops_and_resize_match_value_methods() {
+        for a in operands() {
+            if let Some(r) = vm_bitnot(&a) { same(r, &a.bitwise_not()); }
+            if let Some((v, x)) = vm_logic_not(&a) {
+                same((v, x, 1, false), &a.logic_not());
+            }
+            let (av, ax, aw, asg) = vm_hdr(&a).unwrap();
+            for target in 0..=9u32 {
+                if let Some((rv, rx)) = vm_resize_bits(av, ax, aw, asg, target) {
+                    let reference = a.resize(target);
+                    same((rv, rx, target, a.is_signed), &reference);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selects_match_value_methods() {
+        for a in operands() {
+            for i in 0..8usize {
+                if let Some((v, x)) = vm_bit_select(&a, i) {
+                    same((v, x, 1, false), &a.bit_select(i));
+                    // The `BranchIfSignalFalse` bit path replaces
+                    // `bit_select(..).is_true()` with this test.
+                    assert_eq!(v & !x != 0, a.bit_select(i).is_true());
+                }
+                for j in 0..8usize {
+                    if let Some((v, x, w)) = vm_range_select(&a, i, j) {
+                        same((v, x, w, false), &a.range_select(i, j));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replicate_matches_concat_refs() {
+        for a in operands() {
+            for n in 2..=9usize {
+                if let Some((v, x, w)) = vm_replicate(&a, n) {
+                    let reference = Value::concat_refs(std::iter::repeat_n(&a, n));
+                    same((v, x, w, false), &reference);
+                }
+            }
+        }
+    }
+
+    /// `vm_store` must leave the register in exactly the state a full
+    /// assignment would have, for both an `Inline` and a `Wide` destination.
+    #[test]
+    fn store_overwrites_in_place() {
+        for &(v, x, w, s) in &[(0u64, 0u64, 1u32, false), (0xff, 0x0f, 8, true)] {
+            let mut dst = Value::from_inline(0xdead, 0xbeef, 3);
+            dst.is_signed = true;
+            vm_store(&mut dst, v, x, w, s);
+            assert_eq!(dst.raw_bits(), (v, x));
+            assert_eq!(dst.width, w);
+            assert_eq!(dst.is_signed, s);
+            assert!(!dst.is_real && !dst.is_fill);
+
+            let mut wide = Value::zero(96); // Wide storage
+            vm_store(&mut wide, v, x, w, s);
+            assert_eq!(wide.raw_bits(), (v, x));
+            assert_eq!(wide.width, w);
+            assert_eq!(wide.is_signed, s);
+        }
+    }
 }

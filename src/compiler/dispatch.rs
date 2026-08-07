@@ -142,7 +142,7 @@ impl Opcode {
             Insn::LoadSignalBit(_, _, _) => Self::LoadSignalBit,
             Insn::NbaAssignConst(_, _, _) => Self::NbaAssignConst,
             Insn::BranchUnlessZero(_, _) => Self::BranchUnlessZero,
-            Insn::BranchIfSignalFalse(_, _) => Self::BranchIfSignalFalse,
+            Insn::BranchIfSignalFalse(_, _, _) => Self::BranchIfSignalFalse,
         }
     }
 
