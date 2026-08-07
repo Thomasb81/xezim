@@ -3289,6 +3289,14 @@ pub struct Simulator {
     /// name-resolution hint so AST-evaluated bare names in a multiply-
     /// instantiated module resolve to THIS instance's signals.
     process_scope_hint: HashMap<usize, String>,
+    /// §21.2.1.7 `%m`: label of a named `initial begin : lbl` / `always
+    /// begin : lbl`, per pid. The scheduler FLATTENS a process's outermost
+    /// `begin`/`end` into its statement stream (see `run_process_stmts`), so
+    /// the `SeqBlock` arm that would push the label onto `m_scope_stack`
+    /// never runs for it and `%m` dropped the block name — `top.u_a` where
+    /// it should read `top.u_a.lbl`. Nested (non-flattened) blocks still go
+    /// through `m_scope_stack` as usual.
+    process_m_label: HashMap<usize, String>,
     /// Where each process came from: the creating construct's source span
     /// and its kind ("initial block", "always block", "fork child", …).
     /// One insert per process CREATION (never on the activation hot path);
@@ -3307,6 +3315,23 @@ pub struct Simulator {
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,
+    /// Instance scope of the comb/edge BLOCK currently being evaluated, for
+    /// `%m` only — deliberately separate from `current_scope`, which also
+    /// steers name resolution (`resolve_hier_name`) and must not start
+    /// tracking the settle loop.
+    ///
+    /// §21.2.1.7: `%m` is the hierarchical name of the scope holding the
+    /// format string. `current_scope` is installed by `run_process`, which
+    /// only ever runs `initial`/`fork`/delay-`always` processes — a
+    /// sensitivity-driven block (`always_comb`, `always @(edge)`) is a
+    /// `CombEntry` or a compiled edge block and never passes through there.
+    /// So `%m` in the body of any inlined `always_comb` reported the bare TOP
+    /// module name, identically for every instance, which makes per-instance
+    /// log correlation in a multiply-instantiated design impossible.
+    ///
+    /// Updated in place (`clear` + `push_str`) rather than assigned, so the
+    /// settle hot loop reuses one allocation and pays only a short memcmp.
+    m_block_scope: String,
     /// Stack of the names of the functions/tasks currently executing (innermost
     /// last), so `%m` inside a package subroutine resolves to `<pkg>.<name>`
     /// (matching real simulators) rather than the top-module name. Pushed in
@@ -6319,10 +6344,12 @@ impl Simulator {
             process_parents: HashMap::default(),
             process_contexts: HashMap::default(),
             process_scope_hint: HashMap::default(),
+            process_m_label: HashMap::default(),
             process_origin: HashMap::default(),
             timescale_scope_override: None,
             pending_ret_collection: None,
             current_scope: String::new(),
+            m_block_scope: String::new(),
             func_call_stack: Vec::new(),
             pkg_scope_stack: Vec::new(),
             pending_pkg_scope: None,
@@ -10687,6 +10714,9 @@ impl Simulator {
             }
             self.process_origin.insert(pid, (span, "initial block"));
             if let Some(l) = block_label {
+                // The outermost `begin/end` is flattened away below, so keep
+                // the label for `%m` here — see `process_m_label`.
+                self.process_m_label.insert(pid, l.clone());
                 self.disable_labels.insert(l, pid);
             }
             self.event_queue.schedule(0, pid, stmts.into());
@@ -16100,9 +16130,37 @@ impl Simulator {
         self.trace_always_fire(&label);
     }
 
+    /// Record the instance scope of the block about to run, for `%m`.
+    /// `clear`+`push_str` keeps the existing allocation; the equality guard
+    /// skips even the memcpy for the common case of consecutive blocks in one
+    /// scope. See the `m_block_scope` field doc.
+    #[inline]
+    fn set_m_block_scope(&mut self, scope: Option<&str>) {
+        match scope {
+            Some(s) => {
+                if self.m_block_scope != s {
+                    self.m_block_scope.clear();
+                    self.m_block_scope.push_str(s);
+                }
+            }
+            None => self.m_block_scope.clear(),
+        }
+    }
+
     fn exec_bytecode(&mut self, block_idx: usize) -> bool {
         if self.trace_always.is_some() {
             self.exec_bytecode_trace(block_idx);
+        }
+        // Record the firing block's instance scope for `%m`. This is the
+        // hottest path in an RTL run, so it is a short-string compare that
+        // usually falls through; only a genuine scope CHANGE touches the
+        // buffer, and then `take`/put-back reuses the existing allocation
+        // (the borrow checker needs the buffer out of `self` to copy into it).
+        if self.m_block_scope != self.edge_blocks[block_idx].scope {
+            let mut mbs = std::mem::take(&mut self.m_block_scope);
+            mbs.clear();
+            mbs.push_str(&self.edge_blocks[block_idx].scope);
+            self.m_block_scope = mbs;
         }
         // Fast path: if we JIT-compiled this block, call the native fn
         // directly. Zero-cost when the jit feature is off (jit_fns stays
@@ -18156,7 +18214,20 @@ impl Simulator {
                 let top_prefix = format!("{}.", self.module.name);
                 let resolve_one =
                     |name: &str| -> Option<usize> { self.resolve_read_name(name, &top_prefix) };
-                let scope_hint = self.infer_scope_from_rw_sets(&writes, &reads);
+                // The block's own inlining scope is authoritative; infer from
+                // the read/write sets only when it has none (top module).
+                // This mirrors the edge-block path, which has preferred
+                // `block.scope` for the same reason. Inference picks the first
+                // scope that explains the r/w names, so with two instances of
+                // one module BOTH comb blocks came back as the FIRST
+                // instance's scope — `u_beta`'s block reported `u_alpha`,
+                // which mis-scoped its bare names and made `%m` name the wrong
+                // instance.
+                let scope_hint = if !ab.scope.is_empty() {
+                    Some(ab.scope.clone())
+                } else {
+                    self.infer_scope_from_rw_sets(&writes, &reads)
+                };
                 if std::env::var("XEZIM_AB_DBG").is_ok() {
                     let unresolved: Vec<&String> = reads
                         .iter()
@@ -25069,6 +25140,9 @@ impl Simulator {
         } else {
             self.current_scope.clear();
         }
+        // A process is not a comb/edge block, so the scope the settle loop
+        // last recorded must not leak into this process's `%m`.
+        self.m_block_scope.clear();
         // This retained payload is one non-suspending blocking assignment.
         // Isolate it from a caller task's locals by moving that context aside;
         // the generic path clones the entire context because arbitrary
@@ -32532,6 +32606,7 @@ impl Simulator {
     /// canonical `settle_combinatorial_inner` per-entry arms; marks dirty via
     /// the normal write path. `entry` borrows the caller's clone, not `self`.
     fn eval_comb_entry_full(&mut self, entry: &CombEntry) {
+        self.set_m_block_scope(entry.cold.scope_hint.as_deref());
         match &entry.item {
             CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
                 self.eval_ast_comb_entry(entry);
@@ -33065,6 +33140,7 @@ impl Simulator {
                     }
                     CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
                         // Factored AST eval (shared with the BSP settle driver).
+                        self.set_m_block_scope(entries[eidx].cold.scope_hint.as_deref());
                         self.eval_ast_comb_entry(&entries[eidx]);
                         if self.proc_depth > 0
                             && matches!(entries[eidx].item, CombItem::AlwaysBlock { .. })
@@ -33089,6 +33165,8 @@ impl Simulator {
                         // module timescale (mirrors the edge-block dispatch).
                         let saved_ts = self.timescale_scope_override.take();
                         self.timescale_scope_override = entries[eidx].cold.scope_hint.clone();
+                        // …and `%m` in that fallback names the BLOCK's instance.
+                        self.set_m_block_scope(entries[eidx].cold.scope_hint.as_deref());
                         // A StmtFallback insn re-enters the AST interpreter,
                         // which resolves bare names through the hint — without
                         // it a `foreach (m[i]) m[i] = v;` in a SUBMODULE
@@ -49507,12 +49585,36 @@ impl Simulator {
                             // module with the running process's instance scope
                             // so a multiply-instantiated module reports
                             // `TB.p1` rather than just `TB`.
-                            if !self.current_scope.is_empty() {
+                            // A sensitivity-driven block (`always_comb`,
+                            // `always @(edge)`) is evaluated by the settle /
+                            // edge loop rather than `run_process`, so it
+                            // leaves `current_scope` empty and reports its
+                            // instance in `m_block_scope` instead.
+                            let inst_scope = if !self.current_scope.is_empty() {
+                                Some(self.current_scope.as_str())
+                            } else if !self.m_block_scope.is_empty() {
+                                Some(self.m_block_scope.as_str())
+                            } else {
+                                None
+                            };
+                            if let Some(inst_scope) = inst_scope {
                                 // §21.2.1.7: instance path, then the lexical
                                 // scope chain (task / function / named block)
                                 // the `%m` sits in — e.g. `top.u_leaf.t_auto`.
                                 let mut out =
-                                    format!("{}.{}", self.module.name, self.current_scope);
+                                    format!("{}.{}", self.module.name, inst_scope);
+                                // The process's own flattened block label sits
+                                // between the instance and any nested scopes.
+                                // Skipped inside a subroutine, which replaces
+                                // `m_scope_stack` with its own frame and is
+                                // named from its DECLARING scope, not the
+                                // caller's block.
+                                if self.func_call_stack.is_empty() {
+                                    if let Some(l) = self.process_m_label.get(&self.current_pid) {
+                                        out.push('.');
+                                        out.push_str(l);
+                                    }
+                                }
                                 for sc in &self.m_scope_stack {
                                     out.push('.');
                                     out.push_str(sc);
