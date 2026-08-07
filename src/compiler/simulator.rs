@@ -4229,6 +4229,8 @@ pub struct Simulator {
     prof_entry_hist: [u64; 12],
     /// Per-entry eval counts (XEZIM_PROFILE_TIMING) for shape attribution.
     prof_entry_counts: Vec<u64>,
+    /// XEZIM_CONE: entry is a member of a mergeable chain (static analysis).
+    cone_chain_member: Vec<bool>,
     prof_settle_ca_count: u64,
     prof_settle_ab_count: u64,
     /// Persistent buffers for settle_combinatorial (avoid repeated allocation)
@@ -6502,6 +6504,7 @@ impl Simulator {
             prof_settle_dc_count: 0,
             prof_entry_hist: [0; 12],
             prof_entry_counts: Vec::new(),
+            cone_chain_member: Vec::new(),
             prof_settle_ca_count: 0,
             prof_settle_ab_count: 0,
             t_prevclone: std::time::Duration::ZERO,
@@ -14229,6 +14232,12 @@ impl Simulator {
                 if let Some(f) =
                     jm.try_compile_with_xz(&cb.instructions, cb.num_regs, xz_ptr, xz_len)
                 {
+                    if std::env::var("XEZIM_JIT_DUMP_BLOCKS").is_ok() {
+                        eprintln!("[JITCOMB] eidx={} insns:", idx);
+                        for i in cb.instructions.iter() {
+                            eprintln!("[JITCOMB]   {:?}", i);
+                        }
+                    }
                     self.comb_jit_fns[idx] = Some(f);
                     n += 1;
                 }
@@ -14513,6 +14522,7 @@ impl Simulator {
                         // codegen can pick between the slow / fast
                         // bridges at compile time.
                         jm.set_signal_widths(self.signal_widths.clone());
+                        jm.set_signal_signed(self.signal_signed.clone());
                         // JIT Stage 4 Tier C Path C1: hand the JIT
                         // module the side-queue base pointer + length
                         // pointer so NbaAssign codegen can emit a
@@ -18432,6 +18442,117 @@ impl Simulator {
             })
             .cloned()
             .collect();
+        // Cone-merge OPPORTUNITY analysis (diagnostic only; XEZIM_CONE=1).
+        //
+        // A compiled-code simulator evaluates whole fanin cones as one
+        // function; xezim dispatches each tiny entry separately, paying the
+        // per-eval constant every hop. The candidate for merging is a CHAIN:
+        // entry A writes signal s, and B is the ONLY reader of s, and s has no
+        // other writer — then A+B can become one entry with A's inputs and
+        // B's outputs. This pass counts how much of the graph is chain-shaped
+        // so the merge transform is built (or rejected) on numbers.
+        if std::env::var("XEZIM_CONE").is_ok() {
+            use std::collections::HashMap;
+            let n = entries.len();
+            // signal -> reader entries / writer entries
+            let mut readers: HashMap<usize, Vec<usize>> = HashMap::new();
+            let mut writers: HashMap<usize, Vec<usize>> = HashMap::new();
+            for (eidx, e) in entries.iter().enumerate() {
+                for &r in e.cold.read_signal_ids.iter() {
+                    readers.entry(r).or_default().push(eidx);
+                }
+                for &w in e.cold.write_signal_ids.iter() {
+                    writers.entry(w).or_default().push(eidx);
+                }
+            }
+            // A -> B edge when A writes s, B is s's sole reader, A its sole
+            // writer, and B reads nothing else written by a third entry that
+            // would break ordering (kept simple: just the sole-reader /
+            // sole-writer test — an upper bound on mergeable pairs).
+            let mut chain_next: Vec<Option<usize>> = vec![None; n];
+            let mut chain_prev_cnt: Vec<u32> = vec![0; n];
+            for (eidx, e) in entries.iter().enumerate() {
+                let mut nexts: Vec<usize> = Vec::new();
+                for &w in e.cold.write_signal_ids.iter() {
+                    if writers.get(&w).map(|v| v.len()) != Some(1) {
+                        nexts.clear();
+                        break;
+                    }
+                    if let Some(rd) = readers.get(&w) {
+                        for &b in rd.iter() {
+                            if b != eidx {
+                                nexts.push(b);
+                            }
+                        }
+                    }
+                }
+                nexts.sort_unstable();
+                nexts.dedup();
+                if nexts.len() == 1 && nexts[0] != eidx {
+                    chain_next[eidx] = Some(nexts[0]);
+                    chain_prev_cnt[nexts[0]] += 1;
+                }
+            }
+            // Walk maximal chains: start where prev_cnt == 0.
+            let mut in_chain = 0usize;
+            let mut chains = 0usize;
+            let mut longest = 0usize;
+            let mut len_hist: HashMap<usize, usize> = HashMap::new();
+            for start in 0..n {
+                if chain_prev_cnt[start] != 0 || chain_next[start].is_none() {
+                    continue;
+                }
+                let mut len = 1usize;
+                let mut cur = start;
+                let mut guard = 0usize;
+                while let Some(nx) = chain_next[cur] {
+                    // A node with multiple predecessors ends the chain.
+                    if chain_prev_cnt[nx] != 1 {
+                        break;
+                    }
+                    len += 1;
+                    cur = nx;
+                    guard += 1;
+                    if guard > n {
+                        break;
+                    }
+                }
+                if len >= 2 {
+                    chains += 1;
+                    in_chain += len;
+                    longest = longest.max(len);
+                    *len_hist.entry(len.min(10)).or_insert(0) += 1;
+                }
+            }
+            let mut hist: Vec<(usize, usize)> = len_hist.into_iter().collect();
+            hist.sort();
+            eprintln!(
+                "[CONE] entries={} chain-members={} ({:.1}%) chains={} longest={} len-hist(capped@10)={:?}",
+                n,
+                in_chain,
+                in_chain as f64 * 100.0 / n.max(1) as f64,
+                chains,
+                longest,
+                hist
+            );
+            eprintln!(
+                "[CONE] merging chains would remove {} dispatches ({:.1}% of entries) — upper bound, ordering unchecked",
+                in_chain.saturating_sub(chains),
+                (in_chain.saturating_sub(chains)) as f64 * 100.0 / n.max(1) as f64
+            );
+            // Eval-weighted share (needs XEZIM_PROFILE_TIMING=1 and is printed
+            // at end-of-run instead when counts exist): static entry share
+            // overstates the win if the HOT entries are not chain-shaped.
+            self.cone_chain_member = {
+                let mut v = vec![false; n];
+                for (i, nx) in chain_next.iter().enumerate() {
+                    if nx.is_some() || chain_prev_cnt[i] > 0 {
+                        v[i] = true;
+                    }
+                }
+                v
+            };
+        }
         if std::env::var("XEZIM_LAYOUT").is_ok() {
             eprintln!(
                 "[LAYOUT] CombEntry={}B CombItem={}B Value={}B entries={}",
@@ -23301,6 +23422,22 @@ impl Simulator {
                 "[PROF] comb_jit native={} xz_bail={}",
                 self.prof_comb_jit[0], self.prof_comb_jit[1]
             );
+            if !self.cone_chain_member.is_empty() {
+                let mut chain_evals = 0u64;
+                let mut all_evals = 0u64;
+                for (i, &c) in self.prof_entry_counts.iter().enumerate() {
+                    all_evals += c;
+                    if self.cone_chain_member.get(i).copied().unwrap_or(false) {
+                        chain_evals += c;
+                    }
+                }
+                eprintln!(
+                    "[CONE] eval-weighted: chain-member evals {}/{} ({:.1}%)",
+                    chain_evals,
+                    all_evals,
+                    chain_evals as f64 * 100.0 / all_evals.max(1) as f64
+                );
+            }
             eprintln!("[PROF] opcode_exec total={} (static-estimate, straight-line)", total_insns);
                     let line: Vec<String> = ov.iter().take(14)
                         .map(|(k, c)| format!("{}={:.1}%", k, *c as f64 * 100.0 / total_insns.max(1) as f64))
@@ -51394,6 +51531,25 @@ impl Simulator {
             };
             if let Some(id) = sig_id {
                 if id < self.signal_widths.len() && self.signal_widths[id] > 64 {
+                    return false;
+                }
+                // §5 real-valued signals: the register file moves raw bit
+                // patterns, so f64 payloads would go through integer ops.
+                if self
+                    .signal_table
+                    .get(id)
+                    .map(|v| v.is_real)
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+            }
+            // §5.7.1 unbased-unsized fills ('1/'0/'x) replicate to the width
+            // of their CONSUMING context, and §5 real literals carry f64
+            // payloads — both are `Value` behaviors the register file cannot
+            // express. Blocks carrying either fall back to the interpreter.
+            if let Insn::LoadConst(_, v) = insn {
+                if v.is_fill || v.is_real {
                     return false;
                 }
             }
