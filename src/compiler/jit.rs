@@ -1853,6 +1853,18 @@ mod enabled {
             }
             LoadSignalBit(d, _, _) => set(reg_w, d, 1),
             LoadSignalRange(d, _, hi, lo) => set(reg_w, d, hi.abs_diff(*lo) + 1),
+            // Same shape as `LoadSignalRange` (the unfused form of it). Needed
+            // for parity with the bytecode compiler's `elide_redundant_resizes`
+            // pass: a `Resize` it removes because it proved the width leaves
+            // this table to derive that width by the same rules, and only these
+            // two and `Select` were missing.
+            RangeSelectConst(d, _, hi, lo) => set(reg_w, d, hi.abs_diff(*lo) + 1),
+            // Both `?:` outcomes and the X-condition `merge_unknown` are
+            // `max(then, else)` wide; unknown unless the two branches agree.
+            Select(d, _, t, e) => {
+                let (tw, ew) = (get(reg_w, t), get(reg_w, e));
+                set(reg_w, d, if tw == ew { tw } else { 0 })
+            }
             Move(d, s) => {
                 let w = get(reg_w, s);
                 set(reg_w, d, w)
