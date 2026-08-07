@@ -35687,6 +35687,36 @@ impl Simulator {
                             }
                         }
                     }
+                    // A struct FORMAL bound member-wise lives in the call
+                    // frame under its dotted key (`o.a`), not the signal
+                    // table — the `Ident([o,a])` shape already checks
+                    // `local_stack` (the dotted-local arm above), but the
+                    // `MemberAccess{Ident(o),a}` shape missed and the body's
+                    // `o.a = v` write was silently dropped. Gated on the
+                    // dotted key actually being in the frame, so an ordinary
+                    // top-level struct member (in `signal_name_to_id`) and a
+                    // class property (handled by `class_agg_member`) never
+                    // reach here.
+                    if flat.contains('.') && !self.local_stack.is_empty() {
+                        let last_idx = self.local_stack.len() - 1;
+                        if self.local_stack[last_idx].contains_key(flat.as_str()) {
+                            let fitted = if !val.is_real {
+                                if let Some(&target_w) = self.widths.get(flat.as_str()) {
+                                    if val.width < target_w {
+                                        val.resize_for_assign(target_w)
+                                    } else {
+                                        val.clone()
+                                    }
+                                } else {
+                                    val.clone()
+                                }
+                            } else {
+                                val.clone()
+                            };
+                            self.local_stack[last_idx].insert(flat, fitted);
+                            return true;
+                        }
+                    }
                 }
                 // A nested PACKED struct member inside an unpacked aggregate
                 // (`arr[i].tag.vlan`): slice the parent's own signal.
@@ -35883,6 +35913,35 @@ impl Simulator {
                         {
                             return true;
                         }
+                    }
+                }
+                // A procedural-local unpacked struct whose members were
+                // materialised individually — by the dotted `Ident([s,a])`
+                // lvalue arm above, or by foreach/randomize element
+                // construction — lives in the runtime `signals` map as
+                // standalone dotted keys (`s.a`, `s.b`), NOT as a single
+                // packed whole. The whole-struct splice arm below reads the
+                // (empty) whole value, splices the field into it, and writes
+                // a phantom whole `s` that no member read ever consults — so
+                // the actual `s.a` leaf stays at its pre-call value.
+                //
+                // When the dotted leaf already exists as its own key, write
+                // it directly. A struct stored whole (case 1: `output`
+                // formal whose actual was never pre-touched) has no such key
+                // and correctly falls through to the whole-struct arm.
+                if let Some(flat) = self.flat_member_name(lhs) {
+                    if flat.contains('.') && self.signals.contains_key(flat.as_str()) {
+                        let prev = self.signals.get(flat.as_str()).cloned();
+                        let fitted = match prev.as_ref() {
+                            Some(p) if p.is_real && !val.is_real => {
+                                Value::from_f64(val.to_f64())
+                            }
+                            Some(p) if !p.is_real && !val.is_real => val.resize(p.width),
+                            _ => val.clone(),
+                        };
+                        let changed = prev.as_ref() != Some(&fitted);
+                        self.signals.insert(flat, fitted);
+                        return changed;
                     }
                 }
                 // Struct variable member write: `result.field1 = ...`
@@ -36449,6 +36508,11 @@ impl Simulator {
                     if let Some(r) = self.class_agg_member(expr) {
                         return self.read_class_agg(&r);
                     }
+                    // Whole unpacked-struct class-property read (`c.first`
+                    // where `first` is a struct): assemble the member cells.
+                    if let Some(v) = self.try_read_whole_struct_class_prop(expr) {
+                        return v;
+                    }
                 }
                 // §7.3.2 tagged-union member read (`t.Valid`).
                 if hier.path.len() == 2 {
@@ -36646,14 +36710,22 @@ impl Simulator {
                         })
                         .unwrap_or(false);
                     if !is_static_prop {
-                        if let Some(Some(handle)) = self.this_stack.last() {
+                        if let Some(Some(handle)) = self.this_stack.last().copied() {
                             // §8.10: a shadowed property resolves to the copy
                             // the EXECUTING method's class declares, not the
                             // leaf's.
                             let key = self
                                 .shadowed_prop_key(name, false)
                                 .unwrap_or_else(|| name.clone());
-                            if let Some(Some(instance)) = self.heap.get(*handle) {
+                            // An unpacked-struct property is stored member-wise
+                            // (`<prop>.<member>` cells); any container cell is
+                            // stale, so assemble the members on a whole read.
+                            if let Some(v) =
+                                self.read_whole_struct_class_prop(handle, &key)
+                            {
+                                return v;
+                            }
+                            if let Some(Some(instance)) = self.heap.get(handle) {
                                 if let Some(val) = instance.properties.get(&key) {
                                     return val.clone();
                                 }
@@ -36832,13 +36904,27 @@ impl Simulator {
                                 if h != 0 && h < self.heap.len() {
                                     if let Some(inst) = self.heap.get(h).and_then(|x| x.as_ref()) {
                                         let mut cur_props = &inst.properties;
+                                        let mut cur_handle = h;
                                         let mut found: Option<Value> = None;
                                         let mut sub_handle: Option<usize> = None;
                                         let tail = &segs[split..];
                                         for (i, seg) in tail.iter().enumerate() {
                                             if let Some(val) = cur_props.get(*seg) {
                                                 if i + 1 == tail.len() {
-                                                    found = Some(val.clone());
+                                                    // The leaf may be a whole
+                                                    // unpacked-struct property
+                                                    // stored member-wise: any
+                                                    // container cell is stale,
+                                                    // so assemble the member
+                                                    // cells from the CURRENT
+                                                    // object handle (§10.6/§18.4).
+                                                    if let Some(v) = self
+                                                        .read_whole_struct_class_prop(cur_handle, seg)
+                                                    {
+                                                        found = Some(v);
+                                                    } else {
+                                                        found = Some(val.clone());
+                                                    }
                                                 } else {
                                                     sub_handle =
                                                         Some(val.to_u64().unwrap_or(0) as usize);
@@ -36854,6 +36940,7 @@ impl Simulator {
                                                     self.heap.get(sh).and_then(|x| x.as_ref())
                                                 {
                                                     cur_props = &next_inst.properties;
+                                                    cur_handle = sh;
                                                 } else {
                                                     break;
                                                 }
@@ -40516,6 +40603,13 @@ impl Simulator {
                 if let Some(r) = self.class_agg_member_parts(expr, &member.name) {
                     return self.read_class_agg(&r);
                 }
+                // Whole unpacked-struct class-property read in MemberAccess
+                // shape (`rhs.first` inside a method): assemble the member
+                // cells. class_agg_member_parts returns None for the whole
+                // property (only field accesses match), so this catches it.
+                if let Some(v) = self.try_read_whole_struct_class_prop(expr) {
+                    return v;
+                }
                 // §7.3.2 tagged-union member read (`t.Valid`).
                 if let ExprKind::Ident(h) = &expr.kind {
                     if h.path.len() == 1 && self.active_union_tag.contains_key(&h.path[0].name.name)
@@ -41846,6 +41940,17 @@ impl Simulator {
                             return;
                         }
                     }
+                }
+                // IEEE 1800-2023 §10.6: whole-struct assignment whose TARGET
+                // is an unpacked-struct CLASS property (`c.first = rhs`,
+                // `first = rhs.first` inside `copy`). Decompose member-wise so
+                // each side is read/written by its (working) field path — the
+                // RHS is never materialized as a single (broken) struct Value.
+                if self.try_decompose_struct_class_prop_assign(lvalue, rvalue).is_some() {
+                    if !self.in_edge_block {
+                        self.settle_combinatorial();
+                    }
+                    return;
                 }
                 // IEEE 1800-2017 §7.2: assigning one unpacked struct to another
                 // copies every member. Their leaves live in separate signals, so
@@ -61388,6 +61493,113 @@ impl Simulator {
     }
 
     /// §18.4: resolve `e` — `<agg_prop>.<member>` on a class object, in either
+    /// Append a member segment to an expression: `obj.prop` -> `obj.prop.m`
+    /// (pushes a path segment for an `Ident`, wraps in `MemberAccess`
+    /// otherwise). Used to decompose a whole-struct assignment into per-field
+    /// assignments that reuse the (working) field read/write machinery.
+    fn append_member_expr(expr: &Expression, member: &str) -> Expression {
+        let span = expr.span;
+        match &expr.kind {
+            ExprKind::Ident(h) => {
+                let mut h2 = h.clone();
+                h2.path.push(crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: member.to_string(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                });
+                h2.cached_signal_id = std::cell::Cell::new(None);
+                h2.cached_resolved_name = std::cell::OnceCell::new();
+                Expression::new(ExprKind::Ident(h2), span)
+            }
+            _ => Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(expr.clone()),
+                    member: crate::ast::Identifier {
+                        name: member.to_string(),
+                        span,
+                    },
+                },
+                span,
+            ),
+        }
+    }
+
+    /// Whole-value read of an UNPACKED-STRUCT class property: assemble the
+    /// member cells (`<prop>.<member>`) into one packed integral blob, first
+    /// member at the MSB (matching SV packed layout). Field reads/writes
+    /// already work member-wise; this bridges the whole-value view needed for
+    /// `==`, `%p`/`convert2string`, and passing the struct by value. Returns
+    /// `None` unless `prop` is an unpacked struct on the instance's class
+    /// chain. (IEEE 1800-2023 §7.3.1, §18.4, §10.6)
+    fn read_whole_struct_class_prop(&self, handle: usize, prop: &str) -> Option<Value> {
+        let su = self.class_prop_struct(handle, prop)?;
+        if !Self::spreads_member_wise(&su) {
+            return None;
+        }
+        let fields = Self::struct_field_layout(&DataType::Struct(su))?;
+        let total_w: u32 = fields.iter().map(|(_, _, w, _)| *w).sum();
+        if total_w == 0 {
+            return None;
+        }
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let mut res = Value::zero(total_w);
+        for (fname, off, w, _fr) in &fields {
+            let key = format!("{}.{}", prop, fname);
+            if let Some(fv) = inst.properties.get(&key) {
+                let fw = (*w).max(1);
+                for b in 0..fw {
+                    res.set_bit((off + b) as usize, fv.get_bit(b as usize));
+                }
+            }
+        }
+        Some(res)
+    }
+
+    /// Resolve `expr` (an `obj.prop` or implicit-`this` `prop`) to its instance
+    /// handle + property name, then assemble the whole unpacked-struct value.
+    /// `None` for anything that is not a whole unpacked-struct class property.
+    fn try_read_whole_struct_class_prop(&mut self, expr: &Expression) -> Option<Value> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let (handle, prop_name) = self.class_prop_receiver(expr)?;
+        self.read_whole_struct_class_prop(handle, &prop_name)
+    }
+
+    /// Decompose a whole-struct assignment whose TARGET is an unpacked-struct
+    /// class property (`c.first = rhs`, `first = rhs.first` inside `copy`)
+    /// into per-member field assignments `target.m = eval(rhs.m)`. This reuses
+    /// the already-correct field read/write paths for BOTH signals and class
+    /// properties, so the RHS is read member-by-member (`s0.a`, not the
+    /// whole `s0`) and never needs a (broken) whole-struct Value. Returns
+    /// `Some(())` if it handled the assignment. (IEEE 1800-2023 §10.6)
+    fn try_decompose_struct_class_prop_assign(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> Option<()> {
+        let (handle, prop) = self.class_prop_receiver(lvalue)?;
+        let su = self.class_prop_struct(handle, &prop)?;
+        if !Self::spreads_member_wise(&su) {
+            return None;
+        }
+        // Member-wise assign. Nested struct/array members recurse naturally:
+        // `lhs.m = eval(rhs.m)` re-enters this path (for a nested struct
+        // class-property target) or the existing signal paths.
+        for m in &su.members {
+            for md in &m.declarators {
+                let mname = md.name.name.as_str();
+                let lhs_f = Self::append_member_expr(lvalue, mname);
+                let rhs_f = Self::append_member_expr(rvalue, mname);
+                let v = self.eval_expr(&rhs_f);
+                self.assign_value(&lhs_f, &v);
+            }
+        }
+        Some(())
+    }
+
     /// parse shape — to the storage it aliases. `None` when `e` is not an
     /// aggregate class-property member.
     fn class_agg_member(&mut self, e: &Expression) -> Option<ClassAggRef> {
@@ -63518,12 +63730,58 @@ impl Simulator {
     /// LRM §7.12.2: in-place sort/rsort/unique on `arr` with the
     /// per-element key expression `filter` (binds `item` to each
     /// element). Mirrors `reduce_with`'s `item` plumbing.
+    /// The unpacked-struct type of `e` IF it names a class-property struct
+    /// (members stored in the heap). `None` for non-class-property operands
+    /// (those are handled by the signal-namespace struct path).
+    fn class_prop_struct_of(&mut self, e: &Expression) -> Option<crate::ast::types::StructUnionType> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let (h, p) = self.class_prop_receiver(e)?;
+        let su = self.class_prop_struct(h, &p)?;
+        Self::spreads_member_wise(&su).then_some(su)
+    }
+
     /// IEEE 1800-2017 §11.4.5 / §7.2: `==` and `!=` on unpacked structs compare
     /// them member by member. Their leaves live in separate signals, so the
     /// packed-value path compared two container signals that do not exist and
     /// always yielded X. An X in any leaf makes the result X, as for vectors.
     /// `None` when either side is not an unpacked struct with storage.
     fn compare_unpacked_structs(&mut self, lhs: &Expression, rhs: &Expression) -> Option<Value> {
+        // If EITHER operand is a class-property unpacked struct (members in
+        // the heap, not the signal namespace), compare member-wise by
+        // appending a member segment and evaluating through the field-read
+        // paths — uniform for class-prop vs class-prop and class-prop vs
+        // signal. (IEEE 1800-2023 §11.4.5, §7.2, §10.6)
+        let l_cp = self.class_prop_struct_of(lhs);
+        let r_cp = self.class_prop_struct_of(rhs);
+        if l_cp.is_some() || r_cp.is_some() {
+            let su = l_cp.or(r_cp)?;
+            let mut equal = true;
+            for m in &su.members {
+                for md in &m.declarators {
+                    let lf = Self::append_member_expr(lhs, &md.name.name);
+                    let rf = Self::append_member_expr(rhs, &md.name.name);
+                    let lv = self.eval_expr(&lf);
+                    let rv = self.eval_expr(&rf);
+                    if lv.has_unknown() || rv.has_unknown() {
+                        return Some(Value::new(1)); // X
+                    }
+                    if lv != rv {
+                        equal = false;
+                    }
+                }
+            }
+            return Some(if equal {
+                Value::ones(1)
+            } else {
+                Value::zero(1)
+            });
+        }
+        // Signal-namespace unpacked structs (members are separate signals):
+        // flatten to leaves and compare each, so a nested struct / string
+        // member is read by its own leaf signal rather than a whole-struct
+        // container that does not exist. An X in any leaf makes the result X.
         let (a, b) = (self.flat_member_name(lhs)?, self.flat_member_name(rhs)?);
         let dt = self.p_elem_type(&a)?;
         let DataType::Struct(su) = self.resolve_dt(&dt) else {
@@ -70632,14 +70890,34 @@ impl Simulator {
         dt: &DataType,
         arg: &Expression,
         locals: &mut HashMap<String, Value>,
-    ) -> bool {
+        handle: Option<usize>,
+    ) -> Option<Vec<(String, Expression)>> {
+        // Returns the per-member bindings — each `(local_key, caller_lvalue)` —
+        // so an `output`/`inout`/`ref` formal can be written back member-wise
+        // (the whole-value `output_bindings` path can't see per-member locals
+        // `o.a`, `o.b`). `None` ⇒ not a member-wise struct formal.
         let dt_resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
         let dt_resolved = match dt_resolved {
             DataType::TypeReference { name, .. } => {
                 let tn = &name.name.name;
+                // A TYPE-PARAMETER formal (`class C #(type T); new(T f)`, or a
+                // method `function int rd(T f)`) names the parameter, not a
+                // typedef. Resolve it to the concrete bound type, preferring
+                // the CALLEE instance's own `type_bindings` (authoritative for
+                // regular method calls, where no class specialization is on
+                // `current_spec`) and falling back to `current_spec` (set for
+                // a constructor call). Without this the struct actual is never
+                // bound member-wise and the body reads every member as x.
+                let concrete = self
+                    .heap
+                    .get(handle.unwrap_or(0))
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.type_bindings.get(tn).cloned())
+                    .or_else(|| self.resolve_type_param_binding(tn))
+                    .unwrap_or_else(|| tn.clone());
                 self.module
                     .typedef_types
-                    .get(tn.as_str())
+                    .get(concrete.as_str())
                     .cloned()
                     .unwrap_or_else(|| DataType::TypeReference {
                         name: name.clone(),
@@ -70651,11 +70929,12 @@ impl Simulator {
             other => other,
         };
         let DataType::Struct(su) = dt_resolved else {
-            return false;
+            return None;
         };
         if !Self::spreads_member_wise(&su) {
-            return false;
+            return None;
         }
+        let mut entries = Vec::new();
         for m in &su.members {
             for md in &m.declarators {
                 let fname = &md.name.name;
@@ -70670,10 +70949,54 @@ impl Simulator {
                     arg.span,
                 );
                 let v = self.eval_expr(&member_expr);
-                locals.insert(format!("{}.{}", port_name, fname), v);
+                let local_key = format!("{}.{}", port_name, fname);
+                locals.insert(local_key.clone(), v);
+                // Write-back lvalue: for a plain-identifier actual emit the
+                // hierarchical `Ident([s, a])` form (how source `s.a` parses)
+                // so assign_value's Ident arm handles it whether the member
+                // lives in the compact signal table or the runtime map; the
+                // `MemberAccess` form misses the runtime-map case. Other
+                // actuals (class-property `obj.prop`) wrap in `MemberAccess`,
+                // which the aggregate-property path resolves.
+                entries.push((local_key, Self::struct_member_lvalue(arg, fname)));
             }
         }
-        true
+        Some(entries)
+    }
+
+    /// Build a member-access lvalue for the write-back of a struct formal.
+    /// See `bind_unpacked_struct_arg` for why the `Ident` form is preferred.
+    fn struct_member_lvalue(base: &Expression, member: &str) -> Expression {
+        if let ExprKind::Ident(hier) = &base.kind {
+            let mut path = hier.path.clone();
+            path.push(crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: member.to_string(),
+                    span: base.span,
+                },
+                selects: Vec::new(),
+            });
+            return Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: hier.root.clone(),
+                    path,
+                    span: base.span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
+                base.span,
+            );
+        }
+        Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(base.clone()),
+                member: crate::ast::Identifier {
+                    name: member.to_string(),
+                    span: base.span,
+                },
+            },
+            base.span,
+        )
     }
 
     fn bind_assoc_param(
@@ -70988,6 +71311,11 @@ impl Simulator {
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
+        // `output`/`inout`/`ref` STRUCT formals are bound member-wise (locals
+        // `o.a`, `o.b`), so they bypass the whole-value `output_bindings`
+        // path — collect their `(local_key, caller_lvalue)` pairs to copy
+        // each member back to the caller's actual on return.
+        let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
         for (i, port) in fd.ports.iter().enumerate() {
             let is_out = matches!(
                 port.direction,
@@ -71352,9 +71680,24 @@ impl Simulator {
                     .map(|v| (v, caller.clone()))
             })
             .collect();
+        // Member-wise struct output formals: snapshot each member local
+        // (`o.a`, `o.b`) before the frame is popped, then write it back to
+        // the caller's actual member.
+        let struct_wb: Vec<(Expression, Value)> = struct_output_writebacks
+            .iter()
+            .filter_map(|(local_key, caller_lval)| {
+                self.local_stack
+                    .last()
+                    .and_then(|l| l.get(local_key).cloned())
+                    .map(|v| (caller_lval.clone(), v))
+            })
+            .collect();
         self.local_stack.pop();
         for (v, caller) in writebacks {
             self.assign_value(&caller, &v);
+        }
+        for (caller_lval, v) in struct_wb {
+            self.assign_value(&caller_lval, &v);
         }
         // `return`/`break`/`continue` are frame-local — restore the caller's
         // flags so the function body can't terminate the caller's loop/block.
@@ -80705,6 +81048,9 @@ impl Simulator {
                 let mut queue_writebacks: Vec<(String, String)> = Vec::new();
                 let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
                 let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
+                // Member-wise struct `output`/`inout`/`ref` formals bypass the
+                // whole-value `output_bindings` path (see exec_function_call).
+                let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
                 for (i, port) in ports.iter().enumerate() {
                     let is_assoc = self.port_is_assoc_array(port);
                     // An associative-array `output`/`inout`/`ref` formal
@@ -80730,7 +81076,15 @@ impl Simulator {
                             assoc_params.push((param, caller, is_out));
                             continue;
                         }
-                        if self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals) {
+                        if let Some(struct_entries) = self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals, Some(handle)) {
+                            if matches!(
+                                port.direction,
+                                PortDirection::Output
+                                    | PortDirection::Inout
+                                    | PortDirection::Ref
+                            ) {
+                                struct_output_writebacks.extend(struct_entries);
+                            }
                             continue;
                         }
                         // §6.18/§6.20.3: typedef'd / type-param-bound
@@ -81185,6 +81539,17 @@ impl Simulator {
                             .map(|v| (v, caller.clone()))
                     })
                     .collect();
+                // Member-wise struct output formals: snapshot each member
+                // local (`o.a`, `o.b`) before the frame is popped.
+                let struct_wb: Vec<(Expression, Value)> = struct_output_writebacks
+                    .iter()
+                    .filter_map(|(local_key, caller_lval)| {
+                        self.local_stack
+                            .last()
+                            .and_then(|l| l.get(local_key).cloned())
+                            .map(|v| (caller_lval.clone(), v))
+                    })
+                    .collect();
                 self.local_stack.pop();
                 self.this_stack.pop();
                 self.pop_and_restore_queue_frame();
@@ -81200,6 +81565,9 @@ impl Simulator {
                 }
                 for (v, caller) in writebacks {
                     self.assign_value(&caller, &v);
+                }
+                for (caller_lval, v) in struct_wb {
+                    self.assign_value(&caller_lval, &v);
                 }
                 // §13.5.2: copy `output`/`inout`/`ref` associative-array
                 // formals back onto the caller's AA (signal-namespace
