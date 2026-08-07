@@ -33367,6 +33367,111 @@ impl Simulator {
         true
     }
 
+    /// Resolve `arr[i]…[j].field…[k]` over a PACKED array of packed structs to
+    /// the `(backing_signal, lsb, width)` slice it denotes, where `base` is the
+    /// expression left of the trailing `[k]` and `idx` is that index.
+    ///
+    /// Returns None for anything that is not this shape — an unpacked array of
+    /// structs (whose elements ARE separate signals), a plain struct, or a base
+    /// with no registered element/field metadata — so callers fall through to
+    /// the existing paths unchanged.
+    fn packed_struct_elem_slice(
+        &mut self,
+        base: &Expression,
+        idx: &Expression,
+    ) -> Option<(String, u32, u32)> {
+        // Left of the trailing index must be `<...>.field`.
+        let ExprKind::MemberAccess { expr: obj, member } = &base.kind else {
+            return None;
+        };
+        // Collect the dotted field path inward, then the index chain.
+        let mut field_path: Vec<String> = vec![member.name.clone()];
+        let mut cur: &Expression = obj.as_ref();
+        while let ExprKind::MemberAccess { expr: b, member: m } = &cur.kind {
+            field_path.push(m.name.clone());
+            cur = b.as_ref();
+        }
+        field_path.reverse();
+        let mut indices: Vec<u64> = Vec::new();
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr: b, index } => {
+                    indices.push(self.eval_expr(index).to_u64()?);
+                    cur = b.as_ref();
+                }
+                _ => break,
+            }
+        }
+        if indices.is_empty() {
+            return None; // plain struct — the existing member path handles it
+        }
+        indices.reverse();
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        let root = self.resolve_hier_name(h);
+        // An UNPACKED array stores each element as its own signal; those are
+        // already handled elsewhere and must not be spliced.
+        if self.module.arrays.contains_key(&root) {
+            return None;
+        }
+        let fields = self.module.packed_struct_fields.get(&root).cloned()?;
+        let field_key = field_path.join(".");
+        let (_, field_off, field_w) = fields.iter().find(|(m, _, _)| m == &field_key).cloned()?;
+        // Width of ONE struct, taken from the field layout. NOT
+        // `packed_signal_elem_widths[root]`: that is the width of an element of
+        // the OUTERMOST dimension, which for `t [0:0][1:0]` is the whole [1:0]
+        // sub-array (two structs), not one.
+        let struct_w = fields.iter().map(|(_, o, w)| o + w).max()?;
+        // Flatten the index chain to a slot. `packed_full_dims` carries the
+        // declared ranges so a non-zero-based or ascending dimension maps the
+        // way §7.4.1 labels it; without dims fall back to row-major.
+        let dims = self.module.packed_full_dims.get(&root).cloned();
+        let slot = Self::flatten_packed_slot(&indices, dims.as_deref())?;
+        // The member's own packed element width, for the trailing `[k]`.
+        let member_key = format!("{}.{}", root, field_key);
+        let elem_w = self
+            .module
+            .packed_signal_elem_widths
+            .get(&member_key)
+            .copied()
+            .unwrap_or(1);
+        let k = self.eval_expr(idx).to_u64()? as u32;
+        let lsb = slot * struct_w + field_off + k * elem_w;
+        let w = elem_w.min(field_w);
+        let total = self.get_signal_value_by_name(&root)?.width;
+        if lsb + w > total {
+            return None;
+        }
+        Some((root, lsb, w))
+    }
+
+    /// Row-major flatten of an index chain over a packed array's declared
+    /// dimensions. `dims` are outermost-first `(left, right)` declared ranges;
+    /// the trailing entries that describe the ELEMENT type are ignored.
+    fn flatten_packed_slot(indices: &[u64], dims: Option<&[(i64, i64)]>) -> Option<u32> {
+        let Some(dims) = dims else {
+            // No declared dims on file: treat the chain as row-major over
+            // equal-sized dimensions, which is the historical behaviour.
+            return indices.last().map(|&i| i as u32);
+        };
+        let mut slot: u64 = 0;
+        for (n, &i) in indices.iter().enumerate() {
+            let (l, r) = *dims.get(n)?;
+            let (lo, hi) = (l.min(r), l.max(r));
+            let count = (hi - lo + 1) as u64;
+            let off = (i as i64 - lo) as u64;
+            if off >= count {
+                return None;
+            }
+            // §7.4.1: a descending range labels the LEFT bound as the most
+            // significant element; an ascending one reverses the slot order.
+            let s = if l >= r { off } else { count - 1 - off };
+            slot = slot * count + s;
+        }
+        u32::try_from(slot).ok()
+    }
+
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
         if let Some(rewritten) = self.super_rewrite(lhs) {
             return self.assign_value(&rewritten, val);
@@ -34001,6 +34106,35 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                // §7.4.2: `arr[i].field[k] = v` where `arr` is a PACKED array
+                // of packed structs. `arr[i]` is not a signal of its own — it
+                // is a slice of one backing vector — so the write must splice
+                // at `slot*struct_w + field_off + k*member_elem_w`.
+                //
+                // The MemberAccess arm below already handles `arr[i].field = v`
+                // (no trailing index), but this form's outermost node is an
+                // Index, so it never reached that code and the write was
+                // silently DROPPED — the read path resolved it correctly all
+                // along, which is what made the value look like it was never
+                // driven rather than never stored.
+                if let Some((sig, lsb, w)) = self.packed_struct_elem_slice(expr, index) {
+                    if let Some(cur_sig) = self.get_signal_value_by_name(&sig) {
+                        let mut cur = cur_sig.clone();
+                        let piece = val.resize(w);
+                        let mut changed = false;
+                        for i in 0..w {
+                            let nb = piece.get_bit(i as usize);
+                            if cur.get_bit((lsb + i) as usize) != nb {
+                                cur.set_bit((lsb + i) as usize, nb);
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            self.set_signal_value_by_name(&sig, cur);
+                        }
+                        return changed;
+                    }
+                }
 
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k] = v` writes
                 // element k of the queue `q[i]` (§7.4.5), not a bit of a scalar.
@@ -36112,16 +36246,27 @@ impl Simulator {
                                     // `foo[i]` is NOT a separate signal but a bit
                                     // slice of the single backing vector. Splice
                                     // the field at `i*elem_w + off`.
-                                    if indices.len() == 1 {
-                                        if let Some(&elem_w) =
-                                            self.module.packed_signal_elem_widths.get(&arr_name)
+                                    {
+                                        // Struct width from the field layout, and
+                                        // the slot flattened over ALL declared
+                                        // dims — the old form handled a single
+                                        // index with `packed_signal_elem_widths`,
+                                        // which is the OUTERMOST element width, so
+                                        // `t [0:0][1:0]` (two dims) both failed the
+                                        // arity check and would have used 2x the
+                                        // struct width had it passed.
+                                        let struct_w =
+                                            fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                                        let dims = self.module.packed_full_dims.get(&arr_name).cloned();
+                                        if let Some(slot) =
+                                            Self::flatten_packed_slot(&indices, dims.as_deref())
                                         {
                                             if let Some(cur_sig) =
                                                 self.get_signal_value_by_name(&arr_name)
                                             {
                                                 let total_w = cur_sig.width;
                                                 let mut cur = cur_sig.resize(total_w);
-                                                let abs_off = indices[0] as u32 * elem_w + off;
+                                                let abs_off = slot * struct_w + off;
                                                 let piece = val.resize(w);
                                                 for i in 0..w {
                                                     cur.set_bit(
@@ -49314,10 +49459,19 @@ impl Simulator {
                             // edge loop rather than `run_process`, so it
                             // leaves `current_scope` empty and reports its
                             // instance in `m_block_scope` instead.
-                            let inst_scope = if !self.current_scope.is_empty() {
-                                Some(self.current_scope.as_str())
-                            } else if !self.m_block_scope.is_empty() {
+                            // `m_block_scope` WINS when set. `current_scope` is
+                            // installed by `run_process` but not cleared when
+                            // the process ends, so it lingers as the last
+                            // process's scope — after any `fork`, every later
+                            // edge block reported the forked instance instead of
+                            // its own. `m_block_scope` is set at the entry of
+                            // each comb/edge block and cleared by `run_process`,
+                            // so a non-empty value always describes the block
+                            // actually executing.
+                            let inst_scope = if !self.m_block_scope.is_empty() {
                                 Some(self.m_block_scope.as_str())
+                            } else if !self.current_scope.is_empty() {
+                                Some(self.current_scope.as_str())
                             } else {
                                 None
                             };
