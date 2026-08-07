@@ -57974,7 +57974,14 @@ impl Simulator {
                                             (1i128 << ww.saturating_sub(1)) - 1,
                                         )
                                     } else {
-                                        (0, (1i128 << ww) - 1)
+                                        // §18.4: the unsigned domain is
+                                        // [0, 2^ww - 1]. `ww` is clamped to 127
+                                        // above, and at exactly 127 the shift
+                                        // form breaks: `1i128 << 127` IS
+                                        // i128::MIN (bit 127 is the sign bit),
+                                        // so `- 1` overflows and panics in debug
+                                        // builds. That bound is i128::MAX.
+                                        (0, if ww == 127 { i128::MAX } else { (1i128 << ww) - 1 })
                                     };
                                     cvar_names.push(name.clone());
                                     cvar_dom.push((lo, hi));
@@ -78949,7 +78956,9 @@ impl Simulator {
                         (1i128 << (w.saturating_sub(1))) - 1,
                     )
                 } else {
-                    (0, (1i128 << w) - 1)
+                    // §18.4: see the ww == 127 note above — `1i128 << 127`
+                    // is i128::MIN, so the `- 1` overflows in debug builds.
+                    (0, if w == 127 { i128::MAX } else { (1i128 << w) - 1 })
                 };
                 let (mut lo, mut hi) = (dlo, dhi);
                 let mut bounded = false;
@@ -79355,7 +79364,8 @@ impl Simulator {
                             (1i128 << ww.saturating_sub(1)) - 1,
                         )
                     } else {
-                        (0, (1i128 << ww) - 1)
+                        // §18.4: see the ww == 127 note above.
+                        (0, if ww == 127 { i128::MAX } else { (1i128 << ww) - 1 })
                     };
                     cvar_names.push(name.clone());
                     cvar_dom.push((lo, hi));
