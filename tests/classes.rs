@@ -141,3 +141,7 @@ mod uvm_objection_bridge;
 mod uvm_printer_fixes;
 #[path = "classes/virtual_iface_this_binding.rs"]
 mod virtual_iface_this_binding;
+#[path = "classes/class_unpacked_struct_property.rs"]
+mod class_unpacked_struct_property;
+#[path = "classes/struct_output_formal.rs"]
+mod struct_output_formal;

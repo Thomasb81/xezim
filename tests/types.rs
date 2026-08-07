@@ -191,3 +191,5 @@ mod value_param_specialization;
 mod vcd_param_as_wire;
 #[path = "types/wide_signed_arith_and_power.rs"]
 mod wide_signed_arith_and_power;
+#[path = "types/byte_local_narrow.rs"]
+mod byte_local_narrow;
