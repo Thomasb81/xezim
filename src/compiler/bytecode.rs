@@ -3888,6 +3888,12 @@ impl<'a> BytecodeCompiler<'a> {
     pub fn finish(mut self) -> CompiledBlock {
         debug_assert!(!self.register_overflow);
         Self::fuse_load_selects(&mut self.insns);
+        // After fusion (so the fused `LoadSignalRange`/`LoadSignalBit` count as
+        // width-defining) and before `compact_nops` (which removes the `Nop`s
+        // this pass leaves behind).
+        let signal_widths = self.signal_widths;
+        let num_regs = (self.next_reg as usize).min(u16::MAX as usize + 1);
+        Self::elide_redundant_resizes(&mut self.insns, signal_widths, num_regs);
         Self::compact_nops(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
@@ -4176,6 +4182,308 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Static width inference over the emitted stream: delete every
+    /// `Resize(r, w)` whose register is already provably `w` bits wide.
+    ///
+    /// The 27 `emit(Insn::Resize(..))` sites are unconditional — the compiler
+    /// knows the target width but never asks whether the register already has
+    /// it. On the C906 memcpy census 99.7% of the 243 M executed `Resize`es
+    /// (10.8% of all bytecode, the second most frequent opcode) found
+    /// `vr.width == w` and fell straight through: pure dispatch.
+    ///
+    /// The exec arms are `if vm_regs[r].width != w { .. }`, so an instruction
+    /// this pass removes is one that would have done LITERALLY nothing —
+    /// provided the width really does match. That makes the whole pass rest on
+    /// a single invariant, and nothing else: whenever `rw[r]` holds
+    /// `Some((w, _))`, at run time `vm_regs[r].width` is exactly `w`.
+    ///
+    /// Every rule below is justified from the `Value` method the matching exec
+    /// arm calls, on EVERY path through it (X-propagation, `Wide` storage, the
+    /// §5.7.1 fill widening and the `is_real` special cases each return their
+    /// own freshly-built `Value`, and they do not all agree). Where a method
+    /// can return a width other than the obvious one — `add` on a real operand
+    /// is 64 bits, not `max`; `range_select` past `MAX_WIDTH` is clamped — the
+    /// rule is dropped or guarded rather than approximated. **Unknown means
+    /// keep the `Resize`**: a wrongly deleted one leaves a value at the wrong
+    /// width, which in a 4-state simulator corrupts results silently.
+    ///
+    /// `plain` on a tracked width means additionally `!is_real && !is_fill`,
+    /// which is what the arithmetic and `Select` rules need (see below).
+    ///
+    /// Control flow: any index a branch or jump can land on is a merge point
+    /// where a register's width depends on which path arrived, so the table is
+    /// cleared there. That covers backward jumps too (a loop head is a target),
+    /// at the cost of giving up the first iteration's worth of knowledge inside
+    /// loops. `XEZIM_RESIZE_ELIDE=0` disables the pass (A/B escape hatch).
+    fn elide_redundant_resizes(insns: &mut [Insn], signal_widths: &[u32], num_regs: usize) {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_RESIZE_ELIDE").as_deref(), Ok("0"))
+        }) {
+            return;
+        }
+        if insns.is_empty() {
+            return;
+        }
+
+        /// A width is recorded only inside `1..=MAX_WIDTH`. Below that,
+        /// `fill_at` rounds a zero width up to one; above it, `cap_width`
+        /// clamps — in both cases the constructed `Value` would not have the
+        /// width the rule claims.
+        fn ok(width: u32) -> Option<u32> {
+            (1..=Value::MAX_WIDTH).contains(&width).then_some(width)
+        }
+        fn fact(rw: &[Option<(u32, bool)>], r: RegId) -> Option<(u32, bool)> {
+            rw.get(r as usize).copied().flatten()
+        }
+        fn store(rw: &mut [Option<(u32, bool)>], r: RegId, f: Option<(u32, bool)>) {
+            if let Some(slot) = rw.get_mut(r as usize) {
+                *slot = f;
+            }
+        }
+
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() =>
+                {
+                    is_target[*t as usize] = true;
+                }
+                _ => {}
+            }
+        }
+
+        let mut rw: Vec<Option<(u32, bool)>> = vec![None; num_regs];
+        for i in 0..insns.len() {
+            if is_target[i] {
+                rw.iter_mut().for_each(|f| *f = None);
+            }
+
+            // Handled before the match because this is the only arm that
+            // rewrites the instruction it is looking at.
+            if let &Insn::Resize(r, width) = &insns[i] {
+                let target = ok(width);
+                let prev = fact(&rw, r);
+                if target.is_some() && prev.map(|(pw, _)| pw) == target {
+                    // The exec arm's `vr.width != w` test is already false:
+                    // dead. The register keeps exactly the fact it had.
+                    insns[i] = Insn::Nop;
+                } else {
+                    // `Value::resize` clears `is_fill` on every path, and
+                    // clears `is_real` on every path but one: a real source
+                    // resized to exactly 64 is returned by `self.clone()`.
+                    let plain = width != 64 || prev.is_some_and(|(_, p)| p);
+                    store(&mut rw, r, target.map(|t| (t, plain)));
+                }
+                continue;
+            }
+
+            match &insns[i] {
+                // Handled above.
+                Insn::Resize(..) => {}
+
+                // The exec arms clone the boxed `Value` verbatim.
+                Insn::LoadConst(d, v) => {
+                    let f = ok(v.width).map(|w| (w, !v.is_real && !v.is_fill));
+                    store(&mut rw, *d, f);
+                }
+                // `signal_table[id].clone()`. `is_real` is a property of the
+                // signal's declared type, which is not in scope here, so a
+                // loaded signal is never `plain`.
+                Insn::LoadSignal(d, s) | Insn::LoadSignalSigned(d, s) => {
+                    let f = signal_widths
+                        .get(*s as usize)
+                        .copied()
+                        .and_then(ok)
+                        .map(|w| (w, false));
+                    store(&mut rw, *d, f);
+                }
+                // `Value::bit_select` is 1 bit on every path, including the
+                // §11.5.1 out-of-range read.
+                Insn::LoadSignalBit(d, _, _)
+                | Insn::BitSelect(d, _, _)
+                | Insn::BitSelectConst(d, _, _) => store(&mut rw, *d, Some((1, true))),
+                // `Value::range_select` is `|l-r|+1` on every path — except
+                // `range_select_zext`'s guard against an underflowed index,
+                // which returns a bounded all-X value instead; `ok` excludes
+                // exactly the widths that can reach it.
+                Insn::LoadSignalRange(d, _, l, r) | Insn::RangeSelectConst(d, _, l, r) => {
+                    let f = l
+                        .abs_diff(*r)
+                        .checked_add(1)
+                        .and_then(ok)
+                        .map(|w| (w, true));
+                    store(&mut rw, *d, f);
+                }
+
+                // Every comparison and logical/reduction operator returns
+                // `from_u64(_, 1)` or `new(1)` — 1 bit on every path.
+                Insn::Eq(d, ..)
+                | Insn::Neq(d, ..)
+                | Insn::CaseEq(d, ..)
+                | Insn::CasezEq(d, ..)
+                | Insn::CasexEq(d, ..)
+                | Insn::Lt(d, ..)
+                | Insn::Leq(d, ..)
+                | Insn::Gt(d, ..)
+                | Insn::Geq(d, ..)
+                | Insn::LogAnd(d, ..)
+                | Insn::LogOr(d, ..)
+                | Insn::LogNot(d, _)
+                | Insn::ReduceAnd(d, _)
+                | Insn::ReduceOr(d, _)
+                | Insn::ReduceXor(d, _) => store(&mut rw, *d, Some((1, true))),
+
+                // `vm_regs[d] = vm_regs[s].clone()` / `copy_from`, both of
+                // which copy `width` verbatim.
+                Insn::Move(d, s) => {
+                    let f = fact(&rw, *s);
+                    store(&mut rw, *d, f);
+                }
+                // `bitwise_not` keeps `self.width` for both storage variants.
+                Insn::BitNot(d, s) => {
+                    let f = fact(&rw, *s).map(|(w, _)| (w, true));
+                    store(&mut rw, *d, f);
+                }
+                // `negate` on a REAL returns a 64-bit `from_f64`, not
+                // `self.width`, so the source must be known non-real.
+                Insn::Negate(d, s) => {
+                    let f = fact(&rw, *s).filter(|(_, p)| *p);
+                    store(&mut rw, *d, f);
+                }
+                // All three shift helpers return `self.width` on every path,
+                // real and fill operands included.
+                Insn::Shl(d, l, _) | Insn::Shr(d, l, _) | Insn::AShr(d, l, _) => {
+                    let f = fact(&rw, *l).map(|(w, _)| (w, true));
+                    store(&mut rw, *d, f);
+                }
+
+                // `bitwise_*` take `max(width)` on every path: the fast arm,
+                // the `Wide` arm (entered only for two equal declared widths),
+                // `bitwise_op_slow`, and the §5.7.1 fill widening, which
+                // normalises both operands to `max(w).max(1)` before
+                // recursing. A real operand is not special-cased at all.
+                Insn::BitAnd(d, l, r)
+                | Insn::BitOr(d, l, r)
+                | Insn::BitXor(d, l, r)
+                | Insn::BitXnor(d, l, r) => {
+                    let f = match (fact(&rw, *l), fact(&rw, *r)) {
+                        (Some((a, _)), Some((b, _))) => ok(a.max(b)).map(|w| (w, true)),
+                        _ => None,
+                    };
+                    store(&mut rw, *d, f);
+                }
+                // The arithmetic operators DO special-case a real operand
+                // (`from_f64`, always 64 bits regardless of the operands'
+                // widths), so both operands must be known non-real.
+                Insn::Add(d, l, r)
+                | Insn::Sub(d, l, r)
+                | Insn::Mul(d, l, r)
+                | Insn::Div(d, l, r)
+                | Insn::Mod(d, l, r) => {
+                    let f = match (fact(&rw, *l), fact(&rw, *r)) {
+                        (Some((a, true)), Some((b, true))) => {
+                            ok(a.max(b)).map(|w| (w, true))
+                        }
+                        _ => None,
+                    };
+                    store(&mut rw, *d, f);
+                }
+
+                // `Select` is the one arm that writes registers it does not
+                // name as its destination: it widens a §5.7.1 fill branch to
+                // the other branch's width IN PLACE before choosing. Only when
+                // both branches are known non-fill do they keep their widths —
+                // and then all three outcomes (`merge_unknown`, or a clone of
+                // either branch) are `max(tw, ew)` wide, which is a single
+                // known width when the two agree. Store `dest` last: it may
+                // alias a branch register.
+                Insn::Select(d, _, t, e) => {
+                    let (ft, fe) = (fact(&rw, *t), fact(&rw, *e));
+                    let f = match (ft, fe) {
+                        (Some((a, true)), Some((b, true))) if a == b => Some((a, true)),
+                        _ => {
+                            store(&mut rw, *t, ft.filter(|(_, p)| *p));
+                            store(&mut rw, *e, fe.filter(|(_, p)| *p));
+                            None
+                        }
+                    };
+                    store(&mut rw, *d, f);
+                }
+
+                // `concat_refs` (and the exec arms' inline equivalents)
+                // return the SUM of the operand widths. An overflowing sum
+                // wraps in the exec arm, and one past `MAX_WIDTH` is clamped;
+                // `checked_add` and `ok` between them exclude both.
+                Insn::Concat(d, parts) => {
+                    let mut sum = Some(0u32);
+                    for p in parts.iter() {
+                        sum = match (sum, fact(&rw, *p)) {
+                            (Some(a), Some((b, _))) => a.checked_add(b),
+                            _ => None,
+                        };
+                    }
+                    store(&mut rw, *d, sum.and_then(ok).map(|w| (w, true)));
+                }
+                // `{1{x}}` hands the source `Value` through untouched (the
+                // main exec arm does not even copy it when `d == s`), so it
+                // inherits the source's fact exactly, `is_fill` included.
+                // `{n{x}}` for n >= 2 concatenates n copies; n == 0 is a
+                // zero-width value, which `ok` rejects.
+                Insn::Replicate(d, s, n) => {
+                    let f = if *n == 1 {
+                        fact(&rw, *s)
+                    } else {
+                        fact(&rw, *s)
+                            .and_then(|(w, _)| w.checked_mul(*n))
+                            .and_then(ok)
+                            .map(|w| (w, true))
+                    };
+                    store(&mut rw, *d, f);
+                }
+
+                // Destination width not established here: the bounds of a
+                // dynamic range select are register values, and an array
+                // element read that fails to resolve returns a 1-bit X
+                // instead of the element.
+                Insn::RangeSelect(d, _, _, _) | Insn::LoadArrayElem(d, _, _) => {
+                    store(&mut rw, *d, None)
+                }
+
+                // Stamps `is_signed`; storage and width are untouched.
+                Insn::SetSigned(_) => {}
+
+                // No register destination.
+                Insn::BranchIfFalse(..)
+                | Insn::BranchUnlessZero(..)
+                | Insn::BranchIfSignalFalse(..)
+                | Insn::Jump(..)
+                | Insn::Nop
+                | Insn::NbaAssign(..)
+                | Insn::NbaAssignConst(..)
+                | Insn::NbaAssignRange(..)
+                | Insn::NbaAssignRangeDyn(..)
+                | Insn::NbaAssignBitDyn(..)
+                | Insn::NbaAssignArray(..)
+                | Insn::NbaAssignArrayRange(..)
+                | Insn::BlockingAssign(..)
+                | Insn::BlockingAssignRange(..)
+                | Insn::BlockingAssignRangeDyn(..)
+                | Insn::BlockingAssignBitDyn(..)
+                | Insn::BlockingAssignArray(..)
+                | Insn::BlockingAssignArrayRange(..) => {}
+
+                // The AST interpreter runs with the whole machine in reach.
+                Insn::StmtFallback(..) => rw.iter_mut().for_each(|f| *f = None),
+            }
+        }
+    }
+
     /// Drop `Nop`s left behind by pair fusion above, rewriting branch targets.
     ///
     /// Every fusion in this pass replaces a two-instruction pair with one real
@@ -4382,5 +4690,56 @@ mod tests {
         assert_eq!(compiler.compile_root_expr(&expr), None);
         assert!(compiler.register_overflow);
         assert_eq!(compiler.next_reg, u16::MAX as u32 + 1);
+    }
+
+    #[test]
+    fn redundant_resizes_become_nops_and_narrowing_ones_survive() {
+        // Signal 0 is 8 bits, so the first resize is already satisfied; the
+        // second genuinely narrows; the third is satisfied by the second.
+        let mut insns = vec![
+            Insn::LoadSignal(0, 0),
+            Insn::Resize(0, 8),
+            Insn::Resize(0, 4),
+            Insn::Resize(0, 4),
+        ];
+        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], 1);
+        assert!(matches!(
+            insns.as_slice(),
+            [Insn::LoadSignal(0, 0), Insn::Nop, Insn::Resize(0, 4), Insn::Nop]
+        ));
+    }
+
+    #[test]
+    fn a_resize_that_is_a_branch_target_is_never_removed() {
+        // Control can arrive at index 3 without having run index 2, so the
+        // width of r0 there depends on the path taken.
+        let mut insns = vec![
+            Insn::LoadSignal(0, 0),
+            Insn::BranchIfFalse(0, 3),
+            Insn::Resize(0, 8),
+            Insn::Resize(0, 8),
+        ];
+        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], 1);
+        assert!(matches!(insns[2], Insn::Nop));
+        assert!(matches!(insns[3], Insn::Resize(0, 8)));
+    }
+
+    #[test]
+    fn arithmetic_on_a_possibly_real_operand_keeps_its_resize() {
+        // A signal's declared type may be `real`, and `Value::add` then returns
+        // a 64-bit `from_f64` instead of `max(width)` — so the result width is
+        // not established here even though both operand widths are known.
+        // `bitwise_or` has no such special case, so its resize does go.
+        let mut insns = vec![
+            Insn::LoadSignal(0, 0),
+            Insn::LoadSignal(1, 0),
+            Insn::Add(2, 0, 1),
+            Insn::Resize(2, 8),
+            Insn::BitOr(3, 0, 1),
+            Insn::Resize(3, 8),
+        ];
+        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], 4);
+        assert!(matches!(insns[3], Insn::Resize(2, 8)));
+        assert!(matches!(insns[5], Insn::Nop));
     }
 }
