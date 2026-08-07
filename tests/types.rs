@@ -69,6 +69,8 @@ mod enum_xz_and_package_shapes;
 mod formal_type_metadata_and_typedef_packed_array;
 #[path = "types/forward_referenced_parameter.rs"]
 mod forward_referenced_parameter;
+#[path = "types/forward_typedef_class_handle_width.rs"]
+mod forward_typedef_class_handle_width;
 #[path = "types/function_return_width.rs"]
 mod function_return_width;
 #[path = "types/implicit_port_net_and_packed_typedef_array.rs"]
