@@ -17,6 +17,34 @@ const MAX_INLINE_DEPTH: usize = 8;
 /// counter and falls back before an ID would overflow this representation.
 type RegId = u16;
 
+/// A signal-table index inside an instruction. `u32`, not `usize`: the
+/// largest design measured here has 35.1 M signals and `u32` covers 4.29 B,
+/// so the extra four bytes per field were pure footprint. Fourteen `Insn`
+/// variants carry one, and they are what pushed the enum to 24 bytes — an
+/// awkward size that costs a three-instruction `lea/add/lea` to address and
+/// packs only 2.67 instructions per 64-byte cache line.
+type SigId = u32;
+
+/// Narrow a `usize` signal-table index to the in-instruction [`SigId`].
+///
+/// Every id ultimately comes from a `Vec` index, so on any design that fits
+/// in memory this cannot overflow — but a silent wrap would be catastrophic
+/// and invisible: the instruction would read and write a completely
+/// unrelated signal for the rest of the run, with no diagnostic. Checked
+/// unconditionally (not `debug_assert!`) because this runs once per emitted
+/// instruction at compile time, never in the VM dispatch loop.
+#[inline]
+pub(crate) fn as_sig_id(id: usize) -> SigId {
+    assert!(
+        id <= SigId::MAX as usize,
+        "signal id {id} does not fit in a {}-bit Insn signal field \
+         (limit {}); Insn::SigId must widen before such a design can run",
+        SigId::BITS,
+        SigId::MAX
+    );
+    id as SigId
+}
+
 /// Bytecode instruction set. Stack-free, register-based design.
 /// Each instruction specifies source and destination registers explicitly,
 /// enabling the VM to iterate a flat Vec<Insn> with predictable memory access.
@@ -29,9 +57,9 @@ pub enum Insn {
     /// to shrink `Insn` from 40 B to 32 B.
     LoadConst(RegId, Box<Value>),
     /// Load a signal from signal_table[signal_id] into a register.
-    LoadSignal(RegId, usize),      // (dest_reg, signal_id)
+    LoadSignal(RegId, SigId),      // (dest_reg, signal_id)
     /// Load a signal and mark it as signed.
-    LoadSignalSigned(RegId, usize),
+    LoadSignalSigned(RegId, SigId),
     /// Resize register to given width.
     Resize(RegId, u32),
 
@@ -96,26 +124,26 @@ pub enum Insn {
     Jump(u32),
 
     /// Non-blocking assign: signal_table[id] <= reg (scheduled via NBA queue).
-    NbaAssign(usize, RegId, u32), // (signal_id, value_reg, width)
+    NbaAssign(SigId, RegId, u32), // (signal_id, value_reg, width)
     /// Non-blocking partial assign: signal_table[id][hi:lo] <= reg.
     /// Read-modify-write at exec time using current signal value as base.
-    NbaAssignRange(usize, u32, u32, RegId), // (signal_id, hi, lo, value_reg)
+    NbaAssignRange(SigId, u32, u32, RegId), // (signal_id, hi, lo, value_reg)
     /// NBA partial assign with dynamic hi/lo (mirrors `BlockingAssignRangeDyn`):
     /// signal_table[id][hi_reg:lo_reg] <= reg. Lets us compile NBAs with
     /// run-time bit ranges (e.g. `q[idx +: W]`, `q[j:j-W+1]`) instead of
     /// falling back to the AST interpreter — critical on CPUs like c910
     /// where these patterns fire millions of times per simulation.
-    NbaAssignRangeDyn(usize, RegId, RegId, RegId), // (signal_id, hi_reg, lo_reg, value_reg)
+    NbaAssignRangeDyn(SigId, RegId, RegId, RegId), // (signal_id, hi_reg, lo_reg, value_reg)
     /// Non-blocking bit assign: signal_table[id][bit_idx_reg] <= reg.
-    NbaAssignBitDyn(usize, RegId, RegId), // (signal_id, idx_reg, value_reg)
+    NbaAssignBitDyn(SigId, RegId, RegId), // (signal_id, idx_reg, value_reg)
     /// Blocking assign: signal_table[id] = reg.
-    BlockingAssign(usize, RegId, u32), // (signal_id, value_reg, width)
+    BlockingAssign(SigId, RegId, u32), // (signal_id, value_reg, width)
     /// Blocking range assign: signal_table[id][hi:lo] = reg (read-modify-write).
-    BlockingAssignRange(usize, u32, u32, RegId), // (signal_id, hi, lo, value_reg)
+    BlockingAssignRange(SigId, u32, u32, RegId), // (signal_id, hi, lo, value_reg)
     /// Blocking range assign with dynamic hi/lo (for `[idx +: W]` / `[idx -: W]`).
-    BlockingAssignRangeDyn(usize, RegId, RegId, RegId), // (signal_id, hi_reg, lo_reg, value_reg)
+    BlockingAssignRangeDyn(SigId, RegId, RegId, RegId), // (signal_id, hi_reg, lo_reg, value_reg)
     /// Blocking bit assign: signal_table[id][idx_reg] = reg[0] (read-modify-write).
-    BlockingAssignBitDyn(usize, RegId, RegId), // (signal_id, idx_reg, value_reg)
+    BlockingAssignBitDyn(SigId, RegId, RegId), // (signal_id, idx_reg, value_reg)
 
     /// Load array element: dest = signal_table[array_base + eval(index_reg)]
     /// Boxing the operand keeps the instruction compact.
@@ -151,14 +179,14 @@ pub enum Insn {
     /// for wide (>64-bit) signals, where `LoadSignal` would copy the whole
     /// `Wide` storage (1 byte/bit) into a VM register only to slice a few
     /// bits out. Also removes one dispatch + one 32-byte register write.
-    LoadSignalRange(RegId, usize, u32, u32), // (dest, signal_id, left, right)
+    LoadSignalRange(RegId, SigId, u32, u32), // (dest, signal_id, left, right)
     /// Fused `LoadSignal` + `BitSelectConst`: dest = signal_table[sig][index].
-    LoadSignalBit(RegId, usize, u32), // (dest, signal_id, index)
+    LoadSignalBit(RegId, SigId, u32), // (dest, signal_id, index)
 
     /// Fused `LoadConst` + `NbaAssign`: signal_table[id] <= K. The dominant
     /// reset-value NBA shape (33M dynamic pairs on the c910 memcpy census) —
     /// skips one dispatch and one 32-byte register write per execution.
-    NbaAssignConst(usize, Box<Value>, u32), // (signal_id, const, width)
+    NbaAssignConst(SigId, Box<Value>, u32), // (signal_id, const, width)
     /// Fused `LogNot` + `BranchIfFalse`: jump unless the register is
     /// DEFINITE zero (`is_nonzero() == Some(false)`) — the exact composition
     /// of `logic_not` (Some(true)→0, Some(false)→1, None→X) with
@@ -176,7 +204,7 @@ pub enum Insn {
     /// lowers to. It only becomes adjacent AFTER the
     /// `LoadSignal`+`BitSelectConst` fusion below runs, which is why it needs
     /// its own pass.
-    BranchIfSignalFalse(usize, u32, u32), // (signal_id, jump_target, bit | u32::MAX)
+    BranchIfSignalFalse(SigId, u32, u32), // (signal_id, jump_target, bit | u32::MAX)
 }
 
 /// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
@@ -1782,14 +1810,14 @@ impl<'a> BytecodeCompiler<'a> {
                     } => {
                         if let Some(sig_id) = self.expr_to_signal_id(operand) {
                             let r = self.alloc_reg();
-                            self.emit(Insn::LoadSignal(r, sig_id));
+                            self.emit(Insn::LoadSignal(r, as_sig_id(sig_id)));
                             let one = self.alloc_reg();
                             let w = self.signal_widths[sig_id];
                             self.emit(Insn::LoadConst(one, Box::new(Value::from_u64(1, w))));
                             let result = self.alloc_reg();
                             self.emit(Insn::Add(result, r, one));
                             self.emit(Insn::Resize(result, w));
-                            self.emit(Insn::BlockingAssign(sig_id, result, w));
+                            self.emit(Insn::BlockingAssign(as_sig_id(sig_id), result, w));
                             return true;
                         }
                         self.bail("Expr_PreIncr");
@@ -1805,14 +1833,14 @@ impl<'a> BytecodeCompiler<'a> {
                     } => {
                         if let Some(sig_id) = self.expr_to_signal_id(operand) {
                             let r = self.alloc_reg();
-                            self.emit(Insn::LoadSignal(r, sig_id));
+                            self.emit(Insn::LoadSignal(r, as_sig_id(sig_id)));
                             let one = self.alloc_reg();
                             let w = self.signal_widths[sig_id];
                             self.emit(Insn::LoadConst(one, Box::new(Value::from_u64(1, w))));
                             let result = self.alloc_reg();
                             self.emit(Insn::Sub(result, r, one));
                             self.emit(Insn::Resize(result, w));
-                            self.emit(Insn::BlockingAssign(sig_id, result, w));
+                            self.emit(Insn::BlockingAssign(as_sig_id(sig_id), result, w));
                             return true;
                         }
                         self.bail("Expr_PreDecr");
@@ -2131,9 +2159,9 @@ impl<'a> BytecodeCompiler<'a> {
         if let Some(id) = self.const_multi_dim_array_elem_signal_id(expr) {
             let dest = self.alloc_reg();
             if self.signal_signed[id] {
-                self.emit(Insn::LoadSignalSigned(dest, id));
+                self.emit(Insn::LoadSignalSigned(dest, as_sig_id(id)));
             } else {
-                self.emit(Insn::LoadSignal(dest, id));
+                self.emit(Insn::LoadSignal(dest, as_sig_id(id)));
             }
             return Some(dest);
         }
@@ -2155,9 +2183,9 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(id) = self.lookup_signal_id(hier) {
                     let r = self.alloc_reg();
                     if self.signal_signed[id] {
-                        self.emit(Insn::LoadSignalSigned(r, id));
+                        self.emit(Insn::LoadSignalSigned(r, as_sig_id(id)));
                     } else {
-                        self.emit(Insn::LoadSignal(r, id));
+                        self.emit(Insn::LoadSignal(r, as_sig_id(id)));
                     }
                     return Some(r);
                 }
@@ -2457,7 +2485,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // them.
                 if let Some(id) = self.multi_dim_elem_signal_id(expr, index) {
                     let dest = self.alloc_reg();
-                    self.emit(Insn::LoadSignal(dest, id));
+                    self.emit(Insn::LoadSignal(dest, as_sig_id(id)));
                     return Some(dest);
                 }
                 // Array element access
@@ -2737,7 +2765,7 @@ impl<'a> BytecodeCompiler<'a> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 if let Some(id) = self.lookup_signal_id(hier) {
-                    self.emit(Insn::NbaAssign(id, val_reg, width));
+                    self.emit(Insn::NbaAssign(as_sig_id(id), val_reg, width));
                     true
                 } else {
                     self.bail("nba_ident_unresolved");
@@ -2746,7 +2774,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Index { expr, index } => {
                 if let Some(id) = self.const_multi_dim_array_elem_signal_id(lhs) {
-                    self.emit(Insn::NbaAssign(id, val_reg, width));
+                    self.emit(Insn::NbaAssign(as_sig_id(id), val_reg, width));
                     return true;
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
@@ -2795,21 +2823,21 @@ impl<'a> BytecodeCompiler<'a> {
                                 ));
                                 let hi_reg = self.alloc_reg();
                                 self.emit(Insn::Add(hi_reg, lo_reg, em1_reg));
-                                self.emit(Insn::NbaAssignRangeDyn(id, hi_reg, lo_reg, val_reg));
+                                self.emit(Insn::NbaAssignRangeDyn(as_sig_id(id), hi_reg, lo_reg, val_reg));
                                 return true;
                             }
                         }
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
                             // §7.4.1: rebase for non-zero-based vectors.
                             let idx_reg = self.emit_rebased_index(hier, idx_reg);
-                            self.emit(Insn::NbaAssignBitDyn(id, idx_reg, val_reg));
+                            self.emit(Insn::NbaAssignBitDyn(as_sig_id(id), idx_reg, val_reg));
                             return true;
                         }
                     }
                 }
                 if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     if let Some(idx_reg) = self.compile_expr(index, 0) {
-                        self.emit(Insn::NbaAssignBitDyn(id, idx_reg, val_reg));
+                        self.emit(Insn::NbaAssignBitDyn(as_sig_id(id), idx_reg, val_reg));
                         return true;
                     }
                 }
@@ -2834,7 +2862,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 {
                                     let hi = (hi as i64 - base_lo).max(0) as u32;
                                     let lo = (lo as i64 - base_lo).max(0) as u32;
-                                    self.emit(Insn::NbaAssignRange(id, hi, lo, val_reg));
+                                    self.emit(Insn::NbaAssignRange(as_sig_id(id), hi, lo, val_reg));
                                     return true;
                                 }
                             }
@@ -2872,7 +2900,7 @@ impl<'a> BytecodeCompiler<'a> {
                                         (idx, other)
                                     }
                                 };
-                                self.emit(Insn::NbaAssignRangeDyn(id, hi_reg, lo_reg, resized));
+                                self.emit(Insn::NbaAssignRangeDyn(as_sig_id(id), hi_reg, lo_reg, resized));
                                 return true;
                             }
                         }
@@ -2884,7 +2912,7 @@ impl<'a> BytecodeCompiler<'a> {
                             if let (Some(hi), Some(lo)) =
                                 (self.eval_const_expr(left), self.eval_const_expr(right))
                             {
-                                self.emit(Insn::NbaAssignRange(id, hi, lo, val_reg));
+                                self.emit(Insn::NbaAssignRange(as_sig_id(id), hi, lo, val_reg));
                                 return true;
                             }
                         }
@@ -2920,7 +2948,7 @@ impl<'a> BytecodeCompiler<'a> {
                                     (idx, other)
                                 }
                             };
-                            self.emit(Insn::NbaAssignRangeDyn(id, hi_reg, lo_reg, resized));
+                            self.emit(Insn::NbaAssignRangeDyn(as_sig_id(id), hi_reg, lo_reg, resized));
                             return true;
                         }
                     }
@@ -2928,7 +2956,7 @@ impl<'a> BytecodeCompiler<'a> {
                 if *kind == RangeKind::Constant {
                     if let Some((id, hi, lo)) = self.flattened_const_range_target(expr, left, right)
                     {
-                        self.emit(Insn::NbaAssignRange(id, hi, lo, val_reg));
+                        self.emit(Insn::NbaAssignRange(as_sig_id(id), hi, lo, val_reg));
                         return true;
                     }
                 }
@@ -3027,7 +3055,7 @@ impl<'a> BytecodeCompiler<'a> {
                         let base_name = hier.path[0].name.name.as_str();
                         let dotted = format!("{}.{}", base_name, member.name);
                         if let Some(id) = self.lookup_signal_id_by_name(&dotted) {
-                            self.emit(Insn::BlockingAssign(id, val_reg, width));
+                            self.emit(Insn::BlockingAssign(as_sig_id(id), val_reg, width));
                             return true;
                         }
                     }
@@ -3037,7 +3065,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Ident(hier) => {
                 if let Some(id) = self.lookup_signal_id(hier) {
-                    self.emit(Insn::BlockingAssign(id, val_reg, width));
+                    self.emit(Insn::BlockingAssign(as_sig_id(id), val_reg, width));
                     true
                 } else if let Some((base_id, off, mw)) = self.packed_struct_member_target(hier) {
                     // Packed-struct member write (`s.m0 = …`): splice the value
@@ -3046,7 +3074,7 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::Move(resized, val_reg));
                     self.emit(Insn::Resize(resized, mw));
                     self.emit(Insn::BlockingAssignRange(
-                        base_id,
+                        as_sig_id(base_id),
                         off + mw - 1,
                         off,
                         resized,
@@ -3059,7 +3087,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Index { expr, index } => {
                 if let Some(id) = self.const_multi_dim_array_elem_signal_id(lhs) {
-                    self.emit(Insn::BlockingAssign(id, val_reg, width));
+                    self.emit(Insn::BlockingAssign(as_sig_id(id), val_reg, width));
                     return true;
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
@@ -3112,7 +3140,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 let hi_reg = self.alloc_reg();
                                 self.emit(Insn::Add(hi_reg, lo_reg, em1_reg));
                                 self.emit(Insn::BlockingAssignRangeDyn(
-                                    id, hi_reg, lo_reg, val_reg,
+                                    as_sig_id(id), hi_reg, lo_reg, val_reg,
                                 ));
                                 return true;
                             }
@@ -3134,14 +3162,14 @@ impl<'a> BytecodeCompiler<'a> {
                             } else {
                                 idx_reg
                             };
-                            self.emit(Insn::BlockingAssignBitDyn(id, idx_reg, val_reg));
+                            self.emit(Insn::BlockingAssignBitDyn(as_sig_id(id), idx_reg, val_reg));
                             return true;
                         }
                     }
                 }
                 if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     if let Some(idx_reg) = self.compile_expr(index, 0) {
-                        self.emit(Insn::BlockingAssignBitDyn(id, idx_reg, val_reg));
+                        self.emit(Insn::BlockingAssignBitDyn(as_sig_id(id), idx_reg, val_reg));
                         return true;
                     }
                 }
@@ -3183,7 +3211,7 @@ impl<'a> BytecodeCompiler<'a> {
                                         let resized = self.alloc_reg();
                                         self.emit(Insn::Move(resized, val_reg));
                                         self.emit(Insn::Resize(resized, range_w));
-                                        self.emit(Insn::BlockingAssignRange(id, hi, lo, resized));
+                                        self.emit(Insn::BlockingAssignRange(as_sig_id(id), hi, lo, resized));
                                         return true;
                                     }
                                 }
@@ -3191,7 +3219,7 @@ impl<'a> BytecodeCompiler<'a> {
                                     (self.compile_expr(left, 0), self.compile_expr(right, 0))
                                 {
                                     self.emit(Insn::BlockingAssignRangeDyn(
-                                        id, hi_reg, lo_reg, val_reg,
+                                        as_sig_id(id), hi_reg, lo_reg, val_reg,
                                     ));
                                     return true;
                                 }
@@ -3231,7 +3259,7 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 self.emit(Insn::BlockingAssignRangeDyn(
-                                    id, hi_reg, lo_reg, resized,
+                                    as_sig_id(id), hi_reg, lo_reg, resized,
                                 ));
                                 return true;
                             }
@@ -3251,7 +3279,7 @@ impl<'a> BytecodeCompiler<'a> {
                                     let resized = self.alloc_reg();
                                     self.emit(Insn::Move(resized, val_reg));
                                     self.emit(Insn::Resize(resized, range_w));
-                                    self.emit(Insn::BlockingAssignRange(id, hi, lo, resized));
+                                    self.emit(Insn::BlockingAssignRange(as_sig_id(id), hi, lo, resized));
                                     return true;
                                 }
                             }
@@ -3259,7 +3287,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 (self.compile_expr(left, 0), self.compile_expr(right, 0))
                             {
                                 self.emit(Insn::BlockingAssignRangeDyn(
-                                    id, hi_reg, lo_reg, val_reg,
+                                    as_sig_id(id), hi_reg, lo_reg, val_reg,
                                 ));
                                 return true;
                             }
@@ -3296,7 +3324,7 @@ impl<'a> BytecodeCompiler<'a> {
                                     (idx, other)
                                 }
                             };
-                            self.emit(Insn::BlockingAssignRangeDyn(id, hi_reg, lo_reg, resized));
+                            self.emit(Insn::BlockingAssignRangeDyn(as_sig_id(id), hi_reg, lo_reg, resized));
                             return true;
                         }
                     }
@@ -3308,7 +3336,7 @@ impl<'a> BytecodeCompiler<'a> {
                         let resized = self.alloc_reg();
                         self.emit(Insn::Move(resized, val_reg));
                         self.emit(Insn::Resize(resized, range_w));
-                        self.emit(Insn::BlockingAssignRange(id, hi, lo, resized));
+                        self.emit(Insn::BlockingAssignRange(as_sig_id(id), hi, lo, resized));
                         return true;
                     }
                 }
@@ -3702,7 +3730,7 @@ impl<'a> BytecodeCompiler<'a> {
                 return false;
             }
             self.emit(Insn::Resize(val_reg, width));
-            self.emit(Insn::BlockingAssign(dst_id, val_reg, width));
+            self.emit(Insn::BlockingAssign(as_sig_id(dst_id), val_reg, width));
             true
         } else {
             false

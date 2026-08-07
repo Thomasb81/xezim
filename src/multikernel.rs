@@ -788,6 +788,7 @@ pub fn classify_lp_io(sim: &crate::compiler::Simulator, lp_a_prefix: &str) -> Lp
                 _ => None,
             };
             if let Some(id) = written_all {
+                let id = id as usize;
                 if id < n_signals {
                     all_writer[id] = match all_writer[id] {
                         LP_NONE => lp_full,
@@ -802,6 +803,7 @@ pub fn classify_lp_io(sim: &crate::compiler::Simulator, lp_a_prefix: &str) -> Lp
                 _ => None,
             };
             if let Some(id) = read_all {
+                let id = id as usize;
                 if id < n_signals {
                     all_reader[id] = match all_reader[id] {
                         LP_NONE => lp_full,
@@ -836,6 +838,7 @@ pub fn classify_lp_io(sim: &crate::compiler::Simulator, lp_a_prefix: &str) -> Lp
                 _ => None,
             };
             if let Some(id) = written {
+                let id = id as usize;
                 if id < n_signals {
                     writer[id] = match writer[id] {
                         LP_NONE => lp,
@@ -851,6 +854,7 @@ pub fn classify_lp_io(sim: &crate::compiler::Simulator, lp_a_prefix: &str) -> Lp
                 _ => None,
             };
             if let Some(id) = read {
+                let id = id as usize;
                 if id < n_signals {
                     reader[id] = match reader[id] {
                         LP_NONE => lp,
@@ -1180,13 +1184,13 @@ pub fn compute_ddg(sim: &crate::compiler::Simulator) -> DdgStats {
         for insn in &cb.instructions {
             match insn {
                 Insn::LoadSignal(_, sig) | Insn::LoadSignalSigned(_, sig) => {
-                    block_reads[bi].push(*sig);
+                    block_reads[bi].push(*sig as usize);
                 }
                 Insn::NbaAssign(sig, _, _)
                 | Insn::NbaAssignRange(sig, _, _, _)
                 | Insn::NbaAssignBitDyn(sig, _, _)
                 | Insn::NbaAssignRangeDyn(sig, _, _, _) => {
-                    block_writes[bi].push(*sig);
+                    block_writes[bi].push(*sig as usize);
                 }
                 _ => {}
             }
