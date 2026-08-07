@@ -975,15 +975,26 @@ mod enabled {
                     {
                         let (base_ptr, _len) = inline_storage.unwrap();
                         let base = builder.ins().iconst(pointer_type, base_ptr as i64);
-                        // Each [u64; 2] entry is 16 bytes; val_bits is at offset 0.
+                        // Each `[u64; 2]` entry is 16 bytes: val_bits at offset
+                        // 0, xz_bits at offset 8. BOTH planes must be written.
+                        // Storing only the value plane left `xz_slots[dest]`
+                        // holding whatever the register last had, so every X/Z
+                        // signal read back as a determinate value — silently
+                        // wrong results, not a crash. (Verified: it wedges the
+                        // C906 under `XEZIM_JIT=1 XEZIM_INLINE_BITS=1`.) This
+                        // is the same trap that took the NBA fast paths out of
+                        // service in `FOUR_STATE_NBA_FAST_OK` above; the read
+                        // path was missed at the time.
                         let offset = (*sig_id as i32) * 16;
-                        let val = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            base,
-                            offset,
-                        );
-                        builder.ins().stack_store(val, reg_slots[*dest as usize], 0);
+                        let val =
+                            builder
+                                .ins()
+                                .load(types::I64, MemFlags::trusted(), base, offset);
+                        let xzv =
+                            builder
+                                .ins()
+                                .load(types::I64, MemFlags::trusted(), base, offset + 8);
+                        st2(&mut builder, &reg_slots, &xz_slots, *dest, val, xzv);
                     }
                     other => {
                         emit_insn(
