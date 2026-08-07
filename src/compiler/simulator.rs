@@ -14495,6 +14495,7 @@ impl Simulator {
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
+            compiler.set_signal_real(&self.signal_real);
             compiler.top_module_name = Some(self.module.name.clone());
             if compiler.compile_stmt(&block.stmt) {
                 let cb = compiler.finish();
@@ -14541,6 +14542,7 @@ impl Simulator {
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.set_string_signals(&self.module.string_signals);
+                compiler.set_signal_real(&self.signal_real);
                 compiler.top_module_name = Some(self.module.name.clone());
                 let body = if compiler.compile_stmt(&fast.body) {
                     Some(compiler.finish())
@@ -14567,6 +14569,7 @@ impl Simulator {
                 delay_compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 delay_compiler.set_array_first_id(&self.array_first_id);
                 delay_compiler.set_string_signals(&self.module.string_signals);
+                delay_compiler.set_signal_real(&self.signal_real);
                 delay_compiler.top_module_name = Some(self.module.name.clone());
                 let delay = delay_compiler
                     .compile_root_expr(&fast.delay)
