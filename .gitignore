@@ -45,6 +45,7 @@ scratchpad/
 
 # UVM benchmark result CSVs (bench/run_uvm_bench.sh)
 bench_uvm_*.csv
+tr_db.log
 
 # Files a test run drops in the REPO ROOT. The testcases `$fopen` these with a
 # relative path, so they land in whatever directory `cargo test` ran from —
