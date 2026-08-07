@@ -6960,6 +6960,7 @@ impl Simulator {
                                 cb.instructions.iter().any(|i| match i {
                                     super::bytecode::Insn::NbaAssign(s, _, _)
                                     | super::bytecode::Insn::NbaAssignConst(s, _, _)
+                                    | super::bytecode::Insn::NbaAssignArrayRead(s, _, _, _)
                                     | super::bytecode::Insn::NbaAssignRange(s, _, _, _) => {
                                         let s = &(*s as usize);
                                         *s == sid
@@ -6983,6 +6984,7 @@ impl Simulator {
                                     | super::bytecode::Insn::LoadSignalSigned(_, s)
                                     | super::bytecode::Insn::LoadSignalRange(_, s, _, _)
                                     | super::bytecode::Insn::LoadSignalBit(_, s, _)
+                                    | super::bytecode::Insn::NbaAssignArrayRead(_, _, s, _)
                                     | super::bytecode::Insn::BranchIfSignalFalse(s, _, _) if *s as usize == sid)
                                 })
                             })
@@ -7124,6 +7126,20 @@ impl Simulator {
             };
             for insn in cb.instructions.iter() {
                 match insn {
+                    // The fused array-read NBA both READS its index signal and
+                    // WRITES its destination, so it has to land in BOTH sets —
+                    // the alternations below are mutually exclusive per insn.
+                    super::bytecode::Insn::NbaAssignArrayRead(wsid, _, rsid, _) => {
+                        let (w, r) = (*wsid as usize, *rsid as usize);
+                        if !reads_of[bi].contains(&r) {
+                            reads_of[bi].push(r);
+                            readers_of_sig.entry(r).or_default().push(bi);
+                        }
+                        if !writes_of[bi].contains(&w) {
+                            writes_of[bi].push(w);
+                            writers_of_sig.entry(w).or_default().push(bi);
+                        }
+                    }
                     super::bytecode::Insn::LoadSignal(_, sid)
                     | super::bytecode::Insn::LoadSignalSigned(_, sid)
                     | super::bytecode::Insn::LoadSignalRange(_, sid, _, _)
@@ -7340,6 +7356,7 @@ impl Simulator {
                     Insn::NbaAssign(id, _, _)
                     | Insn::NbaAssignConst(id, _, _)
                     | Insn::NbaAssignRange(id, _, _, _)
+                    | Insn::NbaAssignArrayRead(id, _, _, _)
                     | Insn::NbaAssignBitDyn(id, _, _) => {
                         let id = &(*id as usize);
                         let owner = lp_writer.get(*id).copied().unwrap_or(None);
@@ -7412,6 +7429,7 @@ impl Simulator {
                     Insn::NbaAssignRange(id, _, _, _) => *id,
                     Insn::NbaAssignBitDyn(id, _, _) => *id,
                     Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
+                    Insn::NbaAssignArrayRead(id, _, _, _) => *id,
                     _ => continue,
                 };
                 let sig_id = sig_id as usize;
@@ -7561,6 +7579,16 @@ impl Simulator {
                     super::bytecode::Insn::NbaAssign(sid, _, _)
                     | super::bytecode::Insn::NbaAssignConst(sid, _, _)
                     | super::bytecode::Insn::NbaAssignRange(sid, _, _, _) => *sid,
+                    // Fused array-read NBA touches TWO signals: the index it
+                    // reads and the destination it writes.
+                    super::bytecode::Insn::NbaAssignArrayRead(wsid, _, rsid, _) => {
+                        for s in [*wsid as usize, *rsid as usize] {
+                            if !seen.contains(&s) {
+                                seen.push(s);
+                            }
+                        }
+                        continue;
+                    }
                     _ => continue,
                 };
                 let sid = sid as usize;
@@ -10885,7 +10913,8 @@ impl Simulator {
                             | Insn::NbaAssignRangeDyn(..)
                             | Insn::NbaAssignBitDyn(..)
                             | Insn::NbaAssignArray(..)
-                            | Insn::NbaAssignArrayRange(..) => has_nba = true,
+                            | Insn::NbaAssignArrayRange(..)
+                            | Insn::NbaAssignArrayRead(..) => has_nba = true,
                             // Insns the isolated evaluator can't handle (see the
                             // catch-all in exec_comb_block_isolated): array /
                             // dynamic-range blocking writes and AST fallback.
@@ -10951,6 +10980,7 @@ impl Simulator {
                             | Insn::NbaAssignBitDyn(..)
                             | Insn::NbaAssignArray(..)
                             | Insn::NbaAssignArrayRange(..)
+                            | Insn::NbaAssignArrayRead(..)
                     )
                 }) {
                     nba_blocks += 1;
@@ -11136,18 +11166,24 @@ impl Simulator {
                 continue;
             }
             for insn in &cb.instructions {
-                let touched_id = match insn {
-                    Insn::LoadSignal(_, id) | Insn::LoadSignalSigned(_, id) => Some(*id),
-                    Insn::LoadSignalRange(_, id, _, _) | Insn::LoadSignalBit(_, id, _) => Some(*id),
-                    Insn::BranchIfSignalFalse(id, _, _) => Some(*id),
-                    Insn::NbaAssign(id, _, _) => Some(*id),
-                    Insn::NbaAssignConst(id, _, _) => Some(*id),
-                    Insn::NbaAssignRange(id, _, _, _) => Some(*id),
-                    Insn::NbaAssignBitDyn(id, _, _) => Some(*id),
-                    Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
-                    _ => None,
+                // The fused array-read NBA touches TWO signals (the index it
+                // reads and the destination it writes); everything else here
+                // touches one.
+                let (touched_id, extra_id) = match insn {
+                    Insn::LoadSignal(_, id) | Insn::LoadSignalSigned(_, id) => (Some(*id), None),
+                    Insn::LoadSignalRange(_, id, _, _) | Insn::LoadSignalBit(_, id, _) => {
+                        (Some(*id), None)
+                    }
+                    Insn::BranchIfSignalFalse(id, _, _) => (Some(*id), None),
+                    Insn::NbaAssign(id, _, _) => (Some(*id), None),
+                    Insn::NbaAssignConst(id, _, _) => (Some(*id), None),
+                    Insn::NbaAssignRange(id, _, _, _) => (Some(*id), None),
+                    Insn::NbaAssignBitDyn(id, _, _) => (Some(*id), None),
+                    Insn::NbaAssignRangeDyn(id, _, _, _) => (Some(*id), None),
+                    Insn::NbaAssignArrayRead(id, _, idx, _) => (Some(*id), Some(*idx)),
+                    _ => (None, None),
                 };
-                if let Some(id) = touched_id {
+                for id in touched_id.into_iter().chain(extra_id) {
                     let id = id as usize;
                     if id < n_signals {
                         per_lp_signal_set[lp as usize].insert(id);
@@ -12050,6 +12086,7 @@ impl Simulator {
                         | Insn::NbaAssignConst(id, _, _)
                         | Insn::NbaAssignRange(id, _, _, _)
                         | Insn::NbaAssignBitDyn(id, _, _)
+                        | Insn::NbaAssignArrayRead(id, _, _, _)
                         | Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
                         _ => None,
                     };
@@ -13243,6 +13280,7 @@ impl Simulator {
                     | Insn::NbaAssignConst(id, _, _)
                     | Insn::NbaAssignRange(id, _, _, _)
                     | Insn::NbaAssignBitDyn(id, _, _)
+                    | Insn::NbaAssignArrayRead(id, _, _, _)
                     | Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
                     _ => None,
                 };
@@ -13284,6 +13322,7 @@ impl Simulator {
                     | Insn::NbaAssignConst(id, _, _)
                     | Insn::NbaAssignRange(id, _, _, _)
                     | Insn::NbaAssignBitDyn(id, _, _)
+                    | Insn::NbaAssignArrayRead(id, _, _, _)
                     | Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
                     _ => None,
                 };
@@ -13300,6 +13339,7 @@ impl Simulator {
                 | Insn::LoadSignalSigned(_, id)
                 | Insn::LoadSignalRange(_, id, _, _)
                 | Insn::LoadSignalBit(_, id, _)
+                | Insn::NbaAssignArrayRead(_, _, id, _)
                 | Insn::BranchIfSignalFalse(id, _, _) = insn
                 {
                     let id = &(*id as usize);
@@ -14630,6 +14670,7 @@ impl Simulator {
                                     | super::bytecode::Insn::NbaAssignBitDyn(..)
                                     | super::bytecode::Insn::NbaAssignArray(..)
                                     | super::bytecode::Insn::NbaAssignArrayRange(..)
+                                    | super::bytecode::Insn::NbaAssignArrayRead(..)
                             )
                         })
                         .count() as u64;
@@ -14807,6 +14848,7 @@ impl Simulator {
                         | super::bytecode::Insn::NbaAssignConst(id, _, _)
                         | super::bytecode::Insn::NbaAssignRange(id, _, _, _)
                         | super::bytecode::Insn::NbaAssignBitDyn(id, _, _)
+                        | super::bytecode::Insn::NbaAssignArrayRead(id, _, _, _)
                         | super::bytecode::Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
                         _ => continue,
                     };
@@ -14973,6 +15015,7 @@ impl Simulator {
                         | Insn::NbaAssignConst(id, _, _)
                         | Insn::NbaAssignRange(id, _, _, _)
                         | Insn::NbaAssignBitDyn(id, _, _)
+                        | Insn::NbaAssignArrayRead(id, _, _, _)
                         | Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
                         _ => continue,
                     };
@@ -15451,6 +15494,40 @@ impl Simulator {
                                 block_index,
                             });
                         }
+                    }
+                }
+                // Fused LoadSignal + LoadArrayElem + NbaAssign. Composition of
+                // the three arms above, with the two intermediate register
+                // round-trips removed: the index comes straight from
+                // signal_table (what `LoadSignal` would have copied into a
+                // register) and the element value feeds `resize_for_assign`
+                // directly. The unresolved-element fallback reproduces
+                // `LoadArrayElem`'s 1-bit X exactly.
+                Insn::NbaAssignArrayRead(sig_id, array_name, idx_sig, width) => {
+                    let idx = signal_table[*idx_sig as usize].to_u64().unwrap_or(0) as i64;
+                    let val = match resolve_bytecode_array_elem(
+                        array_name,
+                        idx,
+                        array_first_id,
+                        signal_name_to_id,
+                    ) {
+                        Some(eid) => signal_table[eid].resize_for_assign(*width),
+                        None => Value::new(1).resize_for_assign(*width),
+                    };
+                    let sig_id = &(*sig_id as usize);
+                    // §10.4.2 last-write-wins: see the NbaAssign arm.
+                    if let Some(i) = if nba_dup {
+                        nba_out.iter().rposition(|n| n.signal_id == *sig_id)
+                    } else {
+                        None
+                    } {
+                        nba_out[i].value = val;
+                    } else if signal_table[*sig_id] != val {
+                        nba_out.push(NbaFast {
+                            signal_id: *sig_id,
+                            value: val,
+                            block_index,
+                        });
                     }
                 }
                 Insn::Move(d, s) => {
@@ -15936,6 +16013,34 @@ impl Simulator {
                         });
                     }
                 }
+                // Fused LoadSignal + LoadArrayElem + NbaAssign — see the
+                // `exec_insns_isolated` sibling; reads come from `view`.
+                Insn::NbaAssignArrayRead(sig_id, array_name, idx_sig, width) => {
+                    let idx = view[*idx_sig as usize].to_u64().unwrap_or(0) as i64;
+                    let val = match resolve_bytecode_array_elem(
+                        array_name,
+                        idx,
+                        array_first_id,
+                        signal_name_to_id,
+                    ) {
+                        Some(eid) => view[eid].resize_for_assign(*width),
+                        None => Value::new(1).resize_for_assign(*width),
+                    };
+                    let sig_id = &(*sig_id as usize);
+                    if let Some(i) = if nba_dup {
+                        nba_out.iter().rposition(|n| n.signal_id == *sig_id)
+                    } else {
+                        None
+                    } {
+                        nba_out[i].value = val;
+                    } else if view[*sig_id] != val {
+                        nba_out.push(NbaFast {
+                            signal_id: *sig_id,
+                            value: val,
+                            block_index,
+                        });
+                    }
+                }
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
                     let sig_id = &(*sig_id as usize);
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
@@ -16184,14 +16289,15 @@ impl Simulator {
             local_count += 1;
             #[cfg(feature = "opcode-census")]
             if census_on {
+                const NOP: usize = super::dispatch::NUM_OPCODES;
                 if self.census_counts.is_empty() {
-                    self.census_counts = vec![0u64; 64];
-                    self.census_pairs = vec![0u64; 64 * 64];
+                    self.census_counts = vec![0u64; NOP];
+                    self.census_pairs = vec![0u64; NOP * NOP];
                 }
                 let op = super::dispatch::Opcode::from_insn(&insns[pc]) as usize;
                 self.census_counts[op] += 1;
-                if census_prev < 64 {
-                    self.census_pairs[census_prev * 64 + op] += 1;
+                if census_prev < NOP {
+                    self.census_pairs[census_prev * NOP + op] += 1;
                 }
                 census_prev = op;
             }
@@ -16715,6 +16821,46 @@ impl Simulator {
                         self.nba_fast.push(NbaFast {
                             block_index: 0,
                             signal_id: *sig_id,
+                            value: val,
+                        });
+                    } else {
+                        self.prof_nba_elided += 1;
+                    }
+                }
+                // Fused `LoadSignal ; LoadArrayElem ; NbaAssign` — an RTL
+                // memory read feeding a flop, and 3.7% of the C906 memcpy
+                // instruction stream. Exactly the composition of those three
+                // arms with the two intermediate VM registers elided: the
+                // index is read from signal_table (what `LoadSignal` copied
+                // into a register), the element value is resized for assign
+                // straight from signal_table (what `LoadArrayElem` copied),
+                // and the queue/elision logic is the `NbaAssign` arm verbatim.
+                // The unresolved-element fallback reproduces `LoadArrayElem`'s
+                // 1-bit X. The SoA (`XEZIM_INLINE_BITS`) read shortcut is
+                // deliberately not replicated — `soa_read_ok` only ever holds
+                // for signals whose inline bits are asserted equal to the
+                // canonical table cell, so reading the table is the same value.
+                Insn::NbaAssignArrayRead(sig_id, array_name, idx_sig, width) => {
+                    let idx = self.signal_table[*idx_sig as usize]
+                        .to_u64()
+                        .unwrap_or(0) as i64;
+                    let val = match resolve_bytecode_array_elem(
+                        array_name,
+                        idx,
+                        &self.array_first_id,
+                        &self.signal_name_to_id,
+                    ) {
+                        Some(eid) => self.signal_table[eid].resize_for_assign(*width),
+                        None => Value::new(1).resize_for_assign(*width),
+                    };
+                    let sig_id = *sig_id as usize;
+                    if let Some(i) = self.nba_fast_index.get(sig_id) {
+                        self.nba_fast[i].value = val;
+                    } else if self.signal_table[sig_id] != val {
+                        self.nba_fast_index.insert(sig_id, self.nba_fast.len());
+                        self.nba_fast.push(NbaFast {
+                            block_index: 0,
+                            signal_id: sig_id,
                             value: val,
                         });
                     } else {
@@ -21743,7 +21889,7 @@ impl Simulator {
                 matches!(i,
                     Insn::NbaAssign(id, ..) | Insn::NbaAssignConst(id, ..)
                     | Insn::NbaAssignRange(id, ..) | Insn::NbaAssignRangeDyn(id, ..)
-                    | Insn::NbaAssignBitDyn(id, ..)
+                    | Insn::NbaAssignBitDyn(id, ..) | Insn::NbaAssignArrayRead(id, ..)
                     | Insn::BlockingAssign(id, ..) | Insn::BlockingAssignRange(id, ..)
                     | Insn::BlockingAssignRangeDyn(id, ..) | Insn::BlockingAssignBitDyn(id, ..)
                         if *id as usize == sig_id)
@@ -23762,6 +23908,13 @@ impl Simulator {
             self.prof_insns_executed,
             if self.prof_insns_executed > 0 { self.prof_edge_exec as f64 / self.prof_insns_executed as f64 } else { 0.0 },
             self.prof_fallback_insns);
+        // Static count of `LoadSignal;LoadArrayElem;NbaAssign` triples the
+        // peephole collapsed into `Insn::NbaAssignArrayRead` (see
+        // `BytecodeCompiler::fuse_array_read_nba`).
+        eprintln!(
+            "[FUSE] array-read-NBA fusions (static sites): {}",
+            super::bytecode::array_read_nba_fusions()
+        );
         // XEZIM_OPCODE_CENSUS=1: dynamic opcode + adjacent-pair histogram for
         // fusion planning. Top-20 of each, with % of total executed insns.
         if self.census_enabled && !self.census_counts.is_empty() {
@@ -23792,7 +23945,10 @@ impl Simulator {
             for &(k, c) in pairs.iter().take(20) {
                 eprintln!(
                     "[CENSUS] pair {:>26} -> {:<26} {:>13} ({:.1}%)",
-                    name(k / 64), name(k % 64), c, 100.0 * c as f64 / total as f64
+                    name(k / super::dispatch::NUM_OPCODES),
+                    name(k % super::dispatch::NUM_OPCODES),
+                    c,
+                    100.0 * c as f64 / total as f64
                 );
             }
         }
@@ -24376,6 +24532,7 @@ impl Simulator {
             Insn::Nop => "Nop",
             Insn::LoadSignalRange(..) => "LoadSignalRange",
             Insn::LoadSignalBit(..) => "LoadSignalBit",
+            Insn::NbaAssignArrayRead(..) => "NbaAssignArrayRead",
         }
     }
 
@@ -24395,7 +24552,8 @@ impl Simulator {
             | Insn::BlockingAssign(id, _, _)
             | Insn::BlockingAssignRange(id, _, _, _)
             | Insn::BlockingAssignRangeDyn(id, _, _, _)
-            | Insn::BlockingAssignBitDyn(id, _, _) => Some(*id as usize),
+            | Insn::BlockingAssignBitDyn(id, _, _)
+            | Insn::NbaAssignArrayRead(id, _, _, _) => Some(*id as usize),
             _ => None,
         }
     }
@@ -52058,6 +52216,19 @@ impl Simulator {
                             reads.push(*s as u32);
                         }
                     Insn::LoadArrayElem(..) => dynamic = true,
+                    // Fused `LoadSignal ; LoadArrayElem ; NbaAssign`. It READS
+                    // the index signal (register it exactly as the LoadSignal
+                    // it replaced would have) and WRITES the destination
+                    // whole-width (so, exactly like plain `NbaAssign`, the
+                    // destination is NOT an implicit read). The element read is
+                    // dynamically addressed, so — as for the `LoadArrayElem` it
+                    // replaced — the block must stay non-gateable.
+                    Insn::NbaAssignArrayRead(_, _, s, _) => {
+                        if seen.insert(*s as u32) {
+                            reads.push(*s as u32);
+                        }
+                        dynamic = true;
+                    }
                     // Array-element NBA/blocking writes (memory) use a dynamic
                     // index; conservatively make such blocks non-gateable.
                     Insn::NbaAssignArray(..)
@@ -52281,7 +52452,12 @@ impl Simulator {
                 | Insn::BlockingAssign(id, ..)
                 | Insn::BlockingAssignRange(id, ..)
                 | Insn::BlockingAssignRangeDyn(id, ..)
-                | Insn::BlockingAssignBitDyn(id, ..) => Some(*id),
+                | Insn::BlockingAssignBitDyn(id, ..)
+                // Only the destination is checked here; the index signal this
+                // variant also reads needs no separate check because
+                // `JitModule::is_supported` rejects `NbaAssignArrayRead`
+                // outright, so a block containing one never reaches codegen.
+                | Insn::NbaAssignArrayRead(id, ..) => Some(*id),
                 _ => None,
             };
             if let Some(id) = sig_id {

@@ -45,6 +45,19 @@ pub(crate) fn as_sig_id(id: usize) -> SigId {
     id as SigId
 }
 
+/// Number of `LoadSignal ; LoadArrayElem ; NbaAssign` triples collapsed into
+/// `Insn::NbaAssignArrayRead` across every block compiled in this process.
+/// Reported once by the simulator's `[PROF]` summary so the static fusion
+/// count can be compared against the dynamic opcode census.
+static FUSED_ARRAY_READ_NBA: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Static count of array-read→flop fusions performed. See
+/// [`Insn::NbaAssignArrayRead`].
+pub fn array_read_nba_fusions() -> u64 {
+    FUSED_ARRAY_READ_NBA.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Bytecode instruction set. Stack-free, register-based design.
 /// Each instruction specifies source and destination registers explicitly,
 /// enabling the VM to iterate a flat Vec<Insn> with predictable memory access.
@@ -205,6 +218,28 @@ pub enum Insn {
     /// `LoadSignal`+`BitSelectConst` fusion below runs, which is why it needs
     /// its own pass.
     BranchIfSignalFalse(SigId, u32, u32), // (signal_id, jump_target, bit | u32::MAX)
+
+    /// Fused `LoadSignal` + `LoadArrayElem` + `NbaAssign` — an RTL memory
+    /// read feeding a flop:
+    ///
+    ///   LoadSignal(r1, idx_sig)          ; r1 = the array index, from a signal
+    ///   LoadArrayElem(r2, array, r1)     ; r2 = array[r1]
+    ///   NbaAssign(dst_sig, r2, width)    ; dst_sig <= r2
+    ///       → NbaAssignArrayRead(dst_sig, array, idx_sig, width)
+    ///
+    /// The dominant shape in a CPU's register file and caches. On the C906
+    /// memcpy census the two constituent adjacent pairs each fire 16.5 M times
+    /// with IDENTICAL counts (3.7% of the stream apiece) — one idiom, not two.
+    /// Collapsing it removes two dispatches and two 32-byte VM register
+    /// writes per execution.
+    ///
+    /// NOTE the field order: the DESTINATION signal comes first (so the
+    /// `NbaAssign*` write-extraction alternations bind it in their usual first
+    /// position) and the INDEX signal — which this instruction READS — is
+    /// third. The array element read is dynamically addressed, so like
+    /// `LoadArrayElem` this variant makes an edge block non-gateable in
+    /// `build_event_measure_state`.
+    NbaAssignArrayRead(SigId, Box<ArrayOperand>, SigId, u32), // (dst_sig, array, idx_sig, width)
 }
 
 /// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
@@ -323,6 +358,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::NbaAssignBitDyn(..) => "NbaBitDyn",
         Insn::NbaAssignArray(..) => "NbaArr",
         Insn::NbaAssignArrayRange(..) => "NbaArrRng",
+        Insn::NbaAssignArrayRead(..) => "NbaArrRd",
         Insn::StmtFallback(..) => "Fallback",
     }
 }
@@ -3908,6 +3944,10 @@ impl<'a> BytecodeCompiler<'a> {
         let signal_widths = self.signal_widths;
         let num_regs = (self.next_reg as usize).min(u16::MAX as usize + 1);
         Self::elide_redundant_resizes(&mut self.insns, signal_widths, self.signal_real, num_regs);
+        // AFTER resize elision: an about-to-be-deleted `Resize` sitting between
+        // the array read and the NBA would otherwise hide the triple. Still
+        // before `compact_nops`, which removes the `Nop`s it leaves behind.
+        Self::fuse_array_read_nba(&mut self.insns);
         Self::compact_nops(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
@@ -3928,6 +3968,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::NbaAssignConst(id, _, _)
                 | Insn::NbaAssignRange(id, _, _, _)
                 | Insn::NbaAssignRangeDyn(id, _, _, _)
+                | Insn::NbaAssignArrayRead(id, _, _, _)
                 | Insn::NbaAssignBitDyn(id, _, _) => Some(*id as u32),
                 _ => None,
             };
@@ -3958,6 +3999,8 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::LoadSignalBit(..)
             | Insn::NbaAssignConst(..)
             | Insn::BranchIfSignalFalse(..)
+            // Reads its index straight out of the signal table; no registers.
+            | Insn::NbaAssignArrayRead(..)
             | Insn::Jump(..)
             | Insn::Nop => false,
             Insn::BranchUnlessZero(c, _) => *c == r,
@@ -4193,6 +4236,114 @@ impl<'a> BytecodeCompiler<'a> {
             }
             insns[i] = Insn::BranchIfSignalFalse(sig, t, idx);
             insns[j] = Insn::Nop;
+        }
+    }
+
+    /// Peephole: collapse the RTL "memory read feeding a flop" idiom
+    ///
+    ///   LoadSignal(r1, idx_sig)         ; r1 = the array index, from a signal
+    ///   LoadArrayElem(r2, array, r1)    ; r2 = array[r1]
+    ///   NbaAssign(dst, r2, w)           ; dst <= r2
+    ///       → NbaAssignArrayRead(dst, array, idx_sig, w)
+    ///
+    /// into one instruction, removing two dispatches and two 32-byte VM
+    /// register writes per execution.
+    ///
+    /// The opcode census only proves ADJACENCY; the operand chain is verified
+    /// HERE. `LoadArrayElem`'s index register must be exactly the
+    /// `LoadSignal`'s destination, `NbaAssign`'s value register exactly the
+    /// `LoadArrayElem`'s destination, and — since the fused form writes no
+    /// register at all — neither intermediate may be read anywhere else in the
+    /// block. Registers are allocated fresh per value (`alloc_reg` never
+    /// reuses an id within a block), so any read of `r1`/`r2` outside the
+    /// triple consumes THIS chain; the scan covers the whole block, not just
+    /// the suffix, so a backward jump cannot smuggle one past it.
+    ///
+    /// Runs after `elide_redundant_resizes` (a `Resize` that pass is about to
+    /// delete would otherwise hide the triple) and before `compact_nops`,
+    /// skipping the `Nop` placeholders earlier fusions left behind — those are
+    /// removed before execution, so the three really are consecutive in the
+    /// stream that runs. `XEZIM_FUSE_ARRNBA=0` disables the pass (A/B escape
+    /// hatch).
+    fn fuse_array_read_nba(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_FUSE_ARRNBA").as_deref(), Ok("0"))
+        }) || insns.len() < 3
+        {
+            return;
+        }
+        // Branch targets: fusing must not change what a jump lands on.
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() => {
+                        is_target[*t as usize] = true;
+                    }
+                _ => {}
+            }
+        }
+        // Index of the next instruction that survives `compact_nops`.
+        fn next_real(insns: &[Insn], from: usize) -> Option<usize> {
+            let mut j = from;
+            while j < insns.len() && matches!(insns[j], Insn::Nop) {
+                j += 1;
+            }
+            (j < insns.len()).then_some(j)
+        }
+        for i in 0..insns.len() - 2 {
+            let &Insn::LoadSignal(r1, idx_sig) = &insns[i] else {
+                continue;
+            };
+            let Some(k) = next_real(insns, i + 1) else {
+                continue;
+            };
+            let Insn::LoadArrayElem(r2, _, elem_idx_reg) = &insns[k] else {
+                continue;
+            };
+            let (r2, elem_idx_reg) = (*r2, *elem_idx_reg);
+            if elem_idx_reg != r1 {
+                continue;
+            }
+            let Some(j) = next_real(insns, k + 1) else {
+                continue;
+            };
+            let &Insn::NbaAssign(dst, val_reg, width) = &insns[j] else {
+                continue;
+            };
+            if val_reg != r2 {
+                continue;
+            }
+            // Control must fall through i → k → j: no branch may land on
+            // anything from i+1 through j, or the fused form would swallow an
+            // entry point.
+            if (i + 1..=j).any(|x| is_target[x]) {
+                continue;
+            }
+            let consumed = insns.iter().enumerate().any(|(x, ins)| {
+                x != i
+                    && x != k
+                    && x != j
+                    && (Self::insn_reads_reg(ins, r1) || Self::insn_reads_reg(ins, r2))
+            });
+            if consumed {
+                continue;
+            }
+            // Take the boxed operand out of the `LoadArrayElem` rather than
+            // cloning its name `String`.
+            let Insn::LoadArrayElem(_, array, _) =
+                std::mem::replace(&mut insns[k], Insn::Nop)
+            else {
+                unreachable!("just matched LoadArrayElem")
+            };
+            insns[i] = Insn::NbaAssignArrayRead(dst, array, idx_sig, width);
+            insns[j] = Insn::Nop;
+            FUSED_ARRAY_READ_NBA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -4497,6 +4648,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::NbaAssignBitDyn(..)
                 | Insn::NbaAssignArray(..)
                 | Insn::NbaAssignArrayRange(..)
+                | Insn::NbaAssignArrayRead(..)
                 | Insn::BlockingAssign(..)
                 | Insn::BlockingAssignRange(..)
                 | Insn::BlockingAssignRangeDyn(..)

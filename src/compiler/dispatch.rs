@@ -73,6 +73,7 @@ pub enum Opcode {
     NbaAssignConst,
     BranchUnlessZero,
     BranchIfSignalFalse,
+    NbaAssignArrayRead,
 }
 
 impl Opcode {
@@ -143,6 +144,7 @@ impl Opcode {
             Insn::NbaAssignConst(_, _, _) => Self::NbaAssignConst,
             Insn::BranchUnlessZero(_, _) => Self::BranchUnlessZero,
             Insn::BranchIfSignalFalse(_, _, _) => Self::BranchIfSignalFalse,
+            Insn::NbaAssignArrayRead(_, _, _, _) => Self::NbaAssignArrayRead,
         }
     }
 
@@ -152,7 +154,7 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 64;
+pub const NUM_OPCODES: usize = 65;
 
 /// Dispatch table - proof of concept.
 #[derive(Debug, Clone)]
