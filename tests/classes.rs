@@ -127,6 +127,8 @@ mod uvm_factory_linkage;
 mod uvm_genuine_2017;
 #[path = "classes/uvm_integration_tests.rs"]
 mod uvm_integration_tests;
+#[path = "classes/pure_sv_phase_objection.rs"]
+mod pure_sv_phase_objection;
 #[path = "classes/uvm_objection_bridge.rs"]
 mod uvm_objection_bridge;
 #[path = "classes/uvm_printer_fixes.rs"]
