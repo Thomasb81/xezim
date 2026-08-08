@@ -605,3 +605,80 @@ another "shrink a hot array" optimization without first showing that array is ac
 missing.**
 
 Reverted; tree restored with output byte-identical to baseline.
+
+## Clock-domain kernel batching for `always_ff` — the literal form fails, the inverted form is the best remaining lead
+
+Proposal: on a posedge, instead of waking hundreds of independent event blocks, run one
+clock-domain kernel over the blocks, split into pure compiled FF / dynamic-fallback /
+VPI-visible, executing the pure subset directly.
+
+### Most of the machinery already exists
+
+- **The pure/dynamic split is already computed.** `edge_block_parallel`
+  (`simulator.rs:14853`) is exactly "pure compiled FF": no `StmtFallback`, no blocking
+  writes, no dynamic/array writes, sub-range writes only when single-writer. On c906
+  `XEZIM_PURITY_STATS=1` reports **pure=2859 blocks / 36,946 insns vs non-pure=748 /
+  9,560 — 79.3% of blocks and 79.4% of edge instructions**. Non-pure is dominated by
+  `Nba(array)` (633 blocks, 56% of non-pure insns).
+- **The clock-domain index already exists.** `edge_blocks_by_sig[pos].posedge`
+  (`simulator.rs:10505`) is literally "every block on posedge S". Detection is
+  signal-major (`simulator.rs:30198`), so **`edge_triggered_list` is already segmented by
+  clock signal** — a kernel could record segment boundaries rather than build an index.
+- Class (c) VPI-visible has **no** per-block vector; VPI callbacks are keyed by signal
+  (`dpi_value_change_cbs`) and mutate at run time via `vpi_register_cb`, so block-level
+  VPI visibility would have to be derived dynamically.
+
+### Why the literal form fails: the gating is doing enormous work
+
+`[EVENT-EDGE] would-skip 110,213,593/118,741,930 gateable main-clk flop-fires (**92.8%**)
+had NO data-input change since last posedge`. Only 7.2% of flop fires need to execute at
+all. Running a clock domain without that per-block gating is directly measurable —
+`XEZIM_EVENT_EDGE=0`, same binary, c906 memcpy x50:
+
+| | instructions | cycles |
+|---|---|---|
+| gating on (default) | 284.19 G | 133.43 G |
+| gating off | 338.20 G | 159.88 G |
+| | **+19.0%** | **+19.8%** |
+
+`cost=727` in both. This is the same over-evaluation wall that made `XEZIM_BSP_SETTLE`
++24.7% and capped cone merging. **A clock-domain kernel must keep per-block gating**, which
+leaves it only the per-fire dispatch overhead on the 7.2% that execute.
+
+### The inverted form is where the value is
+
+`[PROF] edge_detect=3111.4ms edge_exec=5140.4ms edges_fired=188,888,084` in a ~33 s run
+(`settle=19479.8ms`). Of the 188.9 M fires, **109.6 M are armed-fast-skips** — so ~79 M
+actually execute and **110 M are rejected one at a time**. `edge_detect` is 3111 ms =
+**~9.4% of simulation time**, much of it spent proving blocks should NOT run.
+
+The `armed` bit is already maintained incrementally: `write_sig!` (`simulator.rs:540`) sets
+`edge_block_armed[bi] = 1` when a data input is written. So the set of blocks that need to
+run is **already known before the clock edge arrives**. Inverting that bitmap into a
+per-domain worklist turns "posedge → walk all fanout blocks → test each → skip 92.8%" into
+"posedge → run exactly the armed set". That is this proposal in the form the data
+supports, and it targets a measured 9.4% rather than fighting the gating.
+
+### Two unconditional per-fire inefficiencies found while measuring
+
+1. `compiled_edge_blocks[bi]` is dereferenced **twice per fire** — once at
+   `simulator.rs:30756` for `instructions.len()` (partition split) and again at
+   `simulator.rs:16291` for ptr/len/num_regs. Both are pointer chases into a cold vector.
+2. The gating makes **two linear passes over the same read span** per surviving fire: a
+   snapshot compare (`simulator.rs:30565`) then a full snapshot refresh
+   (`simulator.rs:30677`).
+3. Minor: `std::env::var("XEZIM_FORCE_PARALLEL")` is called **per dispatch pass**
+   (`simulator.rs:30787`) — uncached, unlike the neighbouring `cached_env_flag` helpers.
+   Only reached when the parallel path qualifies, so it does not affect `XEZIM_NO_PARALLEL`
+   benchmarks, but it is a real cost in default runs.
+
+### The c910 order-dependency bug now has a mechanism
+
+`is_pure` (`simulator.rs:14853`) applies the `nba_writer_count > 1` multi-writer test only
+to `NbaAssignRange`/`NbaAssignBitDyn` — **not to whole-signal `NbaAssign`**. Meanwhile the
+sequential NBA path stamps `block_index: 0` and resolves collisions by queue position
+(`simulator.rs:16891`), with `nba_fast_index` overwriting in place. So two blocks that
+`is_pure` calls order-independent, both NBA-writing the same signal, are resolved by
+**dispatch order** — which is exactly why sorting `parallel_blocks` hangs c910 at
+iters=200040. The machinery to detect this (`nba_writer_count`, `simulator.rs:14803`)
+already exists and simply is not applied to the whole-signal case.
