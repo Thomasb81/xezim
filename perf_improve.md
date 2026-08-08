@@ -1124,3 +1124,56 @@ because the big `Vec`s are single large allocations served directly by `mmap`. T
 properly needs an explicit `madvise(MADV_HUGEPAGE)` on the large arrays — a small code
 change, not a config flag. Untested; the only memory-side lever left with a plausible
 mechanism.
+
+## Huge pages: the feature already exists, and it is INERT on this machine
+
+`Simulator::advise_hugepages()` (`simulator.rs:13480`, called from `simulate()` at 13539)
+already exists, is **default-on** (`XEZIM_HUGEPAGE=0` disables), and covers exactly the
+arrays the TLB analysis pointed at: `signal_table`, `signal_widths`, `signal_signed`,
+`signal_real`, `signal_two_state`, `dirty_signals`, `comb_dep_offsets`, `comb_dep_entries`,
+`comb_entries`. It issues `MADV_HUGEPAGE` then `MADV_COLLAPSE`.
+
+**Correction to the previous section:** the 170 M dTLB misses reported there were measured
+*with this already enabled*. Huge pages were never an untried lever.
+
+### Both madvise results were discarded, hiding a total failure
+
+Added `XEZIM_HUGEPAGE_STATS=1`:
+
+```
+[HUGEPAGE] signal_table    1071.60 MiB  HUGEPAGE=ok COLLAPSE=errno 22 (2MiB-aligned)
+[HUGEPAGE] signal_widths    133.95 MiB  HUGEPAGE=ok COLLAPSE=errno 22 (2MiB-aligned)
+...  (every array identical; comb_dep_entries 0.39 MiB SKIPPED, < 2 MiB)
+```
+
+**`MADV_COLLAPSE` fails with EINVAL on every array.** And per the function's own comment,
+`MADV_HUGEPAGE` alone cannot help here — the arrays are fully populated by `compile()`
+before the advice is issued, so there are no future faults left to steer.
+
+### It is the environment, not xezim
+
+A standalone C probe: a fresh 64 MiB anonymous `mmap`, 2 MiB-aligned, fully faulted —
+`MADV_COLLAPSE` still returns EINVAL. And checking `/proc/self/smaps_rollup`:
+
+| case | AnonHugePages |
+|---|---|
+| advise **then** fault (the ideal case) | **0 kB** |
+| fault then advise (what xezim does) | **0 kB** |
+
+`transparent_hugepage/enabled` reports `always [madvise] never`, but **no huge pages are
+obtainable at all** — a container/VM restriction below the sysfs knob.
+
+Consequences:
+1. The hp-on vs hp-off A/B (LLC -4.8%, cycles -0.5%) is **noise, not a huge-page effect** —
+   nothing was ever backed by a huge page in either arm.
+2. The "dTLB misses are 3x LLC misses, worth 1.3-2.5%" lead **cannot be tested on this
+   machine**. It remains plausible and unverified.
+
+### The design fix worth making on a machine where THP works
+
+`advise_hugepages()` runs from `simulate()`, i.e. *after* `compile()` has populated every
+array — which is precisely the case `MADV_HUGEPAGE` cannot serve, leaving the whole feature
+dependent on `MADV_COLLAPSE`. Issuing the advice at **allocation time**, before the arrays
+are filled, is the case THP is designed for and would not need `MADV_COLLAPSE` at all.
+Deliberately NOT implemented here: it cannot be measured in this environment, and shipping
+an unmeasurable change is exactly what the rest of this document argues against.
