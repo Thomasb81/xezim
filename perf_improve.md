@@ -823,3 +823,67 @@ The temporary repro flag was removed; nothing shipped.
 One structural fact worth recording: this sort sits inside `if use_parallel`, which
 `XEZIM_NO_PARALLEL=1` skips entirely. **Every performance measurement in this document is
 therefore orthogonal to this constraint** — an earlier framing of mine implied otherwise.
+
+## Bit-granular comb sensitivity — prototyped and measured: 9.8% of evaluations avoidable
+
+Built the measurement using the SAME data structure the real optimization needs — a
+per-dependency-edge read mask parallel to `comb_dep_entries` — but counting suppressions
+instead of performing them, so a wrong mask skews the estimate rather than dropping a
+wakeup. `XEZIM_BITGRAN=1`, c906 memcpy x50, `cost=727` throughout.
+
+### Results
+
+```
+[BITGRAN] dep edges: 26239 narrow, 75422 all-bits (25.8% narrowable)
+[BITGRAN] dependent-wakeups tested=510,731,563 suppressible=121,355,954 (23.8%)
+[BITGRAN] ENTRY EVALUATIONS avoided=22,933,862/233,348,958 (9.8%)
+```
+
+The three numbers measure different things and only the last one matters. 23.8% of
+*trigger edges* are suppressible, but an entry woken by three inputs is still evaluated
+once — suppression only saves work when EVERY input that woke it was bit-irrelevant. That
+is **9.8% of all comb entry evaluations**, i.e. **22.9M of the 63.3M wasted evaluations —
+36.2% of all waste recovered**.
+
+### Cost
+
+The disabled path measured **+0.63%** (285.89G vs 284.1G baseline) purely from the
+`if bitgran_on` branch in `trigger_deps!`. A real implementation makes the test
+unconditional, so that same ~0.6% IS the mechanism's cost: one mask load, one AND, one
+branch per dependent across 510.7M tests. Net expectation therefore ~9% of evaluations
+saved against ~0.6% added — and because the avoided evaluations are bit-reading VM entries
+(above average cost, they enter the interpreter), the time saving should exceed the
+evaluation-count share.
+
+### The classifier, and why it is safe
+
+Of 66 `Insn` variants exactly **15 carry a SigId** and 9 carry a `Box` payload; the other
+42 are pure register/constant ops that cannot name a signal. Reads narrow only for
+`LoadSignalBit` (one bit), `LoadSignalRange` (a range); `LoadSignal`/`LoadSignalSigned`/
+`BranchIfSignalFalse` take all bits; sub-range writes take all bits because they preserve
+the untouched bits (an implicit read of the destination); and `StmtFallback` plus every
+`ArrayOperand`-carrying opcode **bail the whole entry to all-bits**, since they can name
+signals the scan cannot see. Only compiled VM entries are analysed — `FusedGate` and the
+copy/fanout arms stay at all-bits, so the 9.8% is a floor, not a ceiling.
+
+### Design note for the real implementation — do NOT use the prototype's shadow arrays
+
+The prototype derives the changed mask by diffing against `bitgran_shadow_val/xz`, two
+`Vec<u64>` sized to the signal count = **561 MB on c906**. That is fine for a diagnostic and
+wrong for production. The write sites already hold both old and new values, so the changed
+mask should be computed there and passed into `trigger_deps!`: the fused arms know the
+exact bit (`set_bit_code` -> `1 << bit`), `FastDirectCopy` has `(sv^dv)|(sx^dx)` in hand,
+and the compiled path would carry a mask alongside `dirty_list`. No per-signal array needed.
+
+Correctness argument for the shadow/broadcast scheme, which carries over: a bit change is
+always contained in exactly one broadcast's changed mask, and every dependent is tested at
+that broadcast, so a dependent whose mask includes the bit is never skipped.
+
+### Bug found while building it
+
+`self.comb_dep_entries` is `mem::take`n into a settle-local for the whole settle, so the
+field reads EMPTY inside the loop. Indexing `self.comb_dep_entries[k]` there panics with
+"len is 0". Anything added to `trigger_deps!` must use the locals, not the fields.
+
+Prototype preserved at `scratchpad/BITGRAN-prototype.patch` (251 lines). Reverted; tree
+restored byte-identical.
