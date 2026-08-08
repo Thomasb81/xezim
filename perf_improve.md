@@ -672,7 +672,7 @@ supports, and it targets a measured 9.4% rather than fighting the gating.
    Only reached when the parallel path qualifies, so it does not affect `XEZIM_NO_PARALLEL`
    benchmarks, but it is a real cost in default runs.
 
-### The c910 order-dependency bug now has a mechanism
+### The c910 order-dependency bug — this hypothesis was DISPROVEN (see below)
 
 `is_pure` (`simulator.rs:14853`) applies the `nba_writer_count > 1` multi-writer test only
 to `NbaAssignRange`/`NbaAssignBitDyn` — **not to whole-signal `NbaAssign`**. Meanwhile the
@@ -682,3 +682,46 @@ sequential NBA path stamps `block_index: 0` and resolves collisions by queue pos
 **dispatch order** — which is exactly why sorting `parallel_blocks` hangs c910 at
 iters=200040. The machinery to detect this (`nba_writer_count`, `simulator.rs:14803`)
 already exists and simply is not applied to the whole-signal case.
+
+
+## `is_pure` multi-writer hole — closed, but it is NOT the c910 bug
+
+**Correction to the previous section.** I proposed that c910's block-order dependency was
+caused by `is_pure` (`simulator.rs:14853`) applying its `nba_writer_count > 1` multi-writer
+test only to `NbaAssignRange`/`NbaAssignBitDyn` and not to whole-signal `NbaAssign` — so two
+blocks NBA-writing the same signal would be labelled order-independent while actually being
+resolved by dispatch order. **The measurement disproves it.**
+
+Extending the test to the whole-signal variants (`NbaAssign`, `NbaAssignConst`,
+`NbaAssignArrayRead`) and adding a `[PURITY]` category for them:
+
+| design | pure before | pure after | whole-sig multi-writer blocks |
+|---|---|---|---|
+| c906 | 2859 / 36,946 insns | **2859 / 36,946** | **0** |
+| c910 | 19,181 / 362,419 insns | **19,181 / 362,419** | **0** |
+
+Zero blocks on either design. Confirmed a true negative rather than dead code by
+temporarily lowering the threshold to `> 0`, which catches **616 blocks on c906** — the arm
+is live and simply never fires at `> 1`.
+
+The reason is now clear and it vindicates the original author's scoping: in these designs
+the multi-writer pattern is confined to **sub-range** writes — yosys-style per-bit flops
+(`cpu_state[0] <= _00014_;` in one block, `cpu_state[1] <= _00015_;` in another) — which
+the existing test already covered. Whole-signal NBA targets have exactly one writing block.
+
+### What was kept, and why
+
+The fix ships anyway (`d8bff6f`): a block that whole-signal-NBA-writes a multi-writer target
+genuinely is not order-independent, and `is_pure` claiming otherwise is a real hole that a
+different design could hit. It is correct by construction and costs nothing measured —
+**zero blocks demoted on both designs**, c906 stdout byte-identical, c910 `cost=216
+finish=2282050` exact, 1742 + 44 tests passing. `nba_writer_count` is now built
+unconditionally, since the whole-signal arm needs it even under `XEZIM_NO_PARALLEL_RANGE`.
+
+But it is **defensive, not a fix for the c910 hang**, and that bug remains unexplained.
+Remaining suspects, none yet checked: `write_sig!` side effects coupling blocks within one
+edge (`simulator.rs:540` re-arms `edge_block_armed`; `:559-565` records `edge_exec_wrote`,
+driving `drain_edge_exec_rescan`, which can re-fire blocks at the same timestamp);
+`apply_nba` ordering changing the dirty-list order into settle; or the hang being specific
+to the partition / k-way-merge path and misattributed to `t=1 k=0`. It should not be
+described as understood until there is a repro.
