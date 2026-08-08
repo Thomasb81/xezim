@@ -69,3 +69,5 @@ mod struct_collections_across_calls;
 mod stream_justify_assoc_default_partsel;
 #[path = "collections/whole_array_continuous_assign.rs"]
 mod whole_array_continuous_assign;
+#[path = "collections/string_foreach_content.rs"]
+mod string_foreach_content;
