@@ -41,6 +41,18 @@ module tb;
   logic [1:0] mid;
   assign mid = v[0][1];
 
+  // DYNAMIC indices in the chain — the shape a
+  //   for (i) for (j) if (vld[i][j][0])
+  // checker loop produces. The constant path cannot fold these, so they used
+  // to fall through to a plain bit select and read x; testbenches hit this as
+  // "loops over multi-dim arrays do not work" and hand-unrolled to dodge it.
+  int di, dj;
+  logic dyn_full, dyn_mixed;
+  logic [1:0] dyn_slice;
+  assign dyn_full  = v[di][dj][1];   // every level dynamic but the last
+  assign dyn_mixed = v[0][dj][1];    // mix of constant and dynamic
+  assign dyn_slice = v[di][dj];      // dynamic chain stopping one level short
+
   // The guard shape that silently never fired. Gated and snapshotted so the
   // count is race-free: `snapshot` is read one time-unit AFTER the third
   // edge's activation has fully settled, and `stop` freezes the counter —
@@ -51,6 +63,7 @@ module tb;
 
   initial begin
     fired = 0; stop = 0;
+    di = 0; dj = 0;
     v = '0;
     v[0][0] = 2'b10;
     v[0][1] = 2'b01;
@@ -70,6 +83,15 @@ fn chained_selects_read_the_declared_element() {
     assert_eq!(u(&sim, "a010"), 1, "v[0][1][0]");
     assert_eq!(u(&sim, "a011"), 0, "v[0][1][1] — read x before the fix");
     assert_eq!(u(&sim, "mid"), 0b01, "v[0][1] two-level slice");
+}
+
+#[test]
+fn dynamic_indices_in_a_chain_select_the_declared_element() {
+    let sim = simulate(SRC, 200).expect("simulate failed");
+    // v[0][0] = 2'b10, v[0][1] = 2'b01  =>  v[0][0][1] is 1, v[0][1] is 2'b01
+    assert_eq!(u(&sim, "dyn_full"), 1, "v[di][dj][1] with di=dj=0 — read x before the fix");
+    assert_eq!(u(&sim, "dyn_mixed"), 1, "v[0][dj][1] — constant and dynamic levels mixed");
+    assert_eq!(u(&sim, "dyn_slice"), 0b10, "v[di][dj] — dynamic chain stopping one level short");
 }
 
 #[test]
