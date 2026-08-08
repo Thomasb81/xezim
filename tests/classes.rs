@@ -117,8 +117,14 @@ mod std_randomize_struct;
 mod string_method_shadows_class_method;
 #[path = "classes/struct_with_class_handle.rs"]
 mod struct_with_class_handle;
+#[path = "classes/struct_output_inout_ref_formal.rs"]
+mod struct_output_inout_ref_formal;
+#[path = "classes/type_param_struct_formal.rs"]
+mod type_param_struct_formal;
 #[path = "classes/typename_param_class.rs"]
 mod typename_param_class;
+#[path = "classes/unpacked_struct_class_property_whole_value.rs"]
+mod unpacked_struct_class_property_whole_value;
 #[path = "classes/uvm_config_db_tests.rs"]
 mod uvm_config_db_tests;
 #[path = "classes/uvm_factory_linkage.rs"]
@@ -127,9 +133,15 @@ mod uvm_factory_linkage;
 mod uvm_genuine_2017;
 #[path = "classes/uvm_integration_tests.rs"]
 mod uvm_integration_tests;
+#[path = "classes/pure_sv_phase_objection.rs"]
+mod pure_sv_phase_objection;
 #[path = "classes/uvm_objection_bridge.rs"]
 mod uvm_objection_bridge;
 #[path = "classes/uvm_printer_fixes.rs"]
 mod uvm_printer_fixes;
 #[path = "classes/virtual_iface_this_binding.rs"]
 mod virtual_iface_this_binding;
+#[path = "classes/class_unpacked_struct_property.rs"]
+mod class_unpacked_struct_property;
+#[path = "classes/struct_output_formal.rs"]
+mod struct_output_formal;

@@ -278,3 +278,43 @@ fn body_driven_input_port_still_reaches_the_parent_net() {
          the parent net, not fight its own connection assign"
     );
 }
+
+/// A port whose packed multi-D type arrives via a TYPEDEF. Both helpers that
+/// register element metadata bail immediately on a `TypeReference` carrying no
+/// dimensions of its own, so such a port registered nothing and `p[i]`
+/// degraded to a one-BIT select — the exact failure the inline
+/// `logic [1:0][3:0]` form was fixed for, reached by a different spelling of
+/// the same type. The inline form working is what made this look
+/// type-specific rather than a missing typedef resolution.
+const SRC_TYPEDEF_PORT: &str = r#"
+typedef logic [1:0][3:0] pair_t;
+
+module tsink (input pair_t tp, output logic [3:0] t0, output logic [3:0] t1, output int tew);
+   assign t0  = tp[0];
+   assign t1  = tp[1];
+   assign tew = $bits(tp[0]);
+endmodule
+
+module tb;
+   logic [7:0] flat;          // deliberately NOT declared with the packed dims
+   logic [3:0] t0, t1;
+   int         tew;
+   tsink u (.tp(flat), .t0(t0), .t1(t1), .tew(tew));
+   initial begin
+      flat = 8'h2D;           // asymmetric: elem[0]=D, elem[1]=2
+      #1;
+   end
+endmodule
+"#;
+
+#[test]
+fn typedefd_packed_multi_d_port_keeps_its_element_stride() {
+    let sim = simulate(SRC_TYPEDEF_PORT, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "tew"), 4, "$bits(tp[0]) through a typedef'd packed multi-D port");
+    assert_eq!(u(&sim, "t0"), 0xD, "tp[0] must be the low nibble of 8'h2D");
+    assert_eq!(
+        u(&sim, "t1"),
+        0x2,
+        "tp[1] must be the high nibble; a one-bit select would read bit 1 and give 0"
+    );
+}

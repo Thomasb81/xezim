@@ -69,6 +69,8 @@ mod enum_xz_and_package_shapes;
 mod formal_type_metadata_and_typedef_packed_array;
 #[path = "types/forward_referenced_parameter.rs"]
 mod forward_referenced_parameter;
+#[path = "types/forward_typedef_class_handle_width.rs"]
+mod forward_typedef_class_handle_width;
 #[path = "types/function_return_width.rs"]
 mod function_return_width;
 #[path = "types/implicit_port_net_and_packed_typedef_array.rs"]
@@ -95,6 +97,8 @@ mod multi_dim_elem_read_and_param_dims;
 mod ascending_indexed_part_select;
 #[path = "types/nonzero_based_vector_writes.rs"]
 mod nonzero_based_vector_writes;
+#[path = "types/nonzero_based_vector_reads.rs"]
+mod nonzero_based_vector_reads;
 #[path = "types/nested_packed_typedefs.rs"]
 mod nested_packed_typedefs;
 #[path = "types/packed_2d_element_in_size_cast.rs"]
@@ -151,6 +155,8 @@ mod struct_unpacked_array_member;
 mod submodule_packed_struct_member_contassign;
 #[path = "types/tagged_union_matches.rs"]
 mod tagged_union_matches;
+#[path = "types/tagged_union_pattern_literal.rs"]
+mod tagged_union_pattern_literal;
 #[path = "types/task_formal_param_width.rs"]
 mod task_formal_param_width;
 #[path = "types/type_param_bound_to_specialization.rs"]
@@ -187,3 +193,7 @@ mod value_param_specialization;
 mod vcd_param_as_wire;
 #[path = "types/wide_signed_arith_and_power.rs"]
 mod wide_signed_arith_and_power;
+#[path = "types/byte_local_narrow.rs"]
+mod byte_local_narrow;
+#[path = "types/packed_struct_array_elem_write.rs"]
+mod packed_struct_array_elem_write;

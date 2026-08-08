@@ -45,3 +45,16 @@ scratchpad/
 
 # UVM benchmark result CSVs (bench/run_uvm_bench.sh)
 bench_uvm_*.csv
+tr_db.log
+
+# Files a test run drops in the REPO ROOT. The testcases `$fopen` these with a
+# relative path, so they land in whatever directory `cargo test` ran from —
+# they are outputs, not fixtures. PR #99 committed several of them by accident.
+#   fscanf_pos_tmp.txt  tests/classes/nonvirtual_dispatch_fscanf_process.rs
+#   ch21_memdump.dec    $readmemh/$writememh round-trip case
+#   /work/              ivtest-derived cases writing work/{temp,test,...}
+# `/work/` is deliberately root-anchored: `simtest/xuantie_c906/work/c906.fl`
+# is a tracked fixture and an unanchored `work/` would swallow it.
+fscanf_pos_tmp.txt
+ch21_memdump.dec
+/work/

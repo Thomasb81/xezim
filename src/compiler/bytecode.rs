@@ -2673,13 +2673,41 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
                 // Bit select
+                //
+                // §7.4.1: a non-zero-based vector stores its declared low bit
+                // at PHYSICAL offset 0 — `logic [3:1] w` keeps declared bit 1
+                // at offset 0, and `logic [1:1] h` is one bit at offset 0.
+                // Both `Insn::BitSelect*` index raw physical bits, so the
+                // declared index has to be rebased first. The WRITE path
+                // already does this via `emit_rebased_index`; the read path
+                // did not, so `h[1]` selected physical bit 1 of a one-bit
+                // signal and evaluated to x. `$display("%b", h[1])` was
+                // correct throughout because it goes through the AST
+                // interpreter, which rebases — so the bug only showed in
+                // assign / always_comb / always_ff, which compile to bytecode.
                 let base = self.compile_expr(expr, 0)?;
+                let base_lo = match &expr.kind {
+                    ExprKind::Ident(h) => self.declared_low_bound(h),
+                    _ => 0,
+                };
                 if let Some(idx) = self.eval_const_expr(index) {
                     let dest = self.alloc_reg();
-                    self.emit(Insn::BitSelectConst(dest, base, idx));
+                    // Saturate rather than wrap: an out-of-range declared index
+                    // is already x-valued, and a negative operand would read as
+                    // a huge unsigned bit position.
+                    let phys = (idx as i64 - base_lo).max(0) as u32;
+                    self.emit(Insn::BitSelectConst(dest, base, phys));
                     return Some(dest);
                 }
                 let idx = self.compile_expr(index, 0)?;
+                let idx = if base_lo != 0 {
+                    match &expr.kind {
+                        ExprKind::Ident(h) => self.emit_rebased_index(h, idx),
+                        _ => idx,
+                    }
+                } else {
+                    idx
+                };
                 let dest = self.alloc_reg();
                 self.emit(Insn::BitSelect(dest, base, idx));
                 Some(dest)
@@ -2753,6 +2781,16 @@ impl<'a> BytecodeCompiler<'a> {
                     };
                     let base = self.compile_expr(expr, 0)?;
                     let idx = self.compile_expr(left, 0)?;
+                    // §7.4.6/§11.5.1: the base index is a DECLARED index, but
+                    // `RangeSelect` takes physical bit offsets — rebase it for a
+                    // non-zero-based vector exactly as the plain bit select
+                    // does. Without this `w[1 +: 2]` on a `logic [3:1] w` read
+                    // physical 2:1 (declared 3:2) instead of declared 2:1, and
+                    // `w[3 -: 2]` ran off the top of the signal and returned x.
+                    let idx = match &expr.kind {
+                        ExprKind::Ident(h) => self.emit_rebased_index(h, idx),
+                        _ => idx,
+                    };
                     let dest = self.alloc_reg();
                     if width == 1 {
                         self.emit(Insn::RangeSelect(dest, base, idx, idx));
