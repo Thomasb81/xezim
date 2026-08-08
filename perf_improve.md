@@ -530,3 +530,32 @@ performance work. Prefetching was only ever the messenger.
 
 Reverted at user direction; tree restored to `7ccf55a` with simulation output
 byte-identical to baseline.
+
+### cmark A/B — instruction cost confirmed, timing self-contaminated
+
+The c906 cmark x2 A/B finished after the revert. All four runs produced the golden
+`714196` cycles/iteration.
+
+| run (in order) | instructions | cycles | wall |
+|---|---|---|---|
+| off1 | 6001.8 G | 3522.3 G | 1125.6 s |
+| on1 | 6067.7 G | 3363.5 G | 1091.6 s |
+| off2 | 6004.7 G | 3118.2 G | 949.7 s |
+| on2 | 6066.9 G | 2628.0 G | 682.4 s |
+
+**Instructions: +1.07%**, matching the clean memcpy figure of +0.96% — architecturally
+exact, so contention-independent, and the one trustworthy column here.
+
+**The cycles and wall columns are invalid.** A c910 run was executing concurrently and was
+killed partway through this sequence, so contention fell monotonically across
+`off1 -> on1 -> off2 -> on2`; the fastest run is simply the last one. Read naively the
+table shows -14.5% wall for the prefetch, which is an artifact of that gradient. Recorded
+here as a worked example of the failure mode the measurement protocol exists to prevent:
+**never interleave an A/B with an unrelated long job, and never let machine load drift
+monotonically across the run order.**
+
+This neither confirms nor refutes the original 31%. But it does show the instruction cost
+is the same on cmark as on memcpy, so there is no mechanism by which cmark would respond
+60x more strongly than the clean memcpy measurement (-0.50% cycles) did. A contaminated
+baseline of exactly this shape remains the most economical explanation for the original
+figure.
