@@ -201,3 +201,5 @@ mod packed_struct_array_elem_write;
 mod bits_of_type_operands;
 #[path = "types/packed_3d_chained_select.rs"]
 mod packed_3d_chained_select;
+#[path = "types/unary_context_width.rs"]
+mod unary_context_width;

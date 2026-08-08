@@ -2433,6 +2433,23 @@ impl<'a> BytecodeCompiler<'a> {
                     ctx_width
                 };
                 let src = self.compile_expr(operand, operand_ctx)?;
+                // §11.6.1: `~` and unary `-` are CONTEXT-determined — the
+                // operand is extended to the context width BEFORE the
+                // operation, not after. Passing `operand_ctx` down is not
+                // enough on its own: a plain signal load returns its declared
+                // width, so `logic [31:0] r = ~a;` with an 8-bit `a` computed
+                // ~a in 8 bits and zero-extended, giving 0000004b where
+                // ffffff4b is required (and 0000004c for `-a`). Resize
+                // explicitly; the value carries its own signedness, so a
+                // signed operand still sign-extends.
+                let src = if operand_ctx > 0
+                    && matches!(op, UnaryOp::Minus | UnaryOp::BitNot)
+                {
+                    self.emit(Insn::Resize(src, operand_ctx));
+                    src
+                } else {
+                    src
+                };
                 let dest = self.alloc_reg();
                 match op {
                     UnaryOp::Plus => return Some(src),
