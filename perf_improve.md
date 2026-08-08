@@ -887,3 +887,68 @@ field reads EMPTY inside the loop. Indexing `self.comb_dep_entries[k]` there pan
 
 Prototype preserved at `scratchpad/BITGRAN-prototype.patch` (251 lines). Reverted; tree
 restored byte-identical.
+
+## Bit-granular sensitivity, REAL implementation — correct, suppresses as predicted, does not pay
+
+Built the full mechanism (not just the counter): per-dependency-edge read masks, a changed-bit
+mask derived per propagation, and actual suppression in `trigger_deps!`. `XEZIM_NO_BITGRAN=1`
+disables it for same-binary A/B.
+
+### Correctness: exact
+
+**Byte-identical output with suppression ON vs OFF and vs the pristine baseline**, on BOTH
+designs — c906 `cost=727`, c910 `cost=216`. The mask classifier is sound.
+
+### It suppresses, roughly as predicted
+
+| design | entry_evals OFF | entry_evals ON | avoided |
+|---|---|---|---|
+| c906 | 233,348,958 | 220,033,704 | **-5.7%** |
+| c910 | 601,191,165 | 582,283,560 | **-3.1%** |
+
+(The prototype predicted 9.8% on c906; the real figure is 5.7% because the settle SEEDING
+path drains `dirty_list` and walks the CSR directly, bypassing `trigger_deps!` entirely.
+From the earlier dirty-propagation census that path is ~69% of all wakeups.)
+
+### But it costs more than it saves
+
+c906 memcpy x50, 2 interleaved reps, against the 284.1 G pristine baseline:
+
+| | instructions | cycles | wall |
+|---|---|---|---|
+| pristine | 284.1 G | ~134 G | ~34 s |
+| machinery present, OFF | 289.5 G (+1.9%) | 136.1 G | 34.8 s |
+| suppression ON | **285.2 G (+0.4%)** | 136.2 G (+1.6%) | 35.4 s |
+
+Suppression recovers 4.3 G instructions but the machinery costs 5.4 G. **Net +0.4%
+instructions and +1.6% cycles — a loss.** c910 agrees: -0.17% instructions from suppression,
+nowhere near the machinery cost.
+
+### Why: the test/benefit ratio
+
+**510 M edge tests to avoid 13.3 M evaluations — 38 tests per avoided evaluation.** The mask
+test is paid on every dependency edge traversal, but the saving only materialises when EVERY
+trigger for an entry is suppressed. And the three extra arrays (mask + two shadow planes) are
+randomly accessed, so cycles degrade more than instructions — the same memory-traffic
+mechanism that sank the `settle_triggered` bitset.
+
+### Two implementation lessons worth keeping
+
+1. **Indexed access in `trigger_deps!` cost +4.3% by itself.** Rewriting the dependent loop
+   from a slice iterator to `for k in lo..hi` adds a bounds check on BOTH arrays across ~510 M
+   iterations. Zipping the two slices instead recovered 2.4 points of that. Anything touching
+   this loop must avoid indexed access.
+2. **`self.comb_entries` is assigned ~260 lines AFTER the dependency CSR** inside
+   `build_comb_entries`. Building masks right after the CSR silently produced an all-`u64::MAX`
+   table (no suppression at all, 25.9 K evals avoided instead of 13.3 M) with no error. The
+   build must follow `self.comb_entries = entries;`.
+
+### The one unexplored lever
+
+The seeding path bypasses the masks and is ~69% of wakeups. Masking it too would roughly
+double the suppression (5.7% -> ~9.8% of evals, ~+3 G instructions saved) — but that is still
+short of the 5.4 G machinery cost, and it would add test cost on the seeding path as well. So
+the expected best case remains around parity, and cycles would likely stay worse. Not pursued.
+
+Working implementation preserved at `scratchpad/BITGRAN-real-implementation.patch` (257 lines,
+byte-identical on both designs). Reverted; tree restored.
