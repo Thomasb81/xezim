@@ -197,3 +197,7 @@ mod wide_signed_arith_and_power;
 mod byte_local_narrow;
 #[path = "types/packed_struct_array_elem_write.rs"]
 mod packed_struct_array_elem_write;
+#[path = "types/bits_of_type_operands.rs"]
+mod bits_of_type_operands;
+#[path = "types/packed_3d_chained_select.rs"]
+mod packed_3d_chained_select;
