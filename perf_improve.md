@@ -559,3 +559,49 @@ is the same on cmark as on memcpy, so there is no mechanism by which cmark would
 60x more strongly than the clean memcpy measurement (-0.50% cycles) did. A contaminated
 baseline of exactly this shape remains the most economical explanation for the original
 figure.
+
+
+## `settle_triggered` bitset — measured, rejected (Aug 2026)
+
+`settle_triggered` is a `Vec<bool>` — one **byte** per comb entry, probed once per settle
+dispatch and once per dependent inside `trigger_deps!` (119.1 M propagation round trips
+per c906 run). At 52 KB on c906 and 367 KB on c910 it sits past the 32 KiB L1d, so packing
+it to one bit per entry (6.5 KB / 46 KB) looked like a clean locality win — and unlike
+cone merging it touches **100%** of evaluations.
+
+Converted to a packed `EntryFlags` with `test_and_set` fusing the probe-then-set that
+`trigger_deps!` performs. Correct: `cost=727`, output byte-identical. c906 memcpy x50,
+3 interleaved reps:
+
+| | baseline | bitset (checked) | bitset (unchecked) |
+|---|---|---|---|
+| instructions | 284.20 G | +1.96% | **+1.42%** |
+| cycles | 134.22 G | +1.34% | **+1.58%** |
+| wall | 35.20 s | +3.4% | +1.8% |
+
+Rust bounds checks on `words[i >> 6]` cannot be elided (indexing can panic), so the
+unchecked variant used `get_unchecked` with a `debug_assert!`. It recovered only 0.54 pp —
+**bounds checking was not the problem.**
+
+### Why it lost, and it is not the obvious reason
+
+The decisive number is that **cycles rose more than instructions** (+1.58% vs +1.42%). Had
+the smaller footprint helped even slightly, cycles would have risen *less* than
+instructions. They did not, so there is no cache benefit hiding behind the instruction
+cost — the packed form is worse for the memory system as well.
+
+The likely mechanism is false serialization. With one byte per entry, two entries in the
+same cache line still have **independent addresses**, so a store to one never blocks a
+load of another. Packed 64-to-a-word, every `set`/`clear` creates a store-to-load
+dependency for all 64 neighbours — and `trigger_deps!` walks CSR runs of clustered entry
+indices, so it hits that pattern constantly. Density bought L1 residency and paid for it
+in a dependency chain.
+
+**Corollary.** This is now the third footprint-reduction attempt to lose on this workload,
+after the 16-byte signal planes (header tax, +11.3%) and this. At IPC ~2.14 with a 6.4%
+cache-miss rate, xezim is instruction-bound, and shrinking a hot array reliably costs more
+in added instructions and dependencies than it recovers in misses. **Do not propose
+another "shrink a hot array" optimization without first showing that array is actually
+missing.**
+
+Reverted; tree restored with output byte-identical to baseline.
