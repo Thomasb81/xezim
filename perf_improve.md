@@ -1002,3 +1002,70 @@ net negative, and the IPC collapse to 1.79 reproduces the 0.109 measurement almo
 a codegen-quality problem. VM registers live in cranelift stack slots, so native code
 reproduces the interpreter's memory traffic minus dispatch, then pays it back in FFI bridge
 calls. Raising coverage first would make it slower still.
+
+## Cache-fit structure (Aug 2026) — two diagnostic defects, and two pathological arrays
+
+### The diagnostic was lying about the hardware
+
+`XEZIM_CACHE_FIT=1` hardcoded `L1d=32KiB L2=1MiB L3=16.5MiB`. The actual machine is a Tiger
+Lake i7-1165G7: **L1d=48 KiB, L2=1.25 MiB, L3=12 MiB**. Every "x L3" ratio was therefore
+~37% understated — the headline "79x L3" is really **109x L3**. Now read from
+`/sys/devices/system/cpu/cpu0/cache/`.
+
+Second defect: `one signal's hot bytes across arrays = 39 B (spans 1 lines if scattered)`
+divided 39 by the 64-byte line size — which answers the *contiguous* question, the opposite
+of what "if scattered" means. Those 39 bytes live in **five separate arrays**, so touching
+all of them costs **up to five distinct cache lines**, not one. A layout report that makes a
+5-line access look like 1 is worse than no report.
+
+### The layout, corrected
+
+| array | c906 | c910 | indexed by |
+|---|---|---|---|
+| `signal_table` | 1071.6 MiB | 1097.3 MiB | signal (32 B/sig, 2 per line) |
+| `signal_widths` (u32) | 133.9 MiB | 137.2 MiB | signal |
+| `dep_offsets` (u32) | 133.9 MiB | 137.2 MiB | signal |
+| `signal_real` / `signal_two_state` / `dirty_signals` | 33.5 MiB each | 34.3 MiB each | signal |
+| `comb_entries` | 3.2 MiB | 22.4 MiB | comb entry |
+| `settle_triggered` | 0.05 MiB | 0.35 MiB | comb entry |
+
+Hot per-signal working set: **1306 MiB (c906) / 1337 MiB (c910) = 109x / 111x L3.**
+
+### Finding 1 — `signal_widths` (134 MiB) is provably redundant
+
+`Value` already carries `width`, in the same cache line as the bits. Added a full-table
+comparison to the report: **identical for all 35,114,136 signals on c906 and all 35,955,898
+on c910**, after complete 50-iteration runs. They are seeded together
+(`signal_table[id] = Value::zero(signal_widths_vec[id])`) and never diverge.
+
+BUT the value is memory, not speed: the hot loops barely read it — **0 reads in
+`exec_insns`, 0 in `check_edges_inner`, 2 in `settle_combinatorial_inner`** out of 100 sites
+repo-wide. So deleting it is a ~134 MiB (10% of the signal working set) RSS win that should
+be roughly perf-neutral — pure deletion of redundant data, adding no instructions, unlike
+every re-encoding attempt this session. Note the report itself counts it in the "hot"
+working set, which overstates that figure by 134 MiB.
+
+### Finding 2 — `dep_offsets` (134 MiB) is 0.094% useful and IS hot-path read
+
+`[DEP_STATS] dep_edges=101661 dep_signals=32986 avg_dep_fanout=3.08 max_dep_fanout=3073`
+
+**Only 32,986 of 35,114,136 signals have any comb dependent — 0.094%.** Yet `dep_offsets` is
+a dense `Vec<u32>` over every signal, 133.9 MiB, and `trigger_deps!` reads
+`dep_offsets[tid]` / `[tid+1]` on **every** propagation. So the overwhelmingly common case —
+a signal write with no comb reader at all, e.g. the ~33 M array/memory elements — pays a
+random access into a 134 MiB array to learn "nothing depends on me".
+
+A "has any comb dependent" **bitset** is `num_signals/8` = **4.2 MiB**, 32x smaller and
+L3-resident, gating access to the big array. Two reasons this is not the `settle_triggered`
+bitset that failed: it is **built once and read-only at runtime**, so there is no
+store-to-load false serialisation (the mechanism that sank that one); and it *avoids* a
+larger access rather than re-encoding an existing one. Unmeasured — the honest next step is
+to count what fraction of `trigger_deps!` calls hit signals with zero dependents before
+building anything.
+
+### Why both designs have ~35 M signals
+
+c906 and c910 report 35.1 M and 36.0 M signals despite very different core sizes, and only
+1.56 M are named on c906 (4.4%). The count is dominated by array elements — the testbench
+memory — not by design logic. Any per-signal array is therefore sized by the testbench RAM,
+which is why these arrays are 134 MiB while the entries that use them number ~52 K.
