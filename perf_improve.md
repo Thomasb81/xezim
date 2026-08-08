@@ -791,3 +791,35 @@ The instrumentation itself cost **+0.77%** on the default path (286.41G vs 284.2
 rather than shipped; patch preserved at `scratchpad/NOCHANGE-instrumentation.patch`. This is
 the second time an always-present hot-loop flag cost ~0.25-0.8% — see the settle-prefetch
 note.
+
+
+## c910 `t=1 k=0` sort constraint — does not reproduce on current code
+
+`simulator.rs:30819` forbids sorting `parallel_blocks` outside the partition path: "c910
+sequential dispatch has block-order dependencies that break under index-sorted order (c910
+t=1 k=0 hangs at iters=200040 if we sort here)." Ran that exact experiment — sort forced on
+via a temporary flag, no partition, `--threads=1`, c910 **cmark** — against an identical
+unsorted control:
+
+| | sort forced on | control |
+|---|---|---|
+| result | **TEST PASSED** | TEST PASSED |
+| cycles/iteration | **158034** (golden) | 158034 |
+| finish time | **34985250** (golden) | 34985250 |
+| iters reached | **698,067** | 696,234 |
+
+The sorted run went **3.5x past** the documented `iters=200040` failure point and produced
+byte-exact golden output. c906 memcpy also passed but only reaches `iters=41,295`, so it
+never approaches the failure point and is not evidence either way — worth noting because it
+was the first thing tried.
+
+**Caveats, which matter.** This shows the constraint does not hold on *current* code, not
+that it was wrong when written in May 2026: 17 upstream commits plus this session's work
+have landed since `dba9289`, so the underlying defect may simply have been fixed elsewhere.
+The second sanity the comment demands (`t=4 k=4`) was **not** run, and the partition path
+independently needs the sort for its k-way merge — so `use_partition`'s sort must stay.
+The temporary repro flag was removed; nothing shipped.
+
+One structural fact worth recording: this sort sits inside `if use_parallel`, which
+`XEZIM_NO_PARALLEL=1` skips entirely. **Every performance measurement in this document is
+therefore orthogonal to this constraint** — an earlier framing of mine implied otherwise.
