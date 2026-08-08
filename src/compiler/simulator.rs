@@ -38022,6 +38022,18 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // §7.4.2: `arr[i]…[j].field[k]` over a PACKED array of packed
+                // structs. `arr[i]` is a bit slice of one backing vector, so
+                // there is no `arr[i]` signal to select from — resolve the
+                // whole path to an offset instead. Shares the resolver with
+                // the write side so the two cannot drift: reading and writing
+                // the same expression must address the same bits.
+                if let Some((sig, lsb, w)) = self.packed_struct_elem_slice(expr, index)
+                    && let Some(v) = self.get_signal_value_by_name(&sig)
+                    && lsb + w <= v.width
+                {
+                    return v.range_select((lsb + w - 1) as usize, lsb as usize);
+                }
                 // §11.5.1: a constant part-select of a packed ARRAY keeps the
                 // original element labels, so `(X[15:0])[11]` selects ELEMENT
                 // 11 of X — not bit 11 of a 16-bit slice. Port connections
@@ -41262,6 +41274,39 @@ impl Simulator {
                                     if let Some(sig) = self.get_signal_value_by_name(&elem_name) {
                                         return sig
                                             .range_select((off + w - 1) as usize, off as usize);
+                                    }
+                                    // §7.4.2: PACKED array of packed structs —
+                                    // `arr[i]` is a bit SLICE of one backing
+                                    // vector, not a signal of its own, so the
+                                    // `elem_name` lookup above finds nothing.
+                                    // The write path already had this fallback;
+                                    // without it here the read silently returned
+                                    // the default, so a correctly-stored value
+                                    // read back as 0 (and `$bits` as 32).
+                                    //
+                                    // `struct_w` comes from the field layout, NOT
+                                    // `packed_signal_elem_widths[arr_name]`: that
+                                    // is the width of an element of the OUTERMOST
+                                    // dimension, which for `t [0:0][1:0]` is the
+                                    // whole `[1:0]` sub-array rather than one
+                                    // struct.
+                                    let struct_w =
+                                        fields.iter().map(|(_, o, fw)| o + fw).max().unwrap_or(0);
+                                    let dims =
+                                        self.module.packed_full_dims.get(&arr_name).cloned();
+                                    if struct_w > 0
+                                        && let Some(slot) =
+                                            Self::flatten_packed_slot(&indices, dims.as_deref())
+                                        && let Some(sig) =
+                                            self.get_signal_value_by_name(&arr_name)
+                                    {
+                                        let lo = slot * struct_w + off;
+                                        if lo + w <= sig.width {
+                                            return sig.range_select(
+                                                (lo + w - 1) as usize,
+                                                lo as usize,
+                                            );
+                                        }
                                     }
                                 }
                             }
