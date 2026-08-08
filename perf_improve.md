@@ -1177,3 +1177,77 @@ dependent on `MADV_COLLAPSE`. Issuing the advice at **allocation time**, before 
 are filled, is the case THP is designed for and would not need `MADV_COLLAPSE` at all.
 Deliberately NOT implemented here: it cannot be measured in this environment, and shipping
 an unmeasurable change is exactly what the rest of this document argues against.
+
+## Huge pages: FOUND AND FIXED — the blocker was an inherited `PR_SET_THP_DISABLE`
+
+**This supersedes the previous section, which concluded huge pages were unobtainable here.
+That was wrong.**
+
+`/proc/<pid>/status` exposes a `THP_enabled` field. Walking the process ancestry:
+
+```
+pid=2505879 name=bash    THP_enabled=0     <- our shell
+pid=2202357 name=claude  THP_enabled=0     <- the launcher
+pid=1511303 name=bash    THP_enabled=1
+pid=1511302 name=sshd    THP_enabled=1
+```
+
+The launching process had `prctl(PR_SET_THP_DISABLE, 1)` set, and **the flag is inherited
+across fork+exec**, so every xezim run inherited it. While set, the kernel accepts
+`madvise(MADV_HUGEPAGE)` — returns 0, and `VM_HUGEPAGE` genuinely appears in the VMA's
+`VmFlags` as `hg` — but the fault handler never attempts a huge page and `MADV_COLLAPSE`
+fails EINVAL. Every symptom I had attributed to the kernel:
+
+- `AnonHugePages: 0 kB` even for a fresh 2 MiB-aligned, fully-faulted anonymous mapping
+- `thp_fault_alloc` never incrementing (not a compaction failure — the path was never taken)
+- `MADV_COLLAPSE` -> EINVAL on every array
+
+Clearing it requires **no privilege** and affects only the calling process.
+
+### Placement matters as much as the call
+
+Clearing it inside `advise_hugepages()` (which runs from `simulate()`) recovers only part of
+the win, because `compile()` has already faulted the ~1.3 GB of per-signal arrays in as
+4 KiB pages, leaving a partial `MADV_COLLAPSE` to clean up:
+
+| where cleared | dTLB-load-misses | cycles |
+|---|---|---|
+| not at all (previous behaviour) | 163.8 M | 133.60 G |
+| in `advise_hugepages()` (late) | 93.7 M | no win |
+| **first line of `main()`** | **64.9 M** | **127.95 G** |
+
+So it is done at the top of `main()`, before any large allocation. `XEZIM_HUGEPAGE=0` opts
+out and is checked in both places.
+
+### Result — c906 memcpy x50, 3 interleaved reps, same binary
+
+| | THP off | THP on | delta |
+|---|---|---|---|
+| **dTLB-load-misses** | 163.8 M | **64.9 M** | **-60.4%** |
+| **cycles** | 133.60 G | **127.95 G** | **-4.23%** |
+| instructions | 284.47 G | 280.28 G | -1.47% |
+| wall | 34.72 s | 33.99 s | -2.11% |
+| IPC | 2.129 | 2.191 | +2.9% |
+
+The instruction drop is real, not measurement error: ~260 K fewer minor page faults means
+less kernel fault-handling code executed (perf counts user+kernel).
+
+Gates: `cost=727` and stdout **byte-identical** with THP on vs off; c910 `cost=216`
+`finish=2282050`; **1758 tests passed / 0 failed**; benches 200000 / 100000 / 50000;
+`--features jit` builds.
+
+### Why this took so long to find, and the lesson
+
+I twice concluded from strong-looking evidence that the environment could not provide huge
+pages — the second time after a standalone C probe showed `AnonHugePages: 0 kB` on a fresh
+aligned mapping, which felt conclusive. It was not: every check I ran confirmed the
+*request* was well-formed while none checked whether the *process* was permitted to receive
+one. `THP_enabled` in `/proc/<pid>/status` is the one field that answers that, and a
+per-process, inherited policy bit is invisible to every system-wide knob
+(`transparent_hugepage/enabled`, `defrag`, the per-size mTHP controls) that I did check.
+
+**This is also the first genuine performance win of the session, and it is not an
+instruction-count reduction** — it is the one memory-side effect that survived, precisely
+because it costs no instructions to obtain. That is consistent with the earlier finding that
+xezim is instruction-bound: page-walk cost was the one memory-side overhead not already
+absorbed by the small touched working set.
