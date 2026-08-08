@@ -23975,8 +23975,19 @@ impl Simulator {
             // Wide-storage heap: only signals wider than 64b carry a Vec<LogicBit>.
             let mut wide_heap = 0usize;
             let mut wide_cnt = 0usize;
-            for v in &self.signal_table {
+            // Is `signal_widths` (134 MiB at 35M signals) redundant with the
+            // `width` already carried inside each `Value`? They are seeded
+            // together at construction; this reports whether they ever diverge.
+            let mut width_mismatch = 0usize;
+            let mut first_mismatch: Option<(usize, u32, u32)> = None;
+            for (i, v) in self.signal_table.iter().enumerate() {
                 if v.width > 64 { wide_cnt += 1; wide_heap += v.width as usize; }
+                if let Some(&w) = self.signal_widths.get(i) {
+                    if w != v.width {
+                        width_mismatch += 1;
+                        if first_mismatch.is_none() { first_mismatch = Some((i, w, v.width)); }
+                    }
+                }
             }
             // Per-entry heap (read/write id vecs, scope_hint strings).
             let mut entry_heap = 0usize;
@@ -23995,7 +24006,29 @@ impl Simulator {
             let strig = self.settle_triggered.capacity();
             let dsig = self.dirty_signals.capacity();
             let tog = self.signal_toggle_counts.capacity() * 8;
-            eprintln!("[CACHE-FIT] L1d=32KiB/core L2=1MiB/core L3=16.5MiB shared line=64B");
+            // Read the ACTUAL cache geometry. The previous hardcoded
+            // "L1d=32KiB L2=1MiB L3=16.5MiB" was wrong on this machine (Tiger
+            // Lake: 48 KiB / 1.25 MiB / 12 MiB), which silently skewed every
+            // "x L3" ratio below by ~37%.
+            let rd_cache = |lvl: u32, ty: &str| -> Option<usize> {
+                for idx in 0..8 {
+                    let base = format!("/sys/devices/system/cpu/cpu0/cache/index{}", idx);
+                    let l = std::fs::read_to_string(format!("{}/level", base)).ok()?;
+                    let t = std::fs::read_to_string(format!("{}/type", base)).ok()?;
+                    if l.trim() == lvl.to_string() && t.trim().starts_with(ty) {
+                        let sz = std::fs::read_to_string(format!("{}/size", base)).ok()?;
+                        let sz = sz.trim();
+                        let n: usize = sz.trim_end_matches(|c: char| c.is_alphabetic()).parse().ok()?;
+                        return Some(if sz.ends_with('M') { n * 1024 * 1024 } else { n * 1024 });
+                    }
+                }
+                None
+            };
+            let l1d = rd_cache(1, "Data").unwrap_or(32 * 1024);
+            let l2 = rd_cache(2, "Unified").unwrap_or(1024 * 1024);
+            let l3 = rd_cache(3, "Unified").unwrap_or(16 * 1024 * 1024);
+            eprintln!("[CACHE-FIT] L1d={:.0}KiB/core L2={:.2}MiB/core L3={:.1}MiB shared line=64B",
+                l1d as f64 / 1024.0, mb(l2), mb(l3));
             eprintln!("[CACHE-FIT] signals={} entries={} sizeof(Value)={} sizeof(CombEntry)={}",
                 self.signal_table.len(), self.comb_entries.len(), vs, ce);
             eprintln!("[CACHE-FIT] --- per-signal arrays (indexed by signal id) ---");
@@ -24012,11 +24045,23 @@ impl Simulator {
             eprintln!("[CACHE-FIT]   entry heap(r/w ids){:>9.2} MiB", mb(entry_heap));
             eprintln!("[CACHE-FIT]   settle_triggered   {:>9.2} MiB", mb(strig));
             eprintln!("[CACHE-FIT]   dep_entries(u32)   {:>9.2} MiB", mb(den));
+            if width_mismatch == 0 {
+                eprintln!("[CACHE-FIT] signal_widths vs Value.width: IDENTICAL for all {} signals => the {:.2} MiB array is REDUNDANT",
+                    self.signal_table.len(), mb(sw));
+            } else {
+                eprintln!("[CACHE-FIT] signal_widths vs Value.width: {} MISMATCHES (first: id={} arr={} val={}) => NOT redundant",
+                    width_mismatch, first_mismatch.unwrap().0, first_mismatch.unwrap().1, first_mismatch.unwrap().2);
+            }
             let per_sig_hot = st + sw + sr + s2 + dsig;
             eprintln!("[CACHE-FIT] hot per-signal working set (table+width+real+2st+dirty) = {:.2} MiB  => {:.0}x L3",
-                mb(per_sig_hot), per_sig_hot as f64 / (16.5*1024.0*1024.0));
-            eprintln!("[CACHE-FIT] one signal's hot bytes across arrays = {} B (spans {} lines if scattered)",
-                vs+4+1+1+1, ((vs+4+1+1+1)+63)/64);
+                mb(per_sig_hot), per_sig_hot as f64 / l3 as f64);
+            // These 39 bytes live in FIVE SEPARATE arrays, so touching all of
+            // them costs up to five distinct cache lines. The old formula
+            // divided the byte total by the line size, which answers the
+            // contiguous-layout question — the opposite of what "if scattered"
+            // means, and it made a 5-line access look like 1.
+            eprintln!("[CACHE-FIT] one signal's hot bytes = {} B across 5 arrays => up to 5 lines scattered (1 line if packed)",
+                vs+4+1+1+1);
         }
         let unresolved = self
             .comb_entries
