@@ -47,15 +47,23 @@ module tb;
   localparam int F = $bits(P::st [1:0]);       // scoped + dims
   localparam int G = $bits(logic [1:0][7:0]);  // TypeLiteral, multi-dim
   localparam int H = $bits(logic [0:0][1:0][1:0]); // TypeLiteral, 3-D
+  // Built-in integer ATOM types parse to a bare Ident (not a typedef, not a
+  // parameter), so both lookups missed and the call answered 0.
+  localparam int I = $bits(int);
+  localparam int J = $bits(byte);
+  localparam int K = $bits(shortint);
+  localparam int L = $bits(longint);
+  localparam int M = $bits(integer);
 
   // The guard must NOT capture a real part-select of a SIGNAL.
   logic [15:0] sig;
   int ps;
   initial ps = $bits(sig[7:0]);
 
-  int a, b, c, d, e, f, g, h;
+  int a, b, c, d, e, f, g, h, i_, j_, k_, l_, m_;
   initial begin
     a = A; b = B; c = C; d = D; e = E; f = F; g = G; h = H;
+    i_ = I; j_ = J; k_ = K; l_ = L; m_ = M;
   end
 
   // Localparam widths must be usable as DECLARED widths, not just values —
@@ -85,6 +93,16 @@ fn bits_of_type_literal_operands() {
     assert_eq!(u(&sim, "f"), 256, "$bits(P::st [1:0]) — the pipeline-stage shape; 2 meant part-select sizing");
     assert_eq!(u(&sim, "g"), 16, "$bits(logic [1:0][7:0]) — TypeLiteral");
     assert_eq!(u(&sim, "h"), 4, "$bits(logic [0:0][1:0][1:0]) — 0 meant the TypeLiteral arm was missing");
+}
+
+#[test]
+fn bits_of_builtin_atom_types() {
+    let sim = simulate(SRC, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "i_"), 32, "$bits(int) — 0 meant the atom-keyword fallback was missing");
+    assert_eq!(u(&sim, "j_"), 8, "$bits(byte)");
+    assert_eq!(u(&sim, "k_"), 16, "$bits(shortint)");
+    assert_eq!(u(&sim, "l_"), 64, "$bits(longint)");
+    assert_eq!(u(&sim, "m_"), 32, "$bits(integer)");
 }
 
 #[test]

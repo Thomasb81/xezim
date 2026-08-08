@@ -1413,6 +1413,31 @@ impl<'a> BytecodeCompiler<'a> {
         false
     }
 
+    /// Walk a chain of `Index` nodes down to its root identifier. Returns the
+    /// root and the index EXPRESSIONS outermost-first; indices need not be
+    /// constant.
+    fn flatten_index_chain_exprs<'e>(
+        &self,
+        base: &'e Expression,
+        index: &'e Expression,
+    ) -> Option<(&'e HierarchicalIdentifier, Vec<&'e Expression>)> {
+        let mut idxs: Vec<&Expression> = vec![index];
+        let mut cur = base;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, index } => {
+                    idxs.push(index);
+                    cur = expr.as_ref();
+                }
+                ExprKind::Ident(h) => {
+                    idxs.reverse();
+                    return Some((h, idxs));
+                }
+                _ => return None,
+            }
+        }
+    }
+
     /// Walk a chain of constant `Index` nodes down to its root identifier.
     /// Returns the root and the indices outermost-first.
     fn flatten_const_index_chain<'e>(
@@ -1437,6 +1462,107 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Declared dimensions of a chain's root, if registered.
+    fn chain_root_dims(&self, hier: &HierarchicalIdentifier) -> Option<Vec<(i64, i64)>> {
+        let raw = Self::hier_raw_name(hier);
+        self.packed_full_dims.and_then(|m| {
+            m.get(raw.as_str())
+                .or_else(|| hier.path.last().and_then(|s| m.get(s.name.name.as_str())))
+                .cloned()
+        })
+    }
+
+    /// Emit a chained packed element select whose indices are NOT all
+    /// constant — `a[i][j][3]` inside a loop. The selected WIDTH is still
+    /// static (it depends only on how many dimensions were consumed), so only
+    /// the offset needs computing at run time:
+    /// `off = Σ slot_k * (product of the counts below level k)`.
+    ///
+    /// Without this, a dynamic chain fell through to the plain bit-select path
+    /// and read x — the shape a `for (i) for (j) vld[i][j][0]` checker loop
+    /// produces, which is why such loops had to be hand-unrolled to work.
+    fn emit_chained_packed_slice_dyn(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<RegId> {
+        let (hier, idx_exprs) = self.flatten_index_chain_exprs(base, index)?;
+        if idx_exprs.len() < 2 {
+            return None;
+        }
+        let dims = self.chain_root_dims(hier)?;
+        if dims.len() < idx_exprs.len() {
+            return None;
+        }
+        let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
+        let width: i64 = counts[idx_exprs.len()..].iter().product();
+        if width <= 0 {
+            return None;
+        }
+        // Compile every index first; bail before emitting any accumulation if
+        // one of them cannot be compiled.
+        let mut idx_regs = Vec::with_capacity(idx_exprs.len());
+        for e in &idx_exprs {
+            idx_regs.push(self.compile_expr(e, 0)?);
+        }
+        let root = self.compile_expr_root_of(base)?;
+        let mut off_reg: Option<RegId> = None;
+        for (k, idx_reg) in idx_regs.into_iter().enumerate() {
+            let (l, r) = dims[k];
+            let (lo_b, hi_b) = (l.min(r), l.max(r));
+            let elem_w: i64 = counts[k + 1..].iter().product();
+            // §7.4.1: descending labels the LEFT bound most-significant, so the
+            // slot counts up from the low bound; ascending reverses it.
+            let slot = if l >= r {
+                if lo_b == 0 {
+                    idx_reg
+                } else {
+                    let c = self.alloc_reg();
+                    self.emit(Insn::LoadConst(c, Box::new(Value::from_u64(lo_b as u64, 32))));
+                    let d = self.alloc_reg();
+                    self.emit(Insn::Sub(d, idx_reg, c));
+                    d
+                }
+            } else {
+                let c = self.alloc_reg();
+                self.emit(Insn::LoadConst(c, Box::new(Value::from_u64(hi_b as u64, 32))));
+                let d = self.alloc_reg();
+                self.emit(Insn::Sub(d, c, idx_reg));
+                d
+            };
+            let term = if elem_w == 1 {
+                slot
+            } else {
+                let w = self.alloc_reg();
+                self.emit(Insn::LoadConst(w, Box::new(Value::from_u64(elem_w as u64, 32))));
+                let t = self.alloc_reg();
+                self.emit(Insn::Mul(t, slot, w));
+                t
+            };
+            off_reg = Some(match off_reg {
+                None => term,
+                Some(acc) => {
+                    let a = self.alloc_reg();
+                    self.emit(Insn::Add(a, acc, term));
+                    a
+                }
+            });
+        }
+        let lo_reg = off_reg?;
+        let hi_reg = if width == 1 {
+            lo_reg
+        } else {
+            let wm1 = self.alloc_reg();
+            self.emit(Insn::LoadConst(wm1, Box::new(Value::from_u64((width - 1) as u64, 32))));
+            let h = self.alloc_reg();
+            self.emit(Insn::Add(h, lo_reg, wm1));
+            h
+        };
+        let dest = self.alloc_reg();
+        self.emit(Insn::RangeSelect(dest, root, hi_reg, lo_reg));
+        Some(dest)
+    }
+
     /// `(lsb, width)` of a chained packed element select, from the root's
     /// declared dimensions. None unless there are at least TWO indices and the
     /// root has enough registered dimensions — a single-level select keeps its
@@ -1446,12 +1572,7 @@ impl<'a> BytecodeCompiler<'a> {
         if idxs.len() < 2 {
             return None;
         }
-        let raw = Self::hier_raw_name(hier);
-        let dims: Vec<(i64, i64)> = self.packed_full_dims.and_then(|m| {
-            m.get(raw.as_str())
-                .or_else(|| hier.path.last().and_then(|s| m.get(s.name.name.as_str())))
-                .cloned()
-        })?;
+        let dims: Vec<(i64, i64)> = self.chain_root_dims(hier)?;
         if dims.len() < idxs.len() {
             return None;
         }
@@ -2555,6 +2676,10 @@ impl<'a> BytecodeCompiler<'a> {
                     let base = self.compile_expr_root_of(expr)?;
                     let dest = self.alloc_reg();
                     self.emit(Insn::RangeSelectConst(dest, base, lo + w - 1, lo));
+                    return Some(dest);
+                }
+                // Same chain with a DYNAMIC index somewhere — `a[i][j][3]`.
+                if let Some(dest) = self.emit_chained_packed_slice_dyn(expr, index) {
                     return Some(dest);
                 }
                 // §11.5.1: `(X[a:b])[i]` on a packed ARRAY selects ELEMENT i
