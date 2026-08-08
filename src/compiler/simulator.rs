@@ -13483,10 +13483,18 @@ impl Simulator {
         }
         // Only worth it for spans >= one huge page.
         const HP: usize = 2 * 1024 * 1024;
+        // Both madvise() results were previously discarded, so a total failure
+        // was indistinguishable from success. XEZIM_HUGEPAGE_STATS=1 reports
+        // what the kernel actually did.
+        let stats = std::env::var("XEZIM_HUGEPAGE_STATS").is_ok();
         #[cfg(target_os = "linux")]
-        fn advise<T>(s: &[T]) {
+        fn advise<T>(s: &[T], name: &str, stats: bool) {
             let bytes = std::mem::size_of_val(s);
             if bytes < HP {
+                if stats {
+                    eprintln!("[HUGEPAGE] {:<20} {:>8.2} MiB  SKIPPED (< 2 MiB)",
+                        name, bytes as f64 / 1048576.0);
+                }
                 return;
             }
             let page = 4096usize;
@@ -13506,23 +13514,33 @@ impl Simulator {
                     // here, so nothing would change without the collapse.
                     // MADV_COLLAPSE is Linux 6.1+; on older kernels it returns
                     // EINVAL and we simply keep the (advisory) hint.
-                    libc::madvise(p, len, libc::MADV_HUGEPAGE);
-                    libc::madvise(p, len, libc::MADV_COLLAPSE);
+                    let r1 = libc::madvise(p, len, libc::MADV_HUGEPAGE);
+                    let e1 = if r1 == 0 { 0 } else { *libc::__errno_location() };
+                    let r2 = libc::madvise(p, len, libc::MADV_COLLAPSE);
+                    let e2 = if r2 == 0 { 0 } else { *libc::__errno_location() };
+                    if stats {
+                        let al = if astart % HP == 0 { "2MiB-aligned" } else { "UNALIGNED" };
+                        eprintln!("[HUGEPAGE] {:<20} {:>8.2} MiB  HUGEPAGE={} COLLAPSE={} ({}, start%2MiB={})",
+                            name, len as f64 / 1048576.0,
+                            if r1 == 0 { "ok".to_string() } else { format!("errno {}", e1) },
+                            if r2 == 0 { "ok".to_string() } else { format!("errno {}", e2) },
+                            al, astart % HP);
+                    }
                 }
             }
         }
         #[cfg(not(target_os = "linux"))]
-        fn advise<T>(_s: &[T]) {}
+        fn advise<T>(_s: &[T], _n: &str, _st: bool) {}
 
-        advise(&self.signal_table);
-        advise(&self.signal_widths);
-        advise(&self.signal_signed);
-        advise(&self.signal_real);
-        advise(&self.signal_two_state);
-        advise(&self.dirty_signals);
-        advise(&self.comb_dep_offsets);
-        advise(&self.comb_dep_entries);
-        advise(&self.comb_entries);
+        advise(&self.signal_table, "signal_table", stats);
+        advise(&self.signal_widths, "signal_widths", stats);
+        advise(&self.signal_signed, "signal_signed", stats);
+        advise(&self.signal_real, "signal_real", stats);
+        advise(&self.signal_two_state, "signal_two_state", stats);
+        advise(&self.dirty_signals, "dirty_signals", stats);
+        advise(&self.comb_dep_offsets, "comb_dep_offsets", stats);
+        advise(&self.comb_dep_entries, "comb_dep_entries", stats);
+        advise(&self.comb_entries, "comb_entries", stats);
     }
 
     pub fn simulate(&mut self) {
