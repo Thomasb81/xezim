@@ -205,3 +205,5 @@ mod packed_3d_chained_select;
 mod unary_context_width;
 #[path = "types/nested_packed_struct_array_access.rs"]
 mod nested_packed_struct_array_access;
+#[path = "types/package_typedef_scoping.rs"]
+mod package_typedef_scoping;
