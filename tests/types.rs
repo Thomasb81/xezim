@@ -203,3 +203,5 @@ mod bits_of_type_operands;
 mod packed_3d_chained_select;
 #[path = "types/unary_context_width.rs"]
 mod unary_context_width;
+#[path = "types/nested_packed_struct_array_access.rs"]
+mod nested_packed_struct_array_access;
