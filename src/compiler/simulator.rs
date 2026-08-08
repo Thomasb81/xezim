@@ -14800,8 +14800,12 @@ impl Simulator {
         // change. Set XEZIM_NO_PARALLEL_RANGE=1 to disable (revert to the
         // conservative all-range-sequential behavior).
         let unlock_range = std::env::var_os("XEZIM_NO_PARALLEL_RANGE").is_none();
+        // Built unconditionally: the sub-range arm below consults it only when
+        // `unlock_range`, but the WHOLE-SIGNAL arm needs it always. (Before,
+        // this map was skipped entirely under XEZIM_NO_PARALLEL_RANGE, which
+        // would have made every whole-signal NBA look single-writer.)
         let mut nba_writer_count: HashMap<usize, u32> = HashMap::default();
-        if unlock_range {
+        {
             for cb in self.compiled_edge_blocks.iter().flatten() {
                 let mut seen: Vec<usize> = Vec::new();
                 for insn in &cb.instructions {
@@ -14867,6 +14871,29 @@ impl Simulator {
                             if (!unlock_range || nba_writer_count.get(&(*id as usize)).copied().unwrap_or(0) > 1) => {
                                 return false;
                             }
+                        // WHOLE-SIGNAL NBA to a multi-writer target. The
+                        // sub-range case above was already excluded because a
+                        // last-writer-wins merge loses bits; the whole-signal
+                        // case loses the whole VALUE the same way, and which
+                        // block wins is decided by position in `nba_fast`
+                        // (`Insn::NbaAssign` stamps `block_index: 0` on the
+                        // sequential path and `nba_fast_index` overwrites in
+                        // place). So two blocks NBA-writing one signal are
+                        // resolved by DISPATCH ORDER while being labelled
+                        // order-independent — which is what makes reordering
+                        // `parallel_blocks` change results.
+                        //
+                        // Static and therefore conservative: two blocks writing
+                        // the same signal under mutually exclusive conditions
+                        // never collide at run time, but are demoted anyway.
+                        // Measured cost of that conservatism is in the
+                        // `[PURITY]` line below.
+                        BcInsn::NbaAssign(id, _, _)
+                        | BcInsn::NbaAssignConst(id, _, _)
+                        | BcInsn::NbaAssignArrayRead(id, _, _, _)
+                            if nba_writer_count.get(&(*id as usize)).copied().unwrap_or(0) > 1 => {
+                                return false;
+                            }
                         _ => {}
                     }
                 }
@@ -14910,6 +14937,7 @@ impl Simulator {
                 ("BlockingAssign(array)", 0, 0),
                 ("Nba(range/bit-dyn)", 0, 0),
                 ("Nba(array)", 0, 0),
+                ("Nba(whole-sig, multi-writer)", 0, 0),
             ];
             let mut nonpure_blocks = 0usize;
             let mut nonpure_insns = 0usize;
@@ -14926,7 +14954,7 @@ impl Simulator {
                 }
                 nonpure_blocks += 1;
                 nonpure_insns += n;
-                let mut seen = [false; 6];
+                let mut seen = [false; 7];
                 for insn in &cb.instructions {
                     let c = match insn {
                         Insn::StmtFallback(..) => 0,
@@ -14939,6 +14967,13 @@ impl Simulator {
                         | Insn::NbaAssignRange(..)
                         | Insn::NbaAssignRangeDyn(..) => 4,
                         Insn::NbaAssignArray(..) | Insn::NbaAssignArrayRange(..) => 5,
+                        Insn::NbaAssign(id, _, _)
+                        | Insn::NbaAssignConst(id, _, _)
+                        | Insn::NbaAssignArrayRead(id, _, _, _)
+                            if nba_writer_count.get(&(*id as usize)).copied().unwrap_or(0) > 1 =>
+                        {
+                            6
+                        }
                         _ => continue,
                     };
                     seen[c] = true;
