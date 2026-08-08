@@ -461,12 +461,7 @@ The per-dispatch constant is real and large. Cone merging just happens to remove
 only 15% (c906) / 6% (c910) of evaluations. Two changes attack the identical cost across
 **100%** of them:
 
-1. **Re-land the `entries[]` prefetch.** `simulator.rs:32905` records that a single-stage
-   `_mm_prefetch` on `entries[cur_list[cur_pos+8]]` gave **c906 cmark a 31% wall-time
-   win**, reverted because c910 began hanging at iters=200040 with it active "despite the
-   prefetch being a semantic no-op". A semantic no-op that changes termination indicates a
-   **latent bug exposed by timing** — worth hunting on correctness grounds alone. Gate any
-   re-land on c910 cmark t=1 k=0 *and* t=4 k=4.
+1. ~~**Re-land the `entries[]` prefetch.**~~ **Tried, measured, reverted — see below.**
 2. **`settle_triggered: Vec<bool>` → bitset.** One byte per entry = 367 KB on c910,
    randomly probed once per dispatch and once per dependent inside `trigger_deps!`
    (119.1M dirty-propagation round trips per c906 run, 93% of them from the fused arms).
@@ -475,3 +470,63 @@ only 15% (c906) / 6% (c910) of evaluations. Two changes attack the identical cos
 The `XEZIM_CONE` economics reporting added for this investigation is diagnostic-only and
 opt-in; default-path instructions and stdout are unchanged (284.35G vs 284.20/284.22G
 baseline, byte-identical output, 1742 tests passing).
+
+
+## Settle prefetch — re-tried, measured, reverted (Aug 2026)
+
+`simulator.rs:32905` claimed a single-stage `_mm_prefetch` on
+`entries[cur_list[cur_pos+8]]` gave **c906 cmark a 31% wall-time win**, reverted because
+c910 t=1 k=0 hung at iters=200040 "despite the prefetch being a semantic no-op — likely a
+downstream cache-state interaction". Both halves of that note turned out to be
+questionable.
+
+### It works, but it does not pay
+
+Re-implemented behind `XEZIM_SETTLE_PREFETCH=1` with **both** indices bounds-checked
+(`cur_list.get(..)` for the worklist read, `nidx < entries.len()` for the pointer), so the
+address is provably in-bounds and the prefetch is a genuine no-op. c906 memcpy x50,
+3 interleaved reps, same binary:
+
+| metric | off | on | delta |
+|---|---|---|---|
+| instructions | 284.91 G | 287.66 G | **+0.96%** |
+| cycles | 133.13 G | 132.47 G | **-0.50%** |
+| IPC | 2.140 | 2.172 | +1.5% |
+| wall | 33.90 s | 33.68 s | -0.67% (noise: off-arm spread 1.80 s) |
+
+`cost=727` and stdout byte-identical in all three reps. The prefetch does what it is
+supposed to — IPC rises — but the lookahead costs more instructions than the cycles it
+saves, and on an instruction-bound workload (IPC 2.14, cache-miss 6.4%) that is a wash.
+
+Two side findings worth keeping:
+- Moving the prefetch **below** the `!triggered[eidx]` guard changed the instruction cost
+  *not at all*. That disproves the theory that many worklist pops are stale duplicates —
+  nearly every position is a real evaluation. The +2.84 G is intrinsic to doing a
+  lookahead inside that very large loop body.
+- The `pf_on` branch cost **~0.25% even when disabled** (clean baseline 284.09 G vs
+  284.87–285.02 G with the flag merely compiled in). Worth remembering for any future
+  env-gated hot-loop A/B: the escape hatch is not free, and it biases the "off" arm.
+
+### The c910 hang is not about prefetching
+
+The "semantic no-op" framing does not survive three checks:
+1. The revert commit `dba9289` itself says the hang had the **"same signature as the
+   original NBA-order bug"**.
+2. `simulator.rs:30819-30827` documents that c910 **already** hangs at the identical
+   `iters=200040` point if you merely **sort** `parallel_blocks`: "c910 sequential
+   dispatch has block-order dependencies that break under index-sorted order."
+3. That loop is *combinational settle* and the run was single-threaded, so it cannot
+   reorder NBAs. A true no-op cannot change termination.
+
+The most likely mechanism for the original failure is that the lookahead was indexed
+**unchecked**: `cur_pos + 8` past the end of `cur_list` is UB, which permits LLVM to
+assume it in range and transform the `cur_pos < cur_list.len()` loop itself. That would
+make the original "prefetch" not a no-op at all.
+
+**So the real open bug is c910's block-order dependency in edge-block dispatch** — a
+design whose result depends on the order blocks were collected in is a latent
+nondeterminism, and it is worth hunting on correctness grounds independently of any
+performance work. Prefetching was only ever the messenger.
+
+Reverted at user direction; tree restored to `7ccf55a` with simulation output
+byte-identical to baseline.
