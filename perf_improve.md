@@ -1069,3 +1069,58 @@ c906 and c910 report 35.1 M and 36.0 M signals despite very different core sizes
 1.56 M are named on c906 (4.4%). The count is dominated by array elements — the testbench
 memory — not by design logic. Any per-signal array is therefore sized by the testbench RAM,
 which is why these arrays are 134 MiB while the entries that use them number ~52 K.
+
+## The cache-fit framing is misleading, and that explains the whole session
+
+Acting on the `dep_offsets` finding: **66.5% of `trigger_deps!` calls hit signals with ZERO
+comb dependents** (228,588,579 of 343,587,176 on c906) — every one a random probe into a
+134 MiB array only to learn "nothing depends on me". Built the gate: a read-only
+`comb_dep_any` bitset, `num_signals/8` = 4.2 MiB, consulted before `dep_offsets`.
+
+Correct (`cost=727`, stdout byte-identical) and **slower**: c906 memcpy x50, 3 interleaved
+reps, two binaries — **instructions +0.46%, cycles +1.19%, wall +0.9%**. Reverted.
+
+### Why it lost, and why it matters more than the optimization
+
+Measuring the machine instead of the allocation:
+
+| counter | c906 memcpy x50 |
+|---|---|
+| instructions | 284.5 G |
+| cache-references | 6.67 G |
+| cache-misses | 484 M (7.3% of references) |
+| **LLC-load-misses** | **54.8 M** |
+| **dTLB-load-misses** | **170 M** |
+
+54.8 M LLC misses is ~3.5 GB of DRAM traffic across a 35 s run — roughly 100 MB/s, which is
+nothing. **The arrays allocate 1.3 GB but the touched working set is small**, because the
+signals actually written and read repeatedly are a tiny concentrated subset (the memcpy
+buffer, the active flops) while the ~33 M testbench-memory elements are mostly cold or
+re-touched in place.
+
+So `[CACHE-FIT] hot per-signal working set = 1306 MiB => 109x L3` measures **allocation, not
+locality**. There is no cache bottleneck to fix. That retroactively explains four separate
+failures this session, all of which optimized a problem that is not there:
+
+| attempt | footprint change | result |
+|---|---|---|
+| SoA 16-byte signal cells | -212 MB | +11.3% |
+| `settle_triggered` bitset | -321 KB | +1.4% insn, +1.6% cycles |
+| bit-granular sensitivity | +3 arrays | +0.4% insn, +1.6% cycles |
+| `comb_dep_any` gate | -0% (adds 4.2 MiB) | +0.46% insn, +1.19% cycles |
+
+**Rule going forward: do not propose a memory-layout optimization for this workload.** At
+0.019% of instructions causing an LLC miss, xezim is instruction-bound with no meaningful
+locality headroom. Only instruction-count reductions can pay.
+
+### One live lead the counters did surface
+
+**dTLB misses (170 M) are 3x the LLC misses.** The ~1 GB arrays span ~340 K 4 KiB pages,
+far past TLB reach, so page walks — not cache misses — are the memory-side cost. At ~10-20
+cycles a walk that is ~1.3-2.5% of the run, and it costs *no instructions* to fix.
+System THP is `madvise`-only, and mimalloc's `MIMALLOC_ALLOW_LARGE_OS_PAGES=1` /
+`MIMALLOC_LARGE_OS_PAGES=1` changed nothing (dTLB 161.3 M -> 165.7 M / 159.9 M, cycles flat)
+because the big `Vec`s are single large allocations served directly by `mmap`. Testing this
+properly needs an explicit `madvise(MADV_HUGEPAGE)` on the large arrays — a small code
+change, not a config flag. Untested; the only memory-side lever left with a plausible
+mechanism.
