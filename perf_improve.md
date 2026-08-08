@@ -725,3 +725,69 @@ driving `drain_edge_exec_rescan`, which can re-fire blocks at the same timestamp
 `apply_nba` ordering changing the dirty-list order into settle; or the hang being specific
 to the partition / k-way-merge path and misattributed to `t=1 k=0`. It should not be
 described as understood until there is a repro.
+
+## Guard-specialized dynamic sensitivity — the phenomenon is real and large, but the mechanism that pays is BIT-GRANULAR, not guard-based
+
+Proposal: after a block runs and its guard selects a path, narrow its active sensitivity to
+the signals on that path. `if (mode) y=a+b; else y=c+d;` with `mode=1` should stop waking on
+`c`/`d`.
+
+### The phenomenon is confirmed, and it is big
+
+Instrumented `settle_combinatorial_inner` to count evaluations that changed NOTHING — the
+entry was woken, ran, and every output compared equal. A wakeup that changes something was
+necessary work regardless of guards, so this is the ceiling on the whole idea.
+
+```
+[NOCHANGE] wasted wakeups 63,280,356/233,348,958 (27.1%)
+gate=6%  contassign_c=64%  alwaysblk_c=69%  fastcopy/dircopy/fanout=~0%
+```
+
+**27.1% of all comb-entry evaluations are wasted**, and the split lands exactly where the
+proposal predicts: branch-free gates waste 6% (independently corroborating the earlier "95%
+of fused-gate evals change their output"), while the VM-executing entries — the expensive
+ones — waste **64-69%**.
+
+### But guard specialization addresses only 14.3% of it
+
+Partitioning the 56.0M wasted VM-entry evaluations by what kind of guard the block actually
+contains (priority: branch > Select > bit/range read > none). Note a ternary compiles to
+`Insn::Select`, a data mux evaluating BOTH sides — a semantic guard with no branch — so it
+must be counted separately or the classification misses the proposal's own example.
+
+| guard kind | entries | evals | wasted | share of VM waste |
+|---|---|---|---|---|
+| branch (`if`/`else`) | 723 | 7.6 M | 68.6% | **9.3%** |
+| `Select` (ternary mux) | 1,337 | 6.3 M | 44.2% | **5.0%** |
+| **bit/range read only** | 20,383 | 58.1 M | 69.7% | **72.4%** |
+| no guard at all | 6,321 | 14.2 M | 52.4% | 13.3% |
+
+Guard specialization — branch and ternary together — reaches **14.3%** of the waste, worth
+about 8.0M of 233.3M evaluations (3.4%). Real, but a fifth of the opportunity.
+
+### Where the value actually is
+
+**72.4% of the waste is blocks whose only guard is that they read a BIT or RANGE of a
+signal.** They are woken because the signal changed and the dirty flag is per-signal, but
+the bits they read did not change. That is **40.5M wasted evaluations = 17.4% of all comb
+entry evaluations**, on VM-executing entries.
+
+This is the **GSIM bit-granular** mechanism, not the ERASER-style path specialization —
+so the citation that turns out to matter is the first one.
+
+**It is tractable, and there is precedent in-tree.** `check_edges_inner` already carries
+`bitsel_sid_bits`, a per-signal bitmap prefilter that does exactly this for edge blocks with
+bit sensitivities. The comb side would need: a changed-bit mask per write
+(`(old_val ^ new_val) | (old_xz ^ new_xz)`, an XOR on a path that already compares
+old vs new), a per-(entry,signal) read mask harvested statically from `LoadSignalBit` /
+`LoadSignalRange` / `BitSelectConst` / `RangeSelectConst` operands, and an intersection test
+in `trigger_deps!` before enqueuing. Unlike cone merging, this REMOVES work rather than
+rearranging it, and unlike the footprint attempts it does not trade instructions for cache.
+
+### Measurement cost note
+
+The instrumentation itself cost **+0.77%** on the default path (286.41G vs 284.2G) because
+`entry_changed = true` fires unconditionally inside `trigger_deps!` (~119M times). Reverted
+rather than shipped; patch preserved at `scratchpad/NOCHANGE-instrumentation.patch`. This is
+the second time an always-present hot-loop flag cost ~0.25-0.8% — see the settle-prefetch
+note.
