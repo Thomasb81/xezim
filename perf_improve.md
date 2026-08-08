@@ -952,3 +952,53 @@ the expected best case remains around parity, and cycles would likely stay worse
 
 Working implementation preserved at `scratchpad/BITGRAN-real-implementation.patch` (257 lines,
 byte-identical on both designs). Reverted; tree restored.
+
+
+## cranelift 0.109 -> 0.134 (Aug 2026)
+
+Updated the optional JIT's cranelift dependency across 25 minor versions. `Cargo.lock` is
+gitignored here, so the change is `Cargo.toml` + `src/compiler/jit.rs` (143 insertions,
+133 deletions).
+
+### The five breaking API changes
+
+| change | fix |
+|---|---|
+| `stack_store(x, ss, off)` gained a leading `pointer_type` | 8 sites |
+| `stack_load(ty, ss, off)` gained a leading `pointer_type` | 25 sites |
+| `MemFlags` became an interned u16 handle; `trusted()` moved to `MemFlagsData` | 7 sites, import swapped |
+| `jump`/`brif` block arguments are now `BlockArg`, not `Value` | 2 sites, `BlockArg::Value(..)` |
+| `FunctionBuilder::finalize()` takes a `TargetFrontendConfig` | 1 site |
+
+The `pointer_type` threading was the bulk of it: the free helper functions (`ld2`, `st2`,
+`emit_cmp`, `emit_binop`, `emit_shift`, `emit_binop_arith`) had no access to it, so the
+parameter had to be pushed through transitively — a fixed-point iteration, since adding it
+to `ld2`/`st2` made *their* callers need it too.
+
+### Verification
+
+- default (non-JIT) build unaffected: c906 `cost=727`, **stdout byte-identical** to
+  pre-update, 284.38 G
+- **`XEZIM_JIT=1` output byte-identical to the interpreter on BOTH designs** — c906
+  `cost=727` (154/3607 blocks compiled), c910 `cost=216` (58/21305). This matters: the JIT
+  has a documented history of silent wrong answers (the inline-bits `LoadSignal` X/Z bug),
+  so "it compiles" is not evidence.
+- **1758 passed / 0 failed** with `--features jit`
+
+### The JIT is still slower, and by more than before
+
+c906 memcpy x50, 2 interleaved reps, same binary:
+
+| | interpreter | JIT | delta |
+|---|---|---|---|
+| instructions | 284.7 G | 294.4 G | **+3.4%** |
+| cycles | 135.0 G | 164.5 G | **+21.8%** |
+| wall | 35.08 s | 41.81 s | **+19.2%** |
+| IPC | 2.11 | 1.79 | -15% |
+
+So 25 versions of cranelift codegen work did **not** change the verdict — the JIT remains
+net negative, and the IPC collapse to 1.79 reproduces the 0.109 measurement almost exactly
+(1.78 then). That is consistent with the original diagnosis: the loss is architectural, not
+a codegen-quality problem. VM registers live in cranelift stack slots, so native code
+reproduces the interpreter's memory traffic minus dispatch, then pays it back in FFI bridge
+calls. Raising coverage first would make it slower still.
