@@ -4600,35 +4600,55 @@ impl Simulator {
             let Some(dt) = module.var_decl_types.get(&var).cloned() else {
                 continue;
             };
-            let resolved = match &dt {
-                DataType::TypeReference { name, .. } => module
-                    .typedef_types
-                    .get(&name.name.name)
-                    .cloned()
-                    .unwrap_or(dt.clone()),
-                _ => dt.clone(),
-            };
-            let DataType::Struct(su) = resolved else { continue };
-            if !su.packed {
-                continue;
-            }
-            for member in &su.members {
-                let Some(ew) = super::elaborate::packed_inner_elem_width(
-                    &member.data_type,
-                    &module.parameters,
-                    &module.typedefs,
-                ) else {
-                    continue;
+            // Walk NESTED packed structs, not just the top level: a member whose
+            // own type is a struct (or a packed array of structs) carries members
+            // of its own, and `s.outer[i].inner[k]` needs `inner`'s element
+            // stride to place the trailing select. Registering only one level
+            // deep left that stride unknown, so the select silently read bit 0.
+            let mut pending: Vec<(String, DataType)> = vec![(var, dt)];
+            let mut budget = 4096usize;
+            while let Some((prefix, dt)) = pending.pop() {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                let resolved = match &dt {
+                    DataType::TypeReference { name, .. } => module
+                        .typedef_types
+                        .get(&name.name.name)
+                        .cloned()
+                        .unwrap_or(dt.clone()),
+                    _ => dt.clone(),
                 };
-                let fdims = super::elaborate::packed_full_dims_of(
-                    &member.data_type,
-                    &module.parameters,
-                );
-                for mdecl in &member.declarators {
-                    let key = format!("{}.{}", var, mdecl.name.name);
-                    module.packed_signal_elem_widths.entry(key.clone()).or_insert(ew);
-                    if let Some(fd) = &fdims {
-                        module.packed_full_dims.entry(key).or_insert_with(|| fd.clone());
+                let DataType::Struct(su) = resolved else { continue };
+                if !su.packed {
+                    continue;
+                }
+                for member in &su.members {
+                    let ew = super::elaborate::packed_inner_elem_width(
+                        &member.data_type,
+                        &module.parameters,
+                        &module.typedefs,
+                    );
+                    let fdims = super::elaborate::packed_full_dims_of(
+                        &member.data_type,
+                        &module.parameters,
+                    );
+                    for mdecl in &member.declarators {
+                        let key = format!("{}.{}", prefix, mdecl.name.name);
+                        if let Some(ew) = ew {
+                            module
+                                .packed_signal_elem_widths
+                                .entry(key.clone())
+                                .or_insert(ew);
+                        }
+                        if let Some(fd) = &fdims {
+                            module
+                                .packed_full_dims
+                                .entry(key.clone())
+                                .or_insert_with(|| fd.clone());
+                        }
+                        pending.push((key, member.data_type.clone()));
                     }
                 }
             }
@@ -33790,75 +33810,189 @@ impl Simulator {
     /// structs (whose elements ARE separate signals), a plain struct, or a base
     /// with no registered element/field metadata — so callers fall through to
     /// the existing paths unchanged.
+    /// Walk a `.field` / `[const]` chain down to its root identifier, returning
+    /// the root's flat storage name and the steps below it, outermost first.
+    /// A step is `(Some(field), _)` or `(None, index)`.
+    fn packed_path_steps(
+        &mut self,
+        e: &Expression,
+    ) -> Option<(String, Vec<(Option<String>, i64)>)> {
+        let mut steps: Vec<(Option<String>, i64)> = Vec::new();
+        let mut cur: &Expression = e;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    steps.push((Some(member.name.clone()), 0));
+                    cur = expr.as_ref();
+                }
+                ExprKind::Index { expr, index } => {
+                    steps.push((None, self.eval_expr(index).to_i64()?));
+                    cur = expr.as_ref();
+                }
+                _ => break,
+            }
+        }
+        steps.reverse();
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        Some((self.resolve_hier_name(h), steps))
+    }
+
+    /// Resolve a walked path over a PACKED aggregate to the
+    /// `(backing_signal, lsb, width)` slice it denotes.
+    ///
+    /// The steps ALTERNATE in the nested case — `n.wdata[0].wdata[0]` is field,
+    /// index, field, index — so the path is rendered into the dotted-with-
+    /// indices key elaboration already registers (`wdata[0].wdata`) rather than
+    /// being matched against a fixed "indices then fields" shape. Matching that
+    /// fixed shape resolved the first group and then gave up, so every access
+    /// below one level of nesting read as 0.
+    ///
+    /// Returns None for anything not this shape, so callers fall through to the
+    /// existing paths unchanged.
+    fn packed_path_slice(
+        &mut self,
+        root: &str,
+        steps: &[(Option<String>, i64)],
+    ) -> Option<(String, u32, u32)> {
+        // Leading indices apply to the root's own dimensions; the rest form the
+        // field path, which may carry indices of its own.
+        let lead: Vec<i64> = steps
+            .iter()
+            .take_while(|(f, _)| f.is_none())
+            .map(|(_, i)| *i)
+            .collect();
+        let rest = &steps[lead.len()..];
+        if rest.is_empty() {
+            return None; // a pure index chain is not a field path
+        }
+        // An UNPACKED dimension stores each element as its own signal, so the
+        // leading indices covering it belong in the signal NAME; the layout
+        // stays keyed by the array's base name.
+        let mut storage = root.to_string();
+        let mut consumed = 0usize;
+        if self.module.arrays.contains_key(root) {
+            for &i in &lead {
+                let cand = format!("{}[{}]", storage, i);
+                if self.get_signal_value_by_name(&cand).is_some() {
+                    storage = cand;
+                    consumed += 1;
+                } else {
+                    break;
+                }
+            }
+            if consumed == 0 {
+                return None;
+            }
+        }
+        let pre: Vec<u64> = lead[consumed..].iter().map(|&i| i as u64).collect();
+        let fields = self.module.packed_struct_fields.get(root).cloned()?;
+        // Width of ONE struct, taken from the field layout. NOT
+        // `packed_signal_elem_widths[root]`: that is the width of an element of
+        // the OUTERMOST dimension, which for `t [0:0][1:0]` is the whole [1:0]
+        // sub-array (two structs), not one.
+        let struct_w = fields.iter().map(|(_, o, w)| o + w).max()?;
+        // Flatten the leading chain to a slot. `packed_full_dims` carries the
+        // declared ranges so a non-zero-based or ascending dimension maps the
+        // way §7.4.1 labels it; without dims fall back to row-major.
+        let slot = if pre.is_empty() {
+            0
+        } else {
+            let dims = self.module.packed_full_dims.get(root).cloned();
+            Self::flatten_packed_slot(&pre, dims.as_deref())?
+        };
+        // Render the field path with indices inline (the registered key shape)
+        // and index-free (how per-member element strides are keyed — one type
+        // per member, so the stride does not vary by slot).
+        let render = |steps: &[(Option<String>, i64)]| -> (String, String) {
+            use std::fmt::Write as _;
+            let (mut key, mut norm) = (String::new(), String::new());
+            for (f, i) in steps {
+                match f {
+                    Some(f) => {
+                        if !key.is_empty() {
+                            key.push('.');
+                        }
+                        key.push_str(f);
+                        if !norm.is_empty() {
+                            norm.push('.');
+                        }
+                        norm.push_str(f);
+                    }
+                    None => {
+                        let _ = write!(key, "[{}]", i);
+                    }
+                }
+            }
+            (key, norm)
+        };
+        let (key, _norm) = render(rest);
+        let base = slot * struct_w;
+        // Exact hit: the whole path names a registered field.
+        if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == &key).cloned() {
+            let total = self.get_signal_value_by_name(&storage)?.width;
+            return (base + off + w <= total).then_some((storage, base + off, w));
+        }
+        // Otherwise the trailing index selects an ELEMENT of the field it
+        // follows (`…wdata[0]` inside a `[1:0][63:0]` member): resolve the
+        // field, then step by its element width.
+        let (last, init) = rest.split_last()?;
+        if last.0.is_some() {
+            return None;
+        }
+        let k = u32::try_from(last.1).ok()?;
+        let (key2, norm2) = render(init);
+        let (_, off, fw) = fields.iter().find(|(m, _, _)| m == &key2).cloned()?;
+        let elem_w = self
+            .module
+            .packed_signal_elem_widths
+            .get(&format!("{}.{}", root, norm2))
+            .copied()
+            .unwrap_or(1);
+        let lsb = base + off + k * elem_w;
+        let w = elem_w.min(fw);
+        let total = self.get_signal_value_by_name(&storage)?.width;
+        (lsb + w <= total).then_some((storage, lsb, w))
+    }
+
+    /// Resolve `arr[i]…[j].field…[k]` over a PACKED array of packed structs to
+    /// the `(backing_signal, lsb, width)` slice it denotes, where `base` is the
+    /// expression left of the trailing `[k]` and `idx` is that index.
     fn packed_struct_elem_slice(
         &mut self,
         base: &Expression,
         idx: &Expression,
     ) -> Option<(String, u32, u32)> {
         // Left of the trailing index must be `<...>.field`.
-        let ExprKind::MemberAccess { expr: obj, member } = &base.kind else {
-            return None;
-        };
-        // Collect the dotted field path inward, then the index chain.
-        let mut field_path: Vec<String> = vec![member.name.clone()];
-        let mut cur: &Expression = obj.as_ref();
-        while let ExprKind::MemberAccess { expr: b, member: m } = &cur.kind {
-            field_path.push(m.name.clone());
-            cur = b.as_ref();
-        }
-        field_path.reverse();
-        let mut indices: Vec<u64> = Vec::new();
-        loop {
-            match &cur.kind {
-                ExprKind::Index { expr: b, index } => {
-                    indices.push(self.eval_expr(index).to_u64()?);
-                    cur = b.as_ref();
-                }
-                _ => break,
-            }
-        }
-        if indices.is_empty() {
-            return None; // plain struct — the existing member path handles it
-        }
-        indices.reverse();
-        let ExprKind::Ident(h) = &cur.kind else {
-            return None;
-        };
-        let root = self.resolve_hier_name(h);
-        // An UNPACKED array stores each element as its own signal; those are
-        // already handled elsewhere and must not be spliced.
-        if self.module.arrays.contains_key(&root) {
+        if !matches!(base.kind, ExprKind::MemberAccess { .. }) {
             return None;
         }
-        let fields = self.module.packed_struct_fields.get(&root).cloned()?;
-        let field_key = field_path.join(".");
-        let (_, field_off, field_w) = fields.iter().find(|(m, _, _)| m == &field_key).cloned()?;
-        // Width of ONE struct, taken from the field layout. NOT
-        // `packed_signal_elem_widths[root]`: that is the width of an element of
-        // the OUTERMOST dimension, which for `t [0:0][1:0]` is the whole [1:0]
-        // sub-array (two structs), not one.
-        let struct_w = fields.iter().map(|(_, o, w)| o + w).max()?;
-        // Flatten the index chain to a slot. `packed_full_dims` carries the
-        // declared ranges so a non-zero-based or ascending dimension maps the
-        // way §7.4.1 labels it; without dims fall back to row-major.
-        let dims = self.module.packed_full_dims.get(&root).cloned();
-        let slot = Self::flatten_packed_slot(&indices, dims.as_deref())?;
-        // The member's own packed element width, for the trailing `[k]`.
-        let member_key = format!("{}.{}", root, field_key);
-        let elem_w = self
-            .module
-            .packed_signal_elem_widths
-            .get(&member_key)
-            .copied()
-            .unwrap_or(1);
-        let k = self.eval_expr(idx).to_u64()? as u32;
-        let lsb = slot * struct_w + field_off + k * elem_w;
-        let w = elem_w.min(field_w);
-        let total = self.get_signal_value_by_name(&root)?.width;
-        if lsb + w > total {
+        let (root, mut steps) = self.packed_path_steps(base)?;
+        // With no index anywhere but the trailing one this is a plain struct
+        // member select, which the existing member path already handles — leave
+        // it there rather than re-deriving it here.
+        if steps.iter().all(|(f, _)| f.is_some()) {
             return None;
         }
-        Some((root, lsb, w))
+        steps.push((None, self.eval_expr(idx).to_i64()?));
+        self.packed_path_slice(&root, &steps)
+    }
+
+    /// Resolve `<...>.member` where the receiver is itself an indexed packed
+    /// aggregate (`n.wdata[0].amask`). Used as a LAST resort, after every other
+    /// member path has declined, so established lookups keep priority.
+    fn packed_member_slice(
+        &mut self,
+        expr: &Expression,
+        member: &str,
+    ) -> Option<(String, u32, u32)> {
+        if !matches!(expr.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let (root, mut steps) = self.packed_path_steps(expr)?;
+        steps.push((Some(member.to_string()), 0));
+        self.packed_path_slice(&root, &steps)
     }
 
     /// Row-major flatten of an index chain over a packed array's declared
@@ -41862,6 +41996,16 @@ impl Simulator {
                     let qualified = format!("{}.{}", base_name, member.name);
                     if let Some(v) = self.lookup_signal_value(&qualified) {
                         return v;
+                    }
+                }
+                // A member of an indexed PACKED aggregate (`n.wdata[0].amask`):
+                // the paths above resolve a struct base only from an `Ident` or
+                // `Index{Ident}`, so a receiver that is itself a nested select
+                // fell through to the class-handle fallback and read zero(32).
+                // Last, so every established lookup keeps priority.
+                if let Some((sig, lsb, w)) = self.packed_member_slice(expr, &member.name) {
+                    if let Some(v) = self.get_signal_value_by_name(&sig) {
+                        return v.range_select((lsb + w - 1) as usize, lsb as usize);
                     }
                 }
                 let base = self.eval_expr(expr);
