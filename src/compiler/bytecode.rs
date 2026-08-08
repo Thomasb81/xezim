@@ -1413,6 +1413,77 @@ impl<'a> BytecodeCompiler<'a> {
         false
     }
 
+    /// Walk a chain of constant `Index` nodes down to its root identifier.
+    /// Returns the root and the indices outermost-first.
+    fn flatten_const_index_chain<'e>(
+        &self,
+        base: &'e Expression,
+        index: &Expression,
+    ) -> Option<(&'e HierarchicalIdentifier, Vec<i64>)> {
+        let mut idxs = vec![self.eval_const_expr(index)? as i64];
+        let mut cur = base;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, index } => {
+                    idxs.push(self.eval_const_expr(index)? as i64);
+                    cur = expr.as_ref();
+                }
+                ExprKind::Ident(h) => {
+                    idxs.reverse();
+                    return Some((h, idxs));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// `(lsb, width)` of a chained packed element select, from the root's
+    /// declared dimensions. None unless there are at least TWO indices and the
+    /// root has enough registered dimensions — a single-level select keeps its
+    /// existing, separately-tested path.
+    fn chained_packed_slice(&self, base: &Expression, index: &Expression) -> Option<(u32, u32)> {
+        let (hier, idxs) = self.flatten_const_index_chain(base, index)?;
+        if idxs.len() < 2 {
+            return None;
+        }
+        let raw = Self::hier_raw_name(hier);
+        let dims: Vec<(i64, i64)> = self.packed_full_dims.and_then(|m| {
+            m.get(raw.as_str())
+                .or_else(|| hier.path.last().and_then(|s| m.get(s.name.name.as_str())))
+                .cloned()
+        })?;
+        if dims.len() < idxs.len() {
+            return None;
+        }
+        let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
+        let mut off: i64 = 0;
+        for (k, &d) in idxs.iter().enumerate() {
+            let (l, r) = dims[k];
+            let (lo_b, hi_b) = (l.min(r), l.max(r));
+            if d < lo_b || d > hi_b {
+                return None;
+            }
+            // §7.4.1: a descending range labels the LEFT bound as the most
+            // significant element; an ascending one reverses the slot order.
+            let slot = if l >= r { d - lo_b } else { hi_b - d };
+            let elem_w: i64 = counts[k + 1..].iter().product();
+            off = off.checked_add(slot.checked_mul(elem_w)?)?;
+        }
+        let width: i64 = counts[idxs.len()..].iter().product();
+        Some((u32::try_from(off).ok()?, u32::try_from(width).ok()?))
+    }
+
+    /// Compile the ROOT identifier of an index chain (the whole backing
+    /// vector), so a chained slice can be taken out of it.
+    fn compile_expr_root_of(&mut self, e: &Expression) -> Option<RegId> {
+        let mut cur = e;
+        while let ExprKind::Index { expr, .. } = &cur.kind {
+            cur = expr.as_ref();
+        }
+        let root = cur.clone();
+        self.compile_expr(&root, 0)
+    }
+
     /// The base's registered packed ELEMENT width (>1), if it is a
     /// multi-dimensional packed vector (`logic [3:0][7:0] x`).
     fn packed_elem_width_of(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
@@ -1754,6 +1825,17 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // Bail out on anything else (timing controls, loops, system tasks, etc.)
             StatementKind::Expr(e) => {
+                // §6.24.1: `void'(expr)` lowers to `Paren(expr)` (the cast is
+                // a pure discard). The old `Paren(_) => no-op` arm below then
+                // swallowed the whole statement, so `void'(q.pop_front())`
+                // inside a compiled always block never popped — while the
+                // bare `q.pop_front();` form fell through to the AST fallback
+                // and worked, which is exactly how the difference hid. Peel
+                // the wrappers so the inner expression's own arm decides.
+                let mut e = e;
+                while let ExprKind::Paren(inner) = &e.kind {
+                    e = inner;
+                }
                 match &e.kind {
                     // Bare identifier as statement: side-effect-free read, compile as no-op
                     // — BUT only if it actually resolves to a signal. A bare ident that
@@ -1796,7 +1878,9 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("Expr_TaskEnable");
                         return self.emit_fallback(stmt);
                     }
-                    ExprKind::Number(_) | ExprKind::Paren(_) => {
+                    // A literal as a statement is genuinely side-effect-free.
+                    // (`Paren` can no longer appear here — peeled above.)
+                    ExprKind::Number(_) => {
                         return true;
                     }
                     // Pre/post increment/decrement have side effects — compile them
@@ -2453,6 +2537,26 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Paren(inner) => self.compile_expr(inner, ctx_width),
             ExprKind::Index { expr, index } => {
+                // §7.4.1 CHAINED packed element select — `v[i][j][k]` on
+                // `logic [0:0][1:0][1:0]`. Only the innermost `Index` has an
+                // Ident base, so the outer ones fell through to the bit select
+                // below: `v[0]` gave a 4-bit slice, `[0]` then took ONE BIT of
+                // it, and `[1]` ran off the end and produced x. The AST
+                // interpreter walks the whole chain, so `$display` printed the
+                // right bit while the same expression in an `assign` or an `if`
+                // condition read x — a guard that never fired while the value
+                // still looked correct in a print.
+                //
+                // Must precede the Ident-base branch, which by construction
+                // only ever sees one level. Constant indices only: that is the
+                // shape RTL uses (and what a genvar unrolls to), and it leaves
+                // the single-level dynamic path untouched.
+                if let Some((lo, w)) = self.chained_packed_slice(expr, index) {
+                    let base = self.compile_expr_root_of(expr)?;
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::RangeSelectConst(dest, base, lo + w - 1, lo));
+                    return Some(dest);
+                }
                 // §11.5.1: `(X[a:b])[i]` on a packed ARRAY selects ELEMENT i
                 // (labels pass through a constant part-select). This shape
                 // comes from port inlining of `.p(arr[15:0])`-style

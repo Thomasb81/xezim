@@ -71,3 +71,5 @@ mod stream_justify_assoc_default_partsel;
 mod whole_array_continuous_assign;
 #[path = "collections/string_foreach_content.rs"]
 mod string_foreach_content;
+#[path = "collections/void_cast_queue_ops.rs"]
+mod void_cast_queue_ops;
