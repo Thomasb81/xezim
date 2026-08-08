@@ -4234,6 +4234,14 @@ pub struct Simulator {
     prof_entry_counts: Vec<u64>,
     /// XEZIM_CONE: entry is a member of a mergeable chain (static analysis).
     cone_chain_member: Vec<bool>,
+    /// XEZIM_CONE: the chains themselves, so the end-of-run report can weigh
+    /// the dispatches a merge would SAVE against the recomputation it would
+    /// FORCE. A merged kernel fires when any member's inputs change and then
+    /// recomputes every member, so its best-case work is max(evals)*len while
+    /// the unmerged chain costs sum(evals). Equal-firing members make that
+    /// ratio 1.0 (merging is pure win); skewed members make it >1.0 and the
+    /// added compute has to be paid for out of the saved dispatch.
+    cone_chains: Vec<Vec<u32>>,
     prof_settle_ca_count: u64,
     prof_settle_ab_count: u64,
     /// Persistent buffers for settle_combinatorial (avoid repeated allocation)
@@ -6567,6 +6575,7 @@ impl Simulator {
             prof_entry_hist: [0; 12],
             prof_entry_counts: Vec::new(),
             cone_chain_member: Vec::new(),
+            cone_chains: Vec::new(),
             prof_settle_ca_count: 0,
             prof_settle_ab_count: 0,
             t_prevclone: std::time::Duration::ZERO,
@@ -19206,12 +19215,14 @@ impl Simulator {
                 let mut len = 1usize;
                 let mut cur = start;
                 let mut guard = 0usize;
+                let mut members: Vec<u32> = vec![start as u32];
                 while let Some(nx) = chain_next[cur] {
                     // A node with multiple predecessors ends the chain.
                     if chain_prev_cnt[nx] != 1 {
                         break;
                     }
                     len += 1;
+                    members.push(nx as u32);
                     cur = nx;
                     guard += 1;
                     if guard > n {
@@ -19223,6 +19234,7 @@ impl Simulator {
                     in_chain += len;
                     longest = longest.max(len);
                     *len_hist.entry(len.min(10)).or_insert(0) += 1;
+                    self.cone_chains.push(members);
                 }
             }
             let mut hist: Vec<(usize, usize)> = len_hist.into_iter().collect();
@@ -24214,6 +24226,85 @@ impl Simulator {
                     chain_evals,
                     all_evals,
                     chain_evals as f64 * 100.0 / all_evals.max(1) as f64
+                );
+                // Does merging actually save work? A merged kernel fires when
+                // ANY member's inputs change and then recomputes every member.
+                // Its fire count is at least max(member evals), so best-case
+                // work is max*len against sum(evals) unmerged. Ratio 1.0 means
+                // members always co-fire (pure win); >1.0 is recomputation the
+                // saved dispatch has to pay for. Dispatches saved is
+                // sum(evals) - max(evals) per chain, i.e. what merging removes
+                // from the worklist even in that best case.
+                let mut before = 0u64; // sum of member evals
+                let mut after = 0u64; // best-case merged work = max*len
+                let mut fires = 0u64; // best-case merged dispatch count
+                let mut skew_hist = [0usize; 5]; // ratio <1.1,<1.5,<2,<4,>=4
+                let mut sel_before = [0u64; 5];
+                let mut sel_after = [0u64; 5];
+                let mut sel_fires = [0u64; 5];
+                for ch in self.cone_chains.iter() {
+                    let evals: Vec<u64> = ch
+                        .iter()
+                        .map(|&e| self.prof_entry_counts.get(e as usize).copied().unwrap_or(0))
+                        .collect();
+                    let s: u64 = evals.iter().sum();
+                    let m: u64 = evals.iter().copied().max().unwrap_or(0);
+                    if s == 0 {
+                        continue;
+                    }
+                    let w = m * ch.len() as u64;
+                    before += s;
+                    after += w;
+                    fires += m;
+                    let r = w as f64 / s as f64;
+                    let b = if r < 1.1 {
+                        0
+                    } else if r < 1.5 {
+                        1
+                    } else if r < 2.0 {
+                        2
+                    } else if r < 4.0 {
+                        3
+                    } else {
+                        4
+                    };
+                    skew_hist[b] += 1;
+                    sel_before[b] += s;
+                    sel_after[b] += w;
+                    sel_fires[b] += m;
+                }
+                // Selective merge: only fold chains whose members co-fire, so
+                // the recomputation stays bounded. Report the running totals by
+                // threshold to show where the knee is.
+                let names = ["<1.1x", "<1.5x", "<2x", "<4x", "all"];
+                let (mut cb, mut ca, mut cf) = (0u64, 0u64, 0u64);
+                for b in 0..5 {
+                    cb += sel_before[b];
+                    ca += sel_after[b];
+                    cf += sel_fires[b];
+                    eprintln!(
+                        "[CONE] selective merge thresh={:>5}: dispatches removed {} ({:.1}% of all evals), \
+                         extra compute {} ({:+.1}% of all evals)",
+                        names[b],
+                        cb.saturating_sub(cf),
+                        cb.saturating_sub(cf) as f64 * 100.0 / all_evals.max(1) as f64,
+                        ca.saturating_sub(cb),
+                        ca.saturating_sub(cb) as f64 * 100.0 / all_evals.max(1) as f64,
+                    );
+                }
+                eprintln!(
+                    "[CONE] merge economics: evals before={} best-case-after={} ({:+.1}% compute), \
+                     dispatches {}->{} ({:.1}% removed)",
+                    before,
+                    after,
+                    (after as f64 - before as f64) * 100.0 / before.max(1) as f64,
+                    before,
+                    fires,
+                    (before.saturating_sub(fires)) as f64 * 100.0 / before.max(1) as f64
+                );
+                eprintln!(
+                    "[CONE] per-chain recompute ratio (max*len/sum): <1.1x={} <1.5x={} <2x={} <4x={} >=4x={}",
+                    skew_hist[0], skew_hist[1], skew_hist[2], skew_hist[3], skew_hist[4]
                 );
             }
             eprintln!("[PROF] opcode_exec total={} (static-estimate, straight-line)", total_insns);
