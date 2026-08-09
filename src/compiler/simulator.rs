@@ -43001,6 +43001,48 @@ impl Simulator {
                         }
                     }
                 }
+                // §7.2.1: `b = a` between unpacked-struct VARS whose type has
+                // a DYNAMIC member (queue/dynamic/assoc) — the pack/scatter
+                // value path cannot carry variable-size members, so `b.d[]`
+                // arrived empty. Copy member-wise (the copier now clones
+                // dynamic members element-by-element).
+                if let (Some(dst), Some(src)) = (
+                    self.flat_member_name(lvalue),
+                    self.flat_member_name(rvalue),
+                ) {
+                    if dst != src {
+                        let su_opt = self
+                            .module
+                            .var_decl_types
+                            .get(&dst)
+                            .cloned()
+                            .and_then(|dt| match self.resolve_dt(&dt) {
+                                DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
+                                _ => None,
+                            });
+                        if let Some(su) = su_opt {
+                            let has_dyn = su.members.iter().any(|m| {
+                                m.declarators.iter().any(|d| {
+                                    d.dimensions.iter().any(|dim| {
+                                        matches!(
+                                            dim,
+                                            crate::ast::types::UnpackedDimension::Unsized(_)
+                                                | crate::ast::types::UnpackedDimension::Queue { .. }
+                                                | crate::ast::types::UnpackedDimension::Associative { .. }
+                                        )
+                                    })
+                                })
+                            });
+                            if has_dyn && self.struct_storage_exists(&src, &su) {
+                                self.copy_unpacked_struct(&dst, &src, &su);
+                                if !self.in_edge_block {
+                                    self.settle_combinatorial();
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
                 // `s = q.pop_front()` on a queue of unpacked structs: the popped
                 // element's members must reach `s` before the queue shifts — a
                 // packed return value cannot carry them.
@@ -63593,6 +63635,27 @@ impl Simulator {
                     if let Some(v) = self.get_signal_value_by_name(&sname) {
                         self.write_leaf_by_name(&d, v);
                     }
+                } else if md.dimensions.iter().any(|dim| {
+                    matches!(
+                        dim,
+                        crate::ast::types::UnpackedDimension::Unsized(_)
+                            | crate::ast::types::UnpackedDimension::Queue { .. }
+                            | crate::ast::types::UnpackedDimension::Associative { .. }
+                    )
+                }) {
+                    // §7.2.1: a DYNAMIC member (queue/dynamic array) copies by
+                    // VALUE — size + elements. member_dim_indices returns
+                    // None for these, so the member was skipped entirely and
+                    // `b = a` lost `a.d[]`'s contents.
+                    let n = self.get_queue_size(&sname);
+                    for j in 0..n {
+                        if let Some(v) =
+                            self.get_signal_value_by_name(&format!("{}[{}]", sname, j))
+                        {
+                            self.set_signal_value_by_name(&format!("{}[{}]", d, j), v);
+                        }
+                    }
+                    self.set_queue_size(&d, n);
                 } else if let Some(idxs) = self.member_dim_indices(&md.dimensions) {
                     for i in idxs {
                         let (di, si) = (format!("{}[{}]", d, i), format!("{}[{}]", sname, i));
@@ -63832,6 +63895,25 @@ impl Simulator {
                     let v = vals.get(k).cloned().unwrap_or_else(|| Value::zero(32));
                     self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
                 }
+                return;
+            }
+        }
+        // §7.10: pushing a QUEUE/dynamic-array VALUE (queue-of-queue) copies
+        // the source's elements into the new row's compound storage —
+        // evaluating the row to one scalar dropped the contents entirely
+        // (`qq.push_back(tmp)` left qq[0] empty).
+        if let Some(src) = self.flat_member_name(arg) {
+            if self.module.dynamic_arrays.contains(&src)
+                || self.signals.contains_key(&format!("{}.size", src))
+            {
+                let n = self.get_queue_size(&src);
+                for j in 0..n {
+                    let v = self
+                        .get_signal_value_by_name(&format!("{}[{}]", src, j))
+                        .unwrap_or_else(|| Value::zero(32));
+                    self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
+                }
+                self.set_queue_size(elem, n);
                 return;
             }
         }
