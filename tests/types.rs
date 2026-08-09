@@ -221,3 +221,5 @@ mod generate_scope_struct_metadata;
 mod signedness_and_power_context;
 #[path = "types/width_context_discipline.rs"]
 mod width_context_discipline;
+#[path = "types/hierarchy_and_type_overrides.rs"]
+mod hierarchy_and_type_overrides;

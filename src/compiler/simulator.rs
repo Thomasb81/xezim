@@ -21061,7 +21061,15 @@ impl Simulator {
         // it twice; clone the segment directly instead. Multi-segment paths
         // build the same string the `join` did, in one pass with an exact
         // up-front capacity. Result is byte-for-byte what `join(".")` returns.
-        let path = &hier.path;
+        // §23.6: `$root` names the root scope — it contributes nothing to the
+        // flat key (`$root.tb.x` == the absolute `tb.x`, which the top-prefix
+        // strip already resolves). The parser keeps it as an ordinary first
+        // segment; joining it verbatim produced a name that matched nothing,
+        // so every `$root.` read was a 32-bit zero and every write vanished.
+        let skip_root = usize::from(
+            hier.path.len() > 1 && hier.path[0].name.name == "$root",
+        );
+        let path = &hier.path[skip_root..];
         match path.len() {
             0 => String::new(),
             1 => path[0].name.name.clone(),
@@ -51031,6 +51039,42 @@ impl Simulator {
         // that guidance.
         if let Some(cached) = hier.cached_resolved_name.get() {
             return cached.clone();
+        }
+        // §23.6: `$root.` names the root scope and contributes nothing to
+        // the flat key — strip it so `$root.tb.x` resolves exactly like the
+        // absolute `tb.x` (the top-prefix strip finishes the job). Joining it
+        // verbatim matched nothing: reads were 32-bit zeros, writes vanished.
+        if hier.path.len() > 1 && hier.path[0].name.name == "$root" {
+            let stripped: String = {
+                let mut out = String::new();
+                for (i, seg) in hier.path[1..].iter().enumerate() {
+                    if i > 0 {
+                        out.push('.');
+                    }
+                    out.push_str(seg.name.name.as_str());
+                    // Constant segment selects are part of the flat key
+                    // (`$root.tb.u_a.gl[1].x` names a for-generate scope).
+                    for sel in &seg.selects {
+                        if let Some(ix) = Self::try_const_u64(sel) {
+                            use std::fmt::Write as _;
+                            let _ = write!(out, "[{}]", ix);
+                        }
+                    }
+                }
+                out
+            };
+            // Do NOT memoize through the shared-node cache here — go through
+            // the generic top-prefix logic below on a rebuilt name instead.
+            if let Some(rest) = stripped.strip_prefix(&format!("{}.", self.module.name)) {
+                if self.signal_name_to_id.contains_key(rest)
+                    || self.signals.contains_key(rest)
+                {
+                    let _ = hier.cached_resolved_name.set(rest.to_string());
+                    return rest.to_string();
+                }
+            }
+            let _ = hier.cached_resolved_name.set(stripped.clone());
+            return stripped;
         }
         // §26.3: a PACKAGE-scoped reference (`P::s`, `P::s.x`) resolves to the
         // package variable's BARE storage name — the package prefix carries no
