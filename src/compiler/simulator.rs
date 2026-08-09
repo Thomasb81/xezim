@@ -2667,6 +2667,10 @@ pub struct Simulator {
     /// `forced_signals` for those targets so the name-keyed write
     /// fallbacks can drop ordinary writes while the override is active.
     forced_names: HashSet<String>,
+    /// §13.3.1: last value of each STATIC function's implicit return
+    /// variable (key: pkg-scope + fn name). Seeds the next call's return
+    /// slot so an unassigned exit path returns the previous value.
+    static_fn_ret: HashMap<String, Value>,
     /// §10.6.2: an active force/procedural-assign whose RHS is an
     /// EXPRESSION acts as a continuous assignment — it re-evaluates when
     /// its operands change until release. (target key, lvalue, rvalue,
@@ -6244,6 +6248,7 @@ impl Simulator {
             multi_dim_array_names,
             forced_signals: HashMap::default(),
             forced_names: HashSet::default(),
+            static_fn_ret: HashMap::default(),
             active_force_exprs: Vec::new(),
             signal_has_xz: signal_has_xz_init,
             signal_inline_bits: Vec::new(),
@@ -26816,7 +26821,7 @@ impl Simulator {
 
             // Check for repeat with event waits inside
             if let StatementKind::Repeat { count, body } = &stmt.kind {
-                let n = self.eval_expr(count).to_u64().unwrap_or(0);
+                let n = self.repeat_count(count);
                 // Mirror the While/For arms: unroll not only when the body has
                 // a direct `@event`/`#delay`, but also when it blocks via a
                 // CALL to a task whose own body contains a `wait`/`#delay`/
@@ -45401,6 +45406,21 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §12.7.3: `foreach (m[i])` with FEWER index vars than
+                        // dims iterates the first dimension fully — the
+                        // single-var fallbacks below sized it wrong (one
+                        // iteration on a 2-D fixed array).
+                        if vars.len() == 1 {
+                            if let Some(dims) = self.foreach_dims(&an) {
+                                if dims.len() >= 2 {
+                                    self.exec_foreach_nested(&dims[..1], vars, body, None);
+                                    self.auto_loop_vars.truncate(fe_auto_len);
+                                    self.restore_loop_vars(&fe_saved);
+                                    if !self.return_flag { self.break_flag = false; }
+                                    return;
+                                }
+                            }
+                        }
                         // §7.9.1/§7.10: `foreach (all[outer, inner])` over an
                         // ASSOCIATIVE ARRAY OF QUEUES (`T all[key][$]`). The
                         // outer index walks the (sparse) assoc keys, the inner
@@ -45621,6 +45641,26 @@ impl Simulator {
                     // dimension — `foreach (m[i, j])`. A null entry (`m[, j]`)
                     // skips that dimension. Only `vars[0]` was ever bound, so
                     // `j` stayed X and the loop ran over the first dim alone.
+                    // §12.7.3: `foreach (m[i])` with FEWER index vars than
+                    // dims iterates the FIRST dimension fully — the 1-var
+                    // fallbacks below sized a 2-D fixed array wrong (one
+                    // iteration).
+                    if vars.len() == 1
+                        && !self.module.dynamic_arrays.contains(&name)
+                        && !self.is_associative_array(&name)
+                    {
+                        if let Some(dims) = self.foreach_dims(&name) {
+                            if dims.len() >= 2 {
+                                self.exec_foreach_nested(&dims[..1], vars, body, None);
+                                self.auto_loop_vars.truncate(fe_auto_len);
+                                self.restore_loop_vars(&fe_saved);
+                                if !self.return_flag {
+                                    self.break_flag = false;
+                                }
+                                return;
+                            }
+                        }
+                    }
                     if vars.len() >= 2 {
                         if let Some(mut dims) = self.foreach_dims(&name) {
                             // A dynamic outer dimension (`T a[][16]`) is backed
@@ -45974,8 +46014,10 @@ impl Simulator {
                 }
             }
             StatementKind::Repeat { count, body } => {
-                let n = self.eval_expr(count).to_u64().unwrap_or(0);
-                for _ in 0..n.min(10000) {
+                // §12.7.2: full count — the old 10000 cap silently truncated
+                // large loops (and negatives-as-unsigned hit it constantly).
+                let n = self.repeat_count(count);
+                for _ in 0..n {
                     if self.finished {
                         break;
                     }
@@ -72500,6 +72542,19 @@ impl Simulator {
         None
     }
 
+    /// §12.7.2: a repeat count that is x/z or NEGATIVE executes zero times.
+    fn repeat_count(&mut self, count: &Expression) -> u64 {
+        let v = self.eval_expr(count);
+        if v.has_xz() {
+            return 0;
+        }
+        if v.is_signed {
+            v.to_i64().unwrap_or(0).max(0) as u64
+        } else {
+            v.to_u64().unwrap_or(0)
+        }
+    }
+
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
         // §26.3: the package this body belongs to. Taken before anything else
         // runs, so a call appearing in an argument (evaluated below, in the
@@ -72707,7 +72762,27 @@ impl Simulator {
         } else {
             Value::new(ret_w)
         };
-        locals.insert(ret_name.clone(), ret_init);
+        // §13.3.1/§13.4.1: a STATIC-lifetime function's implicit return
+        // variable persists across calls — a path that exits without
+        // assigning returns the PREVIOUS call's value, not a fresh default.
+        // Only module-scope functions without an `automatic` qualifier
+        // qualify (class methods default to automatic, §8.6).
+        let static_ret_key = (!matches!(
+            fd.lifetime,
+            Some(crate::ast::types::Lifetime::Automatic)
+        ) && self.module.functions.contains_key(&ret_name))
+        .then(|| {
+            format!(
+                "{}::{}",
+                pkg_scope.as_deref().unwrap_or("-"),
+                ret_name
+            )
+        });
+        let seeded = static_ret_key
+            .as_ref()
+            .and_then(|k| self.static_fn_ret.get(k).cloned())
+            .unwrap_or(ret_init);
+        locals.insert(ret_name.clone(), seeded);
         // §13.4.1: the return variable is a variable of the return type, so it
         // needs the same structural metadata a declaration gets. It had none:
         // a `function pkt_t f(); f.a = ...;` member write found no field layout
@@ -72834,6 +72909,9 @@ impl Simulator {
         // leaves. `resolve_type_width` does not count a member's unpacked
         // dimensions, so resizing to it truncated a struct with an array member
         // and dropped the members laid out above the cut.
+        if let Some(k) = static_ret_key {
+            self.static_fn_ret.insert(k, result.clone());
+        }
         let unpacked_struct_ret = self.unpacked_struct_of(&fd.return_type).is_some();
         if !result.is_real
             && !unpacked_struct_ret
