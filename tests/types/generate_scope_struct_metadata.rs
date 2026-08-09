@@ -178,9 +178,13 @@ module tb;
   logic [7:0] r1, r2, r3, r4;
   initial begin
     g.x = 8'h33; gl[1].v = 8'h44;
-    #1; r1 = t_if; r2 = t_for;
+    // Two delays between write and sample: the property pinned here is that
+    // the CA TRACKS the write at all (it used to stay X forever) — not
+    // same-timestep settle ordering, which one CI runner scheduled
+    // differently than every local run.
+    #1; #1; r1 = t_if; r2 = t_for;
     g.x = 8'h77; gl[1].v = 8'h88;   // the CA must RE-fire, not just settle once
-    #1; r3 = t_if; r4 = t_for;
+    #1; #1; r3 = t_if; r4 = t_for;
   end
 endmodule
 "#;
