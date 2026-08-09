@@ -1723,3 +1723,20 @@ negedge (not posedge), armed bits set correctly. (3) knob `XEZIM_INIT_REG=0|rand
 (random: per-id LCG — reset-bug hunting), `XEZIM_INIT_ZERO` as deprecated alias.
 (4) gates: c906/c910 complete post-merge; on properly-reset designs the flag must be a
 behavioral no-op after the first reset (byte-diff from reset onward).
+
+## AOT coverage extension — measured, and it INVERTS the win
+
+Extended eligibility with `NbaAssignRange` (shared-method bridge — the interpreter arm and
+bridge call the same `nba_assign_range_val`, no drift possible) and native `Replicate`:
+c910 edge eligibility 9,705 -> **17,400/21,305 (82%)**, native fires 156.6M -> **332.1M**.
+Byte-exact golden output, bail 4.37%. Pure sim: **2616.6s interp / 2522.5s original AOT
+(-3.6%) / 2993.8s extended (+14.4%)**.
+
+**Coverage is not the objective function.** The 175M added fires are 1-3-op bodies
+(per-bit nba-range flops, replicates) where per-call glue (ctx + indirect call + X-guard +
+Value materialization + bridge) exceeds the body — the settle-comb lesson repeating at the
+edge level. The original set was accidentally self-selected for amortizable bodies.
+**A shippable AOT needs a fire-weighted body-size heuristic (e.g. compile only blocks with
+>= ~8-10 ops), not maximal coverage.** The -3.6% at the 9,705-block set stands as the
+best measured configuration. WIP preserved at `scratchpad/AOT-COVERAGE.patch` (includes
+the NbaAssignRange shared-method refactor, worth keeping for its own sake).
