@@ -238,3 +238,6 @@ mod expression_event_controls;
 
 #[path = "types/packed_multilevel_and_collision.rs"]
 mod packed_multilevel_and_collision;
+
+#[path = "types/star_vs_always_comb.rs"]
+mod star_vs_always_comb;
