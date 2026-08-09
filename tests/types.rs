@@ -244,3 +244,15 @@ mod star_vs_always_comb;
 
 #[path = "types/force_expression_tracks.rs"]
 mod force_expression_tracks;
+
+#[path = "types/procedural_loop_and_static_fn.rs"]
+mod procedural_loop_and_static_fn;
+
+#[path = "types/inside_defaults_and_foreach_dir.rs"]
+mod inside_defaults_and_foreach_dir;
+
+#[path = "types/param_const_eval_contexts.rs"]
+mod param_const_eval_contexts;
+
+#[path = "types/struct_port_pattern_ca.rs"]
+mod struct_port_pattern_ca;
