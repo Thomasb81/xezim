@@ -1237,6 +1237,12 @@ struct SensitivityId {
     /// term. Consulted by the procedural `@`-event wake path; the always-
     /// block edge paths carry it but do not yet evaluate it.
     iff: Option<Expression>,
+    /// §9.4.2: for a NON-TRIVIAL event expression (`@(a + b)`), the term's
+    /// full expression. Operand-signal edges only COUNT when this
+    /// expression's value differs from its value at arm time (stored in
+    /// `EventWaiter::guard_prev`) — `a=2;b=1` leaving `a+b` at 3 must not
+    /// fire. `None` for plain signal/edge terms.
+    value_of: Option<Expression>,
 }
 
 #[derive(Debug, Clone)]
@@ -1245,6 +1251,8 @@ struct Sensitivity {
     edge: EdgeKind,
     /// See `SensitivityId::iff` — carried through name→id resolution.
     iff: Option<Expression>,
+    /// See `SensitivityId::value_of` — carried through name→id resolution.
+    value_of: Option<Expression>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1367,6 +1375,11 @@ struct EventWaiter {
     /// Full captured value for >64-bit sensitivity signals (parallel to
     /// `captured_prev`); `None` for ≤64-bit signals.
     captured_prev_wide: Vec<Option<Value>>,
+    /// §9.4.2 value guard for non-trivial event expressions — parallel to
+    /// `resolved_sensitivities`. `Some(v)` holds the term expression's value
+    /// at ARM time; an operand edge only counts when the expression now
+    /// evaluates differently (see `SensitivityId::value_of`).
+    guard_prev: Vec<Option<Value>>,
     /// Number of qualifying events still required before the continuation
     /// resumes. This collapses action-free `repeat (N) @(event);` loops into
     /// one parked waiter instead of rebuilding their AST continuation after
@@ -2988,6 +3001,11 @@ pub struct Simulator {
     sdf_delays: Vec<u64>,
     /// Pending delayed signal updates: (time, signal_id, value)
     delayed_updates: Vec<(u64, usize, Value)>,
+    /// §4.9.4: future-time NBA updates (`a <= #d v`). Kept SEPARATE from
+    /// `delayed_updates` (gate/CA transport, an ACTIVE-region event at
+    /// maturity): these commit in the target slot's NBA region, after that
+    /// slot's Active reads.
+    delayed_nba: Vec<(u64, usize, Value)>,
     /// §29 per-instance UDP runtime state, indexed by `CombItem::Udp{idx}`.
     udp_runtime: Vec<UdpRuntime>,
     /// True when the design contains any UDP instance — forces the serial
@@ -6285,6 +6303,7 @@ impl Simulator {
             sdf_select: None,
             sdf_delays: Vec::new(),
             delayed_updates: Vec::new(),
+            delayed_nba: Vec::new(),
             udp_runtime: Vec::new(),
             has_udp: false,
             module,
@@ -14223,6 +14242,7 @@ impl Simulator {
                                 signal_id: id,
                                 edge: s.edge,
                                 iff: s.iff.clone(),
+                                value_of: None,
                             });
                         }
                         if let Some(stripped) = s.signal_name.strip_prefix(&top_prefix) {
@@ -14231,6 +14251,7 @@ impl Simulator {
                                     signal_id: id,
                                     edge: s.edge,
                                     iff: s.iff.clone(),
+                                    value_of: None,
                                 });
                             }
                         }
@@ -21521,6 +21542,7 @@ impl Simulator {
                     signal_name: resolved,
                     edge: EdgeKind::AnyEdge,
                     iff: None,
+                    value_of: None,
                 });
             }
         }
@@ -21645,6 +21667,7 @@ impl Simulator {
                                         signal_name: self.resolve_event_key(&key),
                                         edge,
                                         iff: ee.iff.clone(),
+                                        value_of: None,
                                     });
                                     continue;
                                 }
@@ -21661,6 +21684,7 @@ impl Simulator {
                                     signal_name: format!("{}[{}]", bn, value.replace('_', "")),
                                     edge,
                                     iff: ee.iff.clone(),
+                                    value_of: None,
                                 });
                                 continue;
                             }
@@ -21668,6 +21692,7 @@ impl Simulator {
                     }
                     let mut idents = Vec::new();
                     collect_ident_names(&ee.expr, &mut idents);
+                    let term_start = out.len();
                     for &h in &idents {
                         // LRM §14.3: `@(cb)` naming a clocking block means the
                         // block's clock event (`@(posedge clk)`), not a signal
@@ -21696,6 +21721,7 @@ impl Simulator {
                                         signal_name: hidden,
                                         edge: EdgeKind::AnyEdge,
                                         iff: ee.iff.clone(),
+                                        value_of: None,
                                     });
                                     continue;
                                 }
@@ -21716,6 +21742,7 @@ impl Simulator {
                                     signal_name: self.resolve_event_key(&key),
                                     edge,
                                     iff: ee.iff.clone(),
+                                    value_of: None,
                                 });
                                 continue;
                             }
@@ -21734,6 +21761,7 @@ impl Simulator {
                                         .copied()
                                         .unwrap_or(EdgeKind::Posedge),
                                     iff: ee.iff.clone(),
+                                    value_of: None,
                                 });
                                 continue;
                             }
@@ -21742,7 +21770,22 @@ impl Simulator {
                             signal_name: sig,
                             edge,
                             iff: ee.iff.clone(),
+                            value_of: None,
                         });
+                    }
+                    // §9.4.2: a non-trivial event expression fires on its
+                    // VALUE change, not on any operand write — attach the
+                    // term expression so the wake path can compare against
+                    // the armed value (guard_prev).
+                    if matches!(
+                        &ee.expr.kind,
+                        ExprKind::Binary { .. }
+                            | ExprKind::Unary { .. }
+                            | ExprKind::Conditional { .. }
+                    ) {
+                        for sens in out.iter_mut().skip(term_start) {
+                            sens.value_of = Some(ee.expr.clone());
+                        }
                     }
                     // P6: `@(posedge vif.clk)` — a virtual-interface member is a
                     // MemberAccess, which collect_ident_names doesn't gather.
@@ -21775,6 +21818,7 @@ impl Simulator {
                                         signal_name: self.resolve_event_key(&k),
                                         edge: EdgeKind::AnyEdge,
                                         iff: ee.iff.clone(),
+                                        value_of: None,
                                     });
                                     continue;
                                 }
@@ -21796,6 +21840,7 @@ impl Simulator {
                                             signal_name: hidden,
                                             edge: EdgeKind::AnyEdge,
                                             iff: ee.iff.clone(),
+                                            value_of: None,
                                         });
                                         continue;
                                     }
@@ -21819,6 +21864,7 @@ impl Simulator {
                                             signal_name: format!("{}.{}", b, member.name),
                                             edge,
                                             iff: ee.iff.clone(),
+                                            value_of: None,
                                         });
                                     }
                                 }
@@ -21844,12 +21890,14 @@ impl Simulator {
                         signal_name: clk.clone(),
                         edge: EdgeKind::Posedge,
                         iff: None,
+                        value_of: None,
                     }]
                 } else {
                     vec![Sensitivity {
                         signal_name: id.name.clone(),
                         edge: EdgeKind::AnyEdge,
                         iff: None,
+                        value_of: None,
                     }]
                 }
             }
@@ -21871,6 +21919,7 @@ impl Simulator {
                                 signal_name: clk.clone(),
                                 edge: EdgeKind::Posedge,
                                 iff: None,
+                                value_of: None,
                             }];
                         }
                     }
@@ -21878,6 +21927,7 @@ impl Simulator {
                         signal_name: self.resolve_hier_name(h),
                         edge: EdgeKind::AnyEdge,
                         iff: None,
+                        value_of: None,
                     }]
                 } else {
                     Vec::new()
@@ -22101,7 +22151,7 @@ impl Simulator {
     }
 
     fn make_event_waiter(
-        &self,
+        &mut self,
         pid: usize,
         sens: Vec<Sensitivity>,
         continuation: ProcCont,
@@ -22110,7 +22160,7 @@ impl Simulator {
     }
 
     fn make_event_waiter_kind(
-        &self,
+        &mut self,
         pid: usize,
         sens: Vec<Sensitivity>,
         continuation: ProcCont,
@@ -22125,8 +22175,14 @@ impl Simulator {
                         signal_id: id,
                         edge: s.edge,
                         iff: s.iff.clone(),
+                        value_of: s.value_of.clone(),
                     })
             })
+            .collect();
+        // §9.4.2 value guard: capture each non-trivial term's value at arm.
+        let guard_prev: Vec<Option<Value>> = resolved
+            .iter()
+            .map(|sid| sid.value_of.clone().map(|e| self.eval_expr(&e)))
             .collect();
         // Capture each sensitivity signal's value AT ARM TIME, parallel to
         // `resolved`. A waiter registered within the current snapshot
@@ -22165,6 +22221,7 @@ impl Simulator {
             continuation,
             captured_prev,
             captured_prev_wide,
+            guard_prev,
             remaining_events: 1,
             is_clocking,
         }
@@ -23184,6 +23241,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+            || self.delayed_nba_due()
         {
             self.apply_nba();
             if self.nba_touched_edge_non_clock {
@@ -23286,6 +23344,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+            || self.delayed_nba_due()
         {
                 self.apply_nba();
             }
@@ -23685,6 +23744,7 @@ impl Simulator {
                 && !has_waiters
                 && !has_clocks
                 && self.delayed_updates.is_empty()
+                && self.delayed_nba.is_empty()
                 && !has_reactive
             {
                 break;
@@ -23696,6 +23756,7 @@ impl Simulator {
                 && !has_timed
                 && !has_clocks
                 && self.delayed_updates.is_empty()
+                && self.delayed_nba.is_empty()
             {
                 break;
             }
@@ -25062,6 +25123,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+            || self.delayed_nba_due()
         {
                 self.apply_nba();
             }
@@ -26452,8 +26514,7 @@ impl Simulator {
                                 self.signal_name_to_id.contains_key(s.signal_name.as_str())
                             })
                         {
-                            self.event_waiters
-                                .push(self.make_event_waiter(pid, sens, cont));
+                            { let w = self.make_event_waiter(pid, sens, cont); self.event_waiters.push(w); }
                         } else {
                             eprintln!(
                                 "[xezim][warning] wait_order at time {}: none of the named events resolve to declared events; process will not resume (IEEE 1800-2017 §15.5.3)",
@@ -26589,10 +26650,9 @@ impl Simulator {
                                     signal_name: canon,
                                     edge: EdgeKind::AnyEdge,
                                     iff: None,
+                                    value_of: None,
                                 }];
-                                self.event_waiters.push(
-                                    self.make_event_waiter_kind(pid, sens, cont, false),
-                                );
+                                { let w = self.make_event_waiter_kind(pid, sens, cont, false); self.event_waiters.push(w); }
                                 return;
                             }
                         }
@@ -26619,8 +26679,7 @@ impl Simulator {
                                 self.signal_name_to_id.contains_key(s.signal_name.as_str())
                             });
                             if has_real {
-                                self.event_waiters
-                                    .push(self.make_event_waiter_kind(pid, sens, cont, is_clk_ev));
+                                { let w = self.make_event_waiter_kind(pid, sens, cont, is_clk_ev); self.event_waiters.push(w); }
                             } else {
                                 // `@(x)` where x is not a real signal — a
                                 // procedural local that was NBA-assigned then
@@ -27891,13 +27950,12 @@ impl Simulator {
                                 },
                                 body.span,
                             ));
-                            self.event_waiters
-                                .push(self.make_event_waiter_kind(
+                            { let w = self.make_event_waiter_kind(
                                     pid,
                                     sens,
                                     pc.pushed(cont, resume_at),
                                     is_clk_ev,
-                                ));
+                                ); self.event_waiters.push(w); }
                             return;
                         }
                     }
@@ -28453,6 +28511,24 @@ impl Simulator {
     }
 
     fn apply_nba(&mut self) {
+        // §4.9.4: commit matured future-time NBAs first — they were scheduled
+        // in an earlier slot, so they precede this slot's freshly queued NBAs.
+        if !self.delayed_nba.is_empty() {
+            let mut i = 0;
+            while i < self.delayed_nba.len() {
+                if self.delayed_nba[i].0 <= self.time {
+                    let (_, id, mut val) = self.delayed_nba.swap_remove(i);
+                    val.is_signed = self.signal_signed[id];
+                    if self.signal_table[id] != val {
+                        write_sig!(self, id, val);
+                        self.mark_dirty_id(id);
+                        self.table_modified = true;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
         // JIT Stage 4 Path C1: drain any JIT-emitted inline NBA writes
         // into nba_fast BEFORE clearing the per-window index, so
         // partial-bit follow-ups (NbaAssignRange) see them.
@@ -28723,7 +28799,18 @@ impl Simulator {
 
     /// Get the next time a delayed update is due (for time advancement).
     fn next_delayed_time(&self) -> Option<u64> {
-        self.delayed_updates.iter().map(|(t, _, _)| *t).min()
+        let a = self.delayed_updates.iter().map(|(t, _, _)| *t).min();
+        let b = self.delayed_nba.iter().map(|(t, _, _)| *t).min();
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, None) => x,
+            (None, y) => y,
+        }
+    }
+
+    /// Any future-time NBA matured at (or before) the current time?
+    fn delayed_nba_due(&self) -> bool {
+        self.delayed_nba.iter().any(|(t, _, _)| *t <= self.time)
     }
 
     /// Schedule a delayed signal update (inertial delay model).
@@ -29378,7 +29465,18 @@ impl Simulator {
                     Some(g) => self.eval_expr(g).is_true(),
                     None => true,
                 };
-                if guard_ok {
+                // §9.4.2: a non-trivial event expression fires only when its
+                // VALUE changed since arm — `a=2;b=1` leaving `a+b` at 3 is
+                // not an event, however many operands moved.
+                let value_ok = match (&sid.value_of, waiter.guard_prev.get(i)) {
+                    (Some(e), Some(Some(prev))) => {
+                        let e = e.clone();
+                        let prev = prev.clone();
+                        self.eval_expr(&e) != prev
+                    }
+                    _ => true,
+                };
+                if guard_ok && value_ok {
                     triggered = true;
                     break;
                 }
@@ -39055,6 +39153,71 @@ impl Simulator {
                         };
                     }
                 }
+                // §7.4.1: MULTI-LEVEL packed element select — `x[i][j]` on
+                // `T [0:0][1:0] x;` peels the whole index chain against the
+                // DECLARED packed dims. The single-level arm below knows only
+                // one element width, so the second level degraded to a BIT
+                // select of the first slice ($bits(x[0][0]) read 1 and every
+                // nested-element read returned one bit).
+                {
+                    let mut rev_idx_exprs: Vec<&Expression> = vec![index];
+                    let mut cur: &Expression = expr;
+                    while let ExprKind::Index { expr: b, index: i2 } = &cur.kind {
+                        rev_idx_exprs.push(i2);
+                        cur = b;
+                    }
+                    if rev_idx_exprs.len() >= 2 {
+                        if let ExprKind::Ident(h) = &cur.kind {
+                            let nm = self.resolve_hier_name(h);
+                            if let Some(dims) = self.module.packed_full_dims.get(&nm).cloned() {
+                                if dims.len() >= rev_idx_exprs.len() {
+                                    let base_v = self.eval_expr(cur);
+                                    let total = base_v.width as u64;
+                                    let mut w = total;
+                                    let mut lsb: i64 = 0;
+                                    let mut oob = false;
+                                    let mut xz = false;
+                                    for (k, ie) in rev_idx_exprs.iter().rev().enumerate() {
+                                        let (dl, dr) = dims[k];
+                                        let count = (dl - dr).unsigned_abs() + 1;
+                                        if count == 0 || w % count != 0 {
+                                            oob = true;
+                                            break;
+                                        }
+                                        w /= count;
+                                        let iv = self.eval_expr(ie);
+                                        if iv.has_xz() {
+                                            xz = true;
+                                            break;
+                                        }
+                                        let i = iv.to_i64().unwrap_or(i64::MIN);
+                                        let lo_b = dl.min(dr);
+                                        let off = i - lo_b;
+                                        if off < 0 || off as u64 >= count {
+                                            oob = true;
+                                            break;
+                                        }
+                                        let slot = if dl >= dr {
+                                            off
+                                        } else {
+                                            (count as i64 - 1) - off
+                                        };
+                                        lsb += slot * w as i64;
+                                    }
+                                    if xz || oob {
+                                        // §11.5.1: x/z or out-of-range index
+                                        // reads all-x at the element width.
+                                        return Value::new(w.max(1) as u32);
+                                    }
+                                    return base_v.range_select(
+                                        (lsb as u64 + w - 1) as usize,
+                                        lsb as usize,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 // Packed multi-D signal element select (LRM §7.4.1): for
                 // `logic [3:0][7:0] w;`, `w[i]` selects the i-th 8-bit slice
                 // rather than the i-th bit. Triggered when the signal's name
@@ -44747,7 +44910,10 @@ impl Simulator {
                 } else if let Some(id) = self.resolve_nba_target(lvalue) {
                     // Delayed NBA is transport, not inertial: push directly
                     // so pending same-signal updates are NOT cancelled.
-                    self.delayed_updates
+                    // §4.9.4: matures in the target slot's NBA REGION — the
+                    // separate queue commits inside apply_nba, so Active
+                    // reads at the same time still see the old value.
+                    self.delayed_nba
                         .push((self.time + d, id, val.resize_for_assign(w)));
                 } else {
                     let frozen = self.freeze_lvalue_indices(lvalue);
@@ -45982,8 +46148,7 @@ impl Simulator {
                         // If we are here, it's a nested timing control which we don't fully support yet.
                         let cont = vec![*stmt.clone()];
                         let pid = self.cg_this.unwrap_or(0); // placeholder
-                        self.event_waiters
-                            .push(self.make_event_waiter_kind(pid, sens, cont.into(), is_clk_ev));
+                        { let w = self.make_event_waiter_kind(pid, sens, cont.into(), is_clk_ev); self.event_waiters.push(w); }
                         self.break_flag = true;
                         return;
                     }
@@ -73194,6 +73359,7 @@ impl Simulator {
                             signal_id: id,
                             edge: s.edge,
                             iff: s.iff.clone(),
+                            value_of: None,
                         })
                 })
                 .collect();
