@@ -207,3 +207,5 @@ mod unary_context_width;
 mod nested_packed_struct_array_access;
 #[path = "types/package_typedef_scoping.rs"]
 mod package_typedef_scoping;
+#[path = "types/diag_kind_limit_env.rs"]
+mod diag_kind_limit_env;

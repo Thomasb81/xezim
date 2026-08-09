@@ -134,6 +134,9 @@ fn print_usage() {
     eprintln!("                   drivers. Signals x/z from the start are never reported.");
     eprintln!("                   Also enabled by +X_WARN or X_WARN=1 in the environment.");
     eprintln!("  --x-warn-limit N Cap --x-warn reports at N (default 50, 0 = unlimited).");
+    eprintln!("                   Elaboration diagnostics (port width mismatches, implicit");
+    eprintln!("                   nets, ...) are capped per KIND at 5; raise with");
+    eprintln!("                   XEZIM_DIAG_LIMIT=N (0 = unlimited).");
     eprintln!("                   Also settable as X_WARN_LIMIT=N.");
     eprintln!("  --module-timescale <unit>/<prec>            Timescale for every module with no");
     eprintln!("                     [mod1,mod2=]<unit>/<prec>   explicit source-level timescale (the");
