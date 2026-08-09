@@ -1434,3 +1434,48 @@ vopt-style passes as multipliers on top of it, not standalone.
 
 Dynamic-census instrumentation preserved at `scratchpad/XZ-DYNAMIC-CENSUS.patch`
 (+0.77% hot-path tax when compiled in — reverted per protocol).
+
+## AOT compilation — piloted end-to-end, and it closes the loop on WHY compilation needs 2-state
+
+Built the full pipeline (patch: `scratchpad/AOT-pilot.patch`, 533 lines): generate Rust
+source for pure edge blocks (registers as `Value` locals, ops as inlined `xezim-core`
+methods — layout identical BY CONSTRUCTION via a path dependency), basic-block state
+machine for control flow, ONE FFI callback per NBA write plus a "host executes this one
+Insn via `exec_insns` on a 1-insn slice" escape (zero duplicated semantics), cargo-built
+cdylib cached by source hash (81.5 s first build, then cache hit), dlopen + per-block
+symbols. `XEZIM_AOT=1` opt-in.
+
+**It worked immediately and exactly**: 1,566/3,607 blocks compiled, `cost=727`, stdout
+byte-identical to the interpreter across all runs.
+
+### Verdict — the JIT's failure shape, amplified, and now fully explained
+
+| | interpreter | AOT | |
+|---|---|---|---|
+| instructions | 280.60 G | 277.34 G | **-1.16%** (real) |
+| cycles | 128.77 G | 147.69 G | **+14.7%** |
+| IPC | 2.18 | 1.88 | |
+| L1i-load-misses (x25) | 637 M | 1,369 M | **2.15x** |
+| ifetch stall cycles (x25) | 1.90 G | 5.04 G | **2.65x** |
+
+The generated `.so` is **4.1 MB of native code for 43% of blocks**. Inlining full 4-state
+`Value` semantics turns every bytecode op into ~KB of machine code; 1,566 functions cycle
+through the I-cache where the interpreter runs one resident loop. Fewer instructions
+retired, catastrophically worse fetch behaviour — the cranelift JIT's signature (IPC
+2.11→1.79), reproduced with GOOD codegen, which acquits cranelift: the problem was never
+codegen quality.
+
+### The terminal insight of the whole performance arc
+
+- Stages 1-3: the interpreter's per-op cost is intrinsic 4-state semantics, not
+  representation.
+- JIT + AOT: compiling that 4-state work VERBATIM explodes code size and dies on I-cache,
+  regardless of compiler quality.
+- Therefore compilation only pays TOGETHER WITH 2-state specialization (which shrinks
+  `a<=b&c` to a few instructions) — they are not independent techniques but one paired
+  move. This is exactly the Verilator/GSIM/Questa formula, now derived from xezim's own
+  measurements: **compile AND demote, or do neither.**
+
+The measured assets for that future combined attempt: >99% of dynamic executions are
+X-free (the 2-state guard fires rarely), the JIT's X/Z pre-check-bail is the guard
+pattern, and this pilot's pipeline (codegen/cache/dlopen/bridges) is reusable as-is.
