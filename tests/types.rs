@@ -215,3 +215,5 @@ mod package_scope_resolution;
 mod preprocessor_include_fatal;
 #[path = "types/wire_typedef_declarations.rs"]
 mod wire_typedef_declarations;
+#[path = "types/generate_scope_struct_metadata.rs"]
+mod generate_scope_struct_metadata;
