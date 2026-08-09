@@ -1296,3 +1296,50 @@ I-cache/BTB footprint roughly doubles — a structural cost of any partial-cover
 
 Patch preserved at `scratchpad/STAGE2-flat-interpreter.patch` (1,028 lines, all gates
 green). Reverted; tree byte-identical to baseline.
+
+## Stage 3 (typed registers) — built, measured, rejected. The representation axis is closed.
+
+On top of the revived Stage-2 substrate: VM registers as four parallel planes
+(`treg_v`/`treg_x` bits + DYNAMIC `treg_w`/`treg_s` header, set per store exactly as
+`vm_store` does — deliberately no static width inference, avoiding the JIT's
+`update_reg_width_only` hazard class). Every `vm_*` helper was refactored into a shared
+bit-level `vmb_*` core called by BOTH loops, so the typed arms cannot drift semantically.
+`lower_flat` marks a block `typed` only when no real/fill/wide value can enter a register
+(signals checked by width+realness, pool constants by inspection; the op set cannot widen
+past 64). Assign/queue mechanics materialise a `Value` from the planes on demand.
+
+Correct: `cost=727`, stdout byte-identical. **Typed coverage: 36.2% of all VM instructions
+(96% of flat-eligible ones)** — a real sample. Three-way A/B, same binary, 3 interleaved
+reps, c906 memcpy x50:
+
+| interpreter | instructions | cycles |
+|---|---|---|
+| `Insn` enum loop (`XEZIM_FLAT=0`) | 281.25 G | **131.92 G** |
+| Stage-2 value-flat (`XEZIM_TYPED=0`) | **279.88 G** | 132.71 G |
+| Stage-3 typed planes (default) | 280.50 G | 134.29 G |
+
+**Typed registers are worse than Value registers on both counters** (+0.62 G insn,
++1.58 G cyc vs value-flat; +1.8% cycles vs the plain enum loop). The reason, measured
+rather than assumed: the `Value` fast paths were already near-minimal — `set_inline_bits`
++ header stores on one 32-byte line — while four parallel planes cost four address
+computations and up to four cache lines per register touched. The "32-byte Value overhead"
+that Stage 3 was meant to remove does not exist on the fast paths that dominate.
+
+### The migration triad is now fully measured
+
+| stage | form | result |
+|---|---|---|
+| 1 | SoA signal planes | **+11.3%** (header tax) |
+| 2 | flat wordcode dispatch | **±0** (dispatch was never the cost) |
+| 3 | typed register planes | **worse than Stage 2** on insn AND cycles |
+
+Combined with the JIT (dispatch removed entirely: still +19% wall on cranelift 0.134),
+every representation-level hypothesis about the VM is now dead by direct measurement. The
+~35 retired instructions per bytecode op are the intrinsic cost of 4-state semantics plus
+necessary memory traffic — **this interpreter is already near the efficiency frontier for
+its semantics.** Future effort should go to executing FEWER bytecode ops (algorithmic /
+scheduling work, e.g. the armed-worklist inversion) — not to executing the same ops
+through yet another representation.
+
+Patch preserved at `scratchpad/STAGE3-typed-registers.patch` (1,847 lines, includes the
+revived Stage 2; all gates green). Reverted; tree byte-identical to baseline.
