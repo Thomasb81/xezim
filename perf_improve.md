@@ -1703,3 +1703,23 @@ current code; the regression gate is now the default-mode set: c906 `cost=368`, 
 `cost=216/finish=2282050`, c910 cmark `158034/34985250` (all verified passing post-merge),
 plus the 1798-test suite. cmark on c906 under INIT_ZERO is untested post-merge; c910 needs
 no INIT_ZERO at all.
+
+## INIT_ZERO refactor design (research, Aug 2026)
+
+Current `XEZIM_INIT_ZERO=1` (`simulator.rs:5499`, `:5630`) coerces EVERY X-valued signal
+(nets included, plus all array elements) to 0 at CONSTRUCTION time — invisible to the
+event system: no write, no dirty marking, no X->0 transition. Three measured consequences:
+the 1.64x c906 firmware-path distortion (nets forced into unreachable states), the
+post-merge wedge (upstream's stricter event semantics need the initial transitions that
+coercion suppresses), and c910 needing the flag for nothing.
+
+Design (VCS `+vcs+initreg` model): (1) select REGISTER-class storage only — edge-block NBA
+targets (flop set, derivable via the existing nba_writer_count scan) + procedural
+variables; exclude cont_driven/comb-driven nets; memories under a separate
+`XEZIM_INIT_MEM` keeping cheap construction-time zeroing. (2) initialize by REAL writes at
+simulation start through the standard write path (set_inline_bits + dirty + after_signal_
+write) — semantically "initial q = 0;" per flop: time-0 settle derives nets, X->0 fires
+negedge (not posedge), armed bits set correctly. (3) knob `XEZIM_INIT_REG=0|random`
+(random: per-id LCG — reset-bug hunting), `XEZIM_INIT_ZERO` as deprecated alias.
+(4) gates: c906/c910 complete post-merge; on properly-reset designs the flag must be a
+behavioral no-op after the first reset (byte-diff from reset onward).
