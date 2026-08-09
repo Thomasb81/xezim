@@ -769,6 +769,28 @@ enum FusedGate {
 // while collecting reads for a PLAIN `always` (star or explicit list),
 // whose sensitivity excludes called-function bodies (only
 // always_comb/always_latch descend into them).
+/// §27.6: hierarchical refs through an UNNAMED generate block's implicit
+/// `genblk<N>` name. Unnamed-branch declarations keep bare names (the
+/// historical leakage other resolution depends on), so `genblk1.x`
+/// resolves by stripping the implicit segments and retrying bare.
+fn strip_genblk_segments(name: &str) -> Option<String> {
+    if !name.starts_with("genblk") && !name.contains(".genblk") {
+        return None;
+    }
+    let stripped: Vec<&str> = name
+        .split('.')
+        .filter(|seg| {
+            !(seg.starts_with("genblk")
+                && seg[6..].chars().all(|c| c.is_ascii_digit())
+                && seg.len() > 6)
+        })
+        .collect();
+    if stripped.is_empty() || stripped.len() == name.split('.').count() {
+        return None;
+    }
+    Some(stripped.join("."))
+}
+
 thread_local! {
     static SKIP_FN_BODY_READS: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -57829,7 +57851,13 @@ impl Simulator {
                 return Some(v);
             }
         }
-        let mut v = self.signals.get(name).cloned()?;
+        let mut v = match self.signals.get(name).cloned() {
+            Some(v) => v,
+            None => {
+                let alt = strip_genblk_segments(name)?;
+                return self.get_signal_value_by_name(&alt);
+            }
+        };
         // §6.11.1: an element of an array-of-queue / array-of-dynamic lives
         // only in this slow-path map, so the compact table's signedness stamp
         // above never reaches it — `int aq[2][$]; aq[0][0] = -8` read back
