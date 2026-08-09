@@ -2667,6 +2667,12 @@ pub struct Simulator {
     /// `forced_signals` for those targets so the name-keyed write
     /// fallbacks can drop ordinary writes while the override is active.
     forced_names: HashSet<String>,
+    /// §10.6.2: an active force/procedural-assign whose RHS is an
+    /// EXPRESSION acts as a continuous assignment — it re-evaluates when
+    /// its operands change until release. (target key, lvalue, rvalue,
+    /// scope hint at arm time). One-shot snapshots diverged: `force n =
+    /// src + 1` held the arm-time value forever.
+    active_force_exprs: Vec<(String, Expression, Expression, Option<String>)>,
     /// Fast signal table: indexed by signal_id for O(1) access.
     signal_table: Vec<Value>,
     /// Parallel array: 1 byte per signal_id, non-zero iff that signal
@@ -6238,6 +6244,7 @@ impl Simulator {
             multi_dim_array_names,
             forced_signals: HashMap::default(),
             forced_names: HashSet::default(),
+            active_force_exprs: Vec::new(),
             signal_has_xz: signal_has_xz_init,
             signal_inline_bits: Vec::new(),
             jit_nba_side_queue: Vec::new(),
@@ -31873,6 +31880,11 @@ impl Simulator {
         if self.event_measure {
             self.event_phase += 1; // comb SETTLE phase (distinct from sample)
         }
+        // §10.6.2: expression-RHS forces track their operands (rare —
+        // guarded to a single is_empty check on the hot path).
+        if !self.active_force_exprs.is_empty() {
+            self.refresh_active_forces();
+        }
         // §29: sequential UDPs mutate per-instance state during evaluation,
         // which the parallel/BSP isolated eval (`&self`, view-based) cannot do.
         // Force the serial fixpoint path whenever the design contains any UDP.
@@ -33511,6 +33523,57 @@ impl Simulator {
     /// `signals` map). Only whole-signal identifiers are tracked; §10.6 also
     /// allows bit/part-selects and concatenations on nets — those return
     /// `None` and degrade to an untracked plain write.
+    /// Track an active force/procedural-assign whose RHS reads any signal,
+    /// replacing a previous entry for the same target (§10.6.1/§10.6.2).
+    fn arm_force_expr(&mut self, key: String, lvalue: &Expression, rvalue: &Expression) {
+        self.active_force_exprs.retain(|(k, ..)| k != &key);
+        // A constant RHS never changes — no need to track it.
+        let mut reads: HashSet<String> = HashSet::default();
+        Self::collect_expr_reads(rvalue, &self.module, &mut reads);
+        if reads.is_empty() {
+            return;
+        }
+        let hint = self.name_resolve_hint.borrow().clone();
+        self.active_force_exprs
+            .push((key, lvalue.clone(), rvalue.clone(), hint));
+    }
+
+    /// §10.6.2: re-evaluate every expression-RHS force; write through when
+    /// the value changed. Called from the settle loop, so operand changes
+    /// keep the forced target tracking like a continuous assignment.
+    fn refresh_active_forces(&mut self) {
+        if self.active_force_exprs.is_empty() {
+            return;
+        }
+        let entries = self.active_force_exprs.clone();
+        for (key, lvalue, rvalue, hint) in entries {
+            let saved_hint = self.name_resolve_hint.borrow().clone();
+            *self.name_resolve_hint.borrow_mut() = hint;
+            let v = self.eval_expr(&rvalue);
+            let target = self.force_target(&lvalue);
+            match target {
+                Some((_, Some(id))) => {
+                    if self.forced_signals.get(&id) != Some(&v) {
+                        self.forced_signals.remove(&id);
+                        self.assign_value(&lvalue, &v);
+                        let stored =
+                            self.signal_table.get(id).cloned().unwrap_or(v);
+                        self.forced_signals.insert(id, stored);
+                    }
+                }
+                Some((name, None)) => {
+                    self.forced_names.remove(&name);
+                    self.assign_value(&lvalue, &v);
+                    self.forced_names.insert(name);
+                }
+                None => {
+                    let _ = key;
+                }
+            }
+            *self.name_resolve_hint.borrow_mut() = saved_hint;
+        }
+    }
+
     fn force_target(&self, lv: &Expression) -> Option<(String, Option<usize>)> {
         if let ExprKind::Ident(hier) = &lv.kind {
             if hier.path.iter().all(|s| s.selects.is_empty()) {
@@ -46524,14 +46587,16 @@ impl Simulator {
                     }
                     self.assign_value(lvalue, &v);
                     match target {
-                        Some((_, Some(id))) => {
+                        Some((ref name, Some(id))) => {
                             // Record the value as stored (post-resize), so
                             // the map mirrors the signal table.
                             let stored = self.signal_table.get(id).cloned().unwrap_or(v);
                             self.forced_signals.insert(id, stored);
+                            self.arm_force_expr(name.clone(), lvalue, rvalue);
                         }
                         Some((name, None)) => {
-                            self.forced_names.insert(name);
+                            self.forced_names.insert(name.clone());
+                            self.arm_force_expr(name, lvalue, rvalue);
                         }
                         // Unsupported lvalue shape (part-select, concat, …):
                         // degrade to a plain write, as before.
@@ -46548,6 +46613,7 @@ impl Simulator {
                     // §10.6.1 `deassign` likewise retains the last value.
                     if let Some((name, id)) = self.force_target(lvalue) {
                         self.forced_names.remove(&name);
+                        self.active_force_exprs.retain(|(k, ..)| k != &name);
                         if let Some(id) = id {
                             self.forced_signals.remove(&id);
                             // Re-evaluate continuous drivers (nets). For a
