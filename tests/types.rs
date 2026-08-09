@@ -250,3 +250,6 @@ mod procedural_loop_and_static_fn;
 
 #[path = "types/inside_defaults_and_foreach_dir.rs"]
 mod inside_defaults_and_foreach_dir;
+
+#[path = "types/param_const_eval_contexts.rs"]
+mod param_const_eval_contexts;
