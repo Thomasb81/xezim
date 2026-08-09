@@ -229,3 +229,6 @@ mod array_reduction_element_type;
 
 #[path = "types/lexical_string_literal_semantics.rs"]
 mod lexical_string_literal_semantics;
+
+#[path = "types/procedural_storage_semantics.rs"]
+mod procedural_storage_semantics;

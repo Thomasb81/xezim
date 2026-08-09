@@ -5780,9 +5780,27 @@ impl Simulator {
             // §6.11.1: the array's elements inherit the declared element type's
             // signedness (`byte foo[8]` elements are signed). The push helpers
             // default every element to unsigned, so a signed-element array would
-            // otherwise read its cells as unsigned.
-            if module.var_decl_types.get(base).is_some_and(|dt| {
-                    super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
+            // otherwise read its cells as unsigned. An array-of-queue registers
+            // each element as its own 1-D array under a COMPOUND base
+            // ("aq[0]") while var_decl_types is keyed by the declaration name
+            // ("aq") — strip index suffixes until the declaration is found,
+            // or `int aq[2][$]` elements read back unsigned.
+            let elem_dt = module.var_decl_types.get(base).or_else(|| {
+                let mut b: &str = base;
+                loop {
+                    match b.rfind('[') {
+                        Some(p) => {
+                            b = &b[..p];
+                            if let Some(dt) = module.var_decl_types.get(b) {
+                                break Some(dt);
+                            }
+                        }
+                        None => break None,
+                    }
+                }
+            });
+            if elem_dt.is_some_and(|dt| {
+                super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
                     signal_signed_vec[id] = true;
@@ -5822,6 +5840,7 @@ impl Simulator {
             module.arrays_2d.iter().collect();
         arrays_2d_sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (base, &((lo1, hi1), (lo2, hi2), w)) in arrays_2d_sorted {
+            let first_id = signal_table.len();
             for i in lo1..=hi1 {
                 for j in lo2..=hi2 {
                     push_elem(
@@ -5834,6 +5853,16 @@ impl Simulator {
                         &mut signal_name_to_id,
                         &mut id_to_name,
                     );
+                }
+            }
+            // §6.11.1: same element-signedness inheritance the 1-D loop
+            // applies — without it `int a2[2][2]; a2[0][0] = -1` read back
+            // unsigned (4294967295, and `a2[0][0] < 0` was FALSE).
+            if module.var_decl_types.get(base).is_some_and(|dt| {
+                super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
+            }) {
+                for id in first_id..signal_table.len() {
+                    signal_signed_vec[id] = true;
                 }
             }
         }
@@ -5853,6 +5882,7 @@ impl Simulator {
             }
             let mut names = Vec::new();
             enumerate(shape, base.clone(), &mut names);
+            let first_id = signal_table.len();
             for name in names {
                 push_elem(
                     name.as_str(),
@@ -5864,6 +5894,15 @@ impl Simulator {
                     &mut signal_name_to_id,
                     &mut id_to_name,
                 );
+            }
+            // §6.11.1: element-signedness inheritance (see the 1-D / 2-D
+            // loops above).
+            if module.var_decl_types.get(base).is_some_and(|dt| {
+                super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
+            }) {
+                for id in first_id..signal_table.len() {
+                    signal_signed_vec[id] = true;
+                }
             }
         }
         // Elements that carry a value from ELABORATION (an unpacked-array
@@ -27181,7 +27220,11 @@ impl Simulator {
                         let kv = if *is_str {
                             Value::from_string(&key_str)
                         } else {
-                            Value::from_u64(key_str.parse::<u64>().unwrap_or(0), 32)
+                            // §7.9: signed int keys — u64 parse mangled "-7" to 0.
+                            let mut v =
+                                Value::from_u64(key_str.parse::<i64>().unwrap_or(0) as u64, 32);
+                            v.is_signed = true;
+                            v
                         };
                         self.set_loop_var_aliased(var_scope.as_deref(), vn, kv);
                     }
@@ -27248,7 +27291,12 @@ impl Simulator {
                                 let kv = if is_str {
                                     Value::from_string(&keys[0])
                                 } else {
-                                    Value::from_u64(keys[0].parse::<u64>().unwrap_or(0), 32)
+                                    let mut v = Value::from_u64(
+                                        keys[0].parse::<i64>().unwrap_or(0) as u64,
+                                        32,
+                                    );
+                                    v.is_signed = true;
+                                    v
                                 };
                                 self.set_loop_var_aliased(var_scope.as_deref(), vn, kv);
                             }
@@ -34733,6 +34781,65 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §7.4.1 / §10.4: bit-select write into an element of
+                        // an UNREGISTERED (block-local / automatic
+                        // subroutine-local) unpacked array. The guarded path
+                        // above needs a module `arrays` registration + compact
+                        // id; a block-local `larr[1][2] = 1'b1` had neither,
+                        // and every later arm either targets arrays_2d or
+                        // invents a bogus "larr[1][2]" key that element reads
+                        // never see — the write silently vanished. RMW the
+                        // element through the canonical by-name accessors.
+                        // Block-local arrays DO appear in `module.arrays`
+                        // (the declaration registers them at runtime, after
+                        // the compact tables were built), so the only reliable
+                        // discriminator is the missing compact id itself.
+                        // Collection elements (array-of-queue, where `[j]`
+                        // selects a sub-element, not a bit) were already taken
+                        // by the earlier queue/assoc branches — and are
+                        // excluded again here for safety.
+                        {
+                            let iv = self.eval_expr(inner_idx);
+                            if let Some(i) = iv.to_i64().filter(|_| !iv.has_xz()) {
+                                let elem = format!("{}[{}]", name, i);
+                                // Only a RUNTIME-declared element (no compact
+                                // id) takes this route: a registered element
+                                // that fell through above did so deliberately
+                                // (negative packed labels etc.) and must reach
+                                // the pre-existing normalizing arms below.
+                                let elem_is_collection = self
+                                    .module
+                                    .dynamic_arrays
+                                    .contains(&elem)
+                                    || self.is_associative_array(&elem);
+                                if !elem_is_collection
+                                    && !self.signal_name_to_id.contains_key(elem.as_str())
+                                {
+                                    if let Some(cur) = self.get_signal_value_by_name(&elem) {
+                                        let bv = self.eval_expr(index);
+                                        if let Some(b) =
+                                            bv.to_i64().filter(|_| !bv.has_xz())
+                                        {
+                                            if b >= 0 && (b as u32) < cur.width {
+                                                let mut nv = cur.clone();
+                                                let nb = val.get_bit(0);
+                                                let changed =
+                                                    nv.get_bit(b as usize) != nb;
+                                                if changed {
+                                                    nv.set_bit(b as usize, nb);
+                                                    self.set_signal_value_by_name(&elem, nv);
+                                                    self.mark_dirty(&elem);
+                                                }
+                                                return changed;
+                                            }
+                                            // Out-of-range bit write on a
+                                            // runtime-declared element: no-op.
+                                            return false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // 2D array element assignment: mem[i][j] = val
@@ -35983,6 +36090,54 @@ impl Simulator {
                                         }
                                         return changed;
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+                // §11.5.2 / §10.4: part-select WRITE through an UNPACKED
+                // array element with no compact-table id — block-local and
+                // automatic subroutine-local arrays live in slow-path
+                // storage, and every handler above either requires a
+                // signal_table id or a packed multi-D registration, so
+                // `larr[1][7:4] = 4'hB` fell through to the silent `false`
+                // and the write vanished. Read-modify-write the element
+                // through the canonical by-name accessors instead.
+                if let ExprKind::Index {
+                    expr: arr_expr,
+                    index,
+                } = &expr.kind
+                {
+                    if let ExprKind::Ident(ah) = &arr_expr.kind {
+                        let arr_name = self.resolve_hier_name(ah);
+                        if !self.module.packed_signal_elem_widths.contains_key(&arr_name) {
+                            let idxv = self.eval_expr(index);
+                            if let Some(idx) = idxv.to_i64().filter(|_| !idxv.has_xz()) {
+                                let ename = format!("{}[{}]", arr_name, idx);
+                                if let Some(cur) = self.get_signal_value_by_name(&ename) {
+                                    let w = cur.width as usize;
+                                    let mut nv = cur.clone();
+                                    let mut changed = false;
+                                    let hi2 = msb.min(w.saturating_sub(1));
+                                    let base = if src_base < 0 { src_base } else { lsb as i64 };
+                                    if msb_i >= 0 && hi2 >= lsb {
+                                        for i in lsb..=hi2 {
+                                            let src = i as i64 - base;
+                                            if src < 0 {
+                                                continue;
+                                            }
+                                            let nb = val.get_bit(src as usize);
+                                            if nv.get_bit(i) != nb {
+                                                nv.set_bit(i, nb);
+                                                changed = true;
+                                            }
+                                        }
+                                    }
+                                    if changed {
+                                        self.set_signal_value_by_name(&ename, nv);
+                                        self.mark_dirty(&arr_name);
+                                    }
+                                    return changed;
                                 }
                             }
                         }
@@ -45052,7 +45207,10 @@ impl Simulator {
                                 if is_str {
                                     ks.sort();
                                 } else {
-                                    ks.sort_by_key(|k| k.parse::<u64>().unwrap_or(0));
+                                    // §7.9: int keys traverse in NUMERIC order
+                                    // including NEGATIVE keys — u64 parsing
+                                    // mangled "-7" to 0.
+                                    ks.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
                                 }
                                 keys = ks;
                             }
@@ -45064,7 +45222,15 @@ impl Simulator {
                                 let kv = if is_str {
                                     Value::from_string(&key)
                                 } else {
-                                    Value::from_u64(key.parse::<u64>().unwrap_or(0), 32)
+                                    // Signed 32-bit: a NEGATIVE key must reach
+                                    // the loop variable as itself, not as the
+                                    // u64-parse fallback 0.
+                                    let mut v = Value::from_u64(
+                                        key.parse::<i64>().unwrap_or(0) as u64,
+                                        32,
+                                    );
+                                    v.is_signed = true;
+                                    v
                                 };
                                 self.set_loop_var(&var.name, kv);
                                 self.continue_flag = false;
@@ -45262,10 +45428,12 @@ impl Simulator {
                                             let kv = if is_str {
                                                 Value::from_string(key)
                                             } else {
-                                                Value::from_u64(
-                                                    key.parse::<u64>().unwrap_or(0),
+                                                let mut v = Value::from_u64(
+                                                    key.parse::<i64>().unwrap_or(0) as u64,
                                                     32,
-                                                )
+                                                );
+                                                v.is_signed = true;
+                                                v
                                             };
                                             self.set_loop_var_aliased(
                                                 var_scope.as_deref(),
@@ -45324,7 +45492,7 @@ impl Simulator {
                             if is_str {
                                 keys.sort();
                             } else {
-                                keys.sort_by_key(|k| k.parse::<u64>().unwrap_or(0));
+                                keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
                             }
                             for key in keys {
                                 if self.finished {
@@ -45333,7 +45501,15 @@ impl Simulator {
                                 let kv = if is_str {
                                     Value::from_string(&key)
                                 } else {
-                                    Value::from_u64(key.parse::<u64>().unwrap_or(0), 32)
+                                    // Signed 32-bit: a NEGATIVE key must reach
+                                    // the loop variable as itself, not as the
+                                    // u64-parse fallback 0.
+                                    let mut v = Value::from_u64(
+                                        key.parse::<i64>().unwrap_or(0) as u64,
+                                        32,
+                                    );
+                                    v.is_signed = true;
+                                    v
                                 };
                                 self.set_loop_var_aliased(var_scope.as_deref(), &var.name, kv);
                                 self.continue_flag = false;
@@ -57239,7 +57415,21 @@ impl Simulator {
                 return Some(v);
             }
         }
-        self.signals.get(name).cloned()
+        let mut v = self.signals.get(name).cloned()?;
+        // §6.11.1: an element of an array-of-queue / array-of-dynamic lives
+        // only in this slow-path map, so the compact table's signedness stamp
+        // above never reaches it — `int aq[2][$]; aq[0][0] = -8` read back
+        // 4294967288. Re-stamp from the base declaration's element type.
+        if !v.is_signed && !v.is_real {
+            if let Some(base) = name.split('[').next().filter(|b| b.len() < name.len()) {
+                if self.module.var_decl_types.get(base).is_some_and(|dt| {
+                    super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types)
+                }) {
+                    v.is_signed = true;
+                }
+            }
+        }
+        Some(v)
     }
 
     fn set_signal_value_by_name(&mut self, name: &str, val: Value) {
@@ -57789,7 +57979,8 @@ impl Simulator {
         if is_str {
             ks.sort();
         } else {
-            ks.sort_by_key(|k| k.parse::<u64>().unwrap_or(0));
+            // §7.9: numeric order incl. NEGATIVE int keys.
+            ks.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
         }
         (ks, is_str)
     }
@@ -62761,6 +62952,18 @@ impl Simulator {
                         return;
                     }
                 }
+            }
+        } else if let DataType::Struct(su) = self.resolve_dt(dt) {
+            // §10.9.2: `default:` applies RECURSIVELY to members of aggregate
+            // members. A struct-typed member reached with a plain default
+            // expression previously took the leaf path, writing one packed
+            // container value whose per-member leaves nobody reads — the old
+            // member values survived an assignment that should overwrite
+            // everything. Re-enter the spread with a synthetic default item.
+            if Self::spreads_member_wise(&su) {
+                let synthetic = [AssignmentPatternItem::Default(e.clone())];
+                self.assign_pattern_into_struct(target, &su, &synthetic);
+                return;
             }
         }
         // §10.9.2: each item is evaluated in the context of the ELEMENT type —
