@@ -1653,3 +1653,34 @@ accounted for — no magic, just: (a) compile ALL bodies, not the pure-flop subs
 
 The pilots' verdicts stand: each increment must re-measure. But unlike the start of this
 session, the remaining 9x is now an itemized bill, not a mystery.
+
+## Settle-comb AOT — built with a 3-agent debug cycle, measured, rejected
+
+Extended the 2-state AOT to settle comb bodies: a `blk_assign` bridge (the interpreter's
+BlockingAssign arm verbatim), a second fn table, dispatch in both settle arms. Three
+parallel audit/test agents caught, pre-measurement: a silent no-op patch replace (dropped
+eligibility arms), **two live mixed-signedness comparison bugs** (`ts_eq` extended both
+operands with `asg&&bsg` where the interpreter uses each operand's own signedness;
+casez/casex were mapped to sign-extending equality when they NEVER sign-extend), and two
+unbounded-width holes (`Resize`, `NbaAssign`). All fixed; gates byte-identical in both init
+modes afterward. NOTE: the two comparison bugs also exist in the superseded
+`AOT-2STATE-pilot.patch` — use `AOT-2STATE-COMB.patch` (which contains the fixes) as the
+base for any future work.
+
+c910 cmark x2, INIT_ZERO=0: **72,645 blocks native (10,139 edge + 62,506 comb),
+1.62 BILLION native fires, bail 0.546%, byte-exact golden — and pure sim
+2616.6 s -> 3090.1 s (+18.1%)**, worse than both the interpreter and edge-only AOT
+(2522.5 s). One-time crate build: 22 min.
+
+**Why:** comb bodies average ~3-6 bytecode ops. Each native call pays ctx construction,
+an indirect call, the entry X-guard, and a Value materialization + bridge call per write —
+per-entry glue now exceeds the body it replaces. Edge blocks won because they amortize the
+boundary; settle entries cannot. This is the settle-side twin of the fusion-ceiling
+lesson, and it sharpens the Questa formula once more: compiled processes only pay when
+the SCHEDULING is compiled with them (merged cones with inlined queueing) — one native
+function per tiny entry behind a bridge is structurally the wrong shape.
+
+Final AOT ledger: edge-AOT on compute-heavy workloads = -3.6% (real, kept as the
+recommended opt-in shape); everything else measured negative. The next genuine step
+remains a backend that compiles ENTIRE settle cones (scheduling included) — a compiler
+project, not an increment.
