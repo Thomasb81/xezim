@@ -3153,6 +3153,9 @@ pub struct Simulator {
     /// __deferred_init()`) must run once per specialization — not just once
     /// for the generic class with default params.
     initialized_spec_statics: std::collections::HashSet<(String, String)>,
+    /// (handle, class) whose constructor body is currently executing —
+    /// unqualified calls on `this` bind within that class's chain (§8.7).
+    ctor_class_stack: Vec<(usize, String)>,
     /// (var.prop) null-deref reads already reported (in-method soft errors).
     reported_null_derefs: std::collections::HashSet<String>,
     /// Queue of specializations pending static-init, processed iteratively
@@ -6393,6 +6396,7 @@ impl Simulator {
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
             initialized_spec_statics: std::collections::HashSet::default(),
+            ctor_class_stack: Vec::new(),
             reported_null_derefs: std::collections::HashSet::default(),
             pending_spec_inits: Vec::new(),
             spec_init_depth: 0,
@@ -51309,6 +51313,71 @@ impl Simulator {
                                         }
                                     }
                                 }
+                                // §21.2.1.7: a class FIXED-ARRAY property
+                                // (`c.arr`) renders as an element list — the
+                                // scalar fallback below printed 0.
+                                let obj_prop: Option<(usize, String)> = match &arg.kind {
+                                    ExprKind::MemberAccess { expr: b, member } => {
+                                        let hh =
+                                            self.eval_expr(b).to_u64().unwrap_or(0) as usize;
+                                        Some((hh, member.name.clone()))
+                                    }
+                                    ExprKind::Ident(ih)
+                                        if ih.path.len() == 2
+                                            && ih.path.iter().all(|s| s.selects.is_empty()) =>
+                                    {
+                                        let obj = ih.path[0].name.name.clone();
+                                        self.eval_ident_handle(&obj)
+                                            .map(|hv| (hv, ih.path[1].name.name.clone()))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((h, prop)) = obj_prop {
+                                    if h != 0 && h < self.heap.len() {
+                                        let mut cur = self
+                                            .heap
+                                            .get(h)
+                                            .and_then(|o| o.as_ref())
+                                            .map(|i| i.class_name.clone());
+                                        let mut range: Option<(i64, i64)> = None;
+                                        let mut guard = 0;
+                                        while let Some(c) = cur {
+                                            guard += 1;
+                                            if guard > 64 {
+                                                break;
+                                            }
+                                            let Some(cd) = self.module.classes.get(&c) else {
+                                                break;
+                                            };
+                                            if let Some(&(lo, hi, _w)) =
+                                                cd.array_properties.get(&prop)
+                                            {
+                                                range = Some((lo, hi));
+                                                break;
+                                            }
+                                            cur = cd.extends.clone();
+                                        }
+                                        if let Some((lo, hi)) = range {
+                                            let nm = format!("{}#{}", h, prop);
+                                            let is_str = self.string_signals.contains(&nm);
+                                            let mut parts: Vec<String> = Vec::new();
+                                            for i in lo..=hi {
+                                                let v = self
+                                                    .get_signal_value_by_name(&format!(
+                                                        "{}[{}]",
+                                                        nm, i
+                                                    ))
+                                                    .unwrap_or_else(|| Value::zero(32));
+                                                parts.push(Self::render_p_value(&v, is_str));
+                                            }
+                                            result.push_str(&format!(
+                                                "'{{{}}}",
+                                                parts.join(", ")
+                                            ));
+                                            continue;
+                                        }
+                                    }
+                                }
                                 let v = self.eval_expr(arg);
                                 result.push_str(&v.to_dec_string());
                             }
@@ -77097,6 +77166,15 @@ impl Simulator {
     }
 
     fn exec_method_call(&mut self, handle: usize, method_name: &str, args: &[Expression]) -> Value {
+        // Ctor-time binding: a call on the object UNDER CONSTRUCTION starts
+        // its search at the constructing class, not the runtime leaf.
+        if method_name != "new" {
+            if let Some((ch, cc)) = self.ctor_class_stack.last().cloned() {
+                if ch == handle && self.class_has_method(&cc, method_name) {
+                    return self.exec_method_in_class_hierarchy(handle, &cc, method_name, args);
+                }
+            }
+        }
         // IEEE 1800-2023 §9.7 process class: kill/await/suspend/resume on a
         // process handle (>= PROCESS_HANDLE_BASE). These are intercepted here,
         // before any user-class dispatch.
@@ -84126,6 +84204,13 @@ impl Simulator {
                 // local that leaked into the flat `var_class_types` map.
                 self.method_local_base.push(self.local_stack.len() - 1);
                 self.class_context_stack.push(Some(cname.clone()));
+                // §8.7 ctor-time binding (reference behavior): while class
+                // C's `new` body runs, an unqualified method call on `this`
+                // binds within C's own chain — a derived override must not
+                // run against a partially-constructed object.
+                if method_name == "new" {
+                    self.ctor_class_stack.push((handle, cname.clone()));
+                }
                 self.local_iface_aliases.push(iface_alias_frame);
                 // §6.21: open a static-local sync frame so a `static`
                 // local declared in the method body persists across calls.
@@ -84155,6 +84240,9 @@ impl Simulator {
                     self.break_flag = saved_break;
                     self.continue_flag = saved_continue;
                     self.return_flag = saved_return;
+                }
+                if method_name == "new" {
+                    self.ctor_class_stack.pop();
                 }
                 self.class_context_stack.pop();
                 self.method_local_base.pop();

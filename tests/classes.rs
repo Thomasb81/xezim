@@ -154,3 +154,6 @@ mod nested_and_extends_spec;
 
 #[path = "classes/null_deref_fatal.rs"]
 mod null_deref_fatal;
+
+#[path = "classes/ctor_dispatch_and_p_format.rs"]
+mod ctor_dispatch_and_p_format;
