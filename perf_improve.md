@@ -1740,3 +1740,18 @@ edge level. The original set was accidentally self-selected for amortizable bodi
 >= ~8-10 ops), not maximal coverage.** The -3.6% at the 9,705-block set stands as the
 best measured configuration. WIP preserved at `scratchpad/AOT-COVERAGE.patch` (includes
 the NbaAssignRange shared-method refactor, worth keeping for its own sake).
+
+## INIT_REG implemented — the wedge fixed, and the coercion tax quantified at CoreMark scale
+
+`XEZIM_INIT_REG=0|random` shipped (`60643dd`): register-class signals (NBA targets of
+compiled edge blocks minus cont_driven nets) initialized by REAL t=0 writes through
+`write_sig!` + dirty marking — "initial q = 0;" semantics. Construction-time coercion
+retired; `XEZIM_INIT_ZERO=1` aliases to the new path; arrays split to `XEZIM_INIT_MEM`.
+
+Gates: flag-off byte-identical; c906 memcpy `cost=368` PASSED under `=0`, `=random`, AND
+the legacy alias (which wedged before); c910 `216/2282050` (34,997 flops); tests 1804/0.
+
+**c906 cmark x2 under INIT_REG=0: TEST PASSED at `cycles=286469` — vs 714,196 under the
+old coercion.** Register-only init runs the same firmware in 2.5x fewer simulated cycles;
+combined with memcpy's 727->368, the old flag was distorting every INIT_ZERO benchmark by
+1.6-2.5x. New cmark fingerprint: 286469 cycles/iteration under `XEZIM_INIT_REG=0`.
