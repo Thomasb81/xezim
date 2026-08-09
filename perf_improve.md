@@ -1374,3 +1374,63 @@ over-evaluation). The literature's big wins are all **cross-paradigm**:
 The remaining order-of-magnitude lives where Verilator/GSIM get theirs: ahead-of-time
 compilation with 2-state specialization and inlined activity checks. Everything smaller
 than that paradigm jump is now measured at ≤ ~1.5%.
+
+## Questa techniques #2 (vopt) and #3 (two-state) explored — and a benchmark-fidelity discovery
+
+### The headline is not an optimization: XEZIM_INIT_ZERO was distorting the Verilator comparison
+
+Measuring X rates required a no-`INIT_ZERO` control run, which resolved the year-old
+"fidelity caveat" in the workload notes ("xezim runs ~1.64x more clock cycles for the same
+firmware; INIT_ZERO is a plausible suspect" — never investigated). Confirmed, c906 memcpy
+x50, same binary:
+
+| | cost | finish | instructions | wall |
+|---|---|---|---|---|
+| `XEZIM_INIT_ZERO=1` (the golden config) | 727 | 6,477,650 ticks | 282.4 G | 32.6 s |
+| default true 4-state | **368** | **3,956,650 ticks = 395.7 us** | **189.0 G (-33%)** | **22.9 s (-30%)** |
+
+`cost=368` and `finish=395.7 us` are **Verilator's exact numbers** (368 cycles, 396 us).
+In its default 4-state mode xezim simulates the identical firmware execution; `INIT_ZERO`
+(required only by cmark) makes the memcpy firmware take a 1.64x longer path, and every
+Verilator comparison has carried that inflation. Honest ratio: **22.9 s vs 0.89 s ~ 26x**,
+directly, no normalization. The `cost=727` fingerprint remains the regression gate for the
+golden config; Verilator comparisons should use the default-mode run.
+
+### #3 — two-state opportunity, measured
+
+- **Declared** two-state (`bit`/`int`): 131,072 of 35.1 M signals — **0.37%**. Questa-style
+  demotion must PROVE X-freedom (reset analysis); declarations provide nothing here.
+- **Dynamic** X rate (new counters, patch preserved): LoadSignal operands with X/Z
+  **0.55%** under INIT_ZERO, **0.87%** in true 4-state; NBA writes with X/Z **0.00%** /
+  0.11%. So 2-state specialized bodies would run **>99% of dynamic executions**.
+- **State vs flow**: in true 4-state mode **95.2% of all signals hold X at end** (never-
+  written testbench memory) while the executed path is >99% X-free — X is everywhere in
+  STATE, nowhere in FLOW. Sparse-X storage is a memory play (and layout plays are dead here).
+- Value bound: removing xz-plane computation from X-free bodies is worth perhaps 20-30% of
+  arm work => **ceiling ~3-5% of runtime** — but as a THIRD interpreter loop it pays the
+  dual-loop I-cache tax measured at ~+1.2% cycles, so interpreted it is marginal. It
+  becomes free-riding only inside AOT-compiled bodies (Questa does exactly this: compiled
+  2-state code behind 4-state boundaries). The JIT's X/Z pre-check-bail (`xz_bail`) is the
+  in-tree precedent for the guard pattern.
+
+### #2 — vopt-style passes, priced individually for an interpreter
+
+- **Process merging**: measured dead (clock-domain batching: dropping per-block gating
+  costs +19%; the gating IS xezim's activity optimization). Only viable inside compiled
+  bodies with inlined checks.
+- **Aliasing / hierarchy flattening**: port-copy entries are 12.3% of settle evals; chain
+  collapse was measured <1%; true single-id aliasing also removes writes+triggers but
+  breaks independent force/observability — requires an `+acc`-style visibility contract.
+  Ceiling ~1-2%.
+- **Constant propagation**: the 92.8% armed-skip already harvests runtime stability
+  dynamically; static folding would remove residual prefilter cost, priced ~1-1.5%.
+- **Dead logic**: the never-written 95% of signals are a footprint play — perf-neutral by
+  the LLC evidence.
+
+**Conclusion:** each vopt pass, interpreted, is worth ~1-2%; Questa's stack pays because
+the passes multiply INTO compiled code and the visibility trade. Both threads point at the
+same door as the technique survey: AOT compilation first; 2-state specialization and
+vopt-style passes as multipliers on top of it, not standalone.
+
+Dynamic-census instrumentation preserved at `scratchpad/XZ-DYNAMIC-CENSUS.patch`
+(+0.77% hot-path tax when compiled in — reverted per protocol).
