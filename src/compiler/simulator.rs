@@ -10027,6 +10027,7 @@ impl Simulator {
             *start = std::time::Instant::now();
         };
         self.sanitize_class_hierarchy();
+        self.init_two_state_struct_members();
         // LRM §14.3 — populate clocking-block metadata: per-cb clock
         // signal + per-signal direction. `tick_clocking_blocks`
         // consumes this to maintain `clocking_snapshots`.
@@ -34737,6 +34738,25 @@ impl Simulator {
                 if iv.has_xz() && !iv.is_real {
                     return false;
                 }
+                // §7.10.1: a QUEUE write at index == size APPENDS (`q[0] = v`
+                // on an empty queue makes it '{v}). Bump the size shadow and
+                // let the normal element-write arms store the value. Gated on
+                // declared-queue vars so a dynamic array keeps its
+                // discard-out-of-range semantics.
+                if let ExprKind::Ident(h) = &base.kind {
+                    let qn = self.resolve_hier_name(h);
+                    if self.module.queue_vars.contains(&qn) {
+                        let sz = self.get_queue_size(&qn);
+                        let within_max = self
+                            .module
+                            .queue_max_sizes
+                            .get(&qn)
+                            .is_none_or(|&m| sz < m as u64);
+                        if within_max && iv.to_u64() == Some(sz) {
+                            self.set_queue_size(&qn, sz + 1);
+                        }
+                    }
+                }
             }
         }
 
@@ -43612,10 +43632,42 @@ impl Simulator {
                                     }
                                 }
                             } else {
+                                // §7.5.1: new elements take the element
+                                // type's DEFAULT — x for a 4-state type
+                                // (logic/reg/integer/time), 0 otherwise.
+                                // Everything x-init'd as 0 before.
+                                let w = self
+                                    .module
+                                    .arrays
+                                    .get(&name)
+                                    .map(|&(_, _, w)| w)
+                                    .unwrap_or(32);
+                                let four_state = self.p_elem_type(&name).is_some_and(|dt| {
+                                    use crate::ast::types::{
+                                        DataType as DT, IntegerAtomType as IAT,
+                                        IntegerVectorType as IVT,
+                                    };
+                                    match self.resolve_dt(&dt) {
+                                        DT::IntegerVector {
+                                            kind: IVT::Logic | IVT::Reg,
+                                            ..
+                                        } => true,
+                                        DT::IntegerAtom {
+                                            kind: IAT::Integer | IAT::Time,
+                                            ..
+                                        } => true,
+                                        _ => false,
+                                    }
+                                });
+                                let fill = if four_state {
+                                    Value::new(w)
+                                } else {
+                                    Value::zero(w)
+                                };
                                 for i in keep..n {
                                     self.set_signal_value_by_name(
                                         &format!("{}[{}]", name, i),
-                                        Value::zero(32),
+                                        fill.clone(),
                                     );
                                 }
                             }
@@ -45181,6 +45233,34 @@ impl Simulator {
                         let (rlo, rhi, _) = self.module.arrays[&rname];
                         let lsize = (lhi - llo + 1) as usize;
                         let rsize = (rhi - rlo + 1) as usize;
+                        // §7.6: assigning a FIXED array to a DYNAMIC array
+                        // resizes the destination to the source's size —
+                        // the placeholder (0,63) registration made this look
+                        // like fixed-to-fixed and left the old size in place.
+                        if self.module.dynamic_arrays.contains(&lname)
+                            && !self.module.dynamic_arrays.contains(&rname)
+                        {
+                            let r_desc = self.module.descending_arrays.contains(&rname);
+                            for i in 0..rsize {
+                                let ridx = if r_desc {
+                                    rhi - i as i64
+                                } else {
+                                    rlo + i as i64
+                                };
+                                let rval = self
+                                    .get_signal_value_by_name(&format!("{}[{}]", rname, ridx))
+                                    .unwrap_or(Value::zero(32));
+                                self.set_signal_value_by_name(
+                                    &format!("{}[{}]", lname, i),
+                                    rval,
+                                );
+                            }
+                            self.set_queue_size(&lname, rsize as u64);
+                            if !self.in_edge_block {
+                                self.settle_combinatorial();
+                            }
+                            return;
+                        }
                         let count = lsize.min(rsize);
                         let l_desc = self.module.descending_arrays.contains(&lname);
                         let r_desc = self.module.descending_arrays.contains(&rname);
@@ -64340,6 +64420,145 @@ impl Simulator {
 
     /// Whether `src` actually has per-member storage for `su` — guards against
     /// treating an unrelated same-named scalar as a struct source.
+    /// §6.8/§7.2.1: a member of an UNPACKED struct with a 2-STATE type
+    /// (bit/byte/int/...) defaults to 0. Member-wise struct storage is lazy
+    /// (absent leaf reads x), so never-written 2-state members read x —
+    /// seed a zero for each such leaf at startup. Declared initializers run
+    /// later and simply overwrite the seed.
+    fn init_two_state_struct_members(&mut self) {
+        let decls: Vec<(String, crate::ast::types::DataType)> = self
+            .module
+            .var_decl_types
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (vname, dt) in decls {
+            // var_decl_types drops unpacked dims — a queue/array/assoc OF
+            // structs resolves to the element struct here. Seeding member
+            // leaves on the CONTAINER name would corrupt its storage.
+            if self.module.arrays.contains_key(&vname)
+                || self.module.dynamic_arrays.contains(&vname)
+                || self.module.arrays_2d.contains_key(&vname)
+                || self.is_associative_array(&vname)
+            {
+                continue;
+            }
+            if let DataType::Struct(su) = self.resolve_dt(&dt) {
+                // Packed-style storage: the var is ONE signal and members
+                // are field slices — zero the 2-state members' X bits in
+                // place (4-state members stay x).
+                let fields = self.module.packed_struct_fields.get(&vname).cloned();
+                let cur = self.get_signal_value_by_name(&vname);
+                if let (Some(fields), Some(mut cur)) = (fields, cur) {
+                    let mut ts: HashSet<String> = HashSet::default();
+                    Self::collect_two_state_leaves(self, &su, "", &mut ts);
+                    let mut changed = false;
+                    for (fname, off, w) in fields {
+                        if !ts.contains(&fname) {
+                            continue;
+                        }
+                        for i in 0..w {
+                            let idx = (off + i) as usize;
+                            if idx < cur.width as usize
+                                && !matches!(
+                                    cur.get_bit(idx),
+                                    LogicBit::Zero | LogicBit::One
+                                )
+                            {
+                                cur.set_bit(idx, LogicBit::Zero);
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        self.set_signal_value_by_name(&vname, cur);
+                    }
+                    continue;
+                }
+                if Self::spreads_member_wise(&su) {
+                    self.zero_two_state_members(&vname, &su.clone());
+                }
+            }
+        }
+    }
+
+    /// Relative paths of 2-STATE leaf members of `su` (recursing into
+    /// nested structs), matching packed_struct_fields' key format.
+    fn collect_two_state_leaves(
+        &self,
+        su: &crate::ast::types::StructUnionType,
+        prefix: &str,
+        out: &mut HashSet<String>,
+    ) {
+        use crate::ast::types::{DataType as DT, IntegerAtomType as IAT, IntegerVectorType as IVT};
+        for m in &su.members {
+            let resolved = self.resolve_dt(&m.data_type);
+            for md in &m.declarators {
+                let leaf = if prefix.is_empty() {
+                    md.name.name.clone()
+                } else {
+                    format!("{}.{}", prefix, md.name.name)
+                };
+                match &resolved {
+                    DT::Struct(inner) => {
+                        self.collect_two_state_leaves(inner, &leaf, out);
+                    }
+                    DT::IntegerVector { kind: IVT::Bit, .. }
+                    | DT::IntegerAtom {
+                        kind: IAT::Byte | IAT::ShortInt | IAT::Int | IAT::LongInt,
+                        ..
+                    } => {
+                        out.insert(leaf);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn zero_two_state_members(&mut self, base: &str, su: &crate::ast::types::StructUnionType) {
+        use crate::ast::types::{DataType as DT, IntegerAtomType as IAT, IntegerVectorType as IVT};
+        for m in &su.members {
+            let resolved = self.resolve_dt(&m.data_type);
+            for md in &m.declarators {
+                if !md.dimensions.is_empty() {
+                    continue;
+                }
+                let leaf = format!("{}.{}", base, md.name.name);
+                match &resolved {
+                    DT::Struct(inner) if Self::spreads_member_wise(inner) => {
+                        let inner = inner.clone();
+                        self.zero_two_state_members(&leaf, &inner);
+                    }
+                    DT::IntegerVector { kind: IVT::Bit, .. }
+                    | DT::IntegerAtom {
+                        kind: IAT::Byte | IAT::ShortInt | IAT::Int | IAT::LongInt,
+                        ..
+                    } => {
+                        // Overwrite an ALL-X current value too: the member
+                        // signal may be pre-registered x-filled. A restored
+                        // declared initializer is never fully x, so it wins.
+                        let cur = self.get_signal_value_by_name(&leaf);
+                        let untouched =
+                            cur.as_ref().is_none_or(|v| *v == Value::new(v.width));
+                        if untouched {
+                            let w = cur.map(|v| v.width).unwrap_or_else(|| {
+                                crate::elaborate::resolve_type_width(
+                                    &m.data_type,
+                                    Some(&self.module.parameters),
+                                    Some(&self.module.typedefs),
+                                )
+                                .max(1)
+                            });
+                            self.set_signal_value_by_name(&leaf, Value::zero(w));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     fn struct_storage_exists(&self, src: &str, su: &crate::ast::types::StructUnionType) -> bool {
         su.members.iter().any(|m| {
             m.declarators.iter().any(|md| {
