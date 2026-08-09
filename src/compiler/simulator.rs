@@ -39699,9 +39699,13 @@ impl Simulator {
                 for r in ranges {
                     match &r.kind {
                         ExprKind::Range(lo, hi) => {
-                            let l = self.eval_expr(lo);
-                            let h = self.eval_expr(hi);
-                            if val.greater_equal(&l).is_true() && val.less_equal(&h).is_true() {
+                            // §11.4.13: `$` bound = type extreme (see
+                            // case_inside_match).
+                            let lo_ok = matches!(lo.kind, ExprKind::Dollar)
+                                || val.greater_equal(&self.eval_expr(lo)).is_true();
+                            let hi_ok = matches!(hi.kind, ExprKind::Dollar)
+                                || val.less_equal(&self.eval_expr(hi)).is_true();
+                            if lo_ok && hi_ok {
                                 return Value::from_u64(1, 1);
                             }
                         }
@@ -45682,13 +45686,17 @@ impl Simulator {
                             // ascending for the odometer). Fall back to the
                             // flat width only for a lone packed dim we did not
                             // record (e.g. a bare `reg [W-1:0]` element).
+                            let mut descs: Vec<bool> = vec![false; dims.len()];
                             if dims.len() < vars.len() {
                                 if let Some(pdims) = self.module.packed_full_dims.get(&name) {
                                     for &(l, r) in pdims.iter() {
                                         if dims.len() >= vars.len() {
                                             break;
                                         }
+                                        // §12.7.3: left→right — a packed
+                                        // [3:0] dim iterates 3,2,1,0.
                                         dims.push((l.min(r), l.max(r)));
+                                        descs.push(l > r);
                                     }
                                 } else if dims.len() + 1 == vars.len() {
                                     let ew = self
@@ -45704,15 +45712,23 @@ impl Simulator {
                                         });
                                     if let Some(w) = ew.filter(|&w| w > 1) {
                                         dims.push((0, w as i64 - 1));
+                                        // §12.7.3 left→right: an unrecorded
+                                        // lone packed dim is `[w-1:0]` unless
+                                        // the ascending map says otherwise.
+                                        descs.push(
+                                            !self.module.ascending_packed.contains_key(&name),
+                                        );
                                     }
                                 }
                             }
                             if dims.len() >= vars.len() {
-                                self.exec_foreach_nested(
+                                descs.resize(vars.len().max(descs.len()), false);
+                                self.exec_foreach_nested_dir(
                                     &dims[..vars.len()],
                                     vars,
                                     body,
                                     var_scope.as_deref(),
+                                    Some(&descs[..vars.len()]),
                                 );
                                 self.auto_loop_vars.truncate(fe_auto_len);
                                 self.restore_loop_vars(&fe_saved);
@@ -59218,20 +59234,49 @@ impl Simulator {
         body: &Statement,
         scope: Option<&str>,
     ) {
-        let iterated: Vec<((i64, i64), &crate::ast::Identifier)> = all_dims
+        self.exec_foreach_nested_dir(all_dims, vars, body, scope, None)
+    }
+
+    /// §12.7.3: the loop variable ranges LEFT bound → RIGHT bound. `desc`
+    /// (aligned to `all_dims`, dims still normalized (lo,hi)) marks
+    /// dimensions whose declared left bound is the HIGH one — those iterate
+    /// hi→lo (packed `[3:0]` visits 3,2,1,0).
+    fn exec_foreach_nested_dir(
+        &mut self,
+        all_dims: &[(i64, i64)],
+        vars: &[Option<crate::ast::Identifier>],
+        body: &Statement,
+        scope: Option<&str>,
+        desc: Option<&[bool]>,
+    ) {
+        let iterated: Vec<((i64, i64), bool, &crate::ast::Identifier)> = all_dims
             .iter()
+            .enumerate()
             .zip(vars)
-            .filter_map(|(d, v)| v.as_ref().map(|id| (*d, id)))
+            .filter_map(|((k, d), v)| {
+                v.as_ref().map(|id| {
+                    (
+                        *d,
+                        desc.and_then(|m| m.get(k)).copied().unwrap_or(false),
+                        id,
+                    )
+                })
+            })
             .collect();
-        if iterated.is_empty() || iterated.iter().any(|((lo, hi), _)| hi < lo) {
+        if iterated.is_empty() || iterated.iter().any(|((lo, hi), _, _)| hi < lo) {
             return;
         }
-        let dims: Vec<(i64, i64)> = iterated.iter().map(|(d, _)| *d).collect();
-        for (_, id) in &iterated {
+        let dims: Vec<(i64, i64)> = iterated.iter().map(|(d, _, _)| *d).collect();
+        let descs: Vec<bool> = iterated.iter().map(|(_, dsc, _)| *dsc).collect();
+        for (_, _, id) in &iterated {
             self.widths.insert(id.name.clone(), 32);
         }
         let n = dims.len();
-        let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+        let mut idx: Vec<i64> = dims
+            .iter()
+            .zip(&descs)
+            .map(|(d, &dsc)| if dsc { d.1 } else { d.0 })
+            .collect();
         // Resolve the BODY's bare names under the array's instance too. The
         // loop bounds are found by scoping the array name, but the body then
         // wrote through an unscoped `m[i][j]` — in a submodule that resolved to
@@ -59251,7 +59296,7 @@ impl Simulator {
                 fe_done!();
                 return;
             }
-            for (k, (_, id)) in iterated.iter().enumerate() {
+            for (k, (_, _, id)) in iterated.iter().enumerate() {
                 self.set_loop_var_aliased(scope, &id.name, Self::signed_loop_val(idx[k]));
             }
             self.continue_flag = false;
@@ -59269,11 +59314,19 @@ impl Simulator {
                     return;
                 }
                 k -= 1;
-                idx[k] += 1;
-                if idx[k] <= dims[k].1 {
-                    break;
+                if descs[k] {
+                    idx[k] -= 1;
+                    if idx[k] >= dims[k].0 {
+                        break;
+                    }
+                    idx[k] = dims[k].1;
+                } else {
+                    idx[k] += 1;
+                    if idx[k] <= dims[k].1 {
+                        break;
+                    }
+                    idx[k] = dims[k].0;
                 }
-                idx[k] = dims[k].0;
             }
         }
     }
@@ -71691,9 +71744,15 @@ impl Simulator {
     /// a wildcard item never matched: both silently took `default`.
     fn case_inside_match(&mut self, val: &Value, pat: &Expression) -> bool {
         if let ExprKind::Range(lo, hi) = &pat.kind {
-            let l = self.eval_expr(lo);
-            let h = self.eval_expr(hi);
-            return val.greater_equal(&l).is_true() && val.less_equal(&h).is_true();
+            // §11.4.13: `$` as the LOW bound is the type's smallest value,
+            // as the HIGH bound its largest — an unbounded end always
+            // matches (the Dollar eval's u32::MAX sentinel matched nothing
+            // as a low bound).
+            let lo_ok = matches!(lo.kind, ExprKind::Dollar)
+                || val.greater_equal(&self.eval_expr(lo)).is_true();
+            let hi_ok = matches!(hi.kind, ExprKind::Dollar)
+                || val.less_equal(&self.eval_expr(hi)).is_true();
+            return lo_ok && hi_ok;
         }
         if let Some(nm) = self.array_operand_name(pat) {
             let sz = self.get_queue_size(&nm);
@@ -72664,7 +72723,13 @@ impl Simulator {
             let mut val = if i < args.len() {
                 self.eval_expr(&args[i])
             } else if let Some(def) = &port.default {
-                self.eval_expr(def)
+                // §13.5.3: a default may reference EARLIER formals (`int b =
+                // a + 1`). Push the partially-bound frame so they resolve —
+                // evaluated bare, `a` was unknown and the default was x.
+                self.local_stack.push(locals.clone());
+                let v = self.eval_expr(def);
+                self.local_stack.pop();
+                v
             } else {
                 Value::zero(32)
             };
