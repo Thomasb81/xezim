@@ -209,3 +209,5 @@ mod nested_packed_struct_array_access;
 mod package_typedef_scoping;
 #[path = "types/diag_kind_limit_env.rs"]
 mod diag_kind_limit_env;
+#[path = "types/package_scope_resolution.rs"]
+mod package_scope_resolution;
