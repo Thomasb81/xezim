@@ -2667,6 +2667,10 @@ pub struct Simulator {
     /// `forced_signals` for those targets so the name-keyed write
     /// fallbacks can drop ordinary writes while the override is active.
     forced_names: HashSet<String>,
+    /// §13.3.1: last value of each STATIC function's implicit return
+    /// variable (key: pkg-scope + fn name). Seeds the next call's return
+    /// slot so an unassigned exit path returns the previous value.
+    static_fn_ret: HashMap<String, Value>,
     /// §10.6.2: an active force/procedural-assign whose RHS is an
     /// EXPRESSION acts as a continuous assignment — it re-evaluates when
     /// its operands change until release. (target key, lvalue, rvalue,
@@ -6265,6 +6269,7 @@ impl Simulator {
             multi_dim_array_names,
             forced_signals: HashMap::default(),
             forced_names: HashSet::default(),
+            static_fn_ret: HashMap::default(),
             active_force_exprs: Vec::new(),
             signal_has_xz: signal_has_xz_init,
             signal_inline_bits: Vec::new(),
@@ -18496,6 +18501,30 @@ impl Simulator {
                         found = true;
                     }
                 }
+                // A MEMBER read ("p.lo") has no signal of its own — it is a
+                // slice of its base. Depend on the BASE signal so the entry
+                // re-fires when it changes; dropping the read entirely left
+                // pattern CAs (`assign r = '{hi: p.lo, …}`) frozen at their
+                // time-0 value.
+                if !found && r.contains('.') {
+                    let mut base: &str = r.as_str();
+                    while let Some(pos) = base.rfind('.') {
+                        base = &base[..pos];
+                        if let Some(scope) = &scope_hint {
+                            let q = format!("{}.{}", scope, base);
+                            if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
+                                rids.push(id);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if let Some(id) = self.resolve_read_name(base, &top_prefix) {
+                            rids.push(id);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
                 if !found {
                     unresolved_count += 1;
                 }
@@ -27315,7 +27344,7 @@ impl Simulator {
 
             // Check for repeat with event waits inside
             if let StatementKind::Repeat { count, body } = &stmt.kind {
-                let n = self.eval_expr(count).to_u64().unwrap_or(0);
+                let n = self.repeat_count(count);
                 // Mirror the While/For arms: unroll not only when the body has
                 // a direct `@event`/`#delay`, but also when it blocks via a
                 // CALL to a task whose own body contains a `wait`/`#delay`/
@@ -33006,14 +33035,23 @@ impl Simulator {
                 if let Some(hint) = &scope_hint {
                     *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
                 }
-                let lhs_id = self.get_lhs_signal_id(lhs);
+                let mut lhs_id = self.get_lhs_signal_id(lhs);
                 if scope_hint.is_none() {
-                    if let Some(id) = lhs_id {
+                    // The bare-lhs resolve above can itself need the hint
+                    // (an instance-scoped CA whose lhs is a bare name) — the
+                    // entry's pre-resolved write id breaks that cycle. Without
+                    // it, a submodule pattern CA (`assign r = '{hi: p.lo,…}`)
+                    // read its operands UNSCOPED and produced x.
+                    let hint_id = lhs_id.or_else(|| entry.cold.write_signal_ids.first().copied());
+                    if let Some(id) = hint_id {
                         if let Some(full) = self.id_to_name.get(id) {
                             if let Some((parent, _)) = full.rsplit_once('.') {
                                 *self.name_resolve_hint.borrow_mut() = Some(parent.to_string());
                             }
                         }
+                    }
+                    if lhs_id.is_none() {
+                        lhs_id = self.get_lhs_signal_id(lhs);
                     }
                 }
                 let w = self.infer_lhs_width(lhs);
@@ -34107,21 +34145,34 @@ impl Simulator {
             return None;
         }
         let flat = self.flat_member_name(lvalue)?;
-        let (obj_name, prefix) = match flat.split_once('.') {
-            Some((o, p)) => (o.to_string(), p.to_string()),
-            None => (flat.clone(), String::new()),
-        };
-        let layout = self.module.packed_struct_fields.get(&obj_name).cloned()?;
-        let (base_offset, width) = if prefix.is_empty() {
-            // Whole base signal: span is the max (offset + width) over fields.
-            let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
-            (0, total)
-        } else {
-            // A member: must itself be a registered field (sub-struct or leaf).
-            let (_, o, w) = layout.iter().find(|(k, _, _)| *k == prefix)?;
-            (*o, *w)
-        };
-        Some((obj_name, prefix, layout, base_offset, width))
+        // The base may be INSTANCE-SCOPED ("u.r2"), so the first-dot split
+        // misread the instance prefix as the struct base and every lookup
+        // missed. Try each split point, LONGEST registered base first (the
+        // whole name, then head-of-last-dot, …), with the remainder as the
+        // member prefix.
+        let mut candidates: Vec<(String, String)> =
+            vec![(flat.clone(), String::new())];
+        for (i, _) in flat.match_indices('.').collect::<Vec<_>>().into_iter().rev() {
+            candidates.push((flat[..i].to_string(), flat[i + 1..].to_string()));
+        }
+        for (obj_name, prefix) in candidates {
+            let Some(layout) = self.module.packed_struct_fields.get(&obj_name).cloned() else {
+                continue;
+            };
+            let (base_offset, width) = if prefix.is_empty() {
+                // Whole base signal: span = max (offset + width) over fields.
+                let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                (0, total)
+            } else {
+                // A member: must itself be a registered field.
+                match layout.iter().find(|(k, _, _)| *k == prefix) {
+                    Some((_, o, w)) => (*o, *w),
+                    None => continue,
+                }
+            };
+            return Some((obj_name, prefix, layout, base_offset, width));
+        }
+        None
     }
 
     /// Pack a named/ordered/default assignment pattern into a PACKED struct
@@ -40193,9 +40244,13 @@ impl Simulator {
                 for r in ranges {
                     match &r.kind {
                         ExprKind::Range(lo, hi) => {
-                            let l = self.eval_expr(lo);
-                            let h = self.eval_expr(hi);
-                            if val.greater_equal(&l).is_true() && val.less_equal(&h).is_true() {
+                            // §11.4.13: `$` bound = type extreme (see
+                            // case_inside_match).
+                            let lo_ok = matches!(lo.kind, ExprKind::Dollar)
+                                || val.greater_equal(&self.eval_expr(lo)).is_true();
+                            let hi_ok = matches!(hi.kind, ExprKind::Dollar)
+                                || val.less_equal(&self.eval_expr(hi)).is_true();
+                            if lo_ok && hi_ok {
                                 return Value::from_u64(1, 1);
                             }
                         }
@@ -45900,6 +45955,21 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §12.7.3: `foreach (m[i])` with FEWER index vars than
+                        // dims iterates the first dimension fully — the
+                        // single-var fallbacks below sized it wrong (one
+                        // iteration on a 2-D fixed array).
+                        if vars.len() == 1 {
+                            if let Some(dims) = self.foreach_dims(&an) {
+                                if dims.len() >= 2 {
+                                    self.exec_foreach_nested(&dims[..1], vars, body, None);
+                                    self.auto_loop_vars.truncate(fe_auto_len);
+                                    self.restore_loop_vars(&fe_saved);
+                                    if !self.return_flag { self.break_flag = false; }
+                                    return;
+                                }
+                            }
+                        }
                         // §7.9.1/§7.10: `foreach (all[outer, inner])` over an
                         // ASSOCIATIVE ARRAY OF QUEUES (`T all[key][$]`). The
                         // outer index walks the (sparse) assoc keys, the inner
@@ -46120,6 +46190,26 @@ impl Simulator {
                     // dimension — `foreach (m[i, j])`. A null entry (`m[, j]`)
                     // skips that dimension. Only `vars[0]` was ever bound, so
                     // `j` stayed X and the loop ran over the first dim alone.
+                    // §12.7.3: `foreach (m[i])` with FEWER index vars than
+                    // dims iterates the FIRST dimension fully — the 1-var
+                    // fallbacks below sized a 2-D fixed array wrong (one
+                    // iteration).
+                    if vars.len() == 1
+                        && !self.module.dynamic_arrays.contains(&name)
+                        && !self.is_associative_array(&name)
+                    {
+                        if let Some(dims) = self.foreach_dims(&name) {
+                            if dims.len() >= 2 {
+                                self.exec_foreach_nested(&dims[..1], vars, body, None);
+                                self.auto_loop_vars.truncate(fe_auto_len);
+                                self.restore_loop_vars(&fe_saved);
+                                if !self.return_flag {
+                                    self.break_flag = false;
+                                }
+                                return;
+                            }
+                        }
+                    }
                     if vars.len() >= 2 {
                         if let Some(mut dims) = self.foreach_dims(&name) {
                             // A dynamic outer dimension (`T a[][16]`) is backed
@@ -46141,13 +46231,17 @@ impl Simulator {
                             // ascending for the odometer). Fall back to the
                             // flat width only for a lone packed dim we did not
                             // record (e.g. a bare `reg [W-1:0]` element).
+                            let mut descs: Vec<bool> = vec![false; dims.len()];
                             if dims.len() < vars.len() {
                                 if let Some(pdims) = self.module.packed_full_dims.get(&name) {
                                     for &(l, r) in pdims.iter() {
                                         if dims.len() >= vars.len() {
                                             break;
                                         }
+                                        // §12.7.3: left→right — a packed
+                                        // [3:0] dim iterates 3,2,1,0.
                                         dims.push((l.min(r), l.max(r)));
+                                        descs.push(l > r);
                                     }
                                 } else if dims.len() + 1 == vars.len() {
                                     let ew = self
@@ -46163,15 +46257,23 @@ impl Simulator {
                                         });
                                     if let Some(w) = ew.filter(|&w| w > 1) {
                                         dims.push((0, w as i64 - 1));
+                                        // §12.7.3 left→right: an unrecorded
+                                        // lone packed dim is `[w-1:0]` unless
+                                        // the ascending map says otherwise.
+                                        descs.push(
+                                            !self.module.ascending_packed.contains_key(&name),
+                                        );
                                     }
                                 }
                             }
                             if dims.len() >= vars.len() {
-                                self.exec_foreach_nested(
+                                descs.resize(vars.len().max(descs.len()), false);
+                                self.exec_foreach_nested_dir(
                                     &dims[..vars.len()],
                                     vars,
                                     body,
                                     var_scope.as_deref(),
+                                    Some(&descs[..vars.len()]),
                                 );
                                 self.auto_loop_vars.truncate(fe_auto_len);
                                 self.restore_loop_vars(&fe_saved);
@@ -46473,8 +46575,10 @@ impl Simulator {
                 }
             }
             StatementKind::Repeat { count, body } => {
-                let n = self.eval_expr(count).to_u64().unwrap_or(0);
-                for _ in 0..n.min(10000) {
+                // §12.7.2: full count — the old 10000 cap silently truncated
+                // large loops (and negatives-as-unsigned hit it constantly).
+                let n = self.repeat_count(count);
+                for _ in 0..n {
                     if self.finished {
                         break;
                     }
@@ -48925,8 +49029,25 @@ impl Simulator {
         match &expr.kind {
             ExprKind::SystemCall { name, args } => self.exec_system_task(name, args),
             ExprKind::Ident(hier) => {
+                // §13.3: parens are optional on a task enable — try both the
+                // scope-resolved name and the RAW dotted path (an interface
+                // task `di.show;` resolves under the instance-scoped key,
+                // which resolve_hier_name may rewrite away).
                 let name = self.resolve_hier_name(hier);
-                if let Some(td) = self.module.tasks.get(&name).cloned() {
+                let raw = (hier.path.len() >= 2).then(|| {
+                    hier.path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                });
+                let td = self
+                    .module
+                    .tasks
+                    .get(&name)
+                    .or_else(|| raw.as_deref().and_then(|r| self.module.tasks.get(r)))
+                    .cloned();
+                if let Some(td) = td {
                     // Execute a bare task-enable unless the body genuinely needs
                     // a suspendable process (event control, `wait`, `fork…join`,
                     // `forever`) — those need semantics this synchronous path
@@ -59705,20 +59826,49 @@ impl Simulator {
         body: &Statement,
         scope: Option<&str>,
     ) {
-        let iterated: Vec<((i64, i64), &crate::ast::Identifier)> = all_dims
+        self.exec_foreach_nested_dir(all_dims, vars, body, scope, None)
+    }
+
+    /// §12.7.3: the loop variable ranges LEFT bound → RIGHT bound. `desc`
+    /// (aligned to `all_dims`, dims still normalized (lo,hi)) marks
+    /// dimensions whose declared left bound is the HIGH one — those iterate
+    /// hi→lo (packed `[3:0]` visits 3,2,1,0).
+    fn exec_foreach_nested_dir(
+        &mut self,
+        all_dims: &[(i64, i64)],
+        vars: &[Option<crate::ast::Identifier>],
+        body: &Statement,
+        scope: Option<&str>,
+        desc: Option<&[bool]>,
+    ) {
+        let iterated: Vec<((i64, i64), bool, &crate::ast::Identifier)> = all_dims
             .iter()
+            .enumerate()
             .zip(vars)
-            .filter_map(|(d, v)| v.as_ref().map(|id| (*d, id)))
+            .filter_map(|((k, d), v)| {
+                v.as_ref().map(|id| {
+                    (
+                        *d,
+                        desc.and_then(|m| m.get(k)).copied().unwrap_or(false),
+                        id,
+                    )
+                })
+            })
             .collect();
-        if iterated.is_empty() || iterated.iter().any(|((lo, hi), _)| hi < lo) {
+        if iterated.is_empty() || iterated.iter().any(|((lo, hi), _, _)| hi < lo) {
             return;
         }
-        let dims: Vec<(i64, i64)> = iterated.iter().map(|(d, _)| *d).collect();
-        for (_, id) in &iterated {
+        let dims: Vec<(i64, i64)> = iterated.iter().map(|(d, _, _)| *d).collect();
+        let descs: Vec<bool> = iterated.iter().map(|(_, dsc, _)| *dsc).collect();
+        for (_, _, id) in &iterated {
             self.widths.insert(id.name.clone(), 32);
         }
         let n = dims.len();
-        let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+        let mut idx: Vec<i64> = dims
+            .iter()
+            .zip(&descs)
+            .map(|(d, &dsc)| if dsc { d.1 } else { d.0 })
+            .collect();
         // Resolve the BODY's bare names under the array's instance too. The
         // loop bounds are found by scoping the array name, but the body then
         // wrote through an unscoped `m[i][j]` — in a submodule that resolved to
@@ -59738,7 +59888,7 @@ impl Simulator {
                 fe_done!();
                 return;
             }
-            for (k, (_, id)) in iterated.iter().enumerate() {
+            for (k, (_, _, id)) in iterated.iter().enumerate() {
                 self.set_loop_var_aliased(scope, &id.name, Self::signed_loop_val(idx[k]));
             }
             self.continue_flag = false;
@@ -59756,11 +59906,19 @@ impl Simulator {
                     return;
                 }
                 k -= 1;
-                idx[k] += 1;
-                if idx[k] <= dims[k].1 {
-                    break;
+                if descs[k] {
+                    idx[k] -= 1;
+                    if idx[k] >= dims[k].0 {
+                        break;
+                    }
+                    idx[k] = dims[k].1;
+                } else {
+                    idx[k] += 1;
+                    if idx[k] <= dims[k].1 {
+                        break;
+                    }
+                    idx[k] = dims[k].0;
                 }
-                idx[k] = dims[k].0;
             }
         }
     }
@@ -72178,9 +72336,15 @@ impl Simulator {
     /// a wildcard item never matched: both silently took `default`.
     fn case_inside_match(&mut self, val: &Value, pat: &Expression) -> bool {
         if let ExprKind::Range(lo, hi) = &pat.kind {
-            let l = self.eval_expr(lo);
-            let h = self.eval_expr(hi);
-            return val.greater_equal(&l).is_true() && val.less_equal(&h).is_true();
+            // §11.4.13: `$` as the LOW bound is the type's smallest value,
+            // as the HIGH bound its largest — an unbounded end always
+            // matches (the Dollar eval's u32::MAX sentinel matched nothing
+            // as a low bound).
+            let lo_ok = matches!(lo.kind, ExprKind::Dollar)
+                || val.greater_equal(&self.eval_expr(lo)).is_true();
+            let hi_ok = matches!(hi.kind, ExprKind::Dollar)
+                || val.less_equal(&self.eval_expr(hi)).is_true();
+            return lo_ok && hi_ok;
         }
         if let Some(nm) = self.array_operand_name(pat) {
             let sz = self.get_queue_size(&nm);
@@ -73029,6 +73193,19 @@ impl Simulator {
         None
     }
 
+    /// §12.7.2: a repeat count that is x/z or NEGATIVE executes zero times.
+    fn repeat_count(&mut self, count: &Expression) -> u64 {
+        let v = self.eval_expr(count);
+        if v.has_xz() {
+            return 0;
+        }
+        if v.is_signed {
+            v.to_i64().unwrap_or(0).max(0) as u64
+        } else {
+            v.to_u64().unwrap_or(0)
+        }
+    }
+
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
         // §26.3: the package this body belongs to. Taken before anything else
         // runs, so a call appearing in an argument (evaluated below, in the
@@ -73138,7 +73315,13 @@ impl Simulator {
             let mut val = if i < args.len() {
                 self.eval_expr(&args[i])
             } else if let Some(def) = &port.default {
-                self.eval_expr(def)
+                // §13.5.3: a default may reference EARLIER formals (`int b =
+                // a + 1`). Push the partially-bound frame so they resolve —
+                // evaluated bare, `a` was unknown and the default was x.
+                self.local_stack.push(locals.clone());
+                let v = self.eval_expr(def);
+                self.local_stack.pop();
+                v
             } else {
                 Value::zero(32)
             };
@@ -73236,7 +73419,27 @@ impl Simulator {
         } else {
             Value::new(ret_w)
         };
-        locals.insert(ret_name.clone(), ret_init);
+        // §13.3.1/§13.4.1: a STATIC-lifetime function's implicit return
+        // variable persists across calls — a path that exits without
+        // assigning returns the PREVIOUS call's value, not a fresh default.
+        // Only module-scope functions without an `automatic` qualifier
+        // qualify (class methods default to automatic, §8.6).
+        let static_ret_key = (!matches!(
+            fd.lifetime,
+            Some(crate::ast::types::Lifetime::Automatic)
+        ) && self.module.functions.contains_key(&ret_name))
+        .then(|| {
+            format!(
+                "{}::{}",
+                pkg_scope.as_deref().unwrap_or("-"),
+                ret_name
+            )
+        });
+        let seeded = static_ret_key
+            .as_ref()
+            .and_then(|k| self.static_fn_ret.get(k).cloned())
+            .unwrap_or(ret_init);
+        locals.insert(ret_name.clone(), seeded);
         // §13.4.1: the return variable is a variable of the return type, so it
         // needs the same structural metadata a declaration gets. It had none:
         // a `function pkt_t f(); f.a = ...;` member write found no field layout
@@ -73363,6 +73566,9 @@ impl Simulator {
         // leaves. `resolve_type_width` does not count a member's unpacked
         // dimensions, so resizing to it truncated a struct with an array member
         // and dropped the members laid out above the cut.
+        if let Some(k) = static_ret_key {
+            self.static_fn_ret.insert(k, result.clone());
+        }
         let unpacked_struct_ret = self.unpacked_struct_of(&fd.return_type).is_some();
         if !result.is_real
             && !unpacked_struct_ret
