@@ -76,3 +76,6 @@ mod void_cast_queue_ops;
 
 #[path = "collections/queue_dyn_write_semantics.rs"]
 mod queue_dyn_write_semantics;
+
+#[path = "collections/assoc_of_struct.rs"]
+mod assoc_of_struct;
