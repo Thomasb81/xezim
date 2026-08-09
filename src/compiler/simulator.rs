@@ -34200,7 +34200,16 @@ impl Simulator {
             }
             ExprKind::Index { expr, index } => {
                 let base = self.flat_member_name(expr)?;
-                let i = self.eval_expr(index).to_i64()?;
+                let iv = self.eval_expr(index);
+                // §7.8: an ASSOC element key must use the canonical store
+                // format — a STRING key rendered via to_i64 collapsed to its
+                // byte value ("sa[k]" became "sa[107]"), so writes and the
+                // registered read paths disagreed on the element's name.
+                if self.is_associative_array(&base) {
+                    let key = self.assoc_key_str(&base, &iv);
+                    return Some(format!("{}[{}]", base, key));
+                }
+                let i = iv.to_i64()?;
                 Some(format!("{}[{}]", base, i))
             }
             ExprKind::MemberAccess { expr, member } => {
@@ -58324,16 +58333,20 @@ impl Simulator {
     /// `num()`'s count of distinct keys.
     fn assoc_top_level_keys(&self, obj_name: &str) -> Vec<String> {
         let prefix = format!("{}[", obj_name);
+        // A STRUCT element stores member-wise leaves (`sa[k].id`), which do
+        // not end in `]` — accept any entry whose key bracket closes, else
+        // struct-element assoc arrays enumerate as empty (num()/foreach).
         let mut keys: Vec<String> = self
             .signals
             .keys()
             .map(|k| k.as_str())
             .chain(self.signal_name_to_id.keys().map(|k| &**k))
-            .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
+            .filter(|k| k.starts_with(&prefix))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
                 rest.find(']').map(|pos| rest[..pos].to_string())
             })
+            .filter(|key| !key.contains('.'))
             .collect();
         keys.sort();
         keys.dedup();
@@ -67505,6 +67518,9 @@ impl Simulator {
                 // is never a direct entry. So a hit is EITHER the flat 1D key OR any
                 // compound `m[K1][...]` element (prefix scan).
                 let nested_prefix = format!("{}[", elem_name);
+                // A STRUCT element stores member-wise leaves
+                // (`sa[k].id`) — no `sa[k]` entry ever exists.
+                let member_prefix = format!("{}.", elem_name);
                 let found = self.signals.contains_key(&elem_name)
                     || self.signal_name_to_id.contains_key(elem_name.as_str())
                     // An assoc element that is itself a collection is stored
@@ -67514,7 +67530,7 @@ impl Simulator {
                     || self
                         .signals
                         .keys()
-                        .any(|k| k.starts_with(&nested_prefix));
+                        .any(|k| k.starts_with(&nested_prefix) || k.starts_with(&member_prefix));
                 return Some(Value::from_u64(found as u64, 1));
             }
         }
