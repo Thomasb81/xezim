@@ -27,9 +27,15 @@ endmodule
 
 /// Returns (mismatch_count, suppression_note_count) from stderr.
 fn run(limit: Option<&str>) -> (usize, usize) {
+    // A UNIQUE path per invocation. The tests in this file run in parallel and
+    // each spawns a subprocess, so a shared path lets one test truncate the
+    // file while another's subprocess is reading it — which shows up as a
+    // wrong diagnostic count on a slow machine and passes on a fast one.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("xezim_diaglim_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("diaglim.sv");
+    let path = dir.join(format!("diaglim_{}.sv", n));
     std::fs::write(&path, SRC).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
     cmd.arg("--simulate").arg("-s").arg("top").arg(path.to_str().unwrap());
