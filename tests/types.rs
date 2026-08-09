@@ -235,3 +235,6 @@ mod procedural_storage_semantics;
 
 #[path = "types/expression_event_controls.rs"]
 mod expression_event_controls;
+
+#[path = "types/packed_multilevel_and_collision.rs"]
+mod packed_multilevel_and_collision;
