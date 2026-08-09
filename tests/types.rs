@@ -219,3 +219,5 @@ mod wire_typedef_declarations;
 mod generate_scope_struct_metadata;
 #[path = "types/signedness_and_power_context.rs"]
 mod signedness_and_power_context;
+#[path = "types/width_context_discipline.rs"]
+mod width_context_discipline;

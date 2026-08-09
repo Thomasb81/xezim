@@ -37578,7 +37578,19 @@ impl Simulator {
                 self.fast_signal_read(hier)
             }
             ExprKind::Unary { op, operand } => {
-                let v = self.eval_expr(operand);
+                // §11.6.1: `~` and unary `-` are CONTEXT-determined — the
+                // operand extends to the surrounding width BEFORE the
+                // operation. The VM path got this fix earlier; this arm
+                // evaluated at the operand's own width and zero-extended
+                // after, so `~a + 32'd0` printed 0000005c for ffffff5c while
+                // the identical assign was right. Reductions/! stay
+                // self-determined.
+                let v = if ctx_width > 0 && matches!(op, UnaryOp::Minus | UnaryOp::BitNot | UnaryOp::Plus) {
+                    let v0 = self.eval_expr_ctx(operand, ctx_width);
+                    if ctx_width > v0.width { v0.resize(ctx_width) } else { v0 }
+                } else {
+                    self.eval_expr(operand)
+                };
                 match op {
                     UnaryOp::Plus => v,
                     UnaryOp::Minus => {
@@ -37797,12 +37809,47 @@ impl Simulator {
                         | BinaryOp::Mod
                         | BinaryOp::Power
                 );
+                let is_comparison = matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Neq
+                        | BinaryOp::CaseEq
+                        | BinaryOp::CaseNeq
+                        | BinaryOp::WildcardEq
+                        | BinaryOp::WildcardNeq
+                        | BinaryOp::Lt
+                        | BinaryOp::Leq
+                        | BinaryOp::Gt
+                        | BinaryOp::Geq
+                );
                 let self_det_w = if is_arith_or_bitwise {
                     let lw = self.infer_width(left);
                     let rw = self.infer_width(right);
                     lw.max(rw).max(ctx_width)
                 } else if widens_left {
-                    self.infer_width(left).max(ctx_width)
+                    // The LRM self width, NOT the carry-aware infer_width:
+                    // `(a<<4)>>2` in an 8-bit context otherwise evaluates the
+                    // inner shift at 12 bits and the dropped carry returns.
+                    // (Unknown shapes keep the historical infer_width.)
+                    self.lrm_self_width(left)
+                        .unwrap_or_else(|| self.infer_width(left))
+                        .max(ctx_width)
+                } else if is_comparison {
+                    // §11.6.1: a comparison's operands take the MAX OF EACH
+                    // OTHER's widths — never the SURROUNDING context. The
+                    // assignment width leaked in, so `t32 = (a + a) > 8'h50`
+                    // compared at 32 bits (0x146 > 0x50 = 1) where the
+                    // reference compares the joint 8-bit width (0x46 > 0x50 =
+                    // 0). Reference-validated corner: an UNSIZED literal
+                    // counts as 32, so `(8'hFF << 9) == 0` widens the shift
+                    // to 32 bits and compares FALSE (0x1FE00 != 0).
+                    // Any operand this cannot size without evaluating keeps
+                    // the historical behavior (the outer context) — sizing
+                    // through infer_width would EXECUTE method calls.
+                    match (self.lrm_self_width(left), self.lrm_self_width(right)) {
+                        (Some(lw), Some(rw)) => lw.max(rw),
+                        _ => ctx_width,
+                    }
                 } else {
                     ctx_width
                 };
@@ -37872,17 +37919,30 @@ impl Simulator {
                 // This is the "operands follow normal expression rules" clause
                 // that §18.5.12 defers to for constraint expressions, so the
                 // constraint evaluator (which routes through here) inherits it.
-                if is_arith_or_bitwise && !(l.is_signed && r.is_signed) {
+                // Div/Mod are context-determined in BOTH operands (§11.6.1
+                // Table 11-21) and follow the same §11.8.1/§11.8.2 rules —
+                // they were excluded from this widening, so `smin / sm1` in a
+                // 32-bit context divided at 8 bits (wrapping -128/-1 to -128)
+                // and a divide-by-zero produced x at 8 bits zero-extended
+                // instead of x across the context.
+                let widen_both = (is_arith_or_bitwise
+                    || matches!(op, BinaryOp::Div | BinaryOp::Mod))
+                    // §11.8.1 is an INTEGRAL rule: a real operand makes the
+                    // expression real and sign-clearing an integer next to it
+                    // turned `-1 / 1.0e-6` into 1.8e25.
+                    && !l.is_real
+                    && !r.is_real;
+                if widen_both && !(l.is_signed && r.is_signed) {
                     l.is_signed = false;
                     r.is_signed = false;
                 }
                 let max_w = l.width.max(r.width).max(self_det_w);
-                let wl = if is_arith_or_bitwise && max_w > l.width {
+                let wl = if widen_both && max_w > l.width {
                     l.resize(max_w)
                 } else {
                     l
                 };
-                let wr = if is_arith_or_bitwise && max_w > r.width {
+                let wr = if widen_both && max_w > r.width {
                     r.resize(max_w)
                 } else {
                     r
@@ -53066,6 +53126,78 @@ impl Simulator {
             _ => {}
         }
     }
+    /// The LRM §11.6.1 SELF-determined width of an expression — the "max of
+    /// operand widths" rule with NO carry headroom. `infer_width` deliberately
+    /// over-reports (`a+a` -> 9) so temporaries never truncate, but the width
+    /// that a shift/divide OPERAND takes from its context must be the LRM
+    /// width: using the carry-aware one evaluated `(a<<4)>>2` at 12 bits and
+    /// shifted the dropped carry back into range (0x8c for 0x0c).
+    /// Returns None for any shape it cannot size WITHOUT evaluation —
+    /// crucially it must NEVER fall back to `infer_width`, whose Call arm
+    /// EXECUTES the call to learn its width: sizing the operands of
+    /// `h.q.sz() == 2 && h.q.popf() == 10` that way ran every side-effectful
+    /// method an extra time (the queue came out empty, $urandom sequences
+    /// shifted, assoc-array cursors advanced twice). Callers fall back to
+    /// their historical behavior on None.
+    fn lrm_self_width(&mut self, expr: &Expression) -> Option<u32> {
+        match &expr.kind {
+            ExprKind::Paren(i) => self.lrm_self_width(i),
+            ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
+            ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
+            ExprKind::Ident(h) => {
+                let n = self.resolve_hier_name(h);
+                self.lookup_signal_width(&n)
+            }
+            ExprKind::Unary { op, operand } => match op {
+                UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => self.lrm_self_width(operand),
+                UnaryOp::LogNot
+                | UnaryOp::BitAnd
+                | UnaryOp::BitOr
+                | UnaryOp::BitXor
+                | UnaryOp::BitNand
+                | UnaryOp::BitNor
+                | UnaryOp::BitXnor => Some(1),
+                _ => None,
+            },
+            ExprKind::Binary { op, left, right } => match op {
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::BitXnor => {
+                    Some(self.lrm_self_width(left)?.max(self.lrm_self_width(right)?))
+                }
+                BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::ArithShiftLeft
+                | BinaryOp::ArithShiftRight
+                | BinaryOp::Power => self.lrm_self_width(left),
+                BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::CaseEq
+                | BinaryOp::CaseNeq
+                | BinaryOp::WildcardEq
+                | BinaryOp::WildcardNeq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+                | BinaryOp::LogAnd
+                | BinaryOp::LogOr => Some(1),
+                _ => None,
+            },
+            ExprKind::Conditional { then_expr, else_expr, .. } => {
+                Some(self.lrm_self_width(then_expr)?.max(self.lrm_self_width(else_expr)?))
+            }
+            _ => None,
+        }
+    }
+
     fn infer_width(&mut self, expr: &Expression) -> u32 {
         match &expr.kind {
             ExprKind::Ident(h) => {

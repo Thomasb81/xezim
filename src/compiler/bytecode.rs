@@ -2599,8 +2599,30 @@ impl<'a> BytecodeCompiler<'a> {
                     BinaryOp::Add => self.emit(Insn::Add(dest, l, r)),
                     BinaryOp::Sub => self.emit(Insn::Sub(dest, l, r)),
                     BinaryOp::Mul => self.emit(Insn::Mul(dest, l, r)),
-                    BinaryOp::Div => self.emit(Insn::Div(dest, l, r)),
-                    BinaryOp::Mod => self.emit(Insn::Mod(dest, l, r)),
+                    BinaryOp::Div | BinaryOp::Mod => {
+                        // §11.6.1 Table 11-21: BOTH operands are context-
+                        // determined. The registers kept their declared
+                        // widths, so `smin / sm1` divided at 8 bits (wrapping
+                        // -128/-1) and a divide-by-zero produced x at 8 bits.
+                        // §11.8.1 signedness applies exactly as for +/-.
+                        let opw = ctx_width
+                            .max(self.lrm_self_width(left))
+                            .max(self.lrm_self_width(right))
+                            .max(1);
+                        let ls = self.expr_signedness(left);
+                        let rs = self.expr_signedness(right);
+                        if ls == Some(false) || rs == Some(false) {
+                            self.emit(Insn::ClearSigned(l));
+                            self.emit(Insn::ClearSigned(r));
+                        }
+                        self.emit(Insn::Resize(l, opw));
+                        self.emit(Insn::Resize(r, opw));
+                        if matches!(op, BinaryOp::Div) {
+                            self.emit(Insn::Div(dest, l, r));
+                        } else {
+                            self.emit(Insn::Mod(dest, l, r));
+                        }
+                    }
                     BinaryOp::BitAnd => self.emit(Insn::BitAnd(dest, l, r)),
                     BinaryOp::BitOr => self.emit(Insn::BitOr(dest, l, r)),
                     BinaryOp::BitXor => self.emit(Insn::BitXor(dest, l, r)),
@@ -2638,13 +2660,29 @@ impl<'a> BytecodeCompiler<'a> {
                     BinaryOp::Gt => self.emit(Insn::Gt(dest, l, r)),
                     BinaryOp::Geq => self.emit(Insn::Geq(dest, l, r)),
                     BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => {
-                        if ctx_width > 0 {
-                            self.emit(Insn::Resize(l, ctx_width));
-                        }
+                        // §11.4.10/§11.6.1: the LEFT operand takes the LRM
+                        // operation width — ctx joined with the operand's own
+                        // LRM width (never the carry-aware estimate, which
+                        // shifted dropped carries back into range).
+                        let opw = ctx_width.max(self.lrm_self_width(left)).max(1);
+                        self.emit(Insn::Resize(l, opw));
                         self.emit(Insn::Shl(dest, l, r));
                     }
-                    BinaryOp::ShiftRight => self.emit(Insn::Shr(dest, l, r)),
-                    BinaryOp::ArithShiftRight => self.emit(Insn::AShr(dest, l, r)),
+                    BinaryOp::ShiftRight | BinaryOp::ArithShiftRight => {
+                        // Same rule for right shifts — previously the operand
+                        // register kept whatever width its sub-expression
+                        // produced: a signed 8-bit value in a 32-bit context
+                        // shifted at 8 bits then zero-extended (00000013 for
+                        // 1ffffff3), and `(a+a) >> 1` shifted the carry back
+                        // in (0xa3 for 0x23).
+                        let opw = ctx_width.max(self.lrm_self_width(left)).max(1);
+                        self.emit(Insn::Resize(l, opw));
+                        if matches!(op, BinaryOp::ShiftRight) {
+                            self.emit(Insn::Shr(dest, l, r));
+                        } else {
+                            self.emit(Insn::AShr(dest, l, r));
+                        }
+                    }
                     // LRM §11.4.3 power. There is no runtime Pow instruction;
                     // every `**` seen in RTL has constant operands (`2**level`
                     // after genvar substitution, `2**N` parameters), so fold
@@ -2698,6 +2736,22 @@ impl<'a> BytecodeCompiler<'a> {
                 let cond = self.compile_expr(condition, 0)?;
                 let then_reg = self.compile_expr(then_expr, ctx_width)?;
                 let else_reg = self.compile_expr(else_expr, ctx_width)?;
+                // §11.8.1: a ternary with ANY unsigned arm is unsigned — both
+                // arms then ZERO-extend (a signed arm sign-extended, so
+                // `c ? sa : b` in a 32-bit context read ffffff9c for
+                // 0000009c). And §11.4.11's x-condition per-bit merge must
+                // happen at the CONTEXT width — merging at arm width and
+                // zero-extending after produced 000000XX for xxxxxxXX.
+                if ctx_width > 0 {
+                    let ts = self.expr_signedness(then_expr);
+                    let es = self.expr_signedness(else_expr);
+                    if ts == Some(false) || es == Some(false) {
+                        self.emit(Insn::ClearSigned(then_reg));
+                        self.emit(Insn::ClearSigned(else_reg));
+                    }
+                    self.emit(Insn::Resize(then_reg, ctx_width));
+                    self.emit(Insn::Resize(else_reg, ctx_width));
+                }
                 let dest = self.alloc_reg();
                 self.emit(Insn::Select(dest, cond, then_reg, else_reg));
                 Some(dest)
@@ -4039,10 +4093,15 @@ impl<'a> BytecodeCompiler<'a> {
     /// Compile a continuous assign: evaluate RHS, write to pre-resolved LHS.
     /// Returns true if compiled successfully.
     pub fn compile_cont_assign(&mut self, rhs: &Expression, dst_id: usize, width: u32) -> bool {
-        // Verilog context width = max(LHS width, max operand width in RHS).
+        // Verilog context width = max(LHS width, RHS self-determined width).
         // Using just the LHS width truncates intermediates when operands
-        // (e.g. 32-bit parameters) are wider than the target wire.
-        let ctx = width.max(self.expr_max_width(rhs));
+        // (e.g. 32-bit parameters) are wider than the target wire — but the
+        // RHS width must be the LRM §11.6.1 SELF width, not the carry-aware
+        // expr_max_width: the inflated context leaked dropped carries back
+        // into shift results (`assign r = (a<<4)>>2` on 8-bit r computed the
+        // inner shift at 12 bits and read 0x8c for 0x0c — while the IDENTICAL
+        // always_comb, compiled with the plain LHS width, was correct).
+        let ctx = width.max(self.lrm_self_width(rhs));
         if let Some(val_reg) = self.compile_expr(rhs, ctx) {
             if self.register_overflow {
                 self.bail("bytecode_register_limit");
@@ -4079,6 +4138,44 @@ impl<'a> BytecodeCompiler<'a> {
             self.compile_blocking_target(lhs, val_reg, lhs_width)
         } else {
             false
+        }
+    }
+
+    /// LRM §11.6.1 SELF-determined width — max-of-operands with NO carry
+    /// headroom (expr_max_width deliberately over-reports so temporaries
+    /// never truncate; a shift/divide OPERAND must take the LRM width or the
+    /// dropped carry returns: `(a<<4)>>2` at 8 bits read 0x8c for 0x0c).
+    fn lrm_self_width(&mut self, e: &Expression) -> u32 {
+        match &e.kind {
+            ExprKind::Paren(i) => self.lrm_self_width(i),
+            ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => *sz,
+            ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => 32,
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => 1,
+            ExprKind::Unary { op, operand } => match op {
+                UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => self.lrm_self_width(operand),
+                _ => 1,
+            },
+            ExprKind::Binary { op, left, right } => match op {
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::BitXnor => self.lrm_self_width(left).max(self.lrm_self_width(right)),
+                BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::ArithShiftLeft
+                | BinaryOp::ArithShiftRight
+                | BinaryOp::Power => self.lrm_self_width(left),
+                _ => 1,
+            },
+            ExprKind::Conditional { then_expr, else_expr, .. } => {
+                self.lrm_self_width(then_expr).max(self.lrm_self_width(else_expr))
+            }
+            _ => self.expr_max_width(e),
         }
     }
 
