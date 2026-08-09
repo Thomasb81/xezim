@@ -1251,3 +1251,48 @@ instruction-count reduction** — it is the one memory-side effect that survived
 because it costs no instructions to obtain. That is consistent with the earlier finding that
 xezim is instruction-bound: page-walk cost was the one memory-side overhead not already
 absorbed by the small touched working set.
+
+## Stage 2 (flat ExecInsn interpreter) — built, measured, rejected
+
+The exec-representation migration's Stage 2 was piloted end-to-end: a 16-byte fixed-width
+`FlatInsn` (u8 opcode, u16 regs, u64 imm, side pools for constants/arrays), a 52-op flat
+interpreter transliterated arm-for-arm from `exec_insns` (same `vm_*` helpers, same NBA and
+dirty-list mechanics), a one-way `lower_flat()` in `finish()` with an EXHAUSTIVE `Insn`
+match (new variants fail to compile — the anti-`is_supported`-rot design), wired into
+`exec_bytecode` and both settle arms, `XEZIM_FLAT=0` escape hatch.
+
+Correct everywhere: `cost=727`, stdout byte-identical, across every configuration.
+**Dynamic coverage: 38.7%** of VM instructions executed flat — a real sample.
+
+### Verdict 1 — flat dispatch does not beat the enum match
+
+3 interleaved reps, same binary: **+0.14% instructions, +0.76% cycles.** The 24-byte
+66-variant `Insn` match was hypothesized to pay a dispatch tax that a dense u8 jump table
+would remove; measured, the two dispatch forms are equivalent. LLVM already compiles the
+enum match to a good jump table. (The +1.39% "fusion ceiling" from adding enum variants is
+a layout-INSTABILITY effect at compile time, not a steady-state dispatch cost.)
+
+### Verdict 2 — the fusion substrate works mechanically, and still loses
+
+Added a flat-only `BranchSignalUnlessZero` (the 17.3M-per-8-iters `LoadSignal;
+BranchUnlessZero` pair whose enum-side version measured net-zero), with dead-register and
+branch-target safety checks. Result: **instructions -0.49%** (-1.36G, exactly the fused
+pair count x the elided LoadSignal cost — the mechanism is confirmed) but **cycles +1.2%,
+worse in every run**. Same lesson as the array-read triple, amplified: removed instructions
+are not on the critical path, and at 38.7% coverage BOTH interpreters are hot, so the VM's
+I-cache/BTB footprint roughly doubles — a structural cost of any partial-coverage tiering.
+
+### What this kills, and what it does not
+
+- Kills Stage 2's rationale outright: no dispatch win exists to collect, and fusion gains
+  on the flat side are eaten by the dual-interpreter overhead. Full coverage would remove
+  the dual-loop cost but chase a dispatch delta measured at zero.
+- Also retro-explains the JIT verdict: the JIT removes dispatch entirely and still loses —
+  because dispatch was never the cost. The VM's ~35 retired insns per bytecode op are in
+  the ARM BODIES (Value semantics), not the dispatch.
+- Does NOT test Stage 3 (typed registers): that changes the arm bodies themselves —
+  `val:u64/xz:u64` planes instead of 32-byte `Value` registers — which is now the only
+  untested part of the migration, and the only one aimed at where the cost actually is.
+
+Patch preserved at `scratchpad/STAGE2-flat-interpreter.patch` (1,028 lines, all gates
+green). Reverted; tree byte-identical to baseline.
