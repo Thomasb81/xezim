@@ -223,3 +223,6 @@ mod signedness_and_power_context;
 mod width_context_discipline;
 #[path = "types/hierarchy_and_type_overrides.rs"]
 mod hierarchy_and_type_overrides;
+
+#[path = "types/array_reduction_element_type.rs"]
+mod array_reduction_element_type;
