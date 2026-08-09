@@ -145,3 +145,6 @@ mod virtual_iface_this_binding;
 mod class_unpacked_struct_property;
 #[path = "classes/struct_output_formal.rs"]
 mod struct_output_formal;
+
+#[path = "classes/class_init_cast_copy.rs"]
+mod class_init_cast_copy;

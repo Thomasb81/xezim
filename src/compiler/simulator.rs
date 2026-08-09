@@ -10232,7 +10232,13 @@ impl Simulator {
                 cd.property_inits
                     .iter()
                     .filter(|(p, e)| {
-                        cd.static_properties.contains(*p) && Self::expr_contains_call(e)
+                        cd.static_properties.contains(*p)
+                            && (Self::expr_contains_call(e)
+                                // bare `= new` (no parens) parses as an Ident,
+                                // not a Call — `static C inst = new;` must
+                                // still construct (§8.9)
+                                || matches!(&e.kind, ExprKind::Ident(h)
+                                    if h.path.len() == 1 && h.path[0].name.name == "new"))
                     })
                     .map(|(p, e)| (cn.clone(), p.clone(), e.clone()))
                     .collect::<Vec<_>>()
@@ -10263,9 +10269,18 @@ impl Simulator {
                 .and_then(|cd| cd.properties.get(&prop))
                 .and_then(|s| s.type_name.as_deref())
                 .and_then(Self::container_base);
-            let is_new = matches!(&init.kind, ExprKind::Call { func, .. }
-                if matches!(&func.kind, ExprKind::Ident(h)
-                    if h.path.len() == 1 && h.path[0].name.name == "new"));
+            let (is_new, ctor_args): (bool, Vec<Expression>) = match &init.kind {
+                ExprKind::Call { func, args }
+                    if matches!(&func.kind, ExprKind::Ident(h)
+                        if h.path.len() == 1 && h.path[0].name.name == "new") =>
+                {
+                    (true, args.clone())
+                }
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new" => {
+                    (true, Vec::new())
+                }
+                _ => (false, Vec::new()),
+            };
             let v = if let (Some(kind), true) = (cont_kind, is_new) {
                 let ch = self.heap.len();
                 self.heap.push(Some(ClassInstance {
@@ -10280,6 +10295,32 @@ impl Simulator {
                     self.mailboxes.insert(ch, std::collections::VecDeque::new());
                 }
                 Value::from_u64(ch as u64, 32)
+            } else if is_new {
+                // A CLASS-typed static with `= new(...)`/`= new` constructs
+                // the shared instance once at startup (§8.9) — eval_expr of a
+                // bare `new` has no receiver class and yielded 0 (null).
+                let prop_cn = self
+                    .module
+                    .classes
+                    .get(&cn)
+                    .and_then(|cd| cd.properties.get(&prop))
+                    .and_then(|s| s.type_name.clone())
+                    .map(|tn| match self.lookup_typedef_target(&tn) {
+                        Some(crate::ast::types::DataType::TypeReference { name, .. }) => {
+                            name.name.name.clone()
+                        }
+                        _ => tn,
+                    });
+                if let Some(cd2) = prop_cn.and_then(|tn| self.module.classes.get(&tn).cloned()) {
+                    self.class_context_stack.push(Some(cn.clone()));
+                    self.this_stack.push(None);
+                    let v = self.instantiate_class(&cd2, &ctor_args);
+                    self.this_stack.pop();
+                    self.class_context_stack.pop();
+                    v
+                } else {
+                    Value::zero(32)
+                }
             } else {
                 self.class_context_stack.push(Some(cn.clone()));
                 self.this_stack.push(None);
@@ -48245,6 +48286,10 @@ impl Simulator {
                                                 ExprKind::Ident(_)
                                                     | ExprKind::MemberAccess { .. }
                                                     | ExprKind::Index { .. }
+                                                    // `new this` in a clone
+                                                    // method copies the
+                                                    // CURRENT object (§8.12)
+                                                    | ExprKind::This
                                             )
                                             && self.expr_is_class_handle(&call_args[0])
                                         {
@@ -48279,6 +48324,34 @@ impl Simulator {
                                             // (`T -> int`) — needed for per-spec static
                                             // member resolution (get_type vs
                                             // get_type_handle).
+                                            // §8.25.1: a typedef ALIAS of a
+                                            // specialization (`typedef
+                                            // Box#(byte,8) ByteBox; ByteBox b
+                                            // = new;`) carries no args on the
+                                            // declared type — pull them from
+                                            // the typedef's target, else the
+                                            // instance silently gets the
+                                            // class DEFAULTS.
+                                            let td_args: Option<Vec<Expression>> = match data_type {
+                                                crate::ast::types::DataType::TypeReference {
+                                                    name,
+                                                    type_args,
+                                                    ..
+                                                } if type_args.is_empty() => {
+                                                    match self
+                                                        .lookup_typedef_target(&name.name.name)
+                                                    {
+                                                        Some(
+                                                            crate::ast::types::DataType::TypeReference {
+                                                                type_args: t2,
+                                                                ..
+                                                            },
+                                                        ) if !t2.is_empty() => Some(t2.clone()),
+                                                        _ => None,
+                                                    }
+                                                }
+                                                _ => None,
+                                            };
                                             let ta: Option<&[Expression]> = match data_type {
                                                 crate::ast::types::DataType::TypeReference {
                                                     type_args,
@@ -48286,7 +48359,7 @@ impl Simulator {
                                                 } if !type_args.is_empty() => {
                                                     Some(type_args.as_slice())
                                                 }
-                                                _ => None,
+                                                _ => td_args.as_deref(),
                                             };
                                             produced = Some(self.instantiate_class_with_type_args(
                                                 &class_def, &call_args, ta,
@@ -49581,12 +49654,24 @@ impl Simulator {
                 self.stdout_writeln(&m);
             }
             "$cast" => {
-                // `$cast(dest, src)` as a statement: evaluate src and assign
-                // to dest. Dynamic-cast type checking is not enforced — a
-                // class handle is assigned through (IEEE 1800-2023 §8.16).
+                // `$cast(dest, src)` as a statement (§8.16 task form): the
+                // same runtime compatibility check as the function form, but
+                // a failure is a runtime ERROR and dest is left UNCHANGED —
+                // assigning through unconditionally let an incompatible
+                // handle masquerade as the sibling type.
                 if args.len() >= 2 {
                     let v = self.eval_expr(&args[1]);
-                    self.assign_value(&args[0], &v);
+                    if self.cast_type_ok(&args[0], &v) {
+                        self.assign_value(&args[0], &v);
+                    } else {
+                        let m = format!(
+                            "[xezim][error] $cast: source object is not \
+                             assignment-compatible with the destination (t={})",
+                            self.time
+                        );
+                        self.record_output(m.clone());
+                        self.stdout_writeln(&m);
+                    }
                 }
             }
             // §20.10 severity system tasks. Each emits a tool-specific
@@ -64384,21 +64469,25 @@ impl Simulator {
     /// set to the number of items. Mirrors the AssignmentPattern assignment
     /// path in `assign_value`.
     fn populate_queue_from_init(&mut self, scoped_q: &str, init: &Expression) {
-        if let ExprKind::AssignmentPattern(items) = &init.kind {
-            let (_lo, _hi, w) = self
-                .module
-                .arrays
-                .get(scoped_q)
-                .copied()
-                .unwrap_or((0, 63, 32));
-            for (i, item) in items.iter().enumerate() {
-                let v = self.eval_expr(item.expr());
-                self.set_signal_value_by_name(&format!("{}[{}]", scoped_q, i), v);
-                self.widths
-                    .insert(format!("{}[{}]", scoped_q, i), w);
-            }
-            self.set_queue_size(scoped_q, items.len() as u64);
+        // §7.10.1: both the pattern form `'{1,2,3}` and the queue
+        // concatenation form `{1,2,3}` initialize element-wise.
+        let elems: Vec<&Expression> = match &init.kind {
+            ExprKind::AssignmentPattern(items) => items.iter().map(|it| it.expr()).collect(),
+            ExprKind::Concatenation(parts) => parts.iter().collect(),
+            _ => return,
+        };
+        let (_lo, _hi, w) = self
+            .module
+            .arrays
+            .get(scoped_q)
+            .copied()
+            .unwrap_or((0, 63, 32));
+        for (i, item) in elems.iter().enumerate() {
+            let v = self.eval_expr(item);
+            self.set_signal_value_by_name(&format!("{}[{}]", scoped_q, i), v);
+            self.widths.insert(format!("{}[{}]", scoped_q, i), w);
         }
+        self.set_queue_size(scoped_q, elems.len() as u64);
     }
 
     /// Relative leaf paths of an unpacked struct (`a`, `inner.b`, `arr[0]`).
