@@ -765,6 +765,15 @@ enum FusedGate {
     },
 }
 
+// See the §9.2.2.2 note in Simulator::collect_expr_reads' Call arm: set
+// while collecting reads for a PLAIN `always` (star or explicit list),
+// whose sensitivity excludes called-function bodies (only
+// always_comb/always_latch descend into them).
+thread_local! {
+    static SKIP_FN_BODY_READS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CombEntry {
     item: CombItem,
@@ -18232,7 +18241,11 @@ impl Simulator {
                     matches!(ab.kind, AlwaysKind::AlwaysComb | AlwaysKind::AlwaysLatch);
                 reads.clear();
                 writes.clear();
+                if !is_always_comb {
+                    SKIP_FN_BODY_READS.with(|c| c.set(true));
+                }
                 Self::collect_stmt_reads(&ab.stmt, &self.module, &mut reads, &mut writes);
+                SKIP_FN_BODY_READS.with(|c| c.set(false));
                 // Top-prefix-strip helper: `<top>.<rest>` → `<rest>`. Used
                 // to resolve hierarchical refs whose path includes the
                 // top-module name (e.g. `tb.x_soc.foo`) where the signal
@@ -18393,8 +18406,13 @@ impl Simulator {
                     // (no signal write: `always @(y) $display(...)`) or one
                     // that can $finish, the t0 fire is a spurious side effect a
                     // reference simulator does not produce — defer it.
-                    defer_at_time0: !is_always_comb
-                        && (is_pure_observer || stmt_has_finish_or_stop(&ab.stmt)),
+                    // §9.2.2.1/§9.2.2.2.2: a PLAIN `always` (star or list)
+                    // suspends at its event control first — it does NOT run
+                    // at time 0; only always_comb/always_latch do. The old
+                    // compromise fired writer blocks at t0 anyway; the
+                    // reference leaves their outputs X until a real input
+                    // change, and now so do we.
+                    defer_at_time0: !is_always_comb,
                 });
             }
         }
@@ -20760,19 +20778,25 @@ impl Simulator {
                 // into the callee body so module vars referenced only inside
                 // the function (e.g. `hidden`) join the inferred sensitivity
                 // list; without this the block never re-fires when they change.
-                if let ExprKind::Ident(hier) = &func.kind {
-                    if let Some(seg) = hier.path.last() {
-                        // Prefer the fully-scoped registration: an inlined
-                        // instance's call site resolves to `<inst>.<name>`, and
-                        // only under THAT key do the body's bare reads get the
-                        // instance prefix (see `collect_function_reads`). The
-                        // bare key may also exist (from the module definition)
-                        // and would collect unprefixed, unresolvable reads.
-                        let full = Self::resolve_hier_name_static(hier, module);
-                        if full != seg.name.name && module.functions.contains_key(&full) {
-                            Self::collect_function_reads(&full, module, reads);
-                        } else {
-                            Self::collect_function_reads(&seg.name.name, module, reads);
+                // §9.2.2.2 note: `always @*` is sensitive only to the
+                // function's ARGUMENTS (collected above), NOT its contents —
+                // only always_comb/always_latch descend into the body. The
+                // caller signals which mode applies via SKIP_FN_BODY_READS.
+                if !SKIP_FN_BODY_READS.with(|c| c.get()) {
+                    if let ExprKind::Ident(hier) = &func.kind {
+                        if let Some(seg) = hier.path.last() {
+                            // Prefer the fully-scoped registration: an inlined
+                            // instance's call site resolves to `<inst>.<name>`, and
+                            // only under THAT key do the body's bare reads get the
+                            // instance prefix (see `collect_function_reads`). The
+                            // bare key may also exist (from the module definition)
+                            // and would collect unprefixed, unresolvable reads.
+                            let full = Self::resolve_hier_name_static(hier, module);
+                            if full != seg.name.name && module.functions.contains_key(&full) {
+                                Self::collect_function_reads(&full, module, reads);
+                            } else {
+                                Self::collect_function_reads(&seg.name.name, module, reads);
+                            }
                         }
                     }
                 }
@@ -21523,7 +21547,10 @@ impl Simulator {
     fn star_sens_from_body(&self, body: &Statement) -> Vec<Sensitivity> {
         let mut reads: HashSet<String> = HashSet::default();
         let mut writes: HashSet<String> = HashSet::default();
+        // §9.2.2.2: `@*` sensitivity excludes called-function CONTENTS.
+        SKIP_FN_BODY_READS.with(|c| c.set(true));
         Self::collect_stmt_reads(body, &self.module, &mut reads, &mut writes);
+        SKIP_FN_BODY_READS.with(|c| c.set(false));
         let hint = self.name_resolve_hint.borrow().clone();
         let mut out: Vec<Sensitivity> = Vec::new();
         let mut seen: HashSet<String> = HashSet::default();
