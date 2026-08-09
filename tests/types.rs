@@ -259,3 +259,6 @@ mod struct_port_pattern_ca;
 
 #[path = "types/packed2d_slice_ca_offset.rs"]
 mod packed2d_slice_ca_offset;
+
+#[path = "types/typedef_bits_of_signal_dims.rs"]
+mod typedef_bits_of_signal_dims;
