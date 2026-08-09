@@ -1802,9 +1802,35 @@ impl<'a> BytecodeCompiler<'a> {
         let l = self.eval_const_expr(left)?;
         let r = self.eval_const_expr(right)?;
         let (lo, hi) = if l >= r { (r, l) } else { (l, r) };
-        let elem_w = hi - lo + 1;
-        let flat_lo = outer.checked_mul(elem_w)?.checked_add(lo)?;
-        let flat_hi = outer.checked_mul(elem_w)?.checked_add(hi)?;
+        // §7.4.1: the element stride is the DECLARED element width, not the
+        // slice width — `d[1][31:0]` on `logic [4:0][63:0] d` targets bits
+        // [95:64], not [63:32]. The slice-width fallback stays for signals
+        // with no packed metadata (the generated-loop flattening case this
+        // helper was built for, where slice == element by construction).
+        let (stride, base_bit) = match self.packed_elem_width_of(hier) {
+            Some(decl_ew) => {
+                if hi >= decl_ew {
+                    return None; // slice exceeds the element: not this shape
+                }
+                let dim = self.packed_outer_dim(hier);
+                let lsb = Self::packed_elem_lsb(dim, outer as i64, decl_ew);
+                if lsb < 0 {
+                    return None;
+                }
+                (0, lsb as u32)
+            }
+            None => (hi - lo + 1, 0),
+        };
+        let flat_lo = if stride == 0 {
+            base_bit.checked_add(lo)?
+        } else {
+            outer.checked_mul(stride)?.checked_add(lo)?
+        };
+        let flat_hi = if stride == 0 {
+            base_bit.checked_add(hi)?
+        } else {
+            outer.checked_mul(stride)?.checked_add(hi)?
+        };
         if flat_hi < self.signal_widths[id] {
             Some((id, flat_hi, flat_lo))
         } else {
