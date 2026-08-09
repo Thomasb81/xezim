@@ -34713,6 +34713,33 @@ impl Simulator {
                 return self.write_class_agg(&r, val);
             }
         }
+        // §7.8.6/§8.4: `coll[key].prop = v` where the element is a CLASS
+        // HANDLE writes the heap object the handle points at — not a
+        // composed `coll[key].prop` signal (which silently forks the
+        // element's identity from the stored handle: writes through the
+        // element stopped being visible through other handles to the same
+        // object). Gated on the receiver's value resolving to a live heap
+        // instance that declares the property, so struct-element member
+        // writes (composed-name storage) are untouched.
+        if let ExprKind::MemberAccess { expr: recv, member } = &lhs.kind {
+            if matches!(recv.kind, ExprKind::Index { .. }) {
+                let h = self.eval_expr(recv).to_u64().unwrap_or(0) as usize;
+                if h != 0 && h < self.heap.len() {
+                    let holds = self
+                        .heap
+                        .get(h)
+                        .and_then(|o| o.as_ref())
+                        .is_some_and(|inst| inst.properties.contains_key(&member.name));
+                    if holds {
+                        let fitted = self.fit_class_prop(h, &member.name, val);
+                        if let Some(Some(inst)) = self.heap.get_mut(h) {
+                            inst.properties.insert(member.name.clone(), fitted);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
         // §7.4.1: `<obj>.<prop>[i] = ...` on a multi-dimensional PACKED array
         // property splices the element's bits. Without this the write fell
         // through to a bit-select path that dropped it entirely.
@@ -58145,8 +58172,10 @@ impl Simulator {
             .collect();
         keys.sort();
         keys.dedup();
-        if !keys.is_empty() && keys.iter().all(|k| k.parse::<i64>().is_ok()) {
-            keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
+        // i128 covers both signed keys and full-range u64 keys; with i64 a
+        // single 2^63+ key demoted the whole sort to lexicographic.
+        if !keys.is_empty() && keys.iter().all(|k| k.parse::<i128>().is_ok()) {
+            keys.sort_by_key(|k| k.parse::<i128>().unwrap_or(0));
         }
         keys
     }
@@ -67222,7 +67251,10 @@ impl Simulator {
         if (mname == "first" || mname == "last" || mname == "next" || mname == "prev")
             && self.is_associative_array(obj_name) {
                 let keys = self.assoc_top_level_keys(obj_name);
-                let all_numeric = keys.iter().all(|k| k.parse::<i64>().is_ok());
+                // i128, not i64: a full-range unsigned 64-bit key
+                // (18446744073709551615) is numeric too — treating it as a
+                // string wrote the key's ASCII bytes into the ref arg.
+                let all_numeric = keys.iter().all(|k| k.parse::<i128>().is_ok());
                 if keys.is_empty() {
                     return Some(Value::zero(32));
                 }
@@ -67233,8 +67265,12 @@ impl Simulator {
                 } else {
                     if let Some(arg) = args.first() {
                         let cur_val = self.eval_expr(arg);
+                        // Canonicalize exactly like the STORE side
+                        // (assoc_key_str): a signed ref var must read back
+                        // "-3", not its zero-extended u64 form — otherwise
+                        // next()/prev() never find the current position.
                         let cur = if all_numeric {
-                            cur_val.to_u64().unwrap_or(0).to_string()
+                            self.assoc_key_str(obj_name, &cur_val)
                         } else {
                             cur_val.to_sv_string()
                         };
@@ -67262,7 +67298,7 @@ impl Simulator {
                 if let Some(key) = result_key {
                     if let Some(arg) = args.first() {
                         if all_numeric {
-                            let key_int = key.parse::<i64>().unwrap_or(0);
+                            let key_int = key.parse::<i128>().unwrap_or(0);
                             let w = self.infer_width(arg);
                             self.assign_value(arg, &Value::from_u64(key_int as u64, w));
                         } else {
