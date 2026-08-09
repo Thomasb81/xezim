@@ -1479,3 +1479,42 @@ codegen quality.
 The measured assets for that future combined attempt: >99% of dynamic executions are
 X-free (the 2-state guard fires rarely), the JIT's X/Z pre-check-bail is the guard
 pattern, and this pilot's pipeline (codegen/cache/dlopen/bridges) is reusable as-is.
+
+## Combined 2-state AOT pilot — the mechanism works; the population is wrong
+
+Rebuilt the AOT pipeline with 2-state codegen (patch:
+`scratchpad/AOT-2STATE-pilot.patch`, 665 lines): registers are `(u64, u32, bool)` locals,
+**signal widths/signedness baked as constants** (provably immutable), a `has_xz()` entry
+guard over the block's read set, X-producing corner cases (out-of-range selects) bail with
+`return 1` and the host re-runs the block on the interpreter (value-idempotent: NBA queue
+pushes are last-write-wins). Mul/Div/Mod/shifts/dynamic-range excluded pending width-rule
+proofs.
+
+**Everything about the mechanism worked**: 1,046 blocks compiled, `cost=727`/`1113`,
+stdout byte-identical, **bail rate 1.1–2.6%** (matching the measured dynamic X rate),
+`.so` 2.16 MB (vs 4.05 MB 4-state), and the cycle regression collapsed **+14.7% → +1.7%**
+with L1i misses down from 2.15x to 1.07x. The 2-state thesis is confirmed: X-elision is
+what makes compiled 4-state simulation viable.
+
+### But: instructions only -0.17%, because the addressable population is 1.3% of fires
+
+`native=2,514,523` of ~189 M block fires. The reason is the session's own earlier finding
+turned around: **pure blocks are exactly the ones the armed-skip already suppresses 92.8%
+of the time.** The gate-level flops AOT can compile are cheap AND rarely execute; the
+blocks that actually burn interpreter time are the IMPURE ones — `Nba(array)` (633 blocks,
+56% of non-pure insns, every register-file port), `BlockingAssign` state machines — which
+need array semantics and dirty propagation in native code to compile.
+
+### The AOT arc, complete
+
+| pilot | insn | cycles | verdict |
+|---|---|---|---|
+| 4-state AOT (1,566 blocks) | -1.16% | **+14.7%** | code-size death |
+| 2-state AOT (1,046 blocks) | -0.17% | +1.7% | mechanism proven, population disjoint from heat |
+
+To make AOT pay, the compiled set must include the impure hot blocks: array NBA writes,
+blocking assigns with dirty-list/`after_signal_write` effects, and the settle-side
+`CompiledContAssign` bodies (26.9% of settle evals). That is a full compiler backend, not
+a pilot — with the 2-state guard/bail architecture validated here as its foundation, the
+codegen/cache/dlopen pipeline reusable, and one measured warning to carry: per-block
+native functions must stay small or I-cache eats the win.
