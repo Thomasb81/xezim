@@ -247,3 +247,6 @@ mod force_expression_tracks;
 
 #[path = "types/procedural_loop_and_static_fn.rs"]
 mod procedural_loop_and_static_fn;
+
+#[path = "types/inside_defaults_and_foreach_dir.rs"]
+mod inside_defaults_and_foreach_dir;
