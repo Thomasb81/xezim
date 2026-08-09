@@ -1518,3 +1518,34 @@ blocking assigns with dirty-list/`after_signal_write` effects, and the settle-si
 a pilot — with the 2-state guard/bail architecture validated here as its foundation, the
 codegen/cache/dlopen pipeline reusable, and one measured warning to carry: per-block
 native functions must stay small or I-cache eats the win.
+
+## Full-stack measurement in true-4-state mode (INIT_ZERO off), with the Questa checklist
+
+c906 memcpy x50, default mode (the Verilator-equivalent execution), 3 interleaved reps:
+
+| config | cost | instructions | cycles | wall |
+|---|---|---|---|---|
+| interpreter, all default opts | **368** | 187.91 G | 87.06 G | **22.8 s** |
+| + 2-state AOT (`XEZIM_AOT=1`) | 368 | 187.60 G (-0.17%) | 88.56 G (+1.7%) | 23.3 s |
+| (golden INIT_ZERO config, for reference) | 727 | 280.3 G | ~128 G | ~34 s |
+
+Byte-identical between arms; AOT bail rate 2.6% even in true 4-state — X stays out of the
+executed flow. AOT remains net-negative for the same population reason; the right setting
+is OFF.
+
+**Verilator comparison, fully honest**: 22.8 s vs 0.89 s = **25.6x**, identical simulated
+execution, no normalization.
+
+### The Questa optimization checklist, resolved against measurement
+
+| Questa technique | xezim status |
+|---|---|
+| 1. Native compiled processes | Piloted both ways (4-state, 2-state guard). Mechanism proven; net negative until the IMPURE hot blocks compile. OFF. |
+| 2. vopt global optimization | Partially in-tree (peephole fusion, resize elision, clock-tree dedup). Process merging / aliasing / const-prop each measured ~1-2% and blocked by the always-on visibility contract — an `+acc`-style mode is the enabler xezim lacks. |
+| 3. Two-state solving | Guard architecture proven (1-2.6% bail). As interpreter specialization: marginal. Pays only inside compiled bodies. |
+| 4. Event-count reduction | IN-TREE AND DEFAULT-ON — the armed-skip (92.8%), clock-tree dedup, NBA elision. This is where xezim's existing -26.7% lives, and it is exactly the Questa layer xezim already matches. |
+| 5. Workflow (incremental, PDUs) | Prepared-comb cache + AOT source-hash cache are the analogues. |
+
+So "all Questa optimizations that measure positive" = the default binary: the event-layer
+is already Questa-grade, huge pages are on, and the compile/2-state pair waits on a
+backend for the impure hot blocks plus a visibility contract.
