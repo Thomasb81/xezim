@@ -4058,10 +4058,15 @@ impl<'a> BytecodeCompiler<'a> {
                         },
                     ),
                 };
+                // §5.7.1: unsized all-x/all-z literal is a FILL (see
+                // `Value::unsized_xz_fill_char`) — replicate to context.
+                let xz_fill =
+                    size.is_none() && Value::unsized_xz_fill_char(value).is_some();
                 if let Some((vb, xz, cw)) = cached_val.get() {
                     if cw == w {
                         let mut v = Value::from_inline(vb, xz, w);
                         v.is_signed = *signed;
+                        v.is_fill = xz_fill;
                         return Some(v);
                     }
                 }
@@ -4073,6 +4078,7 @@ impl<'a> BytecodeCompiler<'a> {
                 };
                 let mut v = Value::from_str_radix(value, r, w);
                 v.is_signed = *signed;
+                v.is_fill = xz_fill;
                 Some(v)
             }
             // A real literal must keep its fractional value as IEEE-754 bits so
