@@ -152,3 +152,68 @@ endmodule
     assert_eq!(g("t10"), 0x40);
     assert_eq!(g("t11"), 0x51);
 }
+
+/// Continuous assigns SOURCED from generate-scope signals must track changes.
+/// Reference-validated: t_if/t_for follow every write. The if-scope read
+/// recorded a dependency on a name that matched no signal (labeled-branch
+/// declarations were stored BARE, resolvable only through ad-hoc fallbacks);
+/// the for-scope read (`gl[1].v` = MemberAccess over an Index base) fell
+/// through to depending on the bare label — both evaluated once and stayed X
+/// forever, while the identical procedural reads worked.
+#[test]
+fn continuous_assign_sources_from_generate_scopes() {
+    let src = r#"
+module tb;
+  generate
+    if (1) begin : g
+      logic [7:0] x;
+    end
+    for (genvar i = 0; i < 2; i++) begin : gl
+      logic [7:0] v;
+    end
+  endgenerate
+  logic [7:0] t_if, t_for;
+  assign t_if  = g.x;
+  assign t_for = gl[1].v;
+  logic [7:0] r1, r2, r3, r4;
+  initial begin
+    g.x = 8'h33; gl[1].v = 8'h44;
+    #1; r1 = t_if; r2 = t_for;
+    g.x = 8'h77; gl[1].v = 8'h88;   // the CA must RE-fire, not just settle once
+    #1; r3 = t_if; r4 = t_for;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    let g = |n: &str| sim.get_signal(n).unwrap().to_u64().unwrap();
+    assert_eq!(g("r1"), 0x33, "if-scope CA source, first value");
+    assert_eq!(g("r2"), 0x44, "for-scope CA source, first value");
+    assert_eq!(g("r3"), 0x77, "if-scope CA source tracks the change");
+    assert_eq!(g("r4"), 0x88, "for-scope CA source tracks the change");
+}
+
+/// §27.2: a labeled generate block is its own scope — a same-named
+/// declaration at module scope is LEGAL, not a duplicate. Bare storage made
+/// this a false "duplicate declaration" hard error.
+#[test]
+fn generate_block_scope_does_not_collide_with_module_scope() {
+    let src = r#"
+module tb;
+  logic [7:0] x = 8'hEE;
+  generate
+    if (1) begin : g
+      logic [7:0] x;
+    end
+  endgenerate
+  logic [7:0] r_top, r_blk;
+  initial begin
+    g.x = 8'h33;
+    #1; r_top = x; r_blk = g.x;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("was a false duplicate-declaration error");
+    let g = |n: &str| sim.get_signal(n).unwrap().to_u64().unwrap();
+    assert_eq!(g("r_top"), 0xEE, "module-scope x untouched");
+    assert_eq!(g("r_blk"), 0x33, "block-scope x is its own signal");
+}
