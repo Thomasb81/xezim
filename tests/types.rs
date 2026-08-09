@@ -262,3 +262,6 @@ mod packed2d_slice_ca_offset;
 
 #[path = "types/typedef_bits_of_signal_dims.rs"]
 mod typedef_bits_of_signal_dims;
+
+#[path = "types/nested_dynamic_members.rs"]
+mod nested_dynamic_members;
