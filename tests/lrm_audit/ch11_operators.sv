@@ -28,7 +28,12 @@ module tb;
       s8 = -8;
       `CK("arith shift right", (s8 >>> 1) == -4)
       `CK("logic shift right", ((8'hF0 >> 4) == 8'h0F))
-      `CK("shift by width+ gives 0", ((8'hFF << 9) == 0))
+      // Reference-validated: inside `==` the unsized 0 makes the joint
+      // operand width 32, the shift's left operand widens FIRST (§11.6.1),
+      // and 8'hFF << 9 is 32'h1FE00 — NOT zero. The old expectation encoded
+      // xezim's former bug (shift computed at 8 bits, then compared).
+      `CK("shift by width+ widens via ==", ((8'hFF << 9) == 32'h1FE00))
+      `CK("shift by width+ self-determined", ({(8'hFF << 9)} == 9'h0))
     end
     begin // 11.4.11 conditional with x select
       logic sel; logic [3:0] r;

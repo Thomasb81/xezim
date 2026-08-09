@@ -205,3 +205,42 @@ mod packed_3d_chained_select;
 mod unary_context_width;
 #[path = "types/nested_packed_struct_array_access.rs"]
 mod nested_packed_struct_array_access;
+#[path = "types/package_typedef_scoping.rs"]
+mod package_typedef_scoping;
+#[path = "types/diag_kind_limit_env.rs"]
+mod diag_kind_limit_env;
+#[path = "types/package_scope_resolution.rs"]
+mod package_scope_resolution;
+#[path = "types/preprocessor_include_fatal.rs"]
+mod preprocessor_include_fatal;
+#[path = "types/wire_typedef_declarations.rs"]
+mod wire_typedef_declarations;
+#[path = "types/generate_scope_struct_metadata.rs"]
+mod generate_scope_struct_metadata;
+#[path = "types/signedness_and_power_context.rs"]
+mod signedness_and_power_context;
+#[path = "types/width_context_discipline.rs"]
+mod width_context_discipline;
+#[path = "types/hierarchy_and_type_overrides.rs"]
+mod hierarchy_and_type_overrides;
+
+#[path = "types/array_reduction_element_type.rs"]
+mod array_reduction_element_type;
+
+#[path = "types/lexical_string_literal_semantics.rs"]
+mod lexical_string_literal_semantics;
+
+#[path = "types/procedural_storage_semantics.rs"]
+mod procedural_storage_semantics;
+
+#[path = "types/expression_event_controls.rs"]
+mod expression_event_controls;
+
+#[path = "types/packed_multilevel_and_collision.rs"]
+mod packed_multilevel_and_collision;
+
+#[path = "types/star_vs_always_comb.rs"]
+mod star_vs_always_comb;
+
+#[path = "types/force_expression_tracks.rs"]
+mod force_expression_tracks;
