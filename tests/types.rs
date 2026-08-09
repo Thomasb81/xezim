@@ -256,3 +256,6 @@ mod param_const_eval_contexts;
 
 #[path = "types/struct_port_pattern_ca.rs"]
 mod struct_port_pattern_ca;
+
+#[path = "types/packed2d_slice_ca_offset.rs"]
+mod packed2d_slice_ca_offset;
