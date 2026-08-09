@@ -1549,3 +1549,15 @@ execution, no normalization.
 So "all Questa optimizations that measure positive" = the default binary: the event-layer
 is already Questa-grade, huge pages are on, and the compile/2-state pair waits on a
 backend for the impure hot blocks plus a visibility contract.
+
+## c910 in both init modes — INIT_ZERO is irrelevant on c910
+
+| run | INIT_ZERO=1 | INIT_ZERO=0 |
+|---|---|---|
+| memcpy x50 | cost=216, finish=2282050, 789.0 G, 230.8 s | **identical fingerprints**, 783.4 G, 231.8 s |
+| cmark x2 | 158034 cyc, finish=34985250 | **identical fingerprints**, CoreMark 1.0 PASSED, 2626.6 s |
+
+Both c910 workloads simulate the exact same execution with X-initialization on or off —
+the 1.64x firmware-path divergence was c906-memcpy-specific. Consequences: c910's golden
+fingerprints were Verilator-comparable all along, and the long-standing "INIT_ZERO=1 is
+required for cmark" rule is disproven for c910 (c906 cmark remains untested without it).
