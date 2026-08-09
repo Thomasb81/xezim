@@ -67669,6 +67669,21 @@ impl Simulator {
                             return nm.clone();
                         }
                     }
+                    // An EXPRESSION extends-arg (`extends Base#(N * 3)`)
+                    // must be evaluated with this class's bindings — the
+                    // raw fragment "N*3" matches no registered spec and
+                    // the ancestor silently fell back to its defaults.
+                    let mut ptab: HashMap<String, Value> = HashMap::default();
+                    for (k, v) in &bindings {
+                        if let Ok(n) = v.parse::<i64>() {
+                            ptab.insert(k.clone(), Value::from_u64(n as u64, 32));
+                        }
+                    }
+                    if let Some(n) =
+                        super::elaborate::const_eval_i64_with_params(e, Some(&ptab))
+                    {
+                        return n.to_string();
+                    }
                     self.expr_to_spec_fragment(e).unwrap_or_default()
                 })
                 .collect();
@@ -67986,7 +68001,10 @@ impl Simulator {
 
                     return Some(key);
                 }
-                cur = cd.extends.clone();
+                // §8.23: a NESTED class sees its lexically enclosing class's
+                // statics — hop to the enclosing class when the extends
+                // chain is exhausted.
+                cur = cd.extends.clone().or_else(|| cd.enclosing.clone());
             } else {
                 break;
             }
@@ -75515,12 +75533,60 @@ impl Simulator {
             // default. Re-evaluate the declared initializer with the active
             // specialization bound; the cycle guard above covers a
             // self-referential initializer.
-            let init = cd
+            if let Some(init) = cd
                 .param_defaults
                 .iter()
                 .find(|(n, _)| n == name)
-                .and_then(|(_, e)| e.clone())?;
-            return Some(self.eval_expr(&init));
+                .and_then(|(_, e)| e.clone())
+            {
+                return Some(self.eval_expr(&init));
+            }
+            // Declared by an ANCESTOR: `return W;` in a method inherited
+            // from `Base#(N*3)` runs with the LEAF spec active, and W is
+            // not a leaf parameter — compute the ancestor's specialization
+            // from the leaf bindings (ancestor_spec evaluates expression
+            // extends-args) and read the argument there. Without this,
+            // every inherited parameter read fell back to its default.
+            let mut cur = cd.extends.clone();
+            while let Some(anc) = cur {
+                let Some(acd) = self.module.classes.get(&anc).cloned() else {
+                    break;
+                };
+                let declares = acd.param_order.iter().any(|p| p == name)
+                    || acd.param_defaults.iter().any(|(n, _)| n == name);
+                if declares {
+                    let Some(asig) = self.ancestor_spec(&base, &sig, &anc) else {
+                        break;
+                    };
+                    if let Some(aidx) = acd.param_order.iter().position(|p| p == name) {
+                        let frags = Self::split_spec_args(&asig);
+                        if let Some(frag) = frags.get(aidx).cloned() {
+                            let saved = self.current_spec.clone();
+                            self.current_spec = Some((anc.clone(), asig.clone()));
+                            let v = self.eval_spec_arg_fragment(&frag);
+                            self.current_spec = saved;
+                            if v.is_some() {
+                                return v;
+                            }
+                        }
+                    }
+                    if let Some(init) = acd
+                        .param_defaults
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .and_then(|(_, e)| e.clone())
+                    {
+                        let saved = self.current_spec.clone();
+                        self.current_spec = Some((anc.clone(), asig));
+                        let v = self.eval_expr(&init);
+                        self.current_spec = saved;
+                        return Some(v);
+                    }
+                    break;
+                }
+                cur = acd.extends.clone();
+            }
+            return None;
         };
         // Split the specialization's raw arg text on TOP-LEVEL commas (a naive
         // split would break on commas inside a string literal or a nested
@@ -76140,6 +76206,21 @@ impl Simulator {
                         }
                     } else if let Some(v) = leaf_params.get(frag) {
                         binds.insert(pname.clone(), v.clone());
+                    } else if child.extends_args.len() == child.extends_type_args.len() {
+                        // EXPRESSION arg (`extends Base#(N * 3)`): the
+                        // textual fragment is neither a literal nor a bare
+                        // leaf param — evaluate the parsed extends
+                        // expression against the leaf's bindings. (Guarded
+                        // on 1:1 alignment with the textual list, since
+                        // extends_args filters non-expression items.)
+                        if let Some(e) = child.extends_args.get(i) {
+                            if let Some(v) = crate::elaborate::const_eval_i64_with_params(
+                                e,
+                                Some(&leaf_params),
+                            ) {
+                                binds.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                            }
+                        }
                     }
                 }
                 if !binds.is_empty() {
