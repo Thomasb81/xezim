@@ -1561,3 +1561,29 @@ Both c910 workloads simulate the exact same execution with X-initialization on o
 the 1.64x firmware-path divergence was c906-memcpy-specific. Consequences: c910's golden
 fingerprints were Verilator-comparable all along, and the long-standing "INIT_ZERO=1 is
 required for cmark" rule is disproven for c910 (c906 cmark remains untested without it).
+
+## 2-state AOT on c910 cmark — the first measured AOT win
+
+c910 cmark x2, `INIT_ZERO=0`, single run per arm:
+
+| | interpreter | 2-state AOT (`XEZIM_AOT=1`) |
+|---|---|---|
+| cycles / finish | 158034 / 34985250 | **exact match**, TEST PASSED |
+| eligible blocks | — | 9,705/21,305 (45.6%) |
+| native block fires | — | **156,592,110** (bail 3.09%) |
+| one-time crate build | — | 313.5 s (source-hash cached) |
+| wall net of build | 2626.6 s | **2532.3 s (-3.6%)** |
+
+The c906-memcpy verdict ("compilable and hot are disjoint") was a WORKLOAD property, not
+a technique property: on cmark the c910 core computes continuously, the pure gate-level
+blocks actually fire (156.6 M native executions vs c906 memcpy's 2.5 M), and with real
+dynamic coverage the 2-state compiled bodies measure **-3.6% wall** — the first positive
+AOT result across four pilots. Caveats: single run per arm (44-min runs; ±1-2%
+uncertainty), and the 313.5 s first-build cost is real though cached thereafter.
+
+Where this leaves the AOT ledger: correct everywhere (byte-exact on four
+workload/mode combinations), negative on memcpy-class workloads (population), positive on
+cmark-class (coverage). A shippable version needs: per-design opt-in or a fire-count
+heuristic before building, plus confirmation reps — but the paradigm door is now
+measurably open, on exactly the terms the session's analysis predicted (compile + 2-state
+as one move).
