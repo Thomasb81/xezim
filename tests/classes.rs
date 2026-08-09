@@ -151,3 +151,6 @@ mod class_init_cast_copy;
 
 #[path = "classes/nested_and_extends_spec.rs"]
 mod nested_and_extends_spec;
+
+#[path = "classes/null_deref_fatal.rs"]
+mod null_deref_fatal;

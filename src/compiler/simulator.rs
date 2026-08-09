@@ -3153,6 +3153,8 @@ pub struct Simulator {
     /// __deferred_init()`) must run once per specialization — not just once
     /// for the generic class with default params.
     initialized_spec_statics: std::collections::HashSet<(String, String)>,
+    /// (var.prop) null-deref reads already reported (in-method soft errors).
+    reported_null_derefs: std::collections::HashSet<String>,
     /// Queue of specializations pending static-init, processed iteratively
     /// by `ensure_spec_statics` to avoid deep Rust stack recursion.
     pending_spec_inits: Vec<(String, String)>,
@@ -6391,6 +6393,7 @@ impl Simulator {
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
             initialized_spec_statics: std::collections::HashSet::default(),
+            reported_null_derefs: std::collections::HashSet::default(),
             pending_spec_inits: Vec::new(),
             spec_init_depth: 0,
             var_class_types: HashMap::default(),
@@ -38446,6 +38449,15 @@ impl Simulator {
                             }
                             if let Some(v) = handle_value {
                                 let h = v.to_u64().unwrap_or(0) as usize;
+                                // §8.4: reading an instance property through a
+                                // NULL declared class handle is a runtime
+                                // fatal, not a silent x.
+                                if h == 0 && split == segs.len() - 1 {
+                                    let prefix = segs[..split].join(".");
+                                    if self.null_deref_fatal(&prefix, segs[split]) {
+                                        return Value::new(32);
+                                    }
+                                }
                                 if h != 0 && h < self.heap.len() {
                                     if let Some(inst) = self.heap.get(h).and_then(|x| x.as_ref()) {
                                         let mut cur_props = &inst.properties;
@@ -43022,6 +43034,15 @@ impl Simulator {
                     }
                 }
                 if handle == 0 || handle >= self.heap.len() {
+                    // §8.4: reading an instance property through a null handle
+                    // is a runtime FATAL (the reference simulator aborts) —
+                    // silently yielding 0/x lets a dead testbench keep "passing".
+                    if let ExprKind::Ident(h) = &expr.kind {
+                        let n = self.resolve_hier_name(h);
+                        if self.null_deref_fatal(&n, &member.name) {
+                            return Value::new(32);
+                        }
+                    }
                     Value::zero(32)
                 } else {
                     let prop = self.heap[handle]
@@ -63076,6 +63097,74 @@ impl Simulator {
             }
             _ => val.clone(),
         }
+    }
+
+    /// §8.4: `var.prop` where `var` is a DECLARED class handle currently
+    /// null and `prop` is an instance property of that class — a runtime
+    /// fatal. Emits the error and terminates; returns true when it fired.
+    /// A STATIC property (readable through null) never reaches here — the
+    /// static route runs first at every call site.
+    fn null_deref_fatal(&mut self, vname: &str, prop: &str) -> bool {
+        let Some(cn) = self.class_of_var(vname) else {
+            return false;
+        };
+        let base = cn.split('#').next().unwrap_or(&cn).to_string();
+        let mut cur = Some(base);
+        let mut declares = false;
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&c) else {
+                break;
+            };
+            if cd.properties.contains_key(prop) && !cd.static_properties.contains(prop) {
+                declares = true;
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        if !declares {
+            return false;
+        }
+        // Inside a class method (deep library code), report ONCE and keep
+        // going — an emulation gap can leave a handle null where the
+        // reference had one, and terminating there kills whole UVM runs.
+        // In module/TB context the deref is the user's bug: fatal.
+        let in_method = self.this_stack.last().copied().flatten().is_some()
+            || self
+                .class_context_stack
+                .last()
+                .cloned()
+                .flatten()
+                .is_some()
+            // any subroutine frame (package/module function or task) — the
+            // fatal is reserved for a deref directly in a process body
+            || !self.local_stack.is_empty();
+        let key = format!("{}.{}", vname, prop);
+        if in_method {
+            if self.reported_null_derefs.insert(key.clone()) {
+                let m = format!(
+                    "[xezim][error] null object dereference: '{}' read through \
+                     a null handle (t={})",
+                    key, self.time
+                );
+                self.record_output(m.clone());
+                self.stdout_writeln(&m);
+            }
+            return false;
+        }
+        let m = format!(
+            "[xezim][fatal] null object dereference: '{}' read through a \
+             null handle (t={})",
+            key, self.time
+        );
+        self.record_output(m.clone());
+        self.stdout_writeln(&m);
+        self.finished = true;
+        true
     }
 
     fn class_of_var(&self, vname: &str) -> Option<String> {
