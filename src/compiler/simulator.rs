@@ -18161,6 +18161,30 @@ impl Simulator {
                         found = true;
                     }
                 }
+                // A MEMBER read ("p.lo") has no signal of its own — it is a
+                // slice of its base. Depend on the BASE signal so the entry
+                // re-fires when it changes; dropping the read entirely left
+                // pattern CAs (`assign r = '{hi: p.lo, …}`) frozen at their
+                // time-0 value.
+                if !found && r.contains('.') {
+                    let mut base: &str = r.as_str();
+                    while let Some(pos) = base.rfind('.') {
+                        base = &base[..pos];
+                        if let Some(scope) = &scope_hint {
+                            let q = format!("{}.{}", scope, base);
+                            if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
+                                rids.push(id);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if let Some(id) = self.resolve_read_name(base, &top_prefix) {
+                            rids.push(id);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
                 if !found {
                     unresolved_count += 1;
                 }
@@ -32512,14 +32536,23 @@ impl Simulator {
                 if let Some(hint) = &scope_hint {
                     *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
                 }
-                let lhs_id = self.get_lhs_signal_id(lhs);
+                let mut lhs_id = self.get_lhs_signal_id(lhs);
                 if scope_hint.is_none() {
-                    if let Some(id) = lhs_id {
+                    // The bare-lhs resolve above can itself need the hint
+                    // (an instance-scoped CA whose lhs is a bare name) — the
+                    // entry's pre-resolved write id breaks that cycle. Without
+                    // it, a submodule pattern CA (`assign r = '{hi: p.lo,…}`)
+                    // read its operands UNSCOPED and produced x.
+                    let hint_id = lhs_id.or_else(|| entry.cold.write_signal_ids.first().copied());
+                    if let Some(id) = hint_id {
                         if let Some(full) = self.id_to_name.get(id) {
                             if let Some((parent, _)) = full.rsplit_once('.') {
                                 *self.name_resolve_hint.borrow_mut() = Some(parent.to_string());
                             }
                         }
+                    }
+                    if lhs_id.is_none() {
+                        lhs_id = self.get_lhs_signal_id(lhs);
                     }
                 }
                 let w = self.infer_lhs_width(lhs);
@@ -33613,21 +33646,34 @@ impl Simulator {
             return None;
         }
         let flat = self.flat_member_name(lvalue)?;
-        let (obj_name, prefix) = match flat.split_once('.') {
-            Some((o, p)) => (o.to_string(), p.to_string()),
-            None => (flat.clone(), String::new()),
-        };
-        let layout = self.module.packed_struct_fields.get(&obj_name).cloned()?;
-        let (base_offset, width) = if prefix.is_empty() {
-            // Whole base signal: span is the max (offset + width) over fields.
-            let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
-            (0, total)
-        } else {
-            // A member: must itself be a registered field (sub-struct or leaf).
-            let (_, o, w) = layout.iter().find(|(k, _, _)| *k == prefix)?;
-            (*o, *w)
-        };
-        Some((obj_name, prefix, layout, base_offset, width))
+        // The base may be INSTANCE-SCOPED ("u.r2"), so the first-dot split
+        // misread the instance prefix as the struct base and every lookup
+        // missed. Try each split point, LONGEST registered base first (the
+        // whole name, then head-of-last-dot, …), with the remainder as the
+        // member prefix.
+        let mut candidates: Vec<(String, String)> =
+            vec![(flat.clone(), String::new())];
+        for (i, _) in flat.match_indices('.').collect::<Vec<_>>().into_iter().rev() {
+            candidates.push((flat[..i].to_string(), flat[i + 1..].to_string()));
+        }
+        for (obj_name, prefix) in candidates {
+            let Some(layout) = self.module.packed_struct_fields.get(&obj_name).cloned() else {
+                continue;
+            };
+            let (base_offset, width) = if prefix.is_empty() {
+                // Whole base signal: span = max (offset + width) over fields.
+                let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                (0, total)
+            } else {
+                // A member: must itself be a registered field.
+                match layout.iter().find(|(k, _, _)| *k == prefix) {
+                    Some((_, o, w)) => (*o, *w),
+                    None => continue,
+                }
+            };
+            return Some((obj_name, prefix, layout, base_offset, width));
+        }
+        None
     }
 
     /// Pack a named/ordered/default assignment pattern into a PACKED struct
@@ -48484,8 +48530,25 @@ impl Simulator {
         match &expr.kind {
             ExprKind::SystemCall { name, args } => self.exec_system_task(name, args),
             ExprKind::Ident(hier) => {
+                // §13.3: parens are optional on a task enable — try both the
+                // scope-resolved name and the RAW dotted path (an interface
+                // task `di.show;` resolves under the instance-scoped key,
+                // which resolve_hier_name may rewrite away).
                 let name = self.resolve_hier_name(hier);
-                if let Some(td) = self.module.tasks.get(&name).cloned() {
+                let raw = (hier.path.len() >= 2).then(|| {
+                    hier.path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                });
+                let td = self
+                    .module
+                    .tasks
+                    .get(&name)
+                    .or_else(|| raw.as_deref().and_then(|r| self.module.tasks.get(r)))
+                    .cloned();
+                if let Some(td) = td {
                     // Execute a bare task-enable unless the body genuinely needs
                     // a suspendable process (event control, `wait`, `fork…join`,
                     // `forever`) — those need semantics this synchronous path

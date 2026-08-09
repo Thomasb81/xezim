@@ -253,3 +253,6 @@ mod inside_defaults_and_foreach_dir;
 
 #[path = "types/param_const_eval_contexts.rs"]
 mod param_const_eval_contexts;
+
+#[path = "types/struct_port_pattern_ca.rs"]
+mod struct_port_pattern_ca;
