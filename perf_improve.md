@@ -1602,3 +1602,54 @@ cmark-class (coverage). A shippable version needs: per-design opt-in or a fire-c
 heuristic before building, plus confirmation reps — but the paradigm door is now
 measurably open, on exactly the terms the session's analysis predicted (compile + 2-state
 as one move).
+
+## The 9x QuestaSim gap, decomposed from the post-AOT steady-state profile
+
+QuestaSim reportedly runs these workloads ~9x faster (~280 s where xezim spends 2,522 s on
+c910 cmark). Profiled the steady state (200 s sampling delay to skip elaboration) of c910
+cmark WITH the 2-state AOT active:
+
+```
+37.3%  exec_insns              <- interpreter, STILL — see below
+21.4%  settle self             16.6%  check_edges        9.7%  snapshot_edge_signals
+ 3.7%  memmove                  2.2%  after_signal_write  1.1%  allocator
+  <1%  each: all 9,705 AOT native fns (aggregate small) + exec_bytecode 0.9%
+```
+
+Two facts jump out:
+
+1. **The 156.6 M native fires cost almost nothing** — no AOT function reaches 1%. Native
+   execution of pure flops is nearly free; that is why the win was only -3.6%: the pilot
+   compiled the cheap work.
+2. **`exec_insns` is still 37.3%** because the pilot hooked only the EDGE path. Everything
+   settle-side — `CompiledContAssign`/`CompiledAlwaysBlock` bodies (27%+ of settle evals)
+   — plus the 11.6 K ineligible edge blocks still interprets.
+
+### The gap, bucketed
+
+| bucket | share | what Questa does instead |
+|---|---|---|
+| interpretation remaining (`exec_insns`) | ~37% | compiles every process |
+| scheduling machinery (settle self + check_edges + snapshot) | ~48% | compiled sensitivity, merged processes, no per-tick snapshot gather |
+| memory/allocator/misc | ~7% | — |
+| actual compiled compute | ~8% | this is the part that scales |
+
+2,522 s x ~0.10-0.15 residual ≈ **250-380 s ≈ the reported 9x**. The gap is fully
+accounted for — no magic, just: (a) compile ALL bodies, not the pure-flop subset, and
+(b) collapse per-event scheduling into the compiled code.
+
+### The roadmap this fixes in place
+
+1. **AOT the settle comb bodies** (largest single brick, attacks the 37%): a `blk_assign`
+   bridge (BlockingAssign semantics host-side, one call per write — the `nba_push`
+   pattern), a second fn table for `comb_entries`, dispatch in the settle arms (the
+   Stage-2 wiring points, already mapped). Estimated 10-20% total.
+2. **`snapshot_edge_signals` at 9.7%** (vs 2.9% on c906) — a per-tick gather over 2.4 M
+   named signals that dwarfs c906's share on tick-light workloads. Untouched by
+   everything so far; deserves its own investigation.
+3. **Per-fire scheduling overhead** — the ideas measured dead at interpreter granularity
+   (batching, merged dispatch) change economics once bodies are native, because the
+   per-fire constant becomes the dominant cost of a fire. Re-price AFTER (1).
+
+The pilots' verdicts stand: each increment must re-measure. But unlike the start of this
+session, the remaining 9x is now an itemized bill, not a mystery.
