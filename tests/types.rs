@@ -211,3 +211,5 @@ mod package_typedef_scoping;
 mod diag_kind_limit_env;
 #[path = "types/package_scope_resolution.rs"]
 mod package_scope_resolution;
+#[path = "types/preprocessor_include_fatal.rs"]
+mod preprocessor_include_fatal;
