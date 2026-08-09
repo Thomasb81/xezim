@@ -81,14 +81,14 @@ fn generate_if_scope_struct_values_flow() {
     assert_eq!(u(&sim, "t_m10"), 0xF0);
 }
 
-/// KNOWN GAP, pinned: hierarchical access to FOR-generate block signals
-/// (`gl[i].x`) resolves to nothing — reads return a 32-bit zero and writes
-/// vanish, for PLAIN logic as much as for struct types (the reference reads
-/// p0=11 p1=22 d0=22 d1=44 here). Only localparams get the `label[i].name`
-/// alias today. Needs a signal-aliasing scheme through resolve/read/write
-/// plus metadata aliasing — tracked separately from the metadata fix above.
+/// §27.6 — hierarchical access to FOR-generate block signals. Named blocks'
+/// declarations now take their LRM hierarchical name (`gl[1].plain`) — the
+/// dotted-flat-key convention named IF-generate blocks always used — instead
+/// of an opaque `x__gf_...` rename that nothing outside the block could
+/// address: reads returned a 32-bit zero and writes VANISHED, for plain
+/// logic as much as struct types. Reference-validated (p0=11 p1=22 d0=22
+/// d1=44, and the nested case 10/21/40/51).
 #[test]
-#[ignore = "for-generate hierarchical signal access is not implemented (label[i].name aliases exist only for localparams)"]
 fn for_generate_hierarchical_signal_access() {
     let src = r#"
 module tb;
@@ -99,15 +99,56 @@ module tb;
       assign doubled = plain * 2;
     end
   endgenerate
+  logic [7:0] t_d0, t_d1;
   initial begin
     gl[0].plain = 8'h11;
     gl[1].plain = 8'h22;
     #1;
+    t_d0 = gl[0].doubled;
+    t_d1 = gl[1].doubled;
   end
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     let g = |n: &str| sim.get_signal(n).unwrap().to_u64().unwrap();
-    assert_eq!(g("gl[0].doubled"), 0x22);
-    assert_eq!(g("gl[1].doubled"), 0x44);
+    assert_eq!(g("t_d0"), 0x22, "read through gl[0]. — was 0, writes vanished");
+    assert_eq!(g("t_d1"), 0x44);
+}
+
+/// Nested for-generate: the inner scope inserts BEFORE the base name
+/// (`outer[0].inner[1].q`), matching the LRM path — a naive prefix would
+/// have produced `inner[1].outer[0].q`.
+#[test]
+fn nested_for_generate_hierarchical_access() {
+    let src = r#"
+module tb;
+  generate
+    for (genvar i = 0; i < 2; i++) begin : outer
+      for (genvar j = 0; j < 2; j++) begin : inner
+        logic [7:0] q;
+        logic [7:0] twice;
+        assign twice = q + 8'(i*16 + j);
+      end
+    end
+  endgenerate
+  logic [7:0] t00, t01, t10, t11;
+  initial begin
+    outer[0].inner[0].q = 8'h10;
+    outer[0].inner[1].q = 8'h20;
+    outer[1].inner[0].q = 8'h30;
+    outer[1].inner[1].q = 8'h40;
+    #1;
+    t00 = outer[0].inner[0].twice;
+    t01 = outer[0].inner[1].twice;
+    t10 = outer[1].inner[0].twice;
+    t11 = outer[1].inner[1].twice;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    let g = |n: &str| sim.get_signal(n).unwrap().to_u64().unwrap();
+    assert_eq!(g("t00"), 0x10);
+    assert_eq!(g("t01"), 0x21);
+    assert_eq!(g("t10"), 0x40);
+    assert_eq!(g("t11"), 0x51);
 }
