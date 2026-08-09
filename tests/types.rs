@@ -213,3 +213,5 @@ mod diag_kind_limit_env;
 mod package_scope_resolution;
 #[path = "types/preprocessor_include_fatal.rs"]
 mod preprocessor_include_fatal;
+#[path = "types/wire_typedef_declarations.rs"]
+mod wire_typedef_declarations;
