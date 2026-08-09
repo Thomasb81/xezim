@@ -1574,6 +1574,21 @@ c910 cmark x2, `INIT_ZERO=0`, single run per arm:
 | one-time crate build | — | 313.5 s (source-hash cached) |
 | wall net of build | 2626.6 s | **2532.3 s (-3.6%)** |
 
+Phase split from the `[PHASE]` timers (the AOT build lands inside the "simulation" phase —
+`aot_init()` runs from `simulate()`):
+
+| phase | interpreter | AOT |
+|---|---|---|
+| simulator construction | 2.51 s | 2.47 s |
+| SV -> bytecode compilation | 9.52 s | 9.34 s |
+| AOT crate build | — | 313.5 s (first run only) |
+| **pure simulation** | **2616.6 s** | **2522.5 s (-3.6%)** |
+
+Startup is identical between arms (~12 s), so the whole -94.1 s is in the simulation loop
+where the 156.6 M native fires happen — not a startup artifact. Note xezim's front-end
+remains ~12 s for all of c910; the AOT build is the new dominant startup cost, hence the
+cache (and, for a shippable version, a fire-count heuristic before building).
+
 The c906-memcpy verdict ("compilable and hot are disjoint") was a WORKLOAD property, not
 a technique property: on cmark the c910 core computes continuously, the pure gate-level
 blocks actually fire (156.6 M native executions vs c906 memcpy's 2.5 M), and with real
