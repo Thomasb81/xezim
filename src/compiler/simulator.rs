@@ -20223,9 +20223,12 @@ impl Simulator {
             let depth = parent.split('.').count();
             if score > best_score
                 || (score == best_score && depth > best_depth)
+                // Final tie-break must be a TOTAL order (lexicographic), not
+                // length: equal-length candidates fell through to iteration
+                // order, which is hash-dependent and differs across CPUs.
                 || (score == best_score
                     && depth == best_depth
-                    && best_parent.is_none_or(|best| parent.len() > best.len()))
+                    && best_parent.is_none_or(|best| parent.as_ref() > best))
             {
                 best_parent = Some(parent.as_ref());
                 best_score = score;
@@ -20241,24 +20244,28 @@ impl Simulator {
         reads: &HashSet<String>,
     ) -> Option<String> {
         let mut leaves = HashSet::default();
-        let mut anchor: Option<String> = None;
-        for name in writes {
+        for name in writes.iter().chain(reads.iter()) {
             if !name.contains('.') && !name.contains('[') {
-                if anchor.is_none() {
-                    anchor = Some(name.clone());
-                }
                 leaves.insert(name.clone());
             }
         }
-        for name in reads {
-            if !name.contains('.') && !name.contains('[') {
-                if anchor.is_none() {
-                    anchor = Some(name.clone());
-                }
-                leaves.insert(name.clone());
-            }
-        }
-        self.best_scope_from_leaf_index(anchor?.as_str(), &leaves)
+        // Inference exists to LOCATE a process whose names do not resolve
+        // where it sits (an inlined body whose locals live under an instance
+        // prefix). A process whose every bare name already resolves at its
+        // own level needs NO hint — and because resolution is hint-first, a
+        // wrongly inferred deep scope HIJACKS every bare name that also
+        // exists inside that scope: a testbench checker reading its own
+        // 292-bit `x` got the DUT-internal 128-bit `u_a.u_b.x` instead, and
+        // which scope won depended on hash iteration order — ahash keys
+        // differ across CPUs, so the same binary read different signals on
+        // different machines. Anchor on the SMALLEST unresolved name so the
+        // choice is total-ordered, not iteration-ordered.
+        let anchor = leaves
+            .iter()
+            .filter(|n| !self.signal_name_to_id.contains_key(n.as_str()))
+            .min()
+            .cloned()?;
+        self.best_scope_from_leaf_index(anchor.as_str(), &leaves)
     }
 
     /// Collect all signal names read by an expression.
@@ -20749,6 +20756,32 @@ impl Simulator {
                                         reads.insert(format!("{}[{}].{}", name, i, suffix));
                                     }
                                 }
+                            } else if let Some(i) = Self::constant_array_index(index, module) {
+                                // `gl[1].v` — a FOR-generate scope member
+                                // (§27.6) or instance-array leaf: the storage
+                                // key carries the rendered index. `gl` is
+                                // neither a signal nor an array, so this fell
+                                // through to depending on the bare label and a
+                                // continuous assign reading a for-generate
+                                // signal never re-fired (stayed X while the
+                                // identical procedural read worked). Register
+                                // the flat name unguarded — `module.signals`
+                                // may already be drained into the compact
+                                // table at this point, and a name that maps to
+                                // no id is dropped at id-resolution exactly
+                                // like the Ident arm's inserts. Dotted
+                                // ancestors cover a packed member whose
+                                // storage is the containing struct
+                                // (`gl[1].s.field` -> `gl[1].s`).
+                                let cand = format!("{}[{}].{}", name, i, suffix);
+                                let mut rest = cand.as_str();
+                                while let Some(cut) = rest.rfind('.') {
+                                    rest = &rest[..cut];
+                                    if rest.contains('.') {
+                                        reads.insert(rest.to_string());
+                                    }
+                                }
+                                reads.insert(cand);
                             }
                         }
                     }
@@ -21019,6 +21052,21 @@ impl Simulator {
                         out.push('.');
                     }
                     out.push_str(s.name.name.as_str());
+                    // A CONSTANT segment select is part of the flat name:
+                    // `gl[1].v` names a for-generate iteration (§27.6) and
+                    // `u[0].x` an instance-array element — both are stored
+                    // under keys with the index rendered. Dropping the select
+                    // produced `gl.v`, which names nothing, so a continuous
+                    // assign reading a for-generate signal registered no
+                    // dependency and stayed X forever. Non-constant selects
+                    // keep the historical drop (a variable index cannot name
+                    // a generate scope, §27.5).
+                    for sel in &s.selects {
+                        if let Some(ix) = Self::try_const_u64(sel) {
+                            use std::fmt::Write as _;
+                            let _ = write!(out, "[{}]", ix);
+                        }
+                    }
                 }
                 out
             }

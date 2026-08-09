@@ -221,3 +221,48 @@ endmodule
     assert_eq!(g("r_top"), 0xEE, "module-scope x untouched");
     assert_eq!(g("r_blk"), 0x33, "block-scope x is its own signal");
 }
+
+/// A top-level process reading its OWN bare signal must never be re-scoped
+/// into an instance that happens to declare the same name. Scope inference
+/// anchored on the first element of a hash-set iteration and resolution is
+/// hint-first, so a testbench checker reading its 292-bit signal could get
+/// the DUT-internal 128-bit one instead — and because ahash keys differ
+/// across CPUs, the same binary read DIFFERENT signals on different machines
+/// (a field log showed exactly this; a CI runner disagreed with every local
+/// run on the same commit). Inference now only fires when some bare name
+/// does NOT resolve at the process's own level, with total-ordered
+/// tie-breaks.
+#[test]
+fn top_process_is_not_rescoped_into_a_shadowing_instance() {
+    let src = r#"
+module sink;
+  logic [7:0] shared_name;     // same NAME as the TB signal, different width story
+  logic [7:0] partner;
+  initial begin
+    shared_name = 8'hDD;       // instance-internal value
+    partner     = 8'hEE;
+  end
+endmodule
+module tb;
+  logic [15:0] shared_name;    // the TB's own 16-bit signal
+  logic [15:0] partner;
+  sink u_s ();
+  logic [15:0] got_a, got_b;
+  initial begin
+    shared_name = 16'h1234;
+    partner     = 16'h5678;
+    #2;
+    // Both names ALSO exist under u_s — a wrongly inferred scope hint
+    // would resolve these reads to the instance's 8-bit signals.
+    got_a = shared_name;
+    got_b = partner;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    let g = |n: &str| sim.get_signal(n).unwrap().to_u64().unwrap();
+    assert_eq!(g("got_a"), 0x1234, "TB reads its OWN signal, not u_s's");
+    assert_eq!(g("got_b"), 0x5678);
+    // And the instance still owns its copies.
+    assert_eq!(g("u_s.shared_name"), 0xDD);
+}
