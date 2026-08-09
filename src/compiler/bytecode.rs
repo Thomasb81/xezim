@@ -171,6 +171,13 @@ pub enum Insn {
     StmtFallback(Box<(Arc<Statement>, Arc<str>)>),
 
     SetSigned(RegId),
+    /// §11.8.1: the enclosing expression is UNSIGNED (some operand is
+    /// unsigned), so this operand must ZERO-extend at the coming Resize —
+    /// clear the runtime signed flag the load stamped on it.
+    ClearSigned(RegId),
+    /// §11.4.3 `**` with a non-constant base: left operand pre-resized to the
+    /// operation width by the compiler; result width = left's width.
+    Pow(RegId, RegId, RegId),
     Nop,
 
     /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
@@ -302,6 +309,8 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::Select(..) => "Select",
         Insn::Move(..) => "Move",
         Insn::SetSigned(..) => "SetSigned",
+        Insn::ClearSigned(..) => "ClearSigned",
+        Insn::Pow(..) => "Pow",
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",
@@ -2569,6 +2578,19 @@ impl<'a> BytecodeCompiler<'a> {
                             | BinaryOp::BitXnor
                     )
                 {
+                    // §11.8.1: the expression is UNSIGNED if ANY operand is
+                    // unsigned — widening must then ZERO-extend both. The
+                    // runtime Resize extends by each VALUE's own signed flag,
+                    // so a signed operand in a mixed expression sign-extended:
+                    // `sa + b` in a 32-bit context read fffffff9 instead of
+                    // 000000f9 (the $display path was already correct).
+                    // Unknown signedness keeps the historical behavior.
+                    let ls = self.expr_signedness(left);
+                    let rs = self.expr_signedness(right);
+                    if ls == Some(false) || rs == Some(false) {
+                        self.emit(Insn::ClearSigned(l));
+                        self.emit(Insn::ClearSigned(r));
+                    }
                     self.emit(Insn::Resize(l, ctx_width));
                     self.emit(Insn::Resize(r, ctx_width));
                 }
@@ -2648,8 +2670,15 @@ impl<'a> BytecodeCompiler<'a> {
                             let w = self.expr_max_width(expr).max(ctx_width).max(1);
                             self.emit(Insn::LoadConst(dest, Box::new(Value::from_u64(result, w))));
                         } else {
-                            self.bail("power_nonconst");
-                            return None;
+                            // Non-constant base: a REAL Pow insn. The left
+                            // operand is context-determined (§11.6.1) — a
+                            // load returns its declared width, so resize it
+                            // to the operation width first; `a ** 2` in a
+                            // 32-bit context computed at 8 bits (0x90) and
+                            // then bailed the whole block to the interpreter.
+                            let opw = sub_ctx.max(self.expr_max_width(left)).max(1);
+                            self.emit(Insn::Resize(l, opw));
+                            self.emit(Insn::Pow(dest, l, r));
                         }
                     }
                     _ => {
@@ -3008,7 +3037,13 @@ impl<'a> BytecodeCompiler<'a> {
                         Some(r)
                     }
                     "$unsigned" => {
+                        // §6.24.1: reinterpret as unsigned. This was a NO-OP,
+                        // so the operand kept its runtime signed flag and the
+                        // context Resize SIGN-extended — `unsigned'(sa)` in a
+                        // 32-bit context read fffffff4 instead of 000000f4
+                        // (the $display path was already correct).
                         let r = self.compile_expr(args.first()?, 0)?;
+                        self.emit(Insn::ClearSigned(r));
                         Some(r)
                     }
                     other => {
@@ -4047,6 +4082,73 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Static signedness of an expression operand (§11.8.1), where knowable.
+    /// `Some(false)` is the only answer that changes codegen (it forces a
+    /// zero-extending widen); anything uncertain returns `None` and keeps the
+    /// historical sign-by-value-flag behavior.
+    fn expr_signedness(&mut self, e: &Expression) -> Option<bool> {
+        match &e.kind {
+            ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
+            ExprKind::Paren(i) => self.expr_signedness(i),
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let id = self.lookup_signal_id(h)?;
+                Some(self.signal_signed[id])
+            }
+            // Part-selects, concatenations and replications are UNSIGNED
+            // regardless of their operands (§11.8.1).
+            ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::Concatenation(_)
+            | ExprKind::Replication { .. } => Some(false),
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$signed" => Some(true),
+                "$unsigned" => Some(false),
+                // §6.24.1: a SIZE cast preserves the operand's signedness.
+                "$__xz_size_cast" => args.get(1).and_then(|a| self.expr_signedness(a)),
+                _ => None,
+            },
+            ExprKind::Unary { op, operand } => match op {
+                UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => self.expr_signedness(operand),
+                // Reductions and ! are 1-bit unsigned.
+                _ => Some(false),
+            },
+            ExprKind::Binary { op, left, right } => match op {
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::BitXnor
+                | BinaryOp::Power => {
+                    match (self.expr_signedness(left), self.expr_signedness(right)) {
+                        (Some(true), Some(true)) => Some(true),
+                        (Some(false), _) | (_, Some(false)) => Some(false),
+                        _ => None,
+                    }
+                }
+                // Shifts take the LEFT operand's signedness.
+                BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::ArithShiftLeft
+                | BinaryOp::ArithShiftRight => self.expr_signedness(left),
+                // Comparisons / logical ops are 1-bit unsigned.
+                _ => Some(false),
+            },
+            ExprKind::Conditional { then_expr, else_expr, .. } => {
+                match (self.expr_signedness(then_expr), self.expr_signedness(else_expr)) {
+                    (Some(true), Some(true)) => Some(true),
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+
     fn expr_max_width(&self, expr: &Expression) -> u32 {
         match &expr.kind {
             ExprKind::Ident(hier) => self
@@ -4232,8 +4334,9 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::Nop => false,
             Insn::BranchUnlessZero(c, _) => *c == r,
             // In-place mutators read their register.
-            Insn::Resize(a, _) | Insn::SetSigned(a) => *a == r,
-            Insn::Add(_, l, rr)
+            Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) => *a == r,
+            Insn::Pow(_, l, rr)
+            | Insn::Add(_, l, rr)
             | Insn::Sub(_, l, rr)
             | Insn::Mul(_, l, rr)
             | Insn::Div(_, l, rr)
@@ -4739,8 +4842,12 @@ impl<'a> BytecodeCompiler<'a> {
                     store(&mut rw, *d, None)
                 }
 
-                // Stamps `is_signed`; storage and width are untouched.
-                Insn::SetSigned(_) => {}
+                // Stamp/clear `is_signed`; storage and width are untouched.
+                Insn::SetSigned(_) | Insn::ClearSigned(_) => {}
+
+                // Result width is the (runtime) left operand's width — not
+                // statically tracked here.
+                Insn::Pow(d, _, _) => store(&mut rw, *d, None),
 
                 // No register destination.
                 Insn::BranchIfFalse(..)

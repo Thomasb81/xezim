@@ -15400,6 +15400,13 @@ impl Simulator {
                 Insn::SetSigned(reg) => {
                     vm_regs[*reg as usize].is_signed = true;
                 }
+                Insn::ClearSigned(reg) => {
+                    vm_regs[*reg as usize].is_signed = false;
+                }
+                Insn::Pow(d, l, r) => {
+                    vm_regs[*d as usize] =
+                        vm_regs[*l as usize].power(&vm_regs[*r as usize]);
+                }
                 // These should never appear in parallel-eligible blocks
                 Insn::StmtFallback(..)
                 | Insn::BlockingAssign(..)
@@ -15723,6 +15730,13 @@ impl Simulator {
                 }
                 Insn::SetSigned(reg) => {
                     vm_regs[*reg as usize].is_signed = true;
+                }
+                Insn::ClearSigned(reg) => {
+                    vm_regs[*reg as usize].is_signed = false;
+                }
+                Insn::Pow(d, l, r) => {
+                    vm_regs[*d as usize] =
+                        vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
                 Insn::LoadArrayElem(dest, array_name, idx_reg) => {
                     let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
@@ -17387,6 +17401,13 @@ impl Simulator {
                 }
                 Insn::SetSigned(reg) => {
                     self.vm_regs[*reg as usize].is_signed = true;
+                }
+                Insn::ClearSigned(reg) => {
+                    self.vm_regs[*reg as usize].is_signed = false;
+                }
+                Insn::Pow(d, l, r) => {
+                    self.vm_regs[*d as usize] =
+                        self.vm_regs[*l as usize].power(&self.vm_regs[*r as usize]);
                 }
                 Insn::Nop => {}
             }
@@ -24399,6 +24420,8 @@ impl Simulator {
             Insn::BlockingAssignArrayRange(..) => "BlockingAssignArrayRange",
             Insn::Move(..) => "Move",
             Insn::StmtFallback(..) => "StmtFallback",
+            Insn::ClearSigned(..) => "ClearSigned",
+            Insn::Pow(..) => "Pow",
             Insn::SetSigned(..) => "SetSigned",
             Insn::Nop => "Nop",
             Insn::LoadSignalRange(..) => "LoadSignalRange",
@@ -37932,7 +37955,15 @@ impl Simulator {
                     BinaryOp::Mul => wl.mul(&wr),
                     BinaryOp::Div => wl.div(&wr),
                     BinaryOp::Mod => wl.modulo(&wr),
-                    BinaryOp::Power => wl.power(&wr),
+                    // §11.6.1: `**`'s LEFT operand is context-determined;
+                    // the load gave its declared width, so `a ** 2` in a
+                    // 32-bit context computed at 8 bits and read 0x90 for
+                    // 0x7e90. Widen to the operation width first (the right
+                    // operand stays self-determined).
+                    BinaryOp::Power => {
+                        let opw = self_det_w.max(wl.width);
+                        wl.resize(opw).power(&wr)
+                    }
                     BinaryOp::BitAnd => wl.bitwise_and(&wr),
                     BinaryOp::BitOr => wl.bitwise_or(&wr),
                     BinaryOp::BitXor => wl.bitwise_xor(&wr),

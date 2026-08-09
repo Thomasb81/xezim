@@ -73,6 +73,8 @@ pub enum Opcode {
     NbaAssignConst,
     BranchUnlessZero,
     BranchIfSignalFalse,
+    ClearSigned,
+    Pow,
 }
 
 impl Opcode {
@@ -137,6 +139,8 @@ impl Opcode {
             Insn::Move(_, _) => Self::Move,
             Insn::StmtFallback(_) => Self::StmtFallback,
             Insn::SetSigned(_) => Self::SetSigned,
+            Insn::ClearSigned(_) => Self::ClearSigned,
+            Insn::Pow(_, _, _) => Self::Pow,
             Insn::Nop => Self::Nop,
             Insn::LoadSignalRange(_, _, _, _) => Self::LoadSignalRange,
             Insn::LoadSignalBit(_, _, _) => Self::LoadSignalBit,
