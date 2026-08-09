@@ -1684,3 +1684,22 @@ Final AOT ledger: edge-AOT on compute-heavy workloads = -3.6% (real, kept as the
 recommended opt-in shape); everything else measured negative. The next genuine step
 remains a backend that compiles ENTIRE settle cones (scheduling included) — a compiler
 project, not an increment.
+
+## Merge of upstream (25 + 14 commits, Aug 2026) — and the death of the cost=727 fingerprint
+
+Merged cleanly except one dispatch.rs conflict (upstream added `ClearSigned`/`Pow` opcodes
+next to our fused ones; both kept, NUM_OPCODES 68 -> 70, pin-assert order preserved).
+
+**Post-merge gates:** tests **1798/0** (upstream added 40), c906 default-mode
+`cost=368` PASSED, c910 memcpy `cost=216/finish=2282050` PASSED — but **c906 with
+`XEZIM_INIT_ZERO=1` now wedges** (testbench watchdog: "no instructions retired", t=5.0M).
+A pristine `origin/main` worktree build fails identically, so this is an upstream
+behavioral change (the §9.2.2.2/§9.4.2/NBA-region compliance commits), not a merge
+artifact — and it lands precisely on the configuration this session already proved
+artificial (X->0 coercion that made c906 diverge 1.64x from Verilator).
+
+**Consequence: the golden fingerprints move.** `cost=727` is no longer reachable on
+current code; the regression gate is now the default-mode set: c906 `cost=368`, c910
+`cost=216/finish=2282050`, c910 cmark `158034/34985250` (all verified passing post-merge),
+plus the 1798-test suite. cmark on c906 under INIT_ZERO is untested post-merge; c910 needs
+no INIT_ZERO at all.
