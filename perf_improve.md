@@ -1343,3 +1343,34 @@ through yet another representation.
 
 Patch preserved at `scratchpad/STAGE3-typed-registers.patch` (1,847 lines, includes the
 revived Stage 2; all gates green). Reverted; tree byte-identical to baseline.
+
+## Armed-worklist inversion — priced by annotation, deprioritized
+
+`perf annotate` on `check_edges_inner` (11.6% self) breaks its time down: per-position
+detection scan (clock-tree memo, fanout-empty gate) ~14% of the function; the
+`dispatch_block!` fanout walk + gating tests (`fanout.posedge` iteration, `snap_valid`/
+`bitsel`/armed loads) ~18-20%; `fired_snap` prev-writeback ~3%. The inversion eliminates
+only the walk+gating share: **ceiling ~2.2% of runtime, realistically ~1-1.5% net** after
+paying the arm-side push — far below the earlier 3-7% estimate, and it carries the
+`woke_any`/`snap_valid` semantic coupling risks. Parked.
+
+## Technique survey (Aug 2026) — what the literature offers vs what is measured dead here
+
+The session's measurements close every *within-paradigm* lever: representation (S1/S2/S3,
+JIT), layout/locality (no cache bottleneck: 54.8M LLC misses), activity suppression at
+interpreter granularity (bit-granular: machinery > win), batching (cone/BSP/clock-domain:
+over-evaluation). The literature's big wins are all **cross-paradigm**:
+
+| technique | source | fit for xezim |
+|---|---|---|
+| **AOT compilation to C/C++/Rust source** (not a template JIT) | Verilator, ESSENT, Cuttlesim, GSIM — all compiled | **#1 candidate.** The cost is proven to live in arm bodies; LLVM-compiled per-block source gets real register allocation, inlining, and specialization — everything cranelift's stack-slot codegen (+19% wall) could not do. Pilot: emit Rust for the 2,859 pure edge blocks + compiled cont-assigns, build a cached `.so` (the prepared-comb cache precedent). High effort, only untested compilation form. |
+| **Two-state execution with X-elision** ("two simulation functions per gate"; Verilator's new 4-state work splits vars into two 2-state planes — exactly xezim's val/xz) | Antmicro 4-state Verilator (Apr 2026), classic event-driven X-prop literature | **#2.** The measured ~35 insn/op floor is 4-state semantics; after reset X mostly vanishes but every op still carries the xz plane. Block-level 2-state variants (selected when operands are X-free, like the JIT's X/Z pre-check bail) halve data movement on the dominant path. Untested here. |
+| **Essential-signal / conditional eval** | ESSENT, GSIM (7-20x over Verilator on XiangShan/Rocket, arXiv 2508.02236) | Interpreted version measured dead (bit-granular, 38 tests/avoided eval); only pays fused into COMPILED code where the check inlines to ~2 insns — i.e. it rides on #1, not standalone. |
+| **Replication-aided partitioning** | RepCut | Machinery exists in-tree (multikernel/PDES, hypergraph partitioner). Parallel self-calibration currently picks sequential on c906-scale; c910-scale re-tuning is the realistic angle. |
+| Circuit deduplication | DRY (2025) | Compile-time/I-cache win for compiled simulators; an interpreter already shares one loop. Not applicable. |
+| GPU batch stimulus | RTL-to-CUDA (2022) | Different use case (many parallel stimuli), not single-run latency. |
+
+**Conclusion:** xezim's interpreter is at its paradigm's frontier (measured, not asserted).
+The remaining order-of-magnitude lives where Verilator/GSIM get theirs: ahead-of-time
+compilation with 2-state specialization and inlined activity checks. Everything smaller
+than that paradigm jump is now measured at ≤ ~1.5%.
