@@ -5522,17 +5522,12 @@ impl Simulator {
                 // Needed for designs (like c910) that pump explicit `1'bx`
                 // through default arms and rely on hardware-side gating that
                 // doesn't model in 4-state RTL sim.
-                let path_match = init_zero_paths.is_empty()
-                    || init_zero_paths.iter().any(|p| name.contains(p.as_str()));
-                if init_zero && path_match && val.has_xz() {
-                    val = Value::zero(sig.width);
-                    if sig.is_signed {
-                        val.is_signed = true;
-                    }
-                    if sig.is_real {
-                        val.is_real = true;
-                    }
-                }
+                // Construction-time signal coercion RETIRED (Aug 2026): it was
+                // invisible to the event system and forced nets into unreachable
+                // states. Register init now happens via real t=0 writes in
+                // `init_registers` (XEZIM_INIT_REG, with XEZIM_INIT_ZERO as a
+                // deprecated alias); array/memory zeroing lives on below.
+                let _ = &init_zero_paths;
                 sim_dbg_eprintln!(
                     "[DEBUG] Simulator::new signal {} = {} (signed={})",
                     name,
@@ -5653,7 +5648,12 @@ impl Simulator {
         // also start at zero. c910 has memory-style PRF/AIQ/ROB arrays whose
         // X-init leaks through the forwarding network; zeroing only `module.signals`
         // (the prior behavior) is insufficient.
-        let array_init = if init_zero { Value::zero } else { Value::new };
+        // Memory/array element init: cheap construction-time zeroing (arrays
+        // are read via element ops that never edge-trigger, so coercion is
+        // sound here — the VCS `+vcs+initmem` analogue). Enabled by
+        // XEZIM_INIT_MEM=0 or the legacy XEZIM_INIT_ZERO=1 alias.
+        let init_mem = std::env::var("XEZIM_INIT_MEM").ok().as_deref() == Some("0") || init_zero;
+        let array_init = if init_mem { Value::zero } else { Value::new };
         // PERF: takes `&str`, not `String` — the callers build each element
         // name into a reused scratch buffer, so the only allocation left per
         // element is the `Arc<str>` the tables actually keep (previously a
@@ -13614,6 +13614,98 @@ impl Simulator {
         (a_to_b, b_to_a, max_crossings, rounds, converged)
     }
 
+    /// `XEZIM_INIT_REG=0|random` — initialize REGISTER-class storage at t=0
+    /// via REAL writes, semantically "initial q = <v>;" per flop.
+    ///
+    /// This replaces the retired construction-time X->0 coercion, which was
+    /// invisible to the event system (no dirty marking, no X->0 transition,
+    /// nets forced into unreachable states) — measured to distort c906
+    /// firmware 1.64x and, after the Aug 2026 upstream event-semantics fixes,
+    /// to wedge it entirely. Industry precedent: VCS `+vcs+initreg`,
+    /// Xcelium `-init_reg` — registers only, nets derive by evaluation.
+    ///
+    /// Selection: NBA targets of COMPILED edge blocks (the flop set), minus
+    /// continuously-driven nets, minus anything already non-X. AST-only edge
+    /// blocks are not scanned (rare; their flops stay X). Writes go through
+    /// `write_sig!` + dirty marking, so the time-0 settle derives all comb
+    /// values and edge detection sees a legitimate X->0 (negedge, not
+    /// posedge). `random` fills inline-width flops from a per-id LCG
+    /// (reset-bug hunting); wide flops get 0 in both modes.
+    ///
+    /// `XEZIM_INIT_ZERO=1` is kept as a deprecated alias for `=0` (its array
+    /// zeroing lives on separately as `XEZIM_INIT_MEM`).
+    fn init_registers(&mut self) {
+        let mode = match std::env::var("XEZIM_INIT_REG").ok().as_deref() {
+            Some("0") => 0u8,
+            Some("random") => 1u8,
+            _ => {
+                if std::env::var("XEZIM_INIT_ZERO").ok().as_deref() == Some("1") {
+                    0u8
+                } else {
+                    return;
+                }
+            }
+        };
+        // Flop set: every whole/partial NBA destination in compiled edge blocks.
+        use super::bytecode::Insn as BI;
+        let mut ids: Vec<u32> = Vec::new();
+        for cb in self.compiled_edge_blocks.iter().flatten() {
+            for i in &cb.instructions {
+                match i {
+                    BI::NbaAssign(id, _, _)
+                    | BI::NbaAssignConst(id, _, _)
+                    | BI::NbaAssignRange(id, _, _, _)
+                    | BI::NbaAssignRangeDyn(id, _, _, _)
+                    | BI::NbaAssignBitDyn(id, _, _)
+                    | BI::NbaAssignArrayRead(id, _, _, _) => ids.push(*id),
+                    _ => {}
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let mut inited = 0usize;
+        for id in ids {
+            let id = id as usize;
+            if id >= self.signal_table.len()
+                || self.cont_driven.contains(&id)
+                || !self.signal_table[id].has_xz()
+            {
+                continue;
+            }
+            let w = self.signal_widths[id];
+            let mut val = if mode == 1 && w <= 64 {
+                // SplitMix64 over the signal id: stable, seedless, per-flop.
+                let mut z = (id as u64).wrapping_add(0x9e3779b97f4a7c15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+                let bits = (z ^ (z >> 31)) & if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                Value::from_inline(bits, 0, w)
+            } else {
+                Value::zero(w)
+            };
+            val.is_signed = self.signal_signed[id];
+            if self.signal_real.get(id).copied().unwrap_or(false) {
+                continue; // real-typed flops keep their own init semantics
+            }
+            if !self.dirty_signals[id] {
+                self.dirty_signals[id] = true;
+                self.dirty_list.push(id);
+            }
+            self.dirty_any = true;
+            write_sig!(self, id, val);
+            self.table_modified = true;
+            inited += 1;
+        }
+        if inited > 0 {
+            eprintln!(
+                "[INIT-REG] initialized {} register signals to {}",
+                inited,
+                if mode == 1 { "random" } else { "0" }
+            );
+        }
+    }
+
     /// Advise the kernel to back the largest per-signal / dependency arrays
     /// with transparent huge pages (2 MiB), cutting TLB page-walk cost on the
     /// scattered, GiB-scale working set. See the call site for the rationale.
@@ -13716,6 +13808,7 @@ impl Simulator {
         // single TLB entry. Advisory + safe: a no-op where THP is off/unset, and
         // it never changes results. `XEZIM_HUGEPAGE=0` opts out.
         self.advise_hugepages();
+        self.init_registers();
         // `--dump-timescales`: report every module's timescale before the run.
         if dump_timescales_enabled() {
             self.dump_module_timescales();
