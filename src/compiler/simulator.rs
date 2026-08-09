@@ -64139,6 +64139,10 @@ impl Simulator {
                 let leaf = format!("{}.{}", src, md.name.name);
                 self.signal_name_to_id.contains_key(leaf.as_str())
                     || self.signals.contains_key(&leaf)
+                    // a member that is itself a dynamic collection has no
+                    // scalar leaf — its registration is the storage
+                    || self.module.dynamic_arrays.contains(&leaf)
+                    || self.signals.contains_key(&format!("{}.size", leaf))
             })
         })
     }
@@ -64176,6 +64180,10 @@ impl Simulator {
                     // VALUE — size + elements. member_dim_indices returns
                     // None for these, so the member was skipped entirely and
                     // `b = a` lost `a.d[]`'s contents.
+                    // The destination may be a composed name elaboration never
+                    // saw (`pq[0].data`) — register it so `.size()`/push_back
+                    // on it hit the collection paths instead of reading 0.
+                    self.module.dynamic_arrays.insert(d.clone());
                     let n = self.get_queue_size(&sname);
                     for j in 0..n {
                         if let Some(v) =
@@ -70577,6 +70585,24 @@ impl Simulator {
                         }
                         if let Some(res) = self.eval_builtin_method(&cn, mname, args) {
                             return res;
+                        }
+                    }
+                }
+                // Dynamic member of an ELEMENT: `pq[0].data.push_back(...)` /
+                // `.size()`. The receiver is MemberAccess-over-Index, which
+                // neither the Index arm above nor the flattened-Ident arm
+                // below can name. Gated on collection evidence so a class
+                // method on `obj_array[i]` is never misrouted.
+                if let ExprKind::MemberAccess { .. } = &expr.kind {
+                    if let Some(cn) = self.flat_member_name(expr) {
+                        if cn.contains('[')
+                            && (self.module.dynamic_arrays.contains(&cn)
+                                || self.signals.contains_key(&format!("{}.size", cn)))
+                        {
+                            self.module.dynamic_arrays.insert(cn.clone());
+                            if let Some(res) = self.eval_builtin_method(&cn, mname, args) {
+                                return res;
+                            }
                         }
                     }
                 }
