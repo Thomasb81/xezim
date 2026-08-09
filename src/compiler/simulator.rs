@@ -65083,6 +65083,51 @@ impl Simulator {
         self.eval_expr(arg)
     }
 
+
+    /// §7.12.3: a reduction's result has the ELEMENT type — width AND
+    /// signedness. Summing `byte fixed[4]` with u64 accumulation and a plain
+    /// 32-bit result read 439 where the element-typed answer is -73 (0xB7 as
+    /// signed 8-bit), and min/max compared signed elements unsigned.
+    fn array_elem_sign_width(&self, obj: &str) -> (u32, bool) {
+        let w = self
+            .module
+            .arrays
+            .get(obj)
+            .map(|&(_, _, w)| w)
+            .or_else(|| {
+                self.get_signal_value_by_name(&format!("{}[0]", obj))
+                    .map(|v| v.width)
+            })
+            .unwrap_or(32)
+            .max(1);
+        let signed = self
+            .module
+            .var_decl_types
+            .get(obj)
+            .map(|dt| {
+                use crate::ast::types::{DataType, IntegerAtomType, Signing};
+                match dt {
+                    DataType::IntegerAtom { kind, signing, .. } => !matches!(
+                        signing,
+                        Some(Signing::Unsigned)
+                    ) && matches!(
+                        kind,
+                        IntegerAtomType::Byte
+                            | IntegerAtomType::ShortInt
+                            | IntegerAtomType::Int
+                            | IntegerAtomType::LongInt
+                            | IntegerAtomType::Integer
+                    ),
+                    DataType::IntegerVector { signing, .. } => {
+                        matches!(signing, Some(Signing::Signed))
+                    }
+                    _ => false,
+                }
+            })
+            .unwrap_or(false);
+        (w, signed)
+    }
+
     fn eval_builtin_method(
         &mut self,
         obj_name: &str,
@@ -65495,25 +65540,31 @@ impl Simulator {
             // assoc-of-queue, queues, and dynamic arrays.
             return Some(Value::from_u64(self.assoc_top_level_keys(obj_name).len() as u64, 32));
         }
-        if mname == "sum" {
+        if matches!(mname, "sum" | "product") {
             let cur_size = self.get_queue_size(obj_name) as usize;
-            let mut total = 0u64;
+            let (w, signed) = self.array_elem_sign_width(obj_name);
+            let mut total: u64 = if mname == "sum" { 0 } else { 1 };
             for i in 0..cur_size {
                 if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
-                    total = total.wrapping_add(v.to_u64().unwrap_or(0));
+                    let x = if signed {
+                        v.to_i64().unwrap_or(0) as u64
+                    } else {
+                        v.to_u64().unwrap_or(0)
+                    };
+                    total = if mname == "sum" {
+                        total.wrapping_add(x)
+                    } else {
+                        total.wrapping_mul(x)
+                    };
                 }
             }
-            return Some(Value::from_u64(total, 32));
-        }
-        if mname == "product" {
-            let cur_size = self.get_queue_size(obj_name) as usize;
-            let mut total = 1u64;
-            for i in 0..cur_size {
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
-                    total = total.wrapping_mul(v.to_u64().unwrap_or(0));
-                }
-            }
-            return Some(Value::from_u64(total, 32));
+            // Truncate to the element width — the accumulation wraps there.
+            let mut out = Value::from_u64(
+                if w < 64 { total & ((1u64 << w) - 1) } else { total },
+                w.min(64),
+            );
+            out.is_signed = signed;
+            return Some(out);
         }
         if matches!(mname, "and" | "or" | "xor") {
             let cur_size = self.get_queue_size(obj_name) as usize;
@@ -65537,10 +65588,15 @@ impl Simulator {
             let mut min_val: Option<Value> = None;
             for i in 0..cur_size {
                 if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
-                    if min_val.is_none()
-                        || v.to_u64().unwrap_or(u64::MAX)
+                    let signed = self.array_elem_sign_width(obj_name).1;
+                    let lt = if signed {
+                        v.to_i64().unwrap_or(i64::MAX)
+                            < min_val.as_ref().and_then(|m| m.to_i64()).unwrap_or(i64::MAX)
+                    } else {
+                        v.to_u64().unwrap_or(u64::MAX)
                             < min_val.as_ref().unwrap().to_u64().unwrap_or(u64::MAX)
-                    {
+                    };
+                    if min_val.is_none() || lt {
                         min_val = Some(v);
                     }
                 }
@@ -65552,9 +65608,15 @@ impl Simulator {
             let mut max_val: Option<Value> = None;
             for i in 0..cur_size {
                 if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
-                    if max_val.is_none()
-                        || v.to_u64().unwrap_or(0) > max_val.as_ref().unwrap().to_u64().unwrap_or(0)
-                    {
+                    let signed = self.array_elem_sign_width(obj_name).1;
+                    let gt = if signed {
+                        v.to_i64().unwrap_or(i64::MIN)
+                            > max_val.as_ref().and_then(|m| m.to_i64()).unwrap_or(i64::MIN)
+                    } else {
+                        v.to_u64().unwrap_or(0)
+                            > max_val.as_ref().unwrap().to_u64().unwrap_or(0)
+                    };
+                    if max_val.is_none() || gt {
                         max_val = Some(v);
                     }
                 }
