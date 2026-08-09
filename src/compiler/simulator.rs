@@ -4414,6 +4414,45 @@ struct QueueLocalSave {
     width: Option<u32>,
 }
 
+/// §6.16.9 string→number conversion: scan LEADING digit/underscore
+/// characters and stop at the first other character. No whitespace skip —
+/// `"  512".atoi()` is 0 (the C-atoi trim diverged from the reference) —
+/// and `'+'` is not consumed. `"12_34"` scans to 1234. A single leading
+/// `'-'` negates. For the non-decimal conversions x/z/? are legal 4-STATE
+/// digits: `"3fZ".atohex()` is 12'h3fZ (a partially-z integer), matching
+/// the reference, not a scan-stop. Result is the signed 32-bit `integer`
+/// the LRM specifies.
+fn sv_ato_value(text: &str, radix: u32) -> Value {
+    let mut it = text.chars().peekable();
+    let neg = it.peek() == Some(&'-');
+    if neg {
+        it.next();
+    }
+    let mut digits = String::new();
+    for c in it {
+        if c == '_' {
+            continue;
+        }
+        let is_digit = c.to_digit(radix).is_some()
+            || (radix != 10 && matches!(c, 'x' | 'X' | 'z' | 'Z' | '?'));
+        if !is_digit {
+            break;
+        }
+        digits.push(c);
+    }
+    let mut v = if digits.is_empty() {
+        Value::zero(32)
+    } else {
+        Value::from_str_radix(&digits, radix, 32)
+    };
+    if neg && !v.has_xz() {
+        let n = v.to_u64().unwrap_or(0) as i64;
+        v = Value::from_u64((-n) as u64, 32);
+    }
+    v.is_signed = true;
+    v
+}
+
 impl Simulator {
     /// Safe accessor for `id_to_name`. Large-array element ids may sit
     /// past the end of `id_to_name` (we skip the per-element push to
@@ -36817,25 +36856,12 @@ impl Simulator {
             ExprKind::StringLiteral(s) => {
                 // IEEE 1800-2017 §6.16: A string literal is a packed array of
                 // bytes (8 bits per character).  An empty string "" has width
-                // 0 (zero characters), *not* 8.  Using width 8 for "" caused
-                // `is_equal` to widen a width-0 class-property string to 8 bits
-                // and then return X because the widened bits have X in the
-                // class-property storage.
-                let w = (s.len() * 8) as u32;
-                if w == 0 {
-                    Value::zero(0)
-                } else {
-                    let mut val = Value::zero(w.max(8));
-                    for (i, byte) in s.bytes().rev().enumerate() {
-                        for bit in 0..8 {
-                            if (byte >> bit) & 1 == 1
-                                && i * 8 + bit < val.width as usize {
-                                    val.set_bit(i * 8 + bit, LogicBit::One);
-                                }
-                        }
-                    }
-                    val
-                }
+                // 0 (zero characters), *not* 8.  `Value::from_string` also
+                // maps chars above 0x7F to their Latin-1 byte — one byte per
+                // char, matching the §5.9.1 escape decoder — where the old
+                // per-`s.bytes()` loop counted UTF-8 bytes, so `"\xf1"` was
+                // 16 bits wide and truncated to the wrong byte (0xb1).
+                Value::from_string(s)
             }
             ExprKind::Ident(hier) => {
                 // §26.3: a PACKAGE-scoped reference (`P::s.x` = [P, s, x])
@@ -39459,6 +39485,13 @@ impl Simulator {
                 }
                 "$bits" => {
                     if let Some(arg) = args.first() {
+                        // §5.9: the empty string literal `""` is equivalent to
+                        // `"\0"` — one character, 8 bits (its VALUE stays a
+                        // width-0 zero elsewhere; only the size query sees the
+                        // implicit NUL).
+                        if matches!(&arg.kind, ExprKind::StringLiteral(s) if s.is_empty()) {
+                            return Value::from_u64(8, 32);
+                        }
                         // §20.6.2: `$bits(logic [7:0])` — a TYPE operand.
                         if let ExprKind::TypeLiteral(dt) = &arg.kind {
                             // Inside a parameterized class method the type may
@@ -40439,6 +40472,24 @@ impl Simulator {
                         .get(1)
                         .map(|a| self.eval_expr(a))
                         .unwrap_or_else(|| Value::zero(1));
+                    // §6.16: converting an integral value to `string` removes
+                    // every "\0" character — not just leading zero bytes.
+                    // `string'(24'hab0063)` is 2 characters, not 3.
+                    if matches!(
+                        dt.as_ref(),
+                        crate::ast::types::DataType::Simple {
+                            kind: crate::ast::types::SimpleType::String,
+                            ..
+                        }
+                    ) {
+                        let text: String = v
+                            .sv_string_bytes()
+                            .into_iter()
+                            .filter(|&b| b != 0)
+                            .map(|b| b as char)
+                            .collect();
+                        return Value::from_string(&text);
+                    }
                     if super::elaborate::is_type_real(&dt) {
                         return Value::from_f64(v.to_f64());
                     }
@@ -41928,11 +41979,17 @@ impl Simulator {
                     Some(sz) => *sz,
                     None => Value::unsized_literal_width(value, r_for_w),
                 };
+                // §5.7.1: an unsized all-x/all-z literal ('bx, 'hz, 'b?) is a
+                // FILL — it must replicate to the consuming context, not stop
+                // at 32 bits with zero-extension above.
+                let xz_fill =
+                    size.is_none() && Value::unsized_xz_fill_char(value).is_some();
                 // Fast path: return cached value (avoids re-parsing string)
                 if let Some((vb, xz, cw)) = cached_val.get() {
                     if cw == w {
                         let mut v = Value::from_inline(vb, xz, w);
                         v.is_signed = *signed;
+                        v.is_fill = xz_fill;
                         return v;
                     }
                 }
@@ -41950,6 +42007,7 @@ impl Simulator {
                     }
                 }
                 v.is_signed = *signed;
+                v.is_fill = xz_fill;
                 v
             }
             NumberLiteral::Real(f) => Value::from_f64(*f),
@@ -42981,9 +43039,14 @@ impl Simulator {
                                 } else {
                                     Value::zero(elem_w)
                                 };
-                                self.signals
-                                    .insert(format!("{}[{}]", lname, k), piece.clone());
-                                self.widths.insert(format!("{}[{}]", lname, k), elem_w);
+                                // Write through the canonical setter: elements
+                                // of a registered queue/array live in the
+                                // COMPACT signal table, and a raw
+                                // `signals.insert` leaves that table's zeros
+                                // shadowing the streamed bytes on read.
+                                let ename = format!("{}[{}]", lname, k);
+                                self.set_signal_value_by_name(&ename, piece.resize(elem_w));
+                                self.widths.insert(ename, elem_w);
                             }
                             if !self.in_edge_block {
                                 self.settle_combinatorial();
@@ -69192,29 +69255,13 @@ impl Simulator {
                 && !self.class_expr_has_method(expr, mname)
             {
                 let s = self.eval_expr(expr).to_sv_string();
-                let s = s.trim();
-                let (neg, body) = if let Some(rest) = s.strip_prefix('-') {
-                    (true, rest)
-                } else {
-                    (false, s)
-                };
                 let radix = match mname {
                     "atohex" => 16,
                     "atooct" => 8,
                     "atobin" => 2,
                     _ => 10,
                 };
-                let mut acc: i64 = 0;
-                for c in body.chars() {
-                    match c.to_digit(radix) {
-                        Some(d) => acc = acc.wrapping_mul(radix as i64).wrapping_add(d as i64),
-                        None => break,
-                    }
-                }
-                if neg {
-                    acc = -acc;
-                }
-                return Value::from_u64(acc as u64, 32);
+                return sv_ato_value(&s, radix);
             }
 
             // Nested collection: `assoc_of_queue[key].push_back(...)` / `.size()`
@@ -69589,27 +69636,14 @@ impl Simulator {
                     }
                     "toupper" => return Value::from_string(&text.to_uppercase()),
                     "tolower" => return Value::from_string(&text.to_lowercase()),
-                    "atoi" => {
-                        let t = text.trim();
-                        let neg = t.starts_with('-');
-                        let digits: String =
-                            t.trim_start_matches(['-', '+']).chars().take_while(|c| c.is_ascii_digit()).collect();
-                        let n: i64 = digits.parse().unwrap_or(0);
-                        let mut v = Value::from_u64(if neg { (-n) as u64 } else { n as u64 }, 32);
-                        v.is_signed = true;
-                        return v;
-                    }
-                    "atohex" => {
-                        return Value::from_u64(
-                            u64::from_str_radix(text.trim(), 16).unwrap_or(0),
-                            32,
-                        )
-                    }
-                    "atooct" => {
-                        return Value::from_u64(u64::from_str_radix(text.trim(), 8).unwrap_or(0), 32)
-                    }
-                    "atobin" => {
-                        return Value::from_u64(u64::from_str_radix(text.trim(), 2).unwrap_or(0), 32)
+                    "atoi" | "atohex" | "atooct" | "atobin" => {
+                        let radix = match mname {
+                            "atohex" => 16,
+                            "atooct" => 8,
+                            "atobin" => 2,
+                            _ => 10,
+                        };
+                        return sv_ato_value(&text, radix);
                     }
                     "atoreal" => return Value::from_f64(text.trim().parse::<f64>().unwrap_or(0.0)),
                     "compare" | "icompare" => {
@@ -70168,28 +70202,13 @@ impl Simulator {
                     // decimal string and returned 0, silently swallowing the
                     // user method call.
                     let s = self.eval_expr(&base_expr).to_sv_string();
-                    let s = s.trim();
-                    let (neg, body) = match s.strip_prefix('-') {
-                        Some(rest) => (true, rest),
-                        None => (false, s),
-                    };
                     let radix = match m.as_str() {
                         "atohex" => 16,
                         "atooct" => 8,
                         "atobin" => 2,
                         _ => 10,
                     };
-                    let mut acc: i64 = 0;
-                    for c in body.chars() {
-                        match c.to_digit(radix) {
-                            Some(d) => acc = acc.wrapping_mul(radix as i64).wrapping_add(d as i64),
-                            None => break,
-                        }
-                    }
-                    if neg {
-                        acc = -acc;
-                    }
-                    return Value::from_u64(acc as u64, 32);
+                    return sv_ato_value(&s, radix);
                 }
             }
 

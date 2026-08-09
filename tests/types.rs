@@ -226,3 +226,6 @@ mod hierarchy_and_type_overrides;
 
 #[path = "types/array_reduction_element_type.rs"]
 mod array_reduction_element_type;
+
+#[path = "types/lexical_string_literal_semantics.rs"]
+mod lexical_string_literal_semantics;
