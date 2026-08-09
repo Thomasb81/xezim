@@ -21576,6 +21576,26 @@ impl Simulator {
                         collect_ident_names(p, out);
                     }
                 }
+                // §9.4.2: an ARBITRARY expression is a legal event control —
+                // `always @(a + 1)` must fire on every change of `a`. These
+                // shapes collected NO identifiers, so the block armed on an
+                // empty sensitivity and fired once at t=0, then froze.
+                // Sensitizing to every operand signal over-approximates
+                // "expression value changed" the same way `@(*)` does.
+                ExprKind::Binary { left, right, .. } => {
+                    collect_ident_names(left, out);
+                    collect_ident_names(right, out);
+                }
+                ExprKind::Unary { operand, .. } => collect_ident_names(operand, out),
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => {
+                    collect_ident_names(condition, out);
+                    collect_ident_names(then_expr, out);
+                    collect_ident_names(else_expr, out);
+                }
                 _ => {}
             }
         }
@@ -21628,6 +21648,21 @@ impl Simulator {
                                     });
                                     continue;
                                 }
+                            }
+                            // §9.4.2: `@(arr[1])` on an UNPACKED array — each
+                            // element is its own signal, and walking past the
+                            // Index to the base name armed the wait on a
+                            // signal that doesn't exist (never fired). Only a
+                            // literal index resolves here; a variable index
+                            // keeps the old base-name behavior.
+                            let bn = self.resolve_hier_name(bh);
+                            if self.module.arrays.contains_key(&bn) {
+                                out.push(Sensitivity {
+                                    signal_name: format!("{}[{}]", bn, value.replace('_', "")),
+                                    edge,
+                                    iff: ee.iff.clone(),
+                                });
+                                continue;
                             }
                         }
                     }

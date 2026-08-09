@@ -232,3 +232,6 @@ mod lexical_string_literal_semantics;
 
 #[path = "types/procedural_storage_semantics.rs"]
 mod procedural_storage_semantics;
+
+#[path = "types/expression_event_controls.rs"]
+mod expression_event_controls;
