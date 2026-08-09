@@ -265,3 +265,6 @@ mod typedef_bits_of_signal_dims;
 
 #[path = "types/nested_dynamic_members.rs"]
 mod nested_dynamic_members;
+
+#[path = "types/assoc_keys_and_handles.rs"]
+mod assoc_keys_and_handles;
