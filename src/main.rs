@@ -137,6 +137,8 @@ fn print_usage() {
     eprintln!("                   Elaboration diagnostics (port width mismatches, implicit");
     eprintln!("                   nets, ...) are capped per KIND at 5; raise with");
     eprintln!("                   XEZIM_DIAG_LIMIT=N (0 = unlimited).");
+    eprintln!("                   XEZIM_TRACE_SIGNAL=name[,name...]  Trace elaboration");
+    eprintln!("                   signal-table writes for matching names (debug).");
     eprintln!("                   XEZIM_TRACE_TYPE=name[,name...]  Trace typedef-width table");
     eprintln!("                   writes and type-width resolutions for matching type names (debug).");
     eprintln!("                   Also settable as X_WARN_LIMIT=N.");
