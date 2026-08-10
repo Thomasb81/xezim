@@ -4179,6 +4179,15 @@ pub struct Simulator {
     /// attribute one-cycle-early flop captures (a fire in any window other
     /// than `active` samples post-NBA state).
     edge_fire_trace: Option<String>,
+    /// Lazily-built per-block match bitmap for `edge_fire_trace` — the
+    /// string scan runs ONCE per block, not once per fire (the naive scan
+    /// measurably slowed a customer run with thousands of fires per tick).
+    edge_fire_match: Option<Vec<bool>>,
+    /// XEZIM_EDGE_FIRE_WATCH=<name1,name2>: signals whose CURRENT values
+    /// are appended to every traced fire line. Resolved lazily by substring
+    /// match against the signal table (first match per pattern).
+    edge_fire_watch: Vec<(String, usize)>,
+    edge_fire_watch_init: bool,
     /// Label of the dispatch window the current check_edges belongs to.
     edge_dispatch_phase: &'static str,
     armed_input_bitmap: Vec<bool>,
@@ -6684,6 +6693,9 @@ impl Simulator {
                 || std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
             armed_edge_shadow: std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
             edge_fire_trace: std::env::var("XEZIM_EDGE_FIRE_TRACE").ok().filter(|s| !s.is_empty()),
+            edge_fire_match: None,
+            edge_fire_watch: Vec::new(),
+            edge_fire_watch_init: false,
             edge_dispatch_phase: "active",
             armed_input_bitmap: Vec::new(),
             armed_input_ranges: Vec::new(),
@@ -31465,15 +31477,48 @@ impl Simulator {
 
         if !triggered.is_empty() {
             if let Some(pat) = self.edge_fire_trace.clone() {
+                // One-time: precompute which blocks match, and resolve the
+                // watch list. Per-dispatch cost is then a bitmap index per
+                // fired block.
+                if self.edge_fire_match.is_none() {
+                    let m: Vec<bool> = self
+                        .edge_blocks
+                        .iter()
+                        .map(|b| {
+                            b.scope.contains(pat.as_str())
+                                || b.resolved_sensitivities.iter().any(|si| {
+                                    self.name_for_id(si.signal_id).contains(pat.as_str())
+                                })
+                        })
+                        .collect();
+                    self.edge_fire_match = Some(m);
+                }
+                if !self.edge_fire_watch_init {
+                    self.edge_fire_watch_init = true;
+                    if let Ok(w) = std::env::var("XEZIM_EDGE_FIRE_WATCH") {
+                        for patt in w.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                            let hit = self
+                                .signal_name_to_id
+                                .iter()
+                                .filter(|(n, _)| n.contains(patt))
+                                .min_by_key(|(n, _)| n.len())
+                                .map(|(n, &id)| (n.to_string(), id));
+                            match hit {
+                                Some((n, id)) => self.edge_fire_watch.push((n, id)),
+                                None => eprintln!(
+                                    "[EDGE-FIRE] watch pattern '{}' matched no signal",
+                                    patt
+                                ),
+                            }
+                        }
+                    }
+                }
+                let matched = self.edge_fire_match.as_ref().unwrap();
                 for &bi in &triggered {
-                    let Some(b) = self.edge_blocks.get(bi) else { continue };
-                    let hit = b.scope.contains(pat.as_str())
-                        || b.resolved_sensitivities
-                            .iter()
-                            .any(|si| self.name_for_id(si.signal_id).contains(pat.as_str()));
-                    if !hit {
+                    if !matched.get(bi).copied().unwrap_or(false) {
                         continue;
                     }
+                    let Some(b) = self.edge_blocks.get(bi) else { continue };
                     let sens: Vec<String> = b
                         .resolved_sensitivities
                         .iter()
@@ -31498,14 +31543,27 @@ impl Simulator {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let watch: Vec<String> = self
+                        .edge_fire_watch
+                        .iter()
+                        .map(|(n, id)| {
+                            let v = self
+                                .signal_table
+                                .get(*id)
+                                .map(|v| v.to_hex_string())
+                                .unwrap_or_else(|| "?".into());
+                            format!("{}='h{}", n, v)
+                        })
+                        .collect();
                     eprintln!(
-                        "[EDGE-FIRE] t={} window={} bi={} scope={} @({}) reads=[{}]",
+                        "[EDGE-FIRE] t={} window={} bi={} scope={} @({}) reads=[{}] watch=[{}]",
                         self.time,
                         self.edge_dispatch_phase,
                         bi,
                         if b.scope.is_empty() { "<top>" } else { &b.scope },
                         sens.join(","),
-                        reads.join(", ")
+                        reads.join(", "),
+                        watch.join(", ")
                     );
                 }
             }
