@@ -4172,6 +4172,15 @@ pub struct Simulator {
     /// An unarmed block can skip without reading its operand snapshots.
     armed_edge: bool,
     armed_edge_shadow: bool,
+    /// XEZIM_EDGE_FIRE_TRACE=<substr>: log every edge-block fire whose
+    /// instance scope or sensitivity-signal name contains <substr> — with
+    /// the SCHEDULER WINDOW it fired from (active / cascade / clocking-mirror
+    /// / rescan) and its gateable data-input values at fire time. Built to
+    /// attribute one-cycle-early flop captures (a fire in any window other
+    /// than `active` samples post-NBA state).
+    edge_fire_trace: Option<String>,
+    /// Label of the dispatch window the current check_edges belongs to.
+    edge_dispatch_phase: &'static str,
     armed_input_bitmap: Vec<bool>,
     armed_input_ranges: Vec<(u32, u32)>,
     armed_input_blocks: Vec<u32>,
@@ -6674,6 +6683,8 @@ impl Simulator {
             armed_edge: std::env::var("XEZIM_ARMED_EDGE").ok().as_deref() != Some("0")
                 || std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
             armed_edge_shadow: std::env::var_os("XEZIM_ARMED_EDGE_SHADOW").is_some(),
+            edge_fire_trace: std::env::var("XEZIM_EDGE_FIRE_TRACE").ok().filter(|s| !s.is_empty()),
+            edge_dispatch_phase: "active",
             armed_input_bitmap: Vec::new(),
             armed_input_ranges: Vec::new(),
             armed_input_blocks: Vec::new(),
@@ -14189,6 +14200,7 @@ impl Simulator {
     /// `event_loop` uses that to restrict the next check_edges scan to just
     /// those positions when no other state changed this iter.
     fn fire_clock_generators(&mut self) {
+
         self.toggled_clock_positions.clear();
         for cg in &mut self.clock_generators {
             if cg.next_toggle_time == self.time {
@@ -22953,7 +22965,9 @@ impl Simulator {
             }
             let t0 = self.profile_timing.then(std::time::Instant::now);
             let edges_before = self.prof_edges_fired;
+            self.edge_dispatch_phase = "cascade";
             self.check_edges();
+            self.edge_dispatch_phase = "active";
             if let Some(t) = t0 {
                 t_edges += t.elapsed().as_nanos() as u64;
             }
@@ -23859,7 +23873,9 @@ impl Simulator {
         // publish happens after this slot's edge pass, so run one more.
         if self.clocking_mirror_dirty {
             self.clocking_mirror_dirty = false;
+            self.edge_dispatch_phase = "clocking-mirror";
             self.check_edges();
+            self.edge_dispatch_phase = "active";
             let _ = self.drain_edge_cascade(cascade_limit);
         }
         // §14.13: now that this edge's NBA updates have committed and the
@@ -25979,6 +25995,7 @@ impl Simulator {
     /// keeps a triggered `always @(*)` from running in the middle of another
     /// process's statement sequence.
     fn run_scheduled_process(&mut self, pid: usize, stmts: &ProcCont) {
+
         self.proc_depth += 1;
         self.run_scheduled_process_inner(pid, stmts);
         self.proc_depth -= 1;
@@ -29237,6 +29254,7 @@ impl Simulator {
     }
 
     fn apply_nba(&mut self) {
+
         // §4.9.4: commit matured future-time NBAs first — they were scheduled
         // in an earlier slot, so they precede this slot's freshly queued NBAs.
         if !self.delayed_nba.is_empty() {
@@ -29782,6 +29800,8 @@ impl Simulator {
         let mut passes: u64 = 0;
         self.edge_rescan_block_hits.clear();
         self.in_edge_rescan = true;
+        let prev_phase = self.edge_dispatch_phase;
+        self.edge_dispatch_phase = "rescan";
         let mut subset: Vec<usize> = Vec::new();
         while !self.edge_exec_wrote.is_empty() && !self.finished {
             subset.clear();
@@ -29800,6 +29820,7 @@ impl Simulator {
             self.check_edges_inner(Some(&subset), false);
         }
         self.in_edge_rescan = false;
+        self.edge_dispatch_phase = prev_phase;
     }
 
     /// A zero-delay livelock sustained entirely by edge-triggered always
@@ -29889,6 +29910,7 @@ impl Simulator {
     /// `check_edges`, which additionally drains the §9.2 re-triggers
     /// produced by blocking writes during edge-block execution.
     fn check_edges_pass(&mut self) {
+
         // Time-0 init detect is special (initial values set via non-hot paths
         // vs uninitialized prev → everything "fires"). Run it as a full scan
         // and reset the dirty accumulator so steady-state (time>0) starts clean.
@@ -31401,6 +31423,51 @@ impl Simulator {
         }
 
         if !triggered.is_empty() {
+            if let Some(pat) = self.edge_fire_trace.clone() {
+                for &bi in &triggered {
+                    let Some(b) = self.edge_blocks.get(bi) else { continue };
+                    let hit = b.scope.contains(pat.as_str())
+                        || b.resolved_sensitivities
+                            .iter()
+                            .any(|si| self.name_for_id(si.signal_id).contains(pat.as_str()));
+                    if !hit {
+                        continue;
+                    }
+                    let sens: Vec<String> = b
+                        .resolved_sensitivities
+                        .iter()
+                        .map(|si| {
+                            format!("{}{}", si.edge.print_str(), self.name_for_id(si.signal_id))
+                        })
+                        .collect();
+                    let reads: Vec<String> = self
+                        .edge_block_data_reads
+                        .get(bi)
+                        .map(|rs| {
+                            rs.iter()
+                                .map(|&sid| {
+                                    let sid = sid as usize;
+                                    let v = self
+                                        .signal_table
+                                        .get(sid)
+                                        .map(|v| v.to_hex_string())
+                                        .unwrap_or_else(|| "?".into());
+                                    format!("{}='h{}", self.name_for_id(sid), v)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[EDGE-FIRE] t={} window={} bi={} scope={} @({}) reads=[{}]",
+                        self.time,
+                        self.edge_dispatch_phase,
+                        bi,
+                        if b.scope.is_empty() { "<top>" } else { &b.scope },
+                        sens.join(","),
+                        reads.join(", ")
+                    );
+                }
+            }
             let t1 = self.profile_timing.then(std::time::Instant::now);
             if self.edge_block_stats_enabled {
                 for &bi in &triggered {
@@ -33386,6 +33453,7 @@ impl Simulator {
     }
 
     fn settle_combinatorial_inner(&mut self) {
+
         if self.settling {
             return;
         }
@@ -43440,6 +43508,7 @@ impl Simulator {
     }
 
     pub fn exec_statement(&mut self, stmt: &Statement) {
+
         if self.finished
             || self.time > self.max_time
             || self.break_flag
