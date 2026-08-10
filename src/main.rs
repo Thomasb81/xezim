@@ -114,6 +114,7 @@ fn print_usage() {
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
     eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
+    eprintln!("  --error-exit     Exit nonzero if any $error was reported ($fatal always does)");
     eprintln!("  --verbose        Per-file compile progress: each file as it is parsed and the");
     eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
     eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
@@ -1150,6 +1151,9 @@ fn main() {
     }
     let mut mode: Mode = Mode::Simulate;
     let mut mode_explicit = false;
+    // §20.10 / issue #107: opt-in promotion of `$error` occurrences to a
+    // failing exit status. `$fatal` always fails regardless of this flag.
+    let mut error_exit = false;
     let mut sv2023_mode = true;
     let mut strict_checks = true;
     let mut source_delay_select: u8 = 1;
@@ -1415,6 +1419,9 @@ fn main() {
                     eprintln!("Error: -v requires a library file name");
                     std::process::exit(1);
                 }
+            }
+            "--error-exit" => {
+                error_exit = true;
             }
             "--verbose" => {
                 verbose = true;
@@ -2084,6 +2091,10 @@ suppressed but the explicit SDF annotation still applies."
                         if sim.stuck_clock_aborted {
                             std::process::exit(3);
                         }
+                        let code = exit_status_for_severities(&sim, error_exit);
+                        if code != 0 {
+                            std::process::exit(code);
+                        }
                         return;
                     }
                     Ok(None) => {}
@@ -2497,12 +2508,31 @@ suppressed but the explicit SDF annotation still applies."
                 // fast so CI/regressions surface the hang instead of timing out.
                 std::process::exit(3);
             }
+            let code = exit_status_for_severities(&sim, error_exit);
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Err(e) => {
             eprintln!("Simulation error: {}", e);
             std::process::exit(1);
         }
     }
+}
+
+/// §20.10: translate end-of-run severity state into a process exit status.
+/// `$fatal` must never exit 0 — its finish_number is a diagnostics level, not
+/// a success code, so any `$fatal` fails the run. `$error` only fails when the
+/// user opts in with `--error-exit` (matching the "promote errors" switch other
+/// simulators provide), so existing flows that tolerate errors keep working.
+fn exit_status_for_severities(sim: &xezim::compiler::Simulator, error_exit: bool) -> i32 {
+    if sim.saw_fatal {
+        return 1;
+    }
+    if error_exit && sim.error_count > 0 {
+        return 1;
+    }
+    0
 }
 
 fn byte_to_line_col(source: &str, byte_offset: usize) -> (usize, usize) {
