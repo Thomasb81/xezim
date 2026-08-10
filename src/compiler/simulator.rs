@@ -67256,6 +67256,12 @@ impl Simulator {
     fn queue_eval_arg(&mut self, container_name: &str, arg: &Expression) -> Value {
         let class_name = self.module.array_elem_class.get(container_name).cloned();
         if let Some(cn) = class_name {
+            // NOTE: a BARE `new` is deliberately not accepted here. `new` is
+            // legal only in an assignment to a class handle (§8.7), so
+            // `q.push_back(new)` is invalid SystemVerilog — the reference
+            // simulator rejects it with a syntax error, and accepting it would
+            // be an accepts-invalid. The `new(...)` Call form below is
+            // pre-existing behavior.
             if let ExprKind::Call {
                 func,
                 args: call_args,
