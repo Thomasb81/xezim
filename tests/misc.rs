@@ -113,6 +113,14 @@ mod obj_assocd_event_disable_fork;
 mod param_class_cast_type_args;
 #[path = "misc/param_pair_this_type_cast.rs"]
 mod param_pair_this_type_cast;
+#[path = "misc/assoc_class_new_stores_instance.rs"]
+mod assoc_class_new_stores_instance;
+#[path = "misc/bare_method_call_returns.rs"]
+mod bare_method_call_returns;
+#[path = "misc/bare_randomize_solver.rs"]
+mod bare_randomize_solver;
+#[path = "misc/uvm_agent_active_config.rs"]
+mod uvm_agent_active_config;
 #[path = "misc/pattern_replication_and_extends_args.rs"]
 mod pattern_replication_and_extends_args;
 #[path = "misc/program_block_reactive.rs"]
