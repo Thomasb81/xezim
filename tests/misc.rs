@@ -177,6 +177,8 @@ mod warm_cache_diag_replay;
 mod x_warn_switch;
 #[path = "misc/xselect_and_concat_flatten.rs"]
 mod xselect_and_concat_flatten;
+#[path = "misc/static_method_via_handle.rs"]
+mod static_method_via_handle;
 
 #[path = "misc/array_elem_fast_write.rs"]
 mod array_elem_fast_write;
