@@ -35139,11 +35139,18 @@ impl Simulator {
         // property splices the element's bits. Without this the write fell
         // through to a bit-select path that dropped it entirely.
         if let ExprKind::Index { expr, index } = &lhs.kind {
-            if matches!(&expr.kind,
-                ExprKind::MemberAccess { .. } | ExprKind::Ident(_) | ExprKind::This)
+            // `class_packed_elem_ref` takes references and bails immediately on
+            // an empty heap, so the old `expr.clone()` / `index.clone()` deep-
+            // copied two expression trees on EVERY indexed write — including
+            // designs with no classes at all, where the callee then returned
+            // None. That was pure allocator traffic on the hot array-store path
+            // (a 256K-element memory fill pays it 256K times). Pass the borrows
+            // and skip the call entirely when no objects exist.
+            if !self.heap.is_empty()
+                && matches!(&expr.kind,
+                    ExprKind::MemberAccess { .. } | ExprKind::Ident(_) | ExprKind::This)
             {
-                let (base, idx) = (expr.clone(), index.clone());
-                if let Some(r) = self.class_packed_elem_ref(&base, &idx) {
+                if let Some(r) = self.class_packed_elem_ref(expr, index) {
                     return self.write_class_agg(&r, val);
                 }
             }
