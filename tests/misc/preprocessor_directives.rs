@@ -82,3 +82,35 @@ endmodule
     assert_eq!(g("r1"), 1, "pull1 module's unconnected input reads 1");
     assert_eq!(g("r0z"), 1, "module outside the region keeps z");
 }
+
+/// §14.11: `##n` requires a `default clocking` block. A clocking block
+/// declared WITHOUT `default` does not qualify — the reference rejects it,
+/// xezim used to run it silently.
+#[test]
+fn cycle_delay_requires_default_clocking() {
+    let no_default = r#"
+`timescale 1ns/1ns
+module tb;
+  logic clk = 0; always #5 clk = ~clk;
+  clocking cb @(posedge clk); endclocking
+  initial begin ##1; $display("T|ran"); end
+endmodule
+"#;
+    let err = match simulate(no_default, 100) {
+        Ok(_) => panic!("##n without a default clocking block must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("default clocking"),
+        "diagnostic should name the missing default clocking block, got: {err}"
+    );
+
+    // With `default`, the same code elaborates and runs.
+    let with_default = no_default.replace("clocking cb", "default clocking cb");
+    let sim = simulate(&with_default, 100).expect("valid ##n must still run");
+    assert!(
+        lines(&sim).iter().any(|m| m == "T|ran"),
+        "got {:?}",
+        lines(&sim)
+    );
+}

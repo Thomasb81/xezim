@@ -89,9 +89,12 @@ endmodule
 }
 
 #[test]
-fn cycle_delay_single_undesignated_clocking_fallback() {
-    // No `default` keyword, but only one clocking block in scope — the
-    // pragmatic fallback uses it (strict LRM would require the designation).
+fn cycle_delay_single_undesignated_clocking_is_rejected() {
+    // No `default` keyword, even with only one clocking block in scope.
+    // xezim used to fall back to that sole block; §14.11 requires the
+    // designation and the reference simulator errors with "A default
+    // clocking block must be specified to use the ##n timing statement",
+    // so the lenience made xezim accept code the reference rejects.
     const SRC: &str = r#"
 `timescale 1ns/1ns
 module top;
@@ -105,6 +108,12 @@ module top;
   end
 endmodule
 "#;
-    let out = output_of(&simulate(SRC, 200).expect("sim"));
-    assert!(out.contains("F t=5"), "##1 must use the sole clocking block:\n{}", out);
+    let err = match simulate(SRC, 200) {
+        Ok(_) => panic!("##1 without a `default` clocking block must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("default clocking"),
+        "diagnostic should name the missing default clocking block, got: {err}"
+    );
 }
