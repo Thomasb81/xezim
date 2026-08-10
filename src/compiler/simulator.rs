@@ -14548,6 +14548,7 @@ impl Simulator {
                         scope: ab.scope,
                     });
                 }
+                let mut dropped_terms: Vec<String> = Vec::new();
                 let resolved: Vec<SensitivityId> = sens
                     .iter()
                     .filter_map(|s| {
@@ -14569,9 +14570,49 @@ impl Simulator {
                                 });
                             }
                         }
+                        // The term may still be spelled relative to the
+                        // block's INSTANCE scope (an inlined child whose
+                        // rewrite left the leaf bare).
+                        if !ab.scope.is_empty() {
+                            let scoped = format!("{}.{}", ab.scope, s.signal_name);
+                            if let Some(&id) = self.signal_name_to_id.get(scoped.as_str()) {
+                                return Some(SensitivityId {
+                                    signal_id: id,
+                                    edge: s.edge,
+                                    iff: s.iff.clone(),
+                                    value_of: None,
+                                });
+                            }
+                        }
+                        // NOT resolvable. Silently dropping the term changes
+                        // semantics invisibly: a lost CLOCK term makes a dead
+                        // flop; a lost async-RESET term removes the reset.
+                        // Record it for the warning below.
+                        dropped_terms.push(format!(
+                            "{}{}",
+                            s.edge.print_str(),
+                            s.signal_name
+                        ));
                         None
                     })
                     .collect();
+                if !dropped_terms.is_empty() {
+                    eprintln!(
+                        "[xezim][warning] edge-sensitive always block{} DROPPED {}                          unresolvable sensitivity term(s): {} — {}",
+                        if ab.scope.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" in '{}'", ab.scope)
+                        },
+                        dropped_terms.len(),
+                        dropped_terms.join(", "),
+                        if resolved.is_empty() {
+                            "NO terms remain; this block will NEVER fire (dead flop)"
+                        } else {
+                            "the block will not respond to the dropped term(s)"
+                        }
+                    );
+                }
                 let block_idx = self.edge_blocks.len();
                 // §9.4.2: record constant bit-select event terms (`@(v[3])`).
                 // `event_to_sens` walks past the select and yields the BASE
