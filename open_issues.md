@@ -119,6 +119,27 @@ K-W (wrong-expansion) family was closed.
 
 ---
 
+## 3b. Enum-typed associative-array KEYS on class properties
+
+`foreach (cnt[s]) s.name()` resolves against the wrong enum when `cnt` is a
+**class property**. The module- and package-scope declaration paths now record
+the key's type name (`assoc_key_type_names`) and the `foreach` index variable
+is bound with it, so those cases are correct and reference-validated. The class
+path (`elaborate.rs`, the `assoc_properties.insert(...)` site) builds
+class-local maps and has no access to the module map, so the key type is not
+recorded there.
+
+Symptom: with no type binding, `enum_value_name` scans every enum and returns a
+member of whichever has the most entries. UVM's report summary prints
+`UVM_NORADIX` and `UVM_PHASE_DORMANT` where severities belong, because
+`uvm_report_server`'s `severity_count` is a class property keyed by
+`uvm_severity`.
+
+Repro: `scratchpad/uvm/enum4.sv` (class property — fails) vs `enum3.sv`
+(module scope — fixed). Fix: carry the key type into the class definition
+alongside `assoc_properties`, and consult it from the `foreach` binding when
+the root name isn't in the module map.
+
 ## 4. Customer performance thread
 
 The for-loop bytecode compilation landed (local repro 73.3 s → 6.0 s), but
