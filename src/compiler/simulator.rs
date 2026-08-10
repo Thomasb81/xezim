@@ -30400,6 +30400,12 @@ impl Simulator {
             }
         }
         std::mem::swap(&mut self.event_waiters, &mut self.event_waiters_swap);
+        // Within-region process resumption order is LRM-indeterminate
+        // (§4.7), but the reference simulator wakes the LAST-armed waiter
+        // first — and this campaign matches the reference's observable
+        // ordering so differential runs stay comparable. Registration order
+        // is FIFO; reverse to LIFO at the single hand-off point.
+        triggered_conts.reverse();
         triggered_conts
     }
 
