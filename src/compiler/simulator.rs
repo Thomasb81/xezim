@@ -46466,6 +46466,23 @@ impl Simulator {
                     .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
                     .collect();
                 let fe_saved = self.snapshot_loop_vars(&fe_names);
+                // §6.19.6: when the collection is an associative array whose KEY
+                // is a named type (`int cnt [sev_e];`), the index variable HAS
+                // that type — `foreach (cnt[s]) s.name()` must resolve against
+                // that enum. Without the binding the hint is absent and
+                // `enum_value_name` scans every enum and picks the largest, so
+                // the key printed as a member of an unrelated enum (UVM's report
+                // summary listed `UVM_NORADIX` where a severity belonged).
+                // Registered for the loop's duration; the loop-var restore below
+                // is by value, so drop the type binding on the way out too.
+                let fe_key_type_var: Option<String> = (|| {
+                    let arr_name = Self::foreach_array_root_name(array)?;
+                    let kt = self.module.assoc_key_type_names.get(&arr_name)?.clone();
+                    let v = vars.first()?.as_ref()?.name.clone();
+                    self.var_typedef_types.insert(v.clone(), kt);
+                    Some(v)
+                })();
+                let _fe_key_guard = &fe_key_type_var;
                 // foreach index vars are automatic (§12.7.3); like for-init
                 // vars, record them so a `fork … join_none/join_any` in the
                 // body captures the per-iteration value by value (§9.3.2).
@@ -84831,6 +84848,16 @@ impl Simulator {
     /// type, looks it up directly; otherwise searches all enum tables for a
     /// member with that value, preferring the largest enum (which, for riscv-dv,
     /// is the instruction-name enum the lookup is almost always for).
+/// Root collection name of a `foreach` target (`a`, `a[i]`, `obj.a`).
+    fn foreach_array_root_name(expr: &Expression) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+            ExprKind::Index { expr: base, .. } => Self::foreach_array_root_name(base),
+            ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+            _ => None,
+        }
+    }
+
     fn enum_value_name(&self, value: u64, type_hint: Option<&str>) -> Option<String> {
         if let Some(t) = type_hint {
             if let Some(members) = self.module.enum_members.get(t) {
