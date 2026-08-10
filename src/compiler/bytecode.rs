@@ -2467,6 +2467,29 @@ impl<'a> BytecodeCompiler<'a> {
                             if w > 0 {
                                 self.emit(Insn::Resize(slot, w));
                             }
+                            // §6.11: int/byte/shortint/longint/integer are
+                            // SIGNED by default — the init literal may not be
+                            // (`for (int i = 4'hF; ...)`), and an unsigned
+                            // slot makes `i >= 0` never terminate / negative
+                            // comparisons go unsigned.
+                            use crate::ast::types::{
+                                DataType as FDt, IntegerAtomType as FIat, Signing as FSg,
+                            };
+                            let decl_signed = match data_type {
+                                FDt::IntegerAtom { kind, signing, .. } => {
+                                    !matches!(signing, Some(FSg::Unsigned))
+                                        && !matches!(kind, FIat::Time)
+                                }
+                                FDt::IntegerVector { signing, .. } => {
+                                    matches!(signing, Some(FSg::Signed))
+                                }
+                                _ => false,
+                            };
+                            if decl_signed {
+                                self.emit(Insn::SetSigned(slot));
+                            } else {
+                                self.emit(Insn::ClearSigned(slot));
+                            }
                             self.local_var_regs.insert(name.name.clone(), (slot, w));
                             self.reg_var_loop_depth += 1;
                             reg_vars_registered += 1;
@@ -2542,10 +2565,15 @@ impl<'a> BytecodeCompiler<'a> {
                                 if let Some((slot, dw)) = self.local_var_reg_of(h) {
                                     let one = self.alloc_reg();
                                     let w = if dw > 0 { dw } else { 32 };
-                                    self.emit(Insn::LoadConst(
-                                        one,
-                                        Box::new(Value::from_u64(1, w)),
-                                    ));
+                                    // SIGNED one: signed+signed stays signed
+                                    // (an unsigned 1 silently stripped the
+                                    // loop var's sign on the first step, so
+                                    // `i >= -2` compared unsigned);
+                                    // signed+unsigned still yields unsigned,
+                                    // so unsigned loop vars are unaffected.
+                                    let mut one_v = Value::from_u64(1, w);
+                                    one_v.is_signed = true;
+                                    self.emit(Insn::LoadConst(one, Box::new(one_v)));
                                     let dst = self.alloc_reg();
                                     self.emit(Insn::Move(dst, slot));
                                     if delta > 0 {
@@ -2576,10 +2604,9 @@ impl<'a> BytecodeCompiler<'a> {
                                     let cur = self.alloc_reg();
                                     self.emit(Insn::LoadSignal(cur, id as u32));
                                     let one = self.alloc_reg();
-                                    self.emit(Insn::LoadConst(
-                                        one,
-                                        Box::new(Value::from_u64(1, w)),
-                                    ));
+                                    let mut one_v = Value::from_u64(1, w);
+                                    one_v.is_signed = true; // see register arm
+                                    self.emit(Insn::LoadConst(one, Box::new(one_v)));
                                     if delta > 0 {
                                         self.emit(Insn::Add(cur, cur, one));
                                     } else {

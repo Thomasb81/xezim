@@ -93,3 +93,73 @@ endmodule
     let n = u(&sim, "cyc");
     assert_eq!(u(&sim, "ptr[2]"), n, "each element counts every posedge");
 }
+
+#[test]
+fn negative_bound_descending_loop_signed_compare() {
+    // `i > -3` with a register-backed var: an unsigned step constant used
+    // to strip the var's sign on the first i--, turning the compare
+    // unsigned and exiting after one iteration.
+    let src = r#"
+module tb;
+  logic clk = 0;
+  logic signed [31:0] acc = 0;
+  int cyc = 0;
+  always #1 clk = ~clk;
+  always @(posedge clk) begin
+    for (int i = 2; i > -3; i--) acc <= acc + i; // last NBA: acc + (-2)
+    cyc <= cyc + 1;
+  end
+  initial #12 $finish;
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    let n = u(&sim, "cyc") as i64;
+    let acc = u(&sim, "acc") as u32 as i32 as i64;
+    assert_eq!(acc, -2 * n, "descending loop crosses zero with signed compare");
+}
+
+#[test]
+fn loop_var_shadows_module_signal() {
+    let src = r#"
+module tb;
+  logic clk = 0;
+  int i = 777;
+  logic [31:0] acc = 0;
+  int cyc = 0;
+  always #1 clk = ~clk;
+  always @(posedge clk) begin
+    for (int i = 0; i < 5; i++) acc <= acc + i;
+    cyc <= cyc + 1;
+  end
+  initial #12 $finish;
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "i"), 777, "outer signal untouched by the loop var");
+    let n = u(&sim, "cyc");
+    assert_eq!(u(&sim, "acc"), 4 * n, "last NBA wins: acc + 4 per cycle");
+}
+
+#[test]
+fn nested_register_var_loops_and_stride() {
+    let src = r#"
+module tb;
+  logic clk = 0;
+  logic [31:0] a = 0, b = 0;
+  int cyc = 0;
+  always #1 clk = ~clk;
+  always @(posedge clk) begin
+    for (int i = 0; i < 4; i++)
+      for (int j = 0; j < 4; j++)
+        a <= a + i * 4 + j;          // last NBA: a + 15
+    for (byte k = 0; k < 10; k += 2) b <= b + k; // last NBA: b + 8
+    cyc <= cyc + 1;
+  end
+  initial #12 $finish;
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    let n = u(&sim, "cyc");
+    assert_eq!(u(&sim, "a"), 15 * n);
+    assert_eq!(u(&sim, "b"), 8 * n);
+}
