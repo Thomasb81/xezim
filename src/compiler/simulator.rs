@@ -22989,6 +22989,37 @@ impl Simulator {
         }
     }
 
+    /// Settle after a procedural blocking write (outside edge blocks).
+    ///
+    /// §5.5 + §10.3 say the driven continuous assignments' re-evaluation is a
+    /// separate ACTIVE-region update event: the writing process does NOT
+    /// yield, so its own later reads see PRE-update net values until it hits a
+    /// delay/wait. The reference simulator does exactly that
+    /// (`a=5; s1=b;` reads the OLD b). xezim settles EAGERLY here, so such a
+    /// read observes the propagated value one statement early — a real
+    /// divergence for testbench/BFM code that drives a signal and immediately
+    /// reads a continuous-assign-derived handshake.
+    ///
+    /// Eager remains the DEFAULT: switching wholesale also changes t=0
+    /// gate/UDP initialization ordering, which regressed two
+    /// reference-validated traces (`udp_primitives::edge_shorthands` q2 at
+    /// t=0, `dep_reg_entry_synth`). The correct end state is lazy propagation
+    /// with t=0 initialization kept eager; until that separation exists,
+    /// `XEZIM_LAZY_PROC_SETTLE=1` opts into the LRM/reference ordering so a
+    /// design that depends on it can be run (and diffed) without a rebuild.
+    fn settle_after_proc_write(&mut self) {
+        if self.in_edge_block {
+            return;
+        }
+        static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lazy = *LAZY.get_or_init(|| {
+            std::env::var("XEZIM_LAZY_PROC_SETTLE").ok().as_deref() == Some("1")
+        });
+        if !lazy {
+            self.settle_combinatorial();
+        }
+    }
+
     /// Promote `#0` continuations parked in the Inactive-region queue
     /// (IEEE 1800-2017 §4.4.2.3) back into the event queue at the current
     /// time. Called only AFTER `apply_nba` has committed this pass's NBA
@@ -43775,9 +43806,7 @@ impl Simulator {
                         };
                         let val = self.eval_expr(&new_rhs);
                         self.assign_value(&new_lhs, &val);
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -43812,9 +43841,7 @@ impl Simulator {
                             }
                     };
                     if spread {
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -43825,9 +43852,7 @@ impl Simulator {
                 // the lvalue is not a registered packed struct.
                 if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
                     if self.try_assign_packed_struct_pattern(lvalue, items) {
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                     // §10.9.2: the same per-ELEMENT expansion the continuous
@@ -43837,9 +43862,7 @@ impl Simulator {
                     // own widths (one bit) instead of one item per element.
                     if let Some(v) = self.packed_pattern_for_lhs(lvalue, items) {
                         self.assign_value(lvalue, &v);
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -44014,9 +44037,7 @@ impl Simulator {
                                 }
                             }
                             self.set_queue_size(&name, n);
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -44055,9 +44076,7 @@ impl Simulator {
                             });
                             if has_dyn && self.struct_storage_exists(&src, &su) {
                                 self.copy_unpacked_struct(&dst, &src, &su);
-                                if !self.in_edge_block {
-                                    self.settle_combinatorial();
-                                }
+                                self.settle_after_proc_write();
                                 return;
                             }
                         }
@@ -44076,9 +44095,7 @@ impl Simulator {
                                 self.copy_unpacked_struct(&dst, &src, &su);
                             }
                             self.eval_builtin_method(&obj, &pop, &[]);
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -44089,9 +44106,7 @@ impl Simulator {
                 // each side is read/written by its (working) field path — the
                 // RHS is never materialized as a single (broken) struct Value.
                 if self.try_decompose_struct_class_prop_assign(lvalue, rvalue).is_some() {
-                    if !self.in_edge_block {
-                        self.settle_combinatorial();
-                    }
+                    self.settle_after_proc_write();
                     return;
                 }
                 // IEEE 1800-2017 §7.2: assigning one unpacked struct to another
@@ -44130,9 +44145,7 @@ impl Simulator {
                                 if let Some(src) = self.flat_member_name(rvalue) {
                                     if src != dst && self.struct_storage_exists(&src, &su) {
                                         self.copy_unpacked_struct(&dst, &src, &su.clone());
-                                        if !self.in_edge_block {
-                                            self.settle_combinatorial();
-                                        }
+                                        self.settle_after_proc_write();
                                         return;
                                     }
                                 }
@@ -44163,9 +44176,7 @@ impl Simulator {
                                 {
                                     let v = self.eval_expr(rvalue);
                                     if self.spread_into_unpacked_struct(&dst, &su.clone(), &v) {
-                                        if !self.in_edge_block {
-                                            self.settle_combinatorial();
-                                        }
+                                        self.settle_after_proc_write();
                                         return;
                                     }
                                 }
@@ -44361,9 +44372,7 @@ impl Simulator {
                                 );
                             }
                             self.set_queue_size(&lname, size);
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                             }
                         }
@@ -44400,9 +44409,7 @@ impl Simulator {
                             let w = self.lookup_signal_width(&lname).unwrap_or(1);
                             self.set_signal_value_by_name(&lname, Value::zero(w));
                         }
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -44464,9 +44471,7 @@ impl Simulator {
                         } else {
                             self.assign_value(lvalue, &sval);
                         }
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -44478,9 +44483,7 @@ impl Simulator {
                     if self.expr_assoc_name(base).is_some() {
                         let v = self.eval_expr(rvalue);
                         self.assign_value(lvalue, &v);
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -44583,9 +44586,7 @@ impl Simulator {
                                             .unwrap_or(Value::zero(1));
                                         self.set_signal_value_by_name(&lp, v);
                                     }
-                                    if !self.in_edge_block {
-                                        self.settle_combinatorial();
-                                    }
+                                    self.settle_after_proc_write();
                                     return;
                                 }
                             }
@@ -44630,9 +44631,7 @@ impl Simulator {
                                 self.set_signal_value_by_name(&ename, piece.resize(elem_w));
                                 self.widths.insert(ename, elem_w);
                             }
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -44771,9 +44770,7 @@ impl Simulator {
                             msb = lo;
                         }
                     }
-                    if !self.in_edge_block {
-                        self.settle_combinatorial();
-                    }
+                    self.settle_after_proc_write();
                     return;
                 }
                 // Handle array locator methods with `with` clause: qs = arr.find with (filter)
@@ -44793,9 +44790,7 @@ impl Simulator {
                             iter_name.as_deref(),
                         );
                         self.materialize_locator(&lname, &arr_name, &mname, &idxs);
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -44933,9 +44928,7 @@ impl Simulator {
                                         self.set_queue_size(&lname, results.len() as u64);
                                     }
                                 }
-                                if !self.in_edge_block {
-                                    self.settle_combinatorial();
-                                }
+                                self.settle_after_proc_write();
                                 return;
                             }
                         }
@@ -45047,9 +45040,7 @@ impl Simulator {
                                 let handle = self.instantiate_class(&class_def, ctor_args);
                                 self.current_spec = saved_spec;
                                 self.assign_value(lvalue, &handle.resize(w));
-                                if !self.in_edge_block {
-                                    self.settle_combinatorial();
-                                }
+                                self.settle_after_proc_write();
                                 return;
                             }
                         }
@@ -45073,9 +45064,7 @@ impl Simulator {
                                 ta_cloned.as_deref(),
                             );
                             self.assign_value(lvalue, &handle.resize(w));
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                         // Bare `cg c1 = new;` / `cg c1 = new();` —
@@ -45085,9 +45074,7 @@ impl Simulator {
                         if let Some(cg_def) = self.module.covergroups.get(&tname).cloned() {
                             let handle = self.instantiate_covergroup(&cg_def, ctor_args);
                             self.assign_value(lvalue, &handle.resize(w));
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -45213,9 +45200,7 @@ impl Simulator {
                                             self.set_signal_value_by_name(&dotted, fv);
                                         }
                                     }
-                                    if !self.in_edge_block {
-                                        self.settle_combinatorial();
-                                    }
+                                    self.settle_after_proc_write();
                                     return;
                                 }
                             }
@@ -45259,9 +45244,7 @@ impl Simulator {
                                     lvalue,
                                     &Value::from_u64(handle as u64, 32).resize(w),
                                 );
-                                if !self.in_edge_block {
-                                    self.settle_combinatorial();
-                                }
+                                self.settle_after_proc_write();
                                 return;
                             }
                             // Copy constructor `new <obj>` (SV 8.13): a single
@@ -45292,9 +45275,7 @@ impl Simulator {
                                     if let Some(Some(_)) = self.heap.get(src_h) {
                                         let h = self.copy_construct(src_h);
                                         self.assign_value(lvalue, &h.resize(w));
-                                        if !self.in_edge_block {
-                                            self.settle_combinatorial();
-                                        }
+                                        self.settle_after_proc_write();
                                         return;
                                     }
                                 }
@@ -45374,9 +45355,7 @@ impl Simulator {
                                                 .insert(format!("{}.size", name), size.clone());
                                         }
                                         // Do not assign to lvalue (array) itself
-                                        if !self.in_edge_block {
-                                            self.settle_combinatorial();
-                                        }
+                                        self.settle_after_proc_write();
                                         return;
                                     } else {
                                         // `lhs = new()` where the LHS type
@@ -45412,9 +45391,7 @@ impl Simulator {
                                         let name = self.resolve_hier_name(lhier);
                                         self.signals.insert(format!("{}.size", name), size.clone());
                                     }
-                                    if !self.in_edge_block {
-                                        self.settle_combinatorial();
-                                    }
+                                    self.settle_after_proc_write();
                                     return;
                                 } else {
                                     // `lhs = new()` with an unknown LHS type:
@@ -45461,9 +45438,7 @@ impl Simulator {
                             if dst != src {
                                 self.copy_whole_queue(&dst, &src);
                             }
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -45500,9 +45475,7 @@ impl Simulator {
                         && (r_is_prop || self.module.dynamic_arrays.contains(&rname))
                     {
                         self.copy_whole_queue(&lname, &rname);
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -45529,9 +45502,7 @@ impl Simulator {
                         for (k, v) in entries {
                             self.signals.insert(k, v);
                         }
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                     if self.module.arrays.contains_key(&lname)
@@ -45564,9 +45535,7 @@ impl Simulator {
                                 );
                             }
                             self.set_queue_size(&lname, rsize as u64);
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                         let count = lsize.min(rsize);
@@ -45588,9 +45557,7 @@ impl Simulator {
                                 .unwrap_or(Value::zero(32));
                             self.set_signal_value_by_name(&format!("{}[{}]", lname, lidx), rval);
                         }
-                        if !self.in_edge_block {
-                            self.settle_combinatorial();
-                        }
+                        self.settle_after_proc_write();
                         return;
                     }
                 }
@@ -45668,9 +45635,7 @@ impl Simulator {
                                     if is_dyn {
                                         self.set_queue_size(&lname, results.len() as u64);
                                     }
-                                    if !self.in_edge_block {
-                                        self.settle_combinatorial();
-                                    }
+                                    self.settle_after_proc_write();
                                     return;
                                 }
                             }
@@ -45700,9 +45665,7 @@ impl Simulator {
                             if is_dyn {
                                 self.set_queue_size(&lname, items.len() as u64);
                             }
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                         if let ExprKind::Concatenation(exprs) = &rvalue.kind {
@@ -45832,9 +45795,7 @@ impl Simulator {
                             if is_dyn {
                                 self.set_queue_size(&lname, all_vals.len() as u64);
                             }
-                            if !self.in_edge_block {
-                                self.settle_combinatorial();
-                            }
+                            self.settle_after_proc_write();
                             return;
                         }
                     }
@@ -45867,18 +45828,14 @@ impl Simulator {
                                 } else {
                                     self.set_queue_size(&lname, 0);
                                 }
-                                if !self.in_edge_block {
-                                    self.settle_combinatorial();
-                                }
+                                self.settle_after_proc_write();
                                 return;
                             }
                         }
                     }
                 }
                 self.assign_value(lvalue, &val);
-                if !self.in_edge_block {
-                    self.settle_combinatorial();
-                }
+                self.settle_after_proc_write();
             }
             StatementKind::NonblockingAssign {
                 lvalue,
@@ -65735,9 +65692,7 @@ impl Simulator {
                     });
                 if let Some(v) = self.packed_pattern_value(items, &dims, total_w) {
                     self.set_signal_value_by_name(base, v);
-                    if !self.in_edge_block {
-                        self.settle_combinatorial();
-                    }
+                    self.settle_after_proc_write();
                     return true;
                 }
             }
