@@ -111,6 +111,8 @@ mod parser_stmt_gaps;
 mod obj_assocd_event_disable_fork;
 #[path = "misc/param_class_cast_type_args.rs"]
 mod param_class_cast_type_args;
+#[path = "misc/param_pair_this_type_cast.rs"]
+mod param_pair_this_type_cast;
 #[path = "misc/pattern_replication_and_extends_args.rs"]
 mod pattern_replication_and_extends_args;
 #[path = "misc/program_block_reactive.rs"]
