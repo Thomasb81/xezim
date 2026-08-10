@@ -1,0 +1,143 @@
+# Open issues
+
+Known gaps, each with the evidence that pins it and what a fix has to do.
+Anything listed here was reproduced against the reference simulator; the
+repro paths point at scratchpad files from the sessions that found them.
+
+Closed items are not repeated here — see the git log and `debug_notes.md`
+(outside the repo) for the investigation trail.
+
+---
+
+## 1. Continuous-assignment propagation order after a procedural blocking write
+
+**What differs.** xezim settles continuous assignments immediately after a
+procedural blocking write, so the *writing process* observes the propagated
+value on its very next statement:
+
+```systemverilog
+logic [7:0] a; wire [7:0] b, c;
+assign b = a + 1;  assign c = b + 1;
+initial begin
+  a = 5;
+  s1 = b;   // reference: 1 (stale)   xezim: 6
+  s2 = c;   // reference: 2 (stale)   xezim: 7
+  #0 s3 = c; // both: 7
+end
+```
+
+§5.5/§10.3 make the re-evaluation a separate active-region update event: the
+writing process does not yield, so its own reads see pre-update net values
+until it hits a delay or wait. Eager settling is already suppressed inside
+edge blocks, so the divergence is confined to testbench / initial / task
+code — exactly where a BFM drives a request and immediately reads a
+continuous-assign-derived grant or status wire. Reading a handshake one
+statement early forks the entire stimulus trajectory, which is why this
+class of bug reproduces only in full designs.
+
+**State.** All 38 eager-settle sites route through
+`settle_after_proc_write()`. Eager is the DEFAULT;
+`XEZIM_LAZY_PROC_SETTLE=1` opts into the LRM/reference ordering.
+
+**Why the flag is not simply flipped.** Measured, not assumed — the
+reference is lazy on one real shape and eager on another, so no single
+global setting matches it:
+
+| shape | reference | xezim eager | xezim lazy |
+|---|---|---|---|
+| drive-then-read a cont-assign wire (`bigaudit/c1b.sv`) | `2 1 2 7` | `2 6 7 7` | `2 1 2 7` ✅ |
+| c910 dep_reg entry, TB drives right after `@(posedge clk)` (`bigaudit/dep.sv`) | `wb=1 rdy=1 rfi=1` | ✅ | `wb=0 …` |
+
+Lazy-as-default also regresses two reference-validated t=0 gate/UDP
+initialization traces (`udp_primitives::edge_shorthands` q2 at t=0,
+`dep_reg_entry_synth::dep_reg_entry_wb_wakes_rdy`) — 1849 pass / 2 fail.
+
+**Rejected approaches** (both measured):
+- Keeping t=0 eager — `c1b` runs entirely at t=0, so the exemption defeats
+  the fix.
+- Settling at the `check_edges` boundary so deferred writes land before the
+  next edge — `c1b` stayed correct but `dep.sv` did not recover, proving
+  the dep divergence is not about *when* the deferred settle lands.
+
+**What a fix must do.** Per-evaluator scheduling, not one knob: defer
+`ContAssign`/`CompiledContAssign` updates past the writing process's own
+reads while keeping `Udp`/`UdpBatch`/`FusedGate` evaluation per input
+change. `CombItem` already distinguishes these, so a filtered settle is
+expressible.
+
+**Coupled sub-issue.** xezim's UDP has no "simultaneous multi-input change"
+rule. Under lazy settling two inputs change in one evaluation and the UDP
+matches `* 0 : ? : 0` (output 0) where the reference holds x. Eager hid
+this by only ever presenting one changed input per evaluation. Must be
+fixed alongside, or the UDP trace regresses the moment propagation is
+deferred.
+
+---
+
+## 2. LRM audit backlog (pre-existing)
+
+Each entry is a reference-validated finding from the original audit sweeps.
+
+### G8 + G9 — formatting
+Explicit `%h`/`%b`/`%o` field widths, and unformatted arguments.
+
+### G10, G11, G6 — misc
+`#1step` parse, `$bits("")` should be 8, `trireg` behaviour note.
+
+### H3 — `ref` arguments
+`ref` formals must alias the actual, not copy-in/copy-out. Visible whenever
+the callee writes the formal and the caller reads the actual before return.
+
+### F6–F10 — clocking / process
+Clocking skews, `##0` synchronization, and `process` status naming.
+(`##n` without a `default clocking` block is now rejected — closed.)
+
+### J4, J6–J12 — hierarchy
+Interface ports, exports, port z-padding, nested modules.
+
+### L5/L6/L11/L12 + L3/L4 — symbol tables
+Clash-check family, plus hierarchical-name legality.
+
+### L7–L10, L13–L18, L20 — front-end acceptance batch 2
+
+### J2c, J2e — const-eval remnants
+Type-parameter `$bits`, and interface-port parameters. (The rest of the
+const-eval silent-zero family — dimension-width function calls, package
+const-fn parameters, the hoist fixpoint — is fixed.)
+
+---
+
+## 3. Preprocessor acceptance / rejects-valid (K-A1..A10, K-R2)
+
+K-R1 (`` `ifdef ``/`` `else ``/`` `endif `` inside a macro body) is fixed:
+a conditional directive's name now ends at the first non-identifier
+character, so `` `endif; `` is recognised, split onto its own line, and the
+trailing `;` survives instead of being swallowed with the directive.
+
+The remaining K-A acceptance cases and K-R2 have not been swept since the
+K-W (wrong-expansion) family was closed.
+
+---
+
+## 4. Customer performance thread
+
+The for-loop bytecode compilation landed (local repro 73.3 s → 6.0 s), but
+on the customer's DRAM run `For_init_vardecl` fallback time did not drop
+(~763 s, count only −33%). Their hot loop bodies therefore fail
+`for_body_is_simple` — most likely member access or calls in the body.
+Needs one of their actual loop bodies to extend the prescan.
+
+Remaining fallback targets, ranked from that run's own table: `ident_lookup`
+11.2 s, `Expr_Call_impure` 6.3 s, `nba_ident_unresolved` 4.1 s,
+`Expr_MemberAccess` 2.8 s. See `perf_improve_notes.md`.
+
+---
+
+## 5. Diagnosability
+
+- **Settle-cap silence.** `--settle-limit` hits warn once, then the cap is
+  applied silently for the rest of the run. A design that hits it repeatedly
+  (the customer's does, from t=151,310) gives no further signal.
+- **r11 interpreter melt.** A 45-line interpreted always-block costs ~12 s
+  per tick in one repro — a long-standing separate bug with two pinned next
+  steps in the Round 18 debug notes.

@@ -114,3 +114,61 @@ endmodule
         lines(&sim)
     );
 }
+
+/// §22: a conditional directive's name is an identifier and ends at the
+/// first character that cannot continue one. `\`endif;` was not recognised
+/// as a directive by the inline-splitter (it required WHITESPACE after the
+/// keyword), so the line never got split and the `\`endif` handler swallowed
+/// it whole — taking the `;` that terminated the wrapped statement with it.
+#[test]
+fn conditional_directive_ends_at_non_identifier_char() {
+    let src = r#"
+`define A
+module tb;
+  int x, y, z;
+  initial begin
+`ifdef A
+    x = 1
+`endif;
+    y = (1
+`ifdef A
+      + 2
+`endif);
+    z = 3;
+    $display("T|%0d %0d %0d", x, y, z);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert!(
+        lines(&sim).iter().any(|m| m == "T|1 3 3"),
+        "got {:?}",
+        lines(&sim)
+    );
+}
+
+/// K-R1: a macro BODY carrying `\`ifdef/\`else/\`endif`. The body keeps its
+/// line breaks, the post-expansion re-scan resolves the conditional, and the
+/// `;` after the macro call survives (it rides on the `\`endif` line).
+#[test]
+fn ifdef_inside_macro_body_expands_and_keeps_trailing_text() {
+    let src = r#"
+`define CFG_BIG
+`define SEL_SIZE \
+  `ifdef CFG_BIG \
+    4096 \
+  `else \
+    64 \
+  `endif
+module tb;
+  localparam integer WDBUF_SIZE = `SEL_SIZE;
+  initial $display("T|%0d", WDBUF_SIZE);
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert!(
+        lines(&sim).iter().any(|m| m == "T|4096"),
+        "got {:?}",
+        lines(&sim)
+    );
+}
