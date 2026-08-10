@@ -154,6 +154,30 @@ Remaining fallback targets, ranked from that run's own table: `ident_lookup`
 
 ---
 
+## 4b. Interpreted array-element access is name-based (GitHub #86)
+
+Each `mem[i]` read/write in the AST interpreter materialises the element name
+(`format!("{}[{}]", name, idx)`) and hashes it, costing ~1.6-2.2 us per access
+— `perf` on a memory fill is dominated by `String::clone`,
+`join_generic_copy`, `split_flat_path`, `memcmp` and hashing, not value logic.
+
+The O(1) resolver already exists: `get_array_elem_id` / `array_first_id`
+computes `first_id + (idx - lo)` with no string work, but it is wired only
+into the JIT bridge and one expression path. Routing the interpreted
+read/write paths through it is the substantive fix.
+
+NOTE the issue's premise is wrong and the comment on it explains why: the
+event loop is NOT O(array size) per iteration. Holding the array fixed and
+running 10x longer adds ~0.85 us/iter (the array-free baseline); the cost is a
+one-time O(N) fill. Do not go looking in the settle/process loop.
+
+Separately, the interpreter costs ~1.65 us per statement for a plain `for`
+loop in an `initial` block, independent of arrays — a larger question.
+
+Done so far: the indexed-write path no longer deep-clones two expression trees
+per store for a class check that bails on an empty heap (xezim `e15a0b4`,
+~3-6% on that workload).
+
 ## 5. Diagnosability
 
 - **Settle-cap silence.** `--settle-limit` hits warn once, then the cap is
