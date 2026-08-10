@@ -73662,7 +73662,13 @@ impl Simulator {
                 mv.set_bit(i as usize, v.get_bit((off + i) as usize));
             }
             if is_real {
-                let f = mv.to_u64().unwrap_or(0) as f64;
+                // `Value::from_f64` stores `f.to_bits()`, and packing copied
+                // those raw IEEE-754 bits into the aggregate — so recovering
+                // the member is `from_bits`, not an integer cast. The cast
+                // reinterpreted the bit pattern as an integer, so a struct
+                // with a `real` member assigned WHOLE (function return,
+                // assignment pattern) read 4.0 back as 4.6161896e18.
+                let f = f64::from_bits(mv.to_u64().unwrap_or(0));
                 self.write_leaf_by_name(&leaf, Value::from_f64(f));
             } else {
                 self.write_leaf_by_name(&leaf, mv);
