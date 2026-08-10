@@ -61,3 +61,28 @@ endmodule
     assert_eq!(u(&sim, "s1"), 0, "first #0 hop pre-NBA");
     assert_eq!(u(&sim, "s2"), 0, "second #0 hop still pre-NBA");
 }
+
+#[test]
+fn event_triggered_from_edge_block_wakes_pre_nba() {
+    // `-> ev` inside an always_ff toggles the event DURING block exec; the
+    // waiter must resume in the SAME active region (§15.5.1) — before this
+    // slot's NBAs — not in the cascade's post-NBA check_edges. Covers both
+    // the plain resume and a #0 hop after it.
+    let src = r#"
+`timescale 1ns/1ns
+module tb;
+  event ev;
+  logic clk = 0; always #5 clk = ~clk;
+  logic [7:0] r = 0;
+  always @(posedge clk) begin r <= r + 1; -> ev; end
+  int s_plain = -1, s_zero = -1;
+  initial begin @(ev) s_plain = r; end
+  initial begin @(ev) #0 s_zero = r; end
+  initial begin #7 $finish; end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "s_plain"), 0, "waiter resumes pre-NBA (active region)");
+    assert_eq!(u(&sim, "s_zero"), 0, "#0 hop after the waiter is still pre-NBA");
+    assert_eq!(u(&sim, "r"), 1, "the flop still updates");
+}

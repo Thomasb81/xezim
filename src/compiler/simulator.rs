@@ -32359,6 +32359,39 @@ impl Simulator {
                 self.event_queue.schedule(self.time, pid, stmts);
             }
         }
+        if waiters_first {
+            // The pre-block drain above cannot see waiters whose trigger was
+            // produced BY the blocks just executed (`-> ev` inside an
+            // always_ff toggles the event signal during exec). §15.5.1: such
+            // waiters resume in the SAME active region — before this slot's
+            // NBA region — but the next check_edges that would notice them
+            // sits in the cascade AFTER apply_nba, so they read post-NBA
+            // state (reference-divergent). Drain-and-run inline, re-draining
+            // because a resumed continuation may fire further events.
+            let mut settle_guard = 0u32;
+            loop {
+                let conts = self.drain_triggered_event_waiters();
+                if conts.is_empty() {
+                    break;
+                }
+                for (pid, stmts) in conts {
+                    if self.finished {
+                        break;
+                    }
+                    self.run_scheduled_process(pid, &stmts);
+                    if !self.is_pid_suspended(pid) {
+                        self.child_finished(pid);
+                    }
+                    self.break_flag = false;
+                    self.continue_flag = false;
+                    self.return_flag = false;
+                }
+                settle_guard += 1;
+                if self.finished || settle_guard > 10_000 {
+                    break;
+                }
+            }
+        }
     }
 
     /// Build (once) the per-LP settle state from the multikernel-scope
