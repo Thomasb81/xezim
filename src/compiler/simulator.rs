@@ -2890,6 +2890,12 @@ pub struct Simulator {
     pub output: Vec<SimOutput>,
     capture_output: bool,
     pub finished: bool,
+    /// §20.10: a `$fatal` executed — the run must not exit 0.
+    pub saw_fatal: bool,
+    /// `$fatal`'s finish_number (0/1/2), for the exit status.
+    pub fatal_finish_number: Option<i32>,
+    /// Count of `$error` occurrences (see `--error-exit`).
+    pub error_count: u64,
     /// Set when the dead-clock watchdog aborted the run (XEZIM_STUCK_CLOCK=abort).
     /// The CLI reports a non-zero exit so CI/regressions fail fast.
     pub stuck_clock_aborted: bool,
@@ -6346,6 +6352,9 @@ impl Simulator {
             output: Vec::new(),
             capture_output: true,
             finished: false,
+            saw_fatal: false,
+            fatal_finish_number: None,
+            error_count: 0,
             stuck_clock_aborted: false,
             compiled: false,
             monitor: None,
@@ -9636,7 +9645,8 @@ impl Simulator {
         // after the loop, because arg_refs holds references into their Box
         // contents. Pre-allocate capacity to prevent mid-loop reallocation.
         let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::with_capacity(arg_kinds.len());
-        let mut string_ptr_cells: Vec<Box<*const i8>> = Vec::with_capacity(arg_kinds.len());
+        let mut string_ptr_cells: Vec<Box<*const std::ffi::c_char>> =
+            Vec::with_capacity(arg_kinds.len());
         let mut open_i32_vals: Vec<Vec<i32>> = Vec::with_capacity(arg_kinds.len());
         let mut cstrings: Vec<CString> = Vec::with_capacity(arg_kinds.len());
         let mut logic_aval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
@@ -9719,7 +9729,7 @@ impl Simulator {
                             }
                         })
                         .unwrap_or_default();
-                    let init_ptr: *const i8 = if init_s.is_empty() {
+                    let init_ptr: *const std::ffi::c_char = if init_s.is_empty() {
                         std::ptr::null()
                     } else {
                         let c = CString::new(init_s).unwrap_or_else(|_| CString::new("").unwrap());
@@ -9729,7 +9739,11 @@ impl Simulator {
                     };
                     let cell = Box::new(init_ptr);
                     let p =
-                        Box::new((&*cell as *const *const i8 as *mut *const i8).cast::<c_void>());
+                        Box::new(
+                            (&*cell as *const *const std::ffi::c_char
+                                as *mut *const std::ffi::c_char)
+                                .cast::<c_void>(),
+                        );
                     string_ptr_cells.push(cell);
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
@@ -9947,7 +9961,7 @@ impl Simulator {
                 Value::from_u64(rv as usize as u64, 64)
             }
             DpiRetKind::String => {
-                let rv: *const i8 = unsafe { cif.call(fn_ptr, &arg_refs) };
+                let rv: *const std::ffi::c_char = unsafe { cif.call(fn_ptr, &arg_refs) };
                 if rv.is_null() {
                     Value::from_string("")
                 } else {
@@ -50041,8 +50055,9 @@ impl Simulator {
                 // remaining arguments are the `$display`-style message. A bare
                 // `$fatal("msg")` (no valid finish_number) defaults to 1 and
                 // treats every argument as the message.
-                let (msg_args, _finish) = self.fatal_msg_args(args);
+                let (msg_args, finish) = self.fatal_msg_args(args);
                 self.emit_severity("Fatal", msg_args);
+                self.fatal_finish_number = Some(finish);
                 self.finished = true; // implicit $finish
             }
             "$display" | "$displayb" | "$displayh" | "$displayo" => {
@@ -50674,6 +50689,14 @@ impl Simulator {
             format!("** {}: {}", severity, body)
         };
         let ctx = format!("   Time: {}  Scope: {}", time_s.trim(), scope);
+        // §20.10: record severity occurrences so the process exit status can
+        // reflect them. `$fatal` carries an explicit finish/status semantic and
+        // must not exit 0; `$error` is counted so `--error-exit` can promote it.
+        match severity {
+            "Fatal" => self.saw_fatal = true,
+            "Error" => self.error_count = self.error_count.saturating_add(1),
+            _ => {}
+        }
         self.record_output(line.clone());
         self.record_output(ctx.clone());
         self.stdout_writeln(&line);
