@@ -38844,6 +38844,40 @@ impl Simulator {
                         return self.eval_expr_ctx(&e2, ctx_width);
                     }
                 }
+                // §13.4.1: `obj.method` with NO parens invokes a parameterless
+                // function. The MemberAccess shape (`obj.method`) already
+                // dispatches it; the FLATTENED 2-segment `Ident([obj, method])`
+                // (how `t1.randomize & t2.randomize` parses) fell through to a
+                // property read and returned 0 WITHOUT running the function —
+                // so UVM's `assert(t1.randomize & t2.randomize)` never
+                // randomized `t1`/`t2` (fields stayed 0). Mirror the
+                // MemberAccess dispatch: if the base is a live class handle
+                // whose type declares a parameterless function `method`, call
+                // it and use its return. Guarded to the 2-segment flat form so
+                // struct-member / enum / signal-path reads keep their own arms.
+                if hier.path.len() == 2
+                    && hier.path[1].selects.is_empty()
+                    && hier.path[0].selects.is_empty()
+                {
+                    let base_name = hier.path[0].name.name.as_str();
+                    let member = hier.path[1].name.name.clone();
+                    if let Some(handle) = self.eval_ident_handle(base_name) {
+                        if handle != 0 {
+                            let cls = self
+                                .heap
+                                .get(handle)
+                                .and_then(|o| o.as_ref())
+                                .map(|i| i.class_name.clone());
+                            if let Some(cn) = cls {
+                                if self.class_bare_method(&cn, &member) {
+                                    let r = self.exec_method_call(handle, &member, &[]);
+                                    self.return_flag = false;
+                                    return r;
+                                }
+                            }
+                        }
+                    }
+                }
                 // §18.4: `<obj>.<agg_prop>.<member>` / `<agg_prop>.<member>`
                 // that parsed as a FLAT hier ident — same aggregate-class-
                 // property storage as the `MemberAccess` shape (see there).
@@ -43892,7 +43926,7 @@ impl Simulator {
                     // function if the class declares one (e.g. `if (port.size < 1)`).
                     let cls = self.heap[handle].as_ref().map(|i| i.class_name.clone());
                     match cls {
-                        Some(cn) if self.class_parameterless_function(&cn, &member.name) => {
+                        Some(cn) if self.class_bare_method(&cn, &member.name) => {
                             let res = self.exec_method_call(handle, &member.name, &[]);
                             self.return_flag = false;
                             return res;
@@ -71418,6 +71452,21 @@ impl Simulator {
             }
         }
         false
+    }
+
+    /// Does `obj.name` (a parenthesless member reference) denote a CLASS-
+    /// method invocation per LRM §13.4.1/§18.11? This is true when the class
+    /// declares a parameterless function `name`, OR when `name` is a built-in
+    /// no-arg method of every class OBJECT.
+    ///
+    /// UVM relies on the latter for `assert(t1.randomize & t2.randomize)`.
+    /// `randomize` is NOT a declared class method (the source never lists the
+    /// implicit built-in from `class_object`), so `class_parameterless_function`
+    /// correctly returns false for it — but a bare `obj.randomize` must still
+    /// dispatch to `exec_method_call(.., "randomize", [])`, which routes to
+    /// the §18.11 solver, so both operands of the `&` actually randomize.
+    fn class_bare_method(&self, class_name: &str, name: &str) -> bool {
+        self.class_parameterless_function(class_name, name) || matches!(name, "randomize")
     }
 
     fn class_has_method(&self, class_name: &str, name: &str) -> bool {
