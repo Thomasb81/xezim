@@ -13003,7 +13003,7 @@ impl Simulator {
                     if compiled
                         .instructions
                         .iter()
-                        .any(|i| matches!(i, Insn::StmtFallback(..)))
+                        .any(|i| matches!(i, Insn::StmtFallback(..) | Insn::EvalExprFallback(..)))
                     {
                         SendCombItem::AstFallback
                     } else {
@@ -15245,7 +15245,11 @@ impl Simulator {
             let has_fallback = cb.as_ref().is_some_and(|cb| {
                 cb.instructions
                     .iter()
-                    .any(|insn| matches!(insn, super::bytecode::Insn::StmtFallback(..)))
+                    .any(|insn| matches!(
+                        insn,
+                        super::bytecode::Insn::StmtFallback(..)
+                            | super::bytecode::Insn::EvalExprFallback(..)
+                    ))
             });
             // NbaAssignBitDyn and NbaAssignRange read signal_table.clone() in
             // the parallel path and produce a full-register NbaFast entry with
@@ -15272,6 +15276,7 @@ impl Simulator {
                 for insn in &cb.instructions {
                     match insn {
                         BcInsn::StmtFallback(..)
+                        | BcInsn::EvalExprFallback(..)
                         | BcInsn::BlockingAssign(..)
                         | BcInsn::BlockingAssignRange(..)
                         | BcInsn::BlockingAssignRangeDyn(..)
