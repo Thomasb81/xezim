@@ -38879,7 +38879,7 @@ impl Simulator {
                                 .and_then(|o| o.as_ref())
                                 .map(|i| i.class_name.clone());
                             if let Some(cn) = cls {
-                                if self.class_bare_method(&cn, &member) {
+                                if self.class_parameterless_function(&cn, &member) {
                                     let r = self.exec_method_call(handle, &member, &[]);
                                     self.return_flag = false;
                                     return r;
@@ -44844,6 +44844,7 @@ impl Simulator {
                             let elem_cls = recv_elem_cls
                                 .or_else(|| self.module.array_elem_class.get(&bname).cloned())
                                 .or_else(|| self.var_class_types.get(&bname).cloned())
+                                .or_else(|| self.declared_collection_elem_class(&bname))
                                 .or_else(|| {
                                     // Class-MEMBER collection (static or instance):
                                     // resolve the element class from the current
@@ -86785,6 +86786,51 @@ impl Simulator {
         }
         self.get_expr_type_name(expr)
             .is_some_and(|t| says_mailbox(&t))
+    }
+
+    /// Element class of a bare module-scoped / package-scoped unpacked
+    /// collection of a class type, resolved from the variable's DECLARED
+    /// DataType. `var_decl_types` is keyed by the BASE name and stores the
+    /// ELEMENT type (for `K m [string]` it holds the `TypeReference` "K"), so
+    /// a `= new` assigning into an element slot can construct the right class.
+    ///
+    /// Without this the ARRAY-element type maps
+    /// `array_elem_class` / `var_class_types` are keyed only for ranged / local
+    /// arrays and class-member collections; a MODULE/PACKAGE-scope assoc
+    /// array of a class (e.g. UVM's `uvm_seed_map uvm_random_seed_table_lookup
+    /// [string]`) has no entry, `elem_cls` resolved the element type as unknown,
+    /// and `uvm_random_seed_table_lookup[inst_id] = new;` fell through to an
+    /// OPAQUE "unknown-LHS" instance, so the stored handle deref'd null the
+    /// moment a seed was read back (`seed_map.seed_table` null deref at t=0).
+    fn declared_collection_elem_class(&self, name: &str) -> Option<String> {
+        // Package-scoped collections (e.g. UVM's
+        // `uvm_seed_map uvm_random_seed_table_lookup [string]` inside
+        // `package uvm_pkg`) may be keyed under a QUALIFIED name
+        // (`uvm_pkg::uvm_random_seed_table_lookup`). Try the bare name
+        // first, then a leaf-name match so a bare in-scope reference finds
+        // its declared type either way.
+        let dt = self.module.var_decl_types.get(name).cloned();
+        let dt = dt.or_else(|| {
+            let leaf = name.rsplit(':').next().unwrap_or(name);
+            self.module.var_decl_types.iter().find_map(|(k, v)| {
+                if k.rsplit(':').next().unwrap_or(k) == leaf {
+                    Some(v.clone())
+                } else {
+                    None
+                }
+            })
+        })?;
+        let cn = match &dt {
+            crate::ast::types::DataType::TypeReference { name, .. } => name.name.name.clone(),
+            _ => return None,
+        };
+        if self.module.classes.contains_key(&cn)
+            || self.module.covergroups.contains_key(&cn)
+        {
+            Some(cn)
+        } else {
+            None
+        }
     }
 
     fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {
