@@ -23025,10 +23025,41 @@ impl Simulator {
     ///
     /// Returns (t_snap, t_nba, t_settle, t_edges) deltas in ns for profiling;
     /// callers that don't need them can ignore the return value.
+
+    /// §4.5: drain `#0` continuations (Inactive region) INLINE until empty,
+    /// BEFORE the caller commits the NBA region. A `#0` parked by an
+    /// edge-waiter-resumed process previously promoted only at end-of-tick —
+    /// after the cascade's apply_nba — so `@(posedge clk); #0 x = r;` read
+    /// POST-NBA r (one cycle "early" vs the reference simulator; the exact
+    /// checker/BFM divergence shape of the rptr race-through report).
+    fn drain_inactive_pre_nba(&mut self) {
+        let mut fuel = 1000u32;
+        while !self.inactive_queue.is_empty() && fuel > 0 {
+            fuel -= 1;
+            let moved = std::mem::take(&mut self.inactive_queue);
+            for (pid, cont) in moved {
+                if self.finished {
+                    return;
+                }
+                self.run_scheduled_process(pid, &cont);
+                if !self.is_pid_suspended(pid) {
+                    self.child_finished(pid);
+                }
+            }
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+        }
+    }
+
     fn drain_edge_cascade(&mut self, cascade_limit: u32) -> (u64, u64, u64, u64) {
         let (mut t_snap, mut t_nba, mut t_settle, mut t_edges) = (0u64, 0u64, 0u64, 0u64);
         let mut cascade_iter = 0u32;
         while cascade_iter < cascade_limit {
+            // Inactive region precedes the NBA region (§4.5): `#0`
+            // continuations parked by this round's active-region work run
+            // before its NBAs commit.
+            self.drain_inactive_pre_nba();
             if self.nba_fast.is_empty() && self.nba_queue.is_empty() {
                 break;
             }
@@ -23906,6 +23937,8 @@ impl Simulator {
         }
 
         let _t = profile_timing.then(std::time::Instant::now);
+        // §4.5: inactive (`#0`) continuations run before this slot's NBAs.
+        self.drain_inactive_pre_nba();
         if !self.nba_fast.is_empty()
             || !self.nba_queue.is_empty()
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
