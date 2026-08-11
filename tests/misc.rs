@@ -224,3 +224,5 @@ mod fresh_audit_finds;
 mod symbol_clash_checks;
 #[path = "misc/audit_round45_finds.rs"]
 mod audit_round45_finds;
+#[path = "misc/indexed_event_roundtrip.rs"]
+mod indexed_event_roundtrip;
