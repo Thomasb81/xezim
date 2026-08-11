@@ -3041,6 +3041,15 @@ pub struct Simulator {
     /// §5 diagnosability: how many settles exhausted the cap, and when last.
     settle_limit_hits: u64,
     settle_limit_last_time: u64,
+    /// §5.5/§10.3 (#35): when set, the running settle DEFERS cont-assign
+    /// family entries (the writing PROCESS must not observe its own write's
+    /// propagation until it yields); UDP/gate/always entries stay eager.
+    proc_settle_defer: bool,
+    /// READ signal ids of the entries skipped while deferring. The next FULL
+    /// settle re-dirties them so the skipped entries re-trigger through the
+    /// normal dependency machinery — entry INDICES would go stale across the
+    /// topo reorder / lazy materialization of `comb_entries`.
+    deferred_proc_entries: Vec<u32>,
     /// Maximum snapshot→apply_nba→settle→check_edges rounds per event-loop
     /// iter (see drain_edge_cascade). Cached at sim init; override via
     /// XEZIM_CASCADE_LIMIT env var.
@@ -6428,6 +6437,8 @@ impl Simulator {
             settle_limit: 100,
             settle_limit_hits: 0,
             settle_limit_last_time: 0,
+            proc_settle_defer: false,
+            deferred_proc_entries: Vec::new(),
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -23088,8 +23099,30 @@ impl Simulator {
         let lazy = *LAZY.get_or_init(|| {
             std::env::var("XEZIM_LAZY_PROC_SETTLE").ok().as_deref() == Some("1")
         });
-        if !lazy {
+        // #35: the DEFAULT is the per-evaluator split — gates/UDPs settle now
+        // (dep.sv's reference-eager netlist shape), cont-assign entries defer
+        // to the yield point (c1b.sv's reference-lazy RTL shape).
+        // XEZIM_LAZY_PROC_SETTLE=1 still forces the all-lazy mode;
+        // XEZIM_EAGER_PROC_SETTLE=1 restores the old all-eager mode.
+        static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let eager = *EAGER.get_or_init(|| {
+            std::env::var("XEZIM_EAGER_PROC_SETTLE").ok().as_deref() == Some("1")
+        });
+        if lazy {
+            return;
+        }
+        if eager {
             self.settle_combinatorial();
+            return;
+        }
+        self.proc_settle_defer = true;
+        self.settle_combinatorial();
+        self.proc_settle_defer = false;
+        // The deferred updates are PENDING WORK: without this, a caller that
+        // gates its settle on dirty_any (the tick top) skips the drain and a
+        // process in the NEXT slot reads stale nets.
+        if !self.deferred_proc_entries.is_empty() {
+            self.dirty_any = true;
         }
     }
 
@@ -26403,6 +26436,19 @@ impl Simulator {
             self.run_fast_delay_always(pid);
         } else {
             self.run_process_stmts(pid, stmts);
+        }
+        // #35: the process just YIELDED (parked or finished) — the
+        // cont-assign update events its writes scheduled become runnable
+        // now (§10.3), so the deferred entries drain before anything else
+        // in the slot observes the nets.
+        if !self.deferred_proc_entries.is_empty() && !self.proc_settle_defer {
+            // The drained entries must evaluate in a NEUTRAL scope: the
+            // process's name-resolve hint (its instance path) would anchor a
+            // same-named cont-assign LHS into the instance — the u_h.t
+            // self-assign hazard (see tests/hierarchy/same_name_port_hop.rs).
+            let saved_hint = self.name_resolve_hint.borrow_mut().take();
+            self.settle_combinatorial();
+            *self.name_resolve_hint.borrow_mut() = saved_hint;
         }
     }
 
@@ -32990,7 +33036,7 @@ impl Simulator {
         // §29: sequential UDPs mutate per-instance state during evaluation,
         // which the parallel/BSP isolated eval (`&self`, view-based) cannot do.
         // Force the serial fixpoint path whenever the design contains any UDP.
-        if self.has_udp {
+        if self.has_udp || self.proc_settle_defer || !self.deferred_proc_entries.is_empty() {
             self.settle_combinatorial_inner();
         } else if self.perlp_settle.is_some() {
             if self.perlp_shadow {
@@ -33800,7 +33846,10 @@ impl Simulator {
         if self.settling {
             return;
         }
-        if !self.dirty_any {
+        // #35: deferred cont-assign entries make a full settle necessary even
+        // when nothing is freshly dirty — the deferral consumed the source
+        // dirt when it recorded the entries.
+        if !self.dirty_any && (self.proc_settle_defer || self.deferred_proc_entries.is_empty()) {
             return;
         }
         self.settling = true;
@@ -33834,6 +33883,20 @@ impl Simulator {
             triggered[eidx] = false;
         }
         next_list.clear();
+        // #35: a FULL settle first re-dirties the source signals of the
+        // entries a deferring (post-proc-write) settle skipped, so they
+        // re-trigger through the ordinary dependency walk below.
+        if !self.proc_settle_defer && !self.deferred_proc_entries.is_empty() {
+            let deferred = std::mem::take(&mut self.deferred_proc_entries);
+            for sid in deferred {
+                let sid = sid as usize;
+                if sid < self.dirty_signals.len() && !self.dirty_signals[sid] {
+                    self.dirty_signals[sid] = true;
+                    self.dirty_list.push(sid);
+                }
+            }
+            self.dirty_any = true;
+        }
         // First time-0 settle pass: don't fire `always @(list)` blocks that
         // can reach `$finish`/`$stop` — they should suspend at their event
         // control until a sensitivity input actually transitions, not run
@@ -34010,6 +34073,29 @@ impl Simulator {
                 // later this pass (or next), the entry is re-triggered by
                 // the worklist propagation below.
                 triggered[eidx] = false;
+                // #35 §5.5/§10.3: while a PROCESS's post-write settle runs,
+                // cont-assign re-evaluation is a SEPARATE active-region event
+                // the process must not observe before yielding — defer these
+                // entries to the next full settle. UDP/gate/always entries
+                // (a synthesized netlist's cells) stay eager, which is the
+                // reference-measured split (c1b lazy vs dep eager).
+                if self.proc_settle_defer
+                    && matches!(
+                        entries[eidx].item,
+                        CombItem::ContAssign { .. }
+                            | CombItem::CompiledContAssign { .. }
+                            | CombItem::DirectCopy { .. }
+                            | CombItem::FastDirectCopy { .. }
+                            | CombItem::FastDirectFanout { .. }
+                            | CombItem::FusedBufFanout { .. }
+                            | CombItem::FusedAndFanout { .. }
+                    )
+                {
+                    self.deferred_proc_entries.extend(
+                        entries[eidx].cold.read_signal_ids.iter().map(|&id| id as u32),
+                    );
+                    continue;
+                }
                 evaluated_any = true;
                 let dirty_before = self.dirty_list.len();
 
