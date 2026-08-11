@@ -188,3 +188,7 @@ mod preprocessor_directives;
 mod package_const_fn_params;
 #[path = "misc/ref_args_alias.rs"]
 mod ref_args_alias;
+#[path = "misc/trireg_charge_and_g_audit.rs"]
+mod trireg_charge_and_g_audit;
+#[path = "misc/process_status_name.rs"]
+mod process_status_name;

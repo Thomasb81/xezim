@@ -2999,6 +2999,9 @@ pub struct Simulator {
     /// AT the edge time drives at edge+skew (§14.16.1); between edges it waits
     /// for the next edge.
     clocking_last_edge: HashMap<String, u64>,
+    /// The `default clocking` block's real name — `##0` consults its
+    /// `clocking_last_edge` entry to decide "already at the clocking event".
+    default_clocking_cb: Option<String>,
     /// LRM §14.4 `#1step` input skew — Preponed (slot-entry) value of every
     /// clocking-block INPUT signal, keyed by signal name. Captured at the top
     /// of each time slot BEFORE the active/NBA regions run (same point as
@@ -6390,6 +6393,7 @@ impl Simulator {
             clocking_in_skew: HashMap::default(),
             clocking_sig_in_skew: HashMap::default(),
             clocking_last_edge: HashMap::default(),
+            default_clocking_cb: None,
             clocking_preponed: HashMap::default(),
             deferred_clocking_conts: Vec::new(),
             pending_reactive: Vec::new(),
@@ -10134,6 +10138,12 @@ impl Simulator {
                         .insert("__xz_default_clocking".to_string(), (clk.clone(), sigs.clone()));
                     self.clocking_edge
                         .insert("__xz_default_clocking".to_string(), edge);
+                    // `##0` sync marker resolves through the same lookups.
+                    self.clocking_meta
+                        .insert("__xz_default_clocking0".to_string(), (clk.clone(), sigs.clone()));
+                    self.clocking_edge
+                        .insert("__xz_default_clocking0".to_string(), edge);
+                    self.default_clocking_cb = Some(cb_name.clone());
                 }
                 self.clocking_meta.insert(cb_name.clone(), (clk, sigs));
                 self.clocking_edge.insert(cb_name.clone(), edge);
@@ -10232,14 +10242,19 @@ impl Simulator {
         if !self.clocking_meta.contains_key("__xz_default_clocking")
             && self.clocking_meta.len() == 1
         {
+            self.default_clocking_cb = self.clocking_meta.keys().next().cloned();
             if let Some(v) = self.clocking_meta.values().next().cloned() {
                 self.clocking_meta
-                    .insert("__xz_default_clocking".to_string(), v);
+                    .insert("__xz_default_clocking".to_string(), v.clone());
+                self.clocking_meta
+                    .insert("__xz_default_clocking0".to_string(), v);
             }
             if let Some((k, e)) = self.clocking_edge.iter().next().map(|(k, e)| (k.clone(), *e)) {
                 let _ = k;
                 self.clocking_edge
                     .insert("__xz_default_clocking".to_string(), e);
+                self.clocking_edge
+                    .insert("__xz_default_clocking0".to_string(), e);
             }
         }
         // Seed the runtime string_signals set from the elab-time map so that
@@ -22929,6 +22944,7 @@ impl Simulator {
         match event {
             EventControl::Identifier(id) => {
                 id.name == "__xz_default_clocking"
+                    || id.name == "__xz_default_clocking0"
                     || self.clocking_meta.contains_key(&id.name)
             }
             // The bare `@cb` form (a HierIdentifier) is a clocking event too,
@@ -27512,6 +27528,27 @@ impl Simulator {
                         return;
                     }
                     TimingControl::Event(event) => {
+                        // §14.11 `##0`: SYNCHRONIZE to the default clocking
+                        // event — a no-op when the process is already
+                        // executing in the time slot of that event (its edge
+                        // fired at the current time); otherwise park exactly
+                        // like `@(__xz_default_clocking)`.
+                        if let EventControl::Identifier(id) = event {
+                            if id.name == "__xz_default_clocking0"
+                                && self
+                                    .default_clocking_cb
+                                    .as_ref()
+                                    .and_then(|cb| self.clocking_last_edge.get(cb))
+                                    == Some(&self.time)
+                            {
+                                // The loop increments `i` at its bottom; a bare
+                                // `continue` would re-execute this statement
+                                // forever.
+                                self.exec_statement(body);
+                                i += 1;
+                                continue;
+                            }
+                        }
                         // Suspend process until the event fires
                         // Class-field named event (`@m_event` inside a method
                         // on `this`): park on the per-instance event identity.
@@ -71652,6 +71689,51 @@ impl Simulator {
             // `function string name()` silently returns empty (the enum lookup
             // finds no match and falls through to zero). Many user classes
             // define `name()`.
+            // §9.7 `p.status().name()`: the process state enum (FINISHED,
+            // RUNNING, WAITING, SUSPENDED, KILLED) is BUILT IN — it has no
+            // user enum table, so the generic reflection below found nothing
+            // and returned empty. Guarded on the receiver being a real
+            // process handle so a user class's own `status()` is untouched.
+            if mname == "name" && args.is_empty() {
+                if let ExprKind::Call { func, args: sargs } = &expr.kind {
+                    if sargs.is_empty() {
+                        // `p.status()` reaches here either as
+                        // MemberAccess{p, status} or flattened to the
+                        // 2-segment Ident `p.status`.
+                        let pbase: Option<Expression> = match &func.kind {
+                            ExprKind::MemberAccess { member, expr: pb }
+                                if member.name == "status" =>
+                            {
+                                Some((**pb).clone())
+                            }
+                            ExprKind::Ident(h)
+                                if h.path.len() == 2
+                                    && h.path[1].name.name == "status"
+                                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+                            {
+                                let mut base = h.clone();
+                                base.path.pop();
+                                Some(Expression::new(ExprKind::Ident(base), func.span))
+                            }
+                            _ => None,
+                        };
+                        if let Some(pb) = pbase {
+                            let h = self.eval_expr(&pb).to_u64().unwrap_or(0);
+                            if Self::proc_handle_to_pid(h).is_some() {
+                                let v = self.eval_expr(expr).to_u64().unwrap_or(0);
+                                let nm = match v {
+                                    0 => "FINISHED",
+                                    1 => "RUNNING",
+                                    2 => "WAITING",
+                                    3 => "SUSPENDED",
+                                    _ => "KILLED",
+                                };
+                                return Value::from_string(nm);
+                            }
+                        }
+                    }
+                }
+            }
             if mname == "name" && args.is_empty() {
                 let type_hint = self.get_expr_type_name(expr);
                 let is_class_with_name_method = type_hint
