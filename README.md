@@ -224,6 +224,16 @@ All `pr*.v` tests were taken from the **Icarus Verilog test suite**.
 
 These tests help verify correctness against real-world Verilog/SystemVerilog edge cases.
 
+### UVM tests
+
+The UVM integration tests (`tests/classes/uvm_integration_tests.rs`) run against
+the real Accellera UVM library from https://github.com/nitronis/UVM — one repo
+carrying the 1.1d, 1.2, 1800.2-2017 and 1800.2-2020 releases as subdirectories.
+No manual setup is needed: `cargo build` clones it into `target/uvm-checkout`
+when no checkout is found (and the tests clone on demand as a fallback). To use
+an existing checkout instead, set `XEZIM_UVM_DIR` to its root or clone it as a
+`../UVM` sibling of this repo.
+
 ---
 
 # Build
