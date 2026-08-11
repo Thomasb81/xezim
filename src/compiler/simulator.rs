@@ -27868,6 +27868,48 @@ impl Simulator {
                     if n == 0 {
                         self.break_flag = false;
                         self.continue_flag = false;
+                        // §14.11: a RUNTIME `##(expr)` that evaluates to 0 —
+                        // the desugared `repeat (0) @(__xz_default_clocking)`
+                        // — SYNCHRONIZES to the clocking event like the
+                        // literal ##0 (no-op when already at the edge, park
+                        // otherwise). A plain zero repeat of any other body
+                        // keeps falling straight through.
+                        if let StatementKind::TimingControl {
+                            control: TimingControl::Event(EventControl::Identifier(id)),
+                            ..
+                        } = &body.kind
+                        {
+                            if id.name == "__xz_default_clocking" {
+                                let at_edge = self
+                                    .default_clocking_cb
+                                    .as_ref()
+                                    .and_then(|cb| self.clocking_last_edge.get(cb))
+                                    == Some(&self.time);
+                                if !at_edge {
+                                    let sync = Statement::new(
+                                        StatementKind::TimingControl {
+                                            control: TimingControl::Event(
+                                                EventControl::Identifier(
+                                                    crate::ast::Identifier {
+                                                        name: "__xz_default_clocking0"
+                                                            .to_string(),
+                                                        span: stmt.span,
+                                                    },
+                                                ),
+                                            ),
+                                            stmt: Box::new(Statement::new(
+                                                StatementKind::Null,
+                                                stmt.span,
+                                            )),
+                                        },
+                                        stmt.span,
+                                    );
+                                    let cont = pc.pushed(vec![sync], pc.start + i + 1);
+                                    self.event_queue.schedule(self.time, pid, cont);
+                                    return;
+                                }
+                            }
+                        }
                         i += 1;
                         continue;
                     }
