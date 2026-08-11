@@ -312,6 +312,15 @@ sv-parser = { path = "/abs/path/to/xezim-core/xezim-parser" }
 `cargo tree -p xezim-core` shows which copy is in use (a path in parentheses means
 the patch is active).
 
+Alternatively, skip the config file and use the wrapper, which probes for the
+sibling checkout on every invocation — local path when `../xezim-core` exists,
+plain git fetch when it doesn't:
+
+```bash
+./scripts/cargo-local.sh build --release
+./scripts/cargo-local.sh test --features jit
+```
+
 ---
 
 # Run
