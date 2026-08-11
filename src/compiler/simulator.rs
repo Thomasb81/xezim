@@ -38941,7 +38941,7 @@ impl Simulator {
                                 .and_then(|o| o.as_ref())
                                 .map(|i| i.class_name.clone());
                             if let Some(cn) = cls {
-                                if self.class_parameterless_function(&cn, &member) {
+                                if self.class_bare_method(&cn, &member) {
                                     let r = self.exec_method_call(handle, &member, &[]);
                                     self.return_flag = false;
                                     return r;
