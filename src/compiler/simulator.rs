@@ -2328,7 +2328,7 @@ struct ProcessContext {
     // statement stream — see `task_cleanup` and `StatementKind::ScopePop`).
     local_iface_aliases: Vec<HashMap<String, String>>,
     ref_binding_stack: Vec<HashMap<String, Expression>>,
-    ref_alias_stack: Vec<HashMap<String, Expression>>,
+    ref_alias_stack: Vec<HashMap<String, String>>,
     queue_frame_saves: Vec<HashMap<String, QueueLocalSave>>,
     task_cleanup: Vec<TaskCleanup>,
     // Per-call-frame map of a local dynamic-array/queue/assoc LOCAL's bare
@@ -3038,6 +3038,9 @@ pub struct Simulator {
     time_format: Option<(i32, usize, String, usize)>,
     /// Maximum iterations for combinatorial settling per cycle.
     pub settle_limit: u32,
+    /// §5 diagnosability: how many settles exhausted the cap, and when last.
+    settle_limit_hits: u64,
+    settle_limit_last_time: u64,
     /// Maximum snapshot→apply_nba→settle→check_edges rounds per event-loop
     /// iter (see drain_edge_cascade). Cached at sim init; override via
     /// XEZIM_CASCADE_LIMIT env var.
@@ -3679,7 +3682,7 @@ pub struct Simulator {
     /// made during the call. Actuals that are caller-frame locals or aggregate
     /// elements keep the legacy copy-in/copy-out path (entry absent here).
     /// Pushed/popped in lockstep with `ref_binding_stack`.
-    ref_alias_stack: Vec<HashMap<String, Expression>>,
+    ref_alias_stack: Vec<HashMap<String, String>>,
     /// Deferred teardown for inlined blocking task/method calls (LIFO). Each
     /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
     /// in ProcessContext across suspension).
@@ -6423,6 +6426,8 @@ impl Simulator {
             tick_s,
             time_format: None,
             settle_limit: 100,
+            settle_limit_hits: 0,
+            settle_limit_last_time: 0,
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -34433,16 +34438,26 @@ impl Simulator {
         self.settle_triggered_list = next_list;
         self.settle_dirty_ids = cur_list;
         self.settle_iters += total_iters;
-        if total_iters > self.max_settle_iters {
-            // Unconverged = the loop exhausted its budget with entries still
-            // queued for the next pass. (The old `self.dirty_any` test here
-            // was dead: every pass ends with `dirty_any = false`, so the
-            // warning never actually fired even on a hard oscillator.)
-            if total_iters >= limit && !converged && !self.settle_triggered_list.is_empty() {
-                eprintln!("[WARN] settle limit hit ({} iters) at time {} — signals may not have converged. Use --settle-limit to increase.",
-                    limit, self.time);
+        // Unconverged = the loop exhausted its budget with entries still
+        // queued for the next pass. (The old `self.dirty_any` test here
+        // was dead: every pass ends with `dirty_any = false`, so the
+        // warning never actually fired even on a hard oscillator.)
+        //
+        // Diagnosability (§5): a design that hits the cap REPEATEDLY (the
+        // customer's does, from t=151,310) used to warn once — the
+        // max_settle_iters ratchet swallowed every later hit. Report the
+        // first three hits verbosely, then every 1000th with the running
+        // count; `finish_diagnostics` prints a final total.
+        if total_iters >= limit && !converged && !self.settle_triggered_list.is_empty() {
+            self.settle_limit_hits += 1;
+            self.settle_limit_last_time = self.time;
+            if self.settle_limit_hits <= 3 || self.settle_limit_hits % 1000 == 0 {
+                eprintln!("[WARN] settle limit hit ({} iters) at time {} — signals may not have converged (hit #{}) . Use --settle-limit to increase.",
+                    limit, self.time, self.settle_limit_hits);
                 self.report_settle_churn(&churn, CHURN_TAIL);
             }
+        }
+        if total_iters > self.max_settle_iters {
             self.max_settle_iters = total_iters;
         }
         self.settling = false;
@@ -35383,10 +35398,7 @@ impl Simulator {
                         .ref_alias_stack
                         .last()
                         .and_then(|m| m.get(fname))
-                        .and_then(|bound| match &bound.kind {
-                            ExprKind::Ident(bh) => Some(bh.path[0].name.name.clone()),
-                            _ => None,
-                        })
+                        .cloned()
                     {
                         let fname = fname.to_string();
                         if let Some(frame) = self.local_stack.last_mut() {
@@ -38800,16 +38812,14 @@ impl Simulator {
                     // a formal named like its actual (`task t(ref int foo);
                     // t(foo)`) would otherwise hit the callee frame's own
                     // copy (or recurse into this redirect).
-                    if let Some(bound) = self
+                    if let Some(storage) = self
                         .ref_alias_stack
                         .last()
                         .and_then(|m| m.get(name.as_str()))
+                        .cloned()
                     {
-                        if let ExprKind::Ident(bh) = &bound.kind {
-                            let storage = bh.path[0].name.name.clone();
-                            if let Some(v) = self.get_signal_value_by_name(&storage) {
-                                return v;
-                            }
+                        if let Some(v) = self.get_signal_value_by_name(&storage) {
+                            return v;
                         }
                     }
                     if let Some(locals) = self.local_stack.last() {
@@ -49886,7 +49896,42 @@ impl Simulator {
     ///
     /// NOTE: called AFTER the callee's local frame is pushed, so the caller's
     /// frames are second-from-top.
-    fn ref_alias_target(&self, arg: &Expression) -> Option<Expression> {
+    /// §5 diagnosability: (settle-cap hit count, last hit time). Nonzero
+    /// hits mean some time steps may not have fully converged.
+    pub fn settle_limit_report(&self) -> (u64, u64) {
+        (self.settle_limit_hits, self.settle_limit_last_time)
+    }
+
+    fn ref_alias_target(&mut self, arg: &Expression) -> Option<String> {
+        // §13.5.2: `ref arr[i]` — the ELEMENT identity is frozen at CALL
+        // time; a later change to `i` must not retarget the alias (the old
+        // copy-out re-evaluated the index at return and wrote a different
+        // element).
+        if let ExprKind::Index { expr: base, index } = &arg.kind {
+            if let ExprKind::Ident(bh) = &base.kind {
+                if bh.path.len() == 1 && bh.path[0].selects.is_empty() {
+                    let bname = bh.path[0].name.name.clone();
+                    let caller_local = self
+                        .local_stack
+                        .iter()
+                        .rev()
+                        .nth(1)
+                        .is_some_and(|f| f.contains_key(&bname));
+                    if !caller_local
+                        && self.module.arrays.contains_key(bname.as_str())
+                        && !self.module.dynamic_arrays.contains(&bname)
+                        && !self.module.queue_vars.contains(&bname)
+                        && !self.module.associative_arrays.contains_key(&bname)
+                    {
+                        let idx = self.eval_expr(index).to_i64()?;
+                        if self.get_array_elem_id(&bname, idx).is_some() {
+                            return Some(format!("{}[{}]", bname, idx));
+                        }
+                    }
+                }
+            }
+            return None;
+        }
         let h = match &arg.kind {
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => h,
             _ => return None,
@@ -49933,7 +49978,7 @@ impl Simulator {
         }
         // Plain module-visible variable storage only.
         if self.signal_name_to_id.contains_key(name) || self.signals.contains_key(name) {
-            Some(arg.clone())
+            Some(name.to_string())
         } else {
             None
         }
@@ -75811,7 +75856,7 @@ impl Simulator {
         // during the call (see `ref_alias_stack`). The callee's local frame is
         // already pushed here, so `ref_alias_target` treats the SECOND-from-
         // top frame as the caller when rejecting caller-local actuals.
-        let mut alias_map: HashMap<String, Expression> = HashMap::default();
+        let mut alias_map: HashMap<String, String> = HashMap::default();
         for (i, port) in td.ports.iter().enumerate() {
             if matches!(port.direction, crate::ast::types::PortDirection::Ref) && i < args.len() {
                 if let Some(frozen) = self.ref_alias_target(&args[i]) {

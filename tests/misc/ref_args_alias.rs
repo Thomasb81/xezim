@@ -109,3 +109,53 @@ endmodule
     assert_eq!(u(&sim, "chained_saw"), 99);
     assert_eq!(u(&sim, "loc_out"), 8, "caller-local actual: legacy copy path still lands");
 }
+
+/// §13.5.2: `ref arr[i]` freezes the ELEMENT identity at call time — a later
+/// change to `i` must not retarget the alias. Reference: a1=43 a3=0 (the old
+/// copy-out re-evaluated the index at return and wrote arr[3]).
+#[test]
+fn ref_element_identity_frozen_at_call() {
+    let src = r#"
+module top;
+  int arr [0:3];
+  int idx = 1;
+  task automatic bump(ref int r);
+    r = 42;
+    #5;
+    r = r + 1;
+  endtask
+  initial begin
+    fork
+      bump(arr[idx]);
+      begin #2 idx = 3; end
+    join
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    let a1 = sim.get_signal("arr[1]").and_then(|v| v.to_u64()).unwrap_or(999);
+    let a3 = sim.get_signal("arr[3]").and_then(|v| v.to_u64()).unwrap_or(999);
+    assert_eq!((a1, a3), (43, 0), "writes stay on the element captured at call time");
+}
+
+/// J2 remnant pin: a user function call inside a DIMENSION width is constant-
+/// evaluated (reference: wa=8 wb=16 WA=8).
+#[test]
+fn function_call_in_dimension_width() {
+    let src = r#"
+module top;
+  function automatic int width_of(input int sel);
+    return sel == 0 ? 8 : 16;
+  endfunction
+  logic [width_of(0)-1:0] a;
+  logic [width_of(1)-1:0] b;
+  localparam int WA = $bits(a);
+  int r = 0;
+  initial r = $bits(a) * 1000000 + $bits(b) * 1000 + WA;
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("simulate failed");
+    let r = sim.get_signal("r").and_then(|v| v.to_u64()).unwrap_or(0);
+    assert_eq!(r, 8016008, "wa=8 wb=16 WA=8");
+}
