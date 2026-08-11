@@ -194,5 +194,7 @@ mod trireg_charge_and_g_audit;
 mod process_status_name;
 #[path = "misc/array_element_semantics.rs"]
 mod array_element_semantics;
+#[path = "misc/fresh_audit_finds.rs"]
+mod fresh_audit_finds;
 #[path = "misc/symbol_clash_checks.rs"]
 mod symbol_clash_checks;
