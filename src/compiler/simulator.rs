@@ -4436,6 +4436,11 @@ pub struct Simulator {
     /// value (0x8000_0000+). FD STDOUT/STDERR/STDIN and MCD bit 0 are never
     /// inserted — they are handled inline at write time.
     file_handles: HashMap<i32, std::fs::File>,
+    /// §21.3.5 (measured): `$feof` is a STICKY flag set when a read
+    /// operation actually hits end-of-file — not a position probe. A read
+    /// that consumes exactly up to the final newline leaves it clear.
+    /// Cleared by `$fseek`/`$rewind`/`$ungetc` (C stdio semantics).
+    file_eof: HashSet<i32>,
     /// Per-fd ungetc pushback buffer (LIFO).
     ungetc_buf: HashMap<i32, Vec<u8>>,
     /// §20.15 stochastic-analysis queues, keyed by q_id. Created by
@@ -6866,6 +6871,7 @@ impl Simulator {
             dpi_pending_start_sim_fired: false,
             dpi_pending_end_sim_fired: false,
             file_handles: HashMap::default(),
+            file_eof: HashSet::default(),
             ungetc_buf: HashMap::default(),
             queues: HashMap::default(),
             static_task_init: HashSet::default(),
@@ -8200,6 +8206,8 @@ impl Simulator {
                     let mut b = [0u8; 1];
                     if f.read(&mut b).unwrap_or(0) == 1 {
                         got = Some(b[0]);
+                    } else {
+                        self.file_eof.insert(fd);
                     }
                 }
             }
@@ -8473,6 +8481,7 @@ impl Simulator {
             match bit {
                 Some(b) => {
                     self.file_handles.insert(b as i32, file);
+                    self.file_eof.remove(&(b as i32));
                     Value::from_u64(1u64 << b, 32)
                 }
                 None => Value::zero(32), // too many open MCD channels
@@ -8488,6 +8497,7 @@ impl Simulator {
                 Some(i) => {
                     let key = (0x8000_0000u32 | i) as i32;
                     self.file_handles.insert(key, file);
+                    self.file_eof.remove(&key);
                     Value::from_u64(0x8000_0000u64 | i as u64, 32)
                 }
                 None => Value::zero(32),
@@ -8563,11 +8573,18 @@ impl Simulator {
             return 0;
         };
         let mut got = 0usize;
+        let mut hit_end = false;
         while got < buf.len() {
             match f.read(&mut buf[got..]) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => {
+                    hit_end = true;
+                    break;
+                }
                 Ok(n) => got += n,
             }
+        }
+        if hit_end {
+            self.file_eof.insert(fd);
         }
         got
     }
@@ -41881,6 +41898,7 @@ impl Simulator {
                     };
                     if let Some(f) = self.file_handles.get_mut(&fd) {
                         let _ = f.seek(from);
+                        self.file_eof.remove(&fd);
                     }
                     Value::zero(32)
                 }
@@ -41892,6 +41910,7 @@ impl Simulator {
                         .unwrap_or(0);
                     if let Some(f) = self.file_handles.get_mut(&fd) {
                         let _ = f.seek(SeekFrom::Start(0));
+                        self.file_eof.remove(&fd);
                     }
                     Value::zero(32)
                 }
@@ -41905,6 +41924,7 @@ impl Simulator {
                         .map(|a| self.eval_file_handle_arg(a))
                         .unwrap_or(0);
                     self.ungetc_buf.entry(fd).or_default().push(ch);
+                    self.file_eof.remove(&fd);
                     Value::from_u64(ch as u64, 32)
                 }
                 "$fgets" => {
@@ -41976,25 +41996,12 @@ impl Simulator {
                     }
                 }
                 "$feof" => {
-                    use std::io::Read;
                     let fd = args
                         .first()
                         .map(|a| self.eval_file_handle_arg(a))
                         .unwrap_or(0);
-                    let buffered = self.ungetc_buf.get(&fd).is_some_and(|b| !b.is_empty());
-                    if buffered {
-                        Value::zero(32)
-                    } else if let Some(f) = self.file_handles.get_mut(&fd) {
-                        let mut b = [0u8; 1];
-                        if f.read(&mut b).unwrap_or(0) == 1 {
-                            self.ungetc_buf.entry(fd).or_default().push(b[0]);
-                            Value::zero(32)
-                        } else {
-                            Value::from_u64(1, 32)
-                        }
-                    } else {
-                        Value::from_u64(1, 32)
-                    }
+                    let flag = self.file_eof.contains(&fd) || !self.file_handles.contains_key(&fd);
+                    Value::from_u64(flag as u64, 32)
                 }
                 "$fgetc" => {
                     use std::io::Read;
@@ -42012,6 +42019,7 @@ impl Simulator {
                         if f.read(&mut b).unwrap_or(0) == 1 {
                             return Value::from_u64(b[0] as u64, 32);
                         }
+                        self.file_eof.insert(fd);
                     }
                     Value::from_u64(u32::MAX as u64, 32)
                 }
@@ -42026,6 +42034,7 @@ impl Simulator {
                         .unwrap_or(0);
                     let mut line = Vec::new();
                     let mut got_eof = true;
+                    let mut hit_end = false;
                     if let Some(f) = self.file_handles.get_mut(&fd) {
                         let mut b = [0u8; 1];
                         loop {
@@ -42042,7 +42051,10 @@ impl Simulator {
                                 }
                             }
                             match f.read(&mut b) {
-                                Ok(0) => break,
+                                Ok(0) => {
+                                    hit_end = true;
+                                    break;
+                                }
                                 Ok(_) => {
                                     got_eof = false;
                                     if b[0] == b'\n' {
@@ -42051,9 +42063,15 @@ impl Simulator {
                                     }
                                     line.push(b[0]);
                                 }
-                                Err(_) => break,
+                                Err(_) => {
+                                    hit_end = true;
+                                    break;
+                                }
                             }
                         }
+                    }
+                    if hit_end {
+                        self.file_eof.insert(fd);
                     }
                     let s = String::from_utf8_lossy(&line).to_string();
                     if let Some(d) = dest {
@@ -42067,20 +42085,12 @@ impl Simulator {
                 }
                 // §21.3.8 `$feof(fd)`: returns nonzero if the file is at EOF.
                 "$feof" => {
-                    use std::io::{Seek, SeekFrom};
                     let fd = args
                         .first()
                         .map(|a| self.eval_file_handle_arg(a))
                         .unwrap_or(0);
-                    let at_eof = if let Some(f) = self.file_handles.get_mut(&fd) {
-                        let pos = f.stream_position().unwrap_or(0);
-                        let end = f.seek(SeekFrom::End(0)).unwrap_or(0);
-                        let _ = f.seek(SeekFrom::Start(pos));
-                        pos >= end
-                    } else {
-                        false
-                    };
-                    Value::from_u64(if at_eof { 1 } else { 0 }, 32)
+                    let flag = self.file_eof.contains(&fd) || !self.file_handles.contains_key(&fd);
+                    Value::from_u64(flag as u64, 32)
                 }
                 // §21.3.7 `$ferror(fd, str)`: returns 0 if no error, writes a
                 // description string to the 2nd argument.
@@ -47638,6 +47648,37 @@ impl Simulator {
                                 }
                                 self.continue_flag = false;
                             }
+                        } else if let Some(&(l, r)) = self
+                            .module
+                            .packed_full_dims
+                            .get(&name)
+                            .filter(|d| d.len() >= 2)
+                            .and_then(|d| d.first())
+                        {
+                            // §12.7.3 (measured): a MULTI-packed-dim vector
+                            // (`logic [3:0][7:0] w`) iterates its OUTERMOST
+                            // packed dimension (4 iterations, not 32 bits),
+                            // left→right — [3:0] visits 3,2,1,0.
+                            let n = (l - r).abs() + 1;
+                            let step: i64 = if l >= r { -1 } else { 1 };
+                            let mut idx = l;
+                            for _ in 0..n {
+                                if self.finished {
+                                    break;
+                                }
+                                self.set_loop_var_aliased(
+                                    var_scope.as_deref(),
+                                    &var.name,
+                                    Self::signed_loop_val(idx),
+                                );
+                                self.continue_flag = false;
+                                self.exec_statement(body);
+                                if self.break_flag {
+                                    break;
+                                }
+                                self.continue_flag = false;
+                                idx += step;
+                            }
                         } else {
                             // Bit-by-bit foreach over a packed vector.
                             let size = self.lookup_signal_width(&name).unwrap_or(1) as u64;
@@ -49392,6 +49433,12 @@ impl Simulator {
                             self.local_stack
                                 .last_mut()
                                 .map(|frame| frame.remove(&d.name.name));
+                            // Record the declared type so type-directed
+                            // consumers (`%s` string-member detection, `%p`)
+                            // can resolve `p.member` through the typedef.
+                            self.module
+                                .var_decl_types
+                                .insert(d.name.name.clone(), data_type.clone());
                             // A decl-init whose SOURCE is an unpacked-struct
                             // CLASS property (`pair_t p = o.orig;`, incl. the
                             // ternary form) must write the leaves member-wise —
@@ -51855,6 +51902,7 @@ impl Simulator {
                     || self
                         .get_expr_type_name(expr)
                         .is_some_and(|t| t == "string")
+                    || self.local_struct_member_is_string(h)
             }
             ExprKind::Index { expr: base, .. } => {
                 (if let ExprKind::Ident(h) = &base.kind {
@@ -51865,10 +51913,20 @@ impl Simulator {
                     .get_expr_type_name(base)
                     .is_some_and(|t| t == "string")
             }
-            ExprKind::MemberAccess { .. } => {
+            ExprKind::MemberAccess { expr: base, member } => {
                 // A `this.<prop>` / `obj.<prop>` access where the property is
-                // declared `string` in the class definition, or a 0-arg method.
-                self.class_member_is_string(expr) || self.call_returns_string(expr)
+                // declared `string` in the class definition, a 0-arg method,
+                // or a member of a local/module unpacked-struct variable.
+                self.class_member_is_string(expr)
+                    || self.call_returns_string(expr)
+                    || (if let ExprKind::Ident(bh) = &base.kind {
+                        self.struct_var_member_is_string(
+                            &bh.path[0].name.name,
+                            &member.name,
+                        )
+                    } else {
+                        false
+                    })
             }
             // A method/function call whose return type is `string`
             // (e.g. `obj.str()`, `this.convert2string()`). Without
@@ -51878,6 +51936,44 @@ impl Simulator {
             ExprKind::Call { func, .. } => self.call_returns_string(func),
             _ => false,
         }
+    }
+
+    /// `p.member` where `p` is a (frame-local or module) variable whose
+    /// DECLARED type resolves to an unpacked struct with a `string`-typed
+    /// member of that name. Such paths parse as one dotted Ident and are
+    /// invisible to the class-property and signal-registration checks, so
+    /// `%s` treated the container-stored string as a packed value and
+    /// padded it to the container width.
+    fn local_struct_member_is_string(&self, h: &crate::ast::expr::HierarchicalIdentifier) -> bool {
+        if h.path.len() < 2 {
+            return false;
+        }
+        self.struct_var_member_is_string(
+            &h.path[0].name.name,
+            &h.path[h.path.len() - 1].name.name,
+        )
+    }
+
+    /// Does variable `base`'s declared type resolve to an unpacked struct
+    /// with a `string`-typed member named `member`?
+    fn struct_var_member_is_string(&self, base: &str, member: &str) -> bool {
+        use crate::ast::types::{DataType, SimpleType};
+        let Some(dt) = self.module.var_decl_types.get(base) else {
+            return false;
+        };
+        let resolved = self.resolve_dt(&dt.clone());
+        let DataType::Struct(su) = &resolved else {
+            return false;
+        };
+        su.members.iter().any(|m| {
+            matches!(
+                m.data_type,
+                DataType::Simple {
+                    kind: SimpleType::String,
+                    ..
+                }
+            ) && m.declarators.iter().any(|d| d.name.name == member)
+        })
     }
 
     /// Determine whether `expr` denotes a CLASS PROPERTY whose declared type
@@ -51971,6 +52067,23 @@ impl Simulator {
     fn call_returns_string(&self, func: &Expression) -> bool {
         use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::{DataType, SimpleType};
+        // A plain module/package FUNCTION with a `string` return type
+        // (`$display("%s", where_am_i())`) — not a class method at all.
+        if let ExprKind::Ident(h) = &func.kind {
+            if let Some(seg) = h.path.last() {
+                if let Some(fd) = self.module.functions.get(&seg.name.name) {
+                    if matches!(
+                        fd.return_type,
+                        DataType::Simple {
+                            kind: SimpleType::String,
+                            ..
+                        }
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
         // Extract (class_name, method_name).
         let (class_name, method_name): (Option<String>, Option<String>) = match &func.kind {
                 ExprKind::MemberAccess { expr: recv, member } => {
@@ -52694,8 +52807,41 @@ impl Simulator {
                                         if let ExprKind::StringLiteral(s) = &args[ai - 1].kind {
                                             let lit = s.clone();
                                             result.push_str(&field(lit, 0));
-                                        } else {
+                                        } else if self.expr_is_string_valued(&args[ai - 1]) {
                                             result.push_str(&field(v.to_sv_string(), 0));
+                                        } else {
+                                            // §21.2.1.3 (measured): %s of a PACKED
+                                            // operand renders ceil(width/8) chars —
+                                            // every byte prints, NUL as a space
+                                            // ("[  Hi]", "[A B]"); %0s strips the
+                                            // leading NULs (minimal form).
+                                            let minimal = has_width && pad_width == 0;
+                                            let nbytes = (v.width as usize).div_ceil(8);
+                                            let mut bytes: Vec<u8> =
+                                                Vec::with_capacity(nbytes);
+                                            for bi in (0..nbytes).rev() {
+                                                let mut byte = 0u8;
+                                                for b in 0..8usize {
+                                                    let idx = bi * 8 + b;
+                                                    if idx < v.width as usize
+                                                        && v.get_bit(idx)
+                                                            == LogicBit::One
+                                                    {
+                                                        byte |= 1 << b;
+                                                    }
+                                                }
+                                                bytes.push(byte);
+                                            }
+                                            if minimal {
+                                                while bytes.first() == Some(&0) {
+                                                    bytes.remove(0);
+                                                }
+                                            }
+                                            let s: String = bytes
+                                                .iter()
+                                                .map(|&b| if b == 0 { ' ' } else { b as char })
+                                                .collect();
+                                            result.push_str(&field(s, 0));
                                         }
                                     }
                                     'c' | 'C' => {
@@ -76461,17 +76607,59 @@ impl Simulator {
                             .find_map(|(n, v)| (n == "at_least").then(|| opt_u64(v)).flatten())
                             .unwrap_or(cg_at_least)
                             .max(1);
-                        let hit = explicit
-                            .iter()
-                            .filter(|b| {
-                                bin_hit(
-                                    &format!("{}.{}", cp_name, b.name.name),
-                                    b.array_form,
-                                    at_least,
-                                )
-                            })
-                            .count();
-                        hit as f64 / explicit.len() as f64
+                        // §19.5.2 (measured): `bins b[] = {[0:3]}` creates one
+                        // SUB-BIN per value — 2 of 4 hit is 50%, not 100%. An
+                        // array-form bin contributes its VALUE COUNT to the
+                        // denominator and its distinct hit sub-bins to the
+                        // numerator; a scalar bin contributes 1/1.
+                        let mut total_bins = 0u64;
+                        let mut hit_bins = 0u64;
+                        for b in &explicit {
+                            let key = format!("{}.{}", cp_name, b.name.name);
+                            if b.array_form {
+                                let nvals: u64 = b
+                                    .values
+                                    .iter()
+                                    .map(|r| match r {
+                                        crate::ast::decl::ConstraintRange::Value(_) => 1u64,
+                                        crate::ast::decl::ConstraintRange::Range { lo, hi } => {
+                                            let l = super::elaborate::const_eval_i64_with_params(
+                                                lo, None,
+                                            )
+                                            .unwrap_or(0);
+                                            let h = super::elaborate::const_eval_i64_with_params(
+                                                hi, None,
+                                            )
+                                            .unwrap_or(l);
+                                            (h - l).unsigned_abs() + 1
+                                        }
+                                    })
+                                    .sum();
+                                let nvals = nvals.max(1);
+                                let pre = format!("{}[", key);
+                                let mut sub_hit: std::collections::HashSet<&str> =
+                                    std::collections::HashSet::new();
+                                for inst in insts {
+                                    for (k, &c) in inst.bin_hits.iter() {
+                                        if c >= at_least && k.starts_with(&pre) {
+                                            sub_hit.insert(k.as_str());
+                                        }
+                                    }
+                                }
+                                total_bins += nvals;
+                                hit_bins += (sub_hit.len() as u64).min(nvals);
+                            } else {
+                                total_bins += 1;
+                                if bin_hit(&key, false, at_least) {
+                                    hit_bins += 1;
+                                }
+                            }
+                        }
+                        if total_bins == 0 {
+                            0.0
+                        } else {
+                            hit_bins as f64 / total_bins as f64
+                        }
                     };
                     // §19.7 option.weight (default 1) weights this coverpoint in
                     // the covergroup's mean.
@@ -80925,6 +81113,9 @@ impl Simulator {
                             if sig.is_signed {
                                 signed_rand_props.insert(prop.clone());
                             }
+                            if std::env::var_os("XEZIM_RAND_DBG").is_some() {
+                                eprintln!("RPROP {} w={} signed={}", prop, sig.width, sig.is_signed);
+                            }
                             if let Some(tn) = enum_t {
                                 enum_prop_types.insert(prop.clone(), tn);
                             }
@@ -81588,9 +81779,20 @@ impl Simulator {
                             }
 
                             self.this_stack.push(Some(handle));
-                            let val = self.eval_expr(expr);
+                            let mut val = self.eval_expr(expr);
                             self.this_stack.pop();
 
+                            // §18.4 (measured): an equality pin lands at the
+                            // property's DECLARED width/signedness — `bit
+                            // [3:0] y` pinned to a negative int solves to 15.
+                            // Widening happens FIRST with the pinned value's
+                            // OWN signedness (an unsigned 16-bit 0x8000
+                            // zero-extends to +32768, §11.8.1), then the
+                            // property's signedness applies.
+                            if *width > 0 && val.width != *width {
+                                val = val.resize(*width);
+                            }
+                            val.is_signed = signed_rand_props.contains(name);
                             solved_props.insert(name.clone(), val);
                             pids_to_solve.remove(i);
                             progress = true;
@@ -81759,7 +81961,24 @@ impl Simulator {
             // Apply solved props to instance
             if let Some(Some(inst)) = self.heap.get_mut(handle) {
                 for (name, val) in &solved_props {
-                    inst.properties.insert(name.clone(), val.clone());
+                    // §18.4 (measured): the solution lands at the property's
+                    // DECLARED width — `bit [3:0] y` pinned equal to a
+                    // negative int reads back truncated (15), not as a
+                    // 32-bit -1 leaking through the 4-bit field.
+                    let mut v = val.clone();
+                    if !real_rand_props.contains(name) {
+                        if let Some(&(_, w)) =
+                            rand_props.iter().find(|(n, _)| n == name)
+                        {
+                            if w > 0 {
+                                if v.width != w {
+                                    v = v.resize(w);
+                                }
+                                v.is_signed = signed_rand_props.contains(name);
+                            }
+                        }
+                    }
+                    inst.properties.insert(name.clone(), v);
                 }
             }
 
