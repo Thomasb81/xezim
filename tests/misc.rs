@@ -178,6 +178,8 @@ mod x_warn_switch;
 #[path = "misc/xselect_and_concat_flatten.rs"]
 mod xselect_and_concat_flatten;
 
+#[path = "misc/array_elem_fast_write.rs"]
+mod array_elem_fast_write;
 #[path = "misc/severity_exit_status.rs"]
 mod severity_exit_status;
 #[path = "misc/preprocessor_directives.rs"]
