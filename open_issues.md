@@ -78,8 +78,6 @@ deferred.
 
 Each entry is a reference-validated finding from the original audit sweeps.
 
-### G10, G11, G6 — misc
-`#1step` parse, `$bits("")` should be 8, `trireg` behaviour note.
 
 ### H3 remainder — `ref` aggregate/caller-local aliasing
 CLOSED for plain module-visible variables (true aliasing: mid-call
@@ -95,9 +93,16 @@ reference's minimal+zero-pad model — commercial tools disagree here and the
 previous pin followed the other tool; unconsumed display args now print
 default-width decimal. `tests/strings/format_sibling_fixes.rs`.)
 
-### F6–F10 — clocking / process
-Clocking skews, `##0` synchronization, and `process` status naming.
-(`##n` without a `default clocking` block is now rejected — closed.)
+### F6–F10 — CLOSED
+Clocking skews were already reference-exact; `##0` now synchronizes to the
+default clocking event (waits off-edge, no-op at the edge — the previous
+suite pin of "never waits" contradicted the reference and was re-measured);
+`process.status().name()` returns the built-in state name. Residual
+simplification: a RUNTIME count expression evaluating to 0 (`##(n)` with
+n==0) keeps the repeat form and waits a cycle — literal `##0` is correct.
+(G6/G10/G11 also closed: trireg charge storage via an implicit weak
+self-driver + x initial value; `#1step` and `$bits("")` were already
+reference-exact.)
 
 ### J4, J6–J12 — hierarchy
 Interface ports, exports, port z-padding, nested modules.
