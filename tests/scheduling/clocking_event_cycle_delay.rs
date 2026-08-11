@@ -150,3 +150,34 @@ endmodule
         "diagnostic should name the missing default clocking block, got: {err}"
     );
 }
+
+/// §14.11: a RUNTIME `##(expr)` evaluating to 0 synchronizes exactly like
+/// the literal `##0` — waits off-edge, no-op at the event. Reference:
+/// rt0=5, rt0b=5, rt2=25. (The literal-only limitation is closed.)
+#[test]
+fn runtime_zero_cycle_delay_synchronizes() {
+    const SRC: &str = r#"
+`timescale 1ns/1ns
+module top;
+  logic clk = 0;
+  int n = 0;
+  always #5 clk = ~clk;
+  default clocking cb @(posedge clk); endclocking
+  initial begin
+    #2;
+    ##(n);
+    $display("RT0 t=%0t", $time);
+    ##(n);
+    $display("RT0B t=%0t", $time);
+    n = 2;
+    ##(n);
+    $display("RT2 t=%0t", $time);
+    $finish;
+  end
+endmodule
+"#;
+    let out = output_of(&simulate(SRC, 200).expect("sim"));
+    assert!(out.contains("RT0 t=5"), "runtime 0 waits off-edge:\n{}", out);
+    assert!(out.contains("RT0B t=5"), "runtime 0 no-ops at the edge:\n{}", out);
+    assert!(out.contains("RT2 t=25"), "runtime 2 waits two edges:\n{}", out);
+}

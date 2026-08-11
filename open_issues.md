@@ -104,9 +104,9 @@ default-width decimal. `tests/strings/format_sibling_fixes.rs`.)
 Clocking skews were already reference-exact; `##0` now synchronizes to the
 default clocking event (waits off-edge, no-op at the edge — the previous
 suite pin of "never waits" contradicted the reference and was re-measured);
-`process.status().name()` returns the built-in state name. Residual
-simplification: a RUNTIME count expression evaluating to 0 (`##(n)` with
-n==0) keeps the repeat form and waits a cycle — literal `##0` is correct.
+`process.status().name()` returns the built-in state name. The runtime-count form (`##(n)` with n==0) now synchronizes
+too — the zero-count repeat of the clocking marker re-parks on the sync
+marker (no residual simplification).
 (G6/G10/G11 also closed: trireg charge storage via an implicit weak
 self-driver + x initial value; `#1step` and `$bits("")` were already
 reference-exact.)
@@ -132,10 +132,17 @@ accepted (consumed at parse). Remaining, each reference-validated:
   z" note here was a MIS-MEASUREMENT — the reference x's assign-cycles
   too; xezim's cycle behavior was reference-correct all along, and the
   driven-net x-seed keeps its delayed-driver rationale.)
-- **Wildcard export lenience** (§26.6): `export base_pkg::*` in a package
-  that never references the imported names re-exports them anyway; the
-  reference errors at the downstream use ("Failed to find 'base_val'").
-  xezim accepts — accepts-invalid, benign direction.
+- **Wildcard export lenience** (§26.6) — CLOSED: `export P::*|P::sym|*::*`
+  is now parsed (`PackageItem::Export`) and the nested-import chase in
+  `process_import` is gated on it. Measured semantics: a wildcard import
+  re-exposes a package's own imports ONLY when that package exports them,
+  and a wildcard export covers only names the exporting package itself
+  REFERENCES (unreferenced → the reference's "Failed to find" at the use
+  site; xezim now rejects the same designs). Explicit `export P::sym`
+  bypasses the referenced-candidacy check. Candidacy is scanned from
+  parameter/variable initializers (subroutine bodies not scanned — the
+  initializer shape is the measured/common one; an explicit export covers
+  the rest).
 
 ### J2c, J2e — const-eval remnants
 Type-parameter `$bits`, and interface-port parameters. (The rest of the
