@@ -23989,6 +23989,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+            || !self.pending_nba_instance_triggers.is_empty()
             || self.delayed_nba_due()
         {
             self.apply_nba();
@@ -24094,6 +24095,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+            || !self.pending_nba_instance_triggers.is_empty()
             || self.delayed_nba_due()
         {
                 self.apply_nba();
@@ -26029,6 +26031,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+            || !self.pending_nba_instance_triggers.is_empty()
             || self.delayed_nba_due()
         {
                 self.apply_nba();
@@ -27523,9 +27526,15 @@ impl Simulator {
                         }
                         // `@(h.ce)`: a class-property event reached through a
                         // handle from OUTSIDE the class. `resolve_this_event_field`
-                        // above only covers a bare field on `this`.
+                        // above only covers a bare field on `this`; the general
+                        // resolver adds receivers with runtime selects
+                        // (`@(m_events[obj].all_dropped)` — the UVM objection
+                        // wait, #109) and chained handles.
                         if let Some(expr) = Self::event_control_single_expr(event) {
-                            if let Some(key) = self.expr_handle_event_field(&expr) {
+                            if let Some(key) = self
+                                .expr_handle_event_field(&expr)
+                                .or_else(|| self.expr_instance_event_field_general(&expr))
+                            {
                                 let cont = vec![*body.clone()];
                                 // Chain the caller's tail rather than copying it.
                                 let cont = pc.pushed(cont, pc.start + i + 1);
@@ -47448,6 +47457,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+            || !self.pending_nba_instance_triggers.is_empty()
         {
                             self.apply_nba();
                         }
@@ -47466,6 +47476,27 @@ impl Simulator {
                         // Same rationale as the run_process_stmts arm.
                         if let Some(fname) = self.event_control_field_name(e) {
                             if let Some(key) = self.resolve_this_event_field(&fname) {
+                                let cont = vec![*stmt.clone()];
+                                let pid = self.current_pid;
+                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                    key,
+                                    pid,
+                                    continuation: cont.into(),
+                                });
+                                self.break_flag = true;
+                                return;
+                            }
+                        }
+                        // Member-reached event property (`@(h.ce)`,
+                        // `@(m_events[obj].all_dropped)`) — same routing as the
+                        // run_process_stmts arm; without it these fell into the
+                        // generic waiter below with a sensitivity that never
+                        // matches an instance event.
+                        if let Some(expr) = Self::event_control_single_expr(e) {
+                            if let Some(key) = self
+                                .expr_handle_event_field(&expr)
+                                .or_else(|| self.expr_instance_event_field_general(&expr))
+                            {
                                 let cont = vec![*stmt.clone()];
                                 let pid = self.current_pid;
                                 self.instance_event_waiters.push(InstanceEventWaiter {
@@ -49105,12 +49136,17 @@ impl Simulator {
                     }
                 }
             }
-            StatementKind::EventTrigger { name, nonblocking, .. } => {
+            StatementKind::EventTrigger { name, nonblocking, target, .. } => {
                 if *nonblocking {
                     // §15.5.2: defer to the NBA region of the current slot.
                     // Resolve a class-field instance key NOW (while `this` is
                     // live); the NBA drain cannot reconstruct it later.
                     if let Some(key) = self.resolve_this_event_field(&name.name) {
+                        self.pending_nba_instance_triggers.push(key);
+                    } else if let Some(key) = target
+                        .as_ref()
+                        .and_then(|t| self.expr_instance_event_field_general(t))
+                    {
                         self.pending_nba_instance_triggers.push(key);
                     } else {
                         self.pending_nba_triggers.push(name.name.clone());
@@ -49129,6 +49165,17 @@ impl Simulator {
                         self.fire_instance_event(key);
                         return;
                     }
+                }
+                // Receivers the flattened string cannot express — runtime
+                // selects (`-> m_events[obj].all_dropped`, the UVM objection
+                // drop path, #109) and chained handles — resolve from the
+                // carried target EXPRESSION.
+                if let Some(key) = target
+                    .as_ref()
+                    .and_then(|t| self.expr_instance_event_field_general(t))
+                {
+                    self.fire_instance_event(key);
+                    return;
                 }
                 // An event bound to a `ref` formal fires the CALLER's event.
                 if !self.module.events.contains(name.name.as_str()) {
@@ -49439,6 +49486,84 @@ impl Simulator {
             _ => return None,
         };
         self.resolve_handle_event_field(&dotted)
+    }
+
+    /// §15.5: an event CLASS PROPERTY reached through an ARBITRARY receiver
+    /// expression — `direct.ev` (property-of-`this` handle), `m_events[key].ev`
+    /// (assoc element, runtime key), `q[0].ev` (queue element), `h.grp.ev`
+    /// (chained handles). `resolve_handle_event_field` only accepts a
+    /// select-free single-segment receiver, so all of these fell into the
+    /// delta-yield and woke at t=0 — which is exactly the UVM objection spin:
+    /// `uvm_objection::wait_for`'s `@(m_events[obj].all_dropped)` returned
+    /// immediately, so `wait_for_self_and_siblings_to_drop` re-entered it
+    /// forever and simulation never left the time step (GitHub #109, UVM
+    /// 1800.2-2017). The receiver is EVALUATED here (per §9.4.2 the event
+    /// expression is sampled when the wait executes), and the field must be a
+    /// declared `event` property of the object's class — a non-event member
+    /// keeps its existing (value-change) path.
+    fn expr_instance_event_field_general(&mut self, e: &Expression) -> Option<(usize, String)> {
+        // Split <receiver-expr>.<field>: a MemberAccess head, or a
+        // multi-segment hierarchical ident whose LAST segment is select-free.
+        let (recv_expr, field): (Expression, String) = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => ((**expr).clone(), member.name.clone()),
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.last().is_some_and(|s| s.selects.is_empty()) =>
+            {
+                let mut recv = h.clone();
+                let field = recv.path.pop()?.name.name;
+                (
+                    Expression::new(ExprKind::Ident(recv), e.span),
+                    field,
+                )
+            }
+            _ => return None,
+        };
+        let handle = match &recv_expr.kind {
+            ExprKind::This => self.this_stack.last().copied().flatten()?,
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let n = h.path[0].name.name.as_str();
+                if n == "this" || n == "super" {
+                    self.this_stack.last().copied().flatten()?
+                } else {
+                    self.eval_ident_handle(n)?
+                }
+            }
+            // Selects / chains: evaluate the receiver expression to a handle.
+            _ => {
+                let h = self.eval_expr(&recv_expr).to_u64()? as usize;
+                if h == 0 {
+                    return None; // null handle
+                }
+                h
+            }
+        };
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
+        if !inst.properties.contains_key(&field) {
+            return None;
+        }
+        // Walk the class hierarchy: accept only a declared `event` property.
+        // A missing property_types entry (older registration paths) falls back
+        // to accepting property existence, matching resolve_this_event_field.
+        let mut cur = Some(inst.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else { break };
+            if let Some(dt) = cd.property_types.get(&field) {
+                return if matches!(
+                    dt,
+                    DataType::Simple { kind: crate::ast::types::SimpleType::Event, .. }
+                ) {
+                    Some((handle, field))
+                } else {
+                    None
+                };
+            }
+            cur = cd.extends.clone();
+        }
+        Some((handle, field))
     }
 
     /// §15.5 / §13.5.2: an event passed as a `ref` formal. `-> x` and `@x`

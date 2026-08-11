@@ -201,6 +201,27 @@ the simulator was DEAD CODE and class-free designs paid class-resolution
 probes on every indexed access. All guards now use `no_class_objects()`
 (len <= 1).
 
+## 4c. Module-scope storage crossed with class-method paths (two gaps)
+
+Both found while validating the #109 fix (class-event member wait/trigger);
+both reference-validated as divergences and PRE-EXISTING (reproduced on
+clean main, `--no-cache`).
+
+**(a) Property writes through a module-scope handle variable are lost.**
+`B h; A m;` at MODULE scope; `h = new; h.direct = new; h.direct.tag = 11;
+m = h.direct;` → `m.tag` reads x (reference: 11). The same statements with
+`h`/`m` declared inside the initial block work. Queue-property writes
+through the same module-scope handle (`h.q.push_back(t)`) DO land, so the
+break is specific to plain-property (and assoc-element) stores resolving
+through a module-scope receiver. Repro: `scratchpad/uvm/rp_min2.sv` (x)
+vs `rp_min3.sv` (locals, correct).
+
+**(b) Hierarchical writes to module vars from class methods are dropped.**
+`tb.counter++` inside a class task executes without effect or diagnostic
+(reference: increments). Repro: `scratchpad/uvm/t109_cli.sv` — `created`
+stays 0 while the surrounding protocol works. A silent no-op write is the
+worst failure mode; if unsupported it must at least error.
+
 ## 5. Diagnosability
 
 - **Settle-cap silence.** `--settle-limit` hits warn once, then the cap is
