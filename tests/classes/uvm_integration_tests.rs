@@ -7,11 +7,12 @@
 //!   2. `../UVM` (sibling of this repo)
 //!   3. auto-cloned (shallow) into `target/uvm-checkout`
 //!
-//! The bare run-phase test is the #109 regression pin: `run_test()` used
+//! The bare run-phase tests are the #109 regression pin: `run_test()` used
 //! to spin at 99% CPU without advancing time; it now completes the phase
 //! cycle, so an objection held for #100 must end the run at t=100 on all
 //! three validated UVM versions (1.1d bootstraps but is not yet
-//! label-clean, see debug_notes round 44).
+//! label-clean, see debug_notes round 44). The 2020 tests additionally pin
+//! the full TLM bench (sequencer/driver/monitor/scoreboard) and config_db.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -141,23 +142,103 @@ fn uvm_1800_2_2020_bare_run_phase_completes() {
     bare_run_completes_on("1800.2-2020");
 }
 
-// Full driver/sequencer/monitor/scoreboard bench: build phase succeeds but
-// the connect phase reports "connection count of 0" for every TLM export
-// (seq_item_export, analysis fifos), then BUILDERR stops the run — port
-// connect() registration is not reaching resolve_bindings yet.
+/// Full driver/sequencer/monitor/scoreboard bench on UVM 1800.2-2020: the
+/// sequence drives 10 transactions through the sequencer/driver TLM
+/// handshake; the monitor's analysis port fans out to the scoreboard. Pins
+/// the assoc-key fix that unblocked TLM: connection registries are keyed by
+/// hierarchical names (dotted strings), which key enumeration used to drop —
+/// every `connect()` then resolved to 0 connections and BUILDERR aborted
+/// the run at t=0.
 #[test]
-#[ignore = "uvm-1.2: TLM export connection counts resolve to 0 in the connect phase"]
-fn test_uvm_complete() {
+fn uvm_2020_complete_bench_runs_traffic() {
     let test_src = std::fs::read_to_string("tests/uvm/uvm_complete_test.sv")
         .expect("Could not read uvm_complete_test.sv");
-    let sim = run_uvm("1.2", &[], test_src, "top").expect("UVM complete test failed");
+    let sim = run_uvm("1800.2-2020", &[], test_src, "top")
+        .expect("UVM 2020 complete bench failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
         !out.iter().any(|l| l.contains("UVM_ERROR") || l.contains("UVM_FATAL")),
         "UVM errors:\n{}",
         out.join("\n")
     );
+    let checked = out.iter().filter(|l| l.contains("[SB] Checked data:")).count();
+    assert_eq!(checked, 10, "scoreboard must check all 10 transactions:\n{}", out.join("\n"));
+    assert_eq!(sim.time, 100, "test drops its objection at t=100");
 }
+
+/// UVM 1800.2-2020 `uvm_config_db#(int)`: a value set at the top against
+/// `uvm_test_top` must be visible to the test's build_phase get.
+#[test]
+fn uvm_2020_config_db_reaches_build_phase() {
+    let sim = run_uvm("1800.2-2020", &[], CFG_TEST.to_string(), "top")
+        .expect("UVM 2020 config_db test failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter().any(|l| l.contains("cfg=77")),
+        "config_db set(uvm_test_top, magic, 77) must reach build_phase:\n{}",
+        out.join("\n")
+    );
+}
+
+// `base_c::type_id::set_type_override(deriv_c::get_type())` before create()
+// still constructs base_c — the factory override table is not consulted on
+// the create path yet (kind=base, expected deriv).
+#[test]
+#[ignore = "uvm 2020: factory set_type_override does not redirect type_id::create yet"]
+fn uvm_2020_factory_type_override() {
+    let sim = run_uvm("1800.2-2020", &[], CFG_TEST.to_string(), "top")
+        .expect("UVM 2020 factory test failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter().any(|l| l.contains("kind=deriv")),
+        "type override must make create() return the derived type:\n{}",
+        out.join("\n")
+    );
+}
+
+/// Factory-override + config_db probe (see the two tests above).
+const CFG_TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+class base_c extends uvm_component;
+  `uvm_component_utils(base_c)
+  function new(string name, uvm_component parent); super.new(name, parent); endfunction
+  virtual function string kind(); return "base"; endfunction
+endclass
+
+class deriv_c extends base_c;
+  `uvm_component_utils(deriv_c)
+  function new(string name, uvm_component parent); super.new(name, parent); endfunction
+  virtual function string kind(); return "deriv"; endfunction
+endclass
+
+class cfg_test extends uvm_test;
+  `uvm_component_utils(cfg_test)
+  base_c comp;
+  int cfgval;
+  function new(string name = "cfg_test", uvm_component parent = null); super.new(name, parent); endfunction
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    base_c::type_id::set_type_override(deriv_c::get_type());
+    comp = base_c::type_id::create("comp", this);
+    if (!uvm_config_db#(int)::get(this, "", "magic", cfgval)) cfgval = -1;
+  endfunction
+  virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
+    `uvm_info("CFG", $sformatf("kind=%s cfg=%0d", comp.kind(), cfgval), UVM_LOW)
+    #10;
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module top;
+  initial begin
+    uvm_config_db#(int)::set(null, "uvm_test_top", "magic", 77);
+    run_test("cfg_test");
+  end
+endmodule
+"#;
 
 // Phasing ends at t=0 with no producer/consumer traffic — the packet
 // stimulus never starts. Same family as the connect-phase gap above.
