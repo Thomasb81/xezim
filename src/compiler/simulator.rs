@@ -35181,6 +35181,66 @@ impl Simulator {
         // object). Gated on the receiver's value resolving to a live heap
         // instance that declares the property, so struct-element member
         // writes (composed-name storage) are untouched.
+        // §4c: `h.prop = v` where `h` is a MODULE-SCOPE class-handle variable
+        // (either parse shape). A REAL hierarchical signal `h.prop` must win —
+        // only route to the heap when no such signal exists and the head's
+        // value is a live object declaring the property. Previously the write
+        // landed on a phantom flattened name and silently vanished.
+        {
+            let head_field: Option<(String, String)> = match &lhs.kind {
+                ExprKind::Ident(h2)
+                    if h2.path.len() == 2
+                        && h2.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    Some((h2.path[0].name.name.clone(), h2.path[1].name.name.clone()))
+                }
+                ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
+                    ExprKind::Ident(h2)
+                        if h2.path.len() == 1 && h2.path[0].selects.is_empty() =>
+                    {
+                        Some((h2.path[0].name.name.clone(), member.name.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((head, field)) = head_field {
+                let is_local = self
+                    .local_stack
+                    .last()
+                    .is_some_and(|l| l.contains_key(&head));
+                let dotted = format!("{}.{}", head, field);
+                let dotted_signal = self.signal_name_to_id.contains_key(dotted.as_str())
+                    || self.signals.contains_key(&dotted);
+                if !is_local && !dotted_signal {
+                    // §23.7: `<top>.<sig>` from a class method writes the top
+                    // module's own variable (silently dropped before).
+                    if head == self.module.name
+                        && (self.signal_name_to_id.contains_key(field.as_str())
+                            || self.signals.contains_key(&field))
+                    {
+                        self.set_signal_value_by_name(&dotted, val.clone());
+                        return true;
+                    }
+                    if let Some(h) = self.eval_ident_handle(&head) {
+                        if h != 0 {
+                            let holds = self
+                                .heap
+                                .get(h)
+                                .and_then(|o| o.as_ref())
+                                .is_some_and(|inst| inst.properties.contains_key(&field));
+                            if holds {
+                                let fitted = self.fit_class_prop(h, &field, val);
+                                if let Some(Some(inst)) = self.heap.get_mut(h) {
+                                    inst.properties.insert(field, fitted);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let ExprKind::MemberAccess { expr: recv, member } = &lhs.kind {
             if matches!(recv.kind, ExprKind::Index { .. }) {
                 let h = self.eval_expr(recv).to_u64().unwrap_or(0) as usize;
@@ -38590,6 +38650,27 @@ impl Simulator {
                     let dotted = format!("{}.{}", hier.path[0].name.name, hier.path[1].name.name);
                     if let Some(v) = self.get_signal_value_by_name(&dotted) {
                         return v;
+                    }
+                    // §4c: `h.prop` where `h` is a MODULE-SCOPE class-handle
+                    // variable. No composed signal exists (the hit above wins
+                    // for real instance paths), so resolve the head to its
+                    // heap object and read the property — previously this
+                    // fell through and returned x.
+                    if hier.path[0].selects.is_empty() && hier.path[1].selects.is_empty() {
+                        let head = hier.path[0].name.name.as_str();
+                        let field = hier.path[1].name.name.as_str();
+                        if let Some(hval) = self.eval_ident_handle(head) {
+                            if hval != 0 {
+                                if let Some(v) = self
+                                    .heap
+                                    .get(hval)
+                                    .and_then(|o| o.as_ref())
+                                    .and_then(|inst| inst.properties.get(field))
+                                {
+                                    return v.clone();
+                                }
+                            }
+                        }
                     }
                 }
                 // LRM §14.3 clocking-block input read — `cb.<sig>` returns
@@ -44395,11 +44476,42 @@ impl Simulator {
                                 .last()
                                 .map(|s| s.name.name.clone())
                                 .unwrap_or_default();
-                            let elem_cls = self
-                                .module
-                                .array_elem_class
-                                .get(&bname)
-                                .cloned()
+                            // §4c: `h.assoc[k] = new` — the collection is a
+                            // property of the object `h` (a handle variable,
+                            // module scope included). Resolve the element
+                            // class from the RECEIVER's runtime class; the
+                            // maps below only cover module-scope collections
+                            // and the current class context.
+                            let recv_elem_cls: Option<String> = if bh.path.len() == 2
+                                && bh.path[0].selects.is_empty()
+                            {
+                                self.eval_ident_handle(&bh.path[0].name.name)
+                                    .filter(|&h| h != 0)
+                                    .and_then(|h| {
+                                        self.heap
+                                            .get(h)
+                                            .and_then(|o| o.as_ref())
+                                            .map(|i| i.class_name.clone())
+                                    })
+                                    .and_then(|mut cn| loop {
+                                        let cd = self.module.classes.get(&cn)?;
+                                        if let Some(tn) = cd
+                                            .properties
+                                            .get(&bname)
+                                            .and_then(|sig| sig.type_name.clone())
+                                        {
+                                            break Some(tn);
+                                        }
+                                        match cd.extends.clone() {
+                                            Some(p) => cn = p,
+                                            None => break None,
+                                        }
+                                    })
+                            } else {
+                                None
+                            };
+                            let elem_cls = recv_elem_cls
+                                .or_else(|| self.module.array_elem_class.get(&bname).cloned())
                                 .or_else(|| self.var_class_types.get(&bname).cloned())
                                 .or_else(|| {
                                     // Class-MEMBER collection (static or instance):
@@ -59456,6 +59568,18 @@ impl Simulator {
             if let Some(v) = self.local_stack.last().and_then(|l| l.get(name)) {
                 return Some(v.clone());
             }
+            // §23.7/§4c: `<top>.<sig>` names the TOP MODULE's own variable —
+            // signals are stored unprefixed, so strip the module name when
+            // the dotted spelling itself is not a registered signal (a
+            // genuine composed name always wins). `tb.counter` read from a
+            // class method silently returned x without this.
+            if !self.signal_name_to_id.contains_key(name) && !self.signals.contains_key(name) {
+                if let Some(rest) = name.strip_prefix(&format!("{}.", self.module.name)) {
+                    if let Some(v) = self.get_signal_value_by_name(rest) {
+                        return Some(v);
+                    }
+                }
+            }
         }
         if !name.contains('.') {
             if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
@@ -59526,6 +59650,23 @@ impl Simulator {
     }
 
     fn set_signal_value_by_name(&mut self, name: &str, val: Value) {
+        // §23.7/§4c: `<top>.<sig>` writes the TOP MODULE's own variable (see
+        // the read-side twin). A registered composed name always wins.
+        if name.contains('.')
+            && !self.signal_name_to_id.contains_key(name)
+            && !self.signals.contains_key(name)
+            && self
+                .local_stack
+                .last()
+                .is_none_or(|l| !l.contains_key(name))
+        {
+            if let Some(rest) = name.strip_prefix(&format!("{}.", self.module.name)) {
+                if self.signal_name_to_id.contains_key(rest) || self.signals.contains_key(rest) {
+                    let rest = rest.to_string();
+                    return self.set_signal_value_by_name(&rest, val);
+                }
+            }
+        }
         // §13.4.2: a dotted name the innermost call frame OWNS is a member of a
         // subroutine-local / formal unpacked struct. It must not fall through to
         // the module signal table, where an outer scope's same-named variable
@@ -85461,6 +85602,38 @@ impl Simulator {
                 if hier.path.len() == 1 && self.fe_trusted_types.contains(&name) {
                     if let Some(t) = self.var_typedef_types.get(&name) {
                         return Some(t.clone());
+                    }
+                }
+                // §4c: `h.prop` where `h` is a class-handle VARIABLE (module
+                // scope included). No composed signal carries the type; the
+                // property's declared type comes from the head's runtime
+                // class. Without this, `h.prop = new` could not resolve the
+                // class to construct and silently stored garbage.
+                if hier.path.len() == 2
+                    && hier.path.iter().all(|s| s.selects.is_empty())
+                    && self
+                        .signal_name_to_id
+                        .get(format!(
+                            "{}.{}",
+                            hier.path[0].name.name, hier.path[1].name.name
+                        ).as_str())
+                        .is_none()
+                {
+                    let head = hier.path[0].name.name.as_str();
+                    let field = hier.path[1].name.name.as_str();
+                    if let Some(h) = self.eval_ident_handle(head) {
+                        if h != 0 {
+                            if let Some(cn) = self
+                                .heap
+                                .get(h)
+                                .and_then(|o| o.as_ref())
+                                .map(|i| i.class_name.clone())
+                            {
+                                if let Some(t) = self.class_prop_type_named(&cn, field) {
+                                    return Some(t);
+                                }
+                            }
+                        }
                     }
                 }
                 // A genuine local of the CURRENT scope must resolve before the
