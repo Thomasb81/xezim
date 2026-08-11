@@ -198,3 +198,5 @@ mod array_element_semantics;
 mod fresh_audit_finds;
 #[path = "misc/symbol_clash_checks.rs"]
 mod symbol_clash_checks;
+#[path = "misc/audit_round45_finds.rs"]
+mod audit_round45_finds;
