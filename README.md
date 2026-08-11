@@ -92,6 +92,46 @@ and testbench flows. Portable code should not rely on them.
 
 # What's new in 0.9
 
+### 0.9.8 — reference-parity audit campaign (August 2026)
+
+Dozens of differential test batteries were run against a commercial reference
+simulator; every divergence found was measured construct-by-construct, fixed,
+and pinned with a regression test citing the LRM section:
+
+* **Per-evaluator continuous-assign propagation is now the default** (#35) —
+  combinational updates propagate with LRM evaluation ordering instead of a
+  single batched settle, resolving process-observation orderings that were
+  previously unattainable with either batching mode. Escape hatches:
+  `XEZIM_EAGER_PROC_SETTLE=1` (previous default) and `XEZIM_LAZY_PROC_SETTLE=1`.
+* **UVM `run_test()` termination** (#109) — the phase scheduler advances time
+  through run-phase objections; live regression pins run the real Accellera
+  library (1.2, 1800.2-2017, 1800.2-2020) in every CI gate.
+* **Package export semantics** (§26.6) — `export P::*`, `export P::sym` and
+  `export *::*` are honored: a wildcard import re-exposes a package's own
+  imports only when exported, and a wildcard export covers only names the
+  exporting package references — unexported/unreferenced names are rejected
+  exactly as the reference rejects them.
+* **Implicitly-static initializer legality** (§6.21) — a local variable with an
+  initializer in a static-lifetime task/function is now a compile error
+  (explicit `static`/`automatic` required), matching reference behavior;
+  for-header declarations, block locals and class methods stay accepted.
+* **`alias` as true net unification** (§10.11) and `trireg` charge storage
+  (§6.6.4) — aliased nets share one signal slot rather than lowering to an
+  assign cycle.
+* **Cycle delays synchronize** (§14.11) — `##0` (and a runtime `##(n)` that
+  evaluates to 0) waits for the default clocking event when off-edge and is a
+  no-op at the edge; `##n` without a designated `default clocking` is rejected.
+* **Formatting parity** (§21.2.1.7, §21.2.1.3) — associative arrays print with
+  the reference's `'{k:v, ... }` spacing; explicit-width `%h`/`%b`/`%o`
+  zero-pad to the minimal core without truncation.
+* **Array-method iterators** (§7.12) — `q.sort(x) with (x)` binds the declared
+  iterator (sorts and `with`-reductions no longer act on zeros); event controls
+  on packed-struct fields (§9.4.2) arm the base vector with a field-value
+  compare instead of waking spuriously.
+* **`ref` formals alias the actual** (§13.5.2) — callee writes are visible to
+  parallel observers mid-call, observer writes reach the callee, and the
+  element identity of `ref arr[i]` is frozen at call time.
+
 * **UVM 1800.2-2020.3.1 runs green** — the reference testbench passes against the
   2020.3.1 library (`UVM_ERROR : 0` / `UVM_FATAL : 0`, in/out monitors agree).
   Closing this required a general preprocessor fix (inline
@@ -217,7 +257,11 @@ reachable from the compiled design (transitively), which reclaimed ~1870
 
 # Test Suite
 
-Many test cases are included to validate functionality.
+~1,900 integration tests run in CI, each in **both** execution modes — the
+bytecode interpreter (`cargo test`) and the JIT (`cargo test --features jit`).
+A large share are differential tests whose expected values were measured on a
+commercial reference simulator; their doc comments cite the LRM section and
+the measured behavior.
 
 **Credit:**
 All `pr*.v` tests were taken from the **Icarus Verilog test suite**.
