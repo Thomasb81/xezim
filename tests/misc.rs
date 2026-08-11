@@ -186,3 +186,5 @@ mod severity_exit_status;
 mod preprocessor_directives;
 #[path = "misc/package_const_fn_params.rs"]
 mod package_const_fn_params;
+#[path = "misc/ref_args_alias.rs"]
+mod ref_args_alias;

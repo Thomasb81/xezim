@@ -2328,6 +2328,7 @@ struct ProcessContext {
     // statement stream — see `task_cleanup` and `StatementKind::ScopePop`).
     local_iface_aliases: Vec<HashMap<String, String>>,
     ref_binding_stack: Vec<HashMap<String, Expression>>,
+    ref_alias_stack: Vec<HashMap<String, Expression>>,
     queue_frame_saves: Vec<HashMap<String, QueueLocalSave>>,
     task_cleanup: Vec<TaskCleanup>,
     // Per-call-frame map of a local dynamic-array/queue/assoc LOCAL's bare
@@ -3667,6 +3668,15 @@ pub struct Simulator {
     /// SV-2023: redirected lvalues for `ref` formal parameters during a call.
     /// Top-of-stack scope is consulted when assigning to a known formal name.
     ref_binding_stack: Vec<HashMap<String, Expression>>,
+    /// §13.5.2 TRUE ALIASING for the subset of `ref` actuals whose storage is
+    /// module-visible (a plain variable, resolvable independent of the caller
+    /// frame). Reads of the formal re-read the actual and writes write through
+    /// IMMEDIATELY — a parallel process observing the actual mid-call sees the
+    /// callee's writes, and no return copy-out clobbers writes the observer
+    /// made during the call. Actuals that are caller-frame locals or aggregate
+    /// elements keep the legacy copy-in/copy-out path (entry absent here).
+    /// Pushed/popped in lockstep with `ref_binding_stack`.
+    ref_alias_stack: Vec<HashMap<String, Expression>>,
     /// Deferred teardown for inlined blocking task/method calls (LIFO). Each
     /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
     /// in ProcessContext across suspension).
@@ -6552,6 +6562,7 @@ impl Simulator {
             await_waiters: Vec::new(),
             auto_loop_vars: Vec::new(),
             ref_binding_stack: Vec::new(),
+            ref_alias_stack: Vec::new(),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
             inactive_queue: Vec::new(),
@@ -25834,6 +25845,7 @@ impl Simulator {
             return_flag: self.return_flag,
             local_iface_aliases: self.local_iface_aliases.clone(),
             ref_binding_stack: self.ref_binding_stack.clone(),
+            ref_alias_stack: self.ref_alias_stack.clone(),
             queue_frame_saves: self.queue_frame_saves.clone(),
             task_cleanup: self.task_cleanup.clone(),
             local_dyn: self.local_dyn.clone(),
@@ -25857,6 +25869,7 @@ impl Simulator {
             return_flag: std::mem::replace(&mut self.return_flag, false),
             local_iface_aliases: std::mem::take(&mut self.local_iface_aliases),
             ref_binding_stack: std::mem::take(&mut self.ref_binding_stack),
+            ref_alias_stack: std::mem::take(&mut self.ref_alias_stack),
             queue_frame_saves: std::mem::take(&mut self.queue_frame_saves),
             task_cleanup: std::mem::take(&mut self.task_cleanup),
             local_dyn: std::mem::take(&mut self.local_dyn),
@@ -25874,6 +25887,7 @@ impl Simulator {
         self.return_flag = ctx.return_flag;
         self.local_iface_aliases = ctx.local_iface_aliases;
         self.ref_binding_stack = ctx.ref_binding_stack;
+        self.ref_alias_stack = ctx.ref_alias_stack;
         self.queue_frame_saves = ctx.queue_frame_saves;
         self.task_cleanup = ctx.task_cleanup;
         self.local_dyn = ctx.local_dyn;
@@ -35208,6 +35222,43 @@ impl Simulator {
                 }
             }
         }
+        // §13.5.2: a write to an ALIASED `ref` formal writes THROUGH to the
+        // caller's storage immediately, so concurrent observers of the actual
+        // see it mid-call (see `ref_alias_stack`). The storage is written BY
+        // NAME — evaluating the bound ident would hit the callee frame's own
+        // copy when the formal is named like its actual. The local copy is
+        // refreshed too, keeping any unredirected read path coherent.
+        if !self.ref_alias_stack.is_empty() {
+            if let ExprKind::Ident(h) = &lhs.kind {
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    let fname = h.path[0].name.name.as_str();
+                    if let Some(storage) = self
+                        .ref_alias_stack
+                        .last()
+                        .and_then(|m| m.get(fname))
+                        .and_then(|bound| match &bound.kind {
+                            ExprKind::Ident(bh) => Some(bh.path[0].name.name.clone()),
+                            _ => None,
+                        })
+                    {
+                        let fname = fname.to_string();
+                        if let Some(frame) = self.local_stack.last_mut() {
+                            if let Some(slot) = frame.get_mut(&fname) {
+                                let fitted = if !slot.is_real && !val.is_real && slot.width > 0 {
+                                    val.resize(slot.width)
+                                } else {
+                                    val.clone()
+                                };
+                                *slot = fitted;
+                            }
+                        }
+                        let prev = self.get_signal_value_by_name(&storage);
+                        self.set_signal_value_by_name(&storage, val.clone());
+                        return prev.as_ref() != self.get_signal_value_by_name(&storage).as_ref();
+                    }
+                }
+            }
+        }
         // §7.2/§13.4.2: a leaf of a frame-owned unpacked struct — at any depth,
         // and through an index. The arms below all resolve against the module
         // signal table, so without this the write left the frame's copy alone
@@ -38570,6 +38621,25 @@ impl Simulator {
                     }
                     if name == "UVM_PASSIVE" {
                         return Value::from_u64(0, 32);
+                    }
+                    // §13.5.2: an ALIASED `ref` formal reads the caller's
+                    // storage NOW — external writes made while this call was
+                    // suspended must be visible (see `ref_alias_stack`). The
+                    // storage is read BY NAME, not by re-evaluating the ident:
+                    // a formal named like its actual (`task t(ref int foo);
+                    // t(foo)`) would otherwise hit the callee frame's own
+                    // copy (or recurse into this redirect).
+                    if let Some(bound) = self
+                        .ref_alias_stack
+                        .last()
+                        .and_then(|m| m.get(name.as_str()))
+                    {
+                        if let ExprKind::Ident(bh) = &bound.kind {
+                            let storage = bh.path[0].name.name.clone();
+                            if let Some(v) = self.get_signal_value_by_name(&storage) {
+                                return v;
+                            }
+                        }
                     }
                     if let Some(locals) = self.local_stack.last() {
                         if let Some(val) = locals.get(name) {
@@ -49566,6 +49636,70 @@ impl Simulator {
         Some((handle, field))
     }
 
+    /// §13.5.2: decide whether a `ref` actual can be TRULY ALIASED — reads of
+    /// the formal re-read it, writes write through, no return copy-out. Only
+    /// module-visible plain variables qualify (their resolution is caller-
+    /// frame-independent, so the frozen expression evaluates identically from
+    /// inside the callee). A chained ref (the actual is itself a ref formal of
+    /// the caller) resolves through the CALLER's alias frame to the original
+    /// storage. Caller-frame locals, aggregate elements, class properties and
+    /// events return None and keep the legacy copy-in/copy-out path.
+    ///
+    /// NOTE: called AFTER the callee's local frame is pushed, so the caller's
+    /// frames are second-from-top.
+    fn ref_alias_target(&self, arg: &Expression) -> Option<Expression> {
+        let h = match &arg.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => h,
+            _ => return None,
+        };
+        let name = h.path[0].name.name.as_str();
+        // Chained ref: the caller's alias frame is still top-of-stack here
+        // (the callee's is pushed just after resolution).
+        if let Some(frozen) = self.ref_alias_stack.last().and_then(|m| m.get(name)) {
+            return Some(frozen.clone());
+        }
+        // A caller-frame local (including a non-aliased ref formal) is not
+        // module-visible — the callee cannot reach its storage by name.
+        let caller_frame = self.local_stack.iter().rev().nth(1);
+        if caller_frame.is_some_and(|f| f.contains_key(name)) {
+            return None;
+        }
+        if self
+            .ref_binding_stack
+            .last()
+            .is_some_and(|m| m.contains_key(name))
+        {
+            return None; // ref-bound in the caller but not aliasable
+        }
+        // Aggregates and strings keep their dedicated formal machinery.
+        if self.module.arrays.contains_key(name)
+            || self.module.dynamic_arrays.contains(name)
+            || self.module.queue_vars.contains(name)
+            || self.module.associative_arrays.contains_key(name)
+            || self.string_signals.contains(name)
+        {
+            return None;
+        }
+        // A class property reached via `this` resolves differently inside the
+        // callee — reject when the surrounding context could capture it.
+        if let Some(Some(handle)) = self.this_stack.last() {
+            if self
+                .heap
+                .get(*handle)
+                .and_then(|o| o.as_ref())
+                .is_some_and(|i| i.properties.contains_key(name))
+            {
+                return None;
+            }
+        }
+        // Plain module-visible variable storage only.
+        if self.signal_name_to_id.contains_key(name) || self.signals.contains_key(name) {
+            Some(arg.clone())
+        } else {
+            None
+        }
+    }
+
     /// §15.5 / §13.5.2: an event passed as a `ref` formal. `-> x` and `@x`
     /// inside the subroutine must act on the CALLER's event, but the formal
     /// name is not itself a declared event, so the trigger fired a name with
@@ -51187,7 +51321,20 @@ impl Simulator {
                     'b' => v.to_bin_string(),
                     'h' => v.to_hex_string(),
                     'o' => Self::bin_to_oct_string(&v.to_bin_string()),
-                    _ => v.to_dec_string(),
+                    // §21.2.1.2: an unconsumed argument prints in the task's
+                    // default DECIMAL format — which has the type's default
+                    // field width, space-padded (`$display("x=", v)` of a
+                    // 16-bit 677 is "x=  677", matching the reference
+                    // simulator), not the %0d minimal form.
+                    _ => {
+                        let core = v.to_dec_string();
+                        let dw = Self::dec_default_width(v.width, v.is_signed);
+                        if core.len() >= dw {
+                            core
+                        } else {
+                            format!("{}{}", " ".repeat(dw - core.len()), core)
+                        }
+                    }
                 });
             }
             i += 1;
@@ -51966,7 +52113,6 @@ impl Simulator {
                                                 &full,
                                                 pad_width,
                                                 left_align,
-                                                zero_pad,
                                             );
                                         } else {
                                             result.push_str(&full);
@@ -51980,7 +52126,6 @@ impl Simulator {
                                                 &full,
                                                 pad_width,
                                                 left_align,
-                                                zero_pad,
                                             );
                                         } else {
                                             result.push_str(&full);
@@ -51996,7 +52141,6 @@ impl Simulator {
                                                 &full,
                                                 pad_width,
                                                 left_align,
-                                                zero_pad,
                                             );
                                         } else {
                                             result.push_str(&full);
@@ -63208,32 +63352,34 @@ impl Simulator {
     /// (leading-zero-trimmed) form AND zero-pads it (`%04h` -> `000f`). A `-`
     /// flag left-justifies with trailing spaces. Passing `full` (not a
     /// pre-trimmed core) lets us honour the flag correctly.
-    fn push_radix(result: &mut String, full: &str, width: usize, left_align: bool, zero_pad: bool) {
-        // a reference simulator' radix-field model (matched byte-for-byte):
-        //   * No `0` flag: always the natural full-vector form, space-padded
-        //     (`%4h` of 8'h0f -> "  0f", `%-4h` -> "0f  ").
-        //   * `0` flag + right-justified + explicit width: natural form,
-        //     zero-padded — never trimmed below the natural width
-        //     (`%04b` of an 8-bit value stays "00001111", not "1111";
-        //     `%08o` of 16'o01234 -> "00001234").
-        //   * `0` flag + (bare `%0h` OR left-justified): the minimal
-        //     (leading-zero-trimmed) form (`%0h` -> "f", `%-08o` -> "1234    ").
-        let core = if zero_pad && (width == 0 || left_align) {
-            Self::trim_radix_zeros(full)
-        } else {
-            full.to_string()
-        };
+    fn push_radix(result: &mut String, full: &str, width: usize, left_align: bool) {
+        // The reference simulator's radix-field model, re-measured
+        // byte-for-byte (commercial tools disagree here; xezim previously
+        // followed the OTHER tool's space-pad-to-natural-width model — the
+        // switch is deliberate, see tests/strings/format_sibling_fixes.rs):
+        //   * bare `%0<r>`: minimal form — leading zeros AND a leading x/z
+        //     run collapse (`%0h` of 16'hxx3f -> "x3f", of 8'hzz -> "z").
+        //   * explicit width W: the core is the value with leading ZEROS
+        //     trimmed only — an x/z run is kept (`%6h` of 8'hzz ->
+        //     "0000zz"). Never truncated below the core (`%2h` of 16'h2a5
+        //     -> "2a5"). Right-justified pads with '0' REGARDLESS of the
+        //     `0` flag (`%4h` == `%04h` of 8'h0f -> "000f"); `-` pads with
+        //     spaces on the right (`%-4h` -> "f   ", `%-08h` of 32'hFF ->
+        //     "ff      "). Zero value: `%4h` of 8'h00 -> "0000".
+        if width == 0 {
+            result.push_str(&Self::trim_radix_zeros(full));
+            return;
+        }
+        let t = full.trim_start_matches('0');
+        let core = if t.is_empty() { "0" } else { t };
         if core.len() >= width {
-            result.push_str(&core);
+            result.push_str(core);
         } else if left_align {
-            result.push_str(&core);
+            result.push_str(core);
             result.push_str(&" ".repeat(width - core.len()));
-        } else if zero_pad {
-            result.push_str(&"0".repeat(width - core.len()));
-            result.push_str(&core);
         } else {
-            result.push_str(&" ".repeat(width - core.len()));
-            result.push_str(&core);
+            result.push_str(&"0".repeat(width - core.len()));
+            result.push_str(core);
         }
     }
 
@@ -74951,6 +75097,7 @@ impl Simulator {
             self.current_spec = c.saved_spec;
         }
         self.ref_binding_stack.pop();
+        self.ref_alias_stack.pop();
         self.local_iface_aliases.pop();
         self.continue_flag = c.saved_continue;
         self.sync_static_locals();
@@ -75307,12 +75454,27 @@ impl Simulator {
         // SV-2023: redirect NBAs targeting a `ref` formal back to the caller's
         // actual variable (IEEE 1800-2023 §13.5.2).
         let mut ref_map: HashMap<String, Expression> = HashMap::default();
+        // §13.5.2 true aliasing: where the actual is module-visible storage,
+        // record a redirect so reads/writes of the formal go THROUGH to it
+        // during the call (see `ref_alias_stack`). The callee's local frame is
+        // already pushed here, so `ref_alias_target` treats the SECOND-from-
+        // top frame as the caller when rejecting caller-local actuals.
+        let mut alias_map: HashMap<String, Expression> = HashMap::default();
         for (i, port) in td.ports.iter().enumerate() {
             if matches!(port.direction, crate::ast::types::PortDirection::Ref) && i < args.len() {
+                if let Some(frozen) = self.ref_alias_target(&args[i]) {
+                    alias_map.insert(port.name.name.clone(), frozen);
+                }
                 ref_map.insert(port.name.name.clone(), args[i].clone());
             }
         }
+        // An aliased ref writes through during the call — a return copy-out
+        // would CLOBBER writes other processes made to the actual while this
+        // call was suspended (observed: an observer's write overwritten by
+        // the callee's stale copy).
+        output_bindings.retain(|(n, _)| !alias_map.contains_key(n));
         self.ref_binding_stack.push(ref_map);
+        self.ref_alias_stack.push(alias_map);
         self.return_value = None;
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
@@ -77943,6 +78105,7 @@ impl Simulator {
                                 return_flag: false,
                                 local_iface_aliases: Vec::new(),
                                 ref_binding_stack: Vec::new(),
+            ref_alias_stack: Vec::new(),
                                 queue_frame_saves: Vec::new(),
                                 task_cleanup: Vec::new(),
                                 local_dyn: Vec::new(),

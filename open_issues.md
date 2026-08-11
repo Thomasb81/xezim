@@ -78,15 +78,22 @@ deferred.
 
 Each entry is a reference-validated finding from the original audit sweeps.
 
-### G8 + G9 — formatting
-Explicit `%h`/`%b`/`%o` field widths, and unformatted arguments.
-
 ### G10, G11, G6 — misc
 `#1step` parse, `$bits("")` should be 8, `trireg` behaviour note.
 
-### H3 — `ref` arguments
-`ref` formals must alias the actual, not copy-in/copy-out. Visible whenever
-the callee writes the formal and the caller reads the actual before return.
+### H3 remainder — `ref` aggregate/caller-local aliasing
+CLOSED for plain module-visible variables (true aliasing: mid-call
+visibility both ways, no copy-out clobber, double-ref and chained-ref and
+same-named formal all reference-validated — `tests/misc/ref_args_alias.rs`).
+Remaining on the legacy copy path: actuals that are caller-frame locals,
+aggregate elements (`arr[i]`), class properties, strings. Correct at return,
+not aliased mid-call. Freezing an element index at call time (§13.5.2) and
+routing caller-local storage are the follow-ups.
+
+(G8+G9 formatting closed: explicit `%h`/`%b`/`%o` widths follow the
+reference's minimal+zero-pad model — commercial tools disagree here and the
+previous pin followed the other tool; unconsumed display args now print
+default-width decimal. `tests/strings/format_sibling_fixes.rs`.)
 
 ### F6–F10 — clocking / process
 Clocking skews, `##0` synchronization, and `process` status naming.
