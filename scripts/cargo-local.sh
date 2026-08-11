@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Run cargo with the xezim-core git dependency patched to the sibling
+# ../xezim-core checkout WHEN one exists; plain cargo (git fetch) otherwise.
+# No per-machine .cargo/config.toml needed.
+#
+# Usage:
+#   ./scripts/cargo-local.sh build --release
+#   ./scripts/cargo-local.sh test --features jit
+#   ./scripts/cargo-local.sh            # defaults to `build`
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+ARGS=("$@")
+[ ${#ARGS[@]} -eq 0 ] && ARGS=(build)
+
+if [ -f ../xezim-core/Cargo.toml ]; then
+  exec cargo \
+    --config 'patch."https://github.com/aionhw/xezim-core.git".xezim-core.path="../xezim-core"' \
+    --config 'patch."https://github.com/aionhw/xezim-core.git".sv-parser.path="../xezim-core/xezim-parser"' \
+    "${ARGS[@]}"
+else
+  exec cargo "${ARGS[@]}"
+fi
