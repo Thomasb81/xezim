@@ -25,8 +25,6 @@ mod bit_class_property_signedness;
 mod class_field_named_event;
 #[path = "classes/class_handle_return_preservation.rs"]
 mod class_handle_return_preservation;
-#[path = "classes/var_class_types_name_collision.rs"]
-mod var_class_types_name_collision;
 #[path = "classes/typedef_extends_cast.rs"]
 mod typedef_extends_cast;
 #[path = "classes/class_local_typedef_aa.rs"]
@@ -173,3 +171,5 @@ mod assoc_enum_key_class_property;
 mod module_scope_handle_access;
 #[path = "classes/struct_prop_whole_copy.rs"]
 mod struct_prop_whole_copy;
+#[path = "classes/randomize_obj_array_property.rs"]
+mod randomize_obj_array_property;
