@@ -174,9 +174,32 @@ one-time O(N) fill. Do not go looking in the settle/process loop.
 Separately, the interpreter costs ~1.65 us per statement for a plain `for`
 loop in an `initial` block, independent of arrays — a larger question.
 
-Done so far: the indexed-write path no longer deep-clones two expression trees
-per store for a class check that bails on an empty heap (xezim `e15a0b4`,
-~3-6% on that workload).
+Done: (1) the indexed-write path no longer deep-clones two expression trees
+per store (`e15a0b4`); (2) `mem[i] = v` on a module-scope 1-D fixed unpacked
+array now resolves through `array_first_id` id math with no string work,
+skipping the class/queue/assoc guard chain — store overhead 2.2 -> 0.86
+us/element, the reporter's 256K shape 1124 -> 880 ms. Guards: no live call
+frames, no class objects, and not a queue/dynamic/assoc name (those carry a
+fake 0..63 backing range in `module.arrays`).
+
+ALSO FOUND while validating (all PRE-EXISTING, verified identical on the
+pre-change build; the fast path is bug-for-bug faithful):
+- `force` on an array ELEMENT does not stick (a later procedural write
+  overrides it; the reference holds the forced value until `release`).
+- 2-state element arrays (`bit [7:0] m [0:3]`) accept X instead of
+  fitting X/Z -> 0 on element writes.
+- Negative-lo arrays (`m[-2:1]`): element write/read at a negative index is
+  lost (reads back X; likely unsigned index evaluation upstream of the
+  range check).
+Repro for all three: scratchpad/i86/d1.sv vs the reference. These are
+correctness bugs on BOTH the fast and general paths — fix them together so
+the two paths cannot diverge.
+
+The heap-sentinel discovery matters beyond #86: `heap` is constructed as
+`vec![None]` (index 0 = null handle), so every `heap.is_empty()` guard in
+the simulator was DEAD CODE and class-free designs paid class-resolution
+probes on every indexed access. All guards now use `no_class_objects()`
+(len <= 1).
 
 ## 5. Diagnosability
 

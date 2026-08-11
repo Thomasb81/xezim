@@ -35146,7 +35146,7 @@ impl Simulator {
             // None. That was pure allocator traffic on the hot array-store path
             // (a 256K-element memory fill pays it 256K times). Pass the borrows
             // and skip the call entirely when no objects exist.
-            if !self.heap.is_empty()
+            if !self.no_class_objects()
                 && matches!(&expr.kind,
                     ExprKind::MemberAccess { .. } | ExprKind::Ident(_) | ExprKind::This)
             {
@@ -35723,6 +35723,46 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                // GitHub #86 fast path: `mem[i] = v` on a module-scope 1-D
+                // FIXED unpacked array resolves to a contiguous signal id with
+                // no string work (`array_first_id`), skipping the guard chain
+                // below (packed-struct slice, class ND, queue, assoc) that a
+                // memory fill paid per element (~2 µs each, all of it name
+                // formatting + hashing). Guards: no live call frames (a
+                // task/function local could shadow the name), and the name
+                // must not be a queue/dynamic/associative collection —
+                // `module.arrays` gives those a fake 0..63 backing range, and
+                // their writes need the collection semantics below.
+                if self.local_stack.is_empty() && self.no_class_objects() {
+                    if let ExprKind::Ident(h) = &expr.kind {
+                        if h.path.iter().all(|seg| seg.selects.is_empty()) {
+                            let name = self.resolve_hier_name(h);
+                            if let Some(&(first_id, lo, hi)) =
+                                self.array_first_id.get(name.as_str())
+                            {
+                                if !self.module.queue_vars.contains(&name)
+                                    && !self.module.dynamic_arrays.contains(&name)
+                                    && !self.module.associative_arrays.contains_key(&name)
+                                    // string elements are DYNAMIC-length; the
+                                    // resize-to-declared-width below would
+                                    // truncate them (a 200-char element came
+                                    // back 16 chars) — the general path stores
+                                    // strings unresized.
+                                    && !self.module.string_signals.contains(&name)
+                                {
+                                    let idx =
+                                        self.eval_expr(index).to_i64().unwrap_or(i64::MIN);
+                                    if idx >= lo && idx <= hi {
+                                        let id = first_id + (idx - lo) as usize;
+                                        return self.fast_signal_write_id(id, val);
+                                    }
+                                    // out of range: fall through to the general
+                                    // path for its existing diagnostics/no-op.
+                                }
+                            }
+                        }
+                    }
+                }
                 // §7.4.2: `arr[i].field[k] = v` where `arr` is a PACKED array
                 // of packed structs. `arr[i]` is not a signal of its own — it
                 // is a slice of one backing vector — so the write must splice
@@ -35757,7 +35797,7 @@ impl Simulator {
                 // element k of the queue `q[i]` (§7.4.5), not a bit of a scalar.
                 // §7.4.2: a write to an N-D fixed-array class-property
                 // element lands in its per-instance cell, like the read.
-                if !self.heap.is_empty() {
+                if !self.no_class_objects() {
                     if let Some(nm) = self.class_nd_elem_name(expr, index) {
                         let prev = self.get_signal_value_by_name(&nm);
                         let fitted = match prev.as_ref() {
@@ -38257,7 +38297,7 @@ impl Simulator {
         if matches!(
             expr.kind,
             ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
-        ) && !self.heap.is_empty()
+        ) && !self.no_class_objects()
             && Self::chain_maybe_class_agg(expr, self.this_stack.last().copied().flatten().is_some())
         {
             if let Some(r) = self.class_agg_member(expr) {
@@ -38268,7 +38308,7 @@ impl Simulator {
         // `return s;` from a method, `v = obj.s;`. Its members are per-instance
         // cells with no container, so the lookups further down returned the
         // property's unused scalar cell (zero) instead of the members.
-        if !self.heap.is_empty() {
+        if !self.no_class_objects() {
             if let ExprKind::Ident(h) = &expr.kind {
                 if (h.path.len() >= 2 || self.this_stack.last().copied().flatten().is_some())
                     && h.path.iter().all(|p| p.selects.is_empty())
@@ -38381,7 +38421,7 @@ impl Simulator {
                 // §18.4: `<obj>.<agg_prop>.<member>` / `<agg_prop>.<member>`
                 // that parsed as a FLAT hier ident — same aggregate-class-
                 // property storage as the `MemberAccess` shape (see there).
-                if hier.path.len() >= 2 && !self.heap.is_empty() {
+                if hier.path.len() >= 2 && !self.no_class_objects() {
                     if let Some(r) = self.class_agg_member(expr) {
                         return self.read_class_agg(&r);
                     }
@@ -39921,7 +39961,7 @@ impl Simulator {
                 // §7.4.1: `<obj>.<prop>[i]` on a multi-dimensional PACKED array
                 // class property selects an ELEMENT, not a bit. Gated on the
                 // receiver's shape so nothing else re-evaluates `expr`.
-                if !self.heap.is_empty()
+                if !self.no_class_objects()
                     && matches!(&expr.kind,
                         ExprKind::MemberAccess { .. }
                             | ExprKind::Ident(_)
@@ -40014,7 +40054,7 @@ impl Simulator {
                 }
                 // §7.4.2: an element of an N-D fixed-array CLASS property —
                 // `obj.m[i][j]` — resolves to its per-instance cell.
-                if !self.heap.is_empty() {
+                if !self.no_class_objects() {
                     if let Some(nm) = self.class_nd_elem_name(expr, index) {
                         if let Some(v) = self.get_signal_value_by_name(&nm) {
                             return v;
@@ -54881,6 +54921,33 @@ impl Simulator {
         }
     }
 
+    /// True when NO class object can exist: the heap holds only the index-0
+    /// null sentinel (`heap: vec![None]`), so `heap.is_empty()` is NEVER true
+    /// after construction — every guard spelled that way was dead code, and
+    /// class-free designs paid the class-resolution probes on every indexed
+    /// access.
+    #[inline(always)]
+    fn no_class_objects(&self) -> bool {
+        self.heap.len() <= 1
+    }
+
+    /// Id-keyed write with the same bookkeeping as `fast_signal_write`'s
+    /// resolved branches: element-width resize, declared signedness, change
+    /// compare, `write_sig!` (which respects `forced_signals`), dirty mark.
+    #[inline]
+    fn fast_signal_write_id(&mut self, id: usize, val: &Value) -> bool {
+        let width = self.signal_widths[id];
+        let mut resized = val.resize(width);
+        resized.is_signed = self.signal_signed[id];
+        let changed = self.signal_table[id] != resized;
+        if changed {
+            write_sig!(self, id, resized);
+            self.table_modified = true;
+            self.mark_dirty_id(id);
+        }
+        changed
+    }
+
     /// Fast signal write: update both signal_table and signals HashMap.
     #[inline]
     fn fast_signal_write(&mut self, name: &str, val: Value) -> bool {
@@ -64238,7 +64305,7 @@ impl Simulator {
     /// handle + property name, then assemble the whole unpacked-struct value.
     /// `None` for anything that is not a whole unpacked-struct class property.
     fn try_read_whole_struct_class_prop(&mut self, expr: &Expression) -> Option<Value> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         let (handle, prop_name) = self.class_prop_receiver(expr)?;
@@ -64280,7 +64347,7 @@ impl Simulator {
     /// parse shape — to the storage it aliases. `None` when `e` is not an
     /// aggregate class-property member.
     fn class_agg_member(&mut self, e: &Expression) -> Option<ClassAggRef> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         // §7.2: a member of an UNPACKED-struct property at ANY depth, and
@@ -64466,7 +64533,7 @@ impl Simulator {
         base: &Expression,
         index: &Expression,
     ) -> Option<ClassAggRef> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         let (handle, prop) = self.class_prop_receiver(base)?;
@@ -64599,7 +64666,7 @@ impl Simulator {
 
     /// `class_agg_member` for an already-split `<base>.<field>`.
     fn class_agg_member_parts(&mut self, base: &Expression, field: &str) -> Option<ClassAggRef> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         let (handle, prop) = self.class_prop_receiver(base)?;
@@ -66612,7 +66679,7 @@ impl Simulator {
     /// (members stored in the heap). `None` for non-class-property operands
     /// (those are handled by the signal-namespace struct path).
     fn class_prop_struct_of(&mut self, e: &Expression) -> Option<crate::ast::types::StructUnionType> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         let (h, p) = self.class_prop_receiver(e)?;
@@ -69691,7 +69758,7 @@ impl Simulator {
         base: &Expression,
         outer_index: &Expression,
     ) -> Option<String> {
-        if self.heap.is_empty() {
+        if self.no_class_objects() {
             return None;
         }
         // Collect the index chain innermost-first: base may be
