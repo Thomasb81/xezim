@@ -196,6 +196,64 @@ fn uvm_2020_factory_type_override() {
     );
 }
 
+/// Restoration of the shim-era `analysis_imp_decl_test.sv` (removed with the
+/// PURE_SV_LRM=0 intercepts in 8bace9e without a native successor): two
+/// `uvm_analysis_imp_decl` suffixed imps must route `port.write()` through
+/// the macro-generated forwarders to the RIGHT suffixed method
+/// (`write_in`/`write_out`). This is the requirement whose lost coverage let
+/// the dotted-key enumeration regression (92abea7) break `connect()`
+/// silently — now pinned against the real 1800.2-2020 library.
+#[test]
+fn uvm_2020_analysis_imp_decl_routes_to_suffixed_write() {
+    let sim = run_uvm("1800.2-2020", &[], IMP_DECL_TEST.to_string(), "top")
+        .expect("UVM 2020 imp_decl test failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter().any(|l| l.contains("TEST_PASS")),
+        "imp_decl write routing must hit the suffixed subscribers (2/1):\n{}",
+        out.join("\n")
+    );
+}
+
+const IMP_DECL_TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+`uvm_analysis_imp_decl(_in)
+`uvm_analysis_imp_decl(_out)
+
+module top;
+  class scoreboard;
+    int n_in, n_out;
+    function void write_in(int t);  n_in++;  endfunction
+    function void write_out(int t); n_out++; endfunction
+  endclass
+
+  initial begin
+    automatic scoreboard scb = new;
+    automatic uvm_analysis_imp_in  #(int, scoreboard) imp_in  = new("imp_in",  scb);
+    automatic uvm_analysis_imp_out #(int, scoreboard) imp_out = new("imp_out", scb);
+    automatic uvm_analysis_port #(int) in_ap  = new("in_ap");
+    automatic uvm_analysis_port #(int) out_ap = new("out_ap");
+
+    in_ap.connect(imp_in);
+    out_ap.connect(imp_out);
+    in_ap.resolve_bindings();
+    out_ap.resolve_bindings();
+
+    in_ap.write(7);
+    in_ap.write(8);
+    out_ap.write(9);
+
+    if (scb.n_in !== 2 || scb.n_out !== 1)
+      $display("TEST_FAIL: n_in=%0d (exp 2) n_out=%0d (exp 1)", scb.n_in, scb.n_out);
+    else
+      $display("TEST_PASS");
+    $finish;
+  end
+endmodule
+"#;
+
 /// Factory-override + config_db probe (see the two tests above).
 const CFG_TEST: &str = r#"
 import uvm_pkg::*;
