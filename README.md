@@ -284,8 +284,8 @@ an existing checkout instead, set `XEZIM_UVM_DIR` to its root or clone it as a
 
 Install Rust: https://www.rust-lang.org/tools/install
 
-`xezim-core` is a git dependency, so a bare clone of this repo builds on its own —
-`cargo build` fetches everything else:
+**If you only want to use xezim, there is nothing else to clone** — `xezim-core`
+is a git dependency, and `cargo build` pulls it automatically:
 
 ```bash
 git clone git@github.com:<you>/xezim.git
@@ -296,12 +296,29 @@ cargo build --release  # optimized (recommended for large designs)
 
 The release binary is produced at `target/release/xezim`.
 
-### Co-developing with a local xezim-core
+### Modifying xezim-core
 
-To build against a local `xezim-core` checkout (so its edits take effect without a
-push), clone it anywhere and add a `[patch]` to an **untracked** cargo config in a
-directory above this repo (e.g. `<parent>/.cargo/config.toml` for sibling clones —
-per-developer machine setup, never committed):
+**If you want to modify the parser/elaboration code, clone `xezim-core` as well**
+(it is a separate repo) and point the build at your checkout so edits take effect
+without a push:
+
+```bash
+git clone git@github.com:<you>/xezim-core.git ../xezim-core
+```
+
+Then either build through the wrapper, which probes for the sibling checkout on
+every invocation — it uses `../xezim-core` when present and falls back to the
+plain git fetch when not:
+
+```bash
+./scripts/cargo-local.sh build --release
+./scripts/cargo-local.sh test --features jit
+```
+
+— or, to make plain `cargo build` do it permanently on your machine, add a
+`[patch]` to an **untracked** cargo config in a directory above this repo
+(e.g. `<parent>/.cargo/config.toml` — per-developer machine setup, never
+committed):
 
 ```toml
 [patch."https://github.com/aionhw/xezim-core.git"]
@@ -310,16 +327,7 @@ sv-parser = { path = "/abs/path/to/xezim-core/xezim-parser" }
 ```
 
 `cargo tree -p xezim-core` shows which copy is in use (a path in parentheses means
-the patch is active).
-
-Alternatively, skip the config file and use the wrapper, which probes for the
-sibling checkout on every invocation — local path when `../xezim-core` exists,
-plain git fetch when it doesn't:
-
-```bash
-./scripts/cargo-local.sh build --release
-./scripts/cargo-local.sh test --features jit
-```
+your local checkout is active).
 
 ---
 
