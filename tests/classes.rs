@@ -162,3 +162,6 @@ mod ctor_dispatch_and_p_format;
 
 #[path = "classes/assoc_enum_key_class_property.rs"]
 mod assoc_enum_key_class_property;
+
+#[path = "classes/module_scope_handle_access.rs"]
+mod module_scope_handle_access;
