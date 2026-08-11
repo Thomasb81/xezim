@@ -116,28 +116,19 @@ specify path delays already reference-exact; `extern module` prototypes now
 accepted (consumed at parse). Remaining, each reference-validated:
 - **Nested module declarations** (§23.4) — 17 parse errors; the reference
   runs them. Belongs with the J-family hierarchy work below.
-- **`alias`** (§10.11) — still a parse error, DELIBERATELY: a lowering to a
-  wired-resolution cont-assign pair was implemented and reverted because of
-  the cycle bug below; shipping it would produce silent x on aliased nets.
+- **`alias`** (§10.11) — CLOSED: implemented as true NET UNIFICATION
+  (aliased names share one signal slot; `alias_pairs` in the elaborated
+  module). NOT lowered to assign pairs — measured: the reference reads a
+  hand-written `assign p = q; assign q = p;` cycle as x while an alias of
+  the same nets carries the driven value, so the two constructs genuinely
+  differ. (An earlier "cycles freeze at x where the reference settles to
+  z" note here was a MIS-MEASUREMENT — the reference x's assign-cycles
+  too; xezim's cycle behavior was reference-correct all along, and the
+  driven-net x-seed keeps its delayed-driver rationale.)
 - **Wildcard export lenience** (§26.6): `export base_pkg::*` in a package
   that never references the imported names re-exports them anyway; the
   reference errors at the downstream use ("Failed to find 'base_val'").
   xezim accepts — accepts-invalid, benign direction.
-
-### Combinational feedback cycles freeze at x (found via the alias attempt)
-`wire p, q; assign p = q; assign q = p;` — both read x forever; the
-reference settles the pair to z (and to the driven value when a third
-driver exists, e.g. `assign p = 1'b1` → both 1). Acyclic copies are fine
-(`assign v = u` of undriven u reads z). Mechanism: driven signals start x
-in the runtime table and the first evaluation normally overwrites it —
-inside a dependency cycle each eval reads the other's x and the x
-fixpoint self-sustains. The topo sort explicitly "breaks cycles
-arbitrarily; feedback still needs multi-iter", but multi-iter cannot
-escape an x seed. Fix direction: seed cont-assign-driven NETS (not
-variables) at z per §6.6.1 so cycle iteration starts from the LRM initial
-state. Blast radius: every t=0 edge/settle trace — needs its own round.
-Repros: scratchpad/l31/w5.sv (pure cycle), w6.sv (driven cycle),
-f5.sv/f5b.sv (alias shapes).
 
 ### J2c, J2e — const-eval remnants
 Type-parameter `$bits`, and interface-port parameters. (The rest of the

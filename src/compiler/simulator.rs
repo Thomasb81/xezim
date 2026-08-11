@@ -5648,6 +5648,23 @@ impl Simulator {
                 signal_real_vec.push(false);
             }
         }
+        // §10.11 alias unification: repoint each aliased name at the
+        // canonical net's slot — ONE storage, N names. Width agreement was
+        // checked at elaboration.
+        for (canon, other) in module.alias_pairs.iter() {
+            let (Some(&cid), Some(&oid)) = (
+                signal_name_to_id.get(canon.as_str()),
+                signal_name_to_id.get(other.as_str()),
+            ) else {
+                continue;
+            };
+            if cid != oid {
+                if let Some(slot) = signal_name_to_id.get_mut(other.as_str()) {
+                    *slot = cid;
+                }
+                let _ = oid; // the orphan slot keeps its default value, unreferenced
+            }
+        }
         let static_ms = phase_static.elapsed().as_secs_f64() * 1000.0;
         // Phase 2: synthesize per-element entries for unpacked arrays.
         // Elaborate skips the per-element Signal inserts (memory-as-array
@@ -18887,6 +18904,11 @@ impl Simulator {
         // whole delay window of a DELAYED one, which is exactly a gate-level
         // netlist: `and #(2,5) g(o, a, b);` leaves `o` readable for 5 ticks
         // before it first resolves, and it should read x there.
+        //
+        // A combinational CYCLE (`assign p = q; assign q = p;`) keeps this
+        // x forever — measured: the reference does the SAME (cycles read x,
+        // driven or not). `alias` is NOT a cycle — it unifies names onto one
+        // net (see `alias_pairs`).
         //
         // Only all-z signals are touched, so a net given a real initial value
         // (supply0/1, and the tri0/tri1 pull) keeps it.
@@ -32951,6 +32973,7 @@ impl Simulator {
     /// route to the partitioned settle; otherwise the canonical incremental
     /// settle. Default path pays one `Option::is_some` check per call.
     fn settle_combinatorial(&mut self) {
+
         if self.event_measure {
             self.event_phase += 1; // comb SETTLE phase (distinct from sample)
         }
