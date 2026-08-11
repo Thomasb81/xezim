@@ -34667,12 +34667,34 @@ impl Simulator {
         }
     }
 
-    fn force_target(&self, lv: &Expression) -> Option<(String, Option<usize>)> {
+    fn force_target(&mut self, lv: &Expression) -> Option<(String, Option<usize>)> {
         if let ExprKind::Ident(hier) = &lv.kind {
             if hier.path.iter().all(|s| s.selects.is_empty()) {
                 let name = self.resolve_hier_name(hier);
                 let id = self.signal_name_to_id.get(name.as_str()).copied();
                 return Some((name, id));
+            }
+        }
+        // §10.6.2: `force mem[i] = v` on a FIXED-array element. The element
+        // has a real signal id, so the id-keyed force guard protects it like
+        // any scalar. Previously this shape returned None and the force
+        // silently degraded to a plain write — the next procedural write
+        // simply overrode it.
+        if let ExprKind::Index { expr: base, index } = &lv.kind {
+            if let ExprKind::Ident(bh) = &base.kind {
+                if bh.path.iter().all(|s| s.selects.is_empty()) {
+                    let bname = self.resolve_hier_name(bh);
+                    if self.module.arrays.contains_key(&bname)
+                        && !self.module.dynamic_arrays.contains(&bname)
+                        && !self.module.queue_vars.contains(&bname)
+                        && !self.module.associative_arrays.contains_key(&bname)
+                    {
+                        let idx = self.eval_expr(index).to_i64()?;
+                        if let Some(id) = self.get_array_elem_id(&bname, idx) {
+                            return Some((format!("{}[{}]", bname, idx), Some(id)));
+                        }
+                    }
+                }
             }
         }
         None
@@ -37122,7 +37144,10 @@ impl Simulator {
                         if let ExprKind::Ident(hier) = &arr_expr.kind {
                             let name = self.resolve_hier_name(hier);
                             if self.module.arrays.contains_key(&name) {
-                                let idx = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
+                                // §7.4.6: SIGNED index — a negative-lo array
+                                // (`m[-2:1]`) loses its negative elements when
+                                // the index goes through to_u64.
+                                let idx = self.eval_expr(index).to_i64().unwrap_or(0);
                                 self.get_array_elem_id(&name, idx)
                             } else {
                                 None
@@ -40496,7 +40521,8 @@ impl Simulator {
                             if let Some(&(first_id, lo, hi)) =
                                 self.array_first_id.get(name.as_str())
                             {
-                                let idx = idx_val.to_u64().unwrap_or(0) as i64;
+                                // §7.4.6: SIGNED index — negative-lo arrays.
+                                let idx = idx_val.to_i64().unwrap_or(0);
                                 if idx >= lo && idx <= hi {
                                     let eid = first_id + (idx - lo) as usize;
                                     let mut v = self.signal_table[eid].clone();
@@ -40516,7 +40542,9 @@ impl Simulator {
                         let idx_str = if self.is_associative_array(&name) {
                             self.assoc_key_str(&name, &idx_val)
                         } else {
-                            idx_val.to_u64().unwrap_or(0).to_string()
+                            // §7.4.6: match the declared (signed) element
+                            // spelling — `nmem[-2]`, not `nmem[4294967294]`.
+                            idx_val.to_i64().unwrap_or(0).to_string()
                         };
                         let elem_name = format!("{}[{}]", store_name, idx_str);
                         if let Some(&eid) = self.signal_name_to_id.get(elem_name.as_str()) {
@@ -55395,6 +55423,10 @@ impl Simulator {
     fn fast_signal_write_id(&mut self, id: usize, val: &Value) -> bool {
         let width = self.signal_widths[id];
         let mut resized = val.resize(width);
+        // §6.11.1/§10.7: a 2-state destination drops X/Z on every write.
+        if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
+            resized = resized.to_two_state();
+        }
         resized.is_signed = self.signal_signed[id];
         let changed = self.signal_table[id] != resized;
         if changed {
@@ -55411,6 +55443,9 @@ impl Simulator {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             let width = self.signal_widths[id];
             let mut resized = val.resize(width);
+            if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
+                resized = resized.to_two_state();
+            }
             resized.is_signed = self.signal_signed[id];
             let changed = self.signal_table[id] != resized;
             if changed {
@@ -55429,6 +55464,9 @@ impl Simulator {
             // ballooned simulation memory past 6 GB.
             let width = self.signal_widths[id];
             let mut resized = val.resize(width);
+            if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
+                resized = resized.to_two_state();
+            }
             resized.is_signed = self.signal_signed[id];
             let changed = self.signal_table[id] != resized;
             if changed {
