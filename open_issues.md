@@ -79,14 +79,12 @@ deferred.
 Each entry is a reference-validated finding from the original audit sweeps.
 
 
-### H3 remainder — `ref` aggregate/caller-local aliasing
-CLOSED for plain module-visible variables (true aliasing: mid-call
-visibility both ways, no copy-out clobber, double-ref and chained-ref and
-same-named formal all reference-validated — `tests/misc/ref_args_alias.rs`).
-Remaining on the legacy copy path: actuals that are caller-frame locals,
-aggregate elements (`arr[i]`), class properties, strings. Correct at return,
-not aliased mid-call. Freezing an element index at call time (§13.5.2) and
-routing caller-local storage are the follow-ups.
+### H3 — CLOSED for variables and array elements
+True aliasing for plain module-visible variables AND fixed-array elements
+(the element identity is FROZEN at call time per §13.5.2 — a later index
+change no longer retargets the alias). Remaining on the legacy copy path:
+caller-frame locals, class properties, strings — correct at return, not
+aliased mid-call (documented simplification).
 
 (G8+G9 formatting closed: explicit `%h`/`%b`/`%o` widths follow the
 reference's minimal+zero-pad model — commercial tools disagree here and the
@@ -254,9 +252,9 @@ worst failure mode; if unsupported it must at least error.
 
 ## 5. Diagnosability
 
-- **Settle-cap silence.** `--settle-limit` hits warn once, then the cap is
-  applied silently for the rest of the run. A design that hits it repeatedly
-  (the customer's does, from t=151,310) gives no further signal.
+- **Settle-cap silence — CLOSED.** Hits report verbosely for the first
+  three, then every 1000th with a running count, and the run prints a
+  final exhaustion summary (count + last time).
 - **r11 interpreter melt.** A 45-line interpreted always-block costs ~12 s
   per tick in one repro — a long-standing separate bug with two pinned next
   steps in the Round 18 debug notes.

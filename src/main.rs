@@ -2145,6 +2145,15 @@ suppressed but the explicit SDF annotation still applies."
                         );
                         println!("------------------------------");
                         println!("Simulation finished at time {}", sim.time);
+            {
+                let (hits, last_t) = sim.settle_limit_report();
+                if hits > 0 {
+                    eprintln!(
+                        "[WARN] settle limit was exhausted {} time(s) during this run (last at time {}) — results in those slots may not have converged; raise --settle-limit.",
+                        hits, last_t
+                    );
+                }
+            }
                         if sim.finished {
                             println!("($finish called)");
                         }
@@ -2564,6 +2573,15 @@ suppressed but the explicit SDF annotation still applies."
                 append_adopted_libs_to_merged(mo);
             }
             println!("Simulation finished at time {}", sim.time);
+            {
+                let (hits, last_t) = sim.settle_limit_report();
+                if hits > 0 {
+                    eprintln!(
+                        "[WARN] settle limit was exhausted {} time(s) during this run (last at time {}) — results in those slots may not have converged; raise --settle-limit.",
+                        hits, last_t
+                    );
+                }
+            }
             if sim.finished {
                 println!("($finish called)");
             }
