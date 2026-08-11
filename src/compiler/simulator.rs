@@ -48545,6 +48545,11 @@ impl Simulator {
                             self.killed_pids.insert(pid);
                             self.process_parents.remove(&pid);
                             self.process_contexts.remove(&pid);
+                            // §9.6.2: purge the killed pid's future-time
+                            // #delay too, or the wheel keeps reporting
+                            // activity and the idle break never fires
+                            // (UVM's run-phase watchdog timer).
+                            self.event_queue.remove_pid(pid);
                         }
                         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
                         self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
@@ -48565,6 +48570,7 @@ impl Simulator {
                         self.killed_pids.insert(pid);
                         self.process_parents.remove(&pid);
                         self.process_contexts.remove(&pid);
+                        self.event_queue.remove_pid(pid);
                         self.event_waiters.retain(|w| w.pid != pid);
                         self.instance_event_waiters.retain(|w| w.pid != pid);
                         for q in self.mailbox_get_waiters.values_mut() {
@@ -48594,6 +48600,11 @@ impl Simulator {
                             self.killed_pids.insert(pid);
                             self.process_parents.remove(&pid);
                             self.process_contexts.remove(&pid);
+                            // §9.6.2: purge the killed pid's future-time
+                            // #delay too, or the wheel keeps reporting
+                            // activity and the idle break never fires
+                            // (UVM's run-phase watchdog timer).
+                            self.event_queue.remove_pid(pid);
                         }
                         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
                         self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
@@ -48632,6 +48643,8 @@ impl Simulator {
                     self.killed_pids.insert(pid);
                     self.process_parents.remove(&pid);
                     self.process_contexts.remove(&pid);
+                    // §9.6.2: incl. its future-time #delay (see above).
+                    self.event_queue.remove_pid(pid);
                 }
                 self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
                 self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
@@ -58290,8 +58303,12 @@ impl Simulator {
             self.process_parents.remove(&p);
             self.process_contexts.remove(&p);
         }
-        // Purge from every scheduling structure.
-        self.event_queue.remove_pid(pid);
+        // Purge from every scheduling structure — every DESCENDANT's
+        // future-time #delay too, or the wheel keeps reporting activity
+        // and a quiet run never hits the idle break (§9.6.2).
+        for &p in &to_kill {
+            self.event_queue.remove_pid(p);
+        }
         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
         self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
         self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
