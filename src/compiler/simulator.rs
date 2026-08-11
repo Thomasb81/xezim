@@ -44599,6 +44599,18 @@ impl Simulator {
                     self.settle_after_proc_write();
                     return;
                 }
+                // §10.6 mirror case: the SOURCE is an unpacked-struct class
+                // property (`p = o.orig`, incl. through a ternary — UVM's
+                // factory pair copy). The whole-struct read of a class prop
+                // through a frame-held handle has no flat signals to
+                // assemble, so decompose member-wise from the RHS side too.
+                if self
+                    .try_decompose_struct_class_prop_read_assign(lvalue, rvalue)
+                    .is_some()
+                {
+                    self.settle_after_proc_write();
+                    return;
+                }
                 // IEEE 1800-2017 §7.2: assigning one unpacked struct to another
                 // copies every member. Their leaves live in separate signals, so
                 // evaluating the RHS to a packed value and storing it writes a
@@ -49380,6 +49392,33 @@ impl Simulator {
                             self.local_stack
                                 .last_mut()
                                 .map(|frame| frame.remove(&d.name.name));
+                            // A decl-init whose SOURCE is an unpacked-struct
+                            // CLASS property (`pair_t p = o.orig;`, incl. the
+                            // ternary form) must write the leaves member-wise —
+                            // the whole-value `v` computed above has nothing to
+                            // assemble from and left every member x.
+                            if let Some(init_expr) = d.init.clone() {
+                                let lv = crate::ast::expr::Expression::new(
+                                    crate::ast::expr::ExprKind::Ident(
+                                        crate::ast::expr::HierarchicalIdentifier {
+                                            root: None,
+                                            path: vec![crate::ast::expr::HierPathSegment {
+                                                name: crate::ast::Identifier {
+                                                    name: d.name.name.clone(),
+                                                    span: d.name.span,
+                                                },
+                                                selects: Vec::new(),
+                                            }],
+                                            span: d.name.span,
+                                            cached_signal_id: std::cell::Cell::new(None),
+                                            cached_resolved_name: std::cell::OnceCell::new(),
+                                        },
+                                    ),
+                                    d.name.span,
+                                );
+                                let _ = self
+                                    .try_decompose_struct_class_prop_read_assign(&lv, &init_expr);
+                            }
                         } else if let Some(frame) = self.local_stack.last_mut() {
                             frame.insert(d.name.name.clone(), v);
                         } else {
@@ -65120,6 +65159,53 @@ impl Simulator {
         // Member-wise assign. Nested struct/array members recurse naturally:
         // `lhs.m = eval(rhs.m)` re-enters this path (for a nested struct
         // class-property target) or the existing signal paths.
+        for m in &su.members {
+            for md in &m.declarators {
+                let mname = md.name.name.as_str();
+                let lhs_f = Self::append_member_expr(lvalue, mname);
+                let rhs_f = Self::append_member_expr(rvalue, mname);
+                let v = self.eval_expr(&rhs_f);
+                self.assign_value(&lhs_f, &v);
+            }
+        }
+        Some(())
+    }
+
+    /// Mirror of `try_decompose_struct_class_prop_assign` for the READ side:
+    /// the assignment SOURCE is an unpacked-struct CLASS property (any
+    /// target). Sees through parens and a ?: whose arms are both class-prop
+    /// structs (`cond ? o.orig : o.ovrd` picks the arm by the evaluated
+    /// condition — the UVM factory pair-copy shape). Member-wise
+    /// `lhs.m = eval(rhs.m)` reuses the working field paths on both sides.
+    /// (IEEE 1800-2023 §10.6)
+    fn try_decompose_struct_class_prop_read_assign(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> Option<()> {
+        match &rvalue.kind {
+            ExprKind::Paren(inner) => {
+                return self.try_decompose_struct_class_prop_read_assign(lvalue, inner);
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                // Only take over when BOTH arms are class-prop structs, so a
+                // mixed ternary keeps its existing evaluation.
+                let t_ok = self.class_prop_struct_of(then_expr).is_some();
+                let e_ok = self.class_prop_struct_of(else_expr).is_some();
+                if t_ok && e_ok {
+                    let c = self.eval_expr(condition);
+                    let arm = if c.to_u64().unwrap_or(0) != 0 { then_expr } else { else_expr };
+                    return self.try_decompose_struct_class_prop_read_assign(lvalue, arm);
+                }
+                return None;
+            }
+            _ => {}
+        }
+        let (handle, prop) = self.class_prop_receiver(rvalue)?;
+        let su = self.class_prop_struct(handle, &prop)?;
+        if !Self::spreads_member_wise(&su) {
+            return None;
+        }
         for m in &su.members {
             for md in &m.declarators {
                 let mname = md.name.name.as_str();
