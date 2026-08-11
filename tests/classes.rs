@@ -159,3 +159,6 @@ mod null_deref_fatal;
 
 #[path = "classes/ctor_dispatch_and_p_format.rs"]
 mod ctor_dispatch_and_p_format;
+
+#[path = "classes/assoc_enum_key_class_property.rs"]
+mod assoc_enum_key_class_property;
