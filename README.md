@@ -133,13 +133,12 @@ and testbench flows. Portable code should not rely on them.
 
 # Project Structure
 
-xezim is split across two repos that live **side by side**; this repo depends on
-`xezim-core` via a relative path (`../xezim-core`) — it is a sibling directory, not a
-submodule:
+xezim is split across two repos; this repo depends on `xezim-core` as a **git
+dependency** (Cargo clones it automatically — no submodule, no manual checkout):
 
 ```
-../xezim-core/  — shared library: parser, elaboration, value, SDF, VCD sink (sibling repo)
-./              — bytecode interpreter + simulator (this repo, binary: xezim)
+xezim-core (git dep) — shared library: parser, elaboration, value, SDF, VCD sink
+./                   — bytecode interpreter + simulator (this repo, binary: xezim)
 ```
 
 This repo:
@@ -155,7 +154,7 @@ This repo:
 │   └── main.rs            — CLI entry point (binary: xezim)
 ├── tests/                 — Rust integration tests + SV compliance suite
 ├── examples/
-└── Cargo.toml             — depends on xezim-core (path = ../xezim-core, a sibling repo)
+└── Cargo.toml             — depends on xezim-core (git dependency, fetched by cargo)
 ```
 
 ### Components
@@ -231,31 +230,33 @@ These tests help verify correctness against real-world Verilog/SystemVerilog edg
 
 Install Rust: https://www.rust-lang.org/tools/install
 
-This repo depends on `xezim-core` as a **sibling directory** (Cargo references it via
-`path = "../xezim-core"`), so clone both repos side by side into the same parent:
+`xezim-core` is a git dependency, so a bare clone of this repo builds on its own —
+`cargo build` fetches everything else:
 
 ```bash
-git clone git@github.com:<you>/xezim-core.git
 git clone git@github.com:<you>/xezim.git
 cd xezim
-```
-
-Expected layout:
-
-```
-<parent>/
-├── xezim-core/   — shared library (parser, elaboration, value, SDF, VCD)
-└── xezim/        — this repo (binary: xezim)
-```
-
-Build the simulator:
-
-```bash
 cargo build            # debug
 cargo build --release  # optimized (recommended for large designs)
 ```
 
 The release binary is produced at `target/release/xezim`.
+
+### Co-developing with a local xezim-core
+
+To build against a local `xezim-core` checkout (so its edits take effect without a
+push), clone it anywhere and add a `[patch]` to an **untracked** cargo config in a
+directory above this repo (e.g. `<parent>/.cargo/config.toml` for sibling clones —
+per-developer machine setup, never committed):
+
+```toml
+[patch."https://github.com/aionhw/xezim-core.git"]
+xezim-core = { path = "/abs/path/to/xezim-core" }
+sv-parser = { path = "/abs/path/to/xezim-core/xezim-parser" }
+```
+
+`cargo tree -p xezim-core` shows which copy is in use (a path in parentheses means
+the patch is active).
 
 ---
 

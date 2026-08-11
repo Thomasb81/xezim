@@ -14,10 +14,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Checkout xezim-core
+      # xezim-core is a git dependency in Cargo.toml (cargo clones it), but
+      # Cargo.lock is gitignored so it tracks a moving main — the build cache
+      # key still needs the core commit to avoid reusing a tree built against
+      # a different core.
+      - name: Resolve xezim-core HEAD
         run: |
-          git clone https://github.com/aionhw/xezim-core.git ../xezim-core
-          echo "CORE_SHA=$(git -C ../xezim-core rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "CORE_SHA=$(git ls-remote https://github.com/aionhw/xezim-core.git refs/heads/main | cut -f1)" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

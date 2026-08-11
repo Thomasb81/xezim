@@ -10,8 +10,12 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 ahash = { version = "0.8", features = ["serde"] }
 rand = "0.8"
-xezim-core = { path = "../xezim-core" }
-sv-parser = { path = "../xezim-core/xezim-parser" }
+# Fetched from git so `cargo build` works from a bare clone of this repo
+# alone. Co-developing against a local ../xezim-core checkout: add a
+# `[patch]` to an UNTRACKED .cargo/config.toml in a parent directory —
+# see "Co-developing with a local xezim-core" in README.md.
+xezim-core = { git = "https://github.com/aionhw/xezim-core.git", branch = "main" }
+sv-parser = { git = "https://github.com/aionhw/xezim-core.git", branch = "main" }
 libloading = "0.8"
 libffi = "3"
 libc = "0.2"
