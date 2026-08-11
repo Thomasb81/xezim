@@ -90,3 +90,29 @@ endmodule
 "#;
     simulate(src, 10).expect("the §23.2.2.1 split form is legal");
 }
+
+/// §23.5 `extern module` PROTOTYPE followed by the real definition — the
+/// prototype is consumed; the definition elaborates and instantiates.
+/// Reference-validated (em a=1 / ok at t=1).
+#[test]
+fn extern_module_prototype_is_accepted() {
+    let src = r#"
+extern module em(input logic a);
+module tb;
+  em u(.a(1'b1));
+  logic [7:0] ok = 0;
+  initial begin #1 ok = 8'h4F; end
+endmodule
+module em(input logic a);
+  int saw = 0;
+  initial saw = a;
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("extern prototype must elaborate");
+    let ok = sim
+        .get_signal("ok")
+        .or_else(|| sim.get_signal("tb.ok"))
+        .and_then(|v| v.to_u64())
+        .unwrap_or(0);
+    assert_eq!(ok, 0x4F, "design with an extern prototype runs normally");
+}
