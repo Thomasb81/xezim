@@ -108,3 +108,33 @@ endmodule
     assert_eq!(u(&sim, "at_b"), 1, "last-armed waiter wakes first");
     assert_eq!(u(&sim, "at_a"), 2, "first-armed waiter wakes second");
 }
+
+/// §5.5/§10.3 (#35): a PROCESS's blocking write schedules cont-assign
+/// re-evaluation as a SEPARATE active-region event — the writing process
+/// reads STALE net values until it yields. Reference: 2 1 2 7. The dual
+/// shape (a synthesized netlist evaluated per input change, dep.sv) stays
+/// eager — the split by evaluator kind is what satisfies both.
+#[test]
+fn proc_writes_defer_cont_assign_propagation_until_yield() {
+    let src = r#"
+`timescale 1ns/1ns
+module tb;
+  logic [7:0] a=0; wire [7:0] b, c;
+  assign b = a + 1; assign c = b + 1;
+  int s0, s1, s2, s3;
+  initial begin
+    s0 = c;
+    a = 5;
+    s1 = b;
+    s2 = c;
+    #0 s3 = c;
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "s0"), 2, "pre-write read");
+    assert_eq!(u(&sim, "s1"), 1, "same-process read is STALE (one level)");
+    assert_eq!(u(&sim, "s2"), 2, "same-process read is STALE (two levels)");
+    assert_eq!(u(&sim, "s3"), 7, "after #0 the updates have propagated");
+}
