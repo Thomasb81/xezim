@@ -165,3 +165,5 @@ mod assoc_enum_key_class_property;
 
 #[path = "classes/module_scope_handle_access.rs"]
 mod module_scope_handle_access;
+#[path = "classes/struct_prop_whole_copy.rs"]
+mod struct_prop_whole_copy;

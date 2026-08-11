@@ -180,11 +180,13 @@ fn uvm_2020_config_db_reaches_build_phase() {
     );
 }
 
-// `base_c::type_id::set_type_override(deriv_c::get_type())` before create()
-// still constructs base_c — the factory override table is not consulted on
-// the create path yet (kind=base, expected deriv).
+/// `base_c::type_id::set_type_override(deriv_c::get_type())` must make
+/// `type_id::create` return the derived type. Pins the unpacked-struct
+/// class-property copy fix: the factory's override matcher copies
+/// `override.orig` (a struct with a class-handle + string member) into a
+/// local through a ?: — that whole-struct read through a frame-held handle
+/// came back x, so every registered override failed to match.
 #[test]
-#[ignore = "uvm 2020: factory set_type_override does not redirect type_id::create yet"]
 fn uvm_2020_factory_type_override() {
     let sim = run_uvm("1800.2-2020", &[], CFG_TEST.to_string(), "top")
         .expect("UVM 2020 factory test failed to simulate");
