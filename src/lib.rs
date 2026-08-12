@@ -655,7 +655,85 @@ pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, Stri
     )
 }
 
+/// Public entry point: runs the whole compile+simulate on a worker thread
+/// with a LARGE stack. The parser, elaborator, and statement interpreter are
+/// all deeply recursive; an embedder's thread (a 2 MiB `cargo test` thread,
+/// a debug build's frames) otherwise overflows on real designs — CI's debug
+/// UVM suites aborted with "fatal runtime error: stack overflow". Same
+/// policy as the binary's `main()`: XEZIM_STACK_MB overrides (0 = run on
+/// the caller's thread); the memory is virtual, committed only as used.
+#[allow(clippy::too_many_arguments)]
 pub fn simulate_multi(
+    sources: &[String],
+    max_time: u64,
+    top_module_name: Option<&str>,
+    include_dirs: &[String],
+    source_paths: &[String],
+    settle_limit: Option<u32>,
+    activity_mon: bool,
+    sdf_file: Option<&str>,
+    sdf_select: Option<xezim_core::sdf::DelaySelect>,
+    defines: &[(String, Option<String>)],
+    plusargs: &[String],
+    threads: usize,
+    xtrace_file: Option<&str>,
+    xtrace_scopes: &[String],
+    xtrace_from_ns: u64,
+    xtrace_to_ns: u64,
+    fst_file: Option<&str>,
+    fst_scopes: &[String],
+    emit_hypergraph: Option<&str>,
+    load_partition: Option<&str>,
+    write_profile: Option<&str>,
+    profile_input: Option<&str>,
+    collapse_islands: bool,
+    multikernel_scope: Option<&str>,
+) -> Result<compiler::Simulator, String> {
+    let stack_mb: usize = std::env::var("XEZIM_STACK_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    if stack_mb == 0 {
+        return simulate_multi_inner(
+            sources, max_time, top_module_name, include_dirs, source_paths,
+            settle_limit, activity_mon, sdf_file, sdf_select, defines, plusargs,
+            threads, xtrace_file, xtrace_scopes, xtrace_from_ns, xtrace_to_ns,
+            fst_file, fst_scopes, emit_hypergraph, load_partition, write_profile,
+            profile_input, collapse_islands, multikernel_scope,
+        );
+    }
+    // `Simulator` is not auto-`Send`: it carries raw pointers into its OWN
+    // allocations (`vpi_argv` → `vpi_arg_cstrings`, leaked DPI scope boxes)
+    // and thread-local registrations that are re-established per call. A
+    // one-shot OWNERSHIP TRANSFER of the fully built value out of the worker
+    // is sound — nothing on the worker retains a reference, and the caller
+    // uses it single-threaded exactly as before this wrapper existed.
+    struct SendResult(Result<compiler::Simulator, String>);
+    // SAFETY: see above — transfer-once of a self-contained value.
+    unsafe impl Send for SendResult {}
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("xezim-sim".to_string())
+            .stack_size(stack_mb * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                SendResult(simulate_multi_inner(
+                    sources, max_time, top_module_name, include_dirs, source_paths,
+                    settle_limit, activity_mon, sdf_file, sdf_select, defines,
+                    plusargs, threads, xtrace_file, xtrace_scopes, xtrace_from_ns,
+                    xtrace_to_ns, fst_file, fst_scopes, emit_hypergraph,
+                    load_partition, write_profile, profile_input, collapse_islands,
+                    multikernel_scope,
+                ))
+            })
+            .expect("spawn simulation worker")
+            .join()
+            .map(|r| r.0)
+            .unwrap_or_else(|_| Err("simulation worker panicked".to_string()))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn simulate_multi_inner(
     sources: &[String],
     max_time: u64,
     top_module_name: Option<&str>,
