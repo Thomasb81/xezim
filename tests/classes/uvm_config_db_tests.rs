@@ -132,7 +132,12 @@ endmodule
         return;
     };
     println!("{}", out);
-    assert!(out.contains("GET1_OK: 42"), "same-instance get should hit: {}", out);
+    // Reference-verified (2026-08-11, UVM 2020 src, same test): the set
+    // scope "tc" compiles to /^tc$/ while get(comp1, "tc", ...) looks up
+    // "tc.tc" (cntxt full name + "." + inst_name) — a MISS. The old
+    // GET1_OK expectation pinned the unresolved-DPI always-match bug that
+    // the built-in uvm_re_match replaced with real POSIX-ERE semantics.
+    assert!(out.contains("GET1_FAIL"), "cross-scope get must miss: {}", out);
     assert!(out.contains("GET3_OK: 99"), "wildcard get should hit: {}", out);
 }
 
@@ -216,7 +221,11 @@ endmodule
         return;
     };
     println!("{}", out);
-    assert!(out.contains("T1_GET: 42"), "specific-instance get: {}", out);
+    // Reference-verified (2026-08-11): get(comp, "tc", ...) looks up
+    // "comp.tc", which /^tc$/ from set(null, "tc", ...) does not match —
+    // the reference prints T1_FAIL. The old T1_GET expectation pinned the
+    // unresolved-DPI always-match bug.
+    assert!(out.contains("T1_FAIL"), "cross-scope get must miss: {}", out);
     assert!(out.contains("T2_GET: 77"), "wildcard get: {}", out);
     assert!(out.contains("T3_OK"), "unset field should miss: {}", out);
 }

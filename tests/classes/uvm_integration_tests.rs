@@ -312,3 +312,82 @@ fn test_uvm_hello_world() {
     let sim = run_uvm("1.2", &incs, test_src, "hello_world").expect("hello_world failed");
     assert!(sim.time > 0, "hello_world must advance past t=0");
 }
+
+/// End-to-end pin for the built-in UVM DPI-C helpers: compiled WITHOUT
+/// UVM_NO_DPI, the command-line processor walks the real argv, so
+/// +UVM_CONFIG_DB_TRACE must produce CFGDB trace messages. Under
+/// UVM_NO_DPI this plusarg is dead in every simulator (the no-DPI
+/// fallback returns no args) — the builtin DPI layer is what makes it
+/// live.
+#[test]
+fn uvm_1800_2_2017_config_db_trace_plusarg_with_dpi() {
+    const TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+class my_test extends uvm_test;
+   `uvm_component_utils(my_test)
+   function new(string name = "my_test", uvm_component parent = null);
+      super.new(name, parent);
+   endfunction
+   function void build_phase(uvm_phase phase);
+      int got;
+      uvm_config_db#(int)::set(this, "", "knob", 42);
+      void'(uvm_config_db#(int)::get(this, "", "knob", got));
+      `uvm_info("KNOB", $sformatf("got=%0d", got), UVM_LOW)
+   endfunction
+   task run_phase(uvm_phase phase);
+      phase.raise_objection(this);
+      #100;
+      phase.drop_objection(this);
+   endtask
+endclass
+
+module top;
+   initial run_test("my_test");
+endmodule
+"#;
+    let root = uvm_dir().join("1800.2-2017");
+    let src_dir = root.join("src");
+    let uvm_pkg = std::fs::read_to_string(src_dir.join("uvm_pkg.sv")).expect("read uvm_pkg.sv");
+    let include_dirs = vec![src_dir.to_str().unwrap().to_string()];
+    let sim = simulate_multi(
+        &[uvm_pkg, TEST.to_string()],
+        2000,
+        Some("top"),
+        &include_dirs,
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[], // NO defines — UVM_NO_DPI deliberately absent
+        &["+UVM_CONFIG_DB_TRACE".to_string()],
+        1,
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+    )
+    .expect("UVM 2017 with DPI builtins failed to simulate");
+    let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        msgs.iter().any(|m| m.contains("CFGDB/SET") && m.contains("knob")),
+        "+UVM_CONFIG_DB_TRACE must produce a CFGDB/SET trace for the knob set; output tail: {:?}",
+        &msgs[msgs.len().saturating_sub(15)..]
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("got=42")),
+        "config_db get must still return the value; output tail: {:?}",
+        &msgs[msgs.len().saturating_sub(15)..]
+    );
+    assert_eq!(sim.time, 100, "phase cycle must still end at t=100");
+}
