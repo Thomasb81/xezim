@@ -39789,6 +39789,45 @@ impl Simulator {
                 }
             }
             ExprKind::Binary { op, left, right } => {
+                // §25.9: equality where a side is a VIRTUAL-INTERFACE
+                // VARIABLE compares BINDINGS, not (x) values — `val == t` in
+                // uvm_resource::write with t bound and val unbound must be
+                // FALSE, or the guarded store never runs (issue #113). The
+                // classifier is deliberately narrow (declared vif vars only,
+                // never `iface.signal` selects) so ordinary comparisons keep
+                // their value semantics.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
+                    let lv = self.vif_operand(left);
+                    let rv = self.vif_operand(right);
+                    let engaged = lv.is_some() || rv.is_some();
+                    if engaged {
+                        // A bare `null` on the other side of a vif operand is
+                        // the unbound value.
+                        let l = lv.or_else(|| {
+                            matches!(&left.kind, ExprKind::Null).then_some(None)
+                        });
+                        let r = rv.or_else(|| {
+                            matches!(&right.kind, ExprKind::Null).then_some(None)
+                        });
+                        match (l, r) {
+                            (Some(l), Some(r)) => {
+                                let eq = l == r;
+                                let bit =
+                                    if matches!(op, BinaryOp::Eq) { eq } else { !eq };
+                                return Value::from_u64(bit as u64, 1);
+                            }
+                            // A BOUND vif never equals an operand that is not
+                            // itself vif-classifiable (its untracked storage
+                            // reads x/0 — `val == t` in uvm_resource::write).
+                            (Some(Some(_)), None) | (None, Some(Some(_))) => {
+                                let bit = if matches!(op, BinaryOp::Eq) { 0 } else { 1 };
+                                return Value::from_u64(bit, 1);
+                            }
+                            // Unbound vs unclassifiable: keep value semantics.
+                            _ => {}
+                        }
+                    }
+                }
                 // §11.4.5: equality on unpacked structs is member-wise.
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
                     if let Some(v) = self.compare_unpacked_structs(left, right) {
@@ -70883,11 +70922,142 @@ impl Simulator {
         false
     }
 
+    /// Classify an equality operand as a VIRTUAL-INTERFACE VARIABLE:
+    /// `None` — not one; `Some(Some(n))` — bound to instance `n`;
+    /// `Some(None)` — a declared vif variable with no binding (null).
+    /// Only declared vif storage engages — never `iface.signal` selects.
+    fn vif_operand(&self, e: &Expression) -> Option<Option<String>> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let raw = &h.path[0].name.name;
+                if let Some(th) = self.this_stack.last().copied().flatten() {
+                    if let Some((b, _)) =
+                        self.virtual_iface_bindings.get(&(th, raw.clone()))
+                    {
+                        return Some(Some(b.clone()));
+                    }
+                    if self
+                        .signals
+                        .contains_key(&format!("__vif_local__{}#{}", th, raw))
+                    {
+                        return Some(
+                            self.signals
+                                .get(&format!("__vif_local__{}#{}", th, raw))
+                                .map(|v| v.to_sv_string()),
+                        );
+                    }
+                }
+                if let Some(v) = self.signals.get(&format!("__vif_local__{}", raw)) {
+                    return Some(Some(v.to_sv_string()));
+                }
+                if let Some(b) = self.iface_alias_for(raw) {
+                    return Some(Some(b));
+                }
+                if self.is_interface_instance(raw) {
+                    return Some(Some(raw.clone()));
+                }
+                // A DECLARED vif property of `this` with no binding: unbound.
+                if let Some(th) = self.this_stack.last().copied().flatten() {
+                    let mut cur = self
+                        .heap
+                        .get(th)
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone());
+                    while let Some(cn) = cur {
+                        let Some(cd) = self.module.classes.get(&cn) else { break };
+                        if cd.virtual_iface_properties.contains_key(raw) {
+                            return Some(None);
+                        }
+                        cur = cd.extends.clone();
+                    }
+                }
+                None
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 => {
+                self.vif_operand_obj_prop(&h.path[0].name.name, &h.path[1].name.name)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(bh) = &expr.kind {
+                    if bh.path.len() == 1 && !self.is_interface_instance(&bh.path[0].name.name)
+                    {
+                        return self
+                            .vif_operand_obj_prop(&bh.path[0].name.name, &member.name);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// `obj.prop` classification for `vif_operand` — engages only when the
+    /// receiver's class DECLARES `prop` as a virtual interface.
+    fn vif_operand_obj_prop(&self, obj: &str, prop: &str) -> Option<Option<String>> {
+        let oh = if obj == "this" {
+            self.this_stack.last().copied().flatten().unwrap_or(0)
+        } else {
+            self.eval_ident_handle(obj).unwrap_or(0)
+        };
+        if oh == 0 {
+            return None;
+        }
+        let mut cur = self
+            .heap
+            .get(oh)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        let mut declared = false;
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(&cn) else { break };
+            if cd.virtual_iface_properties.contains_key(prop) {
+                declared = true;
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        if !declared {
+            return None;
+        }
+        Some(
+            self.virtual_iface_bindings
+                .get(&(oh, prop.to_string()))
+                .map(|(b, _)| b.clone()),
+        )
+    }
+
     /// Like `resolve_vif_rhs_name`, but the result must demonstrably NAME a
     /// live interface instance — bound names always bottom out at one, so
     /// anything else (an ordinary variable, an indexed storage name) is
     /// rejected. Keeps the propagation hooks from polluting bindings.
     fn resolve_vif_rhs_name_strict(&self, rvalue: &Expression) -> Option<String> {
+        // `iface.member` where the dotted name is a real SIGNAL is a value
+        // read, not a modport view — `dd1 = u.d` must not classify dd1 as a
+        // vif (a modport view is never a signal).
+        let dotted: Option<String> = match &rvalue.kind {
+            ExprKind::Ident(h) if h.path.len() == 2 => Some(format!(
+                "{}.{}",
+                h.path[0].name.name, h.path[1].name.name
+            )),
+            ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(bh) = &expr.kind {
+                    if bh.path.len() == 1 {
+                        Some(format!("{}.{}", bh.path[0].name.name, member.name))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(d) = dotted {
+            if self.signal_name_to_id.contains_key(d.as_str())
+                || self.signals.contains_key(&d)
+            {
+                return None;
+            }
+        }
         self.resolve_vif_rhs_name(rvalue)
             .filter(|n| self.is_interface_instance(n))
     }

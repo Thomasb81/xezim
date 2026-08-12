@@ -29,6 +29,9 @@ class DB #(type T = int);
   static T store;
   static bit has;
   static function void set_val(T v);
+    // The uvm_resource::write shape: an unbound-vs-bound guard must be
+    // FALSE (binding compare, not x-value compare) or the store is skipped.
+    if (store == v) return;
     store = v;
     has = 1;
   endfunction
