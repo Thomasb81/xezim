@@ -36093,11 +36093,20 @@ impl Simulator {
                             let is_str = self.string_signals.contains(name.as_str());
                             let fitted = if !val.is_real && !is_str {
                                 if let Some(&target_w) = self.widths.get(name) {
-                                    if val.width != target_w {
+                                    let mut f = if val.width != target_w {
                                         val.resize_for_assign(target_w)
                                     } else {
                                         val.clone()
-                                    }
+                                    };
+                                    // §6.11.1: storage keeps the LOCAL'S
+                                    // declared signedness, not the rvalue's —
+                                    // same rule the id-signal path applies.
+                                    // `for (i = 0; ...)` on a `bit [3:0] i`
+                                    // otherwise stored the unsized literal's
+                                    // SIGNED stamp, and the counter wrapped
+                                    // negative at 8 (ivtest sv_foreach3 hang).
+                                    f.is_signed = self.signed_signals.contains(name.as_str());
+                                    f
                                 } else {
                                     val.clone()
                                 }
@@ -42008,6 +42017,7 @@ impl Simulator {
                 }
                 "$bits" => {
                     if let Some(arg) = args.first() {
+
                         // §5.9: the empty string literal `""` is equivalent to
                         // `"\0"` — one character, 8 bits (its VALUE stays a
                         // width-0 zero elsewhere; only the size query sees the
@@ -42125,7 +42135,28 @@ impl Simulator {
                                     .product();
                                 return Value::from_u64(n * *ew as u64, 32);
                             }
-                            if let Some(w) = self.module.typedefs.get(&name).copied() {
+                            // §6.18/§23.10: a typedef declared in an INLINED
+                            // child module survives only under its instance-
+                            // scoped key (`dut.foo_t`) — the bare key is
+                            // restored after inlining so differently
+                            // parameterized instances don't collide. Resolve
+                            // through the process's scope hint, outermost
+                            // scope walked inward (ivtest sv_enum1).
+                            let typedef_w = self.module.typedefs.get(&name).copied().or_else(|| {
+                                let mut h = self.name_resolve_hint.borrow().clone()?;
+                                loop {
+                                    if let Some(&w) =
+                                        self.module.typedefs.get(&format!("{}.{}", h, name))
+                                    {
+                                        return Some(w);
+                                    }
+                                    match h.rfind('.') {
+                                        Some(i) => h.truncate(i),
+                                        None => return None,
+                                    }
+                                }
+                            });
+                            if let Some(w) = typedef_w {
                                 // §20.6.2: a typedef carrying UNPACKED dims is
                                 // element_bits × the dimension sizes —
                                 // `typedef int T[3:0]` is 128, not 32. The
@@ -43674,6 +43705,24 @@ impl Simulator {
                             self.package_enum_member(&h.path[0].name.name, &member.name)
                         {
                             return v;
+                        }
+                        // §26.3: a package PARAMETER/localparam through the
+                        // same shape (`p1::step` in a program initial or a
+                        // subroutine body — ivtest sv_package2). Qualified
+                        // key first so same-named parameters in two packages
+                        // don't collide through the bare fallback.
+                        let base = &h.path[0].name.name;
+                        if self.module.packages.contains(base)
+                            && !self.signal_name_to_id.contains_key(base.as_str())
+                            && !self.signals.contains_key(base)
+                        {
+                            let qual = format!("{}::{}", base, member.name);
+                            if let Some(v) = self.module.parameters.get(&qual) {
+                                return v.clone();
+                            }
+                            if let Some(v) = self.module.parameters.get(&member.name) {
+                                return v.clone();
+                            }
                         }
                     }
                 }

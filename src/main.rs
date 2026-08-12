@@ -1153,12 +1153,39 @@ fn main() {
             libc::prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
         }
     }
-    let compile_wall_start = std::time::Instant::now();
     spawn_memory_watchdog();
     // Install the SIGUSR1 hang-report handler before compile: a user poking a
     // seemingly-hung run during a long elaboration must not kill it (the
     // default SIGUSR1 action is termination).
     xezim::compiler::simulator::install_hang_report_handler();
+
+    // The parser, elaborator, and statement interpreter are all deeply
+    // recursive; a debug build's unoptimized frames overflow the default
+    // 8 MiB main-thread stack on large designs (a full UVM elaboration
+    // aborts with "thread 'main' has overflowed its stack"). Do what rustc
+    // does: run the whole compile+simulate on a worker thread with a large
+    // stack. The memory is virtual — pages commit only if actually used —
+    // so the big default costs nothing. XEZIM_STACK_MB overrides.
+    let stack_mb: usize = std::env::var("XEZIM_STACK_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    if stack_mb > 0 {
+        let code = std::thread::Builder::new()
+            .name("xezim-main".to_string())
+            .stack_size(stack_mb * 1024 * 1024)
+            .spawn(run_main)
+            .expect("spawn simulation thread")
+            .join()
+            .unwrap_or_else(|_| 101);
+        std::process::exit(code);
+    }
+    let code = run_main();
+    std::process::exit(code);
+}
+
+fn run_main() -> i32 {
+    let compile_wall_start = std::time::Instant::now();
 
     // Default to IEEE 1800-2023 mode. SV-2023 is additive over -2017, so
     // valid -2017 code stays valid; pass `--sv2017` to opt back to the
@@ -2167,7 +2194,7 @@ suppressed but the explicit SDF annotation still applies."
                         if code != 0 {
                             std::process::exit(code);
                         }
-                        return;
+                        return 0;
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -2329,7 +2356,7 @@ suppressed but the explicit SDF annotation still applies."
             println!("// === Preprocessed: {} ===", label);
             print!("{}", source);
         }
-        return;
+        return 0;
     }
 
     if mode == Mode::Parse {
@@ -2396,7 +2423,7 @@ suppressed but the explicit SDF annotation still applies."
         if total_err > 0 {
             std::process::exit(1);
         }
-        return;
+        return 0;
     }
 
     if mode == Mode::Compile {
@@ -2505,7 +2532,7 @@ suppressed but the explicit SDF annotation still applies."
                 std::process::exit(1);
             }
         }
-        return;
+        return 0;
     }
 
     println!("Max time: {} ns", max_time);
@@ -2538,7 +2565,7 @@ suppressed but the explicit SDF annotation still applies."
                 std::process::exit(1);
             }
         }
-        return;
+        return 0;
     }
 
     match xezim::simulate_multi(
@@ -2597,6 +2624,7 @@ suppressed but the explicit SDF annotation still applies."
             if code != 0 {
                 std::process::exit(code);
             }
+            0
         }
         Err(e) => {
             eprintln!("Simulation error: {}", e);
