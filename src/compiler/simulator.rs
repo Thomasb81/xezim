@@ -45007,6 +45007,19 @@ impl Simulator {
                                 .or_else(|| self.var_class_types.get(&bname).cloned())
                                 .or_else(|| self.declared_collection_elem_class(&bname))
                                 .or_else(|| {
+                                    // A method-LOCAL collection stores under a
+                                    // per-process RENAMED key — consult it too.
+                                    self.dyn_name_lookup(&bname)
+                                        .map(str::to_string)
+                                        .and_then(|rn| {
+                                            self.module
+                                                .array_elem_class
+                                                .get(&rn)
+                                                .cloned()
+                                                .or_else(|| self.declared_collection_elem_class(&rn))
+                                        })
+                                })
+                                .or_else(|| {
                                     // Class-MEMBER collection (static or instance):
                                     // resolve the element class from the current
                                     // class's property type, walking the hierarchy.
@@ -49538,6 +49551,23 @@ impl Simulator {
                                     .associative_arrays
                                     .insert(name.clone(), is_string_key);
                                 self.widths.insert(name.clone(), w);
+                                // Record the ELEMENT type under the renamed
+                                // storage key so `all[k] = new` can resolve
+                                // the element class (incl. parameterized
+                                // typedefs — UVM's sort_by_precedence local
+                                // `rsrc_q_t all[int]`; issue #113).
+                                self.module
+                                    .var_decl_types
+                                    .insert(name.clone(), data_type.clone());
+                                if let crate::ast::types::DataType::TypeReference {
+                                    name: tn, ..
+                                } = data_type
+                                {
+                                    self.module
+                                        .array_elem_class
+                                        .entry(name.clone())
+                                        .or_insert_with(|| tn.name.name.clone());
+                                }
                                 // A `string m[...]` (string-VALUED assoc): mark the
                                 // name so its elements render as quoted strings under
                                 // `%p` (the element-string check keys off the array
@@ -65389,6 +65419,24 @@ impl Simulator {
                     break;
                 }
                 let cd = self.module.classes.get(&cn)?;
+                // A COLLECTION property (assoc/queue/array — incl. a STATIC
+                // one, which elaboration gates out of the per-instance maps)
+                // is NOT a scalar struct: its unpacked dimension indexes
+                // first (§7.4.2). Answering the element type here routed
+                // `ri_tab[key].scope = v` into the struct-leaf machinery —
+                // stored on the instance, invisible to exists()/num()/
+                // foreach. UVM's resource pool lost every scope that way, so
+                // every uvm_config_db get silently missed (issue #113).
+                // ASSOC/QUEUE collections (incl. statics, which store flat
+                // globally) index their unpacked dimension through the
+                // COLLECTION machinery. FIXED arrays of structs stay here:
+                // their `[i]` element leaves are the struct machinery's job.
+                if cd.assoc_properties.contains_key(prop)
+                    || cd.queue_properties.contains_key(prop)
+                    || cd.static_collections.iter().any(|(n, _, _)| n == prop)
+                {
+                    return None;
+                }
                 if let Some(DataType::Struct(su)) = cd.property_types.get(prop) {
                     return Some(su.clone());
                 }
@@ -66184,6 +66232,10 @@ impl Simulator {
                 || cd.array_nd_properties.contains_key(prop)
                 || cd.queue_properties.contains_key(prop)
                 || cd.assoc_properties.contains_key(prop)
+                // Static collections index their unpacked dimension first
+                // too (§7.4.2) — route them to the collection paths, not
+                // the packed-select machinery.
+                || cd.static_collections.iter().any(|(n, _, _)| n == prop)
             {
                 return None;
             }
@@ -66914,11 +66966,45 @@ impl Simulator {
 
     /// The unpacked-struct element type of queue `obj_name`, if it has one.
     fn queue_elem_struct(&self, obj_name: &str) -> Option<crate::ast::types::StructUnionType> {
-        let dt = self.p_elem_type(obj_name)?;
-        match self.resolve_dt(&dt) {
-            DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
-            _ => None,
+        if let Some(dt) = self.p_elem_type(obj_name) {
+            if let DataType::Struct(su) = self.resolve_dt(&dt) {
+                if Self::spreads_member_wise(&su) {
+                    return Some(su);
+                }
+            }
+            return None;
         }
+        // STATIC class collections store globally under the bare name but
+        // record their element type in the declaring CLASS (`static
+        // rsrc_info_t ri_tab [uvm_resource_base]` — UVM's resource pool).
+        // Without this the struct-element write gate never matched and
+        // `ri_tab[key].scope = v` was dropped (issue #113).
+        if !obj_name.contains('#') && !obj_name.contains('.') {
+            for cd in self.module.classes.values() {
+                if cd.static_collections.iter().any(|(n, _, _)| n == obj_name) {
+                    if let Some(dt) = cd.property_types.get(obj_name) {
+                        // The element type may be a CLASS-LOCAL typedef
+                        // (`typedef struct {...} rsrc_info_t;`) invisible to
+                        // the module-level resolve — chase it through the
+                        // class's own typedef table first.
+                        let resolved = match dt {
+                            DataType::TypeReference { name: tn, .. } => cd
+                                .typedef_targets
+                                .get(&tn.name.name)
+                                .cloned()
+                                .unwrap_or_else(|| dt.clone()),
+                            other => other.clone(),
+                        };
+                        if let DataType::Struct(su) = self.resolve_dt(&resolved) {
+                            if Self::spreads_member_wise(&su) {
+                                return Some(su);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Copy element `si` of queue `src_obj` onto element `di` of `dst_obj`,
@@ -73644,6 +73730,27 @@ impl Simulator {
                 return sv_ato_value(&s, radix);
             }
 
+            // An INDEXED receiver whose ELEMENT is a live CLASS HANDLE with a
+            // user method of this name dispatches the CLASS method — never
+            // the nested-collection fallbacks below, whose "answer 0 for an
+            // unregistered compound name" behavior silently swallowed
+            // `all[prec].size()` on an assoc of queue-class handles (UVM's
+            // sort_by_precedence — issue #113).
+            if matches!(&expr.kind, ExprKind::Index { .. }) {
+                let h = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
+                if h != 0 {
+                    let cn = self
+                        .heap
+                        .get(h)
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone());
+                    if let Some(cn) = cn {
+                        if self.class_has_method(&cn, mname) {
+                            return self.exec_method_call(h, mname, args);
+                        }
+                    }
+                }
+            }
             // Nested collection: `assoc_of_queue[key].push_back(...)` / `.size()`
             // etc. Route to the compound queue name `assoc[<keyval>]`. Gated on
             // queue/array methods so `obj_array[i].some_class_method()` is not

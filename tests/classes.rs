@@ -173,3 +173,5 @@ mod module_scope_handle_access;
 mod struct_prop_whole_copy;
 #[path = "classes/randomize_obj_array_property.rs"]
 mod randomize_obj_array_property;
+#[path = "classes/static_assoc_struct_pool.rs"]
+mod static_assoc_struct_pool;
