@@ -1,7 +1,6 @@
 target/
 **/target/
 **/*.rs.bk
-Cargo.lock
 dump.vcd
 xezim_cov.json
 *.pat
@@ -64,3 +63,10 @@ ch21_memdump.dec
 audit45_feof_tmp.txt
 fscanf_pos_tmp.txt
 c10_tmp.txt
+
+Cargo.lock
+
+# Repo-local cargo config written by scripts/use-local-core.sh (per-machine)
+/.cargo/config.toml
+# A nested local xezim-core checkout used via use-local-core.sh
+/xezim-core/

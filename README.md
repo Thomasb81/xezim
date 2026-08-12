@@ -298,36 +298,41 @@ The release binary is produced at `target/release/xezim`.
 
 ### Modifying xezim-core
 
-**If you want to modify the parser/elaboration code, clone `xezim-core` as well**
-(it is a separate repo) and point the build at your checkout so edits take effect
-without a push:
+`xezim-core` (parser + elaboration) is a separate repo, consumed as a git
+dependency **pinned to the exact revision this xezim revision was tested
+against** (see `rev = ...` in `Cargo.toml`). A bare clone therefore always
+builds the verified pair — never an untested newer core — and a release tag
+of xezim pairs with the core revision it shipped with. The pin is bumped in
+the same commit that starts depending on new core behavior.
+
+**Working on core?** Clone it next to (or inside) this repo and switch the
+build to it — after this, plain `cargo build` uses your checkout directly,
+with **no network fetch**:
 
 ```bash
-git clone git@github.com:<you>/xezim-core.git ../xezim-core
+git clone git@github.com:aionhw/xezim-core.git ../xezim-core
+./scripts/use-local-core.sh        # detects ./xezim-core or ../xezim-core
+cargo build --release              # builds against the local checkout
 ```
 
-Then either build through the wrapper, which probes for the sibling checkout on
-every invocation — it uses `../xezim-core` when present and falls back to the
-plain git fetch when not:
+The script writes a git-ignored `.cargo/config.toml` with a `[patch]` that
+overrides the pinned dependency; `./scripts/use-local-core.sh --remove`
+returns to the pin. For a one-off invocation without persistent state,
+`./scripts/cargo-local.sh build --release` applies the same patch for a
+single command when `../xezim-core` exists.
+
+`cargo tree -p xezim-core` shows which copy is in use (a path in parentheses
+means your local checkout is active).
+
+**Bumping the pin** (after pushing core): from this repo,
 
 ```bash
-./scripts/cargo-local.sh build --release
-./scripts/cargo-local.sh test --features jit
+git -C ../xezim-core rev-parse origin/main   # the freshly pushed rev
+# edit both rev = "..." fields in Cargo.toml to that hash, commit, push
 ```
 
-— or, to make plain `cargo build` do it permanently on your machine, add a
-`[patch]` to an **untracked** cargo config in a directory above this repo
-(e.g. `<parent>/.cargo/config.toml` — per-developer machine setup, never
-committed):
-
-```toml
-[patch."https://github.com/aionhw/xezim-core.git"]
-xezim-core = { path = "/abs/path/to/xezim-core" }
-sv-parser = { path = "/abs/path/to/xezim-core/xezim-parser" }
-```
-
-`cargo tree -p xezim-core` shows which copy is in use (a path in parentheses means
-your local checkout is active).
+CI builds the bare-clone path on every push, so a mismatched pin fails
+loudly instead of producing a subtly incompatible binary.
 
 ---
 
