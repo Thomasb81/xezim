@@ -125,6 +125,8 @@ mod uvm_agent_active_config;
 mod uvm_dpi_builtins;
 #[path = "misc/ivtest_round55_pins.rs"]
 mod ivtest_round55_pins;
+#[path = "misc/audit_round46_finds.rs"]
+mod audit_round46_finds;
 #[path = "misc/new_ctor_vs_shallow_copy.rs"]
 mod new_ctor_vs_shallow_copy;
 #[path = "misc/assoc_dotted_key.rs"]
