@@ -40395,6 +40395,20 @@ impl Simulator {
                 } else {
                     self.eval_expr_ctx(right, self_det_w)
                 };
+                // §11.8.3: when ONE operand of an arithmetic/relational op is
+                // real, the other's INTEGER SUBTREE evaluates in real context
+                // — `3.5 == 7/2` divides as reals (3.5), it does not compare
+                // 3.5 to the integer quotient 3 (reference-verified,
+                // audit46 c3). Shifts and 4-state-only ops are excluded.
+                if !is_shift_op && l.is_real != r.is_real {
+                    if l.is_real {
+                        if let Some(f) = self.eval_subtree_as_real(right) {
+                            r = Value::from_f64(f);
+                        }
+                    } else if let Some(f) = self.eval_subtree_as_real(left) {
+                        l = Value::from_f64(f);
+                    }
+                }
                 // IEEE 1800-2023 §6.16 / Table 6-9: the `==`/`!=` operators
                 // are 2-STATE when applied to the `string` data type — they
                 // compare the textual content and always yield a definite
@@ -51424,11 +51438,7 @@ impl Simulator {
             } else {
                 (a, b)
             };
-            let d: i64 = match a.cmp(&b) {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            };
+            let d: i64 = Self::sv_strcmp(&a, &b);
             let mut v = Value::from_u64(d as u64, 32);
             v.is_signed = true;
             return Some(v);
@@ -67588,6 +67598,61 @@ impl Simulator {
     }
 
     /// Copy every element of `src` onto `dst` and set its size (`r = q`).
+    /// §11.8.3: evaluate an integer subtree in REAL context — arithmetic
+    /// (notably division) computes on reals. Returns None when the subtree
+    /// is not a plain arithmetic shape (then the caller keeps the ordinary
+    /// integral evaluation and converts only the result).
+    fn eval_subtree_as_real(&mut self, e: &Expression) -> Option<f64> {
+        match &e.kind {
+            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { .. }) => {
+                self.eval_expr(e).to_i64().map(|v| v as f64)
+            }
+            ExprKind::Number(crate::ast::expr::NumberLiteral::Real(f)) => Some(*f),
+            ExprKind::Paren(inner) => self.eval_subtree_as_real(inner),
+            ExprKind::Unary { op: crate::ast::expr::UnaryOp::Minus, operand } => {
+                self.eval_subtree_as_real(operand).map(|f| -f)
+            }
+            ExprKind::Unary { op: crate::ast::expr::UnaryOp::Plus, operand } => {
+                self.eval_subtree_as_real(operand)
+            }
+            ExprKind::Binary { op, left, right } => {
+                let l = self.eval_subtree_as_real(left)?;
+                let r = self.eval_subtree_as_real(right)?;
+                match op {
+                    BinaryOp::Add => Some(l + r),
+                    BinaryOp::Sub => Some(l - r),
+                    BinaryOp::Mul => Some(l * r),
+                    BinaryOp::Div => Some(l / r),
+                    _ => None,
+                }
+            }
+            _ => {
+                let v = self.eval_expr(e);
+                if v.is_real {
+                    Some(v.to_f64())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// §6.16.6 compare/icompare, matching the reference simulator: the
+    /// byte difference at the first mismatch within the common length,
+    /// or ±1 by length when one string is a prefix of the other.
+    fn sv_strcmp(a: &str, b: &str) -> i64 {
+        for (ca, cb) in a.bytes().zip(b.bytes()) {
+            if ca != cb {
+                return ca as i64 - cb as i64;
+            }
+        }
+        match a.len().cmp(&b.len()) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+
     /// §6.24.1: pack a call-returned dynamic array/queue (recorded in
     /// `pending_ret_collection`) into a `target_w`-bit vector — element 0
     /// most significant, each element sliced to target_w / n bits (the cast
@@ -74977,11 +75042,7 @@ impl Simulator {
                         } else {
                             (text.clone(), other)
                         };
-                        let c: i64 = match l.cmp(&r) {
-                            std::cmp::Ordering::Less => -1,
-                            std::cmp::Ordering::Equal => 0,
-                            std::cmp::Ordering::Greater => 1,
-                        };
+                        let c: i64 = Self::sv_strcmp(&l, &r);
                         let mut v = Value::from_u64(c as u64, 32);
                         v.is_signed = true;
                         return v;
@@ -77852,7 +77913,14 @@ impl Simulator {
             self.writeback_queue_param(param, caller);
         }
         self.writeback_array_args(&array_writebacks);
-        for (param, ..) in &array_writebacks {
+        for (param, caller, ..) in &array_writebacks {
+            // An IDENTITY binding (formal named like the caller's actual —
+            // `task bump(ref int arr[3]); ... bump(arr)`) shares the
+            // caller's storage: purging the formal's keys deleted the
+            // caller's whole array (audit46 a10 — post-call all-x).
+            if param == caller {
+                continue;
+            }
             let prefix = format!("{}[", param);
             let keys: Vec<String> = self
                 .signals
@@ -77999,6 +78067,9 @@ impl Simulator {
             if *is_out && param_name != caller_name {
                 self.writeback_assoc_param(param_name, caller_name);
             }
+            if param_name == caller_name {
+                continue; // identity binding — the keys ARE the caller's
+            }
             let prefix = format!("{}[", param_name);
             let keys: Vec<String> = self
                 .signals
@@ -78011,7 +78082,17 @@ impl Simulator {
             }
             self.module.associative_arrays.remove(param_name);
         }
+        let identity_params: std::collections::HashSet<&String> = wb
+            .iter()
+            .filter(|(p, c2, ..)| p == c2)
+            .map(|(p, ..)| p)
+            .collect();
         for param_name in &c.array_params {
+            // Identity-bound formals share the caller's storage — see the
+            // function-path twin above (audit46 a10).
+            if identity_params.contains(param_name) {
+                continue;
+            }
             let prefix = format!("{}[", param_name);
             let keys: Vec<String> = self
                 .signals
@@ -78263,6 +78344,18 @@ impl Simulator {
                             ..
                         }
                     ) {
+                        continue;
+                    }
+                    if std::env::var("XZ_REF_DBG").is_ok() {
+                        eprintln!("[REFDBG] task-ref formal={} dims={}", port.name.name, port.dimensions.len());
+                    }
+                    // §13.5.2: a ref formal with UNPACKED dimensions
+                    // (`ref int arr[3]`) binds an AGGREGATE by identity —
+                    // element accesses route through the ref binding, and a
+                    // scalar return copy-back clobbered the caller's whole
+                    // array with the placeholder x (audit46 a10: the
+                    // reference keeps '{11,12,13}).
+                    if !port.dimensions.is_empty() {
                         continue;
                     }
                     let val = if i < args.len() {
