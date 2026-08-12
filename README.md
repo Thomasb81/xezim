@@ -376,6 +376,8 @@ Common options:
 | `+notimingcheck` | Accepted no-op: specify timing checks are not modeled (also `+notimingchecks`/`-notimingchecks`) |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
+| `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for vendor sources you cannot edit |
+| `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
 
 Selected env knobs (off by default unless noted):
 
@@ -387,6 +389,9 @@ Selected env knobs (off by default unless noted):
 | `XEZIM_CACHE_DIR=<dir>` | Override the elaborated-design cache directory |
 | `XEZIM_NO_CACHE=1` | Disable the automatic elaborated-design cache |
 | `XEZIM_COMPILE_PHASES=1` | Report detailed simulator compilation phase timings |
+| `XEZIM_ALLOW_IMPLICIT_STATIC=1` | Same as `--relax-implicit-static` |
+| `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
+| `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
 
 Example — run the picorv32 testbench against a gate-level netlist:
 
