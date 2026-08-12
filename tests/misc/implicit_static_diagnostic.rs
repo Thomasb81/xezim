@@ -122,3 +122,38 @@ fn tempdir(tag: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&d).unwrap();
     d
 }
+
+/// §6.20.4: a block-scope `localparam`/`parameter` inside a static task is a
+/// CONSTANT, not a variable — §6.21 does not apply and it must not be
+/// rejected (a customer testbench's task-body `localparam int MIN = 24;`
+/// was; the reference runs it). Reference output: min=24 max=42.
+#[test]
+fn task_body_localparam_is_not_implicitly_static() {
+    let dir = tempdir("istatic_lp");
+    let src = dir.join("lp.sv");
+    std::fs::write(
+        &src,
+        r#"module testbench;
+  task drive_regs;
+    localparam int MIN = 24;
+    parameter  int MAX = 42;
+    $display("T|min=%0d max=%0d", MIN, MAX);
+  endtask
+  initial drive_regs;
+endmodule
+"#,
+    )
+    .unwrap();
+    let (text, ok) = run(
+        &["--simulate", "-s", "testbench", src.to_str().unwrap(), "--no-cache"],
+        false,
+    );
+    assert!(ok, "task-body localparam is legal:\n{}", text);
+    assert!(text.contains("T|min=24 max=42"), "constants read back:\n{}", text);
+    assert!(
+        !text.contains("implicitly static"),
+        "no §6.21 diagnostic for a constant:\n{}",
+        text
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
