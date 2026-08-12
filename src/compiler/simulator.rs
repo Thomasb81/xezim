@@ -42397,6 +42397,27 @@ impl Simulator {
                     v
                 }
                 "$time" => Value::from_u64(self.time_in_current_unit().round() as u64, 64),
+                // §3.14.2.3: $time/$realtime from a body whose DECLARING
+                // scope has its own timescale (CU/class/package subroutine
+                // bodies are rewritten to this at elaboration; the literal
+                // argument is the scope's unit exponent).
+                "$__xz_time_at" | "$__xz_realtime_at" => {
+                    let ue = args
+                        .first()
+                        .map(|a| self.eval_expr(a).to_f64() as i32)
+                        .unwrap_or(self.module.timeunit_exp);
+                    let diff = ue - Self::secs_to_exp(self.tick_s);
+                    let t = if diff >= 0 {
+                        self.time as f64 / 10f64.powi(diff)
+                    } else {
+                        self.time as f64 * 10f64.powi(-diff)
+                    };
+                    if name == "$__xz_realtime_at" {
+                        Value::from_f64(t)
+                    } else {
+                        Value::from_u64(t.round() as u64, 64)
+                    }
+                }
                 "$realtime" => Value::from_f64(self.time_in_current_unit()),
                 "$stime" => Value::from_u64(
                     (self.time_in_current_unit().round() as u64) & 0xFFFF_FFFF,
@@ -43060,10 +43081,29 @@ impl Simulator {
                             .unwrap_or_else(|| Value::zero(1));
                     };
                     let dt = dt.clone();
-                    let v = args
+                    let inner_is_call =
+                        matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
+                    let mut v = args
                         .get(1)
                         .map(|a| self.eval_expr(a))
                         .unwrap_or_else(|| Value::zero(1));
+                    // §6.24.1: cast of a CALL returning a dynamic array/queue
+                    // packs the returned elements, element 0 most significant,
+                    // each sliced to the target's per-element width (ivtest
+                    // sv_darray_function `byte_vector'(inc_array(b))`).
+                    if inner_is_call && self.pending_ret_collection.is_some() {
+                        let w = super::elaborate::resolve_type_width(
+                            &dt,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        );
+                        if w > 0 {
+                            let src = self.pending_ret_collection.take().unwrap();
+                            if let Some(p) = self.pack_ret_collection(&src, w) {
+                                v = p;
+                            }
+                        }
+                    }
                     // §6.16: converting an integral value to `string` removes
                     // every "\0" character — not just leading zero bytes.
                     // `string'(24'hab0063)` is 2 characters, not 3.
@@ -43104,10 +43144,46 @@ impl Simulator {
                 // `id` gives the target width). Parser-lowered; resolved here
                 // where both the typedef and parameter tables are visible.
                 "$__xz_named_cast" => {
-                    let inner_v = args
+                    let inner_is_call =
+                        matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
+                    let mut inner_v = args
                         .get(1)
                         .map(|a| self.eval_expr(a))
                         .unwrap_or_else(|| Value::zero(1));
+                    // §6.24.1: a cast whose operand is a CALL returning a
+                    // dynamic array/queue packs the returned elements —
+                    // element 0 most significant, each sliced to the target's
+                    // per-element width (ivtest sv_darray_function). The
+                    // collection was recorded at the call's `return`; the
+                    // target width resolves from the cast's leaf name.
+                    if inner_is_call && self.pending_ret_collection.is_some() {
+                        let leaf_w: Option<u32> = args.first().and_then(|a| {
+                            if let ExprKind::Ident(h) = &a.kind {
+                                h.path.last().and_then(|s| {
+                                    let nm = &s.name.name;
+                                    self.module
+                                        .typedef_types
+                                        .get(nm)
+                                        .map(|t| {
+                                            super::elaborate::resolve_type_width(
+                                                t,
+                                                Some(&self.module.parameters),
+                                                Some(&self.module.typedefs),
+                                            )
+                                        })
+                                        .or_else(|| self.module.typedefs.get(nm).copied())
+                                })
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(w) = leaf_w.filter(|&w| w > 0) {
+                            let src = self.pending_ret_collection.take().unwrap();
+                            if let Some(p) = self.pack_ret_collection(&src, w) {
+                                inner_v = p;
+                            }
+                        }
+                    }
                     let leaf = args.first().and_then(|a| {
                         if let ExprKind::Ident(h) = &a.kind {
                             h.path.last().map(|s| s.name.name.clone())
@@ -46689,7 +46765,14 @@ impl Simulator {
                     if let Some(src) = self.pending_ret_collection.take() {
                         let dst: Option<String> = {
                             let byname = if let ExprKind::Ident(h) = &lvalue.kind {
-                                let n = self.resolve_hier_name(h);
+                                // The LHS may itself be a renamed local dyn
+                                // (`byte_array b;` inside an initial/method).
+                                let bare =
+                                    h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                                let n = self
+                                    .dyn_name_lookup(bare)
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| self.resolve_hier_name(h));
                                 self.module.dynamic_arrays.contains(&n).then_some(n)
                             } else {
                                 None
@@ -47672,6 +47755,13 @@ impl Simulator {
                             // in any count-down loop.
                             if super::elaborate::is_type_signed(data_type) {
                                 rv.is_signed = true;
+                            }
+                            // Keep `signed_signals` authoritative for the
+                            // fitted frame-write stamp (§6.11.1).
+                            if super::elaborate::is_type_signed(data_type) {
+                                self.signed_signals.insert(name.name.clone());
+                            } else {
+                                self.signed_signals.remove(&name.name);
                             }
                             // Declare the loop variable in the current call
                             // frame's local scope (highest read/write
@@ -48918,10 +49008,32 @@ impl Simulator {
                         // `instance_assoc_member`). Resolve the instance-scoped
                         // name explicitly so `pending_ret_collection` captures
                         // the real storage.
-                        let n = self.instance_assoc_member(bare)
+                        // A subroutine-LOCAL dyn array/queue lives under its
+                        // process-unique rename (`declare_local_dyn`), so
+                        // `return tmp;` must resolve through the frame's
+                        // rename first — the bare name isn't in
+                        // `dynamic_arrays` (ivtest sv_darray_function).
+                        let n = self
+                            .dyn_name_lookup(bare)
+                            .map(str::to_string)
+                            .or_else(|| self.instance_assoc_member(bare))
                             .unwrap_or_else(|| self.resolve_hier_name(h));
                         if self.module.dynamic_arrays.contains(&n) {
-                            self.pending_ret_collection = Some(n);
+                            // Frame teardown wipes a subroutine-LOCAL
+                            // collection before the caller's assignment
+                            // consumes it (the recorded name read back size
+                            // 0) — snapshot elements+size under a reserved
+                            // name that survives the pop, unless the element
+                            // type is an unpacked struct (that copy path is
+                            // keyed by the ORIGINAL name; module-scope
+                            // collections aren't wiped, so keep them live).
+                            if self.queue_elem_struct(&n).is_none() {
+                                const RET_SNAP: &str = "__xz_ret_coll__";
+                                self.copy_whole_queue(RET_SNAP, &n);
+                                self.pending_ret_collection = Some(RET_SNAP.to_string());
+                            } else {
+                                self.pending_ret_collection = Some(n);
+                            }
                         }
                     }
                     if self.pending_ret_collection.is_none() {
@@ -67443,8 +67555,29 @@ impl Simulator {
     }
 
     /// Copy every element of `src` onto `dst` and set its size (`r = q`).
+    /// §6.24.1: pack a call-returned dynamic array/queue (recorded in
+    /// `pending_ret_collection`) into a `target_w`-bit vector — element 0
+    /// most significant, each element sliced to target_w / n bits (the cast
+    /// is only legal when total bits match, so the division is exact).
+    fn pack_ret_collection(&mut self, src: &str, target_w: u32) -> Option<Value> {
+        let n = self.get_queue_size(src);
+        if n == 0 || target_w == 0 || (target_w as u64) % n != 0 {
+            return None;
+        }
+        let ew = (target_w as u64 / n) as u32;
+        let elems: Vec<Value> = (0..n)
+            .map(|i| {
+                self.get_signal_value_by_name(&format!("{}[{}]", src, i))
+                    .map(|v| v.resize(ew))
+                    .unwrap_or_else(|| Value::zero(ew))
+            })
+            .collect();
+        Some(Value::concat(&elems))
+    }
+
     fn copy_whole_queue(&mut self, dst: &str, src: &str) {
         let n = self.get_queue_size(src);
+
         for i in 0..n {
             self.queue_copy_elem(src, i, dst, i);
         }
@@ -77461,6 +77594,16 @@ impl Simulator {
         )
         .max(1);
         self.widths.insert(ret_name.clone(), ret_w);
+        // §6.11.1: the return variable carries the return type's SIGNEDNESS —
+        // the width-fitted frame-write path stamps stored values from
+        // `signed_signals`, so an unregistered signed return type (`function
+        // integer f`) silently went unsigned and `f >>>= 3` shifted
+        // logically (ivtest cfunc_assign_op_vec asr3).
+        if super::elaborate::is_type_signed(&fd.return_type) {
+            self.signed_signals.insert(ret_name.clone());
+        } else {
+            self.signed_signals.remove(&ret_name);
+        }
         // §13.4.1: the return variable is a VARIABLE of the return type — its
         // initial value is the type default: x for a 4-state type, 0 for a
         // 2-state one. An empty `function integer y(); endfunction` returns
@@ -87758,6 +87901,11 @@ impl Simulator {
                             )
                             .max(1);
                             self.widths.insert(rn.clone(), rw);
+                            if super::elaborate::is_type_signed(&f.return_type) {
+                                self.signed_signals.insert(rn.clone());
+                            } else {
+                                self.signed_signals.remove(rn.as_str());
+                            }
                             // §13.4.1: type default — x for 4-state (see
                             // the module-function twin above).
                             if super::elaborate::is_type_real(&f.return_type) {
