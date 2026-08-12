@@ -35398,6 +35398,34 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
+        // §25.9: a just-returned vif (recorded by the Return arm) binds to
+        // the FIRST assignment target after the call — `value = r.read(c)`
+        // in uvm_config_db::get (issue #113). One-shot; also cleared at the
+        // next function-call entry so it cannot leak further than that.
+        if let Some(nm) = self
+            .signals
+            .remove("__vif_return__")
+            .map(|x| x.to_sv_string())
+            .filter(|s| !s.is_empty())
+        {
+            let synth = Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: None,
+                    path: vec![crate::ast::expr::HierPathSegment {
+                        name: crate::ast::Identifier {
+                            name: nm,
+                            span: crate::ast::Span::dummy(),
+                        },
+                        selects: Vec::new(),
+                    }],
+                    span: crate::ast::Span::dummy(),
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
+                crate::ast::Span::dummy(),
+            );
+            let _ = self.try_bind_virtual_iface(lhs, &synth);
+        }
         if let Some(rewritten) = self.super_rewrite(lhs) {
             return self.assign_value(&rewritten, val);
         }
@@ -48503,6 +48531,13 @@ impl Simulator {
             }
             StatementKind::Return(expr) => {
                 if let Some(e) = expr {
+                    // §25.9: `return val` where val carries a vif binding —
+                    // record it so the caller's `x = f()` re-binds x
+                    // (uvm_resource#(virtual if)::read; issue #113).
+                    if let Some(nm) = self.resolve_vif_rhs_name_strict(e) {
+                        self.signals
+                            .insert("__vif_return__".to_string(), Value::from_string(&nm));
+                    }
                     // §13.4: `return <collection>` — record the collection's
                     // storage name so the caller's assign can copy elements
                     // (a packed Value cannot carry them).
@@ -70774,6 +70809,90 @@ impl Simulator {
     /// RHS must be a single-segment Ident — the bound interface instance
     /// name. Other RHS forms fall through to the normal assignment path.
     fn try_bind_virtual_iface(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        if self.try_bind_virtual_iface_inner(lvalue, rvalue) {
+            return true;
+        }
+        // LHS is a PLAIN NAME (subroutine local, formal, static prop): no
+        // (instance, prop) slot exists, so propagate the binding via the
+        // __vif_local__ convention — resolve_vif_rhs_name's read side
+        // already honors it. This is how a virtual interface survives
+        // uvm_config_db's parameterized static set/get round-trip
+        // (issue #113: the driver's vif stayed null so no stimulus ran).
+        // Gated on a CONFIDENT vif RHS; ordinary assigns fall through
+        // untouched (return false → the normal value assign still runs).
+        if let ExprKind::Ident(h) = &lvalue.kind {
+            if h.path.len() == 1 {
+                let lname = h.path[0].name.name.clone();
+                // A bare name that is a PROPERTY of `this` stores per-instance
+                // (each uvm_resource's `val` must keep its own interface);
+                // otherwise the flat local/static key.
+                // Classify the bare name against `this`:
+                //   declared vif prop -> the REAL binding map (runtime
+                //   @(vif.sig)/reads consult it), other prop -> per-instance
+                //   string key, otherwise -> flat local/static key.
+                let mut is_vif_prop_of: Option<usize> = None;
+                let mut is_prop_of: Option<usize> = None;
+                if let Some(th) = self
+                    .this_stack
+                    .last()
+                    .copied()
+                    .flatten()
+                    .filter(|&th| th != 0)
+                {
+                    let mut cur = self
+                        .heap
+                        .get(th)
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone());
+                    while let Some(cn) = cur {
+                        let Some(cd) = self.module.classes.get(&cn) else { break };
+                        if cd.virtual_iface_properties.contains_key(&lname) {
+                            is_vif_prop_of = Some(th);
+                            break;
+                        }
+                        if cd.properties.contains_key(&lname) {
+                            is_prop_of = Some(th);
+                            break;
+                        }
+                        cur = cd.extends.clone();
+                    }
+                }
+                if let Some(th) = is_vif_prop_of {
+                    if matches!(&rvalue.kind, ExprKind::Null) {
+                        self.virtual_iface_bindings.remove(&(th, lname.clone()));
+                        return true;
+                    }
+                    if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
+                        self.virtual_iface_bindings
+                            .insert((th, lname.clone()), (nm, None));
+                        return true;
+                    }
+                    return false;
+                }
+                let key = match is_prop_of {
+                    Some(th) => format!("__vif_local__{}#{}", th, lname),
+                    None => format!("__vif_local__{}", lname),
+                };
+                if matches!(&rvalue.kind, ExprKind::Null) {
+                    self.signals.remove(&key);
+                } else if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
+                    self.signals.insert(key, Value::from_string(&nm));
+                }
+            }
+        }
+        false
+    }
+
+    /// Like `resolve_vif_rhs_name`, but the result must demonstrably NAME a
+    /// live interface instance — bound names always bottom out at one, so
+    /// anything else (an ordinary variable, an indexed storage name) is
+    /// rejected. Keeps the propagation hooks from polluting bindings.
+    fn resolve_vif_rhs_name_strict(&self, rvalue: &Expression) -> Option<String> {
+        self.resolve_vif_rhs_name(rvalue)
+            .filter(|n| self.is_interface_instance(n))
+    }
+
+    fn try_bind_virtual_iface_inner(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
         // LRM §25.9: a PLAIN variable declared `virtual <iface>` (a
         // block-local `virtual bus_if vif;` or a module-scope one — not
         // a class property, which the (handle, prop) binding below
@@ -71071,6 +71190,15 @@ impl Simulator {
                 // config_db GET lands into a variable with no class context, we
                 // record the interface name in signals["__vif_local__<var>"] so a
                 // later `obj.vif_prop = local_var` can propagate the binding.
+                if let Some(th) = self.this_stack.last().copied().flatten() {
+                    let ikey = format!("__vif_local__{}#{}", th, raw);
+                    if let Some(iface_val) = self.signals.get(&ikey) {
+                        let s = iface_val.to_sv_string();
+                        if !s.is_empty() {
+                            return Some(s);
+                        }
+                    }
+                }
                 let local_key = format!("__vif_local__{}", raw);
                 if let Some(iface_val) = self.signals.get(&local_key) {
                     let s = iface_val.to_sv_string();
@@ -71583,7 +71711,30 @@ impl Simulator {
         match dt {
             DataType::Interface { .. } => true,
             DataType::TypeReference { name, .. } => {
-                self.module.interfaces.contains(&name.name.name)
+                let n = &name.name.name;
+                if self.module.interfaces.contains(n) {
+                    return true;
+                }
+                // A TYPE-PARAM formal (`function void set(T value)` inside
+                // `uvm_config_db#(virtual pipe_if)`) is a virtual-interface
+                // type when the ACTIVE SPECIALIZATION binds it to one —
+                // without this, the §25.9 formal alias never engaged and a
+                // vif passed through config_db arrived as nothing
+                // (issue #113: the driver's vif stayed null).
+                if let Some(resolved) = self.resolve_type_param_binding(n) {
+                    let base = resolved
+                        .trim_start_matches("virtual")
+                        .trim()
+                        .split(['#', '.'])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if self.module.interfaces.contains(&base) {
+                        return true;
+                    }
+                }
+                false
             }
             _ => false,
         }
@@ -76595,6 +76746,7 @@ impl Simulator {
     }
 
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
+        self.signals.remove("__vif_return__");
         // §26.3: the package this body belongs to. Taken before anything else
         // runs, so a call appearing in an argument (evaluated below, in the
         // CALLER's scope) cannot pick it up. A scoped `pkg::f()` dispatch names
@@ -76616,6 +76768,20 @@ impl Simulator {
         // `output`/`inout`/`ref` formals copy back to the caller's actual on
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+        // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
+        // records its interface under the formal's name (cleared otherwise so
+        // a stale same-named formal from an earlier call can't leak).
+        for (i, port) in fd.ports.iter().enumerate() {
+            let key = format!("__vif_local__{}", port.name.name);
+            match args.get(i).and_then(|a| self.resolve_vif_rhs_name_strict(a)) {
+                Some(nm) => {
+                    self.signals.insert(key, Value::from_string(&nm));
+                }
+                None => {
+                    self.signals.remove(&key);
+                }
+            }
+        }
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
@@ -77026,13 +77192,13 @@ impl Simulator {
         }
         // Copy `output`/`inout`/`ref` formals back to the caller's actuals
         // before popping this frame's locals.
-        let writebacks: Vec<(Value, Expression)> = output_bindings
+        let writebacks: Vec<(String, Value, Expression)> = output_bindings
             .iter()
             .filter_map(|(pn, caller)| {
                 self.local_stack
                     .last()
                     .and_then(|l| l.get(pn).cloned())
-                    .map(|v| (v, caller.clone()))
+                    .map(|v| (pn.clone(), v, caller.clone()))
             })
             .collect();
         // Member-wise struct output formals: snapshot each member local
@@ -77048,7 +77214,30 @@ impl Simulator {
             })
             .collect();
         self.local_stack.pop();
-        for (v, caller) in writebacks {
+        for (pn, v, caller) in writebacks {
+            // A vif binding recorded on the formal (out/inout) propagates to
+            // the caller's actual — instance prop or another plain name.
+            let key = format!("__vif_local__{}", pn);
+            if self.signals.contains_key(&key) {
+                let synth = Expression::new(
+                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: vec![crate::ast::expr::HierPathSegment {
+                            name: crate::ast::Identifier {
+                                name: pn.clone(),
+                                span: crate::ast::Span::dummy(),
+                            },
+                            selects: Vec::new(),
+                        }],
+                        span: crate::ast::Span::dummy(),
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    }),
+                    crate::ast::Span::dummy(),
+                );
+                let _ = self.try_bind_virtual_iface(&caller, &synth);
+                self.signals.remove(&key);
+            }
             self.assign_value(&caller, &v);
         }
         for (caller_lval, v) in struct_wb {
@@ -77239,6 +77428,20 @@ impl Simulator {
         // Evaluate input args and collect output/ref arg expressions
         let mut locals = HashMap::default();
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+        // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
+        // records its interface under the formal's name (cleared otherwise so
+        // a stale same-named formal from an earlier call can't leak).
+        for (i, port) in td.ports.iter().enumerate() {
+            let key = format!("__vif_local__{}", port.name.name);
+            match args.get(i).and_then(|a| self.resolve_vif_rhs_name_strict(a)) {
+                Some(nm) => {
+                    self.signals.insert(key, Value::from_string(&nm));
+                }
+                None => {
+                    self.signals.remove(&key);
+                }
+            }
+        }
         let mut assoc_params: Vec<(String, String, bool)> = Vec::new(); // (param_name, caller_array_name)
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
         self.push_queue_frame();
@@ -86817,6 +87020,18 @@ impl Simulator {
                 // actual on return (e.g. `randomize_instr(output riscv_instr
                 // instr, …)` writing the picked instruction to `instr_list[i]`).
                 let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+                // §25.9 __vif_local__: record vif actuals under formal names.
+                for (i, port) in ports.iter().enumerate() {
+                    let key = format!("__vif_local__{}", port.name.name);
+                    match args.get(i).and_then(|a| self.resolve_vif_rhs_name_strict(a)) {
+                        Some(nm) => {
+                            self.signals.insert(key, Value::from_string(&nm));
+                        }
+                        None => {
+                            self.signals.remove(&key);
+                        }
+                    }
+                }
                 let mut queue_writebacks: Vec<(String, String)> = Vec::new();
                 let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
                 let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
@@ -87376,13 +87591,13 @@ impl Simulator {
                     }
                 }
                 // Snapshot output/ref formal values before dropping locals.
-                let writebacks: Vec<(Value, Expression)> = output_bindings
+                let writebacks: Vec<(String, Value, Expression)> = output_bindings
                     .iter()
                     .filter_map(|(pn, caller)| {
                         self.local_stack
                             .last()
                             .and_then(|l| l.get(pn).cloned())
-                            .map(|v| (v, caller.clone()))
+                            .map(|v| (pn.clone(), v, caller.clone()))
                     })
                     .collect();
                 // Member-wise struct output formals: snapshot each member
@@ -87409,7 +87624,28 @@ impl Simulator {
                 if !array_writebacks.is_empty() {
                     self.writeback_array_args(&array_writebacks);
                 }
-                for (v, caller) in writebacks {
+                for (pn, v, caller) in writebacks {
+                    let key = format!("__vif_local__{}", pn);
+                    if self.signals.contains_key(&key) {
+                    let synth = Expression::new(
+                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                            root: None,
+                            path: vec![crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: pn.clone(),
+                                    span: crate::ast::Span::dummy(),
+                                },
+                                selects: Vec::new(),
+                            }],
+                            span: crate::ast::Span::dummy(),
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        crate::ast::Span::dummy(),
+                    );
+                        let _ = self.try_bind_virtual_iface(&caller, &synth);
+                        self.signals.remove(&key);
+                    }
                     self.assign_value(&caller, &v);
                 }
                 for (caller_lval, v) in struct_wb {
