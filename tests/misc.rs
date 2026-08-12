@@ -127,6 +127,8 @@ mod uvm_dpi_builtins;
 mod ivtest_round55_pins;
 #[path = "misc/audit_round46_finds.rs"]
 mod audit_round46_finds;
+#[path = "misc/implicit_static_diagnostic.rs"]
+mod implicit_static_diagnostic;
 #[path = "misc/new_ctor_vs_shallow_copy.rs"]
 mod new_ctor_vs_shallow_copy;
 #[path = "misc/assoc_dotted_key.rs"]
