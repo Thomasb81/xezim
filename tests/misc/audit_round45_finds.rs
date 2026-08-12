@@ -122,16 +122,21 @@ endmodule
 /// eof2=1 only after the next read attempt comes up empty.
 #[test]
 fn feof_is_sticky_not_positional() {
-    let src = r#"
+    // The fixture must NOT land in the repo working tree — a CWD-relative
+    // $fopen recreated `audit45_feof_tmp.txt` at the repo root on every test
+    // run, and blanket `git add -A` commits kept re-tracking it.
+    let tmp = std::env::temp_dir().join(format!("xezim_audit45_feof_{}.txt", std::process::id()));
+    let tmp_path = tmp.to_string_lossy().replace('\\', "/");
+    let src = format!(r#"
 module top;
   int fd, n, a, b;
   string line;
   initial begin
-    fd = $fopen("audit45_feof_tmp.txt", "w");
+    fd = $fopen("{tmp_path}", "w");
     $fwrite(fd, "12 34\n");
     $fwrite(fd, "line-two 99\n");
     $fclose(fd);
-    fd = $fopen("audit45_feof_tmp.txt", "r");
+    fd = $fopen("{tmp_path}", "r");
     n = $fscanf(fd, "%d %d", a, b);
     void'($fgets(line, fd));
     void'($fgets(line, fd));
@@ -141,8 +146,9 @@ module top;
     $fclose(fd);
   end
 endmodule
-"#;
-    let out = outs(&simulate(src, 10).expect("sim"));
+"#);
+    let out = outs(&simulate(&src, 10).expect("sim"));
+    let _ = std::fs::remove_file(&tmp);
     assert!(out.contains("T|n=2 eof=0"), "no flag before a failed read:\n{out}");
     assert!(out.contains("T|eof2=1"), "flag after the failed read:\n{out}");
 }

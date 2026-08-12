@@ -127,16 +127,20 @@ endmodule
 /// §21.3.4.2: a partial-format $fscanf leaves the rest of the line readable.
 #[test]
 fn fscanf_advances_only_past_what_it_matched() {
-    let src = r#"
+    // Keep the fixture out of the repo working tree (see
+    // audit_round45_finds: a CWD-relative $fopen kept re-tracking its file).
+    let tmp = std::env::temp_dir().join(format!("xezim_fscanf_pos_{}.txt", std::process::id()));
+    let tmp_path = tmp.to_string_lossy().replace('\\', "/");
+    let src = format!(r#"
 module top;
   int fd, r, eof_mid, a, b;
   string w1, w2;
   initial begin
-    fd = $fopen("fscanf_pos_tmp.txt", "w");
+    fd = $fopen("{tmp_path}", "w");
     $fdisplay(fd, "alpha beta");
     $fdisplay(fd, "42 43");
     $fclose(fd);
-    fd = $fopen("fscanf_pos_tmp.txt", "r");
+    fd = $fopen("{tmp_path}", "r");
     r = $fscanf(fd, "%s", w1);          // reads "alpha" only
     eof_mid = $feof(fd);                // data remains: 0
     r = $fscanf(fd, "%s", w2);          // "beta"
@@ -145,8 +149,9 @@ module top;
     $display("W1=%s W2=%s A=%0d B=%0d", w1, w2, a, b);
   end
 endmodule
-"#;
-    let sim = simulate(src, 20).expect("simulate failed");
+"#);
+    let sim = simulate(&src, 20).expect("simulate failed");
+    let _ = std::fs::remove_file(&tmp);
     assert_eq!(u(&sim, "eof_mid"), 0, "$feof false with the line half-read");
     let o = outs(&sim).join("\n");
     assert!(o.contains("W1=alpha W2=beta A=42 B=43"), "got: {o}");
