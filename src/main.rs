@@ -118,7 +118,10 @@ fn print_usage() {
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
     eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
-    eprintln!("  --error-exit     Exit nonzero if any $error was reported ($fatal always does)");
+    eprintln!("  --error-exit     Exit nonzero if any $error was reported ($fatal always does)
+  --relax-implicit-static  Accept `int x = ...;` inside a static subroutine
+                   (§6.21) with a warning instead of an error. Also enabled by
+                   XEZIM_ALLOW_IMPLICIT_STATIC=1.");
     eprintln!("  --verbose        Per-file compile progress: each file as it is parsed and the");
     eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
     eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
@@ -1491,6 +1494,13 @@ fn run_main() -> i32 {
             }
             "--error-exit" => {
                 error_exit = true;
+            }
+            // §6.21: downgrade the implicitly-static-initializer error to a
+            // warning. Real designs carry the pattern and other simulators
+            // let it be suppressed, so a user hitting it mid-flow needs a way
+            // forward that is not "edit a vendor's source tree".
+            "--relax-implicit-static" => {
+                xezim_core::elaborate::set_relax_implicit_static(true);
             }
             "--verbose" => {
                 verbose = true;
