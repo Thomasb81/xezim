@@ -39179,7 +39179,40 @@ impl Simulator {
             return v;
         }
         match &expr.kind {
-            ExprKind::Number(num) => self.eval_number(num),
+            ExprKind::Number(num) => {
+                let v = self.eval_number(num);
+                // §5.7.1: an UNSIZED based literal whose leftmost digit is x
+                // or z extends with x/z (not 0) to the assignment context —
+                // `reg [63:0] a = 'hx3x2x1x0` is xxxxxxxxx3x2x1x0 (ivtest
+                // sv_packed_port2: the zero-extension made undriven struct
+                // elements read 00 and drove ~00=ff where the reference
+                // keeps x). Sized literals already extend inside
+                // eval_number; only the context-driven widening is handled
+                // here.
+                if ctx_width > v.width {
+                    if let crate::ast::expr::NumberLiteral::Integer {
+                        size: None,
+                        base:
+                            crate::ast::expr::NumberBase::Hex
+                            | crate::ast::expr::NumberBase::Octal
+                            | crate::ast::expr::NumberBase::Binary,
+                        value,
+                        ..
+                    } = num
+                    {
+                        let lead = value.chars().find(|c| *c != '_');
+                        if let Some(c @ ('x' | 'X' | 'z' | 'Z' | '?')) = lead {
+                            let fill = if matches!(c, 'x' | 'X') {
+                                Value::all_x(ctx_width - v.width)
+                            } else {
+                                Value::all_z(ctx_width - v.width)
+                            };
+                            return Value::concat(&[fill, v]);
+                        }
+                    }
+                }
+                v
+            }
             ExprKind::StringLiteral(s) => {
                 // IEEE 1800-2017 §6.16: A string literal is a packed array of
                 // bytes (8 bits per character).  An empty string "" has width

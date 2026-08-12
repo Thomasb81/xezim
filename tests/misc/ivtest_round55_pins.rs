@@ -125,3 +125,31 @@ endmodule
         msgs
     );
 }
+
+/// §5.7.1: an UNSIZED based literal with an x/z leading digit extends with
+/// x/z to the assignment context; a 0/1 leading digit zero-extends; a SIZED
+/// literal extends inside its own size. Reference-verified (ivtest
+/// sv_packed_port2 — zero-extension made undriven struct elements drive
+/// ~00=ff where the reference keeps x).
+#[test]
+fn unsized_based_literal_xz_extension() {
+    let msgs = out(r#"
+module test;
+  reg [63:0] a, b, c;
+  reg [15:0] d;
+  initial begin
+    a = 'hx3x2x1x0;
+    b = 'hz3z2z1z0;
+    c = 'h13121110;
+    d = 16'hx;
+    $display("T|%h %h %h %h", a, b, c, d);
+  end
+endmodule
+"#);
+    assert!(
+        msgs.iter()
+            .any(|m| m == "T|xxxxxxxxx3x2x1x0 zzzzzzzzz3z2z1z0 0000000013121110 xxxx"),
+        "unsized x/z-lead literals extend with x/z; got {:?}",
+        msgs
+    );
+}
