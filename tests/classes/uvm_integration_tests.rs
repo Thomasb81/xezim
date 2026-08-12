@@ -300,10 +300,11 @@ module top;
 endmodule
 "#;
 
-// Phasing ends at t=0 with no producer/consumer traffic — the packet
-// stimulus never starts. Same family as the connect-phase gap above.
+// §6.21: package-scope class-handle aliasing (`uvm_default_printer =
+// uvm_default_table_printer`) — const-eval stored null and the initial
+// block died at t=0 before run_test(). Now a static init; the example
+// phases through top.run_phase's #1us objection window.
 #[test]
-#[ignore = "uvm-1.2: hello_world terminates at t=0 without producer output"]
 fn test_uvm_hello_world() {
     let hw_dir = uvm_dir().join("1.2/examples/simple/hello_world");
     let test_src = std::fs::read_to_string(hw_dir.join("hello_world.sv"))
