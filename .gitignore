@@ -58,3 +58,9 @@ tr_db.log
 fscanf_pos_tmp.txt
 ch21_memdump.dec
 /work/
+
+# Test fixtures must never land in the repo root (tests write to the
+# system temp dir); belt-and-braces in case an old binary runs here.
+audit45_feof_tmp.txt
+fscanf_pos_tmp.txt
+c10_tmp.txt
