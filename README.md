@@ -470,7 +470,7 @@ xezim --module-timescale 1ns/1ps design.sv
 xezim --module-timescale cpu,cache=10ns/1ns design.sv
 
 # Repeatable; the named form wins over the global one:
-xezim --module-timescale 1ns/1ps --module-timescale dram=1ps/1fs design.sv
+xezim --module-timescale 1ns/1ps --module-timescale mem_ctrl=1ps/1fs design.sv
 ```
 
 **A module has an explicit source-level timescale** — which the option never

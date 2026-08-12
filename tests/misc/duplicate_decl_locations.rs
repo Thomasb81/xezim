@@ -64,7 +64,7 @@ fn duplicate_parameter_reports_both_locations_across_files() {
         ("b_defs.sv", "package other_pkg;\n  parameter int SOMETHING = 3;\nendpackage\n"),
         (
             "c_bfm.sv",
-            "module fc_dram_bfm;\n  parameter int CONFIG = 5;\n  localparam int CONFIG = 9;\n  initial $display(\"%0d\", CONFIG);\nendmodule\n",
+            "module cfg_bfm;\n  parameter int CONFIG = 5;\n  localparam int CONFIG = 9;\n  initial $display(\"%0d\", CONFIG);\nendmodule\n",
         ),
     ]);
     assert!(err.contains("duplicate declaration of 'CONFIG'"), "got: {err}");
@@ -125,7 +125,7 @@ fn duplicate_error_keeps_its_context_lines() {
 fn local_declaration_beats_an_unimported_packages_enum_member() {
     let sources = [
         "package state_types_pkg;\n  typedef enum logic [1:0] { CONFIG = 2'b00, XFER = 2'b01, ERR = 2'b10 } state_ctrl_e;\nendpackage\n".to_string(),
-        "module fc_dram_bfm;\n  int CONFIG = 5;\n  int seen;\n  initial seen = CONFIG;\nendmodule\n".to_string(),
+        "module cfg_bfm;\n  int CONFIG = 5;\n  int seen;\n  initial seen = CONFIG;\nendmodule\n".to_string(),
     ];
     let paths = ["pkg.sv".to_string(), "bfm.sv".to_string()];
     let sim = xezim::simulate_multi(
@@ -135,7 +135,7 @@ fn local_declaration_beats_an_unimported_packages_enum_member() {
     .expect("a local declaration must not collide with an unimported package's enum member");
     let v = sim
         .get_signal("seen")
-        .or_else(|| sim.get_signal("fc_dram_bfm.seen"))
+        .or_else(|| sim.get_signal("cfg_bfm.seen"))
         .expect("signal 'seen' not found")
         .to_u64()
         .expect("not u64-able");
