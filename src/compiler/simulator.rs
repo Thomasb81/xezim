@@ -1420,9 +1420,10 @@ struct EventWaiter {
     /// not a raw `@(posedge clk)`. Its continuation must resume in the Reactive
     /// region — AFTER the same-edge NBA updates commit and the clocking input
     /// snapshot refreshes — so it reads post-edge design state and this cycle's
-    /// `cb.<in>` samples. Raw edge waiters keep the default "resume before
-    /// same-edge blocks" behavior (`waiters_first`), which some gate-level tbs
-    /// depend on; only clocking waiters are deferred.
+    /// `cb.<in>` samples. Raw edge waiters resume in the active region right
+    /// after the same edge's blocks (reference-verified default; see
+    /// `waiters_first` in check_edges_inner); only clocking waiters are
+    /// deferred past the NBA commit.
     is_clocking: bool,
 }
 
@@ -31124,16 +31125,20 @@ impl Simulator {
         if !self.sampled_watches.is_empty() {
             self.tick_sampled_watches();
         }
-        // Commercial-simulator process ordering: a process PARKED on
-        // `@(posedge clk)` resumes BEFORE the same edge's always blocks run.
-        // The reference-simulator consensus (verified on the OpenRAM SRAM
-        // tb: `always @(posedge clk) dout = 'x;` racing a tb check right
-        // after `@(posedge clk)`) is that the parked continuation reads the
-        // pre-block value. Waiters that depend on an edge block's blocking
-        // write still wake within the same timestep via the §9.2 rescan.
+        // Commercial-simulator process ordering (reference-verified on three
+        // same-module micro-shapes: NBA FF racing a driver-style waiter that
+        // writes its inputs; a blocking-write always block racing a waiter
+        // that reads; a waiter reading a same-edge NBA target): the edge's
+        // always blocks execute FIRST, then parked `@(posedge clk)` waiters
+        // resume in the same active region reading pre-NBA state. The
+        // OpenRAM-style "check reads the pre-blast value" case is NOT a
+        // waiters-first ordering — it resolves through port-boundary edge
+        // delivery — and holds under blocks-first too (pinned by
+        // waiter_edge_ordering::parked_waiter_reads_pre_edge_block_value).
+        // XEZIM_WAITERS_FIRST=1 restores the legacy pre-block resumption.
         static WAITERS_FIRST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let waiters_first = *WAITERS_FIRST.get_or_init(|| {
-            !std::env::var("XEZIM_WAITERS_LAST")
+            std::env::var("XEZIM_WAITERS_FIRST")
                 .map(|v| v == "1")
                 .unwrap_or(false)
         });
@@ -32677,12 +32682,12 @@ impl Simulator {
         // their NBA pushes join the same nba_fast queue as the
         // edge_blocks just fired — IEEE 1800-2023 §4.4.5 semantics.
         //
-        // Default behavior preserves the legacy schedule-into-event_queue
-        // path (waiter runs in NEXT event_loop iter after apply_nba) —
-        // some testbenches rely on this (e.g. c910's tb.v initial blocks
-        // with `@(posedge clk)` reads expecting post-NBA signal values).
-        // Opt in to correct §4.4.5 semantics via XEZIM_ACTIVE_REGION=1.
-        let active_region = std::env::var("XEZIM_ACTIVE_REGION").ok().as_deref() == Some("1");
+        // Default is now inline active-region execution — reference-verified
+        // (a waiter resumed by an edge reads the PRE-NBA value of a reg that
+        // same edge updates). XEZIM_ACTIVE_REGION=0 restores the legacy
+        // schedule-into-event_queue path (waiter runs in the NEXT event_loop
+        // iter after apply_nba, reading post-NBA values).
+        let active_region = std::env::var("XEZIM_ACTIVE_REGION").ok().as_deref() != Some("0");
         for (pid, stmts) in triggered_conts {
             if self.finished {
                 break;
@@ -32693,20 +32698,25 @@ impl Simulator {
                 if !self.is_pid_suspended(pid) {
                     self.child_finished(pid);
                 }
+                self.break_flag = false;
+                self.continue_flag = false;
+                self.return_flag = false;
             } else {
                 // Legacy: schedule for next event_loop iter
                 self.event_queue.schedule(self.time, pid, stmts);
             }
         }
-        if waiters_first {
-            // The pre-block drain above cannot see waiters whose trigger was
-            // produced BY the blocks just executed (`-> ev` inside an
-            // always_ff toggles the event signal during exec). §15.5.1: such
-            // waiters resume in the SAME active region — before this slot's
-            // NBA region — but the next check_edges that would notice them
-            // sits in the cascade AFTER apply_nba, so they read post-NBA
-            // state (reference-divergent). Drain-and-run inline, re-draining
-            // because a resumed continuation may fire further events.
+        if waiters_first || active_region {
+            // Waiters whose trigger was produced DURING this pass — by the
+            // blocks just executed (`-> ev` inside an always_ff) or, in
+            // blocks-first mode, by a continuation the inline loop above just
+            // resumed (`-> ev` right after `@(posedge clk)`) — cannot have
+            // been in the earlier drain. §15.5.1: they resume in the SAME
+            // active region — before this slot's NBA region — but the next
+            // check_edges that would notice them sits in the cascade AFTER
+            // apply_nba (or never comes, if no further event wakes this
+            // slot). Drain-and-run inline, re-draining because a resumed
+            // continuation may fire further events.
             let mut settle_guard = 0u32;
             loop {
                 let conts = self.drain_triggered_event_waiters();
@@ -32730,6 +32740,15 @@ impl Simulator {
                     break;
                 }
             }
+        }
+        if !waiters_first && active_region && self.finished {
+            // A `$finish` from a continuation resumed AFTER this edge's
+            // blocks stops the run once the slot completes: its SVA ticks
+            // (tick_sva_sites runs after this pass returns) and postponed
+            // monitors still fire — reference behavior, mirroring the
+            // waiters-first pre-block deferral above.
+            self.finish_deferred = true;
+            self.finished = false;
         }
     }
 
