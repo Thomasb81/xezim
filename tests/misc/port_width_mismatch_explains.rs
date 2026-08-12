@@ -65,9 +65,16 @@ fn port_width_mismatch_names_the_connection_and_its_fields() {
         "breaks the struct down field by field, in declaration order:\n{}",
         text
     );
+    // The generic 1-bit NOTE is superseded by the per-field naming: every
+    // collapsed field prints the identifier(s) in its range and their values.
     assert!(
-        text.contains("resolved to 0 collapses to 1 bit"),
-        "points at the usual cause when several fields are 1 bit:\n{}",
+        text.contains("field 'f0' resolved to 1 bit(s); its range reads: P_UNSET = 0"),
+        "each collapsed field names its sizing parameter and value:\n{}",
+        text
+    );
+    assert!(
+        text.contains("XEZIM_TRACE_PARAM"),
+        "and points at the tracing knob:\n{}",
         text
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -135,6 +142,53 @@ fn mismatch_location_names_the_parent_modules_file() {
     assert!(
         !text.contains("top.sv:1") && !text.contains("top.sv:2"),
         "must not misattribute the connection to the root file:\n{}",
+        text
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The decisive upgrade for the customer's 116-vs-86 case: a field sized by
+/// a parameter that resolved to <= 0 (or not at all) prints the parameter's
+/// NAME and value right in the warning — no need to open the typedef.
+#[test]
+fn collapsed_field_names_its_sizing_parameter() {
+    let dir = std::env::temp_dir().join(format!("xezim_pwm_fld_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("fld.sv");
+    std::fs::write(
+        &src,
+        r#"module dram (input [115:0] dram_ddrh0_req);
+endmodule
+module testbench;
+  localparam int SMEM_MASK_W = 0;
+  typedef struct packed {
+    logic [32:0] addr;
+    logic [6:0]  bcnt_m1;
+    logic        write;
+    logic        wrap;
+    logic [SMEM_MASK_W-1:0] mask;
+  } ndram_ddrc_req_t;
+  ndram_ddrc_req_t [1:0] dram_ddrc_req;
+  dram u_dram (.dram_ddrh0_req(dram_ddrc_req));
+endmodule
+"#,
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--compile", "-s", "testbench", src.to_str().unwrap(), "--no-cache"])
+        .output()
+        .expect("run xezim");
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        text.contains("field 'mask' resolved to") && text.contains("SMEM_MASK_W = 0"),
+        "the collapsed field must name its sizing parameter and value:\n{}",
+        text
+    );
+    assert!(
+        text.contains("XEZIM_TRACE_PARAM"),
+        "and point at the tracing knob:\n{}",
         text
     );
     let _ = std::fs::remove_dir_all(&dir);
