@@ -4398,6 +4398,9 @@ pub struct Simulator {
     trace_always: Option<String>,
     /// Runtime plusargs passed from CLI/filelists (e.g. +FOO, +BAR=1).
     plusargs: Vec<String>,
+    /// Cursor for the built-in `uvm_dpi_get_next_arg_c` argv walk
+    /// (uvm_svcmd_dpi.c keeps the equivalent in a C static; init=1 resets).
+    uvm_dpi_argv_idx: usize,
 
     /// Owned copies of every CLI arg as `CString`s. Required so that
     /// `vpi_argv` (raw `*mut c_char` pointers into these buffers) stays
@@ -6864,6 +6867,7 @@ impl Simulator {
                 if v == "1" { String::new() } else { v }
             }),
             plusargs: Vec::new(),
+            uvm_dpi_argv_idx: 0,
 
             // Default to a single-element argv so vpi_get_vlog_info
             // always returns at least argc=1 / argv[0]="xezim" even
@@ -9730,11 +9734,268 @@ impl Simulator {
         }
     }
 
+    /// Port of uvm_regex.cc `uvm_glob_to_re`: bracket with '/', anchor with
+    /// '^'/'$', translate glob metachars to POSIX-ERE equivalents.
+    fn uvm_glob_to_re(glob: &str) -> String {
+        let bytes = glob.as_bytes();
+        if glob.len() > 2040 {
+            return glob.to_string();
+        }
+        if glob.is_empty() || glob == "/" {
+            return "/^$/".to_string();
+        }
+        if bytes.len() > 1 && bytes[0] == b'/' && bytes[bytes.len() - 1] == b'/' {
+            return glob.to_string();
+        }
+        let mut re = String::with_capacity(glob.len() * 2 + 4);
+        re.push('/');
+        if bytes[0] != b'^' {
+            re.push('^');
+        }
+        for &c in bytes {
+            match c {
+                b'*' => re.push_str(".*"),
+                b'+' => re.push_str(".+"),
+                b'.' => re.push_str("\\."),
+                b'?' => re.push('.'),
+                b'[' => re.push_str("\\["),
+                b']' => re.push_str("\\]"),
+                b'(' => re.push_str("\\("),
+                b')' => re.push_str("\\)"),
+                _ => re.push(c as char),
+            }
+        }
+        if !re.ends_with('$') {
+            re.push('$');
+        }
+        re.push('/');
+        re
+    }
+
+    /// POSIX-ERE search via libc, mirroring uvm_regex.cc `uvm_re_match`:
+    /// surrounding '/' brackets are stripped, 0 = match, nonzero = no match
+    /// or compile error.
+    fn uvm_re_match_impl(&mut self, re: &str, s: &str) -> i32 {
+        let bytes = re.as_bytes();
+        let rex = if bytes.len() > 1 && bytes[0] == b'/' && bytes[bytes.len() - 1] == b'/' {
+            &re[1..re.len() - 1]
+        } else {
+            re
+        };
+        let (Ok(c_re), Ok(c_s)) = (CString::new(rex), CString::new(s)) else {
+            return 1;
+        };
+        unsafe {
+            let mut preg: libc::regex_t = std::mem::zeroed();
+            let err = libc::regcomp(&mut preg, c_re.as_ptr(), libc::REG_EXTENDED);
+            if err != 0 {
+                if self.dpi_unresolved.insert(format!("__uvm_re_bad__{}", rex)) {
+                    eprintln!("[DPI] uvm_re_match: invalid regular expression: |{}|", re);
+                }
+                return err;
+            }
+            let r = libc::regexec(&preg, c_s.as_ptr(), 0, std::ptr::null_mut(), 0);
+            libc::regfree(&mut preg);
+            r
+        }
+    }
+
+    /// Resolve a `uvm_hdl_*` hierarchical path to a signal id or name key.
+    fn uvm_hdl_lookup(&self, path: &str) -> Option<(Option<usize>, String)> {
+        if let Some(&id) = self.signal_name_to_id.get(path) {
+            return Some((Some(id), path.to_string()));
+        }
+        if self.signals.contains_key(path) {
+            return Some((None, path.to_string()));
+        }
+        None
+    }
+
+    /// Write a value to a signal by runtime name (uvm_hdl deposit/force).
+    fn uvm_hdl_write_by_name(&mut self, path: &str, v: &Value, force: bool) -> bool {
+        let Some((id_opt, name)) = self.uvm_hdl_lookup(path) else {
+            return false;
+        };
+        match id_opt {
+            Some(id) => {
+                let mut val = v.resize(self.signal_widths[id]);
+                val.is_signed = self.signal_signed[id];
+                if force {
+                    self.forced_signals.insert(id, val.clone());
+                }
+                if self.signal_table[id] != val {
+                    self.mark_dirty_id(id);
+                    write_sig!(self, id, val);
+                    self.table_modified = true;
+                }
+                true
+            }
+            None => {
+                if force {
+                    return false; // force needs an id-backed signal
+                }
+                let changed = self.signals.get(&name).is_none_or(|p| *p != *v);
+                if changed {
+                    self.mark_dirty(&name);
+                    self.signals.insert(name, v.clone());
+                }
+                true
+            }
+        }
+    }
+
+    fn exec_uvm_dpi_builtin(&mut self, sv_name: &str, args: &[Expression]) -> Option<Value> {
+        match sv_name {
+            "uvm_dpi_get_next_arg_c" => {
+                let init = self.eval_expr(args.first()?).to_i64().unwrap_or(0);
+                if init == 1 {
+                    self.uvm_dpi_argv_idx = 0;
+                }
+                // argv view = binary name + CLI args + plusargs
+                // (vpi_arg_cstrings). uvm_svcmd_dpi.c's walk skips -f/-F
+                // filelist indirections and inlines their contents; xezim's
+                // CLI already flattened filelists, so just skip the flags.
+                loop {
+                    let idx = self.uvm_dpi_argv_idx;
+                    let Some(c) = self.vpi_arg_cstrings.get(idx) else {
+                        return Some(Value::from_string(""));
+                    };
+                    self.uvm_dpi_argv_idx += 1;
+                    let s = c.to_string_lossy().to_string();
+                    if s == "-f" || s == "-F" {
+                        self.uvm_dpi_argv_idx += 1; // skip the filelist path too
+                        continue;
+                    }
+                    return Some(Value::from_string(&s));
+                }
+            }
+            "uvm_dpi_get_tool_name_c" => Some(Value::from_string("xezim")),
+            "uvm_dpi_get_tool_version_c" => {
+                Some(Value::from_string(env!("CARGO_PKG_VERSION")))
+            }
+            "uvm_glob_to_re" => {
+                let g = self.eval_expr(args.first()?).to_sv_string();
+                Some(Value::from_string(&Self::uvm_glob_to_re(&g)))
+            }
+            "uvm_re_match" => {
+                let re = self.eval_expr(args.first()?).to_sv_string();
+                let s = self.eval_expr(args.get(1)?).to_sv_string();
+                let r = self.uvm_re_match_impl(&re, &s);
+                Some(Value::from_u64(r as u32 as u64, 32))
+            }
+            "uvm_dpi_regcomp" => {
+                let pat = self.eval_expr(args.first()?).to_sv_string();
+                let Ok(c_pat) = CString::new(pat.as_str()) else {
+                    return Some(Value::zero(64));
+                };
+                unsafe {
+                    let mut preg: Box<libc::regex_t> = Box::new(std::mem::zeroed());
+                    let err = libc::regcomp(
+                        preg.as_mut(),
+                        c_pat.as_ptr(),
+                        libc::REG_NOSUB | libc::REG_EXTENDED,
+                    );
+                    if err != 0 {
+                        eprintln!("[DPI] uvm_dpi_regcomp: unable to compile regex: |{}|", pat);
+                        return Some(Value::zero(64));
+                    }
+                    let raw = Box::into_raw(preg);
+                    Some(Value::from_u64(raw as usize as u64, 64))
+                }
+            }
+            "uvm_dpi_regexec" => {
+                let h = self.eval_expr(args.first()?).to_u64().unwrap_or(0);
+                if h == 0 {
+                    return Some(Value::from_u64(1, 32));
+                }
+                let s = self.eval_expr(args.get(1)?).to_sv_string();
+                let Ok(c_s) = CString::new(s.as_str()) else {
+                    return Some(Value::from_u64(1, 32));
+                };
+                let r = unsafe {
+                    libc::regexec(
+                        h as usize as *const libc::regex_t,
+                        c_s.as_ptr(),
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                Some(Value::from_u64(r as u32 as u64, 32))
+            }
+            "uvm_dpi_regfree" => {
+                let h = self.eval_expr(args.first()?).to_u64().unwrap_or(0);
+                if h != 0 {
+                    unsafe {
+                        let mut preg = Box::from_raw(h as usize as *mut libc::regex_t);
+                        libc::regfree(preg.as_mut());
+                    }
+                }
+                Some(Value::zero(32))
+            }
+            "uvm_hdl_check_path" => {
+                let path = self.eval_expr(args.first()?).to_sv_string();
+                let ok = self.uvm_hdl_lookup(&path).is_some();
+                Some(Value::from_u64(ok as u64, 32))
+            }
+            "uvm_hdl_read" => {
+                let path = self.eval_expr(args.first()?).to_sv_string();
+                let out = args.get(1)?.clone();
+                match self.uvm_hdl_lookup(&path) {
+                    Some((Some(id), _)) => {
+                        let v = self.signal_table[id].clone();
+                        self.assign_value(&out, &v);
+                        Some(Value::from_u64(1, 32))
+                    }
+                    Some((None, name)) => {
+                        let v = self.signals.get(&name).cloned().unwrap_or_else(|| Value::zero(32));
+                        self.assign_value(&out, &v);
+                        Some(Value::from_u64(1, 32))
+                    }
+                    None => Some(Value::from_u64(0, 32)),
+                }
+            }
+            "uvm_hdl_deposit" | "uvm_hdl_force" => {
+                let path = self.eval_expr(args.first()?).to_sv_string();
+                let v = self.eval_expr(args.get(1)?);
+                let ok = self.uvm_hdl_write_by_name(&path, &v, sv_name == "uvm_hdl_force");
+                Some(Value::from_u64(ok as u64, 32))
+            }
+            "uvm_hdl_release" | "uvm_hdl_release_and_read" => {
+                let path = self.eval_expr(args.first()?).to_sv_string();
+                let Some((Some(id), _)) = self.uvm_hdl_lookup(&path) else {
+                    return Some(Value::from_u64(0, 32));
+                };
+                self.forced_signals.remove(&id);
+                if sv_name == "uvm_hdl_release_and_read" {
+                    if let Some(out) = args.get(1) {
+                        let v = self.signal_table[id].clone();
+                        let out = out.clone();
+                        self.assign_value(&out, &v);
+                    }
+                }
+                Some(Value::from_u64(1, 32))
+            }
+            _ => None,
+        }
+    }
+
     fn exec_dpi_import_call(&mut self, sv_name: &str, args: &[Expression]) -> Option<Value> {
         let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
         let spec = self.module.dpi_imports.get(sv_name)?.clone();
         if !self.dpi_bindings.contains_key(sv_name) && !self.dpi_unsupported.contains(sv_name) {
             self.try_bind_dpi(sv_name, &spec);
+        }
+        // Built-in implementations of the UVM distribution's DPI-C helpers
+        // (uvm_svcmd_dpi.c / uvm_regex.cc / uvm_hdl.c) so UVM runs without
+        // +define+UVM_NO_DPI. A user-loaded shared library that defines one
+        // of these symbols wins — the builtin only serves symbols no
+        // library resolved.
+        if !self.dpi_bindings.contains_key(sv_name) {
+            if let Some(v) = self.exec_uvm_dpi_builtin(sv_name, args) {
+                ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
+                return Some(v);
+            }
         }
         if self.dpi_unsupported.contains(sv_name) {
             ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
