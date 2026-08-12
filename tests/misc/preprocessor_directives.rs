@@ -161,8 +161,8 @@ fn ifdef_inside_macro_body_expands_and_keeps_trailing_text() {
     64 \
   `endif
 module tb;
-  localparam integer WDBUF_SIZE = `SEL_SIZE;
-  initial $display("T|%0d", WDBUF_SIZE);
+  localparam integer SEL_BUF_SIZE = `SEL_SIZE;
+  initial $display("T|%0d", SEL_BUF_SIZE);
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");

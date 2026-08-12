@@ -16,7 +16,7 @@ fn parse_mode_reports_reserved_macro_file_and_line() {
     );
     let dir = std::env::temp_dir().join(unique);
     std::fs::create_dir_all(&dir).expect("create temp directory");
-    let source = dir.join("norand.sv");
+    let source = dir.join("diagsrc.sv");
     std::fs::write(
         &source,
         "module before_redefinition; endmodule\n\

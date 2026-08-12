@@ -287,7 +287,7 @@ module child;
   end
 endmodule
 
-interface abdram_if;
+interface abmem_if;
   wire por_l;
   wire por_l_c;
 endinterface
@@ -297,7 +297,7 @@ module tb;
   wire [2:0] floating_top_bus;
   wire [1:0] floating_top_arr [0:1];
   child u_child();
-  abdram_if abdram();
+  abmem_if abmem();
   initial begin
     $dumpfile("{VCD}");
     $dumpvars(0, tb);
@@ -306,8 +306,8 @@ module tb;
     if (floating_top_bus !== 3'bzzz) $display("FAIL top bus is %b", floating_top_bus);
     if (floating_top_arr[0] !== 2'bzz) $display("FAIL top array[0] is %b", floating_top_arr[0]);
     if (floating_top_arr[1] !== 2'bzz) $display("FAIL top array[1] is %b", floating_top_arr[1]);
-    if (abdram.por_l !== 1'bz) $display("FAIL interface por_l is %b", abdram.por_l);
-    if (abdram.por_l_c !== 1'bz) $display("FAIL interface por_l_c is %b", abdram.por_l_c);
+    if (abmem.por_l !== 1'bz) $display("FAIL interface por_l is %b", abmem.por_l);
+    if (abmem.por_l_c !== 1'bz) $display("FAIL interface por_l_c is %b", abmem.por_l_c);
     #1 $finish;
   end
 endmodule

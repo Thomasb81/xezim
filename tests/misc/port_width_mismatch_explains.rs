@@ -158,7 +158,7 @@ fn collapsed_field_names_its_sizing_parameter() {
     let src = dir.join("fld.sv");
     std::fs::write(
         &src,
-        r#"module dram (input [115:0] dram_ddrh0_req);
+        r#"module dut_core (input [115:0] dut_req);
 endmodule
 module testbench;
   localparam int SMEM_MASK_W = 0;
@@ -168,9 +168,9 @@ module testbench;
     logic        write;
     logic        wrap;
     logic [SMEM_MASK_W-1:0] mask;
-  } ndram_ddrc_req_t;
-  ndram_ddrc_req_t [1:0] dram_ddrc_req;
-  dram u_dram (.dram_ddrh0_req(dram_ddrc_req));
+  } tb_req_t;
+  tb_req_t [1:0] tb_req;
+  dut_core u_dut (.dut_req(tb_req));
 endmodule
 "#,
     )
