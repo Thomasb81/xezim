@@ -129,6 +129,10 @@ mod ivtest_round55_pins;
 mod audit_round46_finds;
 #[path = "misc/implicit_static_diagnostic.rs"]
 mod implicit_static_diagnostic;
+#[path = "misc/port_width_mismatch_explains.rs"]
+mod port_width_mismatch_explains;
+#[path = "misc/elaboration_runaway_guards.rs"]
+mod elaboration_runaway_guards;
 #[path = "misc/new_ctor_vs_shallow_copy.rs"]
 mod new_ctor_vs_shallow_copy;
 #[path = "misc/assoc_dotted_key.rs"]
