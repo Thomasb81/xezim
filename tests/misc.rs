@@ -137,6 +137,8 @@ mod elaboration_runaway_guards;
 mod value_trace;
 #[path = "misc/comb_regvar_loop_fallback.rs"]
 mod comb_regvar_loop_fallback;
+#[path = "misc/svtb_suite.rs"]
+mod svtb_suite;
 #[path = "misc/new_ctor_vs_shallow_copy.rs"]
 mod new_ctor_vs_shallow_copy;
 #[path = "misc/assoc_dotted_key.rs"]
