@@ -9862,11 +9862,34 @@ impl Simulator {
 
     /// Resolve a `uvm_hdl_*` hierarchical path to a signal id or name key.
     fn uvm_hdl_lookup(&self, path: &str) -> Option<(Option<usize>, String)> {
-        if let Some(&id) = self.signal_name_to_id.get(path) {
-            return Some((Some(id), path.to_string()));
+        let direct = |p: &str| -> Option<(Option<usize>, String)> {
+            if let Some(&id) = self.signal_name_to_id.get(p) {
+                return Some((Some(id), p.to_string()));
+            }
+            if self.signals.contains_key(p) {
+                return Some((None, p.to_string()));
+            }
+            None
+        };
+        if let Some(r) = direct(path) {
+            return Some(r);
         }
-        if self.signals.contains_key(path) {
-            return Some((None, path.to_string()));
+        // §23.6: register-model hdl paths are ABSOLUTE ("top.dut.SCRATCH"),
+        // but the signal table keys are top-relative ("dut.SCRATCH") — strip
+        // `$root.` and the top module's own segment before giving up, else
+        // every backdoor access missed and read 0.
+        let p = path.strip_prefix("$root.").unwrap_or(path);
+        if p != path {
+            if let Some(r) = direct(p) {
+                return Some(r);
+            }
+        }
+        if let Some((head, rest)) = p.split_once('.') {
+            if head == self.module.name {
+                if let Some(r) = direct(rest) {
+                    return Some(r);
+                }
+            }
         }
         None
     }
@@ -38824,12 +38847,36 @@ impl Simulator {
                     // `q[i].latency--` never drained its queue.
                     if let Some((parent, _)) = flat.rsplit_once('.') {
                         if let Some(cont) = parent.rfind('[').map(|i| &parent[..i]) {
-                            if (self.module.dynamic_arrays.contains(cont)
-                                || self.module.arrays.contains_key(cont)
-                                || self.module.associative_arrays.contains_key(cont))
-                                && self.queue_elem_struct(cont).is_some()
+                            // A class-member collection stores under its
+                            // instance-scoped name (`<h>#slices`), which the
+                            // flattened bare name misses — `slices[0].path =
+                            // v` inside a method fell through every arm and
+                            // vanished (UVM's uvm_hdl_path_concat::add_path
+                            // built empty slices, so every backdoor access
+                            // read 0). Resolve the container through `this`
+                            // before gating.
+                            let registered = |s: &Self, c: &str| {
+                                s.module.dynamic_arrays.contains(c)
+                                    || s.module.arrays.contains_key(c)
+                                    || s.module.associative_arrays.contains_key(c)
+                            };
+                            let (cont_s, flat_s) = if registered(self, cont) {
+                                (cont.to_string(), flat.clone())
+                            } else {
+                                // this-relative member OR through an object
+                                // handle path (`c.slices[0].path`).
+                                let sc = self.resolve_locator_storage(cont);
+                                if sc != cont {
+                                    let f2 = format!("{}{}", sc, &flat[cont.len()..]);
+                                    (sc, f2)
+                                } else {
+                                    (cont.to_string(), flat.clone())
+                                }
+                            };
+                            if registered(self, &cont_s)
+                                && self.queue_elem_struct(&cont_s).is_some()
                             {
-                                let prev = self.get_signal_value_by_name(&flat);
+                                let prev = self.get_signal_value_by_name(&flat_s);
                                 let fitted = match prev.as_ref() {
                                     Some(p) if p.is_real && !val.is_real => {
                                         Value::from_f64(val.to_f64())
@@ -38838,7 +38885,7 @@ impl Simulator {
                                     _ => val.clone(),
                                 };
                                 let changed = prev.as_ref() != Some(&fitted);
-                                self.set_signal_value_by_name(&flat, fitted);
+                                self.set_signal_value_by_name(&flat_s, fitted);
                                 return changed;
                             }
                         }
@@ -44358,6 +44405,37 @@ impl Simulator {
                 // signal; a nested PACKED member (`arr[i].tag.vlan`) slices its
                 // parent's signal. Packed scalars keep the bit-slice paths below.
                 if let Some(base_flat) = self.flat_member_name(expr) {
+                    // An element of an instance-scoped collection stores its
+                    // leaves under `<h>#slices[0].path`, not the flattened
+                    // `c.slices[0].path` — resolve the container through the
+                    // handle path (same rule as the write arm) before the
+                    // flat lookups, else the read fell to a phantom zero.
+                    let base_flat = match base_flat.rfind('[') {
+                        Some(cut) => {
+                            let cont = base_flat[..cut].to_string();
+                            if !cont.is_empty()
+                                && !self.module.dynamic_arrays.contains(&cont)
+                                && !self.module.arrays.contains_key(&cont)
+                                && !self.module.associative_arrays.contains_key(&cont)
+                                && self
+                                    .get_signal_value_by_name(&format!(
+                                        "{}.{}",
+                                        base_flat, member.name
+                                    ))
+                                    .is_none()
+                            {
+                                let sc = self.resolve_locator_storage(&cont);
+                                if sc != cont {
+                                    format!("{}{}", sc, &base_flat[cut..])
+                                } else {
+                                    base_flat
+                                }
+                            } else {
+                                base_flat
+                            }
+                        }
+                        None => base_flat,
+                    };
                     let flat = format!("{}.{}", base_flat, member.name);
                     // A leaf may live in the compact table OR the runtime map (a
                     // LOCAL unpacked-struct array element is only in the latter),
@@ -44742,11 +44820,32 @@ impl Simulator {
                         let mut an = self.resolve_hier_name(hier);
                         if let Some(scoped) = self.instance_assoc_member(&an) {
                             an = scoped;
+                        } else if !self.is_associative_array(&an)
+                            && !self.module.dynamic_arrays.contains(&an)
+                            && !self.module.arrays.contains_key(&an)
+                        {
+                            // Through an object handle (`c.slices[0].path`).
+                            an = self.resolve_locator_storage(&an);
                         }
                         if self.is_associative_array(&an) {
                             let idx_val = self.eval_expr(index);
                             let key_str = self.assoc_key_str(&an, &idx_val);
                             let target = format!("{}[{}].{}", an, key_str, member.name);
+                            if let Some(v) = self.get_signal_value_by_name(&target) {
+                                return v;
+                            }
+                        } else if (self.module.dynamic_arrays.contains(&an)
+                            || self.module.arrays.contains_key(&an))
+                            && self.queue_elem_struct(&an).is_some()
+                        {
+                            // Same leaf read for a DYNAMIC/fixed collection of
+                            // unpacked structs reached through an instance
+                            // scope (`<h>#slices[0].path`) — the bare
+                            // flattened name misses the storage, so a
+                            // class-member `slices[t].path` read x while the
+                            // write (fixed above) landed correctly.
+                            let i = self.eval_expr(index).to_u64().unwrap_or(0);
+                            let target = format!("{}[{}].{}", an, i, member.name);
                             if let Some(v) = self.get_signal_value_by_name(&target) {
                                 return v;
                             }
@@ -45627,7 +45726,14 @@ impl Simulator {
                             // (`d = new[n](d)`) is index-preserving, so no
                             // snapshot is needed.
                             let src = src_expr.and_then(|e| match &e.kind {
-                                ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                                ExprKind::Ident(h) => {
+                                    let n = self.resolve_hier_name(h);
+                                    // A class-member source (`new[t+1](slices)`
+                                    // in a method) lives at `<h>#slices` — the
+                                    // bare name read size 0, so the copy-init
+                                    // silently dropped every existing element.
+                                    Some(self.resolve_locator_storage(&n))
+                                }
                                 _ => None,
                             });
                             let keep = match &src {
@@ -45705,11 +45811,33 @@ impl Simulator {
                                 } else {
                                     Value::zero(w)
                                 };
+                                // A STRUCT-element array keeps each member in
+                                // its own leaf (`arr[i].path`) — seeding a
+                                // packed container instead made later member
+                                // reads slice that zero container while
+                                // member writes went to the leaves, so
+                                // `slices[t].path` read back blank (UVM's
+                                // uvm_hdl_path_concat::add_path).
+                                let elem_su = self.queue_elem_struct(&name);
                                 for i in keep..n {
-                                    self.set_signal_value_by_name(
-                                        &format!("{}[{}]", name, i),
-                                        fill.clone(),
-                                    );
+                                    let elem = format!("{}[{}]", name, i);
+                                    match &elem_su {
+                                        Some(su) => {
+                                            for (k, lw, is_real) in
+                                                self.unpacked_struct_leaf_keys(&elem, su)
+                                            {
+                                                let sv = if is_real {
+                                                    Value::from_f64(0.0)
+                                                } else {
+                                                    Value::zero(lw)
+                                                };
+                                                self.signals.insert(k, sv);
+                                            }
+                                        }
+                                        None => {
+                                            self.set_signal_value_by_name(&elem, fill.clone());
+                                        }
+                                    }
                                 }
                             }
                             // §7.5.1: `new[n]('{...})` — the argument may be an
@@ -45830,6 +45958,41 @@ impl Simulator {
                 {
                     self.settle_after_proc_write();
                     return;
+                }
+                // §7.2: whole-struct write into an ELEMENT of an
+                // instance-scoped collection (`slices[i] = slice;` inside a
+                // class method — UVM's uvm_hdl_path_concat::add_slice). The
+                // generic arm below can't resolve the container (`p_elem_type`
+                // only knows module-scope names), so the copy fell to a packed
+                // store and every member of the element stayed blank.
+                if self.queue_pop_call(rvalue).is_none() {
+                    if let Some(dst) = self.flat_member_name(lvalue) {
+                        // Only a BARE element lvalue (`slices[i] = ...`) — a
+                        // member path (`arr[0].meta.f = v`) must fall through
+                        // to the leaf/aggregate arms, else a scalar write was
+                        // spread over the whole element.
+                        if let Some(cut) = dst.rfind('[').filter(|_| dst.ends_with(']')) {
+                            let cont = dst[..cut].to_string();
+                            if !cont.is_empty() {
+                                let cont_s = self.resolve_locator_storage(&cont);
+                                if let Some(su) = self.queue_elem_struct(&cont_s) {
+                                    let dst_s = format!("{}{}", cont_s, &dst[cut..]);
+                                    if let Some(src) = self.flat_member_name(rvalue) {
+                                        if self.struct_storage_exists(&src, &su) {
+                                            self.copy_unpacked_struct(&dst_s, &src, &su);
+                                            self.settle_after_proc_write();
+                                            return;
+                                        }
+                                    }
+                                    let v = self.eval_expr(rvalue);
+                                    if self.spread_into_unpacked_struct(&dst_s, &su, &v) {
+                                        self.settle_after_proc_write();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 // IEEE 1800-2017 §7.2: assigning one unpacked struct to another
                 // copies every member. Their leaves live in separate signals, so
@@ -46068,22 +46231,41 @@ impl Simulator {
                             // typedefs so the element's type-param members bind.
                             let elem_cls: Option<(String, Option<(String, String)>)> =
                                 match elem_cls {
-                                    Some(cn)
-                                        if self.module.classes.contains_key(&cn) =>
-                                    {
-                                        Some((cn, None))
-                                    }
-                                    Some(cn) => self
-                                        .resolve_simple_typedef_class(&cn)
-                                        .filter(|c| self.module.classes.contains_key(c))
-                                        .map(|c| (c, None))
-                                        .or_else(|| {
-                                            self.resolve_typedef_spec(&cn)
-                                                .filter(|(b, _)| {
-                                                    self.module.classes.contains_key(b)
+                                    Some(cn) => {
+                                        // §6.20.3: the declared element type may
+                                        // be a TYPE PARAMETER (`T pool[string]`
+                                        // in uvm_pool) — resolve through the
+                                        // current spec / instance bindings first.
+                                        let cn = self
+                                            .resolve_type_param_binding(&cn)
+                                            .unwrap_or(cn);
+                                        if self.module.classes.contains_key(&cn) {
+                                            Some((cn, None))
+                                        } else {
+                                            self.resolve_simple_typedef_class(&cn)
+                                                .filter(|c| self.module.classes.contains_key(c))
+                                                .map(|c| (c, None))
+                                                .or_else(|| {
+                                                    self.resolve_typedef_spec(&cn)
+                                                        .filter(|(b, _)| {
+                                                            self.module.classes.contains_key(b)
+                                                        })
+                                                        .map(|(b, s)| (b.clone(), Some((b, s))))
                                                 })
-                                                .map(|(b, s)| (b.clone(), Some((b, s))))
-                                        }),
+                                                .or_else(|| {
+                                                    // §8.25: the binding is itself
+                                                    // a SPECIALIZED name
+                                                    // (`queue#(string)` — UVM's
+                                                    // string pool of hdl-path
+                                                    // queues).
+                                                    self.extract_spec_from_string(&cn)
+                                                        .filter(|(b, _)| {
+                                                            self.module.classes.contains_key(b)
+                                                        })
+                                                        .map(|(b, s)| (b.clone(), Some((b, s))))
+                                                })
+                                        }
+                                    }
                                     None => None,
                                 };
                             if let Some((cn, spec)) = elem_cls {
@@ -46176,11 +46358,32 @@ impl Simulator {
                                     .arrays
                                     .entry(lname.clone())
                                     .or_insert((0, 63, w));
+                            // A STRUCT-element array keeps each member in its
+                            // own leaf signal (`arr[i].path`); registering a
+                            // packed container instead made every later
+                            // member read slice a zero container while the
+                            // member write went to the leaf — `slices[t].path`
+                            // read blank (UVM's uvm_hdl_path_concat).
+                            let elem_su = self.queue_elem_struct(&lname);
                             for i in 0..size {
-                                self.set_signal_value_by_name(
-                                    &format!("{}[{}]", lname, i),
-                                    Value::zero(w),
-                                );
+                                let elem = format!("{}[{}]", lname, i);
+                                match &elem_su {
+                                    Some(su) => {
+                                        for (k, lw, is_real) in
+                                            self.unpacked_struct_leaf_keys(&elem, su)
+                                        {
+                                            let sv = if is_real {
+                                                Value::from_f64(0.0)
+                                            } else {
+                                                Value::zero(lw)
+                                            };
+                                            self.signals.insert(k, sv);
+                                        }
+                                    }
+                                    None => {
+                                        self.set_signal_value_by_name(&elem, Value::zero(w));
+                                    }
+                                }
                             }
                             self.set_queue_size(&lname, size);
                             self.settle_after_proc_write();
@@ -48660,11 +48863,21 @@ impl Simulator {
                 }
                 if let ExprKind::Ident(hier) = &array.kind {
                     let mut name = self.resolve_hier_name(hier);
-                    let spec_key = self.spec_static_coll_key(&name);
-                    if spec_key != name {
-                        name = spec_key;
-                    } else if let Some(scoped) = self.instance_assoc_member(&name) {
-                        name = scoped;
+                    // A subroutine-LOCAL queue/dyn array lives under its
+                    // per-process rename — and shadows any same-named class
+                    // member (§8.10). Without this, `foreach (pp[j])` over a
+                    // local queue inside a class method iterated ZERO times
+                    // (UVM's get_full_hdl_path parent_paths loop, so every
+                    // backdoor access lost its hdl path).
+                    if let Some(rn) = self.dyn_name_lookup(&name) {
+                        name = rn.to_string();
+                    } else {
+                        let spec_key = self.spec_static_coll_key(&name);
+                        if spec_key != name {
+                            name = spec_key;
+                        } else if let Some(scoped) = self.instance_assoc_member(&name) {
+                            name = scoped;
+                        }
                     }
                     // A bare array name inside a SUBMODULE process resolves
                     // under the process's instance scope ("u_s.mem"), like
@@ -48900,7 +49113,17 @@ impl Simulator {
                     }
                     if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                         self.widths.insert(var.name.clone(), 32);
-                        if self.string_signals.contains(&name) {
+                        if self.string_signals.contains(&name)
+                            // A QUEUE/dyn array OF STRINGS is in
+                            // `string_signals` too (so its elements render as
+                            // strings) — but foreach over it walks ELEMENTS,
+                            // not characters. Without this exclusion a
+                            // `string pp[$]` in a class method iterated zero
+                            // times (UVM get_full_hdl_path's parent_paths
+                            // loop — every backdoor access lost its path).
+                            && !self.module.dynamic_arrays.contains(&name)
+                            && !self.is_associative_array(&name)
+                        {
                             // foreach over a STRING iterates its characters
                             // [0..len) by CONTENT length, and must be checked
                             // BEFORE any collection-array arm: a string name can
@@ -50750,6 +50973,35 @@ impl Simulator {
                                     }
                                     _ => None,
                                 };
+                                // §8.25: the declared type resolved to a
+                                // SPECIALIZED class name `Base#(args)` (a type
+                                // param bound to a nested specialization, e.g.
+                                // `T tmp = new;` with T = `queue#(string)` —
+                                // UVM's uvm_object_string_pool::get building
+                                // the hdl-paths queue). The plain-name lookup
+                                // below misses it, so the init fell to generic
+                                // eval and the local read x. Mirror the
+                                // assignment arm: extract the spec, carry it
+                                // through `current_spec`, construct the base.
+                                if produced.is_none()
+                                    && is_new.is_some()
+                                    && !self.module.classes.contains_key(cn)
+                                {
+                                    if let Some((base, sig)) = self.extract_spec_from_string(cn) {
+                                        if let Some(class_def) =
+                                            self.module.classes.get(&base).cloned()
+                                        {
+                                            let call_args = is_new.clone().unwrap();
+                                            self.ensure_spec_statics(&base, &sig);
+                                            let saved_spec = self.current_spec.clone();
+                                            self.current_spec = Some((base.clone(), sig));
+                                            produced = Some(
+                                                self.instantiate_class(&class_def, &call_args),
+                                            );
+                                            self.current_spec = saved_spec;
+                                        }
+                                    }
+                                }
                                 if let Some(class_def) = self.module.classes.get(cn).cloned() {
                                     if let Some(call_args) = is_new {
                                         // §8.12 copy constructor: `T x = new src;`
@@ -61303,11 +61555,97 @@ impl Simulator {
     }
 
     fn is_string_keyed_array(&self, name: &str) -> bool {
-        self.module
+        if self
+            .module
             .associative_arrays
             .get(name)
             .copied()
             .unwrap_or(false)
+        {
+            return true;
+        }
+        // Per-instance class member `<handle>#<member>`: the declared key may
+        // be a TYPE PARAMETER the instance binds to `string` (`uvm_pool
+        // #(string, T)` — the elaboration-time flag is false because KEY is
+        // unresolved there). Without this, the same logical key took the
+        // NUMERIC branch (<=64-bit values) or the STRING branch (wider ones)
+        // in `assoc_key_str` depending on the VALUE's width — so
+        // `pool["RTL"]` stored under one storage key and a later lookup with
+        // a declared-width-padded copy of the same string missed it (UVM's
+        // m_hdl_paths_pool: has_hdl_path() false right after
+        // add_hdl_path_slice, killing every backdoor access).
+        let Some(pos) = name.find('#') else {
+            return false;
+        };
+        let Ok(handle) = name[..pos].parse::<usize>() else {
+            return false;
+        };
+        let member = &name[pos + 1..];
+        let Some(Some(inst)) = self.heap.get(handle) else {
+            return false;
+        };
+        // Type-param name → concrete, carried down the extends chain (each
+        // hop rebinds the parent's params from `extends_type_args`).
+        let mut carried: HashMap<String, String> = inst.type_bindings.clone();
+        let mut cur = Some(inst.class_name.clone());
+        let mut level = 0;
+        while let Some(cn) = cur {
+            level += 1;
+            if level > 16 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            if let Some(&is_str) = cd.assoc_properties.get(member) {
+                if is_str {
+                    return true;
+                }
+                if let Some(kt) = cd.assoc_key_types.get(member) {
+                    let mut concrete = carried.get(kt).cloned().unwrap_or_else(|| kt.clone());
+                    if let Some(c2) = carried.get(&concrete) {
+                        concrete = c2.clone();
+                    }
+                    if concrete == "string" {
+                        return true;
+                    }
+                    if let Some(dt) = self.module.typedef_types.get(&concrete) {
+                        if matches!(
+                            super::elaborate::resolve_typedef_chain(
+                                dt,
+                                &self.module.typedef_types
+                            ),
+                            DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            match cd.extends.clone() {
+                Some(parent) => {
+                    if let Some(pcd) = self.module.classes.get(&parent) {
+                        let mut next: HashMap<String, String> = HashMap::default();
+                        for (i, pname) in pcd.param_order.iter().enumerate() {
+                            if let Some(arg) = cd.extends_type_args.get(i) {
+                                let a = arg.trim();
+                                let resolved =
+                                    carried.get(a).cloned().unwrap_or_else(|| a.to_string());
+                                next.insert(pname.clone(), resolved);
+                            }
+                        }
+                        carried = next;
+                    }
+                    cur = Some(parent);
+                }
+                None => cur = None,
+            }
+        }
+        false
     }
 
     /// Warn once per associative array about an invalid (x/z) index.
@@ -68158,6 +68496,14 @@ impl Simulator {
                 let leaf = format!("{}.{}", src, md.name.name);
                 self.signal_name_to_id.contains_key(leaf.as_str())
                     || self.signals.contains_key(&leaf)
+                    // a subroutine-local struct / member-wise-bound FORMAL
+                    // keeps its leaves in the call frame (§13.4.2) — without
+                    // this check a whole-struct copy from a formal declined
+                    // and fell to a packed spread that read x.
+                    || self
+                        .local_stack
+                        .last()
+                        .is_some_and(|f| f.contains_key(&leaf))
                     // a member that is itself a dynamic collection has no
                     // scalar leaf — its registration is the storage
                     || self.module.dynamic_arrays.contains(&leaf)
@@ -68260,6 +68606,46 @@ impl Simulator {
                                 return Some(su);
                             }
                         }
+                    }
+                }
+            }
+        }
+        // INSTANCE member `<handle>#<member>`: the element type lives in the
+        // declaring class's `property_types` (same typedef-chase as the
+        // static case). Without this a class-member dyn array OF STRUCTS
+        // never matched the struct-element write gate and `slices[t].path =
+        // v` was dropped (UVM's uvm_hdl_path_concat, so every backdoor
+        // access saw empty hdl-path slices).
+        if let Some(pos) = obj_name.find('#') {
+            if let Ok(handle) = obj_name[..pos].parse::<usize>() {
+                let member = &obj_name[pos + 1..];
+                if !member.contains('[') {
+                    let mut cur = self
+                        .heap
+                        .get(handle)
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone());
+                    while let Some(cn) = cur {
+                        let Some(cd) = self.module.classes.get(&cn) else {
+                            break;
+                        };
+                        if let Some(dt) = cd.property_types.get(member) {
+                            let resolved = match dt {
+                                DataType::TypeReference { name: tn, .. } => cd
+                                    .typedef_targets
+                                    .get(&tn.name.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| dt.clone()),
+                                other => other.clone(),
+                            };
+                            if let DataType::Struct(su) = self.resolve_dt(&resolved) {
+                                if Self::spreads_member_wise(&su) {
+                                    return Some(su);
+                                }
+                            }
+                            return None;
+                        }
+                        cur = cd.extends.clone();
                     }
                 }
             }
@@ -70733,6 +71119,30 @@ impl Simulator {
         // methods and non-static/non-collection names.
         let _resolved = self.spec_static_coll_key(obj_name);
         let obj_name = _resolved.as_str();
+        // §8.10: inside a class method, a MEMBER collection shadows any
+        // same-named module/package-scope collection. Several callers gate
+        // on the bare name being registered globally before trying the
+        // instance scope, so `queue.size()` inside `uvm_queue` read a phase-
+        // graph function's global-by-bare-name local `queue[$]` instead of
+        // `<this>#queue` — every pool queue reported a phantom size and null
+        // elements (backdoor hdl paths came back empty). Rewrite centrally:
+        // bare name + declared by the current class + not a true local.
+        let _inst_scoped;
+        let obj_name = if !obj_name.contains('#')
+            && !obj_name.contains('.')
+            && !obj_name.contains('[')
+            && self.dyn_name_lookup(obj_name).is_none()
+        {
+            match self.instance_assoc_member(obj_name) {
+                Some(s) => {
+                    _inst_scoped = s;
+                    _inst_scoped.as_str()
+                }
+                None => obj_name,
+            }
+        } else {
+            obj_name
+        };
         // §6.19.6 — Enum methods first/last/next/prev/num on an enum-typed
         // signal. Look up the signal's type_name → enum_members[type_name]
         // (Vec<(name, value)> in declaration order, which IS the LRM

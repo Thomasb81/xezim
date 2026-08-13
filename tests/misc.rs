@@ -258,3 +258,5 @@ mod while_continue_final_iter;
 mod class_queue_locators;
 #[path = "misc/struct_local_declinit_copy.rs"]
 mod struct_local_declinit_copy;
+#[path = "misc/class_collection_storage.rs"]
+mod class_collection_storage;
