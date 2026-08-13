@@ -163,3 +163,5 @@ mod compiled_for_loops;
 
 #[path = "scheduling/class_event_member_wait.rs"]
 mod class_event_member_wait;
+#[path = "scheduling/comb_self_member_sensitivity.rs"]
+mod comb_self_member_sensitivity;
