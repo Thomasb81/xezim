@@ -46192,7 +46192,20 @@ impl Simulator {
                             // and constructed THAT class — UVM's hdl-path pool
                             // handed back a uvm_pool where a uvm_queue
                             // belonged, and every backdoor path read empty.
-                            let local_elem_cls = self.local_class_type_of(&bname);
+                            // A method-LOCAL collection stores under a
+                            // per-process RENAMED key; its declared element
+                            // type shadows a same-named class member (§8.10).
+                            let local_elem_cls = self.local_class_type_of(&bname).or_else(|| {
+                                self.dyn_name_lookup(&bname)
+                                    .map(str::to_string)
+                                    .and_then(|rn| {
+                                        self.module
+                                            .array_elem_class
+                                            .get(&rn)
+                                            .cloned()
+                                            .or_else(|| self.declared_collection_elem_class(&rn))
+                                    })
+                            });
                             let elem_cls = recv_elem_cls
                                 .or_else(|| local_elem_cls)
                                 .or_else(|| member_elem_cls)
@@ -70940,6 +70953,13 @@ impl Simulator {
         // When the queue's element type is a struct, copy the struct's
         // packed_struct_fields layout to the queue's name so that
         // `driver[i].field` MemberAccess on queue elements works.
+        // Record the formal's ELEMENT type so the callee's `push_back` of an
+        // unpacked struct writes member leaves (and the writeback copies them
+        // back) — without it a `ref rec_t items[$]` came back with the right
+        // SIZE and every member blank.
+        self.module
+            .var_decl_types
+            .insert(pname.to_string(), queue_data_type.clone());
         let resolved_dt = Self::resolve_type_ref(queue_data_type, &self.module.typedef_types);
         matches!(resolved_dt, DataType::Struct(_));
         if let crate::ast::types::DataType::Struct(su) = resolved_dt {
@@ -89335,7 +89355,17 @@ impl Simulator {
                             assoc_params.push((param, caller, is_out));
                             continue;
                         }
-                        if let Some(struct_entries) = self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals, Some(handle)) {
+                        // §13.5.2: a formal with an unpacked QUEUE / array
+                        // dimension is a COLLECTION of structs, not a
+                        // member-wise struct formal — binding it here made
+                        // `ref rec_t items[$]` a scalar struct, so the
+                        // callee's push_backs never reached the caller.
+                        let struct_arg_binding = if port.dimensions.is_empty() {
+                            self.bind_unpacked_struct_arg(&port.name.name, &port.data_type, &args[i], &mut locals, Some(handle))
+                        } else {
+                            None
+                        };
+                        if let Some(struct_entries) = struct_arg_binding {
                             if matches!(
                                 port.direction,
                                 PortDirection::Output
