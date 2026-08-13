@@ -260,3 +260,5 @@ mod class_queue_locators;
 mod struct_local_declinit_copy;
 #[path = "misc/class_collection_storage.rs"]
 mod class_collection_storage;
+#[path = "misc/macro_directive_prefix_names.rs"]
+mod macro_directive_prefix_names;
