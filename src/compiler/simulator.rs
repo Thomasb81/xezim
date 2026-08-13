@@ -46620,7 +46620,10 @@ impl Simulator {
                 // that nothing reads — the destination came back as X.
                 if let Some((arr_name, mname, filter, iter_name)) = self.locator_call(rvalue) {
                     if let ExprKind::Ident(lhier) = &lvalue.kind {
-                        let lname = self.resolve_hier_name(lhier);
+                        // The destination may itself be a renamed subroutine
+                        // local or a class-member queue — same storage rules
+                        // as the receiver.
+                        let lname = self.resolve_locator_storage(&self.resolve_hier_name(lhier));
                         let idxs = self.locator_indices_named(
                             &arr_name,
                             &mname,
@@ -46651,7 +46654,10 @@ impl Simulator {
                     } = &ma_expr.kind
                     {
                         if let ExprKind::Ident(hier) = &arr_expr.kind {
-                            let arr_name = self.resolve_hier_name(hier);
+                            let arr_name = {
+                                let n = self.resolve_hier_name(hier);
+                                self.resolve_locator_storage(&n)
+                            };
                             let mname = member.name.as_str();
                             if matches!(
                                 mname,
@@ -46681,7 +46687,10 @@ impl Simulator {
                                     .unwrap_or_else(|| "item".to_string());
                                 let idx_name = iter_args.get(1).and_then(extract_ident);
                                 if let ExprKind::Ident(lhier) = &lvalue.kind {
-                                    let lname = self.resolve_hier_name(lhier);
+                                    let lname = {
+                                        let n = self.resolve_hier_name(lhier);
+                                        self.resolve_locator_storage(&n)
+                                    };
                                     let mut cur_size = self.get_queue_size(&arr_name) as usize;
                                     if cur_size == 0 {
                                         let mut k = 0usize;
@@ -49127,6 +49136,13 @@ impl Simulator {
                     i += 1;
                     self.reset_hint_to_process_scope();
                     if !self.eval_expr(condition).is_true() {
+                        // §12.7.2: a `continue` on the FINAL iteration reaches
+                        // this exit with the flag still set (the `for` arm
+                        // clears it after the body; `while` re-tests the
+                        // condition first). Leaked, it skips every statement
+                        // after the loop — a function ends without executing
+                        // its `return` and the caller reads a stale slot.
+                        self.continue_flag = false;
                         break;
                     }
                     self.break_flag = false;
@@ -50012,7 +50028,15 @@ impl Simulator {
                 // may report as 0 for a class with only methods/statics).
                 // A 0 width is never valid for a variable.
                 let w = if w0 == 0 { 32 } else { w0 };
-                let two_state = super::elaborate::is_type_two_state(data_type);
+                // §6.8/§6.18: resolve typedef aliases before deciding 2- vs
+                // 4-state — `uvm_reg_data_t value_adjust;` (typedef of `bit
+                // [63:0]`) must initialize to 0, not x (UVM's field
+                // read-modify-write ORs into it, so an x seed poisoned the
+                // whole register write).
+                let two_state = super::elaborate::is_type_two_state_resolved(
+                    data_type,
+                    &self.module.typedef_types,
+                );
                 // LRM §8.4: an uninitialized class handle defaults to
                 // `null`. Treat class-handle types and `chandle` as
                 // two-state-zero so `if (h == null)` works without an
@@ -50928,8 +50952,43 @@ impl Simulator {
                                     ),
                                     d.name.span,
                                 );
-                                let _ = self
-                                    .try_decompose_struct_class_prop_read_assign(&lv, &init_expr);
+                                if self
+                                    .try_decompose_struct_class_prop_read_assign(&lv, &init_expr)
+                                    .is_none()
+                                {
+                                    // §7.2: decl-init from any OTHER struct
+                                    // source — another local, a queue/array
+                                    // element (`op_s x = accesses[i];`, UVM's
+                                    // reg-map bus access loop) — copies member
+                                    // -wise exactly like the assignment arm.
+                                    // The packed `v` stored above has no
+                                    // leaves, so without this every member of
+                                    // the fresh local stayed x.
+                                    if let crate::ast::types::DataType::Struct(su) =
+                                        self.resolve_dt(data_type)
+                                    {
+                                        let src = self.flat_member_name(&init_expr);
+                                        match src {
+                                            Some(src)
+                                                if self.struct_storage_exists(&src, &su) =>
+                                            {
+                                                self.copy_unpacked_struct(
+                                                    &d.name.name,
+                                                    &src,
+                                                    &su,
+                                                );
+                                            }
+                                            _ => {
+                                                let v = self.eval_expr(&init_expr);
+                                                let _ = self.spread_into_unpacked_struct(
+                                                    &d.name.name,
+                                                    &su,
+                                                    &v,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         } else if let Some(frame) = self.local_stack.last_mut() {
                             frame.insert(d.name.name.clone(), v);
@@ -69923,6 +69982,59 @@ impl Simulator {
         )
     }
 
+    /// Resolve a locator receiver's STORAGE name (§7.12.1). The parse-level
+    /// name is not the storage key for two common shapes: a subroutine-local
+    /// queue lives under its per-process rename, and a class-member
+    /// collection lives at `<handle>#<member>` — this-relative for the bare
+    /// name, or reached through object handles for `obj.member`. Without
+    /// this, a locator on a class-member queue saw size 0 and every
+    /// `find*`/`unique`/`min`/`max` inside a class method returned empty
+    /// (UVM's `grant_queued_locks` then mistook a REQ entry for a leading
+    /// lock and granted arbitration no driver asked for).
+    fn resolve_locator_storage(&self, name: &str) -> String {
+        let registered = |s: &Self, n: &str| {
+            s.module.arrays.contains_key(n)
+                || s.module.dynamic_arrays.contains(n)
+                || s.is_associative_array(n)
+        };
+        if registered(self, name) {
+            return name.to_string();
+        }
+        if !name.contains('.') {
+            if let Some(r) = self.dyn_name_lookup(name) {
+                return r.to_string();
+            }
+            if let Some(r) = self.instance_assoc_member(name) {
+                return r;
+            }
+            return name.to_string();
+        }
+        // `obj.member` / `a.b.member`: walk handles through the heap.
+        let segs: Vec<&str> = name.split('.').collect();
+        let mut handle: usize = match segs[0] {
+            "this" | "super" => self.this_stack.last().copied().flatten().unwrap_or(0),
+            head => self.eval_ident_handle(head).unwrap_or(0),
+        };
+        if handle == 0 {
+            return name.to_string();
+        }
+        for seg in &segs[1..segs.len() - 1] {
+            let next = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(*seg))
+                .and_then(|v| v.to_u64())
+                .unwrap_or(0) as usize;
+            if next == 0 {
+                return name.to_string();
+            }
+            handle = next;
+        }
+        self.handle_collection_name(handle, segs[segs.len() - 1])
+            .unwrap_or_else(|| name.to_string())
+    }
+
     /// `(array, method, filter)` when `e` is a locator call on an array/queue,
     /// with or without a `with (...)` clause. `q.min()` parses as a Call, while
     /// `q.min` (no parens) parses as a 2-segment identifier.
@@ -69956,22 +70068,48 @@ impl Simulator {
             }
             _ => inner,
         };
+        // Flatten a receiver of Ident / nested-MemberAccess segments to a
+        // dotted path (`s.arb_q.find` parses as MemberAccess{MemberAccess}).
+        fn flatten_dotted(sim: &Simulator, e: &Expression) -> Option<String> {
+            match &e.kind {
+                ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                    Some(sim.resolve_hier_name(h))
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    Some(format!("{}.{}", flatten_dotted(sim, expr)?, member.name))
+                }
+                _ => None,
+            }
+        }
         let (arr, mname) = match &target.kind {
             ExprKind::MemberAccess { expr, member } => {
-                let ExprKind::Ident(h) = &expr.kind else {
-                    return None;
-                };
-                (self.resolve_hier_name(h), member.name.clone())
+                (flatten_dotted(self, expr)?, member.name.clone())
             }
-            ExprKind::Ident(h) if h.path.len() == 2 => {
-                (h.path[0].name.name.clone(), h.path[1].name.name.clone())
+            // `q.find` flattens to a 2-seg Ident; `s.arb_q.find` to 3-seg.
+            // The last segment is the method, the rest the receiver path.
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let base = h.path[..h.path.len() - 1]
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                (base, h.path.last().unwrap().name.name.clone())
             }
             _ => return None,
         };
         if !Self::is_locator_method(&mname) {
             return None;
         }
-        if self.module.arrays.contains_key(&arr) || self.module.dynamic_arrays.contains(&arr) {
+        let arr = self.resolve_locator_storage(&arr);
+        // A `<handle>#member` / `@local#N` result is already verified as a
+        // collection by its resolver; anything else must be registered.
+        if arr.contains('#')
+            || self.module.arrays.contains_key(&arr)
+            || self.module.dynamic_arrays.contains(&arr)
+            || self.is_associative_array(&arr)
+        {
             Some((arr, mname, filter, iter_name))
         } else {
             None
