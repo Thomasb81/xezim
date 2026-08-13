@@ -60,6 +60,36 @@ endmodule
 }
 
 #[test]
+fn zero_delay_continuation_write_wakes_anyedge_comb_block() {
+    // §4.4.2.3/§9.2: `@(negedge clk) begin #0 sig = …; end` parks the rest
+    // of the process in the Inactive-region queue; its write runs after the
+    // slot's edge detection. Before the fix, drain_inactive_pre_nba neither
+    // recorded the write for the rescan drain nor ran another detect (it
+    // broke early with no NBAs pending), so the AnyEdge block never woke —
+    // and the nested-#0 path also needed the in_edge_cont flag to
+    // save/restore rather than clear. Reference-verified.
+    let text = run(
+        "zero_delay_wake",
+        r#"module test;
+  typedef struct packed { logic vld; logic [7:0] addr; } req_t;
+  req_t in_q, o;
+  logic clk = 0; always #5 clk = ~clk;
+  always @(*) begin o = in_q; if (o.vld) o.addr = o.addr + 1; end
+  initial begin
+    in_q = '{1'b0, 8'h10};
+    @(negedge clk) begin #0 in_q = '{1'b1, 8'h20}; end
+    #1 $display("T|t=%0t o=%p", $time, o);
+    #10 $display("T|t=%0t o=%p", $time, o);
+    #2 $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(text.contains("T|t=11 o='{vld:1, addr:33}"), "{text}");
+    assert!(text.contains("T|t=21 o='{vld:1, addr:33}"), "{text}");
+}
+
+#[test]
 fn delay_driven_input_still_works() {
     // Control: the same shape driven by #delay writes (never broken).
     let text = run(

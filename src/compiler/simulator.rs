@@ -23608,11 +23608,20 @@ impl Simulator {
     /// checker/BFM divergence shape of the rptr race-through report).
     fn drain_inactive_pre_nba(&mut self) {
         let mut fuel = 1000u32;
+        // §9.2: a `#0` continuation's write happens AFTER this slot's edge
+        // detection; without recording it for the rescan drain, the caller
+        // either breaks without another check_edges (no NBAs pending) or
+        // snapshots prev over the change before the next detect — the edge
+        // is silently lost and an AnyEdge block never wakes. Record like
+        // edge-block/continuation writes (save/restore for nesting).
+        let __prev_edge_cont = self.in_edge_cont;
+        self.in_edge_cont = true;
         while !self.inactive_queue.is_empty() && fuel > 0 {
             fuel -= 1;
             let moved = std::mem::take(&mut self.inactive_queue);
             for (pid, cont) in moved {
                 if self.finished {
+                    self.in_edge_cont = __prev_edge_cont;
                     return;
                 }
                 self.run_scheduled_process(pid, &cont);
@@ -23624,6 +23633,11 @@ impl Simulator {
                 self.settle_combinatorial();
             }
         }
+        self.in_edge_cont = __prev_edge_cont;
+        // Re-detect the recorded positions NOW, against the still-pre-write
+        // prev — before any snapshot can erase them. No-op when nothing was
+        // recorded.
+        self.drain_edge_exec_rescan();
     }
 
     fn drain_edge_cascade(&mut self, cascade_limit: u32) -> (u64, u64, u64, u64) {
@@ -23634,7 +23648,10 @@ impl Simulator {
             // continuations parked by this round's active-region work run
             // before its NBAs commit.
             self.drain_inactive_pre_nba();
-            if self.nba_fast.is_empty() && self.nba_queue.is_empty() {
+            if self.nba_fast.is_empty()
+                && self.nba_queue.is_empty()
+                && self.inactive_queue.is_empty()
+            {
                 break;
             }
             let t0 = self.profile_timing.then(std::time::Instant::now);
@@ -33071,7 +33088,11 @@ impl Simulator {
         // `in_edge_cont`): these run AFTER this pass's edge detection, so
         // without recording, an AnyEdge block sensitive to a signal a
         // continuation writes never re-fires (change swallowed by the next
-        // prev refresh). Restored by the same flag write in both exits.
+        // prev refresh). SAVE/RESTORE, not set/clear: a continuation whose
+        // body hits `#0` re-enters check_edges synchronously (nested pass),
+        // and an unconditional clear there stripped the flag before the
+        // post-#0 write executed — losing exactly the event this exists for.
+        let __prev_edge_cont = self.in_edge_cont;
         self.in_edge_cont = true;
         for (pid, stmts) in triggered_conts {
             if self.finished {
@@ -33126,7 +33147,7 @@ impl Simulator {
                 }
             }
         }
-        self.in_edge_cont = false;
+        self.in_edge_cont = __prev_edge_cont;
         if !waiters_first && active_region && self.finished {
             // A `$finish` from a continuation resumed AFTER this edge's
             // blocks stops the run once the slot completes: its SVA ticks
