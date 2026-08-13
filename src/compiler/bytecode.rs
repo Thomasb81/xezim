@@ -2138,7 +2138,14 @@ impl<'a> BytecodeCompiler<'a> {
         if self.register_overflow {
             self.bail("bytecode_register_limit");
         }
-        if self.allow_ast_fallback {
+        // Same guard as emit_fallback: inside a loop whose counter lives in
+        // a VM register, a per-statement fallback reads the loop var as a
+        // (non-existent) SIGNAL — `wr[i] = req.vld` inside `for (int i;…)`
+        // silently indexed with x and wrote NOTHING, 16 times per fire,
+        // while the entry reported success. Fail the statement instead so
+        // the whole loop (or block) rolls back to one AST-interpreted unit
+        // where the loop var is a real interpreter local.
+        if self.allow_ast_fallback && self.reg_var_loop_depth == 0 {
             let reason = self
                 .bail_reason
                 .unwrap_or_else(|| Self::stmt_kind_label(stmt));
