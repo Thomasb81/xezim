@@ -53772,14 +53772,14 @@ impl Simulator {
                 // or a member of a local/module unpacked-struct variable.
                 self.class_member_is_string(expr)
                     || self.call_returns_string(expr)
-                    || (if let ExprKind::Ident(bh) = &base.kind {
-                        self.struct_var_member_is_string(
-                            &bh.path[0].name.name,
-                            &member.name,
-                        )
-                    } else {
-                        false
-                    })
+                    // Walk the whole receiver chain, not just its head: a
+                    // NESTED struct member (`o.in.s`, either parse shape)
+                    // otherwise missed and `%s` padded the string to its
+                    // container width.
+                    || Self::flatten_member_path(base)
+                        .is_some_and(|segs| {
+                            self.dotted_member_is_string(&segs.join("."), &member.name)
+                        })
             }
             // A method/function call whose return type is `string`
             // (e.g. `obj.str()`, `this.convert2string()`). Without
@@ -53798,12 +53798,75 @@ impl Simulator {
     /// `%s` treated the container-stored string as a packed value and
     /// padded it to the container width.
     fn local_struct_member_is_string(&self, h: &crate::ast::expr::HierarchicalIdentifier) -> bool {
+        use crate::ast::types::{DataType, SimpleType};
         if h.path.len() < 2 {
             return false;
         }
-        self.struct_var_member_is_string(
-            &h.path[0].name.name,
-            &h.path[h.path.len() - 1].name.name,
+        // Walk EVERY segment: only the outermost struct's direct members
+        // were consulted, so a NESTED member (`o.in.s`) missed and `%s`
+        // padded the string to its container width, while the same member
+        // reached through a one-level path printed correctly.
+        let Some(dt) = self.module.var_decl_types.get(&h.path[0].name.name) else {
+            return false;
+        };
+        let mut cur = self.resolve_dt(&dt.clone());
+        for seg in &h.path[1..] {
+            let DataType::Struct(su) = &cur else {
+                return false;
+            };
+            let next = su.members.iter().find_map(|m| {
+                m.declarators
+                    .iter()
+                    .any(|d| d.name.name == seg.name.name)
+                    .then(|| self.resolve_dt(&m.data_type))
+            });
+            match next {
+                Some(t) => cur = t,
+                None => return false,
+            }
+        }
+        matches!(
+            cur,
+            DataType::Simple {
+                kind: SimpleType::String,
+                ..
+            }
+        )
+    }
+
+    /// Like `struct_var_member_is_string`, but `base` may be a DOTTED path
+    /// (`o.in`) — each segment is resolved through its struct type in turn.
+    fn dotted_member_is_string(&self, base: &str, member: &str) -> bool {
+        use crate::ast::types::{DataType, SimpleType};
+        let mut segs = base.split('.');
+        let Some(head) = segs.next() else {
+            return false;
+        };
+        let Some(dt) = self.module.var_decl_types.get(head) else {
+            return false;
+        };
+        let mut cur = self.resolve_dt(&dt.clone());
+        for seg in segs.chain(std::iter::once(member)) {
+            let DataType::Struct(su) = &cur else {
+                return false;
+            };
+            let next = su.members.iter().find_map(|m| {
+                m.declarators
+                    .iter()
+                    .any(|d| d.name.name == seg)
+                    .then(|| self.resolve_dt(&m.data_type))
+            });
+            match next {
+                Some(t) => cur = t,
+                None => return false,
+            }
+        }
+        matches!(
+            cur,
+            DataType::Simple {
+                kind: SimpleType::String,
+                ..
+            }
         )
     }
 
