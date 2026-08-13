@@ -2337,6 +2337,7 @@ struct AssertionStat {
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,
+    local_type_stack: Vec<(HashMap<String, String>, HashMap<String, String>)>,
     class_context_stack: Vec<Option<String>>,
     cg_this: Option<usize>,
     return_value: Option<Value>,
@@ -3164,6 +3165,17 @@ pub struct Simulator {
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
     class_statics: HashMap<String, Value>,
+    /// Per-frame overlay for class/typedef types of frame-locals. The
+    /// global var_class_types/var_typedef_types are keyed by BARE name and
+    /// shared across every process, so a class-typed local declared in one
+    /// subroutine (or another process) silently overwrote the entry a
+    /// different frame relied on — `$cast`/`new`-resolution then read a
+    /// stale class and a valid cast reported a definite mismatch. Each
+    /// local frame carries its own (class, typedef) maps, consulted
+    /// innermost-first before the globals; the stack mirrors `local_stack`
+    /// (push/pop helpers + ProcessContext swaps), so process interleaving
+    /// keeps each process's bindings intact.
+    local_type_stack: Vec<(HashMap<String, String>, HashMap<String, String>)>,
     /// Active parameterized-class specialization for per-spec static storage:
     /// `(base_class, sig)` where `sig` is the canonical `#(...)` param text. Set
     /// while a `C#(params)::...` static method runs or a `C#(params)::prop` is
@@ -6525,6 +6537,7 @@ impl Simulator {
             dist_picked_once: HashSet::default(),
             rand_ranges: HashMap::default(),
             class_statics: HashMap::default(),
+            local_type_stack: Vec::new(),
             current_spec: None,
             gate_fall_delay_by_id: HashMap::default(),
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
@@ -10815,6 +10828,69 @@ impl Simulator {
             };
             self.class_statics.insert(format!("{}::{}", cn, prop), v);
         }
+
+        // §8.25/§8.9: real simulators elaborate the static initializers of
+        // EVERY referenced class specialization at time 0 — UVM's factory
+        // registration (`local static this_type me = get();` inside each
+        // `*_registry#(T,"T")`) depends on exactly that. xezim runs per-spec
+        // statics lazily on first instantiation, which is too late for
+        // `run_test`/`create_*_by_name` (nothing is registered when the
+        // by-name lookup happens). Eagerly run them for every registry
+        // specialization referenced by a class-scope `type_id` typedef.
+        let reg_specs: Vec<(String, String)> = self
+            .module
+            .classes
+            .iter()
+            .filter_map(|(_, cd)| {
+                let dt = cd.typedef_targets.get("type_id")?;
+                if let DataType::TypeReference {
+                    name, type_args, ..
+                } = dt
+                {
+                    if name.name.name.contains("registry") && !type_args.is_empty() {
+                        let base = name.name.name.clone();
+                        let frags: Vec<Option<String>> = type_args
+                            .iter()
+                            .map(|e| self.expr_to_spec_fragment(e))
+                            .collect();
+                        if frags.iter().any(|f| f.is_none()) {
+                            return None;
+                        }
+                        let sig = frags
+                            .into_iter()
+                            .map(|f| f.unwrap())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        return Some((base, sig));
+                    }
+                }
+                None
+            })
+            .collect();
+        let reg_dbg = std::env::var("XEZIM_REG_DBG").is_ok();
+        for (base, sig) in reg_specs {
+            if reg_dbg {
+                eprintln!("[REG] ensure {}#({})", base, sig);
+            }
+            self.ensure_spec_statics(&base, &sig);
+            // 1800.2: the factory registration lives one hop further — in
+            // `uvm_registry_common#(...)`'s `m__initialized =
+            // __deferred_init();` static, reached through the registry
+            // class's own `common_type` typedef. Resolve that typedef under
+            // the registry's spec and run its statics too (harmless no-op
+            // for 1.x registries, which have no `common_type`).
+            let saved = self.current_spec.clone();
+            self.current_spec = Some((base.clone(), sig.clone()));
+            let common = self.resolve_class_member_typedef_spec(&base, "common_type");
+            if reg_dbg {
+                eprintln!("[REG]   common_type -> {:?}", common);
+            }
+            if let Some((b2, s2)) = common {
+                self.ensure_spec_statics(&b2, &s2);
+            }
+            self.current_spec = saved;
+        }
+        mark_compile_phase("registry spec static init", &mut compile_phase_start);
 
         // Evaluate parameter expressions whose initializers contained function
         // calls and were deferred by the elaborator.
@@ -26549,6 +26625,7 @@ impl Simulator {
         ProcessContext {
             this_stack: self.this_stack.clone(),
             local_stack: self.local_stack.clone(),
+            local_type_stack: self.local_type_stack.clone(),
             class_context_stack: self.class_context_stack.clone(),
             cg_this: self.cg_this,
             return_value: self.return_value.clone(),
@@ -26573,6 +26650,7 @@ impl Simulator {
         ProcessContext {
             this_stack: std::mem::take(&mut self.this_stack),
             local_stack: std::mem::take(&mut self.local_stack),
+            local_type_stack: std::mem::take(&mut self.local_type_stack),
             class_context_stack: std::mem::take(&mut self.class_context_stack),
             cg_this: self.cg_this.take(),
             return_value: self.return_value.take(),
@@ -26591,6 +26669,7 @@ impl Simulator {
     fn restore_process_context(&mut self, ctx: ProcessContext) {
         self.this_stack = ctx.this_stack;
         self.local_stack = ctx.local_stack;
+        self.local_type_stack = ctx.local_type_stack;
         self.class_context_stack = ctx.class_context_stack;
         self.cg_this = ctx.cg_this;
         self.return_value = ctx.return_value;
@@ -28784,7 +28863,7 @@ impl Simulator {
                                     // the process its own frame here.
                                     let mut f: HashMap<String, Value> = HashMap::default();
                                     f.insert(name.name.clone(), rv);
-                                    self.local_stack.push(f);
+                                    self.push_local_frame(f);
                                 }
                             }
                             ForInit::Assign { lvalue, rvalue } => {
@@ -42361,6 +42440,35 @@ impl Simulator {
                     if args.len() >= 2 {
                         let v = self.eval_expr(&args[1]);
                         let ok = self.cast_type_ok(&args[0], &v);
+                        if !ok && std::env::var("XEZIM_CAST_DBG").is_ok() {
+                            let h = v.to_u64().unwrap_or(0) as usize;
+                            let src_cls = self
+                                .heap
+                                .get(h)
+                                .and_then(|o| o.as_ref())
+                                .map(|i| i.class_name.clone())
+                                .unwrap_or_else(|| "<not-an-object>".into());
+                            let dest_cls = match &args[0].kind {
+                                ExprKind::Ident(hh) if hh.path.len() == 1 => {
+                                    self.class_of_var(&hh.path[0].name.name)
+                                }
+                                _ => None,
+                            };
+                            let (ovl, glob, depth) = match &args[0].kind {
+                                ExprKind::Ident(hh) if hh.path.len() == 1 => (
+                                    self.local_class_type_of(&hh.path[0].name.name),
+                                    self.var_class_types
+                                        .get(&hh.path[0].name.name)
+                                        .cloned(),
+                                    self.local_type_stack.len(),
+                                ),
+                                _ => (None, None, 0),
+                            };
+                            eprintln!(
+                                "[CAST] t={} FAIL src='{}' dest={:?} overlay={:?} global={:?} depth={}",
+                                self.time, src_cls, dest_cls, ovl, glob, depth
+                            );
+                        }
                         if ok {
                             self.assign_value(&args[0], &v);
                             Value::from_u64(1, 32)
@@ -45227,7 +45335,7 @@ impl Simulator {
         binds: &[(String, Value)],
     ) -> (bool, Vec<(String, Option<Value>)>) {
         let pushed = if self.local_stack.is_empty() {
-            self.local_stack.push(HashMap::default());
+            self.push_local_frame(HashMap::default());
             true
         } else {
             false
@@ -45256,7 +45364,7 @@ impl Simulator {
             }
         }
         if pushed {
-            self.local_stack.pop();
+            self.pop_local_frame();
         }
     }
 
@@ -46626,9 +46734,9 @@ impl Simulator {
                                                     Value::from_u64(i as u64, 32),
                                                 );
                                             }
-                                            self.local_stack.push(locals);
+                                            self.push_local_frame(locals);
                                             let cond = self.eval_expr(filter);
-                                            self.local_stack.pop();
+                                            self.pop_local_frame();
                                             if mname == "map" {
                                                 results.push(cond);
                                             } else if cond.is_true() {
@@ -48102,7 +48210,7 @@ impl Simulator {
                         _ => false,
                     });
                 if shadow_frame {
-                    self.local_stack.push(HashMap::default());
+                    self.push_local_frame(HashMap::default());
                 }
                 // Init-declared loop vars are automatic. When the process has no
                 // local frame they land in the signal table; record them so a
@@ -48231,7 +48339,7 @@ impl Simulator {
                     self.auto_loop_vars.pop();
                 }
                 if shadow_frame {
-                    self.local_stack.pop();
+                    self.pop_local_frame();
                 }
                 self.restore_loop_vars(&fv_saved);
             }
@@ -49134,7 +49242,7 @@ impl Simulator {
                         _ => false,
                     });
                 if shadow_frame {
-                    self.local_stack.push(HashMap::default());
+                    self.push_local_frame(HashMap::default());
                 }
                 // `automatic` locals declared in this block (see the VarDecl
                 // arm) are fork-capturable only while the block is in scope
@@ -49158,7 +49266,7 @@ impl Simulator {
                     self.m_scope_stack.pop();
                 }
                 if shadow_frame {
-                    self.local_stack.pop();
+                    self.pop_local_frame();
                 }
                 self.auto_loop_vars.truncate(seq_auto_len);
                 // A `disable` naming THIS block ends here; execution resumes
@@ -50897,6 +51005,7 @@ impl Simulator {
                                         .classes
                                         .contains_key(cn.split('#').next().unwrap_or(cn)));
                             if cn_is_class {
+                                self.record_local_class_type(&d.name.name, cn);
                                 self.var_class_types
                                     .insert(d.name.name.clone(), cn.clone());
                                 // A typedef'd local (e.g. `table_q_t rq` where
@@ -50934,6 +51043,7 @@ impl Simulator {
                                 // `$cast(cb, ...)` assignment and any later
                                 // `new()` could not resolve CB, and the return
                                 // value came back null to the caller.
+                                self.record_local_class_type(&d.name.name, cn);
                                 self.var_class_types.insert(d.name.name.clone(), cn.clone());
                             }
                         }
@@ -63700,9 +63810,9 @@ impl Simulator {
                         if let Some(iv) = &idx_var {
                             frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
                         }
-                        self.local_stack.push(frame);
+                        self.push_local_frame(frame);
                         self.solve_inline_foreach_elem(item, &arr_name, i, elem_w);
-                        self.local_stack.pop();
+                        self.pop_local_frame();
                     }
                 } else if let Some(w) = Self::plain_ident_name(base)
                     .and_then(|n| self.lookup_signal_width(&n))
@@ -63724,9 +63834,9 @@ impl Simulator {
                         if let Some(iv) = &idx_var {
                             frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
                         }
-                        self.local_stack.push(frame);
+                        self.push_local_frame(frame);
                         self.apply_inline_constraint(item, targets);
-                        self.local_stack.pop();
+                        self.pop_local_frame();
                     }
                 }
             }
@@ -64464,9 +64574,9 @@ impl Simulator {
                     if let Some(iv) = &idx_var {
                         frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
                     }
-                    self.local_stack.push(frame);
+                    self.push_local_frame(frame);
                     let ok = self.check_constraint_item_impl(body);
-                    self.local_stack.pop();
+                    self.pop_local_frame();
                     if !ok {
                         return false;
                     }
@@ -66201,6 +66311,43 @@ impl Simulator {
         true
     }
 
+    /// See `local_type_stack`: record a frame-local's declared CLASS type
+    /// in the innermost frame overlay (falls back to the global map at
+    /// module scope).
+    fn record_local_class_type(&mut self, name: &str, cls: &str) {
+        if let Some((c, _)) = self.local_type_stack.last_mut() {
+            c.insert(name.to_string(), cls.to_string());
+        }
+    }
+
+    /// See `local_type_stack`: typedef/enum flavor.
+    fn record_local_typedef_type(&mut self, name: &str, tn: &str) {
+        if let Some((_, t)) = self.local_type_stack.last_mut() {
+            t.insert(name.to_string(), tn.to_string());
+        }
+    }
+
+    /// Innermost-first overlay lookup for a frame-local's class type.
+    fn local_class_type_of(&self, name: &str) -> Option<String> {
+        self.local_type_stack
+            .iter()
+            .rev()
+            .find_map(|(c, _)| c.get(name).cloned())
+    }
+
+    /// Push a local frame, keeping the type overlay in lockstep.
+    fn push_local_frame(&mut self, f: HashMap<String, Value>) {
+        self.local_stack.push(f);
+        self.local_type_stack
+            .push((HashMap::default(), HashMap::default()));
+    }
+
+    /// Pop a local frame, keeping the type overlay in lockstep.
+    fn pop_local_frame(&mut self) -> Option<HashMap<String, Value>> {
+        self.local_type_stack.pop();
+        self.local_stack.pop()
+    }
+
     fn class_of_var(&self, vname: &str) -> Option<String> {
         // A class name IS its own class — `ClassName::static_prop` writes
         // and reads route here with vname = the class name. Without this,
@@ -66208,6 +66355,19 @@ impl Simulator {
         // write is silently lost.
         if self.module.classes.contains_key(vname) {
             return Some(vname.to_string());
+        }
+        // Frame-local overlay first (see local_type_stack): the innermost
+        // live frame's declaration wins over the shared global map.
+        if let Some(c) = self.local_class_type_of(vname) {
+            if self.module.classes.contains_key(&c) {
+                return Some(c);
+            }
+            if c.contains('#') {
+                let base = c.split('#').next().unwrap_or(&c);
+                if self.module.classes.contains_key(base) {
+                    return Some(c);
+                }
+            }
         }
         // Procedural locals record their class at VarDecl exec time.
         if let Some(c) = self.var_class_types.get(vname) {
@@ -69844,7 +70004,7 @@ impl Simulator {
         }
         let elem_su = self.queue_elem_struct(arr);
         let pushed_frame = if self.local_stack.is_empty() {
-            self.local_stack.push(HashMap::default());
+            self.push_local_frame(HashMap::default());
             true
         } else {
             false
@@ -69895,7 +70055,7 @@ impl Simulator {
             }
         }
         if pushed_frame {
-            self.local_stack.pop();
+            self.pop_local_frame();
         }
 
         match method {
@@ -69948,7 +70108,7 @@ impl Simulator {
         }
         let elem_su = self.queue_elem_struct(arr);
         let pushed_frame = if self.local_stack.is_empty() {
-            self.local_stack.push(HashMap::default());
+            self.push_local_frame(HashMap::default());
             true
         } else {
             false
@@ -69989,7 +70149,7 @@ impl Simulator {
             }
         }
         if pushed_frame {
-            self.local_stack.pop();
+            self.pop_local_frame();
         }
 
         let mut order: Vec<usize> = (0..size).collect();
@@ -70021,7 +70181,7 @@ impl Simulator {
         // with an empty local_stack, which previously silenced every
         // `item` insert and made the filter eval as 0.
         let pushed_frame = if self.local_stack.is_empty() {
-            self.local_stack.push(HashMap::default());
+            self.push_local_frame(HashMap::default());
             true
         } else {
             false
@@ -70076,7 +70236,7 @@ impl Simulator {
             }
         }
         if pushed_frame {
-            self.local_stack.pop();
+            self.pop_local_frame();
         }
         // Truncate to the expression's width for the accumulating reductions;
         // min/max/and/or/xor cannot exceed an operand and need no masking.
@@ -71853,22 +72013,56 @@ impl Simulator {
             // We must extract any expression clone before eval_expr to
             // avoid borrowing self.module and self simultaneously.
             let init_val: Option<Value> = {
-                let cd = self.module.classes.get(decl_class);
-                if let Some(cd) = cd {
-                    if let Some(sig) = cd.properties.get(prop) {
-                        Some(sig.value.clone())
-                    } else {
-                        // Look for class localparam constants (e.g.
-                        // `localparam string prefix = "+set_verbosity="`).
-                        let pd_expr = cd
-                            .param_defaults
+                let (sig_val, init_expr, pd_expr): (
+                    Option<Value>,
+                    Option<Expression>,
+                    Option<Expression>,
+                ) = match self.module.classes.get(decl_class) {
+                    Some(cd) => (
+                        cd.properties.get(prop).map(|sig| sig.value.clone()),
+                        cd.property_inits
+                            .iter()
+                            .find(|(p, _)| p.as_str() == prop)
+                            .map(|(_, e)| e.clone()),
+                        cd.param_defaults
                             .iter()
                             .find(|(name, _)| name == prop)
-                            .and_then(|(_, e)| e.clone());
-                        pd_expr.map(|init_expr| self.eval_expr(&init_expr))
+                            .and_then(|(_, e)| e.clone()),
+                    ),
+                    None => (None, None, None),
+                };
+                if sig_val.is_some() {
+                    // §8.25: a parameterized class's static initializer may
+                    // reference the class's VALUE parameters (`const static
+                    // string type_name = Tname;` — every uvm_object_registry).
+                    // The elaboration-time `sig.value` was computed with NO
+                    // active specialization, so for such classes it holds the
+                    // unresolved default (a blank string) — and every
+                    // registry then registered under the same blank name,
+                    // corrupting the factory's by-name table. Re-evaluate the
+                    // initializer HERE, where the key derivation has already
+                    // established the active spec context.
+                    if let Some(e) = init_expr {
+                        // Cycle-breaker: seed the cell with the elaborated
+                        // value BEFORE evaluating — an initializer chain that
+                        // reads back through this static (UVM's registries
+                        // reference each other during uvm_pkg init) would
+                        // otherwise recurse without a base case.
+                        self.class_statics
+                            .insert(key.clone(), sig_val.clone().unwrap());
+                        self.class_context_stack.push(Some(decl_class.to_string()));
+                        self.this_stack.push(None);
+                        let v = self.eval_expr(&e);
+                        self.this_stack.pop();
+                        self.class_context_stack.pop();
+                        Some(v)
+                    } else {
+                        sig_val
                     }
                 } else {
-                    None
+                    // Class localparam constants (e.g.
+                    // `localparam string prefix = "+set_verbosity="`).
+                    pd_expr.map(|init_expr| self.eval_expr(&init_expr))
                 }
             };
             let init = init_val.unwrap_or_else(|| Value::zero(32));
@@ -74386,6 +74580,29 @@ impl Simulator {
         r
     }
 
+    /// Does the RECEIVER of this member call resolve to a live object whose
+    /// class chain implements `mname` with a real body? Used to gate the
+    /// pure-SV factory/sequencer bridges below: they predate real UVM
+    /// execution and must not shadow an actual implementation.
+    fn receiver_implements_method(&mut self, recv: &Expression, mname: &str) -> bool {
+        let h = self
+            .eval_handle_expr(recv)
+            .or_else(|| self.eval_expr(recv).to_u64().map(|v| v as usize))
+            .unwrap_or(0);
+        if h == 0 {
+            return false;
+        }
+        let Some(cn) = self
+            .heap
+            .get(h)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())
+        else {
+            return false;
+        };
+        self.class_has_method(&cn, mname)
+    }
+
     fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
         // Normalize away Specialization wrappers for dispatch shape-matching
         // (the `#(...)` text is retained in the original AST + `current_spec`
@@ -74855,14 +75072,50 @@ impl Simulator {
             // `MemberAccess{ MemberAccess{ Ident(pkg), arr }, size }`. The
             // bare-array dispatch below only handles `Ident` receivers, so the
             // package qualifier would otherwise hide the array.
-            if Self::is_array_builtin_method(mname) {
-                if let ExprKind::MemberAccess {
-                    expr: base,
-                    member: arr_m,
-                } = &expr.kind
-                {
-                    if matches!(&base.kind, ExprKind::Ident(_)) {
-                        let arr = arr_m.name.clone();
+            if Self::is_array_builtin_method(mname)
+                || matches!(
+                    mname,
+                    "push_back"
+                        | "push_front"
+                        | "pop_back"
+                        | "pop_front"
+                        | "insert"
+                        | "delete"
+                        | "sort"
+                        | "rsort"
+                        | "reverse"
+                        | "shuffle"
+                        | "unique"
+                )
+            {
+                // Two parse shapes reach here for `pkg::arr.m(...)`:
+                // MemberAccess{Ident(pkg), arr} and (from class-method
+                // contexts) a flattened 2-segment Ident [pkg, arr]. Only the
+                // former was handled, and only for QUERY methods — so
+                // `uvm_pkg::uvm_deferred_init.push_back(rgtry)` (1800.2's
+                // whole factory registration) was a silent no-op from class
+                // static initializers. Guard the flattened form on the head
+                // NOT being a live object handle (an instance member reaches
+                // the class-property arms earlier anyway).
+                let pkg_arr: Option<String> = match &expr.kind {
+                    ExprKind::MemberAccess {
+                        expr: base,
+                        member: arr_m,
+                    } if matches!(&base.kind, ExprKind::Ident(_)) => Some(arr_m.name.clone()),
+                    ExprKind::Ident(h)
+                        if h.path.len() == 2
+                            && h.path.iter().all(|s| s.selects.is_empty())
+                            && self
+                                .eval_ident_handle(&h.path[0].name.name)
+                                .unwrap_or(0)
+                                == 0 =>
+                    {
+                        Some(h.path[1].name.name.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(arr) = pkg_arr {
+                    {
                         if self.module.arrays.contains_key(&arr)
                             || self.module.dynamic_arrays.contains(&arr)
                             || self.is_associative_array(&arr)
@@ -75534,7 +75787,8 @@ impl Simulator {
                 }
             }
 
-            if mname == "get_next_item" {
+
+            if mname == "get_next_item" && !self.receiver_implements_method(expr, "get_next_item") {
                 if let Some(arg) = args.first() {
                     // Create a simple_transaction
                     if let Some(class_def) = self.module.classes.get("simple_transaction").cloned()
@@ -75658,7 +75912,9 @@ impl Simulator {
             // typedef's registered name) and construct the real class — the
             // net effect of the real `wrapper.create_component`/`create_object`
             // (which runs `T::new`).
-            if mname == "create_component_by_name" || mname == "create_object_by_name" {
+            if (mname == "create_component_by_name" || mname == "create_object_by_name")
+                && !self.receiver_implements_method(expr, mname)
+            {
                 let type_name = args
                     .first()
                     .map(|a| self.eval_expr(a).to_sv_string())
@@ -77052,9 +77308,9 @@ impl Simulator {
             }
             PortList::Empty => {}
         }
-        self.local_stack.push(locals);
+        self.push_local_frame(locals);
         let out = self.eval_expr(&ld.expr);
-        self.local_stack.pop();
+        self.pop_local_frame();
         out
     }
 
@@ -78081,9 +78337,9 @@ impl Simulator {
                 // §13.5.3: a default may reference EARLIER formals (`int b =
                 // a + 1`). Push the partially-bound frame so they resolve —
                 // evaluated bare, `a` was unknown and the default was x.
-                self.local_stack.push(locals.clone());
+                self.push_local_frame(locals.clone());
                 let v = self.eval_expr(def);
-                self.local_stack.pop();
+                self.pop_local_frame();
                 v
             } else {
                 Value::zero(32)
@@ -78141,8 +78397,10 @@ impl Simulator {
                 if self.module.enum_members.contains_key(&type_name)
                     || self.module.typedefs.contains_key(&type_name)
                 {
+                    self.record_local_typedef_type(&port.name.name, &type_name);
                     self.var_typedef_types.insert(port.name.name.clone(), type_name);
                 } else if self.module.classes.contains_key(&type_name) {
+                    self.record_local_class_type(&port.name.name, &type_name);
                     self.var_class_types.insert(port.name.name.clone(), type_name);
                 }
             }
@@ -78241,8 +78499,10 @@ impl Simulator {
             if self.module.enum_members.contains_key(&type_name)
                 || self.module.typedefs.contains_key(&type_name)
             {
+                self.record_local_typedef_type(&ret_name, &type_name);
                 self.var_typedef_types.insert(ret_name.clone(), type_name);
             } else if self.module.classes.contains_key(&type_name) {
+                self.record_local_class_type(&ret_name, &type_name);
                 self.var_class_types.insert(ret_name.clone(), type_name);
             }
         }
@@ -78283,7 +78543,7 @@ impl Simulator {
             }
         }
         self.local_iface_aliases.push(iface_alias_frame);
-        self.local_stack.push(locals);
+        self.push_local_frame(locals);
         self.return_value = None;
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
@@ -78439,7 +78699,7 @@ impl Simulator {
                     .map(|v| (caller_lval.clone(), v))
             })
             .collect();
-        self.local_stack.pop();
+        self.pop_local_frame();
         for (pn, v, caller) in writebacks {
             // A vif binding recorded on the formal (out/inout) propagates to
             // the caller's actual — instance prop or another plain name.
@@ -78531,7 +78791,7 @@ impl Simulator {
         self.local_iface_aliases.pop();
         self.continue_flag = c.saved_continue;
         self.sync_static_locals();
-        let locals = self.local_stack.pop().unwrap_or_default();
+        let locals = self.pop_local_frame().unwrap_or_default();
         for (port_name, caller_expr) in &c.output_bindings {
             if let Some(val) = locals.get(port_name) {
                 self.assign_value(caller_expr, val);
@@ -78899,7 +79159,7 @@ impl Simulator {
                 }
             }
         }
-        self.local_stack.push(locals);
+        self.push_local_frame(locals);
         // §6.21: open a static-local sync frame keyed by this task name.
         self.static_local_syncs
             .push((td.name.name.name.clone(), Vec::new()));
@@ -81639,6 +81899,10 @@ impl Simulator {
                             ProcessContext {
                                 this_stack: vec![Some(handle)],
                                 local_stack: vec![locals],
+                                local_type_stack: vec![(
+                                    HashMap::default(),
+                                    HashMap::default(),
+                                )],
                                 class_context_stack: vec![Some(cname.clone())],
                                 cg_this: self.cg_this,
                                 return_value: None,
@@ -82333,9 +82597,9 @@ impl Simulator {
                     };
                     let mut frame: HashMap<String, Value> = HashMap::default();
                     frame.insert(idx_name, Value::from_u64(row.unwrap() as u64, 32));
-                    self.local_stack.push(frame);
+                    self.push_local_frame(frame);
                     let mut inner = self.size_cons_in_item(&body, prop, true);
-                    self.local_stack.pop();
+                    self.pop_local_frame();
                     out.append(&mut inner);
                 }
                 other => {
@@ -82718,12 +82982,12 @@ impl Simulator {
                             };
                             frame.insert(n.clone(), kv);
                         }
-                        self.local_stack.push(frame);
+                        self.push_local_frame(frame);
                         let ek = format!("{}[{}]", c.scoped, key);
                         if self.solve_one_elem(handle, &body, &ek, c.width, &c.prop, constraints) {
                             pinned.insert(ek);
                         }
-                        self.local_stack.pop();
+                        self.pop_local_frame();
                     }
                 }
                 CollKind::Dyn | CollKind::Fixed => {
@@ -82740,7 +83004,7 @@ impl Simulator {
                                 if let Some(Some(n)) = idx_names.get(1) {
                                     frame.insert(n.clone(), Value::from_u64(j as u64, 32));
                                 }
-                                self.local_stack.push(frame);
+                                self.push_local_frame(frame);
                                 let ek = format!("{}[{}]", row, j);
                                 if self.solve_one_elem(
                                     handle,
@@ -82752,7 +83016,7 @@ impl Simulator {
                                 ) {
                                     pinned.insert(ek);
                                 }
-                                self.local_stack.pop();
+                                self.pop_local_frame();
                             }
                             continue;
                         }
@@ -82760,7 +83024,7 @@ impl Simulator {
                         if let Some(Some(n)) = idx_names.first() {
                             frame.insert(n.clone(), Value::from_u64(i as u64, 32));
                         }
-                        self.local_stack.push(frame);
+                        self.push_local_frame(frame);
                         // A 1-var foreach over a 2-D array constrains the ROW
                         // (its `.size()`), already handled by the sizing pass.
                         if !c.nested {
@@ -82776,7 +83040,7 @@ impl Simulator {
                                 pinned.insert(ek);
                             }
                         }
-                        self.local_stack.pop();
+                        self.pop_local_frame();
                     }
                 }
             }
@@ -83098,7 +83362,7 @@ impl Simulator {
     /// spread of probe values — this covers `item`, `(item)`, `int'(item)` and
     /// `unsigned'(item)` without matching the (lowered) cast AST directly.
     fn filter_is_identity(&mut self, filter: &Expression) -> bool {
-        self.local_stack.push(HashMap::default());
+        self.push_local_frame(HashMap::default());
         let mut ok = true;
         for &p in &[0u64, 1, 7, 255, 1000] {
             if let Some(f) = self.local_stack.last_mut() {
@@ -83109,7 +83373,7 @@ impl Simulator {
                 break;
             }
         }
-        self.local_stack.pop();
+        self.pop_local_frame();
         ok
     }
 
@@ -83635,9 +83899,9 @@ impl Simulator {
                         };
                         frame.insert(n.clone(), kv);
                     }
-                    self.local_stack.push(frame);
+                    self.push_local_frame(frame);
                     let good = self.item_holds(handle, body);
-                    self.local_stack.pop();
+                    self.pop_local_frame();
                     if !good {
                         ok = false;
                         break;
@@ -83662,9 +83926,9 @@ impl Simulator {
                                 frame.insert(n.clone(), Value::from_u64(j as u64, 32));
                             }
                         }
-                        self.local_stack.push(frame);
+                        self.push_local_frame(frame);
                         let good = self.item_holds(handle, body);
-                        self.local_stack.pop();
+                        self.pop_local_frame();
                         if !good {
                             ok = false;
                             break 'outer;
@@ -85688,9 +85952,9 @@ impl Simulator {
                     if let Some(iv) = &idx_var {
                         frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
                     }
-                    self.local_stack.push(frame);
+                    self.push_local_frame(frame);
                     self.apply_bit_body(handle, &body, rand_set);
-                    self.local_stack.pop();
+                    self.pop_local_frame();
                 }
             }
             _ => {}
@@ -87079,7 +87343,7 @@ impl Simulator {
                         frame.insert(nm.clone(), Value::from_u64(idx[k] as u64, 32));
                         suffix.push_str(&format!("[{}]", idx[k]));
                     }
-                    self.local_stack.push(frame);
+                    self.push_local_frame(frame);
                     let mut elem_rand_set = rand_set.clone();
                     elem_rand_set.insert(format!("{}{}", arr_name, suffix));
                     if self.solve_forced_array_elem(
@@ -87091,7 +87355,7 @@ impl Simulator {
                     ) {
                         changed = true;
                     }
-                    self.local_stack.pop();
+                    self.pop_local_frame();
                     let mut k = used.len();
                     loop {
                         if k == 0 {
@@ -88447,8 +88711,10 @@ impl Simulator {
                         if self.module.enum_members.contains_key(&type_name)
                             || self.module.typedefs.contains_key(&type_name)
                         {
+                            self.record_local_typedef_type(&port.name.name, &type_name);
                             self.var_typedef_types.insert(port.name.name.clone(), type_name);
                         } else if self.module.classes.contains_key(&type_name) {
+                            self.record_local_class_type(&port.name.name, &type_name);
                             self.var_class_types.insert(port.name.name.clone(), type_name.clone());
                         }
                     }
@@ -88532,6 +88798,7 @@ impl Simulator {
                         {
                             let cn = name.name.name.clone();
                             if self.module.classes.contains_key(&cn) {
+                                self.record_local_class_type(&rn, &cn);
                                 self.var_class_types.insert(rn.clone(), cn);
                             }
                         }
@@ -88696,7 +88963,7 @@ impl Simulator {
                     }
                 }
                 self.this_stack.push(Some(handle));
-                self.local_stack.push(locals);
+                self.push_local_frame(locals);
                 // Record the `local_stack` depth BEFORE this method's own
                 // frame (i.e. the count of caller frames) so that
                 // `get_expr_type_name`'s `in_any_frame` check only considers
@@ -88853,7 +89120,7 @@ impl Simulator {
                             .map(|v| (caller_lval.clone(), v))
                     })
                     .collect();
-                self.local_stack.pop();
+                self.pop_local_frame();
                 self.this_stack.pop();
                 self.pop_and_restore_queue_frame();
                 for (param, caller) in &queue_writebacks {

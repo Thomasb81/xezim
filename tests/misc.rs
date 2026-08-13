@@ -143,6 +143,8 @@ mod svtb_suite;
 mod shadow_name_matrix;
 #[path = "misc/mailbox_method_blocking.rs"]
 mod mailbox_method_blocking;
+#[path = "misc/spec_static_and_pkg_queue.rs"]
+mod spec_static_and_pkg_queue;
 #[path = "misc/new_ctor_vs_shallow_copy.rs"]
 mod new_ctor_vs_shallow_copy;
 #[path = "misc/assoc_dotted_key.rs"]
