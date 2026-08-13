@@ -139,6 +139,8 @@ mod value_trace;
 mod comb_regvar_loop_fallback;
 #[path = "misc/svtb_suite.rs"]
 mod svtb_suite;
+#[path = "misc/shadow_name_matrix.rs"]
+mod shadow_name_matrix;
 #[path = "misc/new_ctor_vs_shallow_copy.rs"]
 mod new_ctor_vs_shallow_copy;
 #[path = "misc/assoc_dotted_key.rs"]
