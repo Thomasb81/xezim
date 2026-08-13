@@ -266,3 +266,5 @@ mod macro_directive_prefix_names;
 mod queue_ref_formal_shadowing;
 #[path = "misc/ref_struct_queue_and_local_shadow.rs"]
 mod ref_struct_queue_and_local_shadow;
+#[path = "misc/nested_struct_string_member_display.rs"]
+mod nested_struct_string_member_display;
