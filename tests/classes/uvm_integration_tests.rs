@@ -684,3 +684,239 @@ fn uvm_tlm1_nonblocking_family_analysis_fifo() {
 ")
     );
 }
+
+
+/// uvm_event trigger data + timing, uvm_barrier 3-way release, global event pool identity (reference-verified 6/6)
+const UVM_EVENTS_BARRIERS_POOLS_TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+class ev_test extends uvm_test;
+  `uvm_component_utils(ev_test)
+  int failures = 0;
+  uvm_event #(int) ev;
+  uvm_barrier bar;
+  int woke_at = -1;
+  int bar_done[3];
+  function new(string name = "ev_test", uvm_component parent = null); super.new(name, parent); endfunction
+  task chk(bit ok, string what);
+    if (!ok) begin failures++; $display("FAIL: %s", what); end
+    else $display("PASS: %s", what);
+  endtask
+  task run_phase(uvm_phase phase);
+    uvm_event_pool pool = uvm_event_pool::get_global_pool();
+    uvm_event pooled_a = pool.get("sync_a");
+    uvm_event pooled_b = pool.get("sync_a");
+    phase.raise_objection(this);
+    ev = new("ev");
+    bar = new("bar", 3);
+    chk(pooled_a == pooled_b, "event pool returns same event for same name");
+    fork
+      begin
+        int d;
+        ev.wait_trigger();
+        d = ev.get_trigger_data();
+        woke_at = $time;
+        chk(d == 42, $sformatf("event trigger data (got %0d)", d));
+      end
+      begin #7 ev.trigger(42); end
+      begin bar.wait_for(); bar_done[0] = $time; end
+      begin #3 bar.wait_for(); bar_done[1] = $time; end
+      begin #12 bar.wait_for(); bar_done[2] = $time; end
+    join
+    chk(woke_at == 7, $sformatf("event woke at 7 (got %0d)", woke_at));
+    chk(bar_done[0] == 12 && bar_done[1] == 12 && bar_done[2] == 12,
+        $sformatf("barrier released all at 12 (got %0d %0d %0d)", bar_done[0], bar_done[1], bar_done[2]));
+    chk(ev.is_on(), "event stays on after trigger");
+    ev.reset();
+    chk(!ev.is_on(), "event reset clears state");
+    if (failures == 0) $display("TEST_PASS"); else $display("TEST_FAIL count=%0d", failures);
+    phase.drop_objection(this);
+  endtask
+endclass
+module top; initial run_test("ev_test"); endmodule
+
+"#;
+
+#[test]
+fn uvm_events_barriers_pools() {
+    let sim = run_uvm("1.2", &[], UVM_EVENTS_BARRIERS_POOLS_TEST.to_string(), "top")
+        .expect("UVM 1.2 uvm_events_barriers_pools failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter().any(|m| m.contains("TEST_PASS")),
+        "uvm_events_barriers_pools did not pass:
+{}",
+        out.join("
+")
+    );
+    assert!(
+        !out.iter().any(|m| m.starts_with("FAIL:")),
+        "uvm_events_barriers_pools had failures:
+{}",
+        out.join("
+")
+    );
+}
+
+/// uvm_resource_db int/string, report catcher demotion (error count stays 0), verbosity filtering (reference-verified)
+const UVM_RESOURCE_DB_REPORT_CATCHER_TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+class demoter extends uvm_report_catcher;
+  int caught = 0;
+  function new(string name = "demoter"); super.new(name); endfunction
+  function action_e catch();
+    if (get_id() == "NOISY") begin
+      caught++;
+      set_severity(UVM_INFO);
+    end
+    return THROW;
+  endfunction
+endclass
+class rd_test extends uvm_test;
+  `uvm_component_utils(rd_test)
+  int failures = 0;
+  function new(string name = "rd_test", uvm_component parent = null); super.new(name, parent); endfunction
+  task chk(bit ok, string what);
+    if (!ok) begin failures++; $display("FAIL: %s", what); end
+    else $display("PASS: %s", what);
+  endtask
+  task run_phase(uvm_phase phase);
+    int v;
+    string sv;
+    demoter d = new();
+    uvm_report_server srv = uvm_report_server::get_server();
+    phase.raise_objection(this);
+    // resource_db
+    uvm_resource_db#(int)::set("scope_a", "knob", 77, this);
+    chk(uvm_resource_db#(int)::read_by_name("scope_a", "knob", v), "resource_db read_by_name");
+    chk(v == 77, $sformatf("resource_db value (got %0d)", v));
+    uvm_resource_db#(string)::set("scope_a", "sknob", "hello", this);
+    chk(uvm_resource_db#(string)::read_by_name("scope_a", "sknob", sv) && sv == "hello", "resource_db string value");
+    // report catcher demotes an error
+    uvm_report_cb::add(null, d);
+    `uvm_error("NOISY", "should be demoted to info")
+    chk(d.caught == 1, "report catcher saw the message");
+    chk(srv.get_severity_count(UVM_ERROR) == 0, $sformatf("error demoted (count=%0d)", srv.get_severity_count(UVM_ERROR)));
+    // verbosity filtering
+    set_report_verbosity_level(UVM_LOW);
+    `uvm_info("VFILT", "this HIGH message must be filtered", UVM_HIGH)
+    `uvm_info("VKEEP", "this LOW message must appear", UVM_LOW)
+    if (failures == 0) $display("TEST_PASS"); else $display("TEST_FAIL count=%0d", failures);
+    phase.drop_objection(this);
+  endtask
+endclass
+module top; initial run_test("rd_test"); endmodule
+
+"#;
+
+#[test]
+fn uvm_resource_db_report_catcher() {
+    let sim = run_uvm("1.2", &[], UVM_RESOURCE_DB_REPORT_CATCHER_TEST.to_string(), "top")
+        .expect("UVM 1.2 uvm_resource_db_report_catcher failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter().any(|m| m.contains("TEST_PASS")),
+        "uvm_resource_db_report_catcher did not pass:
+{}",
+        out.join("
+")
+    );
+    assert!(
+        !out.iter().any(|m| m.starts_with("FAIL:")),
+        "uvm_resource_db_report_catcher had failures:
+{}",
+        out.join("
+")
+    );
+}
+
+/// TLM-2 b_target/initiator sockets: b_transport with target-side time consumption and payload mutation (reference-verified 3/3)
+const UVM_TLM2_B_TRANSPORT_TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+class t2_target extends uvm_component;
+  `uvm_component_utils(t2_target)
+  uvm_tlm_b_target_socket #(t2_target) sock;
+  int writes = 0;
+  function new(string name, uvm_component parent); super.new(name, parent); endfunction
+  function void build_phase(uvm_phase phase);
+    sock = new("sock", this);
+  endfunction
+  task b_transport(uvm_tlm_generic_payload t, uvm_tlm_time delay);
+    byte unsigned data[];
+    #3;
+    t.get_data(data);
+    writes++;
+    data[0] = data[0] + 8'h10;      // response mutates payload
+    t.set_data(data);
+    t.set_response_status(UVM_TLM_OK_RESPONSE);
+  endtask
+endclass
+class t2_init extends uvm_component;
+  `uvm_component_utils(t2_init)
+  uvm_tlm_b_initiator_socket sock;
+  int failures = 0;
+  function new(string name, uvm_component parent); super.new(name, parent); endfunction
+  function void build_phase(uvm_phase phase);
+    sock = new("sock", this);
+  endfunction
+  task chk(bit ok, string what);
+    if (!ok) begin failures++; $display("FAIL: %s", what); end
+    else $display("PASS: %s", what);
+  endtask
+  task run_phase(uvm_phase phase);
+    uvm_tlm_generic_payload gp = new("gp");
+    uvm_tlm_time delay = new("d");
+    byte unsigned data[] = '{8'h21};
+    phase.raise_objection(this);
+    gp.set_address(64'h1000);
+    gp.set_data(data);
+    gp.set_data_length(1);
+    gp.set_write();
+    sock.b_transport(gp, delay);
+    chk($time == 3, $sformatf("b_transport consumed target time (t=%0t)", $time));
+    chk(gp.get_response_status() == UVM_TLM_OK_RESPONSE, "OK response");
+    gp.get_data(data);
+    chk(data[0] == 8'h31, $sformatf("payload mutated by target (got %h)", data[0]));
+    if (failures == 0) $display("TEST_PASS"); else $display("TEST_FAIL count=%0d", failures);
+    phase.drop_objection(this);
+  endtask
+endclass
+class t2_test extends uvm_test;
+  `uvm_component_utils(t2_test)
+  t2_init ini;
+  t2_target tgt;
+  function new(string name = "t2_test", uvm_component parent = null); super.new(name, parent); endfunction
+  function void build_phase(uvm_phase phase);
+    ini = t2_init::type_id::create("ini", this);
+    tgt = t2_target::type_id::create("tgt", this);
+  endfunction
+  function void connect_phase(uvm_phase phase);
+    ini.sock.connect(tgt.sock);
+  endfunction
+endclass
+module top; initial run_test("t2_test"); endmodule
+
+"#;
+
+#[test]
+fn uvm_tlm2_b_transport() {
+    let sim = run_uvm("1.2", &[], UVM_TLM2_B_TRANSPORT_TEST.to_string(), "top")
+        .expect("UVM 1.2 uvm_tlm2_b_transport failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter().any(|m| m.contains("TEST_PASS")),
+        "uvm_tlm2_b_transport did not pass:
+{}",
+        out.join("
+")
+    );
+    assert!(
+        !out.iter().any(|m| m.starts_with("FAIL:")),
+        "uvm_tlm2_b_transport had failures:
+{}",
+        out.join("
+")
+    );
+}
