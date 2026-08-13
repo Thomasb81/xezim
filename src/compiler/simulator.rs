@@ -515,6 +515,23 @@ macro_rules! write_sig {
                         .push((__wsig_id, __xt, __wsig_val.clone(), __xp, None));
                 }
             }
+            // XEZIM_VALUE_TRACE: queue a changed watched write (old value is
+            // still in the table here). Disjoint field accesses only — this
+            // macro expands under live &mut borrows of other fields.
+            if let Some(__vt_ids) = &$self.value_trace_ids {
+                if __vt_ids.contains(&__wsig_id)
+                    && $self.signal_table[__wsig_id] != __wsig_val
+                {
+                    $self.value_trace_pending.borrow_mut().push((
+                        __wsig_id,
+                        $self.time,
+                        $self.signal_table[__wsig_id].clone(),
+                        __wsig_val.clone(),
+                        $self.current_pid,
+                        $self.edge_dispatch_phase,
+                    ));
+                }
+            }
             $self.signal_table[__wsig_id] = __wsig_val;
             // Incremental VCD: mark this write dirty (no-op when the dump is off
             // or the full scan is forced). Superset-safe — the flush re-checks
@@ -4235,6 +4252,18 @@ pub struct Simulator {
     edge_fire_watch_init: bool,
     /// Label of the dispatch window the current check_edges belongs to.
     edge_dispatch_phase: &'static str,
+    /// XEZIM_VALUE_TRACE=<substr>[,<substr>...] — print every committed
+    /// change of any signal whose hierarchical name contains a pattern:
+    /// time, name, old→new value, dispatch phase, and the WRITING process's
+    /// origin (file:line). The tool for "where does the data stop flowing
+    /// and who wrote it" on a design we cannot see. The write macro runs
+    /// under disjoint-field borrow constraints, so hits are queued in a
+    /// RefCell (same shape as warn_x_pending) and formatted at the drain.
+    /// None = disabled, Some(ids) = resolved watch set.
+    value_trace_ids: Option<std::collections::HashSet<usize>>,
+    value_trace_pending: std::cell::RefCell<Vec<(usize, u64, Value, Value, usize, &'static str)>>,
+    value_trace_emitted: u64,
+    value_trace_limit: u64,
     armed_input_bitmap: Vec<bool>,
     armed_input_ranges: Vec<(u32, u32)>,
     armed_input_blocks: Vec<u32>,
@@ -6778,6 +6807,13 @@ impl Simulator {
             edge_fire_watch: Vec::new(),
             edge_fire_watch_init: false,
             edge_dispatch_phase: "active",
+            value_trace_ids: None,
+            value_trace_pending: std::cell::RefCell::new(Vec::new()),
+            value_trace_emitted: 0,
+            value_trace_limit: std::env::var("XEZIM_VALUE_TRACE_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20_000),
             armed_input_bitmap: Vec::new(),
             armed_input_ranges: Vec::new(),
             armed_input_blocks: Vec::new(),
@@ -11348,6 +11384,7 @@ impl Simulator {
         self.auto_partition_by_clock();
         self.auto_partition_by_scope();
         mark_compile_phase("schedule initial blocks", &mut compile_phase_start);
+        self.init_value_trace();
         self.compiled = true;
     }
 
@@ -14365,6 +14402,7 @@ impl Simulator {
         }
         // Flush any `--warn-x` reports captured during the final region.
         self.drain_warn_x();
+        self.drain_value_trace();
         self.vcd_finish();
         self.xtrace_finish();
         self.fst_finish();
@@ -24561,6 +24599,7 @@ impl Simulator {
         // borrow and can only record, not print.
         if self.warn_x {
             self.drain_warn_x();
+        self.drain_value_trace();
         }
 
         self.loop_iters += 1;
@@ -29969,6 +30008,16 @@ impl Simulator {
     }
 
     fn apply_nba(&mut self) {
+        // Value-trace attribution: NBA commits run outside the scheduling
+        // process, so current_pid is stale here -- stamp the phase so the
+        // drain prints "nba" instead of a misleading process origin.
+        let __vt_prev_phase = self.edge_dispatch_phase;
+        self.edge_dispatch_phase = "nba";
+        self.apply_nba_inner();
+        self.edge_dispatch_phase = __vt_prev_phase;
+    }
+
+    fn apply_nba_inner(&mut self) {
 
         // §4.9.4: commit matured future-time NBAs first — they were scheduled
         // in an earlier slot, so they precede this slot's freshly queued NBAs.
@@ -32167,7 +32216,20 @@ impl Simulator {
                 }
                 if !self.edge_fire_watch_init {
                     self.edge_fire_watch_init = true;
-                    if let Ok(w) = std::env::var("XEZIM_EDGE_FIRE_WATCH") {
+                    // A bare `EDGE_FIRE_WATCH` (missing prefix) was silently
+                    // ignored — both prior customer traces ran with watch=[]
+                    // because of exactly this. Accept the alias and always
+                    // report the resolved configuration.
+                    let w_env = std::env::var("XEZIM_EDGE_FIRE_WATCH")
+                        .or_else(|_| std::env::var("EDGE_FIRE_WATCH"));
+                    if w_env.is_err() {
+                        eprintln!(
+                            "[EDGE-FIRE] trace active but XEZIM_EDGE_FIRE_WATCH is not set — \
+                             per-fire values will not be printed; set \
+                             XEZIM_EDGE_FIRE_WATCH=<sig1,sig2,...>"
+                        );
+                    }
+                    if let Ok(w) = w_env {
                         for patt in w.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                             let hit = self
                                 .signal_name_to_id
@@ -32183,6 +32245,11 @@ impl Simulator {
                                 ),
                             }
                         }
+                        eprintln!(
+                            "[EDGE-FIRE] watching {} signal(s): {:?}",
+                            self.edge_fire_watch.len(),
+                            self.edge_fire_watch.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+                        );
                     }
                 }
                 let matched = self.edge_fire_match.as_ref().unwrap();
@@ -56130,7 +56197,113 @@ impl Simulator {
             .unwrap_or_default()
     }
 
+    /// Drain queued value-trace hits (see `value_trace_pending`).
+    pub fn drain_value_trace(&mut self) {
+        if self.value_trace_ids.is_none() {
+            return;
+        }
+        let pending: Vec<(usize, u64, Value, Value, usize, &'static str)> =
+            std::mem::take(&mut *self.value_trace_pending.borrow_mut());
+        for (id, t, old, new, pid, phase) in pending {
+            if self.value_trace_emitted > self.value_trace_limit {
+                return;
+            }
+            if self.value_trace_emitted == self.value_trace_limit {
+                self.value_trace_emitted += 1;
+                eprintln!(
+                    "[value-trace] output limit reached ({} lines) — raise XEZIM_VALUE_TRACE_LIMIT",
+                    self.value_trace_limit
+                );
+                return;
+            }
+            self.value_trace_emitted += 1;
+            let name = self.name_for_id(id).to_string();
+            let render = |v: &Value| {
+                let s = if v.width <= 8 { v.to_bin() } else { format!("'h{}", v.to_hex()) };
+                if s.len() > 80 { format!("{}…", &s[..80]) } else { s }
+            };
+            let who = if phase == "nba" {
+                "nba commit".to_string()
+            } else {
+                self.process_origin
+                .get(&pid)
+                .map(|(sp, kind)| {
+                    let loc = self
+                        .span_file_line_in(*sp, None)
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("{} at {}", kind, loc)
+                })
+                .unwrap_or_else(|| "settle/elab".to_string())
+            };
+            // In-place mutation paths (bit/part-select, inline-bits fast
+            // paths) can't capture the pre-write value; they queue old==new
+            // and get the arrowless form.
+            if old == new {
+                eprintln!(
+                    "[value-trace] t={} {} = {} ({}; {})",
+                    t, name, render(&new), phase, who
+                );
+            } else {
+                eprintln!(
+                    "[value-trace] t={} {} {} -> {} ({}; {})",
+                    t, name, render(&old), render(&new), phase, who
+                );
+            }
+        }
+    }
+
+    /// Resolve XEZIM_VALUE_TRACE patterns to signal ids (post-construction,
+    /// when the name table exists). Prints the resolved watch set so a
+    /// misspelled pattern is visible immediately instead of silently
+    /// matching nothing.
+    fn init_value_trace(&mut self) {
+        let Ok(pats) = std::env::var("XEZIM_VALUE_TRACE") else { return };
+        let pats: Vec<&str> = pats.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if pats.is_empty() {
+            return;
+        }
+        let mut ids = std::collections::HashSet::new();
+        for pat in &pats {
+            let mut hits = 0;
+            for (n, &id) in self.signal_name_to_id.iter() {
+                if n.contains(pat) {
+                    ids.insert(id);
+                    hits += 1;
+                }
+            }
+            if hits == 0 {
+                eprintln!("[value-trace] pattern '{}' matched no signal", pat);
+            } else {
+                eprintln!("[value-trace] pattern '{}' matched {} signal(s)", pat, hits);
+            }
+        }
+        if ids.len() > 256 {
+            eprintln!(
+                "[value-trace] {} signals watched — narrow the patterns if the output drowns",
+                ids.len()
+            );
+        }
+        self.value_trace_ids = Some(ids);
+    }
+
     fn after_signal_write(&mut self, id: usize) {
+        // XEZIM_VALUE_TRACE: this hook covers the write paths that mutate
+        // signal_table in place (bit/part-select, inline-bits, parallel-NBA
+        // raw pointers) and so never expand write_sig!. The pre-write value
+        // is gone here; queue old==new for the arrowless print form.
+        if let Some(vt_ids) = &self.value_trace_ids {
+            if vt_ids.contains(&id) && id < self.signal_table.len() {
+                let v = self.signal_table[id].clone();
+                self.value_trace_pending.borrow_mut().push((
+                    id,
+                    self.time,
+                    v.clone(),
+                    v,
+                    self.current_pid,
+                    self.edge_dispatch_phase,
+                ));
+            }
+        }
         self.note_armed_write(id);
         self.note_edge_write(id);
         // Incremental VCD: this is the post-write hook for the direct
