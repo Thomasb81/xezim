@@ -45025,10 +45025,14 @@ impl Simulator {
                                     );
                                 }
                             }
-                            // Module-level queue/dynamic/fixed array.
-                            if self.module.arrays.contains_key(&name)
-                                || self.module.dynamic_arrays.contains(&name)
-                                || self.signals.contains_key(&format!("{}.size", name))
+                            // Module-level queue/dynamic/fixed array —
+                            // unless the name is a class-typed receiver in
+                            // the CURRENT scope (§8.10): then the user
+                            // method must dispatch, not a same-named global.
+                            if !self.bare_receiver_is_class_handle(&name)
+                                && (self.module.arrays.contains_key(&name)
+                                    || self.module.dynamic_arrays.contains(&name)
+                                    || self.signals.contains_key(&format!("{}.size", name)))
                             {
                                 return Value::from_u64(self.get_queue_size(&name), 32);
                             }
@@ -46132,7 +46136,66 @@ impl Simulator {
                             } else {
                                 None
                             };
+                            // §8.10: when the collection is a MEMBER of the
+                            // enclosing class, its declared element type wins
+                            // over any global bare-name lookup.
+                            // `declared_collection_elem_class` matches
+                            // `var_decl_types` by bare/leaf name across the
+                            // whole design, so `pool[key] = new(key)` inside
+                            // uvm_pool::get picked up an unrelated `pool`
+                            // declared elsewhere and constructed THAT class —
+                            // UVM's hdl-path pool handed back a uvm_pool where
+                            // a uvm_queue belonged, and every backdoor path
+                            // read empty.
+                            let member_elem_cls: Option<String> = {
+                                let mut found = None;
+                                let mut cur =
+                                    self.class_context_stack.last().cloned().flatten();
+                                let mut seen: HashSet<String> = HashSet::default();
+                                while let Some(cn) = cur {
+                                    if !seen.insert(cn.clone()) {
+                                        break;
+                                    }
+                                    match self.module.classes.get(&cn) {
+                                        Some(cd) => {
+                                            if let Some(tn) = cd
+                                                .properties
+                                                .get(&bname)
+                                                .and_then(|s| s.type_name.clone())
+                                            {
+                                                found = Some(tn);
+                                                break;
+                                            }
+                                            cur = cd.extends.clone();
+                                        }
+                                        None => break,
+                                    }
+                                }
+                                found
+                            };
+                            if std::env::var("XZ_EC_DBG").is_ok() && bname == "pool" {
+                                eprintln!("[ECDBG] bname={} recv={:?} aec={:?} vct={:?} member={:?} decl={:?} ctx={:?}",
+                                    bname, recv_elem_cls,
+                                    self.module.array_elem_class.get(&bname).cloned(),
+                                    self.var_class_types.get(&bname).cloned(),
+                                    member_elem_cls,
+                                    self.declared_collection_elem_class(&bname),
+                                    self.class_context_stack.last().cloned().flatten());
+                            }
+                            // §8.10 precedence: a true frame-LOCAL shadows a
+                            // class member, which in turn shadows any
+                            // global-by-bare-name map. `var_class_types` and
+                            // `declared_collection_elem_class` are both keyed
+                            // by bare name across the whole design, so
+                            // `pool[key] = new(key)` inside uvm_pool::get
+                            // picked up an unrelated `pool` declared elsewhere
+                            // and constructed THAT class — UVM's hdl-path pool
+                            // handed back a uvm_pool where a uvm_queue
+                            // belonged, and every backdoor path read empty.
+                            let local_elem_cls = self.local_class_type_of(&bname);
                             let elem_cls = recv_elem_cls
+                                .or_else(|| local_elem_cls)
+                                .or_else(|| member_elem_cls)
                                 .or_else(|| self.module.array_elem_class.get(&bname).cloned())
                                 .or_else(|| self.var_class_types.get(&bname).cloned())
                                 .or_else(|| self.declared_collection_elem_class(&bname))
@@ -46268,6 +46331,9 @@ impl Simulator {
                                     }
                                     None => None,
                                 };
+                            if std::env::var("XZ_EC_DBG").is_ok() && bname == "pool" {
+                                eprintln!("[ECDBG] final elem_cls={:?}", elem_cls);
+                            }
                             if let Some((cn, spec)) = elem_cls {
                                 let ctor_args: &[Expression] = match &rvalue.kind {
                                     ExprKind::Call { args, .. } => args,
@@ -70368,6 +70434,36 @@ impl Simulator {
         )
     }
 
+    /// §8.10: is this BARE name, in the CURRENT scope, a class-typed
+    /// receiver holding a live object? Such a receiver dispatches its USER
+    /// methods — never a collection builtin — even when an outer call
+    /// frame or the module scope registered a same-named queue (UVM's
+    /// `paths`/`queue` locals made `paths.size()` on a fresh uvm_queue
+    /// handle report another subroutine's element count).
+    fn bare_receiver_is_class_handle(&self, name: &str) -> bool {
+        let statically_class_typed = self.local_class_type_of(name).is_some()
+            || self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .is_some_and(|h| {
+                    self.class_prop_type_name(h, name).is_some_and(|tn| {
+                        self.module.classes.contains_key(&tn)
+                            || tn
+                                .split('#')
+                                .next()
+                                .is_some_and(|b| self.module.classes.contains_key(b))
+                    })
+                })
+            || (self.dyn_name_lookup(name).is_none()
+                && self.var_class_types.contains_key(name));
+        statically_class_typed
+            && self
+                .eval_ident_handle(name)
+                .is_some_and(|h| h != 0 && self.heap.get(h).and_then(|o| o.as_ref()).is_some())
+    }
+
     /// Resolve a locator receiver's STORAGE name (§7.12.1). The parse-level
     /// name is not the storage key for two common shapes: a subroutine-local
     /// queue lives under its per-process rename, and a class-member
@@ -70900,7 +70996,16 @@ impl Simulator {
         let cname = match &arg.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 let mut n = self.resolve_hier_name(h);
-                if let Some(s) = self.instance_assoc_member(&n) {
+                // A subroutine-LOCAL queue actual lives under its
+                // per-process rename (`@paths#7`). Resolving it to the bare
+                // name made the formal look IDENTITY-bound to its own bare
+                // storage, so the writeback was skipped and the callee's
+                // results never reached the caller's local (UVM's
+                // `get_full_hdl_path(paths)` returned an empty path list —
+                // every backdoor access read 0).
+                if let Some(r) = self.dyn_name_lookup(&n) {
+                    n = r.to_string();
+                } else if let Some(s) = self.instance_assoc_member(&n) {
                     n = s;
                 }
                 n
@@ -70959,6 +71064,22 @@ impl Simulator {
                     .unwrap_or_else(|| Value::zero(w))
             })
             .collect();
+        // §13.5.2: a queue FORMAL lives under its BARE name, so a nested
+        // call whose formal has the SAME name overwrites this frame's
+        // storage — and the outer frame then keeps appending to whatever the
+        // inner call left behind. Snapshot the caller-frame content the same
+        // way a declared local does; `pop_and_restore_queue_frame` puts it
+        // back on return. (UVM's `uvm_reg::get_full_hdl_path(ref paths[$])`
+        // calls `uvm_reg_block::get_full_hdl_path(ref paths[$])` — the inner
+        // string entry survived into the outer concat queue, so every
+        // backdoor read saw a bogus leading path and failed.)
+        // An IDENTITY binding (the actual IS the formal's bare storage —
+        // `f(paths)` into `ref paths[$]`) shares one storage by design:
+        // snapshotting it would restore the caller's pre-call content over
+        // the callee's writes on return.
+        if pname != cname {
+            self.snapshot_queue_local(pname);
+        }
         self.module.arrays.insert(pname.to_string(), (0, -1, w));
         self.module.dynamic_arrays.insert(pname.to_string());
         for (j, v) in vals.into_iter().enumerate() {
@@ -70976,6 +71097,79 @@ impl Simulator {
             frame.insert(pname.to_string(), pname.to_string());
         }
         Some(cname)
+    }
+
+    /// §13.5.2: stage a queue FORMAL's contents under a fresh temporary
+    /// name so the caller's shadowed storage can be restored BEFORE the
+    /// ref/output writeback is applied.
+    ///
+    /// Both orders are wrong without this: writing back first lets the
+    /// callee-frame restore of a same-named LOCAL overwrite the result
+    /// (UVM's nested `get_full_hdl_path`, whose callee declares its own
+    /// `parent_paths`), while restoring first discards the callee's formal
+    /// before it can be read. Capture, restore, then apply.
+    fn stage_queue_param(&mut self, param: &str) -> String {
+        let id = self.next_dyn_id;
+        self.next_dyn_id += 1;
+        let tmp = format!("@wb#{}", id);
+        let sz_key = format!("{}.size", param);
+        let pre = format!("{}[", param);
+        let moved: Vec<(String, Value)> = self
+            .signals
+            .iter()
+            .filter(|(k, _)| **k == sz_key || k.starts_with(&pre))
+            .map(|(k, v)| {
+                let nk = if **k == sz_key {
+                    format!("{}.size", tmp)
+                } else {
+                    format!("{}{}", tmp, &k[param.len()..])
+                };
+                (nk, v.clone())
+            })
+            .collect();
+        for (k, v) in moved {
+            self.signals.insert(k, v);
+        }
+        // The size may live in the compact table rather than `signals`.
+        let sz = self.get_queue_size(param);
+        if let Some(e) = self.module.arrays.get(param).copied() {
+            self.module.arrays.insert(tmp.clone(), e);
+        }
+        if self.module.dynamic_arrays.contains(param) {
+            self.module.dynamic_arrays.insert(tmp.clone());
+        }
+        if let Some(dt) = self.module.var_decl_types.get(param).cloned() {
+            self.module.var_decl_types.insert(tmp.clone(), dt);
+        }
+        for j in 0..sz {
+            let (d, s2) = (format!("{}[{}]", tmp, j), format!("{}[{}]", param, j));
+            if self.signals.contains_key(&d) {
+                continue;
+            }
+            if let Some(v) = self.get_signal_value_by_name(&s2) {
+                self.signals.insert(d, v);
+            }
+        }
+        self.set_queue_size(&tmp, sz);
+        tmp
+    }
+
+    /// Drop a staged queue temp created by `stage_queue_param`.
+    fn drop_staged_queue(&mut self, tmp: &str) {
+        let sz_key = format!("{}.size", tmp);
+        let pre = format!("{}[", tmp);
+        let keys: Vec<String> = self
+            .signals
+            .keys()
+            .filter(|k| **k == sz_key || k.starts_with(&pre))
+            .cloned()
+            .collect();
+        for k in keys {
+            self.signals.remove(&k);
+        }
+        self.module.arrays.remove(tmp);
+        self.module.dynamic_arrays.remove(tmp);
+        self.module.var_decl_types.remove(tmp);
     }
 
     /// Copy a queue param's contents back to the caller's queue on return
@@ -71131,14 +71325,22 @@ impl Simulator {
         let obj_name = if !obj_name.contains('#')
             && !obj_name.contains('.')
             && !obj_name.contains('[')
-            && self.dyn_name_lookup(obj_name).is_none()
         {
-            match self.instance_assoc_member(obj_name) {
-                Some(s) => {
-                    _inst_scoped = s;
-                    _inst_scoped.as_str()
+            // §8.10 precedence for a BARE receiver — see
+            // `bare_receiver_is_class_handle`.
+            if self.bare_receiver_is_class_handle(obj_name) {
+                return None;
+            }
+            if self.dyn_name_lookup(obj_name).is_none() {
+                match self.instance_assoc_member(obj_name) {
+                    Some(scoped) => {
+                        _inst_scoped = scoped;
+                        _inst_scoped.as_str()
+                    }
+                    None => obj_name,
                 }
-                None => obj_name,
+            } else {
+                obj_name
             }
         } else {
             obj_name
@@ -79200,8 +79402,16 @@ impl Simulator {
             }
             self.purge_assoc_param(&param);
         }
+        // Capture the callee's queue formals now; the caller's shadowed
+        // storage is restored below, and only then is the writeback
+        // applied — see `stage_queue_param`.
+        let mut staged_wb: Vec<(String, String)> = Vec::new();
         for (param, caller) in &queue_writebacks {
-            self.writeback_queue_param(param, caller);
+            if caller.is_empty() || param == caller {
+                continue;
+            }
+            let tmp = self.stage_queue_param(param);
+            staged_wb.push((tmp, caller.clone()));
         }
         self.writeback_array_args(&array_writebacks);
         for (param, caller, ..) in &array_writebacks {
@@ -79283,6 +79493,10 @@ impl Simulator {
         self.continue_flag = saved_continue;
         self.return_flag = saved_return;
         self.pop_and_restore_queue_frame();
+        for (tmp, caller) in staged_wb {
+            self.writeback_queue_param(&tmp, &caller);
+            self.drop_staged_queue(&tmp);
+        }
         result
     }
 
@@ -79345,8 +79559,13 @@ impl Simulator {
                 self.assign_value(caller_expr, val);
             }
         }
+        let mut staged_wb: Vec<(String, String)> = Vec::new();
         for (param, caller) in &c.queue_writebacks.clone() {
-            self.writeback_queue_param(param, caller);
+            if caller.is_empty() || param == caller {
+                continue;
+            }
+            let tmp = self.stage_queue_param(param);
+            staged_wb.push((tmp, caller.clone()));
         }
         let wb = c.array_writebacks.clone();
         self.writeback_array_args(&wb);
@@ -79399,6 +79618,10 @@ impl Simulator {
         self.break_flag = c.saved_break;
         self.return_flag = c.saved_return;
         self.pop_and_restore_queue_frame();
+        for (tmp, caller) in staged_wb {
+            self.writeback_queue_param(&tmp, &caller);
+            self.drop_staged_queue(&tmp);
+        }
     }
 
     /// Register the structural metadata a task/function FORMAL needs so that
@@ -89670,9 +89893,20 @@ impl Simulator {
                     .collect();
                 self.pop_local_frame();
                 self.this_stack.pop();
-                self.pop_and_restore_queue_frame();
+                // Capture the callee's formals, restore the caller's
+                // shadowed storage, then apply — see `stage_queue_param`.
+                let mut staged_wb: Vec<(String, String)> = Vec::new();
                 for (param, caller) in &queue_writebacks {
-                    self.writeback_queue_param(param, caller);
+                    if caller.is_empty() || param == caller {
+                        continue;
+                    }
+                    let tmp = self.stage_queue_param(param);
+                    staged_wb.push((tmp, caller.clone()));
+                }
+                self.pop_and_restore_queue_frame();
+                for (tmp, caller) in staged_wb {
+                    self.writeback_queue_param(&tmp, &caller);
+                    self.drop_staged_queue(&tmp);
                 }
                 // §13.5.2: copy `output`/`inout`/`ref` fixed-array formals
                 // back onto the caller's array (a plain `input` formal is
