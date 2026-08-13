@@ -27699,9 +27699,23 @@ impl Simulator {
                             .copied()
                             .flatten()
                             .map(|hh| (hh, h.path[0].name.name.clone(), false)),
-                        ExprKind::Ident(h) if h.path.len() == 2 => self
-                            .eval_ident_handle(&h.path[0].name.name)
-                            .map(|hh| (hh, h.path[1].name.name.clone(), true)),
+                        // `a.m(args)` and deeper chains `a.b.m(args)` both
+                        // parse as a flattened multi-segment Ident; the
+                        // receiver is the path minus the trailing method
+                        // segment. Only the 2-segment form was recognised, so
+                        // a blocking method reached through a nested handle
+                        // (`w.fifo.peek_it(x)` — the uvm_tlm_fifo shape) fell
+                        // through to the SYNCHRONOUS executor, where a
+                        // blocking mailbox peek cannot suspend and returned
+                        // garbage immediately.
+                        ExprKind::Ident(h) if h.path.len() >= 2 => {
+                            let mut head = h.clone();
+                            let last = head.path.pop().unwrap();
+                            let recv =
+                                Expression::new(ExprKind::Ident(head), expr.span);
+                            self.eval_handle_expr(&recv)
+                                .map(|hh| (hh, last.name.name, true))
+                        }
                         ExprKind::MemberAccess { expr: recv, member } => self
                             .eval_handle_expr(recv)
                             .map(|hh| (hh, member.name.clone(), true)),
@@ -27918,6 +27932,10 @@ impl Simulator {
                                             cont,
                                             is_peek: method == "peek",
                                         });
+                                    if std::env::var("XEZIM_MBX_DBG").is_ok() {
+                                        eprintln!("[MBX] t={} pid={} PARKED {} handle={}",
+                                            self.time, pid, method, handle);
+                                    }
                                     return;
                                 }
                             }
@@ -59153,6 +59171,43 @@ impl Simulator {
         }
     }
 
+    /// §15.4: after any put, deliver queued items to parked get/peek
+    /// waiters until one side runs dry. A peek delivery leaves the item in
+    /// the box (so a subsequent parked GET can consume the same item — the
+    /// sequencer's get_next_item peek followed by item_done's try_get); a
+    /// get delivery consumes it.
+    fn drain_mailbox_get_waiters(&mut self, handle: usize) {
+        loop {
+            let front = match self.mailboxes.get(&handle).and_then(|q| q.front().cloned()) {
+                Some(v) => v,
+                None => break,
+            };
+            let waiter = self
+                .mailbox_get_waiters
+                .get_mut(&handle)
+                .and_then(|q| q.pop_front());
+            let Some(w) = waiter else { break };
+            let MailboxGetWaiter {
+                pid,
+                lvalue,
+                cont,
+                is_peek,
+            } = w;
+            if !is_peek {
+                self.mailboxes.get_mut(&handle).unwrap().pop_front();
+                // A consumed slot may admit a parked bounded-put producer.
+                self.admit_mailbox_put_waiter(handle);
+            }
+            if std::env::var("XEZIM_MBX_DBG").is_ok() {
+                eprintln!(
+                    "[MBX] t={} DRAIN deliver to pid={} is_peek={} handle={}",
+                    self.time, pid, is_peek, handle
+                );
+            }
+            self.deliver_to_mailbox_waiter(pid, &lvalue, front, cont);
+        }
+    }
+
     fn deliver_to_mailbox_waiter(
         &mut self,
         pid: usize,
@@ -81405,29 +81460,14 @@ impl Simulator {
                         // mailbox, hand the value directly to the waiter
                         // (skipping the queue) and reschedule its
                         // continuation at the current time.
-                        let waiter = self
-                            .mailbox_get_waiters
-                            .get_mut(&handle)
-                            .and_then(|q| q.pop_front());
-                        if let Some(w) = waiter {
-                            let MailboxGetWaiter {
-                                pid,
-                                lvalue,
-                                cont,
-                                is_peek,
-                            } = w;
-                            if is_peek {
-                                // peek doesn't consume — leave the item for the
-                                // subsequent get/try_get (sequencer item_done).
-                                self.mailboxes
-                                    .get_mut(&handle)
-                                    .unwrap()
-                                    .push_back(v.clone());
-                            }
-                            self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont);
-                        } else {
-                            self.mailboxes.get_mut(&handle).unwrap().push_back(v);
-                        }
+                        // Push, then drain: a single-waiter handoff left a
+                        // peek-woken item in the box while a GET waiter on the
+                        // same mailbox stayed parked forever (peek+get pair on
+                        // one FIFO — the sequencer get_next_item/item_done
+                        // shape). The drain keeps delivering while items and
+                        // waiters remain.
+                        self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                        self.drain_mailbox_get_waiters(handle);
                     }
                     return Value::zero(32);
                 }
@@ -81437,6 +81477,25 @@ impl Simulator {
                     } else {
                         self.mailboxes.get(&handle).and_then(|q| q.front().cloned())
                     };
+                    if val.is_none() {
+                        // A blocking get/peek reached the SYNCHRONOUS
+                        // dispatcher with the box empty: this context cannot
+                        // suspend, so the call returns without a value —
+                        // silently wrong. The suspend-aware inliner should
+                        // have caught the call chain; warn loudly (once) so
+                        // the gap is visible instead of reading as data
+                        // corruption.
+                        static WARNED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!(
+                                "[xezim][warning] blocking mailbox {}() on an EMPTY mailbox reached a synchronous \
+                                 context that cannot suspend (t={}); the call returns without a value. \
+                                 This usually means a blocking call chain was not inlined — please report.",
+                                method_name, self.time
+                            );
+                        }
+                    }
                     if let (Some(v), Some(arg)) = (val, args.first()) {
                         let w = self.infer_lhs_width(arg);
                         self.assign_value(arg, &v.resize(w));
@@ -81460,27 +81519,9 @@ impl Simulator {
                             }
                         }
                         let v = self.eval_expr(arg);
-                        let waiter = self
-                            .mailbox_get_waiters
-                            .get_mut(&handle)
-                            .and_then(|q| q.pop_front());
-                        if let Some(w) = waiter {
-                            let MailboxGetWaiter {
-                                pid,
-                                lvalue,
-                                cont,
-                                is_peek,
-                            } = w;
-                            if is_peek {
-                                self.mailboxes
-                                    .get_mut(&handle)
-                                    .unwrap()
-                                    .push_back(v.clone());
-                            }
-                            self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont);
-                        } else {
-                            self.mailboxes.get_mut(&handle).unwrap().push_back(v);
-                        }
+                        // Push-then-drain — see the blocking `put` arm.
+                        self.mailboxes.get_mut(&handle).unwrap().push_back(v);
+                        self.drain_mailbox_get_waiters(handle);
                     }
                     return Value::from_u64(1, 32);
                 }
