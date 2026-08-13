@@ -10974,8 +10974,13 @@ impl Simulator {
         self.jit_compile_comb_entries();
         mark_compile_phase("build combinational entries", &mut compile_phase_start);
         if let Ok(w) = std::env::var("XEZIM_DUMP_ENTRY") {
-            let want: usize = w.parse().unwrap_or(0);
-            for probe in [want, want + 1] {
+            let probes: Vec<usize> = if w == "all" {
+                (0..self.comb_entries.len()).collect()
+            } else {
+                let want: usize = w.parse().unwrap_or(0);
+                vec![want, want + 1]
+            };
+            for probe in probes {
                 if let Some(e) = self.comb_entries.get(probe) {
                     let rn: Vec<&str> = e.cold.read_signal_ids.iter().filter_map(|&i| self.id_to_name.get(i).map(|s| s.as_ref())).collect();
                     let wn: Vec<&str> = e.cold.write_signal_ids.iter().filter_map(|&i| self.id_to_name.get(i).map(|s| s.as_ref())).collect();
@@ -19163,6 +19168,26 @@ impl Simulator {
             // settle iteration.
             let mut rids: Vec<usize> = Vec::with_capacity(reads.len());
             let mut unresolved_count = 0usize;
+            // Secondary scope for read resolution, derived from the entry's
+            // already-resolved WRITE names. An inlined member-fanout assign
+            // (`assign out[k] = port.f;`) can end up with scope_hint=None
+            // (absolute LHS / failed inference) while its bare RHS base name
+            // ALSO exists at TB level (port named like its connected signal):
+            // the dep then landed only on the TB signal, the runtime read the
+            // instance-scoped port copy, and the entry never re-fired when
+            // that copy updated — the member fanout froze on the pre-update
+            // value. Probing the write-side scope registers the scoped id
+            // too (superset, dedup'd).
+            let write_scope: Option<String> = if scope_hint.is_none() {
+                wids.iter()
+                    .filter_map(|&id| {
+                        let n = self.name_for_id(id);
+                        n.rfind('.').map(|p| n[..p].to_string())
+                    })
+                    .next()
+            } else {
+                None
+            };
             // Top-module name (e.g. "tb") used to detect and strip
             // top-prefixed cross-hierarchical references. Some E902 modules
             // emit `tb.x_soc.biu_pad_hwdata`-style names through xezim's
@@ -19203,13 +19228,15 @@ impl Simulator {
                     // scoped id too; a superset sensitivity only costs an extra
                     // evaluation, while missing one loses the value entirely.
                     if !entry_is_bytecode && !r.contains('.') {
-                        if let Some(scope) = &scope_hint {
-                            if let Some(&sid) = self
-                                .signal_name_to_id
-                                .get(format!("{}.{}", scope, r).as_str())
-                            {
-                                if sid != id {
-                                    rids.push(sid);
+                        for sc in [scope_hint.as_ref(), write_scope.as_ref()] {
+                            if let Some(scope) = sc {
+                                if let Some(&sid) = self
+                                    .signal_name_to_id
+                                    .get(format!("{}.{}", scope, r).as_str())
+                                {
+                                    if sid != id && !rids.contains(&sid) {
+                                        rids.push(sid);
+                                    }
                                 }
                             }
                         }
@@ -19239,6 +19266,38 @@ impl Simulator {
                     if let Some(id) = self.resolve_read_name(r, &top_prefix) {
                         rids.push(id);
                         found = true;
+                        // resolve_read_name may have matched via BASE-prefix
+                        // stripping ("port.f" -> TB-level "port"). The AST
+                        // runtime resolves scope-first, so when the entry's
+                        // scope (or its WRITE-side scope, for inlined entries
+                        // whose scope_hint inference failed) holds a
+                        // same-named port copy, register that id too — else
+                        // the entry fires on the TB signal, reads the stale
+                        // scoped copy, and never re-fires when the copy
+                        // updates (member-fanout assigns froze on the
+                        // pre-update port value).
+                        let mut cands: Vec<&str> = vec![r.as_str()];
+                        {
+                            let mut b: &str = r.as_str();
+                            while let Some(p) = b.rfind('.') {
+                                b = &b[..p];
+                                cands.push(b);
+                            }
+                        }
+                        for sc in [scope_hint.as_ref(), write_scope.as_ref()] {
+                            if let Some(scope) = sc {
+                                for c in &cands {
+                                    let q = format!("{}.{}", scope, c);
+                                    if let Some(&sid) =
+                                        self.signal_name_to_id.get(q.as_str())
+                                    {
+                                        if !rids.contains(&sid) {
+                                            rids.push(sid);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // A MEMBER read ("p.lo") has no signal of its own — it is a
@@ -19250,17 +19309,33 @@ impl Simulator {
                     let mut base: &str = r.as_str();
                     while let Some(pos) = base.rfind('.') {
                         base = &base[..pos];
-                        if let Some(scope) = &scope_hint {
-                            let q = format!("{}.{}", scope, base);
-                            if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
-                                rids.push(id);
-                                found = true;
-                                break;
+                        // Register BOTH the instance-scoped and the bare/top
+                        // resolution of the base — same superset rule as the
+                        // whole-read path above. When a TB signal and the
+                        // instance port SHARE a name, scoped-or-bare picked
+                        // one id; the entry then fired only on that one and
+                        // read the OTHER (stale) copy — a member-fanout
+                        // assign latched the pre-update port value and never
+                        // re-fired when the port copy arrived. `write_scope`
+                        // covers the scope_hint=None inlined case.
+                        for sc in [scope_hint.as_ref(), write_scope.as_ref()] {
+                            if let Some(scope) = sc {
+                                let q = format!("{}.{}", scope, base);
+                                if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
+                                    if !rids.contains(&id) {
+                                        rids.push(id);
+                                    }
+                                    found = true;
+                                }
                             }
                         }
                         if let Some(id) = self.resolve_read_name(base, &top_prefix) {
-                            rids.push(id);
+                            if !rids.contains(&id) {
+                                rids.push(id);
+                            }
                             found = true;
+                        }
+                        if found {
                             break;
                         }
                     }
@@ -19268,6 +19343,13 @@ impl Simulator {
                 if !found {
                     unresolved_count += 1;
                 }
+            }
+            if std::env::var("XEZIM_DUMP_CA_READS").is_ok() {
+                let rn: Vec<&str> = rids.iter().map(|&i| self.name_for_id(i)).collect();
+                eprintln!(
+                    "[CA-READS] scope_hint={:?} reads={:?} rids={:?} lhs_abs={}",
+                    scope_hint, reads, rn, lhs_is_absolute
+                );
             }
             let has_unresolved_reads = unresolved_count > 0;
             if has_unresolved_reads && std::env::var("XEZIM_DUMP_UNRESOLVED").is_ok() {
