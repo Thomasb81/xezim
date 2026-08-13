@@ -252,3 +252,9 @@ mod symbol_clash_checks;
 mod audit_round45_finds;
 #[path = "misc/indexed_event_roundtrip.rs"]
 mod indexed_event_roundtrip;
+#[path = "misc/while_continue_final_iter.rs"]
+mod while_continue_final_iter;
+#[path = "misc/class_queue_locators.rs"]
+mod class_queue_locators;
+#[path = "misc/struct_local_declinit_copy.rs"]
+mod struct_local_declinit_copy;

@@ -1066,3 +1066,64 @@ fn uvm_field_automation_clone_pack() {
 ")
     );
 }
+/// UVM 1.2 sequencer/driver handshake: a sequence's start_item must BLOCK
+/// until the driver's get_next_item grants arbitration, and all items must
+/// reach the driver. Pinned against the reference flow after three fixes:
+/// the `while`-final-iteration `continue` flag leak (killed
+/// m_choose_next_request's return), and the class-member-queue locator
+/// resolution (grant_queued_locks' find_first_index returned empty, so a
+/// REQ entry was treated as a leading lock — arbitration was granted with
+/// no driver and the queue drained, starving get_next_item forever).
+#[test]
+fn uvm_1_2_sequencer_driver_handshake() {
+    let test_src = std::fs::read_to_string("tests/uvm/uvm_sequencer_handshake.sv")
+        .expect("Could not read uvm_sequencer_handshake.sv");
+    let sim = run_uvm("1.2", &[], test_src, "top")
+        .expect("UVM 1.2 sequencer handshake failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        !out.iter().any(|l| (l.contains("UVM_ERROR") && !l.contains("UVM_ERROR :"))
+            || (l.contains("UVM_FATAL") && !l.contains("UVM_FATAL :"))),
+        "UVM errors:\n{}",
+        out.join("\n")
+    );
+    let got = out.iter().filter(|l| l.contains("DRV: got item")).count();
+    assert_eq!(got, 3, "driver must receive all 3 items:\n{}", out.join("\n"));
+    assert!(out.iter().any(|l| l.contains("TEST_PASS")), "TEST_PASS:\n{}", out.join("\n"));
+}
+
+/// UVM 1.2 register-model FRONTDOOR path end-to-end: read of reset value,
+/// write + auto-predict mirror, read-back, field read-modify-write, and
+/// set/update — with REAL data (the checks below pin exact values because
+/// the TB's own `==` checks pass vacuously on x). Data integrity depends on
+/// the unpacked-struct decl-init member copy (`op_s x = accesses[i]` in the
+/// reg map's bus access loop) and on 2-state typedef locals defaulting to 0
+/// (`uvm_reg_data_t value_adjust` in the field RMW).
+#[test]
+fn uvm_1_2_ral_frontdoor_read_write() {
+    let test_src = std::fs::read_to_string("tests/uvm/uvm_ral_frontdoor.sv")
+        .expect("Could not read uvm_ral_frontdoor.sv");
+    let sim = run_uvm("1.2", &[], test_src, "top")
+        .expect("UVM 1.2 RAL frontdoor failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        !out.iter().any(|l| (l.contains("UVM_ERROR") && !l.contains("UVM_ERROR :"))
+            || (l.contains("UVM_FATAL") && !l.contains("UVM_FATAL :"))),
+        "UVM errors:\n{}",
+        out.join("\n")
+    );
+    assert!(!out.iter().any(|l| l.starts_with("FAIL:")), "TB FAILs:\n{}", out.join("\n"));
+    for pin in [
+        "read reset value (got 00000000000000c0)",
+        "read-back (got 00000000a5a55a5a)",
+        "MODE field write (got 0000000000003ac0)",
+        "set+update (got 0000000012345678)",
+        "TEST_PASS",
+    ] {
+        assert!(
+            out.iter().any(|l| l.contains(pin)),
+            "missing `{pin}`:\n{}",
+            out.join("\n")
+        );
+    }
+}
