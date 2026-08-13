@@ -82,13 +82,30 @@ endmodule
 "#;
 
 fn run_uvm(version: &str, extra_incdirs: &[String], test_src: String, top: &str) -> Result<compiler::Simulator, String> {
+    run_uvm_opt(version, extra_incdirs, test_src, top, true)
+}
+
+/// `no_dpi = false` compiles UVM with its DPI imports live, so xezim's
+/// native implementations of the UVM DPI-C helpers (uvm_hdl_*) serve them —
+/// which is what a register model's BACKDOOR access needs.
+fn run_uvm_opt(
+    version: &str,
+    extra_incdirs: &[String],
+    test_src: String,
+    top: &str,
+    no_dpi: bool,
+) -> Result<compiler::Simulator, String> {
     let root = uvm_dir().join(version);
     let src_dir = root.join("src");
     let uvm_pkg = std::fs::read_to_string(src_dir.join("uvm_pkg.sv"))
         .unwrap_or_else(|e| panic!("read {}/src/uvm_pkg.sv: {}", version, e));
     let mut include_dirs = vec![src_dir.to_str().unwrap().to_string()];
     include_dirs.extend_from_slice(extra_incdirs);
-    let defines = vec![("UVM_NO_DPI".to_string(), None)];
+    let defines = if no_dpi {
+        vec![("UVM_NO_DPI".to_string(), None)]
+    } else {
+        Vec::new()
+    };
     simulate_multi(
         &[uvm_pkg, test_src],
         2000,
@@ -1125,5 +1142,37 @@ fn uvm_1_2_ral_frontdoor_read_write() {
             "missing `{pin}`:\n{}",
             out.join("\n")
         );
+    }
+}
+
+/// UVM 1.2 register-model BACKDOOR access end-to-end: `get_full_hdl_path`
+/// composes `top.dut.<reg>` from the block's root path and the register's
+/// configure-supplied slice, and the peek/poke reach the RTL signals
+/// directly (no bus traffic, so it completes in one delta at t=20).
+///
+/// Exercises the nested `ref` queue formals in `get_full_hdl_path` (both
+/// overloads take `ref ... paths[$]`, and the callee declares its own
+/// `parent_paths`), plus the class-member pool whose element type is a
+/// nested specialization.
+#[test]
+fn uvm_1_2_ral_backdoor_peek_poke() {
+    let test_src = std::fs::read_to_string("tests/uvm/uvm_ral_backdoor.sv")
+        .expect("Could not read uvm_ral_backdoor.sv");
+    let sim = run_uvm_opt("1.2", &[], test_src, "top", false)
+        .expect("UVM 1.2 RAL backdoor failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        !out.iter().any(|l| (l.contains("UVM_ERROR") && !l.contains("UVM_ERROR :"))
+            || (l.contains("UVM_FATAL") && !l.contains("UVM_FATAL :"))),
+        "UVM errors:\n{}",
+        out.join("\n")
+    );
+    assert!(!out.iter().any(|l| l.starts_with("FAIL:")), "TB FAILs:\n{}", out.join("\n"));
+    for pin in [
+        "backdoor read reset (got 00000000000000c0)",
+        "backdoor read-back (got 00000000facecafe)",
+        "TEST_PASS",
+    ] {
+        assert!(out.iter().any(|l| l.contains(pin)), "missing `{pin}`:\n{}", out.join("\n"));
     }
 }

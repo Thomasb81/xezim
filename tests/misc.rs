@@ -262,3 +262,5 @@ mod struct_local_declinit_copy;
 mod class_collection_storage;
 #[path = "misc/macro_directive_prefix_names.rs"]
 mod macro_directive_prefix_names;
+#[path = "misc/queue_ref_formal_shadowing.rs"]
+mod queue_ref_formal_shadowing;
