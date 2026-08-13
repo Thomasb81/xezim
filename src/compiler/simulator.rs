@@ -573,7 +573,9 @@ macro_rules! write_sig {
             // made WHILE an edge block executes must re-run edge detection
             // for that signal (drain_edge_exec_rescan) — record its position.
             // One bool load when not inside an edge block.
-            if $self.in_edge_block && (__wsig_id as usize) < $self.sig_to_edge_pos.len() {
+            if ($self.in_edge_block || $self.in_edge_cont)
+                && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+            {
                 let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
                 if __ep >= 0 && !$self.edge_exec_seen[__ep as usize] {
                     $self.edge_exec_seen[__ep as usize] = true;
@@ -3462,6 +3464,14 @@ pub struct Simulator {
     randomize_subset: Option<HashSet<String>>,
     settling: bool,
     in_edge_block: bool,
+    /// True while waiter CONTINUATIONS resumed inline in the active region
+    /// (blocks-first mode) execute. Their writes happen AFTER this pass's
+    /// edge detection, so — exactly like writes made inside an edge block —
+    /// they must be recorded into `edge_exec_wrote` for the §9.2 rescan
+    /// drain, or the change is silently swallowed when the next snapshot
+    /// refreshes `prev` (an AnyEdge comb block sensitive to a TB-driven
+    /// signal then never fires again: the write-data-stops-flowing bug).
+    in_edge_cont: bool,
     /// Nesting depth of `check_edges_inner`. A `#delay` inside an edge block's
     /// body re-enters the edge machinery through the synchronous
     /// `TimingControl::Delay` arm; now that a nested pass sees the real block
@@ -6581,6 +6591,7 @@ impl Simulator {
             shadowed_prop_names: HashSet::default(),
             settling: false,
             in_edge_block: false,
+            in_edge_cont: false,
             edge_pass_depth: 0,
             bitsel_edge_sens: HashMap::default(),
             bitsel_sid_bits: Vec::new(),
@@ -15084,6 +15095,21 @@ impl Simulator {
                         self.bitsel_sid_bits.resize(w + 1, 0);
                     }
                     self.bitsel_sid_bits[w] |= 1u64 << b;
+                }
+                if std::env::var("XEZIM_DUMP_EDGE_SENS").is_ok() {
+                    let terms: Vec<String> = resolved
+                        .iter()
+                        .map(|si| {
+                            format!("{}{}", si.edge.print_str(), self.name_for_id(si.signal_id))
+                        })
+                        .collect();
+                    eprintln!(
+                        "[EDGE-SENS] block#{} kind={:?} scope='{}' sens=[{}]",
+                        block_idx,
+                        ab.kind,
+                        ab.scope,
+                        terms.join(", ")
+                    );
                 }
                 Arc::make_mut(&mut self.edge_blocks).push(EdgeSensitiveBlock {
                     resolved_sensitivities: resolved,
@@ -33041,6 +33067,12 @@ impl Simulator {
         // schedule-into-event_queue path (waiter runs in the NEXT event_loop
         // iter after apply_nba, reading post-NBA values).
         let active_region = std::env::var("XEZIM_ACTIVE_REGION").ok().as_deref() != Some("0");
+        // Record continuation writes for the §9.2 rescan drain (see
+        // `in_edge_cont`): these run AFTER this pass's edge detection, so
+        // without recording, an AnyEdge block sensitive to a signal a
+        // continuation writes never re-fires (change swallowed by the next
+        // prev refresh). Restored by the same flag write in both exits.
+        self.in_edge_cont = true;
         for (pid, stmts) in triggered_conts {
             if self.finished {
                 break;
@@ -33094,6 +33126,7 @@ impl Simulator {
                 }
             }
         }
+        self.in_edge_cont = false;
         if !waiters_first && active_region && self.finished {
             // A `$finish` from a continuation resumed AFTER this edge's
             // blocks stops the run once the slot completes: its SVA ticks
@@ -55823,7 +55856,7 @@ impl Simulator {
     #[inline(always)]
     fn note_edge_write(&mut self, id: usize) {
         // §9.2 re-trigger recording (always on) — see the write_sig! twin.
-        if self.in_edge_block {
+        if self.in_edge_block || self.in_edge_cont {
             if let Some(&p) = self.sig_to_edge_pos.get(id) {
                 if p >= 0 {
                     let p = p as usize;
