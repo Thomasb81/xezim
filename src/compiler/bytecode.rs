@@ -3308,6 +3308,16 @@ impl<'a> BytecodeCompiler<'a> {
                             return Some(dest);
                         }
                         let idx_reg = self.compile_expr(index, 0)?;
+                        // §7.4.1: normalize a DYNAMIC index against the
+                        // declared outer range, exactly like the constant
+                        // branch above and the write path. Without this,
+                        // `src[i]` on a `[N:1]` outer dimension read slice
+                        // i+1 — and the top element read out of range,
+                        // injecting X into whatever it fed (a lane-expander's
+                        // per-lane status flops all went X on the first
+                        // multi-lane advance).
+                        let idx_reg =
+                            self.emit_packed_slot_index(self.packed_outer_dim(hier), idx_reg);
                         let elem_w_reg = self.alloc_reg();
                         self.emit(Insn::LoadConst(
                             elem_w_reg,
