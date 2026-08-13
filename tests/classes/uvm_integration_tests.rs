@@ -392,3 +392,295 @@ endmodule
     );
     assert_eq!(sim.time, 100, "phase cycle must still end at t=100");
 }
+
+
+/// TLM-1 blocking path audit (reference-verified 7/7): blocking put through
+/// an imp with REAL back-pressure (producer completes at t=6, gated by the
+/// consumer's #2 per item), analysis broadcast to two subscribers, and a
+/// bounded uvm_tlm_fifo with blocking-put back-pressure, peek, in-order
+/// delivery, and drain. All of this rode on the round-72 mailbox fixes
+/// (nested-receiver inlining + multi-waiter drain).
+const TLM1_TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+class item_c extends uvm_object;
+  int val;
+  `uvm_object_utils(item_c)
+  function new(string name = "item_c"); super.new(name); endfunction
+endclass
+
+// ---- consumer implements blocking put ----
+class consumer_c extends uvm_component;
+  `uvm_component_utils(consumer_c)
+  uvm_blocking_put_imp #(item_c, consumer_c) put_export;
+  int got[$];
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    put_export = new("put_export", this);
+  endfunction
+  task put(item_c t);
+    #2;               // consume takes time — producer must block with us
+    got.push_back(t.val);
+  endtask
+endclass
+
+class producer_c extends uvm_component;
+  `uvm_component_utils(producer_c)
+  uvm_blocking_put_port #(item_c) put_port;
+  int done_at = -1;
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    put_port = new("put_port", this);
+  endfunction
+  task run_phase(uvm_phase phase);
+    item_c t;
+    phase.raise_objection(this);
+    for (int k = 0; k < 3; k++) begin
+      t = item_c::type_id::create($sformatf("t%0d", k));
+      t.val = 100 + k;
+      put_port.put(t);
+    end
+    done_at = $time;
+    phase.drop_objection(this);
+  endtask
+endclass
+
+// ---- analysis broadcast to two subscribers ----
+class sub_c extends uvm_subscriber #(item_c);
+  `uvm_component_utils(sub_c)
+  int seen[$];
+  function new(string name, uvm_component parent); super.new(name, parent); endfunction
+  function void write(item_c t);
+    seen.push_back(t.val);
+  endfunction
+endclass
+
+// ---- fifo-coupled producer/consumer ----
+class fifo_prod_c extends uvm_component;
+  `uvm_component_utils(fifo_prod_c)
+  uvm_blocking_put_port #(item_c) out;
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    out = new("out", this);
+  endfunction
+  task run_phase(uvm_phase phase);
+    item_c t;
+    phase.raise_objection(this);
+    for (int k = 0; k < 4; k++) begin
+      #1;
+      t = item_c::type_id::create($sformatf("f%0d", k));
+      t.val = 200 + k;
+      out.put(t);       // fifo depth 2: 3rd put must block until a get
+    end
+    phase.drop_objection(this);
+  endtask
+endclass
+
+class fifo_cons_c extends uvm_component;
+  `uvm_component_utils(fifo_cons_c)
+  uvm_blocking_get_peek_port #(item_c) inp;
+  int got[$];
+  int peeked = -1;
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    inp = new("inp", this);
+  endfunction
+  task run_phase(uvm_phase phase);
+    item_c t;
+    phase.raise_objection(this);
+    #10;
+    inp.peek(t); peeked = t.val;          // peek leaves item
+    for (int k = 0; k < 4; k++) begin
+      inp.get(t);
+      got.push_back(t.val);
+    end
+    phase.drop_objection(this);
+  endtask
+endclass
+
+class tlm_test extends uvm_test;
+  `uvm_component_utils(tlm_test)
+  producer_c prod;
+  consumer_c cons;
+  uvm_analysis_port #(item_c) ap;
+  sub_c sub1, sub2;
+  fifo_prod_c fprod;
+  fifo_cons_c fcons;
+  uvm_tlm_fifo #(item_c) fifo;
+  int failures = 0;
+  function new(string name = "tlm_test", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+  function void build_phase(uvm_phase phase);
+    prod = producer_c::type_id::create("prod", this);
+    cons = consumer_c::type_id::create("cons", this);
+    ap = new("ap", this);
+    sub1 = sub_c::type_id::create("sub1", this);
+    sub2 = sub_c::type_id::create("sub2", this);
+    fprod = fifo_prod_c::type_id::create("fprod", this);
+    fcons = fifo_cons_c::type_id::create("fcons", this);
+    fifo = new("fifo", this, 2);
+  endfunction
+  function void connect_phase(uvm_phase phase);
+    prod.put_port.connect(cons.put_export);
+    ap.connect(sub1.analysis_export);
+    ap.connect(sub2.analysis_export);
+    fprod.out.connect(fifo.blocking_put_export);
+    fcons.inp.connect(fifo.blocking_get_peek_export);
+  endfunction
+  task chk(bit ok, string what);
+    if (!ok) begin failures++; $display("FAIL: %s", what); end
+    else $display("PASS: %s", what);
+  endtask
+  task run_phase(uvm_phase phase);
+    item_c t;
+    phase.raise_objection(this);
+    // analysis broadcast (functions, immediate)
+    t = item_c::type_id::create("a0"); t.val = 7;  ap.write(t);
+    t = item_c::type_id::create("a1"); t.val = 9;  ap.write(t);
+    #40;
+    chk(cons.got.size() == 3 && cons.got[0] == 100 && cons.got[2] == 102,
+        $sformatf("blocking put through imp (got %0d items)", cons.got.size()));
+    chk(prod.done_at == 6, $sformatf("producer blocked with consumer (done at %0d, want 6)", prod.done_at));
+    chk(sub1.seen.size() == 2 && sub1.seen[0] == 7 && sub1.seen[1] == 9, "analysis sub1 saw both writes");
+    chk(sub2.seen.size() == 2 && sub2.seen[1] == 9, "analysis sub2 saw both writes");
+    chk(fcons.peeked == 200, $sformatf("fifo peek saw first item (got %0d)", fcons.peeked));
+    chk(fcons.got.size() == 4 && fcons.got[0] == 200 && fcons.got[3] == 203,
+        $sformatf("fifo delivered all 4 in order (got %0d)", fcons.got.size()));
+    chk(fifo.used() == 0, $sformatf("fifo drained (used=%0d)", fifo.used()));
+    if (failures == 0) $display("TEST_PASS");
+    else $display("TEST_FAIL count=%0d", failures);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module top;
+  initial run_test("tlm_test");
+endmodule
+
+"#;
+
+#[test]
+fn uvm_tlm1_blocking_ports_fifo_analysis() {
+    let sim = run_uvm("1.2", &[], TLM1_TEST.to_string(), "top")
+        .expect("UVM 1.2 TLM1 test failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter().any(|m| m.contains("TEST_PASS")),
+        "TLM1 blocking audit did not pass:
+{}",
+        out.join("
+")
+    );
+    assert!(
+        !out.iter().any(|m| m.starts_with("FAIL:")),
+        "TLM1 blocking audit had failures:
+{}",
+        out.join("
+")
+    );
+}
+
+/// TLM-1 nonblocking family audit (reference-verified 18/18): try_put/
+/// try_get/try_peek/can_put/can_get on a bounded fifo (incl. try_put on
+/// FULL), used()/is_full/is_empty, the analysis fifo's unbounded write
+/// side with blocking gets, and flush().
+const TLM2_TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+class item_c extends uvm_object;
+  int val;
+  `uvm_object_utils(item_c)
+  function new(string name = "item_c"); super.new(name); endfunction
+endclass
+
+class nb_test extends uvm_test;
+  `uvm_component_utils(nb_test)
+  uvm_tlm_fifo #(item_c) fifo;
+  uvm_tlm_analysis_fifo #(item_c) afifo;
+  uvm_analysis_port #(item_c) ap;
+  int failures = 0;
+  function new(string name = "nb_test", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+  function void build_phase(uvm_phase phase);
+    fifo  = new("fifo", this, 2);
+    afifo = new("afifo", this);
+    ap    = new("ap", this);
+  endfunction
+  function void connect_phase(uvm_phase phase);
+    ap.connect(afifo.analysis_export);
+  endfunction
+  task chk(bit ok, string what);
+    if (!ok) begin failures++; $display("FAIL: %s", what); end
+    else $display("PASS: %s", what);
+  endtask
+  task run_phase(uvm_phase phase);
+    item_c t, r;
+    bit ok;
+    phase.raise_objection(this);
+    // ---- nonblocking try/can family on bounded fifo ----
+    chk(fifo.can_put() == 1, "empty bounded fifo can_put");
+    chk(fifo.can_get() == 0, "empty bounded fifo cannot get");
+    chk(fifo.try_get(r) == 0, "try_get on empty returns 0");
+    chk(fifo.try_peek(r) == 0, "try_peek on empty returns 0");
+    t = item_c::type_id::create("n0"); t.val = 11; ok = fifo.try_put(t);
+    chk(ok == 1, "try_put #1");
+    t = item_c::type_id::create("n1"); t.val = 22; ok = fifo.try_put(t);
+    chk(ok == 1, "try_put #2");
+    t = item_c::type_id::create("n2"); t.val = 33; ok = fifo.try_put(t);
+    chk(ok == 0, "try_put on FULL returns 0");
+    chk(fifo.used() == 2 && fifo.is_full(), "used()==2 and is_full");
+    ok = fifo.try_peek(r);
+    chk(ok == 1 && r.val == 11, "try_peek front");
+    ok = fifo.try_get(r);
+    chk(ok == 1 && r.val == 11, "try_get front");
+    ok = fifo.try_get(r);
+    chk(ok == 1 && r.val == 22, "try_get second");
+    chk(fifo.is_empty(), "fifo empty again");
+    // ---- analysis fifo: unbounded write-side, blocking get side ----
+    t = item_c::type_id::create("a0"); t.val = 55; ap.write(t);
+    t = item_c::type_id::create("a1"); t.val = 66; ap.write(t);
+    t = item_c::type_id::create("a2"); t.val = 77; ap.write(t);
+    chk(afifo.used() == 3, $sformatf("analysis fifo buffered 3 (used=%0d)", afifo.used()));
+    afifo.get(r); chk(r.val == 55, "analysis fifo get #1");
+    afifo.get(r); chk(r.val == 66, "analysis fifo get #2");
+    afifo.get(r); chk(r.val == 77, "analysis fifo get #3");
+    // ---- flush ----
+    t = item_c::type_id::create("f0"); t.val = 1; void'(fifo.try_put(t));
+    fifo.flush();
+    chk(fifo.used() == 0, "flush empties fifo");
+    if (failures == 0) $display("TEST_PASS");
+    else $display("TEST_FAIL count=%0d", failures);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module top;
+  initial run_test("nb_test");
+endmodule
+
+"#;
+
+#[test]
+fn uvm_tlm1_nonblocking_family_analysis_fifo() {
+    let sim = run_uvm("1.2", &[], TLM2_TEST.to_string(), "top")
+        .expect("UVM 1.2 TLM2 test failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter().any(|m| m.contains("TEST_PASS")),
+        "TLM1 nonblocking audit did not pass:
+{}",
+        out.join("
+")
+    );
+    assert!(
+        !out.iter().any(|m| m.starts_with("FAIL:")),
+        "TLM1 nonblocking audit had failures:
+{}",
+        out.join("
+")
+    );
+}
