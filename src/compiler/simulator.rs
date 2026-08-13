@@ -10984,6 +10984,15 @@ impl Simulator {
                             CombItem::DirectCopy{..} => "dc", CombItem::FastDirectCopy{..} => "fdc",
                             CombItem::CompiledAlwaysBlock{..} => "cab", CombItem::AlwaysBlock{..} => "ab", _ => "other" },
                         e.has_unresolved_reads, rn, wn);
+                    // Full instruction stream for compiled entries — the tool
+                    // for "the block fires but its writes don't land".
+                    if let CombItem::CompiledAlwaysBlock { compiled, .. }
+                    | CombItem::CompiledContAssign { compiled } = &e.item
+                    {
+                        for (k, insn) in compiled.instructions.iter().enumerate() {
+                            eprintln!("[ENTRY]   {:>4}: {:?}", k, insn);
+                        }
+                    }
                 }
             }
         }
@@ -19469,11 +19478,62 @@ impl Simulator {
                             }
                         }
                     }
+                    let before = rids.len();
                     if let Some(id) = resolve_one(r.as_str()) {
                         if !rids.contains(&id) {
                             rids.push(id);
                         }
                     }
+                    // A MEMBER read ("req.vld") has no signal of its own —
+                    // depend on the BASE signal, mirroring the cont-assign
+                    // path. Without this, a block whose ONLY reads of a
+                    // struct are member-granular got NO dependency on it and
+                    // never re-fired on its changes (a multi-slot queue write
+                    // enable computed from req.vld/req.id missed every
+                    // request; state updates silently froze). Reads whose
+                    // base the block writes were already stripped above.
+                    if rids.len() == before && r.contains('.') {
+                        let mut base: &str = r.as_str();
+                        while let Some(pos) = base.rfind('.') {
+                            base = &base[..pos];
+                            let mut found = false;
+                            if let Some(scope) = &scope_hint {
+                                let q = format!("{}.{}", scope, base);
+                                if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
+                                    if !rids.contains(&id) {
+                                        rids.push(id);
+                                    }
+                                    found = true;
+                                }
+                            }
+                            if !ab.scope.is_empty() && Some(&ab.scope) != scope_hint.as_ref() {
+                                let q = format!("{}.{}", ab.scope, base);
+                                if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
+                                    if !rids.contains(&id) {
+                                        rids.push(id);
+                                    }
+                                    found = true;
+                                }
+                            }
+                            if let Some(id) = resolve_one(base) {
+                                if !rids.contains(&id) {
+                                    rids.push(id);
+                                }
+                                found = true;
+                            }
+                            if found {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if std::env::var("XEZIM_DUMP_COMB_SENS").is_ok() {
+                    let names: Vec<&str> =
+                        rids.iter().map(|&id| self.name_for_id(id)).collect();
+                    eprintln!(
+                        "[COMB-SENS] scope='{}' reads={:?} writes={:?} sens_reads={:?} rids={:?}",
+                        ab.scope, reads, writes, sens_reads, names
+                    );
                 }
                 // Unresolved reads in always @* are usually parameters, genvars,
                 // typedefs, or loop-local integer variables — none of which change
@@ -22694,23 +22754,57 @@ impl Simulator {
         let hint = self.name_resolve_hint.borrow().clone();
         let mut out: Vec<Sensitivity> = Vec::new();
         let mut seen: HashSet<String> = HashSet::default();
-        for r in reads.difference(&writes) {
-            // Prefer the instance-scoped name when one exists, mirroring the
-            // scope-first resolution the rest of the runtime performs.
-            let resolved = hint
-                .as_ref()
-                .map(|sc| format!("{}.{}", sc, r))
-                .filter(|q| self.signal_name_to_id.contains_key(q.as_str()))
-                .unwrap_or_else(|| r.clone());
-            if self.signal_name_to_id.contains_key(resolved.as_str())
-                && seen.insert(resolved.clone())
+        for r in reads.iter() {
+            // §9.2.2.2.1: exclude reads of variables this block writes —
+            // at MEMBER granularity too (same rule as the comb-entry path),
+            // or the base fallback below would re-introduce the self-dep.
+            if writes.contains(r) {
+                continue;
+            }
             {
-                out.push(Sensitivity {
-                    signal_name: resolved,
-                    edge: EdgeKind::AnyEdge,
-                    iff: None,
-                    value_of: None,
-                });
+                let mut wbase: &str = r.as_str();
+                let mut self_written = false;
+                while let Some(pos) = wbase.rfind('.') {
+                    wbase = &wbase[..pos];
+                    if writes.contains(wbase) {
+                        self_written = true;
+                        break;
+                    }
+                }
+                if self_written {
+                    continue;
+                }
+            }
+            // Prefer the instance-scoped name when one exists, mirroring the
+            // scope-first resolution the rest of the runtime performs. A
+            // MEMBER read ("req.vld") that resolves to no signal falls back
+            // to its '.'-base prefixes — without this, a block whose only
+            // reads of a struct are member-granular had no sensitivity to it.
+            let mut cand: Vec<String> = vec![r.clone()];
+            {
+                let mut base: &str = r.as_str();
+                while let Some(pos) = base.rfind('.') {
+                    base = &base[..pos];
+                    cand.push(base.to_string());
+                }
+            }
+            for c in cand {
+                let resolved = hint
+                    .as_ref()
+                    .map(|sc| format!("{}.{}", sc, c))
+                    .filter(|q| self.signal_name_to_id.contains_key(q.as_str()))
+                    .unwrap_or_else(|| c.clone());
+                if self.signal_name_to_id.contains_key(resolved.as_str()) {
+                    if seen.insert(resolved.clone()) {
+                        out.push(Sensitivity {
+                            signal_name: resolved,
+                            edge: EdgeKind::AnyEdge,
+                            iff: None,
+                            value_of: None,
+                        });
+                    }
+                    break;
+                }
             }
         }
         out
