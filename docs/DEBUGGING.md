@@ -42,6 +42,17 @@ simulator".
 
 - `XEZIM_TRACE_ALWAYS=1` (or `=<substr>`) — per-fire trace of always
   blocks (kind, scope, written signals).
+- `XEZIM_VALUE_TRACE=<substr>[,<substr>...]` — the "where does the data
+  stop flowing" tool: prints every committed change of any signal whose
+  hierarchical name contains a pattern, as
+  `[value-trace] t=<time> <name> <old> -> <new> (<phase>; <writer at file:line>)`.
+  Blocking writes name the writing process; NBA commits happen outside the
+  scheduling process and are labeled `nba`. Bit/part-select writes mutate
+  in place and print the arrowless `name = value` form. Each pattern's
+  match count is announced at startup, so a typo is visible immediately.
+  `XEZIM_VALUE_TRACE_LIMIT=N` caps output (default 20000). To follow a
+  pipeline, watch each stage register:
+  `XEZIM_VALUE_TRACE=wr_data,buf_q,out_q xezim --simulate ... 2>trace.log`.
 - `$display` probes remain the highest-signal tool; `%p`, `%h`, `%b` on the
   suspect expression at the suspect time beats a wall of waveforms.
 - Waveforms: `--fst out.fst` writes an FST for any viewer; XTrace

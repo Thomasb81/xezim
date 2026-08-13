@@ -133,6 +133,8 @@ mod implicit_static_diagnostic;
 mod port_width_mismatch_explains;
 #[path = "misc/elaboration_runaway_guards.rs"]
 mod elaboration_runaway_guards;
+#[path = "misc/value_trace.rs"]
+mod value_trace;
 #[path = "misc/new_ctor_vs_shallow_copy.rs"]
 mod new_ctor_vs_shallow_copy;
 #[path = "misc/assoc_dotted_key.rs"]
