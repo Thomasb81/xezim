@@ -264,3 +264,5 @@ mod class_collection_storage;
 mod macro_directive_prefix_names;
 #[path = "misc/queue_ref_formal_shadowing.rs"]
 mod queue_ref_formal_shadowing;
+#[path = "misc/ref_struct_queue_and_local_shadow.rs"]
+mod ref_struct_queue_and_local_shadow;
