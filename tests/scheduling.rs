@@ -165,3 +165,5 @@ mod compiled_for_loops;
 mod class_event_member_wait;
 #[path = "scheduling/comb_self_member_sensitivity.rs"]
 mod comb_self_member_sensitivity;
+#[path = "scheduling/waiter_cont_anyedge_wake.rs"]
+mod waiter_cont_anyedge_wake;
