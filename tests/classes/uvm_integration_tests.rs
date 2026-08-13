@@ -920,3 +920,149 @@ fn uvm_tlm2_b_transport() {
 ")
     );
 }
+
+/// factory type/instance overrides + create_object_by_name honoring overrides (round-75 registry fixes) — reference-verified TEST_PASS.
+const UVM_FACTORY_OVERRIDES_AND_BY_NAME_TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+class base_item extends uvm_object;
+  `uvm_object_utils(base_item)
+  function new(string name = "base_item"); super.new(name); endfunction
+  virtual function string whoami(); return "base"; endfunction
+endclass
+class derived_item extends base_item;
+  `uvm_object_utils(derived_item)
+  function new(string name = "derived_item"); super.new(name); endfunction
+  virtual function string whoami(); return "derived"; endfunction
+endclass
+class comp_a extends uvm_component;
+  `uvm_component_utils(comp_a)
+  function new(string name, uvm_component parent); super.new(name, parent); endfunction
+  virtual function string kind(); return "A"; endfunction
+endclass
+class comp_b extends comp_a;
+  `uvm_component_utils(comp_b)
+  function new(string name, uvm_component parent); super.new(name, parent); endfunction
+  virtual function string kind(); return "B"; endfunction
+endclass
+class fac_test extends uvm_test;
+  `uvm_component_utils(fac_test)
+  int failures = 0;
+  comp_a child;
+  function new(string name = "fac_test", uvm_component parent = null); super.new(name, parent); endfunction
+  function void build_phase(uvm_phase phase);
+    set_type_override_by_type(base_item::get_type(), derived_item::get_type());
+    set_inst_override_by_type("child", comp_a::get_type(), comp_b::get_type());
+    child = comp_a::type_id::create("child", this);
+  endfunction
+  task chk(bit ok, string what);
+    if (!ok) begin failures++; $display("FAIL: %s", what); end
+    else $display("PASS: %s", what);
+  endtask
+  task run_phase(uvm_phase phase);
+    base_item it;
+    uvm_object o;
+    uvm_factory f = uvm_factory::get();
+    phase.raise_objection(this);
+    it = base_item::type_id::create("it");
+    chk(it.whoami() == "derived", "type override applied on object create");
+    chk(child.kind() == "B", "instance override applied on component create");
+    o = f.create_object_by_name("base_item", "", "byname");
+    chk(o != null, "create_object_by_name returns object");
+    if (o != null) begin
+      base_item bi;
+      chk($cast(bi, o) && bi.whoami() == "derived", "by-name create honors override");
+    end
+    if (failures == 0) $display("TEST_PASS"); else $display("TEST_FAIL count=%0d", failures);
+    phase.drop_objection(this);
+  endtask
+endclass
+module top; initial run_test("fac_test"); endmodule
+
+"#;
+
+#[test]
+fn uvm_factory_overrides_and_by_name() {
+    let sim = run_uvm("1.2", &[], UVM_FACTORY_OVERRIDES_AND_BY_NAME_TEST.to_string(), "top")
+        .expect("UVM 1.2 uvm_factory_overrides_and_by_name failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter().any(|m| m.contains("TEST_PASS")),
+        "uvm_factory_overrides_and_by_name did not pass:
+{}",
+        out.join("
+")
+    );
+}
+
+/// field automation: copy/compare/clone/pack/unpack/sprint (clone needed the frame-scoped type overlay) — reference-verified TEST_PASS.
+const UVM_FIELD_AUTOMATION_CLONE_PACK_TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+class pkt extends uvm_object;
+  rand bit [15:0] addr;
+  rand bit [31:0] data;
+  bit [7:0] tag;
+  `uvm_object_utils_begin(pkt)
+    `uvm_field_int(addr, UVM_ALL_ON)
+    `uvm_field_int(data, UVM_ALL_ON)
+    `uvm_field_int(tag, UVM_ALL_ON)
+  `uvm_object_utils_end
+  function new(string name = "pkt"); super.new(name); endfunction
+endclass
+class fa_test extends uvm_test;
+  `uvm_component_utils(fa_test)
+  int failures = 0;
+  function new(string name = "fa_test", uvm_component parent = null); super.new(name, parent); endfunction
+  task chk(bit ok, string what);
+    if (!ok) begin failures++; $display("FAIL: %s", what); end
+    else $display("PASS: %s", what);
+  endtask
+  task run_phase(uvm_phase phase);
+    pkt a, b, c;
+    bit bits[];
+    int n;
+    string s;
+    phase.raise_objection(this);
+    a = pkt::type_id::create("a");
+    a.addr = 16'hBEEF; a.data = 32'h12345678; a.tag = 8'h5A;
+    // copy
+    b = pkt::type_id::create("b");
+    b.copy(a);
+    chk(b.addr == 16'hBEEF && b.data == 32'h12345678 && b.tag == 8'h5A, "copy replicates fields");
+    // compare
+    chk(a.compare(b), "compare equal objects");
+    b.tag = 8'h00;
+    chk(!a.compare(b), "compare detects difference");
+    // clone
+    chk($cast(c, a.clone()) && c.addr == 16'hBEEF && c.data == 32'h12345678, "clone deep-copies");
+    // pack/unpack
+    n = a.pack(bits);
+    chk(n == 56, $sformatf("pack size 56 (got %0d)", n));
+    b = pkt::type_id::create("b2");
+    void'(b.unpack(bits));
+    chk(b.addr == a.addr && b.data == a.data && b.tag == a.tag, "unpack round-trips");
+    // sprint
+    s = a.sprint();
+    chk(s.len() > 0, "sprint produces text");
+    if (failures == 0) $display("TEST_PASS"); else $display("TEST_FAIL count=%0d", failures);
+    phase.drop_objection(this);
+  endtask
+endclass
+module top; initial run_test("fa_test"); endmodule
+
+"#;
+
+#[test]
+fn uvm_field_automation_clone_pack() {
+    let sim = run_uvm("1.2", &[], UVM_FIELD_AUTOMATION_CLONE_PACK_TEST.to_string(), "top")
+        .expect("UVM 1.2 uvm_field_automation_clone_pack failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter().any(|m| m.contains("TEST_PASS")),
+        "uvm_field_automation_clone_pack did not pass:
+{}",
+        out.join("
+")
+    );
+}
