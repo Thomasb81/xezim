@@ -862,7 +862,7 @@ struct CombEntryCold {
     span: crate::ast::Span,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB005";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB006";
 
 #[derive(serde::Serialize)]
 struct PreparedCombCacheRef<'a> {
@@ -19383,7 +19383,32 @@ impl Simulator {
                 // within a single execution; external re-triggering on them would
                 // cause infinite settle loops (e.g. `for (j = 0; j < N; j++)` in an
                 // always @* block).
-                let sens_reads: HashSet<String> = reads.difference(&writes).cloned().collect();
+                //
+                // §9.2.2.2.1: the exclusion must also hold at MEMBER granularity —
+                // `out = in; if (out.vld) out.f = …;` reads `out.vld`, which is not
+                // string-equal to any write ("out"/"out.f") but IS a read of a
+                // variable this block writes. Keeping it as a dependency makes the
+                // block re-queue itself every settle pass (the pass-through write
+                // then the field write commit two different values per eval), which
+                // churns to the settle limit. Strip a read whose '.'-base prefix is
+                // in the write set.
+                let sens_reads: HashSet<String> = reads
+                    .iter()
+                    .filter(|r| {
+                        if writes.contains(*r) {
+                            return false;
+                        }
+                        let mut base: &str = r.as_str();
+                        while let Some(pos) = base.rfind('.') {
+                            base = &base[..pos];
+                            if writes.contains(base) {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .cloned()
+                    .collect();
                 // A bare read may resolve BOTH to a top-level signal and to
                 // this block's instance-scoped one ("trig" vs "u_s.trig") —
                 // the bytecode resolves scope-FIRST at runtime, so the dep
