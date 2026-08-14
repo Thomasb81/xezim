@@ -1,5 +1,5 @@
 //! Pure-SystemVerilog regression for two xezim fixes that surfaced in the UVM
-//! phasing suites (40phasing / 35objections), distilled to the raw SV idiom
+//! phasing suites, distilled to the raw SV idiom
 //! with NO Rust-side shims and NO UVM library. Each test is deterministic and
 //! self-checking.
 

@@ -1,9 +1,8 @@
 //! Regression for a parenthesless ('bare') call to the built-in `randomize()`
 //! method appearing as an operand of a larger expression.
 //!
-//! UVM 05components/10uvm_pair/02class does `assert(t1.randomize & t2.randomize)`.
-//! `t1.randomize` (no parens) parses as a flattened 2-segment
-//! `Ident([t1, randomize])`. Because the built-in `randomize` is NOT a declared
+//! `t1.randomize` (no parens) parses as a flattened 2-segment `Ident([t1,
+//! randomize])`. Because the built-in `randomize` is NOT a declared
 //! class method, `class_parameterless_function` returned false and the operand
 //! fell through to a property read — returning 0 without ever calling the
 //! solver, so both transactions randomized to zeros. LRM 1800-2023 §13.4.1 +

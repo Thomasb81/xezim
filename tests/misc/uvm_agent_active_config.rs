@@ -1,5 +1,4 @@
-//! Regression for `uvm_agent::is_active` configuration propagation
-//! (`05components/90Mantis/3167_agent_activepassive`).
+//! Regression for `uvm_agent::is_active` configuration propagation.
 //!
 //! `uvm_agent.build_phase` reads `is_active` from the resource pool via
 //! `uvm_resource_enum_read`, whose `$cast` to `uvm_resource#(<enum>)` /

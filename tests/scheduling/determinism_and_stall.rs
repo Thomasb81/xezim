@@ -180,6 +180,61 @@ endmodule
     assert_eq!(sim.time, 0, "wait-on-true livelock cannot advance time");
 }
 
+/// The same livelock shape reached through a TASK call on a NULL (unassigned)
+/// class handle: `w.wait_ev()` on null runs no body and cannot suspend, so the
+/// forever is a zero-delay loop. This used to livelock the synchronous path
+/// (a blocking-task-call recursion that never hit the stall cap) and spin at
+/// 100%% CPU forever. The reference simulator treats a null deref ("Null
+/// instance ... dereferencing 'this'") as a fatal and aborts; we mirror that
+/// with an explicit null-receiver error terminating the run at time 0.
+/// `simulate_multi` returning at all, with no `T|after-fork`, is the
+/// no-spin assertion.
+#[test]
+fn task_call_on_null_receiver_in_forever_terminates() {
+    const SRC: &str = r#"
+class waiter;
+  event ev;
+  int count = 0;
+  task wait_ev();
+    @ev;
+    count++;
+  endtask
+endclass
+module tb;
+  waiter w; // null
+  int n = 0;
+  initial begin
+    fork
+      forever begin
+        w.wait_ev();
+        n++;
+      end
+    join_none
+    #1;
+    $display("T|after-fork");
+  end
+endmodule
+"#;
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("XEZIM_STALL_LIMIT", "2000") };
+    let sim = run(SRC, &[]);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("XEZIM_STALL_LIMIT") };
+    // The null call must terminate the run at time 0 with an explicit
+    // null-receiver diagnostic (mirroring the reference's null-deref abort), NOT
+    // hang at 100%% CPU and NOT resume past the fork.
+    assert_eq!(sim.time, 0, "null-receiver livelock cannot advance time");
+    let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        msgs.iter().any(|m| m.contains("null receiver")),
+        "must report a null-receiver error, got: {msgs:?}"
+    );
+    assert!(
+        !msgs.iter().any(|m| m.contains("T|after-fork")),
+        "the run must abort at the null call, not resume past the fork"
+    );
+}
+
 /// The stall report must name the RTL behind each spinner, not just a bare
 /// pid: the creating construct's kind + file:line, the instance path, and the
 /// re-arm reason. Asserted through the CLI binary (the report goes to stderr,

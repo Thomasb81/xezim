@@ -23,6 +23,7 @@ TESTS=(
   packed_port_formal_width
   packed_port_loop_select
   pct_m_hier_scope
+  param_static_park
 )
 
 mkdir -p "$OUT"
@@ -40,7 +41,10 @@ run_ref() {
 run_xezim() {
   local t=$1
   ( cd "$OUT" || exit 1
-    "$XEZIM" "${HERE}/${t}.sv" -s "$t" >"${t}.xezim.log" 2>&1
+    # A bounded run so a hang-regression (the param_static_park class of
+    # bug spins forever) yields a clean <no verdict>/FAIL instead of wedging
+    # the whole harness.
+    timeout 60 "$XEZIM" "${HERE}/${t}.sv" -s "$t" >"${t}.xezim.log" 2>&1
   )
 }
 

@@ -77,6 +77,8 @@ mod forever_break_and_disable_fork_label;
 mod fork_automatic_capture;
 #[path = "scheduling/fork_join_edge.rs"]
 mod fork_join_edge;
+#[path = "scheduling/fork_join_none_await_context.rs"]
+mod fork_join_none_await_context;
 #[path = "scheduling/fork_var_sharing.rs"]
 mod fork_var_sharing;
 #[path = "scheduling/gap_fixes_scoping_and_nba.rs"]
@@ -147,6 +149,12 @@ mod suspending_loop_depth_and_continue;
 mod task_body_delay_scaling;
 #[path = "scheduling/timing_check_delayed_nets_singlelimit.rs"]
 mod timing_check_delayed_nets_singlelimit;
+#[path = "scheduling/multidim_assoc_struct_copy.rs"]
+mod multidim_assoc_struct_copy;
+#[path = "scheduling/assoc_bracket_keys.rs"]
+mod assoc_bracket_keys;
+#[path = "scheduling/typeparam_pool_wait.rs"]
+mod typeparam_pool_wait;
 #[path = "scheduling/unbased_unsized_fill.rs"]
 mod unbased_unsized_fill;
 #[path = "scheduling/vardelay_clock_period.rs"]
@@ -163,6 +171,12 @@ mod compiled_for_loops;
 
 #[path = "scheduling/class_event_member_wait.rs"]
 mod class_event_member_wait;
+#[path = "scheduling/static_recursion_shared_cell.rs"]
+mod static_recursion_shared_cell;
+#[path = "scheduling/phase_jump_static_latch.rs"]
+mod phase_jump_static_latch;
+#[path = "scheduling/bare_randomize_in_method.rs"]
+mod bare_randomize_in_method;
 #[path = "scheduling/comb_self_member_sensitivity.rs"]
 mod comb_self_member_sensitivity;
 #[path = "scheduling/waiter_cont_anyedge_wake.rs"]

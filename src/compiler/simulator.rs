@@ -3446,6 +3446,20 @@ pub struct Simulator {
     /// `"<subroutine>::<var>"`. Only scalar integral/real statics are tracked;
     /// arrays/queues fall back to per-call storage.
     static_local_vars: HashMap<String, Value>,
+    /// Bare names of `static` subroutine locals that are scalar (tracked in
+    /// `static_local_vars`). Used as a CHEAP gate before the per-subroutine
+    /// `static_local_keys` check, so a bare identifier that is never a static
+    /// anywhere skips the key-building cost. (`static_local_vars` cells are
+    /// still read/written route to each cell's shared value only when the
+    /// SUBROUTINE-PRECISE key below also matches.)
+    static_local_names: HashSet<String>,
+    /// Persistent-cell keys ("`<cls>::<sub>::<nm>`"/"`<sub>::<nm>`") of all
+    /// scalar `static` subroutine locals. A name into `static_local_names`
+    /// only routes to the live shared cell when this key — which embeds the
+    /// declaring subroutine/class/specialization — matches, so a DIFFERENT
+    /// subroutine's same-named (plain/automatic) local is never wrongly
+    /// shared.
+    static_local_keys: HashSet<String>,
     /// True while evaluating elaboration-time constant (local)parameter
     /// initializers that call user functions. Each such constant-function call
     /// is independent (§13.4.3), so `static` locals must NOT share the runtime
@@ -3479,6 +3493,12 @@ pub struct Simulator {
     /// (a stack — a constraint/post_randomize may randomize another object).
     /// `cur_rng` consults the top of this stack first.
     obj_rng_stack: Vec<usize>,
+    /// §18.7 — the receiver NAME (a bare handle variable) of the in-flight
+    /// `obj.randomize() with {…}` call. Inside the randomized frame that
+    /// local is out of scope (eval of it returns 0), so the member-forcing
+    /// solver recognises `recv.member` as the object's own `member` when
+    /// `recv` is this receiver AND `member` is a rand property.
+    rand_receiver: Option<String>,
     /// §8.10: property names declared by MORE than one class of some object's
     /// inheritance chain. Non-leaf declarers' copies are stored under
     /// `"<Class>::<name>"`; the set is the cheap gate that keeps every
@@ -6625,6 +6645,8 @@ impl Simulator {
             pkg_ambiguous_names,
             m_scope_stack: Vec::new(),
             static_local_vars: HashMap::default(),
+            static_local_names: HashSet::default(),
+            static_local_keys: HashSet::default(),
             static_local_syncs: Vec::new(),
             in_const_param_eval: false,
             return_value: None,
@@ -6632,6 +6654,7 @@ impl Simulator {
             proc_rng: HashMap::default(),
             obj_rng: HashMap::default(),
             obj_rng_stack: Vec::new(),
+            rand_receiver: None,
             randomize_subset: None,
             shadowed_prop_names: HashSet::default(),
             settling: false,
@@ -28839,6 +28862,28 @@ impl Simulator {
                             Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
                         }
                         ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
+                            // `C#(T)::method(...)` — the receiver is a
+                            // parameterized static class. Stage 1b's receiver
+                            // is a HANDLE; a `Specialization` receiver is a
+                            // TYPE, so it reaches here (static form). Build
+                            // the concrete specialized class name and classify
+                            // its blocking method like the plain static form.
+                            ExprKind::Specialization { base, type_args_text } => {
+                                let bn = Self::leaf_ident_name(base).unwrap_or_default();
+                                if bn.is_empty() {
+                                    None
+                                } else {
+                                    let spec = format!(
+                                        "{}#({})",
+                                        bn,
+                                        Self::normalize_spec_ws(type_args_text)
+                                    );
+                                    let mut cand = vec![spec.clone(), bn];
+                                    cand.retain(|c| self.module.classes.contains_key(c));
+                                    cand.first()
+                                        .map(|c| (c.clone(), member.name.clone()))
+                                }
+                            }
                             ExprKind::Ident(h)
                                 if h.path.len() == 1
                                     && self
@@ -30651,6 +30696,83 @@ impl Simulator {
 
 
 
+    /// For a statement-position method call (`obj.task(...)`, or `obj.a.task(...)`)
+    /// whose receiver handle resolves to null (0), the call cannot suspend: a
+    /// null handler runs no body, so weaving the loop through the suspend-aware
+    /// runner imprints one recursion per iteration and livelocks (`forever {
+    /// null_handle.wait_trigger(); }` spins at 100% CPU instead of being bounded).
+    /// The reference simulator treats dereferencing `this` of a null handle as a
+    /// runtime fatal and aborts; we mirror that with an explicit error plus
+    /// terminate (not a stall), so the run stops instead of burning the CPU. A
+    /// null receiver on a mailbox `get`/`put`/`peek` is NOT handled here —
+    /// that has its own dedicated null-mailbox diagnostic.
+    fn blocking_call_on_null_receiver(&mut self, s: &Statement) -> bool {
+        let StatementKind::Expr(expr) = &s.kind else {
+            return false;
+        };
+        let ExprKind::Call { func, .. } = &expr.kind else {
+            return false;
+        };
+        let rh = match &func.kind {
+            // `w.m(...)` / `w.a.m(...)` — flattened multi-segment Ident.
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mut head = h.clone();
+                head.path.pop();
+                let recv = Expression::new(ExprKind::Ident(head), expr.span);
+                self.eval_handle_expr(&recv)
+            }
+            // `w.m(...)` — MemberAccess form.
+            ExprKind::MemberAccess { expr: recv, .. } => self.eval_handle_expr(recv),
+            _ => None,
+        };
+        if rh != Some(0) {
+            return false;
+        }
+        let what = match &func.kind {
+            ExprKind::Ident(h) => h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+            ExprKind::MemberAccess { expr, member, .. } => format!(
+                "{}.{}",
+                self.span_source_snippet_in(expr.span, None)
+                    .unwrap_or_else(|| "<null>".to_string()),
+                member.name
+            ),
+            _ => "<call>".to_string(),
+        };
+        // Mirror the property-deref path (§8.4): a null `this` deref at the TOP
+        // level (module/TB process body) is the user's bug — fatal, like the
+        // reference simulator aborting. But inside a class method (deep UVM
+        // library code, an emulation gap can leave a handle null) report a
+        // corrected diagnostic and stop just this forever process instead of
+        // killing the whole UVM run.
+        let in_method = self.this_stack.last().copied().flatten().is_some()
+            || self
+                .class_context_stack
+                .last()
+                .cloned()
+                .flatten()
+                .is_some()
+            || !self.local_stack.is_empty();
+        if !in_method {
+            let m = format!(
+                "[xezim][error] null receiver at time {} — task/function call \
+                 `{}` on a null class handle. The reference simulator dereferences \
+                 'this' of null and aborts; a blocking call here cannot suspend, so a \
+                 `forever` around it would spin forever.",
+                self.time, what
+            );
+            self.record_output(m.clone());
+            self.stdout_writeln(&m);
+            self.finished = true;
+            return true;
+        }
+        true
+    }
+
     /// Is `s` a (potentially blocking) mailbox `get`/`peek` call — `mb.get(v)`
     /// or `mb.peek(v)` (either MemberAccess or flattened hier-Ident form)? Such
     /// a call blocks when the mailbox is empty; inside a `forever` it must route
@@ -30778,6 +30900,17 @@ impl Simulator {
             if !matches!(&s.kind, StatementKind::TimingControl { .. })
                 && (self.stmt_is_blocking(s) || Self::stmt_is_mailbox_get(s))
             {
+                // A blocking task/function call on a NULL class-handle receiver
+                // cannot suspend and is a runtime error in the reference
+                // simulator (it dereferences `this` of null and aborts). The
+                // helper has already emitted its diagnostic and terminated (the
+                // whole run at top level, or just this forever process inside
+                // deep library method code). Don't weave the loop through
+                // recursion (which spins on each iteration) or let it fall to
+                // the plain stall report.
+                if !Self::stmt_is_mailbox_get(s) && self.blocking_call_on_null_receiver(s) {
+                    return;
+                }
                 let mut cont: Vec<Statement> = vec![s.clone()];
                 cont.extend_from_slice(&body_stmts[i + 1..]);
                 cont.push(Statement::new(
@@ -37526,7 +37659,20 @@ impl Simulator {
                             } else {
                                 val.clone()
                             };
-                            self.local_stack[last_idx].insert(name.clone(), fitted);
+                            self.local_stack[last_idx].insert(name.clone(), fitted.clone());
+                            // §6.21: write a `static` subroutine local through
+                            // to its live shared cell so other simultaneous
+                            // activations (recursive phase re-entry / method)
+                            // observe the mutation immediately. Skipped during
+                            // elaboration-time constant-function evaluation,
+                            // where each call is independent.
+                            if !self.in_const_param_eval
+                                && self.static_local_names.contains(name.as_str())
+                                && let Some(k) = self.static_local_key_for(name)
+                                && self.static_local_keys.contains(&k)
+                            {
+                                self.static_local_vars.insert(k, fitted);
+                            }
                             return true;
                         }
                     }
@@ -40538,6 +40684,31 @@ impl Simulator {
             if let Some(key) = self.frame_leaf_key_of(expr) {
                 if let Some(v) = self.local_stack.last().and_then(|l| l.get(&key)) {
                     return v.clone();
+                }
+            }
+        }
+        // §6.21: a `static` subroutine local is a LIVE cell shared across ALL
+        // simultaneous activations — including re-entrant/recursive ones. Read
+        // the committed value from `static_local_vars` rather than this
+        // recursion window's snapshot frame, so mutations inside an inner
+        // activation are instantly visible to the caller's frames (otherwise a
+        // recursive phase re-entry / method would reset the static to its
+        // per-window initialiser and livelock). Skipped during elaboration-time
+        // constant-function evaluation, where §13.4.3 makes each such call
+        // independent.
+        if !self.in_const_param_eval && !self.static_local_names.is_empty() {
+            if let ExprKind::Ident(h) = &expr.kind {
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    let n = &h.path[0].name.name;
+                    if self.static_local_names.contains(n.as_str())
+                        && let Some(k) = self.static_local_key_for(n)
+                    {
+                        if self.static_local_keys.contains(&k)
+                            && let Some(v) = self.static_local_vars.get(&k).cloned()
+                        {
+                            return v;
+                        }
+                    }
                 }
             }
         }
@@ -45204,6 +45375,31 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §18.7 — inside `obj.randomize() with { obj.member … }` the
+                // receiver `obj` is a caller-scope handle that no longer evals
+                // in the randomized frame, so `obj.member` would read 0 and
+                // every prefixed acceptance (`req.addr == start_addr`) failed.
+                // When the receiver is the recorded `rand_receiver` of the
+                // in-flight call and the randomized object has that member,
+                // read the OBJECT's property (mirrors the forcing in
+                // `prefixed_self_member`). Pure read — no scope mutation.
+                if self.rand_receiver.is_some() {
+                    if let Some(rn) = Self::plain_ident_name(expr) {
+                        if self.rand_receiver.as_deref() == Some(&rn) {
+                            if let Some(&obj) = self.obj_rng_stack.last() {
+                                let v = self
+                                    .heap
+                                    .get(obj)
+                                    .and_then(|o| o.as_ref())
+                                    .and_then(|i| i.properties.get(&member.name))
+                                    .cloned();
+                                if let Some(v) = v {
+                                    return v;
+                                }
+                            }
+                        }
+                    }
+                }
                 // §13.4.2: a member of a subroutine-local / formal unpacked
                 // struct is owned by the call frame; read it there before any
                 // module-scope lookup, mirroring the write path. Otherwise a
@@ -47278,41 +47474,72 @@ impl Simulator {
                             // typedefs so the element's type-param members bind.
                             let elem_cls: Option<(String, Option<(String, String)>)> =
                                 match elem_cls {
-                                    Some(cn) => {
-                                        // §6.20.3: the declared element type may
-                                        // be a TYPE PARAMETER (`T pool[string]`
-                                        // in uvm_pool) — resolve through the
-                                        // current spec / instance bindings first.
-                                        let cn = self
-                                            .resolve_type_param_binding(&cn)
-                                            .unwrap_or(cn);
-                                        if self.module.classes.contains_key(&cn) {
-                                            Some((cn, None))
-                                        } else {
-                                            self.resolve_simple_typedef_class(&cn)
-                                                .filter(|c| self.module.classes.contains_key(c))
-                                                .map(|c| (c, None))
-                                                .or_else(|| {
-                                                    self.resolve_typedef_spec(&cn)
-                                                        .filter(|(b, _)| {
-                                                            self.module.classes.contains_key(b)
-                                                        })
-                                                        .map(|(b, s)| (b.clone(), Some((b, s))))
-                                                })
-                                                .or_else(|| {
-                                                    // §8.25: the binding is itself
-                                                    // a SPECIALIZED name
-                                                    // (`queue#(string)` — UVM's
-                                                    // string pool of hdl-path
-                                                    // queues).
-                                                    self.extract_spec_from_string(&cn)
-                                                        .filter(|(b, _)| {
-                                                            self.module.classes.contains_key(b)
-                                                        })
-                                                        .map(|(b, s)| (b.clone(), Some((b, s))))
-                                                })
-                                        }
+                                    Some(cn)
+                                        if self.module.classes.contains_key(&cn) =>
+                                    {
+                                        Some((cn, None))
                                     }
+                                    // §6.20.3: the declared element type is a
+                                    // class TYPE PARAMETER (`PARAM pool[string]`
+                                    // in generic `class Base#(type PARAM)` —
+                                    // i.e. `uvm_pool`'s `T`). It is neither a
+                                    // module.classes key nor a typedef; bind it
+                                    // to the concrete class via the active
+                                    // instance/spec so `pool[key] = new` builds
+                                    // the right element class (e.g. `myitem` for
+                                    // `Base#(myitem)`, or `uvm_event#(uvm_object)`
+                                    // for `uvm_object_string_pool`).
+                                    //
+                                    // evaluate a single time (the bound class's
+                                    // keys would falsify the `contains_key(c)`
+                                    // guard that the typedef arms rely on).
+                                    Some(cn)
+                                        if self
+                                            .resolve_type_param_binding(&cn)
+                                            .map(|b| {
+                                                let base = self
+                                                    .extract_spec_from_string(&b)
+                                                    .map(|(base, _)| base)
+                                                    .unwrap_or(b);
+                                                self.module.classes.contains_key(&base)
+                                            })
+                                            .unwrap_or(false) =>
+                                    {
+                                        let bound = self.resolve_type_param_binding(&cn).unwrap();
+                                        let tup = self
+                                            .extract_spec_from_string(&bound)
+                                            .unwrap_or_else(|| (bound.clone(), String::new()));
+                                        let (base, sig) = tup;
+                                        let spec = if sig.is_empty() {
+                                            None
+                                        } else {
+                                            Some((base.clone(), sig))
+                                        };
+                                        Some((base, spec))
+                                    }
+                                    Some(cn) => self
+                                        .resolve_simple_typedef_class(&cn)
+                                        .filter(|c| self.module.classes.contains_key(c))
+                                        .map(|c| (c, None))
+                                        .or_else(|| {
+                                            self.resolve_typedef_spec(&cn)
+                                                .filter(|(b, _)| {
+                                                    self.module.classes.contains_key(b)
+                                                })
+                                                .map(|(b, s)| (b.clone(), Some((b, s))))
+                                        })
+                                        .or_else(|| {
+                                            // §8.25: the binding is itself
+                                            // a SPECIALIZED name
+                                            // (`queue#(string)` — UVM's
+                                            // string pool of hdl-path
+                                            // queues).
+                                            self.extract_spec_from_string(&cn)
+                                                .filter(|(b, _)| {
+                                                    self.module.classes.contains_key(b)
+                                                })
+                                                .map(|(b, s)| (b.clone(), Some((b, s))))
+                                        }),
                                     None => None,
                                 };
                             if std::env::var("XZ_EC_DBG").is_ok() && bname == "pool" {
@@ -48055,6 +48282,11 @@ impl Simulator {
                 // lvalue's declared type, then construct via
                 // `instantiate_class_with_type_args`.  The bare `new` expression
                 // is `Ident([new])`; `new(args)` is `Call(func=Ident([new]), args=...)`.
+                // §8.7 / §8.8: `c = new;` (bare, no parens) or `c = new(args)` (with
+                // constructor arguments).  Resolve the class type from the
+                // lvalue's declared type, then construct via
+                // `instantiate_class_with_type_args`.  The bare `new` expression
+                // is `Ident([new])`; `new(args)` is `Call(func=Ident([new]), args=...)`.
                 // §8.7 / §8.8: `c = new;` (bare, no parens) or `c = new()`/`c = new(args)`
                 // (with constructor arguments).  When args are non-empty AND the
                 // lvalue is typed as a class handle (not a dynamic array), route
@@ -48131,6 +48363,28 @@ impl Simulator {
                         // it (so the instance's inherited methods resolve `T`
                         // correctly). Mirrors the factory `create` path.
                         if let Some((base, sig)) = self.extract_spec_from_string(&tname) {
+                            if let Some(class_def) = self.module.classes.get(&base).cloned() {
+                                self.ensure_spec_statics(&base, &sig);
+                                let saved_spec = self.current_spec.clone();
+                                self.current_spec = Some((base.clone(), sig));
+                                let handle = self.instantiate_class(&class_def, ctor_args);
+                                self.current_spec = saved_spec;
+                                self.assign_value(lvalue, &handle.resize(w));
+                                self.settle_after_proc_write();
+                                return;
+                            }
+                        }
+                        // A class-MEMBER `prop = new(...)` whose declared type
+                        // is a TYPEDEF ALIAS to a parameterized class (UVM's
+                        // `uvm_component.event_pool` / `uvm_event_pool` =
+                        // `uvm_object_string_pool#(uvm_event#(uvm_object))`).
+                        // `get_expr_type_name` above returned just the BASE
+                        // class (no `#(...)`), so neither `extract_spec_..`
+                        // nor `resolve_ctor_type_args` finds the type args,
+                        // and the pool would be built with `T` = its default
+                        // (`uvm_object`). Recover the spec from the member's
+                        // alias and construct the correct specialization.
+                        if let Some((base, sig)) = self.this_member_typedef_spec(lvalue) {
                             if let Some(class_def) = self.module.classes.get(&base).cloned() {
                                 self.ensure_spec_statics(&base, &sig);
                                 let saved_spec = self.current_spec.clone();
@@ -49833,8 +50087,7 @@ impl Simulator {
                                     .keys()
                                     .filter_map(|k| {
                                         let rest = k.strip_prefix(&prefix)?;
-                                        let end = rest.find(']')?;
-                                        Some(rest[..end].to_string())
+                                        Self::assoc_first_key_seg(rest).map(|s| s.to_string())
                                     })
                                     .collect();
                                 ks.sort();
@@ -50173,6 +50426,9 @@ impl Simulator {
                             // loop — every backdoor access lost its path).
                             && !self.module.dynamic_arrays.contains(&name)
                             && !self.is_associative_array(&name)
+                            && !self.module.arrays.contains_key(&name)
+                            && !self.module.arrays_2d.contains_key(&name)
+                            && !self.module.arrays_nd.contains_key(&name)
                         {
                             // foreach over a STRING iterates its characters
                             // [0..len) by CONTENT length, and must be checked
@@ -50182,6 +50438,17 @@ impl Simulator {
                             // would otherwise send it through the fixed-array
                             // arm iterating 2 instead of the true character
                             // count, truncating UVM's `pack_string` by 8 bytes.
+                            //
+                            // A QUEUE / DYNAMIC / ASSOC ARRAY OF STRINGS
+                            // (`string q[$]`, `string m[int]`) is NOT a scalar
+                            // string: `string_signals` holds the collection name
+                            // but the loop must iterate its ELEMENTS, not its
+                            // characters — treating it as a string here left
+                            // `foreach (name_order[k])` over uvm's string queue
+                            // of field names with zero iterations, so config was
+                            // never applied (`string_signals` won because the
+                            // collection-carried registration; the char count
+                            // of the unbuilt queue was 0).
                             let len = self.eval_expr(array).to_sv_string().len() as u64;
                             for i in 0..len {
                                 if self.finished {
@@ -50219,8 +50486,7 @@ impl Simulator {
                                 .keys()
                                 .filter_map(|k| {
                                     let rest = k.strip_prefix(&prefix)?;
-                                    let end = rest.find(']')?;
-                                    Some(rest[..end].to_string())
+                                    Self::assoc_first_key_seg(rest).map(|s| s.to_string())
                                 })
                                 .collect();
                             keys.sort();
@@ -52569,7 +52835,18 @@ impl Simulator {
                             self.static_local_vars.insert(key.clone(), cur);
                         }
                         if let Some((_n, syncs)) = self.static_local_syncs.last_mut() {
-                            syncs.push((nm.clone(), key));
+                            syncs.push((nm.clone(), key.clone()));
+                        }
+                        // Route to the live shared cell only for scalar
+                        // integral/real statics (the re-entrant/recursive
+                        // case this fixes). Strings and other aggregates keep
+                        // their existing per-call storage semantics and must
+                        // not be intercepted.
+                        if !self.string_signals.contains(nm.as_str())
+                            && !self.module.arrays.contains_key(nm.as_str())
+                        {
+                            self.static_local_names.insert(nm.clone());
+                            self.static_local_keys.insert(key);
                         }
                     }
                 }
@@ -60982,6 +61259,19 @@ impl Simulator {
         {
             return true;
         }
+        // A process parked on a `process::await()` (a forked child waiting on
+        // the producer sequence's process, as `m_safe_select_item`'s re-arbitration
+        // loop does) is SUSPENDED, not finished. Without this it looked FINISHED,
+        // so its ProcessContext (sequencer `this` + the task's `selected_sequence_request`
+        // local) was dropped and it resumed with this=None/lstack=0, dereferencing
+        // the recalled item handle as null.
+        if self
+            .await_waiters
+            .iter()
+            .any(|w| w.waiter_pid == pid)
+        {
+            return true;
+        }
         false
     }
 
@@ -62304,7 +62594,72 @@ impl Simulator {
                 }
             }
         }
+        // Nested associative-array ELEMENT (`base[K1][K2]...[Kn]` with n >= 1):
+        // the receiver is the sub-array obtained by selecting a key from a
+        // MULTIDIMENSIONAL associative array (IEEE 1800 §7.8.1) — e.g.
+        // UVM's `m_recur_states[rhs]` where `m_recur_states[rhs].first(lhs)`
+        // is called on the nested sub-array. The storage name is
+        // `base[K1]...[Kn]`; strip trailing `[key]` segments to the root
+        // declaration, then confirm a stored key exists under the compound
+        // prefix (proving the selected element is itself a collection, not a
+        // scalar). Without this the copier's cycle-detection `first()/exists()`
+        // on a nested assoc silently returns "not found", so deep-clone of a
+        // cyclic object graph recurses forever (stack overflow).
+        if self.is_nested_assoc_elem(name) {
+            return true;
+        }
         false
+    }
+
+    /// Strip trailing `[key]` index segments from a possibly-indexed storage
+    /// name, returning the declaration base (module-level or `<h>#member`).
+    /// `foo[1]` -> `foo`; `h#m[1][2]` -> `h#m`.
+    fn assoc_decl_base(&self, name: &str) -> Option<String> {
+        let mut b = name;
+        loop {
+            match b.rfind('[') {
+                Some(p) if b[p + 1..].ends_with(']') => {
+                    b = &b[..p];
+                }
+                _ => break,
+            }
+        }
+        if b != name { Some(b.to_string()) } else { None }
+    }
+
+    /// Nested associative-array receiver: `name` is `base[K1]...[Kn]` (n >= 1),
+    /// `base` is a registered associative array, and the selected element is
+    /// ITSELF an associative array (a multidimensional assoc, IEEE 1800 §7.8.1)
+    /// — i.e. at least one stored key exists under the compound prefix
+    /// `name[..` (`g[1][2]` proves `g[1]` is a collection). This is exactly the
+    /// shape UVM's copier uses (`m_recur_states[rhs][lhs][policy]`, then
+    /// `m_recur_states[rhs].first(lhs)`), whose cycle guard the deep-clone of
+    /// a CYCLIC object graph depends on. An empty nested sub-array can't be
+    /// proven from a stored key, but `first`/`num`/`size` on an empty array
+    /// return 0 anyway.
+    fn is_nested_assoc_elem(&self, name: &str) -> bool {
+        let Some(base) = self.assoc_decl_base(name) else {
+            return false;
+        };
+        if !self.module.associative_arrays.contains_key(&base) {
+            return false;
+        }
+        let nested_prefix = format!("{name}[");
+        self.signal_name_prefix_present(&nested_prefix)
+    }
+
+    /// True if any stored signal name starts with `prefix`. Mirrors the prefix
+    /// scanning that `assoc_top_level_keys` uses (checks both `signals` ids and
+    /// the `name->id` index), so a nested assoc element (stored as
+    /// `base[k1][k2]...`) is visible.
+    fn signal_name_prefix_present(&self, prefix: &str) -> bool {
+        self.signals
+            .keys()
+            .any(|k| k.starts_with(prefix))
+            || self
+                .signal_name_to_id
+                .keys()
+                .any(|k| k.starts_with(prefix))
     }
 
     /// Resolve a `TypeName` (possibly a scoped/class-local typedef alias) to the
@@ -63036,6 +63391,17 @@ impl Simulator {
         // A STRUCT element stores member-wise leaves (`sa[k].id`), which do
         // not end in `]` — accept any entry whose key bracket closes, else
         // struct-element assoc arrays enumerate as empty (num()/foreach).
+        //
+        // The stored entry is `name + rest` where `rest = KEY`, or
+        // `KEY[K2]...[Kn]` for a MULTIDIM assoc (`arr[k1][k2]`) or an
+        // assoc-of-queue (`arr[key][i]`). Decide which by inspection: a
+        // multi-index entry has an inner `[` immediately after its FIRST
+        // `]` (`k1][k2]`), so the level-0 key = up to that `]`. Otherwise
+        // the array is 1-D and KEY is the WHOLE text, which may itself
+        // contain `]`/`[` (UVM component names like
+        // `special-:{ chars{}[0123456789] _` are legal assoc string keys,
+        // §7.11) — take up to the LAST `]` so such brackets are not mistaken
+        // for an index end.
         let mut keys: Vec<String> = self
             .signals
             .keys()
@@ -63044,7 +63410,7 @@ impl Simulator {
             .filter(|k| k.starts_with(&prefix))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
-                rest.find(']').map(|pos| rest[..pos].to_string())
+                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
             })
             .collect();
         keys.sort();
@@ -64042,6 +64408,21 @@ impl Simulator {
     /// Compute the iteration keys for a named array/collection
     /// (`<name>.size` dense fallback, else raw key-scan of `<name>[…]`).
     /// Returns `(keys, is_str)`. Integer keys are sorted numerically.
+    /// Top-level assoc key for a stored entry whose text after the array
+    /// name is `rest`. A MULTIDIM or collection-valued assoc stores
+    /// `arr[k1][k2]...` (an inner `[` right after the FIRST `]`), so the
+    /// level-0 key runs to that `]`. Otherwise the array is 1-D and the key
+    /// is the WHOLE text to the FINAL `]` — a 1-D string key may itself
+    /// contain `]`/`[` (a UVM component name like
+    /// `special-:{ chars{}[0123456789] _` is a legal assoc key, §7.11).
+    fn assoc_first_key_seg(rest: &str) -> Option<&str> {
+        if rest.find(']').map_or(false, |p| rest[p + 1..].starts_with('[')) {
+            rest.find(']').map(|e| &rest[..e])
+        } else {
+            rest.rfind(']').map(|e| &rest[..e])
+        }
+    }
+
     fn array_iter_keys(&self, name: &str) -> (Vec<String>, bool) {
         // A queue / dynamic array carries an authoritative `<name>.size`
         // shadow and is DENSE: iterate the logical range [0, size). Scanning
@@ -64061,13 +64442,18 @@ impl Simulator {
         // is stored as `all[5][0]`, `all[5][1]`, etc. The key must be
         // extracted up to the FIRST `]`, not `k.len()-1` (which would grab
         // `5][0`). Dedup because multiple sub-elements share one key.
+        //
+        // But a 1-D STRING key may itself contain `]`/`[` (e.g. a UVM
+        // component name `special-:{ chars{}[0123456789] _`), stored
+        // verbatim as `arr[KEY]`. Distinguish by shape: a multi-index entry
+        // has an inner `[` right after its first `]` (`k1][k2]`), so extract
+        // up to that `]`; otherwise take the whole key up to the final `]`.
         let mut ks: Vec<String> = self
             .signals
             .keys()
             .filter_map(|k| {
                 let rest = k.strip_prefix(&prefix)?;
-                let end = rest.find(']')?;
-                Some(rest[..end].to_string())
+                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
             })
             .collect();
         ks.sort();
@@ -64557,6 +64943,7 @@ impl Simulator {
                                     &cvar_names,
                                     &cvar_dom,
                                     attempt,
+                                    None,
                                 );
                                 self.constraint_cmp_unsigned = false;
                                 let mut owned_names: HashSet<String> = HashSet::default();
@@ -64667,9 +65054,17 @@ impl Simulator {
                     if handle != 0 {
                         // §18.7.1 `local::` — must be bound in the CALLER's
                         // scope, i.e. before `this` switches to the object.
-                        let bound = self.bind_local_scope_refs(handle, constraints);
+                        let mut items_vec: Option<Vec<crate::ast::decl::ConstraintItem>> =
+                            self.bind_local_scope_refs(handle, constraints);
+                        // §18.7 — also freeze references to the ENCLOSING scope's
+                        // members (still on `this_stack` here) so `obj`'s inline
+                        // can compare against a sequence member (`obj.addr ==
+                        // start_addr`) once `this` moves to `obj`.
+                        if let Some(sub) = self.subst_enclosing_scope_refs(handle, constraints) {
+                            items_vec = Some(sub);
+                        }
                         let items: &[crate::ast::decl::ConstraintItem] =
-                            bound.as_deref().unwrap_or(constraints);
+                            items_vec.as_deref().unwrap_or(constraints);
                         // §18.11 `obj.randomize(null) with {...}` — in-line
                         // constraint CHECKER: nothing is randomized, the
                         // current values are checked against the constraints.
@@ -64679,7 +65074,12 @@ impl Simulator {
                         // §18.7: the inline constraints join the class's set
                         // for this call (sizing, element solving, acceptance).
                         self.obj_rng_stack.push(handle);
+                        let prev_receiver = self.rand_receiver.take();
+                        if let Some(rn) = Self::plain_ident_name(expr) {
+                            self.rand_receiver = Some(rn);
+                        }
                         let r = self.exec_randomize_inner(handle, items);
+                        self.rand_receiver = prev_receiver;
                         self.obj_rng_stack.pop();
                         return r;
                     }
@@ -64821,6 +65221,123 @@ impl Simulator {
         } else {
             None
         }
+    }
+
+    /// §18.7 — inside `obj.randomize() with {…}` the randomized frame's
+    /// `this` is the OBJECT, so a free identifier that names an ENCLOSING
+    /// scope's member (e.g. a sequence's `start_addr` from a `uvm_do` inline
+    /// block) no longer resolves during the solve and reads 0/garbage. Freeze
+    /// every bare identifier that is a member of the enclosing `this` instance
+    /// (still on `this_stack` at the call site, before `this` switches) but is
+    /// NOT a rand member of the randomized object to its current value as a
+    /// literal. Returns a substituted copy only when something changed.
+    fn subst_enclosing_scope_refs(
+        &mut self,
+        handle: usize,
+        items: &[crate::ast::decl::ConstraintItem],
+    ) -> Option<Vec<crate::ast::decl::ConstraintItem>> {
+        use crate::ast::decl::ConstraintItem as CI;
+        let rand_set = self.object_rand_set(handle);
+        // The enclosing scope's instance handle is this_stack's top. If none
+        // (no class `this`), there is nothing to freeze.
+        let Some(Some(enc_h)) = self.this_stack.last().copied() else {
+            return None;
+        };
+        let Some(enc_cd) = self
+            .heap
+            .get(enc_h)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())
+            .and_then(|cn| self.module.classes.get(&cn).cloned())
+        else {
+            return None;
+        };
+        if enc_cd.properties.is_empty() {
+            return None;
+        }
+        let mut out: Vec<CI> = Vec::with_capacity(items.len());
+        let mut any = false;
+        for item in items {
+            let mut new_item = item.clone();
+            if let CI::Expr(e) = &mut new_item {
+                if self.subst_enclosing_ident(e, enc_h, &enc_cd, &rand_set) {
+                    any = true;
+                }
+            }
+            out.push(new_item);
+        }
+        if any {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Walk `e`, replacing bare identifiers that are members of the enclosing
+    /// instance `enc_h` (but not rand members of the object) with their current
+    /// value as a literal. Returns whether anything changed.
+    fn subst_enclosing_ident(
+        &mut self,
+        e: &mut Expression,
+        enc_h: usize,
+        enc_cd: &crate::compiler::elaborate::ElaboratedClass,
+        rand_set: &HashSet<String>,
+    ) -> bool {
+        use crate::ast::expr::{ExprKind, NumberBase, NumberLiteral};
+        let mut hit = false;
+        match &mut e.kind {
+            ExprKind::Ident(h)
+                if h.path.len() == 1 && h.root.is_none() => {
+                    let name = &h.path[0].name.name;
+                    if rand_set.contains(name) {
+                        return false; // the object's own rand member — solve it
+                    }
+                    // Must live on the ENCLOSING instance, not be shadowed by
+                    // an enclosing local of the same name nor be the object's
+                    // own (non-rand) field the inline qualifies via the receiver.
+                    if !enc_cd.properties.contains_key(name) {
+                        return false;
+                    }
+                    if self.local_stack.last().is_some_and(|l| l.contains_key(name)) {
+                        return false;
+                    }
+                    let v = self
+                        .heap
+                        .get(enc_h)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|i| i.properties.get(name))
+                        .cloned();
+                    if let Some(v) = v.as_ref() {
+                        let lit = NumberLiteral::Integer {
+                            size: Some(v.width.max(1)),
+                            signed: v.is_signed,
+                            base: NumberBase::Decimal,
+                            value: v.to_u64().unwrap_or(0).to_string(),
+                            cached_val: Cell::new(None),
+                        };
+                        e.kind = ExprKind::Number(lit);
+                        hit = true;
+                    }
+                }
+            ExprKind::Binary { left, right, .. } => {
+                hit |= self.subst_enclosing_ident(left, enc_h, enc_cd, rand_set);
+                hit |= self.subst_enclosing_ident(right, enc_h, enc_cd, rand_set);
+            }
+            ExprKind::Unary { operand, .. } => hit |= self.subst_enclosing_ident(operand, enc_h, enc_cd, rand_set),
+            ExprKind::Paren(inner) => hit |= self.subst_enclosing_ident(inner, enc_h, enc_cd, rand_set),
+            ExprKind::Inside { expr, ranges } => {
+                hit |= self.subst_enclosing_ident(expr, enc_h, enc_cd, rand_set);
+                for r in ranges {
+                    hit |= self.subst_enclosing_ident(r, enc_h, enc_cd, rand_set);
+                }
+            }
+            ExprKind::Range(lo, hi) => {
+                hit |= self.subst_enclosing_ident(lo, enc_h, enc_cd, rand_set);
+                hit |= self.subst_enclosing_ident(hi, enc_h, enc_cd, rand_set);
+            }
+            _ => {}
+        }
+        hit
     }
 
     /// Bare single-segment identifier name of `e`, if that is what it is.
@@ -65154,6 +65671,23 @@ impl Simulator {
         let mut bn = self.resolve_hier_name(bh);
         if let Some(s) = self.instance_assoc_member(&bn) {
             bn = s;
+        } else if bh.path.len() >= 2 {
+            // `obj.member` accessed from module/lower scope where the first
+            // path segment is an OBJECT handle and the member is an
+            // associative property of that object's class. resolve_hier_name
+            // collapses to the bare `member` (losing the per-instance scope),
+            // so is_associative_array(bare) is false and the multidim helper
+            // bails. Re-derive the per-instance storage `<h>#<member>`.
+            let objnm = &bh.path[0].name.name;
+            let member = &bh.path[bh.path.len() - 1].name.name;
+            if let Some(h) = self.eval_ident_handle(objnm) {
+                if h != 0 {
+                    let cand = format!("{h}#{member}");
+                    if self.is_associative_array(&cand) {
+                        bn = cand;
+                    }
+                }
+            }
         }
         if !self.is_associative_array(&bn) {
             return None;
@@ -66497,6 +67031,7 @@ impl Simulator {
         e: &Expression,
         names: &HashMap<String, usize>,
         ncols: usize,
+        obj_handle: Option<usize>,
     ) -> Option<(Vec<i128>, i128, BinaryOp)> {
         let ExprKind::Binary { op, left, right } = &e.kind else {
             return None;
@@ -66511,6 +67046,22 @@ impl Simulator {
                 | BinaryOp::Neq
         ) {
             return None;
+        }
+        // §18.5: a rand dynamic array's `.size()` is not a settled numeric
+        // operand during the coupled scalar solve (the array is only sized
+        // later) — `arr.size() == N` would pin `N` to the current empty size
+        // (0). The array-sizing solver owns that coupling. Prefer the
+        // randomized object's handle (from the caller) over the this-frame
+        // top, which in a UVM run points at the TEST harness (uvm_root), not
+        // the payload object, so the array lookup would fail and the guard
+        // would let `arr.size()==N` become a spurious `N == 0` row that
+        // contradicts `N == <non-zero>`.
+        let h = obj_handle
+            .or_else(|| self.this_stack.iter().flatten().next().copied());
+        if let Some(h) = h {
+            if self.is_rand_dyn_size_expr(h, left) || self.is_rand_dyn_size_expr(h, right) {
+                return None;
+            }
         }
         let (lc, lk) = self.affine_cols(left, names, ncols)?;
         let (rc, rk) = self.affine_cols(right, names, ncols)?;
@@ -66537,18 +67088,19 @@ impl Simulator {
         item: &crate::ast::decl::ConstraintItem,
         names: &HashMap<String, usize>,
         ncols: usize,
+        obj_handle: Option<usize>,
         out: &mut Vec<(Vec<i128>, i128, BinaryOp)>,
     ) {
         use crate::ast::decl::ConstraintItem as CI;
         match item {
             CI::Expr(e) => {
-                if let Some(con) = self.affine_binary_con(e, names, ncols) {
+                if let Some(con) = self.affine_binary_con(e, names, ncols, obj_handle) {
                     out.push(con);
                 }
             }
             CI::Block(items) => {
                 for it in items {
-                    self.collect_affine_cons(it, names, ncols, out);
+                    self.collect_affine_cons(it, names, ncols, obj_handle, out);
                 }
             }
             _ => {}
@@ -66629,24 +67181,48 @@ impl Simulator {
         names: &HashMap<String, usize>,
         ncols: usize,
         owned: &HashSet<usize>,
+        obj_handle: Option<usize>,
     ) -> bool {
         use crate::ast::decl::ConstraintItem as CI;
-        let touches_owned = |me: &Self, it: &CI| -> bool {
+        let owned_count = |me: &Self, it: &CI| -> usize {
             let mut ids = HashSet::default();
             me.collect_item_idents(it, &mut ids);
             ids.iter()
-                .any(|n| names.get(n).is_some_and(|i| owned.contains(i)))
+                .filter(|n| names.get(n.as_str()).is_some_and(|i| owned.contains(i)))
+                .count()
+        };
+        let touches_owned = |me: &Self, it: &CI| -> bool {
+            owned_count(me, it) > 0
         };
         match item {
             CI::Expr(e) => {
-                if self.affine_binary_con(e, names, ncols).is_some() {
+                // A `.size()` coupling to a rand DYNAMIC array (`arr.size() ==
+                // N`) is sized to the array's length separately; it must not
+                // block the coupled scalar solve even though it touches an
+                // owned variable through the equality.
+                let h = obj_handle
+                    .or_else(|| self.this_stack.iter().flatten().next().copied());
+                if let Some(h) = h {
+                    if self.expr_involves_dyn_size(h, e) {
+                        return true;
+                    }
+                }
+                if self.affine_binary_con(e, names, ncols, obj_handle).is_some() {
                     return true; // fully modeled affine constraint
                 }
-                !touches_owned(self, item)
+                // A non-affine predicate that constrains at most ONE owned
+                // variable (`m % 4 == 0`, `m inside {…}`, a single-var
+                // inequality) cannot take part in the affine coupling, but it
+                // need not abort the whole solve: the assigned value is still
+                // enforced by the trial acceptance check, which retries a
+                // fresh draw if violated. Requiring it to pass here would
+                // abandon coupling for the whole set whenever any scalar has a
+                // modulus/inside guard.
+                owned_count(self, item) <= 1
             }
             CI::Block(items) => items
                 .iter()
-                .all(|it| self.item_ok_for_coupled(it, names, ncols, owned)),
+                .all(|it| self.item_ok_for_coupled(it, names, ncols, owned, obj_handle)),
             // A soft constraint can always be dropped, and `solve` is only an
             // ordering hint — neither blocks the coupled solve.
             CI::Soft(_) | CI::Solve { .. } => true,
@@ -66667,6 +67243,7 @@ impl Simulator {
         var_names: &[String],
         var_dom: &[(i128, i128)],
         attempt: usize,
+        obj_handle: Option<usize>,
     ) -> Option<Vec<(usize, i128)>> {
         use rand::Rng;
         let ncols = var_names.len();
@@ -66680,7 +67257,7 @@ impl Simulator {
         // Extract the affine relational/equality constraints.
         let mut cons: Vec<(Vec<i128>, i128, BinaryOp)> = Vec::new();
         for it in items {
-            self.collect_affine_cons(it, &names, ncols, &mut cons);
+            self.collect_affine_cons(it, &names, ncols, obj_handle, &mut cons);
         }
         // A variable is COUPLED if it shares a constraint with another target.
         let mut owned: HashSet<usize> = HashSet::default();
@@ -66698,7 +67275,7 @@ impl Simulator {
         // Never take ownership of a variable that an unmodeled construct also
         // constrains (preserve existing behavior for such mixed sets).
         for it in items {
-            if !self.item_ok_for_coupled(it, &names, ncols, &owned) {
+            if !self.item_ok_for_coupled(it, &names, ncols, &owned, obj_handle) {
                 return None;
             }
         }
@@ -69303,15 +69880,48 @@ impl Simulator {
     ) -> Option<(String, crate::ast::types::StructUnionType)> {
         // compound key `base[K1][K2]...[Kn]` (assoc key-stringified).
         let key = self.nested_index_name(element)?;
-        // Strip the trailing `[K...]` for the storage base `<handle>#<prop>`.
         let scoped = key.split('[').next().unwrap_or("");
         let (hstr, prop) = scoped.split_once('#')?;
         let handle: usize = hstr.parse().ok()?;
-        let su = self.class_prop_struct(handle, prop)?;
+        // `class_prop_struct` deliberately refuses COLLECTION (assoc/queue)
+        // properties (issue #113: their element leaves go through the
+        // collection machinery). Here the element IS the collection's struct
+        // value, so resolve its declared DataType directly from the
+        // instance's class-chain `property_decl_types` and require it to be
+        // an unpacked struct (spread member-wise).
+        let su = self.collection_elem_struct(handle, prop)?;
         if !Self::spreads_member_wise(&su) {
             return None;
         }
         Some((key, su))
+    }
+
+    /// Unpacked-struct TYPE of a collection property's element. Resolves the
+    /// property's declared (element) DataType over the instance's inheritance
+    /// chain, then reduces typedef aliases to its `Struct` if it is one.
+    fn collection_elem_struct(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<crate::ast::types::StructUnionType> {
+        use crate::ast::types::DataType;
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let mut cur = Some(inst.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(dt) = cd.property_types.get(prop).cloned() {
+                if let DataType::Struct(su) = self.resolve_dt(&dt) {
+                    return Some(su.clone());
+                }
+                return None;
+            }
+            cur = cd.extends.clone();
+        }
+        None
     }
 
     /// `element` : resolved as above for a struct element in a class collection,
@@ -76106,7 +76716,7 @@ impl Simulator {
     /// this check the cast only compared the base-class hierarchy (both are
     /// `uvm_resource`) and the value params (none), so it wrongly returned
     /// success, the sequence was never started, and its body messages never
-    /// ran (50phase_controls/01simple ended with message count 0).
+    /// ran (message count 0).
     ///
     /// Mirrors `cast_value_params_ok`: for each TYPE param position the dest
     /// declares, the src instance's `type_bindings` must carry the same
@@ -76307,7 +76917,14 @@ impl Simulator {
                 let c = self.class_of_var(name);
                 let th = self.this_stack.last().copied().flatten();
                 let pt = th.and_then(|hh| self.prop_class_type(hh, name));
-                c.or_else(|| pt)
+                // For a bare member of the current `this` object (`seq.get_type()`
+                // where `seq` is a declared field of the running sequence), the
+                // member's declared type from the object's class chain is
+                // authoritative. `class_of_var` is only a loose heuristic for
+                // locals/module vars and can drift to a base type (e.g. resolves
+                // the `seq` field to `uvm_sequence_item`) — prefer the property
+                // lookup when it resolves, else fall back to the var class.
+                pt.or_else(|| c)
             }
             // `this.req.get_type()` (receiver = `this.req`) — resolve the
             // declared member type through the current `this` class.
@@ -79103,7 +79720,19 @@ impl Simulator {
             // `this` when in an instance method, or as a static method
             // when there is no instance handle.
             if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
-                if self.class_has_method(&ctx, name) {
+                // A bare `randomize()`/`srandom()`/`get_randstate()`/
+                // `set_randstate()` inside a class method is an implicit
+                // built-in, not a declared method — `class_has_method` reports
+                // false for it (the source never lists it), so the bare call
+                // used to fall through and silently return 0, while the
+                // qualified `this.randomize()` (member-access path) reached
+                // `exec_method_call` -> the §18.11 solver correctly. Route the
+                // built-in names through `exec_method_call` too (it intercepts
+                // them ahead of user dispatch), restoring bare `randomize()`
+                // inside `new`/functions (Questa honors it).
+                if self.class_has_method(&ctx, name)
+                    || matches!(name.as_str(), "randomize" | "srandom" | "get_randstate" | "set_randstate")
+                {
                     let this_handle = self.this_stack.last().copied().flatten().unwrap_or(0);
                     if this_handle != 0 {
                         // IEEE 1800-2017 §8.20: a NON-virtual method (which
@@ -79668,11 +80297,27 @@ impl Simulator {
         let mut leaves = Vec::new();
         self.unpacked_struct_leaves(port_name, arg, &su, 0, &mut leaves);
         locals.insert(format!("{}.", port_name), Value::zero(1));
+        // A positional STRUCT pattern literal actual (`'{a, b}`) can't be read
+        // member-by-member (`.a` on a pattern returns x), so bind its evaluated
+        // parts positionally to the flat leaves when the shape matches.
+        let leaf_count = leaves.iter().filter(|(_, ce, _, _)| {
+            matches!(
+                ce.kind,
+                ExprKind::MemberAccess { .. } | ExprKind::Index { .. }
+            )
+        }).count();
+        let pattern_vals = self.eval_flat_struct_pattern(arg, leaf_count);
+        let mut leaf_pos = 0usize;
         let mut backs = Vec::new();
         for (key, caller_expr, w, is_real) in leaves {
             if copies_in {
-                let v = self.eval_expr(&caller_expr);
+                let v = if let Some(pv) = &pattern_vals {
+                    pv[leaf_pos].clone()
+                } else {
+                    self.eval_expr(&caller_expr)
+                };
                 locals.insert(key.clone(), v);
+                leaf_pos += 1;
             } else {
                 let seed = if is_real {
                     Value::from_f64(0.0)
@@ -79745,6 +80390,33 @@ impl Simulator {
         }
     }
 
+    /// If `arg` is a positional STRUCT ASSIGNMENT-PATTERN literal
+    /// (`'{a, b, c}`) with exactly the given number of flat members, evaluate
+    /// its parts in declaration order. `member-access` on a literal base
+    /// (`('{a,b}).x`) does not evaluate in this simulator, so binding a struct
+    /// formal from a literal via `arg.<member>` reads x — this lets the struct
+    /// bind paths consume a literal directly. Returns `None` when `arg` is not
+    /// a simple ordered pattern (caller falls back to member-access eval).
+    fn eval_flat_struct_pattern(&mut self, arg: &Expression, n: usize) -> Option<Vec<Value>> {
+        let ExprKind::AssignmentPattern(parts) = &arg.kind else {
+            return None;
+        };
+        if parts.len() != n {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        for p in parts.iter() {
+            // Positional only; keyed (`'{"name": v}`) and `default:` forms are
+            // not positionally ordinal.
+            if let crate::ast::expr::AssignmentPatternItem::Ordered(e) = p {
+                out.push(self.eval_expr(e));
+            } else {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
     fn bind_unpacked_struct_arg(
         &mut self,
         port_name: &str,
@@ -79796,21 +80468,36 @@ impl Simulator {
             return None;
         }
         let mut entries = Vec::new();
+        // A positional STRUCT pattern literal argument (`'{a, b}`) can't be
+        // read member-by-member (`.a` on a pattern returns x), so bind its
+        // evaluated parts positionally when the shape matches the flat members.
+        let flat_names: Vec<String> = su
+            .members
+            .iter()
+            .flat_map(|m| m.declarators.iter().map(|md| md.name.name.clone()))
+            .collect();
+        let pattern_vals = self.eval_flat_struct_pattern(arg, flat_names.len());
+        let mut member_pos = 0usize;
         for m in &su.members {
             for md in &m.declarators {
                 let fname = &md.name.name;
-                let member_expr = Expression::new(
-                    ExprKind::MemberAccess {
-                        expr: Box::new(arg.clone()),
-                        member: crate::ast::Identifier {
-                            name: fname.clone(),
-                            span: arg.span,
-                        },
-                    },
-                    arg.span,
-                );
-                let v = self.eval_expr(&member_expr);
                 let local_key = format!("{}.{}", port_name, fname);
+                let v = if let Some(pv) = &pattern_vals {
+                    pv[member_pos].clone()
+                } else {
+                    let member_expr = Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(arg.clone()),
+                            member: crate::ast::Identifier {
+                                name: fname.clone(),
+                                span: arg.span,
+                            },
+                        },
+                        arg.span,
+                    );
+                    self.eval_expr(&member_expr)
+                };
+                member_pos += 1;
                 locals.insert(local_key.clone(), v);
                 // Write-back lvalue: for a plain-identifier actual emit the
                 // hierarchical `Ident([s, a])` form (how source `s.a` parses)
@@ -80119,12 +80806,43 @@ impl Simulator {
         Some(out)
     }
 
+    ///  §6.21: build the shared persistent-cell key for a `static` subroutine
+    /// local, mirroring the key constructed at its declaration site (§8.25/
+    /// §6.21 specialization-aware prefixing). `None` when no sync frame that
+    /// DECLARES this name is open. The key's subroutine is the routine whose
+    /// body declared the static (found by scanning the open sync frames for
+    /// the one that registered `nm`) — NOT the innermost frame, which may be a
+    /// nested helper (e.g. a timing `wait_for` wrapper around a revived task
+    /// body) that merely surrounds the read/write without declaring `nm`.
+    fn static_local_key_for(&self, nm: &str) -> Option<String> {
+        let sub_name = self
+            .static_local_syncs
+            .iter()
+            .rev()
+            .find(|(_, syncs)| syncs.iter().any(|(n, _)| n == nm))
+            .map(|(n, _)| n.clone())?;
+        Some(match (self.class_context_stack.last().and_then(|c| c.as_ref()), self.current_spec.as_ref()) {
+            (Some(cn), Some((spec_base, sig))) if spec_base == cn => {
+                format!("{}#{}::{}::{}", cn, sig, sub_name, nm)
+            }
+            (Some(cn), _) => format!("{}::{}::{}", cn, sub_name, nm),
+            _ => format!("{}::{}", sub_name, nm),
+        })
+    }
+
     /// §6.21: on subroutine return, copy each `static` local's final value from
     /// the (about-to-be-popped) local frame back into the persistent store, then
     /// close this call's sync frame. Called before `local_stack` is popped.
     fn sync_static_locals(&mut self) {
         if let Some((_name, syncs)) = self.static_local_syncs.pop() {
             for (local_name, key) in syncs {
+                // Live-sourced statics keep `static_local_vars` authoritative
+                // (literal write-through + read-through); writing back the
+                // recursion-window snapshot here would clobber the committed
+                // value with a stale frame copy.
+                if self.static_local_names.contains(&local_name) {
+                    continue;
+                }
                 if let Some(v) = self.local_stack.last().and_then(|l| l.get(&local_name)) {
                     self.static_local_vars.insert(key, v.clone());
                 }
@@ -80230,6 +80948,18 @@ impl Simulator {
                     &args[i],
                     &mut locals,
                 ) {
+                    // §13.4.2: struct FORMALS bind member-wise (above) but are
+                    // skipped by the plain-formal registration, so
+                    // `register_formal_type_metadata` below never ran, and a
+                    // whole-struct reference to the formal (`y = arg`,
+                    // `return arg`) had no type, so `p_elem_type` missed it:
+                    // the RHS evaluated to a zeroed container instead of the
+                    // members. Register the same struct metadata here too.
+                    self.register_formal_type_metadata(
+                        &port.name.name,
+                        &port.data_type,
+                        port.dimensions.is_empty(),
+                    );
                     output_bindings.extend(backs);
                     continue;
                 }
@@ -82873,6 +83603,48 @@ impl Simulator {
                     return Some(ta);
                 }
             }
+        }
+        None
+    }
+
+    /// When the lvalue is a class MEMBER whose declared type is a TYPEDEF
+    /// ALIAS to a PARAMETERIZED class — e.g. UVM's
+    /// `typedef uvm_object_string_pool#(uvm_event#(uvm_object))
+    /// uvm_event_pool;  ...  uvm_event_pool event_pool;` — recover the
+    /// target specialization `(base, sig)` so a later
+    /// `event_pool = new(...)` binds the pool's `T` to the concrete
+    /// element (`uvm_event#(uvm_object)`) instead of the class default
+    /// (`uvm_object`). The field's own `#(...)` is empty (the args live on
+    /// the alias target), so `get_expr_type_name` returns just the base
+    /// class and `resolve_ctor_type_args` finds no args.
+    ///
+    /// Returns the specialization only when the member's raw declared type
+    /// is a typedef alias (not a direct class/`#` spelling). Walks the
+    /// `this`-instance inheritance chain so a base-class property (e.g.
+    /// `uvm_component.event_pool`) resolves from a derived component.
+    fn this_member_typedef_spec(&self, lvalue: &Expression) -> Option<(String, String)> {
+        let leaf = match &lvalue.kind {
+            ExprKind::Ident(h) => h.path.last()?.name.name.clone(),
+            ExprKind::MemberAccess { member, .. } => member.name.clone(),
+            _ => return None,
+        };
+        let h = self.this_stack.last().copied().flatten()?;
+        let this_cn = self.heap.get(h).and_then(|o| o.as_ref())?.class_name.clone();
+        let mut cur = Some(this_cn);
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(prop) = cd.properties.get(&leaf) {
+                if let Some(raw) = &prop.type_name {
+                    // `raw` is the declared type name. If it is a typedef
+                    // alias to a parameterized class, `resolve_typedef_spec`
+                    // follows it. Base classes / non-aliases yield None.
+                    if let Some(spec) = self.resolve_typedef_spec(raw) {
+                        return Some(spec);
+                    }
+                }
+                return None;
+            }
+            cur = cd.extends.clone();
         }
         None
     }
@@ -87136,7 +87908,7 @@ impl Simulator {
                     let all_unsigned = cvar_w.iter().all(|(_, s)| !*s);
                     self.constraint_cmp_unsigned = all_unsigned;
                     let coupled =
-                        self.solve_coupled_affine(&citems, &cvar_names, &cvar_dom, _trial);
+                        self.solve_coupled_affine(&citems, &cvar_names, &cvar_dom, _trial, Some(handle));
                     self.constraint_cmp_unsigned = false;
                     if let Some(pairs) = coupled {
                         for (col, val) in pairs {
@@ -87155,35 +87927,6 @@ impl Simulator {
                             }
                         }
                     }
-                }
-            }
-
-            // ---- §18.4 collection pipeline: SIZE, then SEED, then SOLVE ----
-            // A rand dynamic array whose `.size()` is constrained has no
-            // element set until it is sized, so element solving must follow
-            // sizing. `unique {}` runs last over the settled elements.
-            let mut pinned_elems: HashSet<String> = HashSet::default();
-            if !rand_colls.is_empty() {
-                self.solve_array_sizes(&rand_colls, &constraints);
-                // Fresh random baseline for every element of a dynamic /
-                // associative member (fixed arrays keep the legacy pool pass).
-                // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
-                // object handles that are randomized RECURSIVELY — never drawn
-                // as scalars, or the handle is overwritten with junk.
-                for c in &rand_colls {
-                    if c.kind == CollKind::Fixed || c.is_object_elem {
-                        continue;
-                    }
-                    for key in self.coll_elem_keys(c) {
-                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
-                        let v = self.draw_elem(c.width, prev);
-                        self.write_coll_elem(&key, v);
-                    }
-                }
-                self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
-                self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
-                for c in &unique_colls {
-                    self.enforce_unique_coll(c, &constraints, &pinned_elems);
                 }
             }
 
@@ -87286,6 +88029,39 @@ impl Simulator {
                 }
                 if !changed {
                     break;
+                }
+            }
+
+            // ---- §18.4 collection pipeline: SIZE, then SEED, then SOLVE ----
+            // Runs now, AFTER the scalar-equality propagation above. A rand
+            // dynamic array whose `.size()` is tied to a rand SCALAR
+            // (`m_data.size() == m.length` with `m.length == N`) is only
+            // size-able once the propagation has pinned the scalar to its
+            // constrained value; sizing it earlier yields the scalar's raw,
+            // unconstrained draw and the `.size() == m.length` acceptance then
+            // fails. `unique {}` runs last over the settled elements.
+            let mut pinned_elems: HashSet<String> = HashSet::default();
+            if !rand_colls.is_empty() {
+                self.solve_array_sizes(&rand_colls, &constraints);
+                // Fresh random baseline for every element of a dynamic /
+                // associative member (fixed arrays keep the legacy pool pass).
+                // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
+                // object handles that are randomized RECURSIVELY — never drawn
+                // as scalars, or the handle is overwritten with junk.
+                for c in &rand_colls {
+                    if c.kind == CollKind::Fixed || c.is_object_elem {
+                        continue;
+                    }
+                    for key in self.coll_elem_keys(c) {
+                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
+                        let v = self.draw_elem(c.width, prev);
+                        self.write_coll_elem(&key, v);
+                    }
+                }
+                self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
+                self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
+                for c in &unique_colls {
+                    self.enforce_unique_coll(c, &constraints, &pinned_elems);
                 }
             }
 
@@ -87703,6 +88479,41 @@ impl Simulator {
                 if rand_set.contains(n) {
                     return Some(n.clone());
                 }
+            }
+        }
+        None
+    }
+
+    /// §18.7 — an inline `obj.randomize() with { obj.member == … }` constraint
+    /// refers to the randomized object's own rand property through its
+    /// RECEIVER (the bare handle `obj`, possibly `obj.field`). The forcing
+    /// solver keys targets by the object's bare property name, so a prefixed
+    /// `obj.member` must be recognised as the bare `member` when `obj`
+    /// evaluates to the object currently being randomized (`handle`).
+    fn prefixed_self_member(
+        &mut self,
+        expr: &Expression,
+        handle: usize,
+        rand_set: &HashSet<String>,
+    ) -> Option<String> {
+        let ExprKind::MemberAccess { expr: recv, member } = &expr.kind
+        else {
+            return None;
+        };
+        let prop = member.name.clone();
+        if !rand_set.contains(&prop) {
+            return None;
+        }
+        let h = self.eval_expr(recv).to_u64().unwrap_or(0) as usize;
+        if h == handle {
+            return Some(prop);
+        }
+        // Inside the randomized frame the receiver LOCAL is out of scope
+        // (eval returns 0), so recognise it by name when it matches the
+        // `obj.randomize() with { obj.member … }` receiver.
+        if let Some(rn) = Self::plain_ident_name(recv) {
+            if self.rand_receiver.as_deref() == Some(&rn) {
+                return Some(prop);
             }
         }
         None
@@ -88660,6 +89471,14 @@ impl Simulator {
         right: &Expression,
         rand_set: &HashSet<String>,
     ) -> bool {
+        // §18.5: a `.size()` of a rand dynamic array is not a settled integral
+        // operand during the scalar fixpoint — it is empty until sized, so
+        // treating `arr.size() == N` as an affine equation in `N` would force
+        // `N := arr.size()` (= 0) and clobber a sibling `N == K`. The array
+        // sizing solver owns this coupling.
+        if self.is_rand_dyn_size_expr(handle, left) || self.is_rand_dyn_size_expr(handle, right) {
+            return false;
+        }
         let mut cands = self.affine_candidates(left, rand_set);
         for c in self.affine_candidates(right, rand_set) {
             if !cands.contains(&c) {
@@ -88841,6 +89660,55 @@ impl Simulator {
         self.set_prop_if_changed(handle, &target, p)
     }
 
+    /// Is `e` a `.size()` (`.size` / `.size()`) reference to a rand DYNAMIC
+    /// array / queue of the object `handle`? Used by the constraint solver so
+    /// an equality between a rand scalar and an as-yet-unsized collection
+    /// length does not force the scalar from the collection's current (empty)
+    /// size — the sizing phase owns that coupling.
+    fn is_rand_dyn_size_expr(&self, handle: usize, e: &Expression) -> bool {
+        let arr = match &e.kind {
+            ExprKind::Call { func, args } if args.is_empty() => match &func.kind {
+                ExprKind::MemberAccess { expr, member } if member.name == "size" => expr,
+                _ => return false,
+            },
+            ExprKind::MemberAccess { expr, member } if member.name == "size" => expr,
+            _ => return false,
+        };
+        let ExprKind::Ident(h) = &arr.kind else {
+            return false;
+        };
+        if h.path.len() != 1 {
+            return false;
+        }
+        let name = &h.path[0].name.name;
+        let cn = match self.heap.get(handle).and_then(|o| o.as_ref()) {
+            Some(inst) => inst.class_name.clone(),
+            None => return false,
+        };
+        let mut cur = Some(cn);
+        while let Some(c) = cur {
+            let Some(cd) = self.module.classes.get(&c) else { return false; };
+            if cd.queue_properties.contains_key(name) {
+                return true;
+            }
+            cur = cd.extends.clone();
+        }
+        false
+    }
+
+    /// Does a binary constraint expression couple a rand DYNAMIC-array length
+    /// through `.size()` on either operand? Used so such an item is not
+    /// blocked from (and not folded into) the coupled scalar solve.
+    fn expr_involves_dyn_size(&self, handle: usize, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Binary { left, right, .. } => {
+                self.is_rand_dyn_size_expr(handle, left)
+                    || self.is_rand_dyn_size_expr(handle, right)
+            }
+            _ => false,
+        }
+    }
+
     fn solve_forced(
         &mut self,
         handle: usize,
@@ -88917,13 +89785,38 @@ impl Simulator {
                     }
                     if let Some(v) = self.rand_lvalue_name(left, rand_set) {
                         if self.rand_lvalue_name(right, rand_set).is_none() {
+                            // §18.5: do not force a rand scalar from a rand
+                            // DYNAMIC-ARRAY `.size()` (`arr.size() == N`): the
+                            // array length is not settled yet, so its current
+                            // size is 0 and forcing `N := arr.size()` clobbers
+                            // a sibling constraint (`N == K`). The collection
+                            // sizing solver owns the coupling and sizes the
+                            // array to N once N is final.
+                            if !self.is_rand_dyn_size_expr(handle, right) {
+                                let val = self.eval_expr(right);
+                                return self.set_prop_if_changed(handle, &v, val);
+                            }
+                        }
+                    }
+                    if let Some(v) = self.rand_lvalue_name(right, rand_set) {
+                        if !self.is_rand_dyn_size_expr(handle, left) {
+                            let val = self.eval_expr(left);
+                            return self.set_prop_if_changed(handle, &v, val);
+                        }
+                    }
+                    // §18.7 — an inline `obj.randomize() with { obj.member == … }`
+                    // prefixed reference to the randomized object's own property.
+                    if let Some(v) = self.prefixed_self_member(left, handle, rand_set) {
+                        if !self.is_rand_dyn_size_expr(handle, right) {
                             let val = self.eval_expr(right);
                             return self.set_prop_if_changed(handle, &v, val);
                         }
                     }
-                    if let Some(v) = self.rand_lvalue_name(right, rand_set) {
-                        let val = self.eval_expr(left);
-                        return self.set_prop_if_changed(handle, &v, val);
+                    if let Some(v) = self.prefixed_self_member(right, handle, rand_set) {
+                        if !self.is_rand_dyn_size_expr(handle, left) {
+                            let val = self.eval_expr(left);
+                            return self.set_prop_if_changed(handle, &v, val);
+                        }
                     }
                     // §18.4: the target may be a member of an aggregate rand
                     // property, or a property of a `rand` object handle solved
@@ -90546,6 +91439,36 @@ impl Simulator {
                             None
                         };
                         if let Some(struct_entries) = struct_arg_binding {
+                            // §13.5.2: a struct METHOD formal binds member-wise (above) but
+                            // skips the scalar formal registration below, so `p_elem_type`
+                            // misses it and a whole-struct reference to the formal reads a
+                            // zeroed container. Register the same struct type metadata the
+                            // free-function path does — resolving a type-PARAMETER formal
+                            // (`function void f(T item)` with struct `T`) to its concrete
+                            // bound struct, like `bind_unpacked_struct_arg` does.
+                            let reg_dt = if let DataType::TypeReference { name: tn, .. } =
+                                &port.data_type
+                            {
+                                let cname = self
+                                    .heap
+                                    .get(handle)
+                                    .and_then(|o| o.as_ref())
+                                    .and_then(|i| i.type_bindings.get(&tn.name.name).cloned())
+                                    .or_else(|| self.resolve_type_param_binding(&tn.name.name))
+                                    .unwrap_or_else(|| tn.name.name.clone());
+                                self.module
+                                    .typedef_types
+                                    .get(&cname)
+                                    .cloned()
+                                    .unwrap_or_else(|| port.data_type.clone())
+                            } else {
+                                port.data_type.clone()
+                            };
+                            self.register_formal_type_metadata(
+                                &port.name.name,
+                                &reg_dt,
+                                port.dimensions.is_empty(),
+                            );
                             if matches!(
                                 port.direction,
                                 PortDirection::Output
@@ -91609,7 +92532,7 @@ impl Simulator {
                 // user class PROPERTY `seqprtzmb_catcher catcher;` when the
                 // property's `catcher = new()` resolves its type, so the
                 // base class is constructed and the derived `catch()`
-                // override never runs (UVM 04sync/.../06test_end_cleanup).
+                // override never runs (phasing cleanup).
                 //
                 // Only trust these maps when `name` is genuinely a local of
                 // the current scope. Two cases are genuine:
@@ -91722,6 +92645,41 @@ impl Simulator {
                     let bname = self.resolve_hier_name(bh);
                     if let Some(cn) = self.module.array_elem_class.get(&bname).cloned() {
                         return Some(cn);
+                    }
+                    // §8.20 + §6.20.3: a class-MEMBER array whose element
+                    // type is a TYPE PARAMETER (e.g. `PARAM pool[string]` in
+                    // a generic `class Base#(type PARAM)` = `uvm_pool#(T)`).
+                    // It has no compile-time `array_elem_class` entry because
+                    // the element type isn't concrete until specialization.
+                    // Resolve the field's type-param element type through the
+                    // current `this` instance's bindings so that `pool[k] =
+                    // new(...)` constructs the bound concrete class (`myitem`
+                    // for `Base#(myitem)`), not a null/empty handle.
+                    if let Some(h) = self.this_stack.last().copied().flatten() {
+                        if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
+                            let this_cn = inst.class_name.clone();
+                            let base = self
+                                .extract_spec_from_string(&this_cn)
+                                .map(|(b, _)| b)
+                                .unwrap_or(this_cn);
+                            if let Some(elem_decl) =
+                                self.class_prop_type_named(&base, &bname)
+                            {
+                                // Bound concrete type if the element's declared
+                                // type is a type param of `base`; else the
+                                // declared type itself.
+                                let concrete =
+                                    self.resolve_type_param_with(&elem_decl, &self.current_spec)
+                                        .unwrap_or(elem_decl);
+                                let cb = self
+                                    .extract_spec_from_string(&concrete)
+                                    .map(|(b, _)| b)
+                                    .unwrap_or_else(|| concrete.clone());
+                                if self.module.classes.contains_key(&cb) {
+                                    return Some(concrete);
+                                }
+                            }
+                        }
                     }
                 }
                 None
