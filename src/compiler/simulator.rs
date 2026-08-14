@@ -2854,6 +2854,10 @@ pub struct Simulator {
     /// drained into bytecode at compile time, so the fact is recorded here while
     /// it is still known.
     cont_driven: HashSet<usize>,
+    /// Names whose sole continuous driver was an identity port connect that
+    /// collapsed into a shared id. The dropped connect made them wire-typed
+    /// for a dump, and the shared id can't carry per-name typing.
+    collapsed_port_children: HashSet<String>,
     /// Sparse: signal_id → declared user type name (e.g. class/struct
     /// type for `MyClass h;`). Only populated for signals where the
     /// elaborator recorded a non-None `type_name` on the source
@@ -6469,6 +6473,7 @@ impl Simulator {
             warn_x_count: 0,
             warn_x_drivers: None,
             cont_driven: HashSet::default(),
+            collapsed_port_children: HashSet::default(),
             signal_type_names,
             time: 0,
             output: Vec::new(),
@@ -6982,6 +6987,9 @@ impl Simulator {
                 named_count
             );
         }
+        // Collapse identity port nets before anything resolves names to ids:
+        // per-node id caches make later re-pointing unreliable.
+        sim.collapse_identity_port_nets();
         sim.load_dpi_libraries();
         sim.bind_all_dpi_imports();
         // VPI modules register their $systf's before simulation starts. The
@@ -10991,6 +10999,7 @@ impl Simulator {
             );
             self.jit_nba_side_len = 0;
         }
+        self.collapse_identity_port_nets();
         self.compile_edge_blocks();
         // Intern each edge block's instance scope to a dense u32 so the `%m`
         // tracking in `exec_bytecode` compares integers, not strings. Blocks
@@ -15435,6 +15444,118 @@ impl Simulator {
         }
     }
 
+    /// §23.3.3: a whole-net identity port connection makes formal and actual
+    /// ONE net. Substitution already rewrites the child's READS to the
+    /// parent name, but the connect assign still re-drove the (mostly
+    /// unread) child-port signal on every parent change — on a 200-instance
+    /// RAM-macro bench those dead connects were ~85% of the settle work.
+    /// Collapse them at the ID level instead: point the child NAME at the
+    /// parent's signal id. Every remaining reader of the child name
+    /// (no-subst body reads, edge sensitivities, dumps, hierarchical
+    /// references) then transparently follows the one collapsed net, and
+    /// the connect assign becomes a self-copy that `build_comb_entries`
+    /// drops. Runs BEFORE edge-block compilation so bytecode binds the
+    /// collapsed ids.
+    fn collapse_identity_port_nets(&mut self) {
+        let mut collapsed = 0usize;
+        // A net the connect CA drives may have OTHER continuous drivers (a
+        // hierarchical TB assign, a shorted second output). Dropping the
+        // connect then loses multi-driver resolution, so only nets with
+        // exactly one continuous driver — the connect itself — collapse.
+        let mut ca_driver_counts: HashMap<String, u32> = HashMap::default();
+        for ca in &self.module.continuous_assigns {
+            let base = match &ca.lhs.kind {
+                ExprKind::Ident(h) => Some(h),
+                ExprKind::Index { expr, .. } => match &expr.kind {
+                    ExprKind::Ident(h) => Some(h),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(h) = base else { continue };
+            let name = if h.path.len() == 1 {
+                h.path[0].name.name.clone()
+            } else {
+                Self::resolve_hier_name_static(h, &self.module)
+            };
+            *ca_driver_counts.entry(name).or_insert(0) += 1;
+        }
+        // Chains (leaf -> mid -> top) resolve over multiple passes; they are
+        // short, and each pass only ever re-points names, so a small bound
+        // is plenty.
+        for _ in 0..8 {
+            let mut changed = false;
+            for ca in &self.module.continuous_assigns {
+                if ca.delay != 0 {
+                    continue;
+                }
+                let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&ca.lhs.kind, &ca.rhs.kind)
+                else {
+                    continue;
+                };
+                if lh.path.len() != 1
+                    || !lh.path[0].selects.is_empty()
+                    || !rh.path.iter().all(|s| s.selects.is_empty())
+                {
+                    continue;
+                }
+                // INPUT identity connects only (`u1.din = src`, rhs in parent
+                // scope): the child name re-points at the parent's id. Output
+                // connects (`snk = u1.dout`) must KEEP their propagation step:
+                // a waiter parked on the same edge reads the parent net before
+                // a blocking write in the child reaches it (reference-verified
+                // in scheduling::waiter_edge_ordering), so collapsing them is
+                // observably wrong, not just unprofitable.
+                if !ca.rhs_parent_scoped {
+                    continue;
+                }
+                let lhs_name = lh.path[0].name.name.as_str();
+                let rhs_name = Self::resolve_hier_name_static(rh, &self.module);
+                // Only connections the elaborator recorded as WHOLE-NET
+                // identity (the same predicate the dump-side fold trusts).
+                if self.module.port_aliases.get(lhs_name).map(String::as_str)
+                    != Some(rhs_name.as_str())
+                {
+                    continue;
+                }
+                let (child, parent) = (lhs_name, rhs_name.as_str());
+                // The net this connect drives is its CA lhs; require the
+                // connect to be that net's only continuous driver.
+                if ca_driver_counts.get(lhs_name).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                let (Some(&cid), Some(&pid)) = (
+                    self.signal_name_to_id.get(child),
+                    self.signal_name_to_id.get(parent),
+                ) else {
+                    continue;
+                };
+                if cid == pid {
+                    continue;
+                }
+                if self.signal_widths[cid] != self.signal_widths[pid]
+                    || self.signal_real[cid] != self.signal_real[pid]
+                    || self.module.events.contains(child)
+                    || self.module.events.contains(parent)
+                {
+                    continue;
+                }
+                self.signal_name_to_id.insert(child.into(), pid);
+                // The lhs is the name the dropped connect was driving; it
+                // stays wire-typed in dumps by NAME (the shared id can't say).
+                self.collapsed_port_children.insert(lhs_name.into());
+                collapsed += 1;
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+        if collapsed > 0 && std::env::var("XEZIM_DEBUG").is_ok() {
+            eprintln!("[NET-COLLAPSE] {} identity port nets collapsed", collapsed);
+        }
+    }
+
     fn compile_edge_blocks(&mut self) {
         use super::bytecode::BytecodeCompiler;
         let mut compiled = Vec::with_capacity(self.edge_blocks.len());
@@ -19006,8 +19127,12 @@ impl Simulator {
             if let ExprKind::Ident(lhs_hier) = &ca.lhs.kind {
                 if lhs_hier.path.iter().all(|s| s.selects.is_empty()) {
                     let n = Self::resolve_hier_name_static(lhs_hier, &self.module);
-                    if let Some(&id) = self.signal_name_to_id.get(n.as_str()) {
-                        self.cont_driven.insert(id);
+                    // A collapsed identity connect is a dropped self-copy, not
+                    // a driver of the shared id — the PARENT keeps its own kind.
+                    if !self.collapsed_port_children.contains(n.as_str()) {
+                        if let Some(&id) = self.signal_name_to_id.get(n.as_str()) {
+                            self.cont_driven.insert(id);
+                        }
                     }
                 }
             }
@@ -19065,6 +19190,12 @@ impl Simulator {
                         self.signal_name_to_id.get(dst_name.as_str()),
                         self.signal_name_to_id.get(src_name.as_str()),
                     ) {
+                        // A collapsed identity port net (see
+                        // `collapse_identity_port_nets`) leaves its connect
+                        // assign as a self-copy — drop it entirely.
+                        if dst_id == src_id {
+                            continue;
+                        }
                         let width = self.signal_widths[dst_id];
                         let delay = self.sdf_delays.get(dst_id).copied().unwrap_or(0);
                         if width == self.signal_widths[src_id] {
@@ -59108,6 +59239,11 @@ impl Simulator {
         // variable, so a continuous driver is proof there is no procedural one.
         // Typing these `reg` made GTKWave colour a driven net as a register.
         if self.cont_driven.contains(&id) {
+            return VcdVarKind::Wire;
+        }
+        // A collapsed child port shares the parent's id, so the id carries the
+        // parent's kind; the child name itself is port-connect-driven → wire.
+        if self.collapsed_port_children.contains(base) {
             return VcdVarKind::Wire;
         }
         if self.module.parameters.contains_key(base)
