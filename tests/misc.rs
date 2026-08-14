@@ -268,3 +268,5 @@ mod queue_ref_formal_shadowing;
 mod ref_struct_queue_and_local_shadow;
 #[path = "misc/nested_struct_string_member_display.rs"]
 mod nested_struct_string_member_display;
+#[path = "misc/package_property_assertions.rs"]
+mod package_property_assertions;

@@ -50072,6 +50072,45 @@ impl Simulator {
                                 a.expr.clone()
                             }
                         }
+                        // §16.6: `assert property (p(actuals));` — an
+                        // INSTANTIATION of a named property with a port
+                        // list. Resolve the body and substitute each formal
+                        // for its positional actual (the substitution walker
+                        // descends into SvaClocked, so a formal used as the
+                        // CLOCK — `p(clk, ...)` — binds too). Previously
+                        // this shape fell through unresolved and the assert
+                        // was silently dropped: it never passed, never
+                        // failed, and read as always-true.
+                        ExprKind::Call { func, args } => {
+                            let pname: Option<String> = match &func.kind {
+                                ExprKind::Ident(h)
+                                    if !h.path.is_empty()
+                                        && h.path.iter().all(|s| s.selects.is_empty()) =>
+                                {
+                                    Some(h.path.last().unwrap().name.name.clone())
+                                }
+                                _ => None,
+                            };
+                            let resolved = pname.and_then(|n| {
+                                let body = self.module.property_decls.get(&n).cloned()?;
+                                let formals =
+                                    self.module.property_params.get(&n).cloned().unwrap_or_default();
+                                let mut map: HashMap<String, Expression> = HashMap::default();
+                                for (i, f) in formals.iter().enumerate() {
+                                    if let Some(actual) = args.get(i) {
+                                        map.insert(f.clone(), actual.clone());
+                                    }
+                                }
+                                Some(super::elaborate::rewrite_expr(
+                                    &body,
+                                    "",
+                                    &map,
+                                    &std::collections::HashSet::new(),
+                                    &HashMap::default(),
+                                ))
+                            });
+                            resolved.unwrap_or_else(|| a.expr.clone())
+                        }
                         _ => a.expr.clone(),
                     };
                     // LRM §16.5: a `SvaClocked{clock, body}` body
