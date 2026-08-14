@@ -732,7 +732,11 @@ fn check_stream_widths(
     elab: &ElaboratedModule,
     errs: &mut Vec<String>,
 ) {
-    let vw = build_var_widths(items, elab);
+    // Raw-AST width scan: suppress clamp warnings (elaboration re-resolves
+    // every kept declaration and warns there; dead ones get elided instead).
+    let vw = xezim_core::elaborate::with_width_warnings_suppressed(|| {
+        build_var_widths(items, elab)
+    });
     for it in items {
         match it {
             ModuleItem::DataDeclaration(d) => {
