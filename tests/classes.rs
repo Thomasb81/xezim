@@ -57,10 +57,16 @@ mod constraint_algebra_inherit;
 mod constraint_array_sum;
 #[path = "classes/constraint_arrays_ordering.rs"]
 mod constraint_arrays_ordering;
+#[path = "classes/constraint_dyn_size_pinned_scalar.rs"]
+mod constraint_dyn_size_pinned_scalar;
 #[path = "classes/constraint_foreach_and_casts.rs"]
 mod constraint_foreach_and_casts;
 #[path = "classes/constraint_funcs_aggregates.rs"]
 mod constraint_funcs_aggregates;
+#[path = "classes/constraint_inline_enclosing_scope.rs"]
+mod constraint_inline_enclosing_scope;
+#[path = "classes/constraint_prefixed_inline_with.rs"]
+mod constraint_prefixed_inline_with;
 #[path = "classes/constraint_randc_soft_local.rs"]
 mod constraint_randc_soft_local;
 #[path = "classes/cov_covergroup_basic.rs"]
@@ -127,6 +133,8 @@ mod struct_with_class_handle;
 mod struct_output_inout_ref_formal;
 #[path = "classes/type_param_struct_formal.rs"]
 mod type_param_struct_formal;
+#[path = "classes/struct_formal_and_config_foreach.rs"]
+mod struct_formal_and_config_foreach;
 #[path = "classes/typename_param_class.rs"]
 mod typename_param_class;
 #[path = "classes/unpacked_struct_class_property_whole_value.rs"]

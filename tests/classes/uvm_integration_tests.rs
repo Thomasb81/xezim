@@ -1176,3 +1176,92 @@ fn uvm_1_2_ral_backdoor_peek_poke() {
         assert!(out.iter().any(|l| l.contains(pin)), "missing `{pin}`:\n{}", out.join("\n"));
     }
 }
+
+/// Sequence-field static type resolution inside a started `body()`.
+///
+/// `uvm_create(seq)` (and a bare `seq.get_type()` in `body()`) recovers the
+/// compile-time type of a sequence field that is still NULL by dispatching the
+/// registered `static get_type()` on the field's DECLARED type. Here `seq` is
+/// a `my_sequence` member of `top_seq`; `uvm_sequence_base` also defines a
+/// `static get_type()` (via `uvm_object_abstract_utils`), so the concrete
+/// member type must win. xezim's `receiver_static_class` used the loose
+/// `class_of_var` heuristic first, which drifted a `my_sequence` class member
+/// to `uvm_sequence_item`, so `uvm_create(seq)` asked the factory to build an
+/// abstract `uvm_sequence_base`, and `start_item(seq)` then saw a null item
+/// (NULLITM). Reference and xezim must both pick `my_sequence`.
+const SEQ_GET_TYPE_TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+class my_item extends uvm_sequence_item;
+  `uvm_object_utils(my_item)
+  function new(string name = "my_item"); super.new(name); endfunction
+endclass
+
+class my_sequence extends uvm_sequence #(my_item);
+  `uvm_object_utils(my_sequence)
+  function new(string name = "my_sequence"); super.new(name); endfunction
+endclass
+
+class top_seq extends uvm_sequence #(my_item);
+  `uvm_object_utils(top_seq)
+  my_sequence seq;
+  function new(string name = "top_seq"); super.new(name); endfunction
+  task body();
+    uvm_object_wrapper w = seq.get_type();
+    if (w != null && w.get_type_name() == "my_sequence")
+      $display("TEST_PASS");
+    else
+      $display("TEST_FAIL got=%s", (w==null)?"<null>":w.get_type_name());
+  endtask
+endclass
+
+class my_sqr extends uvm_sequencer #(my_item);
+  `uvm_component_utils(my_sqr)
+  function new(string name, uvm_component parent); super.new(name, parent); endfunction
+endclass
+
+class seq_test extends uvm_test;
+  `uvm_component_utils(seq_test)
+  my_sqr sq;
+  function new(string name = "seq_test", uvm_component parent = null); super.new(name, parent); endfunction
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    sq = my_sqr::type_id::create("sq", this);
+  endfunction
+  task run_phase(uvm_phase phase);
+    top_seq ts;
+    phase.raise_objection(this);
+    ts = new("ts");
+    ts.start(sq);
+    #1;
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module top;
+  initial run_test("seq_test");
+endmodule
+"#;
+
+/// 2020 `uvm_sequence.start()` + `uvm_create`-style `get_type` on a sequence
+/// FIELD (still null) must resolve to the concrete `my_sequence`, not the
+/// abstract `uvm_sequence_base` / `uvm_sequence_item`.
+#[test]
+fn uvm_2020_sequence_field_get_type_resolves_declared_type() {
+    let sim = run_uvm("1800.2-2020", &[], SEQ_GET_TYPE_TEST.to_string(), "top")
+        .expect("UVM 2020 sequence-field get_type test failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter().any(|m| m.contains("TEST_PASS")),
+        "sequence field get_type must resolve to my_sequence:
+{}",
+        out.join("\n")
+    );
+    assert!(
+        !out.iter().any(|m| m.contains("TEST_FAIL")),
+        "sequence field get_type mis-resolved:
+{}",
+        out.join("\n")
+    );
+}
