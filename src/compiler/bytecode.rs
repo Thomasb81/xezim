@@ -6173,3 +6173,244 @@ mod tests {
         assert!(matches!(insns[5], Insn::Nop));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Two-state lowering (P5). A comb block whose reads are all X-free at eval
+// time can run on plain u64 words: no 4-state masks, no `Value` clones, no
+// storage dispatch. `lower_two_state` translates a compiled block's insn
+// stream 1:1 into `TsInsn`s with STATICALLY-known widths and masks, bailing
+// (returning None) on anything whose 2-state semantics are not proven here:
+//
+// - signed loads/consts (2-state Resize only zero-extends; every lowered reg
+//   is unsigned by construction, so a Resize that widens is a no-op),
+// - out-of-STATIC-range selects (4-state reads produce X bits there),
+// - fill/real/wide(>64)/X-carrying constants,
+// - width-changing or real/wide writebacks,
+// - any opcode outside the proven set (branches, fallbacks, arrays, …).
+//
+// The eval site must additionally check, per evaluation: every signal in
+// `read_sigs` currently holds an X-free value (width ≤ 64 was proven at
+// lower time, so storage is Inline and `raw_bits` is exact), no forces are
+// active, and `warn_x` is off (the 2-state path skips its bookkeeping).
+// On any miss it falls back to the 4-state stream, which is always correct.
+// ---------------------------------------------------------------------------
+
+/// One two-state instruction. Register file is `u64`; every value is kept
+/// masked to its static width by construction (loads mask, ops that can
+/// carry beyond the width — none in the current set — would re-mask).
+#[derive(Debug, Clone)]
+pub enum TsInsn {
+    /// regs[d] = signal_table[sig] (raw value bits; proven X-free by the
+    /// eval-site prefilter).
+    LoadSig { d: u16, sig: u32 },
+    Const { d: u16, v: u64 },
+    /// regs[d] = bit `bit` of signal `sig`.
+    SigBit { d: u16, sig: u32, bit: u8 },
+    /// regs[d] = (signal >> lo) & mask.
+    SigRange { d: u16, sig: u32, lo: u8, mask: u64 },
+    /// regs[d] = bit `bit` of regs[s].
+    Bit { d: u16, s: u16, bit: u8 },
+    /// regs[d] = (regs[s] >> lo) & mask.
+    Range { d: u16, s: u16, lo: u8, mask: u64 },
+    Xor { d: u16, a: u16, b: u16 },
+    And { d: u16, a: u16, b: u16 },
+    Or { d: u16, a: u16, b: u16 },
+    /// regs[d] = !regs[s] & mask (mask = source width).
+    Not { d: u16, s: u16, mask: u64 },
+    XorC { d: u16, s: u16, k: u64 },
+    /// MSB-first parts, mirroring `Value::concat_refs`.
+    Concat { d: u16, parts: Box<[(u16, u8)]> },
+    /// In-place truncation (a `Resize` that narrows; widening is free).
+    Mask { d: u16, mask: u64 },
+    /// Write back `regs[s] & mask` to `sig` with change-detect + dirty
+    /// marking (the eval site mirrors the 4-state fast-path bookkeeping).
+    Store { sig: u32, s: u16, mask: u64 },
+}
+
+pub struct TwoStateBlock {
+    pub insns: Vec<TsInsn>,
+    pub num_regs: u32,
+    /// Deduped signals the block READS — the eval-site X-clean prefilter.
+    pub read_sigs: Box<[u32]>,
+}
+
+fn ts_mask(w: u32) -> u64 {
+    if w >= 64 { u64::MAX } else { (1u64 << w) - 1 }
+}
+
+pub fn lower_two_state(
+    cb: &CompiledBlock,
+    signal_widths: &[u32],
+    signal_signed: &[bool],
+    signal_real: &[bool],
+) -> Option<TwoStateBlock> {
+    let mut out: Vec<TsInsn> = Vec::with_capacity(cb.instructions.len());
+    // Static width per register; None = not yet defined / untracked.
+    let mut rw: Vec<Option<u32>> = vec![None; cb.num_regs as usize];
+    let mut reads: Vec<u32> = Vec::new();
+    let mut note_read = |sig: usize, reads: &mut Vec<u32>| {
+        let s32 = sig as u32;
+        if !reads.contains(&s32) {
+            reads.push(s32);
+        }
+    };
+    // A readable, X-free-checkable source signal for the prefilter.
+    let sig_ok = |sig: usize| -> bool {
+        sig < signal_widths.len() && signal_widths[sig] <= 64 && !signal_real[sig]
+    };
+    for insn in &cb.instructions {
+        match insn {
+            Insn::Nop => {}
+            // ClearSigned is a no-op here: every lowered register is unsigned
+            // by construction (signed sources bail below).
+            Insn::ClearSigned(_) => {}
+            Insn::LoadSignal(d, sig) => {
+                let sig = *sig as usize;
+                if !sig_ok(sig) || signal_signed[sig] {
+                    return None;
+                }
+                note_read(sig, &mut reads);
+                rw[*d as usize] = Some(signal_widths[sig]);
+                out.push(TsInsn::LoadSig { d: *d as u16, sig: sig as u32 });
+            }
+            Insn::LoadConst(d, k) => {
+                let (v, x) = if k.width <= 64 && !k.is_real { k.raw_bits() } else { return None };
+                if x != 0 || k.is_signed || k.is_fill {
+                    return None;
+                }
+                rw[*d as usize] = Some(k.width);
+                out.push(TsInsn::Const { d: *d as u16, v: v & ts_mask(k.width) });
+            }
+            Insn::LoadSignalBit(d, sig, idx) => {
+                let sig = *sig as usize;
+                if !sig_ok(sig) || *idx >= signal_widths[sig] {
+                    return None;
+                }
+                note_read(sig, &mut reads);
+                rw[*d as usize] = Some(1);
+                out.push(TsInsn::SigBit { d: *d as u16, sig: sig as u32, bit: *idx as u8 });
+            }
+            Insn::LoadSignalRange(d, sig, l, r) => {
+                let sig = *sig as usize;
+                let (hi, lo) = (*l.max(r), *l.min(r));
+                if !sig_ok(sig) || hi >= signal_widths[sig] {
+                    return None;
+                }
+                note_read(sig, &mut reads);
+                let w = hi - lo + 1;
+                rw[*d as usize] = Some(w);
+                out.push(TsInsn::SigRange {
+                    d: *d as u16,
+                    sig: sig as u32,
+                    lo: lo as u8,
+                    mask: ts_mask(w),
+                });
+            }
+            Insn::BitSelectConst(d, s, idx) => {
+                let sw = rw[*s as usize]?;
+                if *idx >= sw {
+                    return None;
+                }
+                rw[*d as usize] = Some(1);
+                out.push(TsInsn::Bit { d: *d as u16, s: *s as u16, bit: *idx as u8 });
+            }
+            Insn::RangeSelectConst(d, s, l, r) => {
+                let sw = rw[*s as usize]?;
+                let (hi, lo) = (*l.max(r), *l.min(r));
+                if hi >= sw {
+                    return None;
+                }
+                let w = hi - lo + 1;
+                rw[*d as usize] = Some(w);
+                out.push(TsInsn::Range {
+                    d: *d as u16,
+                    s: *s as u16,
+                    lo: lo as u8,
+                    mask: ts_mask(w),
+                });
+            }
+            Insn::BitXor(d, a, b) | Insn::BitAnd(d, a, b) | Insn::BitOr(d, a, b) => {
+                let (wa, wb) = (rw[*a as usize]?, rw[*b as usize]?);
+                // 4-state bitwise ops zero-extend the narrower operand to
+                // max(wa, wb); lowered registers are already zero-extended.
+                rw[*d as usize] = Some(wa.max(wb));
+                let (d, a, b) = (*d as u16, *a as u16, *b as u16);
+                out.push(match insn {
+                    Insn::BitXor(..) => TsInsn::Xor { d, a, b },
+                    Insn::BitAnd(..) => TsInsn::And { d, a, b },
+                    _ => TsInsn::Or { d, a, b },
+                });
+            }
+            Insn::BitNot(d, s) => {
+                let w = rw[*s as usize]?;
+                rw[*d as usize] = Some(w);
+                out.push(TsInsn::Not { d: *d as u16, s: *s as u16, mask: ts_mask(w) });
+            }
+            Insn::BinOpConst(d, s, k, BinOpConstKind::Xor) => {
+                let w = rw[*s as usize]?;
+                let (v, x) = if k.width <= 64 && !k.is_real { k.raw_bits() } else { return None };
+                if x != 0 || k.is_signed || k.is_fill {
+                    return None;
+                }
+                rw[*d as usize] = Some(w.max(k.width));
+                out.push(TsInsn::XorC {
+                    d: *d as u16,
+                    s: *s as u16,
+                    k: v & ts_mask(k.width),
+                });
+            }
+            Insn::Concat(d, parts) => {
+                let mut total = 0u32;
+                let mut lowered: Vec<(u16, u8)> = Vec::with_capacity(parts.len());
+                for &p in parts.iter() {
+                    let w = rw[p as usize]?;
+                    total += w;
+                    lowered.push((p as u16, w as u8));
+                }
+                if total > 64 || total == 0 {
+                    return None;
+                }
+                rw[*d as usize] = Some(total);
+                out.push(TsInsn::Concat { d: *d as u16, parts: lowered.into_boxed_slice() });
+            }
+            Insn::Resize(r, w) => {
+                let cur = rw[*r as usize]?;
+                if *w > 64 {
+                    return None;
+                }
+                if *w < cur {
+                    out.push(TsInsn::Mask { d: *r as u16, mask: ts_mask(*w) });
+                }
+                // Widening zero-extends — free for an unsigned register.
+                rw[*r as usize] = Some(*w);
+            }
+            Insn::BlockingAssign(sig, r, w) => {
+                let sig = *sig as usize;
+                let cur = rw[*r as usize]?;
+                // Same-width, non-real destination only: the 4-state slow
+                // path's fit/resize semantics are not reproduced here. A
+                // wider register than `w` is truncated by the store mask —
+                // matching the fast path's `src_v & mask`.
+                if sig >= signal_widths.len()
+                    || signal_widths[sig] != *w
+                    || *w > 64
+                    || signal_real[sig]
+                {
+                    return None;
+                }
+                let _ = cur;
+                out.push(TsInsn::Store { sig: sig as u32, s: *r as u16, mask: ts_mask(*w) });
+            }
+            _ => return None,
+        }
+    }
+    // A block that stores nothing is useless to run in 2-state.
+    if !out.iter().any(|i| matches!(i, TsInsn::Store { .. })) {
+        return None;
+    }
+    Some(TwoStateBlock {
+        insns: out,
+        num_regs: cb.num_regs,
+        read_sigs: reads.into_boxed_slice(),
+    })
+}
