@@ -613,6 +613,16 @@ macro_rules! write_sig {
     }};
 }
 
+/// Lazy two-state lowering state for one comb entry (see P5 lowering in
+/// bytecode.rs). `Arc` so the eval site can clone the handle out of `self`
+/// before running with `&mut self`.
+#[derive(Clone)]
+enum TsSlot {
+    Untried,
+    No,
+    Yes(std::sync::Arc<super::bytecode::TwoStateBlock>),
+}
+
 /// A combinatorial item (continuous assign or always @*/always_comb block)
 /// with pre-computed sensitivity set for efficient evaluation.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -4072,6 +4082,14 @@ pub struct Simulator {
     /// signal_id and comb_entry index fit comfortably in 32 bits at
     /// any practical design size.
     comb_dep_offsets: Vec<u32>,
+    /// Lazily-lowered two-state bodies for comb entries (P5): indexed by
+    /// entry, `Untried` until first evaluation. Cleared whenever the entry
+    /// list is rebuilt.
+    ts_comb: Vec<TsSlot>,
+    /// Two-state scratch register file (u64 words).
+    ts_regs: Vec<u64>,
+    /// Two-state eval hits, for the profile report.
+    prof_ts_evals: u64,
     comb_dep_entries: Vec<u32>,
     /// Bitvec: dirty_signals[signal_id] = true if signal changed since last settle.
     dirty_signals: Vec<bool>,
@@ -6781,6 +6799,9 @@ impl Simulator {
             comb_time0_deferred: Vec::new(),
             comb_time0_deferred_done: false,
             comb_dep_offsets: Vec::new(),
+            ts_comb: Vec::new(),
+            ts_regs: Vec::new(),
+            prof_ts_evals: 0,
             comb_dep_entries: Vec::new(),
             dirty_signals: vec![false; num_signals],
             dirty_list: Vec::new(),
@@ -15456,6 +15477,141 @@ impl Simulator {
     /// the connect assign becomes a self-copy that `build_comb_entries`
     /// drops. Runs BEFORE edge-block compilation so bytecode binds the
     /// collapsed ids.
+    /// P5 two-state fast path for one comb entry. Returns true when the
+    /// entry was fully evaluated in 2-state (the caller skips the 4-state
+    /// stream); false = run the normal path (not lowerable, X present on a
+    /// read, forces active, or warn-x bookkeeping needed).
+    fn try_two_state(
+        &mut self,
+        eidx: usize,
+        compiled: &super::bytecode::CompiledBlock,
+    ) -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_TWO_STATE").as_deref(), Ok("0"))
+        }) {
+            return false;
+        }
+        if eidx >= self.ts_comb.len() {
+            self.ts_comb.resize(eidx + 1, TsSlot::Untried);
+        }
+        if matches!(self.ts_comb[eidx], TsSlot::Untried) {
+            self.ts_comb[eidx] = match super::bytecode::lower_two_state(
+                compiled,
+                &self.signal_widths,
+                &self.signal_signed,
+                &self.signal_real,
+            ) {
+                Some(ts) => TsSlot::Yes(std::sync::Arc::new(ts)),
+                None => TsSlot::No,
+            };
+        }
+        let TsSlot::Yes(ts) = &self.ts_comb[eidx] else {
+            return false;
+        };
+        // Per-eval guards: no forces (stores bypass force filtering), no
+        // warn-x (its transition notes live on the 4-state path), and every
+        // read X-free (width ≤ 64 was proven at lower time, so storage is
+        // Inline and raw_bits is exact).
+        if !self.forced_signals.is_empty() || self.warn_x {
+            return false;
+        }
+        let ts = ts.clone();
+        for &s in ts.read_sigs.iter() {
+            let (_, x) = self.signal_table[s as usize].raw_bits();
+            if x != 0 {
+                return false;
+            }
+        }
+        self.exec_two_state(&ts);
+        self.prof_ts_evals += 1;
+        true
+    }
+
+    fn exec_two_state(&mut self, ts: &super::bytecode::TwoStateBlock) {
+        use super::bytecode::TsInsn;
+        let mut regs = std::mem::take(&mut self.ts_regs);
+        if regs.len() < ts.num_regs as usize {
+            regs.resize(ts.num_regs as usize, 0);
+        }
+        for insn in &ts.insns {
+            match insn {
+                TsInsn::LoadSig { d, sig } => {
+                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    regs[*d as usize] = v;
+                }
+                TsInsn::Const { d, v } => regs[*d as usize] = *v,
+                TsInsn::SigBit { d, sig, bit } => {
+                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    regs[*d as usize] = (v >> bit) & 1;
+                }
+                TsInsn::SigRange { d, sig, lo, mask } => {
+                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    regs[*d as usize] = (v >> lo) & mask;
+                }
+                TsInsn::Bit { d, s, bit } => {
+                    regs[*d as usize] = (regs[*s as usize] >> bit) & 1;
+                }
+                TsInsn::Range { d, s, lo, mask } => {
+                    regs[*d as usize] = (regs[*s as usize] >> lo) & mask;
+                }
+                TsInsn::Xor { d, a, b } => {
+                    regs[*d as usize] = regs[*a as usize] ^ regs[*b as usize];
+                }
+                TsInsn::And { d, a, b } => {
+                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                }
+                TsInsn::Or { d, a, b } => {
+                    regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
+                }
+                TsInsn::Not { d, s, mask } => {
+                    regs[*d as usize] = !regs[*s as usize] & mask;
+                }
+                TsInsn::XorC { d, s, k } => {
+                    regs[*d as usize] = regs[*s as usize] ^ k;
+                }
+                TsInsn::Concat { d, parts } => {
+                    let mut acc = 0u64;
+                    for &(r, w) in parts.iter() {
+                        acc = (acc << w) | regs[r as usize];
+                    }
+                    regs[*d as usize] = acc;
+                }
+                TsInsn::Mask { d, mask } => {
+                    regs[*d as usize] &= mask;
+                }
+                TsInsn::Store { sig, s, mask } => {
+                    let id = *sig as usize;
+                    let v = regs[*s as usize] & mask;
+                    let (dv, dx) = self.signal_table[id].raw_bits();
+                    if v != (dv & *mask) || (dx & *mask) != 0 {
+                        // Mirrors the 4-state BlockingAssign fast path's
+                        // bookkeeping exactly (dirty + after_signal_write).
+                        if self.signal_table[id].set_inline_bits(v, 0) {
+                            self.signal_table[id].is_signed = self.signal_signed[id];
+                        } else {
+                            // Width ≤ 64 was proven, so storage should be
+                            // Inline; keep a correct cold fallback anyway.
+                            let mut val =
+                                Value::from_u64(v, self.signal_widths[id]);
+                            val.is_signed = self.signal_signed[id];
+                            self.signal_table[id] = val;
+                        }
+                        if !self.dirty_signals[id] {
+                            self.dirty_signals[id] = true;
+                            self.dirty_list.push(id);
+                        }
+                        self.dirty_any = true;
+                        self.table_modified = true;
+                        self.after_signal_write(id);
+                    }
+                }
+            }
+        }
+        self.ts_regs = regs;
+    }
+
     fn collapse_identity_port_nets(&mut self) {
         let mut collapsed = 0usize;
         // A net the connect CA drives may have OTHER continuous drivers (a
@@ -18965,6 +19121,7 @@ impl Simulator {
         };
 
         self.comb_entries = cache.entries;
+        self.ts_comb.clear();
         self.comb_dep_offsets = cache.dep_offsets;
         self.comb_dep_entries = cache.dep_entries;
         self.comb_unresolved_idx = cache.unresolved_idx;
@@ -19029,6 +19186,8 @@ impl Simulator {
     }
 
     fn build_comb_entries(&mut self) {
+        // Entry indices are about to change — drop stale two-state bodies.
+        self.ts_comb.clear();
         if self.try_load_prepared_comb_cache() {
             return;
         }
@@ -26109,6 +26268,14 @@ impl Simulator {
         eprintln!("[PROF] settle_calls={} settle_iters={} max_iters={} entry_evals={} unresolved_entries={}/{}",
             self.settle_calls, self.settle_iters, self.max_settle_iters, self.entry_evals,
             unresolved, self.comb_entries.len());
+        eprintln!(
+            "[PROF] two_state_evals={} ({} entries lowered)",
+            self.prof_ts_evals,
+            self.ts_comb
+                .iter()
+                .filter(|s| matches!(s, TsSlot::Yes(_)))
+                .count()
+        );
             {
                 const NAMES: [&str; 12] = ["noop","fastcopy","dircopy","fastfanout","busfanout",
                     "andfanout","gate","udp","contassign_c","alwaysblk_c","contassign_ast","other"];
@@ -35509,6 +35676,12 @@ impl Simulator {
                         n_dc += 1;
                     }
                     CombItem::CompiledContAssign { compiled, .. } => {
+                        // P5: X-free evaluations run on u64 words. NO
+                        // `continue` — the worklist propagation after this
+                        // match must still see the stores' dirtied signals.
+                        if self.try_two_state(eidx, compiled) {
+                            n_dc += 1;
+                        } else {
                         // Native path (cfg-gated: compiled out of the default
                         // build entirely — a runtime check here measured
                         // +2.0%). rc 0 = ran; 1 = bailed pre-side-effect
@@ -35570,6 +35743,7 @@ impl Simulator {
                         // through `self` (which also forces the entry tables'
                         // base pointers to be re-derived on every iteration).
                         n_dc += 1;
+                        }
                     }
                     CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
                         // Factored AST eval (shared with the BSP settle driver).
@@ -35582,6 +35756,15 @@ impl Simulator {
                         }
                     }
                     CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                        // P5: X-free evaluations run on u64 words (a lowered
+                        // block has no fallbacks, so none of the scope /
+                        // timescale bookkeeping below applies to it).
+                        if self.try_two_state(eidx, compiled) {
+                            n_ab += 1;
+                            if self.proc_depth > 0 {
+                                self.note_comb_ran_in_process(eidx, &entries[eidx]);
+                            }
+                        } else {
                         // Bytecode path: BlockingAssign/NbaAssign insns mark
                         // dirty automatically; no pre/post value snapshot needed.
                         if self.vm_regs.len() < compiled.num_regs as usize {
@@ -35623,6 +35806,7 @@ impl Simulator {
                         n_ab += 1;
                         if self.proc_depth > 0 {
                             self.note_comb_ran_in_process(eidx, &entries[eidx]);
+                        }
                         }
                     }
                     // The three fused arms are the settle loop's highest-volume
