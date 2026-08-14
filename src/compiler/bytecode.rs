@@ -6256,6 +6256,21 @@ pub enum TsInsn {
     /// Nonblocking write: queue `regs[s] & mask` (width `w`) with §10.4.2
     /// last-write-wins and the eval-time elision, exactly as `NbaAssign`.
     StoreNba { sig: u32, s: u16, w: u32, mask: u64 },
+    /// Dynamic array-element read: eid = first + (regs[idx] - lo). ABORTS
+    /// the two-state run (caller re-runs 4-state) when the index is out of
+    /// range or the element holds X — both produce X in 4-state. Lowering
+    /// only admits this before any side-effecting op, so an abort is clean.
+    ElemLoad { d: u16, first: u32, lo: i64, hi: i64, idx: u16 },
+    /// Dynamic array-element NBA (`mem[waddr] <= v`): out-of-range DROPS
+    /// silently (4-state behavior); otherwise mirrors the NbaAssignArray
+    /// arm (elide-if-equal, then index+push).
+    ElemStoreNba { first: u32, lo: i64, hi: i64, idx: u16, s: u16, w: u32, mask: u64 },
+    /// Dynamic array-element blocking write; out-of-range drops silently.
+    ElemStore { first: u32, lo: i64, hi: i64, idx: u16, s: u16, mask: u64 },
+    /// Fused array-read-to-NBA (`q <= mem[raddr]`, NbaAssignArrayRead):
+    /// index comes from a SIGNAL; aborts on out-of-range or X element
+    /// (4-state queues an X value there).
+    NbaFromElem { dst: u32, first: u32, lo: i64, hi: i64, idx_sig: u32, w: u32 },
 }
 
 pub struct TwoStateBlock {
@@ -6281,6 +6296,7 @@ pub fn lower_two_state(
     signal_widths: &[u32],
     signal_signed: &[bool],
     signal_real: &[bool],
+    array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
 ) -> Option<TwoStateBlock> {
     let n = cb.instructions.len();
     let mut out: Vec<TsInsn> = Vec::with_capacity(n);
@@ -6288,6 +6304,12 @@ pub fn lower_two_state(
     // (possible for loop-var slots, which are mutable) bails: stream-order
     // width tracking can't represent it.
     let mut rw: Vec<Option<u32>> = vec![None; cb.num_regs as usize];
+    // Constant value per register (from LoadConst), for folding const-index
+    // array writes into static element stores. Cleared on any redefinition.
+    let mut rc: Vec<Option<u64>> = vec![None; cb.num_regs as usize];
+    // Once a side-effecting op is emitted, ABORTABLE ops (dynamic element
+    // reads) can no longer be admitted: an abort must leave no trace.
+    let mut side_effects = false;
     let mut reads_whole: Vec<u32> = Vec::new();
     let mut reads_slice: Vec<(u32, u16, u16)> = Vec::new();
     // idx_map[i] = lowered index of the first lowered insn at-or-after
@@ -6323,6 +6345,29 @@ pub fn lower_two_state(
     let sig_ok_slice = |sig: usize| -> bool {
         sig < signal_widths.len() && !signal_real[sig]
     };
+    // Static array span: (first_id, lo, hi) with elements proven narrow,
+    // unsigned, non-real (elements of one array share their declaration;
+    // the first element's metadata stands for all).
+    let array_span = |a: &ArrayOperand| -> Option<(usize, i64, i64)> {
+        let (first, lo, hi) = match a {
+            ArrayOperand::Dense { first_id, lo, hi, .. } => (*first_id, *lo, *hi),
+            ArrayOperand::Named(name) => {
+                let &(first, lo, hi) = array_first_id.get(name.as_str())?;
+                (first, lo, hi)
+            }
+        };
+        if hi < lo {
+            return None;
+        }
+        if first >= signal_widths.len()
+            || signal_widths[first] > 64
+            || signal_signed[first]
+            || signal_real[first]
+        {
+            return None;
+        }
+        Some((first, lo, hi))
+    };
     let clean_const = |k: &Value| -> Option<u64> {
         if k.width > 64 || k.is_real || k.is_signed || k.is_fill {
             return None;
@@ -6338,6 +6383,7 @@ pub fn lower_two_state(
                 Some(prev) if prev != w => return None,
                 _ => $rw[r] = Some(w),
             }
+            rc[r] = None;
         }};
     }
     for insn in &cb.instructions {
@@ -6359,6 +6405,7 @@ pub fn lower_two_state(
             Insn::LoadConst(d, k) => {
                 let v = clean_const(k)?;
                 def!(rw, *d, k.width);
+                rc[*d as usize] = Some(v);
                 out.push(TsInsn::Const { d: *d as u16, v });
             }
             Insn::LoadSignalBit(d, sig, idx) => {
@@ -6548,6 +6595,10 @@ pub fn lower_two_state(
                 // Redefinition width-conflict does not apply: Resize is a
                 // width CHANGE of the same value, not a second definition.
                 rw[*r as usize] = Some(*w);
+                // Keep const knowledge in sync with the (possible) truncation.
+                if let Some(k) = rc[*r as usize] {
+                    rc[*r as usize] = Some(k & ts_mask(*w));
+                }
             }
             Insn::BranchIfSignalFalse(sig, t, bit) => {
                 let sig = *sig as usize;
@@ -6594,6 +6645,7 @@ pub fn lower_two_state(
                 {
                     return None;
                 }
+                side_effects = true;
                 out.push(TsInsn::Store { sig: sig as u32, s: *r as u16, mask: ts_mask(*w) });
             }
             Insn::NbaAssign(sig, r, w) => {
@@ -6602,11 +6654,120 @@ pub fn lower_two_state(
                 if sig >= signal_widths.len() || *w > 64 || signal_real[sig] {
                     return None;
                 }
+                side_effects = true;
                 out.push(TsInsn::StoreNba {
                     sig: sig as u32,
                     s: *r as u16,
                     w: *w,
                     mask: ts_mask(*w),
+                });
+            }
+            Insn::LoadArrayElem(d, array, idx_reg) => {
+                // Abortable (X/out-of-range element read) — only admissible
+                // while nothing side-effecting has run.
+                if side_effects {
+                    return None;
+                }
+                let (first, lo, hi) = array_span(array)?;
+                rw[*idx_reg as usize]?;
+                let w = signal_widths[first];
+                def!(rw, *d, w);
+                out.push(TsInsn::ElemLoad {
+                    d: *d as u16,
+                    first: first as u32,
+                    lo,
+                    hi,
+                    idx: *idx_reg as u16,
+                });
+            }
+            Insn::NbaAssignArray(array, idx_reg, val_reg, w) => {
+                let (first, lo, hi) = array_span(array)?;
+                rw[*val_reg as usize]?;
+                if *w > 64 || signal_widths[first] != *w {
+                    return None;
+                }
+                side_effects = true;
+                if let Some(k) = rc[*idx_reg as usize] {
+                    // Const index folds to a static element target (an
+                    // out-of-range constant mirrors the silent 4-state drop
+                    // by emitting nothing).
+                    let ki = k as i64;
+                    if ki >= lo && ki <= hi {
+                        let eid = first + (ki - lo) as usize;
+                        out.push(TsInsn::StoreNba {
+                            sig: eid as u32,
+                            s: *val_reg as u16,
+                            w: *w,
+                            mask: ts_mask(*w),
+                        });
+                    }
+                } else {
+                    rw[*idx_reg as usize]?;
+                    out.push(TsInsn::ElemStoreNba {
+                        first: first as u32,
+                        lo,
+                        hi,
+                        idx: *idx_reg as u16,
+                        s: *val_reg as u16,
+                        w: *w,
+                        mask: ts_mask(*w),
+                    });
+                }
+            }
+            Insn::BlockingAssignArray(array, idx_reg, val_reg, w) => {
+                let (first, lo, hi) = array_span(array)?;
+                rw[*val_reg as usize]?;
+                if *w > 64 || signal_widths[first] != *w {
+                    return None;
+                }
+                side_effects = true;
+                if let Some(k) = rc[*idx_reg as usize] {
+                    let ki = k as i64;
+                    if ki >= lo && ki <= hi {
+                        let eid = first + (ki - lo) as usize;
+                        out.push(TsInsn::Store {
+                            sig: eid as u32,
+                            s: *val_reg as u16,
+                            mask: ts_mask(*w),
+                        });
+                    }
+                } else {
+                    rw[*idx_reg as usize]?;
+                    out.push(TsInsn::ElemStore {
+                        first: first as u32,
+                        lo,
+                        hi,
+                        idx: *idx_reg as u16,
+                        s: *val_reg as u16,
+                        mask: ts_mask(*w),
+                    });
+                }
+            }
+            Insn::NbaAssignArrayRead(dst, array, idx_sig, w) => {
+                // Reads an element (abortable on X/out-of-range) AND queues —
+                // the read must still precede every side effect.
+                if side_effects {
+                    return None;
+                }
+                let (first, lo, hi) = array_span(array)?;
+                let isig = *idx_sig as usize;
+                let d = *dst as usize;
+                if !sig_ok(isig)
+                    || *w > 64
+                    || d >= signal_widths.len()
+                    || signal_real[d]
+                {
+                    return None;
+                }
+                note_read(isig, 0, signal_widths[isig], true, &mut reads_whole, &mut reads_slice);
+                side_effects = true;
+                out.push(TsInsn::NbaFromElem {
+                    dst: *dst,
+                    first: first as u32,
+                    lo,
+                    hi,
+                    idx_sig: isig as u32,
+                    w: *w,
                 });
             }
             _ => return None,
@@ -6632,7 +6793,16 @@ pub fn lower_two_state(
     // A block that stores nothing is useless to run in 2-state.
     if !out
         .iter()
-        .any(|i| matches!(i, TsInsn::Store { .. } | TsInsn::StoreNba { .. }))
+        .any(|i| {
+            matches!(
+                i,
+                TsInsn::Store { .. }
+                    | TsInsn::StoreNba { .. }
+                    | TsInsn::ElemStore { .. }
+                    | TsInsn::ElemStoreNba { .. }
+                    | TsInsn::NbaFromElem { .. }
+            )
+        })
     {
         return None;
     }

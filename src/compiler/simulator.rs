@@ -15515,20 +15515,8 @@ impl Simulator {
                 &self.signal_widths,
                 &self.signal_signed,
                 &self.signal_real,
+                &self.array_first_id,
             );
-            if std::env::var("XZ_TS_DBG").is_ok() {
-                eprintln!(
-                    "[TS-LOWER] edge={} idx={} -> {} (insns={:?})",
-                    edge,
-                    eidx,
-                    if lowered.is_some() { "YES" } else { "no" },
-                    compiled
-                        .instructions
-                        .iter()
-                        .map(super::bytecode::insn_opcode_name)
-                        .collect::<Vec<_>>()
-                );
-            }
             let slots = if edge { &mut self.ts_edge } else { &mut self.ts_comb };
             slots[eidx] = match lowered {
                 Some(ts) => TsSlot::Yes(std::sync::Arc::new(ts)),
@@ -15563,23 +15551,28 @@ impl Simulator {
                 return false;
             }
         }
-        self.exec_two_state(ts);
+        if !self.exec_two_state(ts) {
+            return false;
+        }
         self.prof_ts_evals += 1;
         true
     }
 
-    fn exec_two_state(&mut self, ts: &super::bytecode::TwoStateBlock) {
+    /// Returns false when the run ABORTED (dynamic element read hit X or an
+    /// out-of-range index) — lowering guarantees no side effect has been
+    /// committed at that point, so the caller re-runs the 4-state stream.
+    fn exec_two_state(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
         if ts.has_ctrl {
-            self.exec_two_state_ctrl(ts);
+            self.exec_two_state_ctrl(ts)
         } else {
-            self.exec_two_state_line(ts);
+            self.exec_two_state_line(ts)
         }
     }
 
     /// Straight-line executor — no pc bookkeeping, compact codegen for the
     /// dominant comb shape. Control-flow variants are unreachable here
     /// (`has_ctrl` routed them to the pc-loop twin).
-    fn exec_two_state_line(&mut self, ts: &super::bytecode::TwoStateBlock) {
+    fn exec_two_state_line(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
         use super::bytecode::TsInsn;
         let mut regs = std::mem::take(&mut self.ts_regs);
         if regs.len() < ts.num_regs as usize {
@@ -15681,6 +15674,64 @@ impl Simulator {
                 TsInsn::Mask { d, mask } => {
                     regs[*d as usize] &= mask;
                 }
+                TsInsn::ElemLoad { d, first, lo, hi, idx } => {
+                    let i = regs[*idx as usize] as i64;
+                    if i < *lo || i > *hi {
+                        self.ts_regs = regs;
+                        return false;
+                    }
+                    let eid = *first as usize + (i - lo) as usize;
+                    let (v, x) = self.signal_table[eid].raw_bits();
+                    if x != 0 {
+                        self.ts_regs = regs;
+                        return false;
+                    }
+                    regs[*d as usize] = v;
+                }
+                TsInsn::ElemStoreNba { first, lo, hi, idx, s, w, mask } => {
+                    let i = regs[*idx as usize] as i64;
+                    if i >= *lo && i <= *hi {
+                        let eid = *first as usize + (i - lo) as usize;
+                        // Mirrors the NbaAssignArray arm: elide-if-equal,
+                        // then index + push (no prior-entry lookup).
+                        let val = Value::from_u64(regs[*s as usize] & mask, *w);
+                        if self.signal_table[eid] != val {
+                            self.nba_fast_index.insert(eid, self.nba_fast.len());
+                            self.nba_fast.push(NbaFast {
+                                block_index: 0,
+                                signal_id: eid,
+                                value: val,
+                            });
+                        } else {
+                            self.prof_nba_elided += 1;
+                        }
+                    }
+                    // Out-of-range: silent drop, as in 4-state.
+                }
+                TsInsn::ElemStore { first, lo, hi, idx, s, mask } => {
+                    let i = regs[*idx as usize] as i64;
+                    if i >= *lo && i <= *hi {
+                        let eid = *first as usize + (i - lo) as usize;
+                        let v = regs[*s as usize] & mask;
+                        self.ts_store(eid, v, *mask);
+                    }
+                }
+                TsInsn::NbaFromElem { dst, first, lo, hi, idx_sig, w } => {
+                    let (iv, _) = self.signal_table[*idx_sig as usize].raw_bits();
+                    let i = iv as i64;
+                    if i < *lo || i > *hi {
+                        self.ts_regs = regs;
+                        return false;
+                    }
+                    let eid = *first as usize + (i - lo) as usize;
+                    let (ev, ex) = self.signal_table[eid].raw_bits();
+                    if ex != 0 {
+                        self.ts_regs = regs;
+                        return false;
+                    }
+                    let m = if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 };
+                    self.ts_store_nba(*dst as usize, ev & m, *w);
+                }
                 TsInsn::Store { sig, s, mask } => {
                     let v = regs[*s as usize] & mask;
                     self.ts_store(*sig as usize, v, *mask);
@@ -15696,6 +15747,7 @@ impl Simulator {
             }
         }
         self.ts_regs = regs;
+        true
     }
 
     /// Writeback shared by both executors; mirrors the 4-state
@@ -15741,7 +15793,7 @@ impl Simulator {
         }
     }
 
-    fn exec_two_state_ctrl(&mut self, ts: &super::bytecode::TwoStateBlock) {
+    fn exec_two_state_ctrl(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
         use super::bytecode::TsInsn;
         let mut regs = std::mem::take(&mut self.ts_regs);
         if regs.len() < ts.num_regs as usize {
@@ -15883,6 +15935,64 @@ impl Simulator {
                     pc = *t as usize;
                     continue;
                 }
+                TsInsn::ElemLoad { d, first, lo, hi, idx } => {
+                    let i = regs[*idx as usize] as i64;
+                    if i < *lo || i > *hi {
+                        self.ts_regs = regs;
+                        return false;
+                    }
+                    let eid = *first as usize + (i - lo) as usize;
+                    let (v, x) = self.signal_table[eid].raw_bits();
+                    if x != 0 {
+                        self.ts_regs = regs;
+                        return false;
+                    }
+                    regs[*d as usize] = v;
+                }
+                TsInsn::ElemStoreNba { first, lo, hi, idx, s, w, mask } => {
+                    let i = regs[*idx as usize] as i64;
+                    if i >= *lo && i <= *hi {
+                        let eid = *first as usize + (i - lo) as usize;
+                        // Mirrors the NbaAssignArray arm: elide-if-equal,
+                        // then index + push (no prior-entry lookup).
+                        let val = Value::from_u64(regs[*s as usize] & mask, *w);
+                        if self.signal_table[eid] != val {
+                            self.nba_fast_index.insert(eid, self.nba_fast.len());
+                            self.nba_fast.push(NbaFast {
+                                block_index: 0,
+                                signal_id: eid,
+                                value: val,
+                            });
+                        } else {
+                            self.prof_nba_elided += 1;
+                        }
+                    }
+                    // Out-of-range: silent drop, as in 4-state.
+                }
+                TsInsn::ElemStore { first, lo, hi, idx, s, mask } => {
+                    let i = regs[*idx as usize] as i64;
+                    if i >= *lo && i <= *hi {
+                        let eid = *first as usize + (i - lo) as usize;
+                        let v = regs[*s as usize] & mask;
+                        self.ts_store(eid, v, *mask);
+                    }
+                }
+                TsInsn::NbaFromElem { dst, first, lo, hi, idx_sig, w } => {
+                    let (iv, _) = self.signal_table[*idx_sig as usize].raw_bits();
+                    let i = iv as i64;
+                    if i < *lo || i > *hi {
+                        self.ts_regs = regs;
+                        return false;
+                    }
+                    let eid = *first as usize + (i - lo) as usize;
+                    let (ev, ex) = self.signal_table[eid].raw_bits();
+                    if ex != 0 {
+                        self.ts_regs = regs;
+                        return false;
+                    }
+                    let m = if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 };
+                    self.ts_store_nba(*dst as usize, ev & m, *w);
+                }
                 TsInsn::Store { sig, s, mask } => {
                     let v = regs[*s as usize] & mask;
                     self.ts_store(*sig as usize, v, *mask);
@@ -15895,6 +16005,7 @@ impl Simulator {
             pc += 1;
         }
         self.ts_regs = regs;
+        true
     }
 
     fn collapse_identity_port_nets(&mut self) {
