@@ -65,6 +65,7 @@ static FUSED_BINOP_CONST: [std::sync::atomic::AtomicU64; BinOpConstKind::COUNT] 
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
 ];
 
 /// Static count of constant-operand ALU fusions performed, per
@@ -89,11 +90,13 @@ pub enum BinOpConstKind {
     Eq = 1,
     /// `dst = (src === K)` — same `Value` semantics as [`Insn::CaseEq`].
     CaseEq = 2,
+    /// `dst = src ^ K` — same `Value` semantics as [`Insn::BitXor`].
+    Xor = 3,
 }
 
 impl BinOpConstKind {
     /// Number of kinds; sizes the static fusion-count array.
-    pub const COUNT: usize = 3;
+    pub const COUNT: usize = 4;
 }
 
 /// Bytecode instruction set. Stack-free, register-based design.
@@ -440,6 +443,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::BinOpConst(_, _, _, BinOpConstKind::Add) => "AddC",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Eq) => "EqC",
         Insn::BinOpConst(_, _, _, BinOpConstKind::CaseEq) => "CaseEqC",
+        Insn::BinOpConst(_, _, _, BinOpConstKind::Xor) => "XorC",
         Insn::StmtFallback(..) => "Fallback",
         Insn::EvalExprFallback(..) => "EvalExpr",
     }
@@ -5087,6 +5091,54 @@ impl<'a> BytecodeCompiler<'a> {
             insns[i + 1] = Insn::Nop;
         }
 
+        // `if (a && b)` guard:
+        //   LoadSignal(r1,s1); LoadSignal(r2,s2); LogAnd(d,r1,r2);
+        //   BranchIfFalse(d,T)
+        //       → BranchIfSignalFalse(s1,T); BranchIfSignalFalse(s2,T)
+        // Equivalent under 4-state semantics: the body is skipped whenever
+        // `a && b` is not true, and testing the operands in sequence skips in
+        // exactly those cases (an X operand skips either way). Both operands
+        // are bare signal loads, so dropping the second test on an early skip
+        // loses no side effects.
+        if (mode & 8) != 0 && insns.len() >= 4 {
+            for i in 0..insns.len() - 3 {
+                let (&Insn::LoadSignal(r1, s1), &Insn::LoadSignal(r2, s2)) =
+                    (&insns[i], &insns[i + 1])
+                else {
+                    continue;
+                };
+                let Insn::LogAnd(d, a, b) = insns[i + 2] else {
+                    continue;
+                };
+                if a != r1 || b != r2 {
+                    continue;
+                }
+                let Insn::BranchIfFalse(cnd, t) = insns[i + 3] else {
+                    continue;
+                };
+                if cnd != d {
+                    continue;
+                }
+                if (i + 1..=i + 3).any(|x| is_target[x]) {
+                    continue;
+                }
+                // r1, r2 and d must be dead outside the quad.
+                let consumed = insns.iter().enumerate().any(|(x, ins)| {
+                    !(i..=i + 3).contains(&x)
+                        && (Self::insn_reads_reg(ins, r1)
+                            || Self::insn_reads_reg(ins, r2)
+                            || Self::insn_reads_reg(ins, d))
+                });
+                if consumed {
+                    continue;
+                }
+                insns[i] = Insn::BranchIfSignalFalse(s1, t, u32::MAX);
+                insns[i + 1] = Insn::BranchIfSignalFalse(s2, t, u32::MAX);
+                insns[i + 2] = Insn::Nop;
+                insns[i + 3] = Insn::Nop;
+            }
+        }
+
         for i in 0..insns.len() - 1 {
             let &Insn::LoadSignal(t, sig) = &insns[i] else {
                 continue;
@@ -5353,10 +5405,27 @@ impl<'a> BytecodeCompiler<'a> {
                 continue;
             };
             let c = *c;
-            // Index of the next instruction that survives `compact_nops`.
+            // Index of the next instruction that survives `compact_nops`,
+            // additionally stepping over `ClearSigned` sign scrubs: a scrub of
+            // the CONSTANT's register is absorbed into the boxed constant at
+            // fuse time; a scrub of any other register stays in place and
+            // still executes before the fused op (which lands at `j`, not `i`).
             let mut j = i + 1;
-            while j < insns.len() && matches!(insns[j], Insn::Nop) {
-                j += 1;
+            let mut const_scrub: Option<usize> = None;
+            loop {
+                if j >= insns.len() {
+                    break;
+                }
+                match insns[j] {
+                    Insn::Nop => j += 1,
+                    Insn::ClearSigned(r) => {
+                        if r == c {
+                            const_scrub = Some(j);
+                        }
+                        j += 1;
+                    }
+                    _ => break,
+                }
             }
             if j >= insns.len() {
                 continue;
@@ -5365,6 +5434,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::Add(d, l, r) if r == c => (d, l, BinOpConstKind::Add),
                 Insn::Eq(d, l, r) if r == c => (d, l, BinOpConstKind::Eq),
                 Insn::CaseEq(d, l, r) if r == c => (d, l, BinOpConstKind::CaseEq),
+                Insn::BitXor(d, l, r) if r == c => (d, l, BinOpConstKind::Xor),
                 _ => continue,
             };
             // `op(d, c, c)`: the left operand is the constant register too,
@@ -5378,20 +5448,24 @@ impl<'a> BytecodeCompiler<'a> {
             if (i + 1..=j).any(|x| is_target[x]) {
                 continue;
             }
-            let consumed = insns
-                .iter()
-                .enumerate()
-                .any(|(x, ins)| x != i && x != j && Self::insn_reads_reg(ins, c));
+            let consumed = insns.iter().enumerate().any(|(x, ins)| {
+                x != i && x != j && Some(x) != const_scrub && Self::insn_reads_reg(ins, c)
+            });
             if consumed {
                 continue;
             }
             // Take the boxed constant out of the `LoadConst` rather than
             // cloning a possibly-`Wide` `Value`.
-            let Insn::LoadConst(_, k) = std::mem::replace(&mut insns[i], Insn::Nop) else {
+            let Insn::LoadConst(_, mut k) = std::mem::replace(&mut insns[i], Insn::Nop) else {
                 unreachable!("just matched LoadConst")
             };
-            insns[i] = Insn::BinOpConst(d, l, k, kind);
-            insns[j] = Insn::Nop;
+            if let Some(sj) = const_scrub {
+                k.is_signed = false;
+                insns[sj] = Insn::Nop;
+            }
+            // The fused op replaces the BINOP's slot so any surviving
+            // `ClearSigned` of the left operand still runs first.
+            insns[j] = Insn::BinOpConst(d, l, k, kind);
             FUSED_BINOP_CONST[kind as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -5634,6 +5708,9 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::BinOpConst(d, s, k, kind) => {
                     let f = match kind {
                         BinOpConstKind::Eq | BinOpConstKind::CaseEq => Some((1, true)),
+                        // `bitwise_xor` has no single-width guarantee worth
+                        // proving here — leave the register width unknown.
+                        BinOpConstKind::Xor => None,
                         BinOpConstKind::Add => {
                             // Identical to the `Insn::LoadConst` arm's fact.
                             let kf = ok(k.width).map(|w| (w, !k.is_real && !k.is_fill));

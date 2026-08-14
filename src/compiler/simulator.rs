@@ -15626,6 +15626,20 @@ impl Simulator {
             compiler.top_module_name = Some(self.module.name.clone());
             if compiler.compile_stmt(&block.stmt) {
                 let cb = compiler.finish();
+                if let Ok(limit) = std::env::var("XZ_BC_DUMP") {
+                    let limit: usize = limit.parse().unwrap_or(0);
+                    if compiled.len() < limit {
+                        eprintln!(
+                            "[BC-DUMP] block#{} scope='{}' insns={:?}",
+                            compiled.len(),
+                            block.scope,
+                            cb.instructions
+                                .iter()
+                                .map(super::bytecode::insn_opcode_name)
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
                 if cb.num_regs > max_regs {
                     max_regs = cb.num_regs;
                 }
@@ -16308,6 +16322,7 @@ impl Simulator {
                         K::Add => vm_regs[d] = vm_regs[s].add(&**k),
                         K::Eq => vm_regs[d] = vm_regs[s].is_equal(&**k),
                         K::CaseEq => vm_regs[d] = vm_regs[s].case_eq(&**k),
+                        K::Xor => vm_regs[d] = vm_regs[s].bitwise_xor(&**k),
                     }
                 }
                 Insn::CasezEq(d, l, r) => {
@@ -16828,6 +16843,7 @@ impl Simulator {
                         K::Add => vm_regs[d] = vm_regs[s].add(&**k),
                         K::Eq => vm_regs[d] = vm_regs[s].is_equal(&**k),
                         K::CaseEq => vm_regs[d] = vm_regs[s].case_eq(&**k),
+                        K::Xor => vm_regs[d] = vm_regs[s].bitwise_xor(&**k),
                     }
                 }
                 Insn::CasezEq(d, l, r) => {
@@ -17773,6 +17789,7 @@ impl Simulator {
                             Some(e) => vm_store(&mut self.vm_regs[d], e as u64, 0, 1, false),
                             None => self.vm_regs[d] = self.vm_regs[s].case_eq(&**k),
                         },
+                        K::Xor => self.vm_regs[d] = self.vm_regs[s].bitwise_xor(&**k),
                     }
                 }
                 Insn::CasezEq(d, l, r) => {
@@ -25853,10 +25870,11 @@ impl Simulator {
         {
             let f = super::bytecode::binop_const_fusions();
             eprintln!(
-                "[FUSE] const-operand ALU fusions (static sites): Add={} Eq={} CaseEq={} total={}",
+                "[FUSE] const-operand ALU fusions (static sites): Add={} Eq={} CaseEq={} Xor={} total={}",
                 f[0],
                 f[1],
                 f[2],
+                f[3],
                 f.iter().sum::<u64>()
             );
         }
@@ -26566,6 +26584,7 @@ impl Simulator {
                 super::bytecode::BinOpConstKind::Add => "BinOpConstAdd",
                 super::bytecode::BinOpConstKind::Eq => "BinOpConstEq",
                 super::bytecode::BinOpConstKind::CaseEq => "BinOpConstCaseEq",
+                super::bytecode::BinOpConstKind::Xor => "BinOpConstXor",
             },
         }
     }
