@@ -35500,6 +35500,33 @@ impl Simulator {
                         lhs_id = self.get_lhs_signal_id(lhs);
                     }
                 }
+                // A HIERARCHICAL lhs writes into a foreign scope, but the RHS
+                // is lexical to the WRITING scope. The lhs resolution above
+                // ratchets name_resolve_hint to the TARGET's parent, under
+                // which a bare RHS name binds to a same-named net inside the
+                // target — a TB `assign dut.core.rst_in = grst_l` read the
+                // DUT's own dead `grst_l` and forwarded x forever (its clock
+                // sibling worked only because that name had no deep twin).
+                // Restore the entry's own hint before evaluating the RHS.
+                // Bare-lhs entries keep the write-derived hint set above —
+                // their operands ARE target-scoped (submodule pattern CAs).
+                fn lhs_is_hier(e: &Expression) -> bool {
+                    match &e.kind {
+                        ExprKind::MemberAccess { expr, .. }
+                        | ExprKind::Index { expr, .. }
+                        | ExprKind::RangeSelect { expr, .. } => lhs_is_hier(expr),
+                        ExprKind::Ident(h) => {
+                            h.path.len() > 1
+                                || h.path
+                                    .first()
+                                    .is_some_and(|s| s.name.name.contains('.'))
+                        }
+                        _ => false,
+                    }
+                }
+                if lhs_is_hier(lhs) {
+                    *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
+                }
                 let w = self.infer_lhs_width(lhs);
                 // §7.4.2/§10.9: `assign x = '{...}` (or `assign x[i] = '{...}`
                 // on an array of packed vectors) converts each item to the
@@ -36179,6 +36206,18 @@ impl Simulator {
                     CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
                         // Factored AST eval (shared with the BSP settle driver).
                         self.set_m_block_scope(entries[eidx].cold.scope_hint.as_deref());
+                        // `name_resolve_hint` is a ratchet every resolution
+                        // advances; without a reset here this entry resolves
+                        // bare names under whatever scope the PREVIOUS entry
+                        // left behind — and the shared-node cache then pins
+                        // the wrong binding forever. A TB's hierarchical
+                        // `assign dut.deep.rst_in = grst_l` evaluated after a
+                        // DUT-internal entry read the DUT's own dead `grst_l`
+                        // (the clock sibling worked only because its source
+                        // name had no deep twin). Same disease as the
+                        // edge-block fix in exec_bytecode.
+                        *self.name_resolve_hint.borrow_mut() =
+                            entries[eidx].cold.scope_hint.clone();
                         self.eval_ast_comb_entry(&entries[eidx]);
                         if self.proc_depth > 0
                             && matches!(entries[eidx].item, CombItem::AlwaysBlock { .. })
