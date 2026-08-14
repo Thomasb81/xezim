@@ -4229,6 +4229,12 @@ pub struct Simulator {
     // contiguous memory: edge_block_off[bi]..edge_block_off[bi+1] indexes
     // both reads_flat and snap_flat for block bi.
     edge_block_reads_flat: Vec<u32>,
+    /// Parallel to `edge_block_reads_flat`: the (lo, width) BIT SLICE of the
+    /// signal that the block actually reads. A full read of a narrow signal
+    /// is (0, width). A constant bit/part select of a WIDE bus records just
+    /// the selected slice, which is what lets a 1-bit synchronizer tap of a
+    /// 1000+-bit bus stay gateable (whole-signal raw_bits would alias).
+    edge_block_reads_meta: Vec<(u16, u16)>,
     edge_block_snap_flat: Vec<(u64, u64)>,
     edge_block_off: Vec<u32>,
     edge_block_snap_valid: Vec<bool>,
@@ -6816,6 +6822,7 @@ impl Simulator {
             sig_last_change: Vec::new(),
             flop_last_fire: Vec::new(),
             edge_block_reads_flat: Vec::new(),
+            edge_block_reads_meta: Vec::new(),
             edge_block_snap_flat: Vec::new(),
             edge_block_off: Vec::new(),
             edge_block_snap_valid: Vec::new(),
@@ -32434,7 +32441,9 @@ impl Simulator {
                             let mut differ = false;
                             for k in start..end {
                                 let sid = self.edge_block_reads_flat[k] as usize;
-                                let (v, x) = self.signal_table[sid].raw_bits();
+                                let (lo, w) = self.edge_block_reads_meta[k];
+                                let (v, x) =
+                                    Self::raw_bits_slice(&self.signal_table[sid], lo, w);
                                 let (sv, sx) = self.edge_block_snap_flat[k];
                                 if v != sv || x != sx {
                                     differ = true;
@@ -32462,11 +32471,13 @@ impl Simulator {
                         snap_check_delta += 1;
                         let st: &[Value] = &self.signal_table;
                         let reads: &[u32] = &self.edge_block_reads_flat;
+                        let mets: &[(u16, u16)] = &self.edge_block_reads_meta;
                         let snaps: &[(u64, u64)] = &self.edge_block_snap_flat;
                         let mut differ = false;
                         for k in start..end {
                             let sid = reads[k] as usize;
-                            let (v, x) = st[sid].raw_bits();
+                            let (lo, w) = mets[k];
+                            let (v, x) = Self::raw_bits_slice(&st[sid], lo, w);
                             let (sv, sx) = snaps[k];
                             if v != sv || x != sx {
                                 differ = true;
@@ -32503,11 +32514,13 @@ impl Simulator {
                     } else {
                         snap_check_delta += 1;
                         let snap = &self.edge_block_snap_flat[start..end];
+                        let mets = &self.edge_block_reads_meta[start..end];
                         let st = &self.signal_table;
                         let mut differ = false;
                         for k in 0..reads.len() {
                             let s = unsafe { *reads.get_unchecked(k) } as usize;
-                            let (v, x) = st[s].raw_bits();
+                            let (lo, w) = unsafe { *mets.get_unchecked(k) };
+                            let (v, x) = Self::raw_bits_slice(&st[s], lo, w);
                             let (sv, sx) = unsafe { *snap.get_unchecked(k) };
                             if v != sv || x != sx {
                                 differ = true;
@@ -32575,10 +32588,12 @@ impl Simulator {
                             // gather/scatter over registers-held bases.
                             let st: &[Value] = &self.signal_table;
                             let reads: &[u32] = &self.edge_block_reads_flat;
+                            let mets: &[(u16, u16)] = &self.edge_block_reads_meta;
                             let snaps: &mut [(u64, u64)] = &mut self.edge_block_snap_flat;
                             for k in start..end {
                                 let s = reads[k] as usize;
-                                snaps[k] = st[s].raw_bits();
+                                let (lo, w) = mets[k];
+                                snaps[k] = Self::raw_bits_slice(&st[s], lo, w);
                             }
                             self.edge_block_snap_valid[bi] = true;
                         }
@@ -57310,10 +57325,41 @@ impl Simulator {
     /// data-read sets (LoadSignal sids minus the block's edge sensitivity),
     /// marks blocks with dynamic reads non-gateable, and picks the main clock
     /// (the posedge edge-signal with the most flop fanout). No behavior change.
+    /// (v, x) raw bits of a `w`-bit slice of `signal_table[sid]` starting at
+    /// bit `lo`. For narrow signals this is a shift of `raw_bits`; for wide
+    /// ones the (<=64) bits are gathered individually — only slice entries of
+    /// gateable blocks ever take that path, and they are 1-few bits wide.
+    #[inline]
+    fn raw_bits_slice(v: &Value, lo: u16, w: u16) -> (u64, u64) {
+        let lo = lo as usize;
+        let w = w as usize;
+        if v.width as usize <= 64 {
+            let (rv, rx) = v.raw_bits();
+            let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            ((rv >> lo) & mask, (rx >> lo) & mask)
+        } else {
+            let mut rv = 0u64;
+            let mut rx = 0u64;
+            for i in 0..w.min(64) {
+                match v.get_bit(lo + i) {
+                    LogicBit::One => rv |= 1 << i,
+                    LogicBit::X => rx |= 1 << i,
+                    LogicBit::Z => {
+                        rv |= 1 << i;
+                        rx |= 1 << i;
+                    }
+                    LogicBit::Zero => {}
+                }
+            }
+            (rv, rx)
+        }
+    }
+
     fn build_event_measure_state(&mut self) {
         use super::bytecode::Insn;
         let nb = self.compiled_edge_blocks.len();
         let mut data_reads: Vec<Vec<u32>> = vec![Vec::new(); nb];
+        let mut data_metas: Vec<Vec<(u16, u16)>> = vec![Vec::new(); nb];
         let mut gateable: Vec<bool> = vec![false; nb];
         // Subtract ONLY true clock-generator signals (they toggle every cycle,
         // so they'd never let a flop skip). Keep reset/enable/gated-clock
@@ -57330,7 +57376,8 @@ impl Simulator {
                 continue;
             };
             let mut reads: Vec<u32> = Vec::new();
-            let mut seen: HashSet<u32> = HashSet::default();
+            let mut metas: Vec<(u16, u16)> = Vec::new();
+            let mut seen: HashSet<(u32, u16, u16)> = HashSet::default();
             let mut dynamic = false;
             // A block that escapes to the AST interpreter (`StmtFallback`, e.g.
             // its only effect is `$display`/`$monitor`) has side effects and
@@ -57341,14 +57388,37 @@ impl Simulator {
             for insn in &cb.instructions {
                 match insn {
                     Insn::StmtFallback(..) | Insn::EvalExprFallback(..) => opaque = true,
+                    // Constant bit/part selects record only the SLICE they
+                    // read (see `edge_block_reads_meta`); everything else is
+                    // a full-signal read.
+                    Insn::LoadSignalBit(_, s, idx) if *idx <= u16::MAX as u32 => {
+                        if seen.insert((*s as u32, *idx as u16, 1)) {
+                            reads.push(*s as u32);
+                            metas.push((*idx as u16, 1));
+                        }
+                    }
+                    Insn::LoadSignalRange(_, s, l, r) => {
+                        let lo = (*l).min(*r);
+                        let w = (*l).max(*r) - lo + 1;
+                        if lo <= u16::MAX as u32 && w <= 64 {
+                            if seen.insert((*s as u32, lo as u16, w as u16)) {
+                                reads.push(*s as u32);
+                                metas.push((lo as u16, w as u16));
+                            }
+                        } else {
+                            dynamic = true;
+                        }
+                    }
                     Insn::LoadSignal(_, s)
                     | Insn::LoadSignalSigned(_, s)
-                    | Insn::LoadSignalRange(_, s, _, _)
                     | Insn::LoadSignalBit(_, s, _)
-                    | Insn::BranchIfSignalFalse(s, _, _)
-                        if seen.insert(*s as u32) => {
+                    | Insn::BranchIfSignalFalse(s, _, _) => {
+                        let w = self.signal_widths[*s as usize].min(u16::MAX as u32) as u16;
+                        if seen.insert((*s as u32, 0, w)) {
                             reads.push(*s as u32);
+                            metas.push((0, w));
                         }
+                    }
                     // Partial (read-modify-write) assigns read the destination
                     // signal's current value as base, but NOT via a LoadSignal —
                     // so the preserved bits are an implicit input. Treat the dest
@@ -57359,10 +57429,13 @@ impl Simulator {
                     | Insn::NbaAssignBitDyn(s, ..)
                     | Insn::BlockingAssignRange(s, ..)
                     | Insn::BlockingAssignRangeDyn(s, ..)
-                    | Insn::BlockingAssignBitDyn(s, ..)
-                        if seen.insert(*s as u32) => {
+                    | Insn::BlockingAssignBitDyn(s, ..) => {
+                        let w = self.signal_widths[*s as usize].min(u16::MAX as u32) as u16;
+                        if seen.insert((*s as u32, 0, w)) {
                             reads.push(*s as u32);
+                            metas.push((0, w));
                         }
+                    }
                     Insn::LoadArrayElem(..) => dynamic = true,
                     // Fused `LoadSignal ; LoadArrayElem ; NbaAssign`. It READS
                     // the index signal (register it exactly as the LoadSignal
@@ -57372,8 +57445,10 @@ impl Simulator {
                     // dynamically addressed, so — as for the `LoadArrayElem` it
                     // replaced — the block must stay non-gateable.
                     Insn::NbaAssignArrayRead(_, _, s, _) => {
-                        if seen.insert(*s as u32) {
+                        let w = self.signal_widths[*s as usize].min(u16::MAX as u32) as u16;
+                        if seen.insert((*s as u32, 0, w)) {
                             reads.push(*s as u32);
+                            metas.push((0, w));
                         }
                         dynamic = true;
                     }
@@ -57387,13 +57462,24 @@ impl Simulator {
                 }
             }
             // Drop only true clock signals; keep reset/enable/data.
-            reads.retain(|s| !clock_sids.contains(s));
+            {
+                let mut i = 0;
+                while i < reads.len() {
+                    if clock_sids.contains(&reads[i]) {
+                        reads.swap_remove(i);
+                        metas.swap_remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
             // Wide-signal reads (>64b) would alias under raw_bits — degrade
             // those blocks to non-gateable to keep the fast (v,x) compare
             // sound. Most c910 flops read narrow ctrl/data bits.
-            let has_wide = reads.iter().any(|&s| self.signal_widths[s as usize] > 64);
+            let has_wide = metas.iter().any(|&(_, w)| w > 64);
             gateable[bi] = !dynamic && !has_wide && !opaque;
             data_reads[bi] = reads;
+            data_metas[bi] = metas;
         }
         self.edge_block_gateable = gateable;
         let tracked_signal_len = if self.armed_edge {
@@ -57424,16 +57510,19 @@ impl Simulator {
             // Non-gateable blocks contribute zero entries (offsets equal).
             let mut off: Vec<u32> = Vec::with_capacity(nb + 1);
             let mut flat_reads: Vec<u32> = Vec::new();
+            let mut flat_metas: Vec<(u16, u16)> = Vec::new();
             off.push(0);
             for bi in 0..nb {
                 if self.edge_block_gateable[bi] {
                     flat_reads.extend_from_slice(&data_reads[bi]);
+                    flat_metas.extend_from_slice(&data_metas[bi]);
                 }
                 off.push(flat_reads.len() as u32);
             }
             let total = flat_reads.len();
             self.edge_block_off = off;
             self.edge_block_reads_flat = flat_reads;
+            self.edge_block_reads_meta = flat_metas;
             self.edge_block_snap_flat = vec![(0u64, 0u64); total];
             self.edge_block_snap_valid = vec![false; nb];
             self.edge_block_change_streak = vec![0; nb];
@@ -57450,6 +57539,7 @@ impl Simulator {
             self.edge_block_data_reads = data_reads;
             self.edge_block_off = Vec::new();
             self.edge_block_reads_flat = Vec::new();
+            self.edge_block_reads_meta = Vec::new();
             self.edge_block_snap_flat = Vec::new();
             self.edge_block_snap_valid = Vec::new();
             self.edge_block_change_streak = Vec::new();
