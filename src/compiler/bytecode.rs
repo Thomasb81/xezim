@@ -3038,8 +3038,12 @@ impl<'a> BytecodeCompiler<'a> {
                     let ls = self.expr_signedness(left);
                     let rs = self.expr_signedness(right);
                     if ls == Some(false) || rs == Some(false) {
-                        self.emit(Insn::ClearSigned(l));
-                        self.emit(Insn::ClearSigned(r));
+                        if !self.operand_scrub_is_noop(left) {
+                            self.emit(Insn::ClearSigned(l));
+                        }
+                        if !self.operand_scrub_is_noop(right) {
+                            self.emit(Insn::ClearSigned(r));
+                        }
                     }
                     self.emit(Insn::Resize(l, ctx_width));
                     self.emit(Insn::Resize(r, ctx_width));
@@ -3062,8 +3066,12 @@ impl<'a> BytecodeCompiler<'a> {
                         let ls = self.expr_signedness(left);
                         let rs = self.expr_signedness(right);
                         if ls == Some(false) || rs == Some(false) {
-                            self.emit(Insn::ClearSigned(l));
-                            self.emit(Insn::ClearSigned(r));
+                            if !self.operand_scrub_is_noop(left) {
+                                self.emit(Insn::ClearSigned(l));
+                            }
+                            if !self.operand_scrub_is_noop(right) {
+                                self.emit(Insn::ClearSigned(r));
+                            }
                         }
                         self.emit(Insn::Resize(l, opw));
                         self.emit(Insn::Resize(r, opw));
@@ -3196,8 +3204,12 @@ impl<'a> BytecodeCompiler<'a> {
                     let ts = self.expr_signedness(then_expr);
                     let es = self.expr_signedness(else_expr);
                     if ts == Some(false) || es == Some(false) {
-                        self.emit(Insn::ClearSigned(then_reg));
-                        self.emit(Insn::ClearSigned(else_reg));
+                        if !self.operand_scrub_is_noop(then_expr) {
+                            self.emit(Insn::ClearSigned(then_reg));
+                        }
+                        if !self.operand_scrub_is_noop(else_expr) {
+                            self.emit(Insn::ClearSigned(else_reg));
+                        }
                     }
                     self.emit(Insn::Resize(then_reg, ctx_width));
                     self.emit(Insn::Resize(else_reg, ctx_width));
@@ -4686,6 +4698,88 @@ impl<'a> BytecodeCompiler<'a> {
     /// `Some(false)` is the only answer that changes codegen (it forces a
     /// zero-extending widen); anything uncertain returns `None` and keeps the
     /// historical sign-by-value-flag behavior.
+    /// True when compiling `e` provably leaves an UNSIGNED value in its
+    /// register at RUNTIME — stronger than §11.8.1's static judgment, which
+    /// says what the flag SHOULD be, not what the exec arms produce. The
+    /// §11.8.1 sites scrub such an operand with `ClearSigned`; when this
+    /// returns true that scrub is a no-op and is elided (16.5% of executed
+    /// insns on a comb-dense fabric were these scrubs).
+    ///
+    /// Proof obligations, per accepted shape:
+    /// - bit/part select of a plain signal: `Value::bit_select` /
+    ///   `range_select` construct `is_signed: false` on every path (fast,
+    ///   slow, zext, Wide→Wide — verified in value.rs).
+    /// - plain load of an unsigned signal: `LoadSignal` copies the table
+    ///   Value, and every table write path re-stamps `is_signed` from
+    ///   `signal_signed` before committing.
+    /// Idents that name params (compiled as `LoadConst` of the param value)
+    /// or arrays (element values keep their own flag) are REJECTED, as is
+    /// everything this fn doesn't recognise — a false `false` only keeps a
+    /// redundant scrub.
+    fn operand_scrub_is_noop(&self, e: &Expression) -> bool {
+        let plain_unsigned_signal = |h: &crate::ast::expr::HierarchicalIdentifier| -> bool {
+            if !h.path.iter().all(|s| s.selects.is_empty()) {
+                return false;
+            }
+            let name = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+            if self.arrays.contains_key(name)
+                || self.multi_dim_arrays.is_some_and(|m| m.contains(name))
+                || self.assoc_arrays.is_some_and(|m| m.contains_key(name))
+            {
+                return false;
+            }
+            if self.lookup_param_value(h).is_some() {
+                return false;
+            }
+            self.lookup_signal_id(h)
+                .is_some_and(|id| !self.signal_signed[id])
+        };
+        // Root of a select/member chain. A select is compiled as a
+        // value-select (unsigned result) UNLESS the chain roots in a
+        // CONTAINER name — array / assoc / multi-dim — whose element LOAD
+        // copies the stored element's own flag. A non-ident root (concat,
+        // binary result, call, …) always selects a plain register value.
+        fn chain_root(e: &Expression) -> Option<&crate::ast::expr::HierarchicalIdentifier> {
+            match &e.kind {
+                ExprKind::Paren(inner) => chain_root(inner),
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => chain_root(expr),
+                ExprKind::Ident(h) => Some(h),
+                _ => None,
+            }
+        }
+        let root_is_container = |e: &Expression| -> bool {
+            match chain_root(e) {
+                None => false,
+                Some(h) => {
+                    let name = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                    // Path-segment selects mean the flattened key differs
+                    // from `name` — refuse rather than mis-key the check.
+                    !h.path.iter().all(|s| s.selects.is_empty())
+                        || self.arrays.contains_key(name)
+                        || self.multi_dim_arrays.is_some_and(|m| m.contains(name))
+                        || self.assoc_arrays.is_some_and(|m| m.contains_key(name))
+                        || self
+                            .string_signals
+                            .is_some_and(|m| m.contains(name))
+                }
+            }
+        };
+        match &e.kind {
+            ExprKind::Paren(inner) => self.operand_scrub_is_noop(inner),
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                // Selects are unsigned on every exec path (bit_select /
+                // range_select construct is_signed:false) — regardless of
+                // the base's own flag — unless the "select" is really a
+                // container-element load.
+                !root_is_container(expr)
+            }
+            ExprKind::Ident(h) => plain_unsigned_signal(h),
+            _ => false,
+        }
+    }
+
     fn expr_signedness(&mut self, e: &Expression) -> Option<bool> {
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
