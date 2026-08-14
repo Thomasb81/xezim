@@ -154,3 +154,50 @@ endmodule
     );
     assert!(text.contains("TEST_PASS"), "same-name identity actual:\n{text}");
 }
+
+/// §23.3.3: an EXPRESSION actual over a parent net named like the child's
+/// FORMAL (`.d(d ^ 1)` where the parent also has a `d`). Reference-verified:
+/// the substituted actual keeps PARENT-scope resolution inside the child
+/// (child sees `src^1`, never double-applies the map), and the parent's own
+/// processes read the parent's `d` even right after the child's block ran
+/// (the resolve hint must not leak across edge blocks).
+#[test]
+fn expression_actual_name_collision_resolves_parent_scope() {
+    let text = run(
+        "expr_collide",
+        r#"module ff (input clk, input [31:0] d, output reg [31:0] q);
+  initial q = 0;
+  always @(posedge clk) begin
+    q <= d;
+    $display("CHILD d=%h", d);
+  end
+endmodule
+module tb_top;
+  reg clk = 0; always #5 clk = ~clk;
+  reg [31:0] src = 32'h11111111;
+  wire [31:0] d = src;
+  wire [31:0] q1;
+  ff u1 (.clk(clk), .d(d ^ 1), .q(q1));
+  integer cyc = 0;
+  always @(posedge clk) begin
+    src <= src + 32'h01010101;
+    cyc <= cyc + 1;
+    if (cyc >= 2 && cyc <= 3) $display("TOP src=%h d=%h u1d=%h q1=%h", src, d, u1.d, q1);
+    if (cyc == 4) $finish;
+  end
+endmodule
+"#,
+    );
+    // Child reads the PARENT d (src) through the substituted actual: src^1.
+    assert!(text.contains("CHILD d=11111110"), "child first sample:\n{text}");
+    assert!(text.contains("CHILD d=12121213"), "child second sample:\n{text}");
+    // Parent reads its own d (== src), u1.d == src^1, q1 == previous u1.d.
+    assert!(
+        text.contains("TOP src=13131313 d=13131313 u1d=13131312 q1=12121213"),
+        "parent cycle 2:\n{text}"
+    );
+    assert!(
+        text.contains("TOP src=14141414 d=14141414 u1d=14141415 q1=13131312"),
+        "parent cycle 3:\n{text}"
+    );
+}

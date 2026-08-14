@@ -17440,6 +17440,21 @@ impl Simulator {
             self.m_block_scope = mbs;
             self.m_block_scope_id = scope_id;
         }
+        // `name_resolve_hint` is a ratchet every resolution advances; without
+        // a reset here, a fallback stmt in THIS block resolves bare names
+        // under whatever scope the previous block or process left behind — a
+        // TOP-module `$display(d)` after a sub-instance block read the
+        // instance's same-named port copy. Install this block's own scope
+        // (None for a top block) so intra-block ratcheting still works but
+        // nothing leaks across blocks.
+        {
+            let scope = &self.edge_blocks[block_idx].scope;
+            *self.name_resolve_hint.borrow_mut() = if scope.is_empty() {
+                None
+            } else {
+                Some(scope.clone())
+            };
+        }
         // Fast path: if we JIT-compiled this block, call the native fn
         // directly. Zero-cost when the jit feature is off (jit_fns stays
         // empty; index returns None which short-circuits).
@@ -56039,6 +56054,32 @@ impl Simulator {
         // that guidance.
         if let Some(cached) = hier.cached_resolved_name.get() {
             return cached.clone();
+        }
+        // A parent-rooted ident (an EXPRESSION port actual substituted into a
+        // child body — see core's mark_actual_rooted): its name is already the
+        // absolute flattened parent name, and the executing child block's
+        // scope hint must NOT redirect it to a same-named child signal.
+        if hier.root.is_some() {
+            let raw = hier
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if self.signal_name_to_id.contains_key(raw.as_str())
+                || self.signals.contains_key(raw.as_str())
+                || self.module.arrays.contains_key(raw.as_str())
+                || self.module.arrays_2d.contains_key(raw.as_str())
+                || self.module.arrays_nd.contains_key(raw.as_str())
+                || self.module.dynamic_arrays.contains(raw.as_str())
+                || self.module.associative_arrays.contains_key(raw.as_str())
+                || self.module.struct_members.contains_key(raw.as_str())
+            {
+                let _ = hier.cached_resolved_name.set(raw.clone());
+                return raw;
+            }
+            // Not a table name (parameter, iterator var, …) — fall through to
+            // the normal resolution below.
         }
         // §23.6: `$root.` names the root scope and contributes nothing to
         // the flat key — strip it so `$root.tb.x` resolves exactly like the
