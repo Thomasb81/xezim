@@ -6196,8 +6196,8 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 /// One two-state instruction. Register file is `u64`; every value is kept
-/// masked to its static width by construction (loads mask, ops that can
-/// carry beyond the width — none in the current set — would re-mask).
+/// masked to its static width by construction. Branch targets are indices
+/// into the LOWERED stream (remapped from the 4-state stream's indices).
 #[derive(Debug, Clone)]
 pub enum TsInsn {
     /// regs[d] = signal_table[sig] (raw value bits; proven X-free by the
@@ -6218,13 +6218,41 @@ pub enum TsInsn {
     /// regs[d] = !regs[s] & mask (mask = source width).
     Not { d: u16, s: u16, mask: u64 },
     XorC { d: u16, s: u16, k: u64 },
+    /// regs[d] = (regs[s] == k) — 4-state Eq/CaseEq agree on clean values.
+    EqC { d: u16, s: u16, k: u64 },
+    /// Wrapping two's-complement at max operand width (`mask`); operands are
+    /// zero-extended (all lowered registers are unsigned).
+    Add { d: u16, a: u16, b: u16, mask: u64 },
+    Sub { d: u16, a: u16, b: u16, mask: u64 },
+    /// 1-bit comparison results; unsigned compare per §5.5.1 (either operand
+    /// unsigned ⇒ unsigned, and every lowered register is unsigned).
+    Eq { d: u16, a: u16, b: u16 },
+    Neq { d: u16, a: u16, b: u16 },
+    Lt { d: u16, a: u16, b: u16 },
+    Leq { d: u16, a: u16, b: u16 },
+    Gt { d: u16, a: u16, b: u16 },
+    Geq { d: u16, a: u16, b: u16 },
+    LogNot { d: u16, s: u16 },
+    LogAnd { d: u16, a: u16, b: u16 },
+    LogOr { d: u16, a: u16, b: u16 },
     /// MSB-first parts, mirroring `Value::concat_refs`.
     Concat { d: u16, parts: Box<[(u16, u8)]> },
     /// In-place truncation (a `Resize` that narrows; widening is free).
     Mask { d: u16, mask: u64 },
+    /// Jump to `t` when the signal (or its `bit`, when != u32::MAX) is zero.
+    /// The prefilter proved the signal X-free, so `!is_true` = `== 0`.
+    BrSigFalse { sig: u32, bit: u32, t: u32 },
+    /// Jump to `t` when regs[s] == 0 (4-state `BranchIfFalse` on a clean reg).
+    BrFalse { s: u16, t: u32 },
+    /// Jump to `t` when regs[s] != 0 (4-state `BranchUnlessZero`).
+    BrNz { s: u16, t: u32 },
+    Jmp { t: u32 },
     /// Write back `regs[s] & mask` to `sig` with change-detect + dirty
     /// marking (the eval site mirrors the 4-state fast-path bookkeeping).
     Store { sig: u32, s: u16, mask: u64 },
+    /// Nonblocking write: queue `regs[s] & mask` (width `w`) with §10.4.2
+    /// last-write-wins and the eval-time elision, exactly as `NbaAssign`.
+    StoreNba { sig: u32, s: u16, w: u32, mask: u64 },
 }
 
 pub struct TwoStateBlock {
@@ -6232,6 +6260,9 @@ pub struct TwoStateBlock {
     pub num_regs: u32,
     /// Deduped signals the block READS — the eval-site X-clean prefilter.
     pub read_sigs: Box<[u32]>,
+    /// Any branch/jump present. Straight-line blocks (the overwhelmingly
+    /// common comb shape) run a compact loop without the pc bookkeeping.
+    pub has_ctrl: bool,
 }
 
 fn ts_mask(w: u32) -> u64 {
@@ -6244,25 +6275,49 @@ pub fn lower_two_state(
     signal_signed: &[bool],
     signal_real: &[bool],
 ) -> Option<TwoStateBlock> {
-    let mut out: Vec<TsInsn> = Vec::with_capacity(cb.instructions.len());
-    // Static width per register; None = not yet defined / untracked.
+    let n = cb.instructions.len();
+    let mut out: Vec<TsInsn> = Vec::with_capacity(n);
+    // Static width per register. A register REDEFINED with a different width
+    // (possible for loop-var slots, which are mutable) bails: stream-order
+    // width tracking can't represent it.
     let mut rw: Vec<Option<u32>> = vec![None; cb.num_regs as usize];
     let mut reads: Vec<u32> = Vec::new();
+    // idx_map[i] = lowered index of the first lowered insn at-or-after
+    // 4-state index i (dropped insns map to their successor). Branch targets
+    // are rewritten through it in a fixup pass.
+    let mut idx_map: Vec<u32> = Vec::with_capacity(n + 1);
     let mut note_read = |sig: usize, reads: &mut Vec<u32>| {
         let s32 = sig as u32;
         if !reads.contains(&s32) {
             reads.push(s32);
         }
     };
-    // A readable, X-free-checkable source signal for the prefilter.
     let sig_ok = |sig: usize| -> bool {
         sig < signal_widths.len() && signal_widths[sig] <= 64 && !signal_real[sig]
     };
+    let clean_const = |k: &Value| -> Option<u64> {
+        if k.width > 64 || k.is_real || k.is_signed || k.is_fill {
+            return None;
+        }
+        let (v, x) = k.raw_bits();
+        if x != 0 { None } else { Some(v & ts_mask(k.width)) }
+    };
+    macro_rules! def {
+        ($rw:ident, $r:expr, $w:expr) => {{
+            let r = $r as usize;
+            let w = $w;
+            match $rw[r] {
+                Some(prev) if prev != w => return None,
+                _ => $rw[r] = Some(w),
+            }
+        }};
+    }
     for insn in &cb.instructions {
+        idx_map.push(out.len() as u32);
         match insn {
             Insn::Nop => {}
-            // ClearSigned is a no-op here: every lowered register is unsigned
-            // by construction (signed sources bail below).
+            // No-op here: every lowered register is unsigned by construction
+            // (signed sources bail below).
             Insn::ClearSigned(_) => {}
             Insn::LoadSignal(d, sig) => {
                 let sig = *sig as usize;
@@ -6270,16 +6325,13 @@ pub fn lower_two_state(
                     return None;
                 }
                 note_read(sig, &mut reads);
-                rw[*d as usize] = Some(signal_widths[sig]);
+                def!(rw, *d, signal_widths[sig]);
                 out.push(TsInsn::LoadSig { d: *d as u16, sig: sig as u32 });
             }
             Insn::LoadConst(d, k) => {
-                let (v, x) = if k.width <= 64 && !k.is_real { k.raw_bits() } else { return None };
-                if x != 0 || k.is_signed || k.is_fill {
-                    return None;
-                }
-                rw[*d as usize] = Some(k.width);
-                out.push(TsInsn::Const { d: *d as u16, v: v & ts_mask(k.width) });
+                let v = clean_const(k)?;
+                def!(rw, *d, k.width);
+                out.push(TsInsn::Const { d: *d as u16, v });
             }
             Insn::LoadSignalBit(d, sig, idx) => {
                 let sig = *sig as usize;
@@ -6287,7 +6339,7 @@ pub fn lower_two_state(
                     return None;
                 }
                 note_read(sig, &mut reads);
-                rw[*d as usize] = Some(1);
+                def!(rw, *d, 1);
                 out.push(TsInsn::SigBit { d: *d as u16, sig: sig as u32, bit: *idx as u8 });
             }
             Insn::LoadSignalRange(d, sig, l, r) => {
@@ -6298,7 +6350,7 @@ pub fn lower_two_state(
                 }
                 note_read(sig, &mut reads);
                 let w = hi - lo + 1;
-                rw[*d as usize] = Some(w);
+                def!(rw, *d, w);
                 out.push(TsInsn::SigRange {
                     d: *d as u16,
                     sig: sig as u32,
@@ -6311,7 +6363,7 @@ pub fn lower_two_state(
                 if *idx >= sw {
                     return None;
                 }
-                rw[*d as usize] = Some(1);
+                def!(rw, *d, 1);
                 out.push(TsInsn::Bit { d: *d as u16, s: *s as u16, bit: *idx as u8 });
             }
             Insn::RangeSelectConst(d, s, l, r) => {
@@ -6321,7 +6373,7 @@ pub fn lower_two_state(
                     return None;
                 }
                 let w = hi - lo + 1;
-                rw[*d as usize] = Some(w);
+                def!(rw, *d, w);
                 out.push(TsInsn::Range {
                     d: *d as u16,
                     s: *s as u16,
@@ -6331,9 +6383,7 @@ pub fn lower_two_state(
             }
             Insn::BitXor(d, a, b) | Insn::BitAnd(d, a, b) | Insn::BitOr(d, a, b) => {
                 let (wa, wb) = (rw[*a as usize]?, rw[*b as usize]?);
-                // 4-state bitwise ops zero-extend the narrower operand to
-                // max(wa, wb); lowered registers are already zero-extended.
-                rw[*d as usize] = Some(wa.max(wb));
+                def!(rw, *d, wa.max(wb));
                 let (d, a, b) = (*d as u16, *a as u16, *b as u16);
                 out.push(match insn {
                     Insn::BitXor(..) => TsInsn::Xor { d, a, b },
@@ -6343,21 +6393,87 @@ pub fn lower_two_state(
             }
             Insn::BitNot(d, s) => {
                 let w = rw[*s as usize]?;
-                rw[*d as usize] = Some(w);
+                def!(rw, *d, w);
                 out.push(TsInsn::Not { d: *d as u16, s: *s as u16, mask: ts_mask(w) });
             }
-            Insn::BinOpConst(d, s, k, BinOpConstKind::Xor) => {
-                let w = rw[*s as usize]?;
-                let (v, x) = if k.width <= 64 && !k.is_real { k.raw_bits() } else { return None };
-                if x != 0 || k.is_signed || k.is_fill {
-                    return None;
-                }
-                rw[*d as usize] = Some(w.max(k.width));
-                out.push(TsInsn::XorC {
-                    d: *d as u16,
-                    s: *s as u16,
-                    k: v & ts_mask(k.width),
+            // Wrapping at max operand width; zero-extension is the correct
+            // §11.8.1 widening because both registers are unsigned.
+            Insn::Add(d, a, b) | Insn::Sub(d, a, b) => {
+                let (wa, wb) = (rw[*a as usize]?, rw[*b as usize]?);
+                let w = wa.max(wb);
+                def!(rw, *d, w);
+                let (d, a, b) = (*d as u16, *a as u16, *b as u16);
+                out.push(if matches!(insn, Insn::Add(..)) {
+                    TsInsn::Add { d, a, b, mask: ts_mask(w) }
+                } else {
+                    TsInsn::Sub { d, a, b, mask: ts_mask(w) }
                 });
+            }
+            // 1-bit results. CaseEq/CaseNeq equal Eq/Neq on X-free values.
+            Insn::Eq(d, a, b) | Insn::CaseEq(d, a, b) => {
+                rw[*a as usize]?;
+                rw[*b as usize]?;
+                def!(rw, *d, 1);
+                out.push(TsInsn::Eq { d: *d as u16, a: *a as u16, b: *b as u16 });
+            }
+            Insn::Neq(d, a, b) => {
+                rw[*a as usize]?;
+                rw[*b as usize]?;
+                def!(rw, *d, 1);
+                out.push(TsInsn::Neq { d: *d as u16, a: *a as u16, b: *b as u16 });
+            }
+            // §5.5.1: unsigned compare when either operand is unsigned —
+            // always here, since every lowered register is unsigned.
+            Insn::Lt(d, a, b) | Insn::Leq(d, a, b) | Insn::Gt(d, a, b)
+            | Insn::Geq(d, a, b) => {
+                rw[*a as usize]?;
+                rw[*b as usize]?;
+                def!(rw, *d, 1);
+                let (d, a, b) = (*d as u16, *a as u16, *b as u16);
+                out.push(match insn {
+                    Insn::Lt(..) => TsInsn::Lt { d, a, b },
+                    Insn::Leq(..) => TsInsn::Leq { d, a, b },
+                    Insn::Gt(..) => TsInsn::Gt { d, a, b },
+                    _ => TsInsn::Geq { d, a, b },
+                });
+            }
+            Insn::LogNot(d, s) => {
+                rw[*s as usize]?;
+                def!(rw, *d, 1);
+                out.push(TsInsn::LogNot { d: *d as u16, s: *s as u16 });
+            }
+            Insn::LogAnd(d, a, b) | Insn::LogOr(d, a, b) => {
+                rw[*a as usize]?;
+                rw[*b as usize]?;
+                def!(rw, *d, 1);
+                let (d, a, b) = (*d as u16, *a as u16, *b as u16);
+                out.push(if matches!(insn, Insn::LogAnd(..)) {
+                    TsInsn::LogAnd { d, a, b }
+                } else {
+                    TsInsn::LogOr { d, a, b }
+                });
+            }
+            Insn::BinOpConst(d, s, k, kind) => {
+                let w = rw[*s as usize]?;
+                let v = clean_const(k)?;
+                match kind {
+                    BinOpConstKind::Xor => {
+                        def!(rw, *d, w.max(k.width));
+                        out.push(TsInsn::XorC { d: *d as u16, s: *s as u16, k: v });
+                    }
+                    BinOpConstKind::Eq | BinOpConstKind::CaseEq => {
+                        def!(rw, *d, 1);
+                        out.push(TsInsn::EqC { d: *d as u16, s: *s as u16, k: v });
+                    }
+                    BinOpConstKind::Add => {
+                        let wr = w.max(k.width);
+                        def!(rw, *d, wr);
+                        // Reuse Add via a synthetic const register? Keep it
+                        // simple: constant add is rare in comb cones — bail.
+                        let _ = wr;
+                        return None;
+                    }
+                }
             }
             Insn::Concat(d, parts) => {
                 let mut total = 0u32;
@@ -6370,7 +6486,7 @@ pub fn lower_two_state(
                 if total > 64 || total == 0 {
                     return None;
                 }
-                rw[*d as usize] = Some(total);
+                def!(rw, *d, total);
                 out.push(TsInsn::Concat { d: *d as u16, parts: lowered.into_boxed_slice() });
             }
             Insn::Resize(r, w) => {
@@ -6382,11 +6498,35 @@ pub fn lower_two_state(
                     out.push(TsInsn::Mask { d: *r as u16, mask: ts_mask(*w) });
                 }
                 // Widening zero-extends — free for an unsigned register.
+                // Redefinition width-conflict does not apply: Resize is a
+                // width CHANGE of the same value, not a second definition.
                 rw[*r as usize] = Some(*w);
+            }
+            Insn::BranchIfSignalFalse(sig, t, bit) => {
+                let sig = *sig as usize;
+                if !sig_ok(sig) {
+                    return None;
+                }
+                if *bit != u32::MAX && *bit >= signal_widths[sig] {
+                    return None;
+                }
+                note_read(sig, &mut reads);
+                out.push(TsInsn::BrSigFalse { sig: sig as u32, bit: *bit, t: *t });
+            }
+            Insn::BranchIfFalse(c, t) => {
+                rw[*c as usize]?;
+                out.push(TsInsn::BrFalse { s: *c as u16, t: *t });
+            }
+            Insn::BranchUnlessZero(s, t) => {
+                rw[*s as usize]?;
+                out.push(TsInsn::BrNz { s: *s as u16, t: *t });
+            }
+            Insn::Jump(t) => {
+                out.push(TsInsn::Jmp { t: *t });
             }
             Insn::BlockingAssign(sig, r, w) => {
                 let sig = *sig as usize;
-                let cur = rw[*r as usize]?;
+                rw[*r as usize]?;
                 // Same-width, non-real destination only: the 4-state slow
                 // path's fit/resize semantics are not reproduced here. A
                 // wider register than `w` is truncated by the store mask —
@@ -6398,19 +6538,62 @@ pub fn lower_two_state(
                 {
                     return None;
                 }
-                let _ = cur;
                 out.push(TsInsn::Store { sig: sig as u32, s: *r as u16, mask: ts_mask(*w) });
+            }
+            Insn::NbaAssign(sig, r, w) => {
+                let sig = *sig as usize;
+                rw[*r as usize]?;
+                if sig >= signal_widths.len() || *w > 64 || signal_real[sig] {
+                    return None;
+                }
+                out.push(TsInsn::StoreNba {
+                    sig: sig as u32,
+                    s: *r as u16,
+                    w: *w,
+                    mask: ts_mask(*w),
+                });
             }
             _ => return None,
         }
     }
+    idx_map.push(out.len() as u32);
+    // Fixup: branch targets were recorded as 4-state indices.
+    for insn in out.iter_mut() {
+        match insn {
+            TsInsn::BrSigFalse { t, .. }
+            | TsInsn::BrFalse { t, .. }
+            | TsInsn::BrNz { t, .. }
+            | TsInsn::Jmp { t } => {
+                let old = *t as usize;
+                if old >= idx_map.len() {
+                    return None;
+                }
+                *t = idx_map[old];
+            }
+            _ => {}
+        }
+    }
     // A block that stores nothing is useless to run in 2-state.
-    if !out.iter().any(|i| matches!(i, TsInsn::Store { .. })) {
+    if !out
+        .iter()
+        .any(|i| matches!(i, TsInsn::Store { .. } | TsInsn::StoreNba { .. }))
+    {
         return None;
     }
+    let has_ctrl = out.iter().any(|i| {
+        matches!(
+            i,
+            TsInsn::BrSigFalse { .. }
+                | TsInsn::BrFalse { .. }
+                | TsInsn::BrNz { .. }
+                | TsInsn::Jmp { .. }
+        )
+    });
     Some(TwoStateBlock {
         insns: out,
         num_regs: cb.num_regs,
         read_sigs: reads.into_boxed_slice(),
+        has_ctrl,
     })
 }
+

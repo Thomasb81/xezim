@@ -4086,6 +4086,8 @@ pub struct Simulator {
     /// entry, `Untried` until first evaluation. Cleared whenever the entry
     /// list is rebuilt.
     ts_comb: Vec<TsSlot>,
+    /// Same, for edge blocks (indexed like `compiled_edge_blocks`).
+    ts_edge: Vec<TsSlot>,
     /// Two-state scratch register file (u64 words).
     ts_regs: Vec<u64>,
     /// Two-state eval hits, for the profile report.
@@ -6800,6 +6802,7 @@ impl Simulator {
             comb_time0_deferred_done: false,
             comb_dep_offsets: Vec::new(),
             ts_comb: Vec::new(),
+            ts_edge: Vec::new(),
             ts_regs: Vec::new(),
             prof_ts_evals: 0,
             comb_dep_entries: Vec::new(),
@@ -15486,6 +15489,15 @@ impl Simulator {
         eidx: usize,
         compiled: &super::bytecode::CompiledBlock,
     ) -> bool {
+        self.try_two_state_in(eidx, compiled, false)
+    }
+
+    fn try_two_state_in(
+        &mut self,
+        eidx: usize,
+        compiled: &super::bytecode::CompiledBlock,
+        edge: bool,
+    ) -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
         if !*ON.get_or_init(|| {
@@ -15493,43 +15505,62 @@ impl Simulator {
         }) {
             return false;
         }
-        if eidx >= self.ts_comb.len() {
-            self.ts_comb.resize(eidx + 1, TsSlot::Untried);
+        let slots = if edge { &mut self.ts_edge } else { &mut self.ts_comb };
+        if eidx >= slots.len() {
+            slots.resize(eidx + 1, TsSlot::Untried);
         }
-        if matches!(self.ts_comb[eidx], TsSlot::Untried) {
-            self.ts_comb[eidx] = match super::bytecode::lower_two_state(
+        if matches!(slots[eidx], TsSlot::Untried) {
+            let lowered = super::bytecode::lower_two_state(
                 compiled,
                 &self.signal_widths,
                 &self.signal_signed,
                 &self.signal_real,
-            ) {
+            );
+            let slots = if edge { &mut self.ts_edge } else { &mut self.ts_comb };
+            slots[eidx] = match lowered {
                 Some(ts) => TsSlot::Yes(std::sync::Arc::new(ts)),
                 None => TsSlot::No,
             };
         }
-        let TsSlot::Yes(ts) = &self.ts_comb[eidx] else {
+        let slots = if edge { &self.ts_edge } else { &self.ts_comb };
+        let TsSlot::Yes(ts) = &slots[eidx] else {
             return false;
         };
-        // Per-eval guards: no forces (stores bypass force filtering), no
-        // warn-x (its transition notes live on the 4-state path), and every
-        // read X-free (width ≤ 64 was proven at lower time, so storage is
-        // Inline and raw_bits is exact).
+        let ts = ts.clone();
+        self.ts_guard_and_exec(&ts)
+    }
+
+    /// Per-eval guards + execution: no forces (stores bypass force
+    /// filtering), no warn-x (its transition notes live on the 4-state
+    /// path), and every read X-free (width ≤ 64 was proven at lower time,
+    /// so storage is Inline and raw_bits is exact).
+    fn ts_guard_and_exec(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
         if !self.forced_signals.is_empty() || self.warn_x {
             return false;
         }
-        let ts = ts.clone();
         for &s in ts.read_sigs.iter() {
             let (_, x) = self.signal_table[s as usize].raw_bits();
             if x != 0 {
                 return false;
             }
         }
-        self.exec_two_state(&ts);
+        self.exec_two_state(ts);
         self.prof_ts_evals += 1;
         true
     }
 
     fn exec_two_state(&mut self, ts: &super::bytecode::TwoStateBlock) {
+        if ts.has_ctrl {
+            self.exec_two_state_ctrl(ts);
+        } else {
+            self.exec_two_state_line(ts);
+        }
+    }
+
+    /// Straight-line executor — no pc bookkeeping, compact codegen for the
+    /// dominant comb shape. Control-flow variants are unreachable here
+    /// (`has_ctrl` routed them to the pc-loop twin).
+    fn exec_two_state_line(&mut self, ts: &super::bytecode::TwoStateBlock) {
         use super::bytecode::TsInsn;
         let mut regs = std::mem::take(&mut self.ts_regs);
         if regs.len() < ts.num_regs as usize {
@@ -15571,6 +15602,46 @@ impl Simulator {
                 TsInsn::XorC { d, s, k } => {
                     regs[*d as usize] = regs[*s as usize] ^ k;
                 }
+                TsInsn::EqC { d, s, k } => {
+                    regs[*d as usize] = (regs[*s as usize] == *k) as u64;
+                }
+                TsInsn::Add { d, a, b, mask } => {
+                    regs[*d as usize] =
+                        regs[*a as usize].wrapping_add(regs[*b as usize]) & mask;
+                }
+                TsInsn::Sub { d, a, b, mask } => {
+                    regs[*d as usize] =
+                        regs[*a as usize].wrapping_sub(regs[*b as usize]) & mask;
+                }
+                TsInsn::Eq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                }
+                TsInsn::Neq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] != regs[*b as usize]) as u64;
+                }
+                TsInsn::Lt { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] < regs[*b as usize]) as u64;
+                }
+                TsInsn::Leq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] <= regs[*b as usize]) as u64;
+                }
+                TsInsn::Gt { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] > regs[*b as usize]) as u64;
+                }
+                TsInsn::Geq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] >= regs[*b as usize]) as u64;
+                }
+                TsInsn::LogNot { d, s } => {
+                    regs[*d as usize] = (regs[*s as usize] == 0) as u64;
+                }
+                TsInsn::LogAnd { d, a, b } => {
+                    regs[*d as usize] =
+                        (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
+                }
+                TsInsn::LogOr { d, a, b } => {
+                    regs[*d as usize] =
+                        (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
+                }
                 TsInsn::Concat { d, parts } => {
                     let mut acc = 0u64;
                     for &(r, w) in parts.iter() {
@@ -15582,32 +15653,197 @@ impl Simulator {
                     regs[*d as usize] &= mask;
                 }
                 TsInsn::Store { sig, s, mask } => {
-                    let id = *sig as usize;
                     let v = regs[*s as usize] & mask;
-                    let (dv, dx) = self.signal_table[id].raw_bits();
-                    if v != (dv & *mask) || (dx & *mask) != 0 {
-                        // Mirrors the 4-state BlockingAssign fast path's
-                        // bookkeeping exactly (dirty + after_signal_write).
-                        if self.signal_table[id].set_inline_bits(v, 0) {
-                            self.signal_table[id].is_signed = self.signal_signed[id];
-                        } else {
-                            // Width ≤ 64 was proven, so storage should be
-                            // Inline; keep a correct cold fallback anyway.
-                            let mut val =
-                                Value::from_u64(v, self.signal_widths[id]);
-                            val.is_signed = self.signal_signed[id];
-                            self.signal_table[id] = val;
-                        }
-                        if !self.dirty_signals[id] {
-                            self.dirty_signals[id] = true;
-                            self.dirty_list.push(id);
-                        }
-                        self.dirty_any = true;
-                        self.table_modified = true;
-                        self.after_signal_write(id);
+                    self.ts_store(*sig as usize, v, *mask);
+                }
+                TsInsn::StoreNba { sig, s, w, mask } => {
+                    let v = regs[*s as usize] & mask;
+                    self.ts_store_nba(*sig as usize, v, *w);
+                }
+                TsInsn::BrSigFalse { .. }
+                | TsInsn::BrFalse { .. }
+                | TsInsn::BrNz { .. }
+                | TsInsn::Jmp { .. } => unreachable!("ctrl insn in straight-line block"),
+            }
+        }
+        self.ts_regs = regs;
+    }
+
+    /// Writeback shared by both executors; mirrors the 4-state
+    /// BlockingAssign fast path's bookkeeping exactly (dirty +
+    /// after_signal_write, which also records §9.2 edge-exec writes).
+    #[inline]
+    fn ts_store(&mut self, id: usize, v: u64, mask: u64) {
+        let (dv, dx) = self.signal_table[id].raw_bits();
+        if v != (dv & mask) || (dx & mask) != 0 {
+            if self.signal_table[id].set_inline_bits(v, 0) {
+                self.signal_table[id].is_signed = self.signal_signed[id];
+            } else {
+                let mut val = Value::from_u64(v, self.signal_widths[id]);
+                val.is_signed = self.signal_signed[id];
+                self.signal_table[id] = val;
+            }
+            if !self.dirty_signals[id] {
+                self.dirty_signals[id] = true;
+                self.dirty_list.push(id);
+            }
+            self.dirty_any = true;
+            self.table_modified = true;
+            self.after_signal_write(id);
+        }
+    }
+
+    /// NBA writeback: exact mirror of the `NbaAssign` exec arm — §10.4.2
+    /// last-write-wins via nba_fast_index, eval-time elision otherwise.
+    #[inline]
+    fn ts_store_nba(&mut self, id: usize, v: u64, w: u32) {
+        let val = Value::from_u64(v, w);
+        if let Some(i) = self.nba_fast_index.get(id) {
+            self.nba_fast[i].value = val;
+        } else if self.signal_table[id] != val {
+            self.nba_fast_index.insert(id, self.nba_fast.len());
+            self.nba_fast.push(NbaFast {
+                block_index: 0,
+                signal_id: id,
+                value: val,
+            });
+        } else {
+            self.prof_nba_elided += 1;
+        }
+    }
+
+    fn exec_two_state_ctrl(&mut self, ts: &super::bytecode::TwoStateBlock) {
+        use super::bytecode::TsInsn;
+        let mut regs = std::mem::take(&mut self.ts_regs);
+        if regs.len() < ts.num_regs as usize {
+            regs.resize(ts.num_regs as usize, 0);
+        }
+        // Raw-ptr walk mirrors exec_insns: the indexed form's bounds check
+        // per instruction cost ~14% on a comb-dense fabric. Targets were
+        // range-checked against the lowered stream at fixup time.
+        let insns_ptr = ts.insns.as_ptr();
+        let insns_len = ts.insns.len();
+        let mut pc = 0usize;
+        while pc < insns_len {
+            match unsafe { &*insns_ptr.add(pc) } {
+                TsInsn::LoadSig { d, sig } => {
+                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    regs[*d as usize] = v;
+                }
+                TsInsn::Const { d, v } => regs[*d as usize] = *v,
+                TsInsn::SigBit { d, sig, bit } => {
+                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    regs[*d as usize] = (v >> bit) & 1;
+                }
+                TsInsn::SigRange { d, sig, lo, mask } => {
+                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    regs[*d as usize] = (v >> lo) & mask;
+                }
+                TsInsn::Bit { d, s, bit } => {
+                    regs[*d as usize] = (regs[*s as usize] >> bit) & 1;
+                }
+                TsInsn::Range { d, s, lo, mask } => {
+                    regs[*d as usize] = (regs[*s as usize] >> lo) & mask;
+                }
+                TsInsn::Xor { d, a, b } => {
+                    regs[*d as usize] = regs[*a as usize] ^ regs[*b as usize];
+                }
+                TsInsn::And { d, a, b } => {
+                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                }
+                TsInsn::Or { d, a, b } => {
+                    regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
+                }
+                TsInsn::Not { d, s, mask } => {
+                    regs[*d as usize] = !regs[*s as usize] & mask;
+                }
+                TsInsn::XorC { d, s, k } => {
+                    regs[*d as usize] = regs[*s as usize] ^ k;
+                }
+                TsInsn::EqC { d, s, k } => {
+                    regs[*d as usize] = (regs[*s as usize] == *k) as u64;
+                }
+                TsInsn::Add { d, a, b, mask } => {
+                    regs[*d as usize] =
+                        regs[*a as usize].wrapping_add(regs[*b as usize]) & mask;
+                }
+                TsInsn::Sub { d, a, b, mask } => {
+                    regs[*d as usize] =
+                        regs[*a as usize].wrapping_sub(regs[*b as usize]) & mask;
+                }
+                TsInsn::Eq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                }
+                TsInsn::Neq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] != regs[*b as usize]) as u64;
+                }
+                TsInsn::Lt { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] < regs[*b as usize]) as u64;
+                }
+                TsInsn::Leq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] <= regs[*b as usize]) as u64;
+                }
+                TsInsn::Gt { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] > regs[*b as usize]) as u64;
+                }
+                TsInsn::Geq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] >= regs[*b as usize]) as u64;
+                }
+                TsInsn::LogNot { d, s } => {
+                    regs[*d as usize] = (regs[*s as usize] == 0) as u64;
+                }
+                TsInsn::LogAnd { d, a, b } => {
+                    regs[*d as usize] =
+                        (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
+                }
+                TsInsn::LogOr { d, a, b } => {
+                    regs[*d as usize] =
+                        (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
+                }
+                TsInsn::Concat { d, parts } => {
+                    let mut acc = 0u64;
+                    for &(r, w) in parts.iter() {
+                        acc = (acc << w) | regs[r as usize];
+                    }
+                    regs[*d as usize] = acc;
+                }
+                TsInsn::Mask { d, mask } => {
+                    regs[*d as usize] &= mask;
+                }
+                TsInsn::BrSigFalse { sig, bit, t } => {
+                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    let cond = if *bit == u32::MAX { v != 0 } else { (v >> bit) & 1 != 0 };
+                    if !cond {
+                        pc = *t as usize;
+                        continue;
                     }
                 }
+                TsInsn::BrFalse { s, t } => {
+                    if regs[*s as usize] == 0 {
+                        pc = *t as usize;
+                        continue;
+                    }
+                }
+                TsInsn::BrNz { s, t } => {
+                    if regs[*s as usize] != 0 {
+                        pc = *t as usize;
+                        continue;
+                    }
+                }
+                TsInsn::Jmp { t } => {
+                    pc = *t as usize;
+                    continue;
+                }
+                TsInsn::Store { sig, s, mask } => {
+                    let v = regs[*s as usize] & mask;
+                    self.ts_store(*sig as usize, v, *mask);
+                }
+                TsInsn::StoreNba { sig, s, w, mask } => {
+                    let v = regs[*s as usize] & mask;
+                    self.ts_store_nba(*sig as usize, v, *w);
+                }
             }
+            pc += 1;
         }
         self.ts_regs = regs;
     }
@@ -15806,6 +16042,7 @@ impl Simulator {
             }
         }
         self.compiled_edge_blocks = compiled;
+        self.ts_edge.clear();
 
         // Retained dynamic-delay processes are also hot procedural code. In
         // PLL models this is commonly `always #(period/2) clk = ...`, which
@@ -17655,6 +17892,29 @@ impl Simulator {
                     // condition the JIT can't recover from. Disable JIT
                     // for this block for the rest of the run.
                     self.jit_fns[block_idx] = None;
+                }
+            }
+        }
+        // P5: X-free edge bodies run on u64 words. NBA queue semantics are
+        // preserved by StoreNba; blocking stores record §9.2 edge writes
+        // through after_signal_write. The resolved slot is checked FIRST so
+        // non-lowerable blocks pay one enum test; only the initial lowering
+        // takes the block out (borrow) and puts it back.
+        match self.ts_edge.get(block_idx) {
+            Some(TsSlot::No) => {}
+            Some(TsSlot::Yes(ts)) => {
+                let ts = ts.clone();
+                if self.ts_guard_and_exec(&ts) {
+                    return true;
+                }
+            }
+            _ => {
+                if let Some(cb) = self.compiled_edge_blocks[block_idx].take() {
+                    let ran = self.try_two_state_in(block_idx, &cb, true);
+                    self.compiled_edge_blocks[block_idx] = Some(cb);
+                    if ran {
+                        return true;
+                    }
                 }
             }
         }
