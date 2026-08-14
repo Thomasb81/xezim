@@ -5477,6 +5477,7 @@ impl Simulator {
                         lhs: mk_ident(&nm, rhs.span),
                         rhs,
                         delay: 0,
+                        rhs_parent_scoped: false,
                     });
             }
         }
@@ -18896,6 +18897,20 @@ impl Simulator {
         // The array table is snapshotted because the loop below needs `&mut
         // self`; it is names→ranges only, not ASTs.
         let arrays_snapshot = self.module.arrays.clone();
+        // §23.9/§6.10: a HIERARCHICAL continuous assign can target a
+        // sub-instance INPUT PORT (`assign uut.mid.core.i_clk = tb_clk;`
+        // with the port chain above unconnected). Identity port connects
+        // collapse by SUBSTITUTION, and different readers may have bound at
+        // DIFFERENT levels of the chain (the deep flop's clock bound one
+        // level up). Fan the drive out to EVERY name in the alias chain so
+        // all of them stay coherent. Width-guarded; chains are short and
+        // hierarchy overrides rare, so the duplication is negligible.
+        let alias_snapshot = self.module.port_aliases.clone();
+        let alias_widths: HashMap<String, u32> = alias_snapshot
+            .iter()
+            .flat_map(|(k, v)| [k.clone(), v.clone()])
+            .filter_map(|n| self.module.signals.get(&n).map(|sig| (n.clone(), sig.width)))
+            .collect();
         // Hoisted out of the loop to reuse capacity across iterations.
         // Avoids ~2 × N HashMap allocs/drops where N = cont_assign count
         // (63K on c906, 501K on c910). Clear() preserves the bucket array.
@@ -18912,6 +18927,64 @@ impl Simulator {
                 ) {
                     Some(parts) => parts,
                     None => vec![ca],
+                }
+            })
+            .flat_map(|ca| {
+                let chain: Option<Vec<String>> = match &ca.lhs.kind {
+                    // ONLY a user-written HIERARCHY REFERENCE (multi-segment
+                    // path `a.b.c`). Inlined port-connect assigns carry their
+                    // instance-scoped name as ONE dotted segment — fanning
+                    // those out would double-drive the parent net of every
+                    // identity connection in the design.
+                    ExprKind::Ident(h)
+                        if h.path.len() > 1
+                            && h.path.iter().all(|s| s.selects.is_empty()) =>
+                    {
+                        let flat = Self::resolve_hier_name_static(h, &self.module);
+                        if flat.contains('.') && alias_snapshot.contains_key(&flat) {
+                            let w0 = alias_widths.get(&flat).copied();
+                            let mut names = vec![flat.clone()];
+                            let mut cur = flat;
+                            for _ in 0..64 {
+                                let Some(p) = alias_snapshot.get(&cur) else { break };
+                                if alias_widths.get(p).copied() != w0 || names.contains(p) {
+                                    break;
+                                }
+                                names.push(p.clone());
+                                cur = p.clone();
+                            }
+                            (names.len() > 1).then_some(names)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                match chain {
+                    None => vec![ca],
+                    Some(names) => names
+                        .into_iter()
+                        .map(|n| {
+                            let mut c = ca.clone();
+                            c.lhs = Expression::new(
+                                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                    root: None,
+                                    path: vec![crate::ast::expr::HierPathSegment {
+                                        name: crate::ast::Identifier {
+                                            name: n,
+                                            span: crate::ast::Span::dummy(),
+                                        },
+                                        selects: Vec::new(),
+                                    }],
+                                    span: crate::ast::Span::dummy(),
+                                    cached_signal_id: std::cell::Cell::new(None),
+                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                }),
+                                ca.lhs.span,
+                            );
+                            c
+                        })
+                        .collect(),
                 }
             })
         {
@@ -18964,7 +19037,11 @@ impl Simulator {
                     && !h.path[0].name.name.contains('.')
                     && self.signal_name_to_id.contains_key(h.path[0].name.name.as_str())
             });
-            let scope_hint = if lhs_is_absolute {
+            let scope_hint = if lhs_is_absolute || ca.rhs_parent_scoped {
+                // A port-connection assign's RHS names live in the PARENT
+                // scope by construction (§23.3.3) — the child hint turned
+                // `.d(d ^ 1)` with a same-named parent net into the
+                // self-loop `u1.d = u1.d ^ 1` (x forever).
                 None
             } else {
                 self.infer_contassign_scope_hint(&ca.lhs, &ca.rhs)
