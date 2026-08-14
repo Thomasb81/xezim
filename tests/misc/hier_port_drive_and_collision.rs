@@ -201,3 +201,58 @@ endmodule
         "parent cycle 3:\n{text}"
     );
 }
+
+/// A TB-level hierarchical assign whose RHS name COLLIDES with a net inside
+/// the target scope (reference-verified): `assign dut.core.rst_in = grst_l`
+/// must read the TB's `grst_l`, not the DUT-internal dead net of the same
+/// name. The LHS resolution ratchets the resolve hint to the TARGET's
+/// parent scope, under which the bare RHS bound to the deep twin and
+/// forwarded x forever — while a sibling clock assign (no deep twin) worked,
+/// hiding the bug behind that asymmetry.
+#[test]
+fn hier_assign_rhs_survives_target_scope_name_collision() {
+    let text = run(
+        "hier_shadow",
+        r#"module m_core (
+  input logic i_clk,
+  input logic grst_l_deep,
+  output logic [7:0] o_q
+);
+  logic grst_l;   // DUT-internal same-named net, undriven (x forever)
+  logic unused;
+  assign unused = grst_l;
+  always_ff @(posedge i_clk or negedge grst_l_deep)
+    if (!grst_l_deep) o_q <= '0;
+    else o_q <= o_q + 8'h1;
+endmodule
+module m_dut (
+  input logic i_clk,
+  output logic [7:0] o_q
+);
+  m_core u_core (.i_clk(i_clk), .grst_l_deep(), .o_q(o_q));
+endmodule
+module tb_top;
+  logic tb_clk = 0;
+  logic grst_l;
+  logic [7:0] q;
+  m_dut uut (.i_clk(tb_clk), .o_q(q));
+  assign tb_top.uut.u_core.grst_l_deep = grst_l;
+  always #5 tb_clk = ~tb_clk;
+  int bad = 0;
+  initial begin
+    grst_l = 1'bx;
+    #2 grst_l = 0;
+    @(posedge tb_clk); #1;
+    if (q !== 8'h00) bad++;
+    grst_l = 1;
+    @(posedge tb_clk); #1;
+    @(posedge tb_clk); #1;
+    if (q !== 8'h02) bad++;
+    if (bad == 0) $display("TEST_PASS"); else $display("TEST_FAIL n=%0d", bad);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(text.contains("TEST_PASS"), "shadowed hier-assign rhs:\n{text}");
+}
