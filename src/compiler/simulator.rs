@@ -15516,6 +15516,19 @@ impl Simulator {
                 &self.signal_signed,
                 &self.signal_real,
             );
+            if std::env::var("XZ_TS_DBG").is_ok() {
+                eprintln!(
+                    "[TS-LOWER] edge={} idx={} -> {} (insns={:?})",
+                    edge,
+                    eidx,
+                    if lowered.is_some() { "YES" } else { "no" },
+                    compiled
+                        .instructions
+                        .iter()
+                        .map(super::bytecode::insn_opcode_name)
+                        .collect::<Vec<_>>()
+                );
+            }
             let slots = if edge { &mut self.ts_edge } else { &mut self.ts_comb };
             slots[eidx] = match lowered {
                 Some(ts) => TsSlot::Yes(std::sync::Arc::new(ts)),
@@ -15538,8 +15551,14 @@ impl Simulator {
         if !self.forced_signals.is_empty() || self.warn_x {
             return false;
         }
-        for &s in ts.read_sigs.iter() {
-            let (_, x) = self.signal_table[s as usize].raw_bits();
+        for &sig in ts.reads_whole.iter() {
+            let (_, x) = self.signal_table[sig as usize].raw_bits();
+            if x != 0 {
+                return false;
+            }
+        }
+        for &(sig, lo, w) in ts.reads_slice.iter() {
+            let (_, x) = Self::raw_bits_slice(&self.signal_table[sig as usize], lo, w);
             if x != 0 {
                 return false;
             }
@@ -15580,6 +15599,16 @@ impl Simulator {
                 TsInsn::SigRange { d, sig, lo, mask } => {
                     let (v, _) = self.signal_table[*sig as usize].raw_bits();
                     regs[*d as usize] = (v >> lo) & mask;
+                }
+                TsInsn::SigBitW { d, sig, bit } => {
+                    let (v, _) =
+                        Self::raw_bits_slice(&self.signal_table[*sig as usize], *bit, 1);
+                    regs[*d as usize] = v;
+                }
+                TsInsn::SigRangeW { d, sig, lo, w, mask } => {
+                    let (v, _) =
+                        Self::raw_bits_slice(&self.signal_table[*sig as usize], *lo, *w);
+                    regs[*d as usize] = v & mask;
                 }
                 TsInsn::Bit { d, s, bit } => {
                     regs[*d as usize] = (regs[*s as usize] >> bit) & 1;
@@ -15739,6 +15768,16 @@ impl Simulator {
                     let (v, _) = self.signal_table[*sig as usize].raw_bits();
                     regs[*d as usize] = (v >> lo) & mask;
                 }
+                TsInsn::SigBitW { d, sig, bit } => {
+                    let (v, _) =
+                        Self::raw_bits_slice(&self.signal_table[*sig as usize], *bit, 1);
+                    regs[*d as usize] = v;
+                }
+                TsInsn::SigRangeW { d, sig, lo, w, mask } => {
+                    let (v, _) =
+                        Self::raw_bits_slice(&self.signal_table[*sig as usize], *lo, *w);
+                    regs[*d as usize] = v & mask;
+                }
                 TsInsn::Bit { d, s, bit } => {
                     regs[*d as usize] = (regs[*s as usize] >> bit) & 1;
                 }
@@ -15811,8 +15850,18 @@ impl Simulator {
                     regs[*d as usize] &= mask;
                 }
                 TsInsn::BrSigFalse { sig, bit, t } => {
-                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
-                    let cond = if *bit == u32::MAX { v != 0 } else { (v >> bit) & 1 != 0 };
+                    let cond = if *bit == u32::MAX {
+                        // Whole-value form was lowered only for <=64-bit sigs.
+                        let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                        v != 0
+                    } else {
+                        let (v, _) = Self::raw_bits_slice(
+                            &self.signal_table[*sig as usize],
+                            *bit as u16,
+                            1,
+                        );
+                        v != 0
+                    };
                     if !cond {
                         pc = *t as usize;
                         continue;
@@ -17910,7 +17959,18 @@ impl Simulator {
             }
             _ => {
                 if let Some(cb) = self.compiled_edge_blocks[block_idx].take() {
-                    let ran = self.try_two_state_in(block_idx, &cb, true);
+                    // Tiny bodies (a 2-flop sync is 4 insns) lose more to the
+                    // ts entry overhead (prefilter, reg-file swap, Value
+                    // construction per NBA) than the word ops save.
+                    let ran = if cb.instructions.len() >= 8 {
+                        self.try_two_state_in(block_idx, &cb, true)
+                    } else {
+                        if block_idx >= self.ts_edge.len() {
+                            self.ts_edge.resize(block_idx + 1, TsSlot::Untried);
+                        }
+                        self.ts_edge[block_idx] = TsSlot::No;
+                        false
+                    };
                     self.compiled_edge_blocks[block_idx] = Some(cb);
                     if ran {
                         return true;
@@ -58063,6 +58123,7 @@ impl Simulator {
     /// bit `lo`. For narrow signals this is a shift of `raw_bits`; for wide
     /// ones the (<=64) bits are gathered individually — only slice entries of
     /// gateable blocks ever take that path, and they are 1-few bits wide.
+    #[inline]
     #[inline]
     fn raw_bits_slice(v: &Value, lo: u16, w: u16) -> (u64, u64) {
         let lo = lo as usize;

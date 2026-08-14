@@ -6204,10 +6204,13 @@ pub enum TsInsn {
     /// eval-site prefilter).
     LoadSig { d: u16, sig: u32 },
     Const { d: u16, v: u64 },
-    /// regs[d] = bit `bit` of signal `sig`.
-    SigBit { d: u16, sig: u32, bit: u8 },
-    /// regs[d] = (signal >> lo) & mask.
-    SigRange { d: u16, sig: u32, lo: u8, mask: u64 },
+    /// regs[d] = bit `bit` of a ≤64-bit signal (inline raw_bits path).
+    SigBit { d: u16, sig: u32, bit: u16 },
+    /// regs[d] = (signal >> lo) & mask, ≤64-bit signal.
+    SigRange { d: u16, sig: u32, lo: u16, mask: u64 },
+    /// Wide-signal (>64) variants — read the addressed slice only.
+    SigBitW { d: u16, sig: u32, bit: u16 },
+    SigRangeW { d: u16, sig: u32, lo: u16, w: u16, mask: u64 },
     /// regs[d] = bit `bit` of regs[s].
     Bit { d: u16, s: u16, bit: u8 },
     /// regs[d] = (regs[s] >> lo) & mask.
@@ -6258,8 +6261,12 @@ pub enum TsInsn {
 pub struct TwoStateBlock {
     pub insns: Vec<TsInsn>,
     pub num_regs: u32,
-    /// Deduped signals the block READS — the eval-site X-clean prefilter.
-    pub read_sigs: Box<[u32]>,
+    /// Deduped ≤64-bit signals read WHOLE — checked X-free with one
+    /// raw_bits call each.
+    pub reads_whole: Box<[u32]>,
+    /// Deduped (signal, lo, width) slices of WIDE signals — checked via
+    /// raw_bits_slice, so unrelated X bits don't force a bail.
+    pub reads_slice: Box<[(u32, u16, u16)]>,
     /// Any branch/jump present. Straight-line blocks (the overwhelmingly
     /// common comb shape) run a compact loop without the pc bookkeeping.
     pub has_ctrl: bool,
@@ -6281,19 +6288,40 @@ pub fn lower_two_state(
     // (possible for loop-var slots, which are mutable) bails: stream-order
     // width tracking can't represent it.
     let mut rw: Vec<Option<u32>> = vec![None; cb.num_regs as usize];
-    let mut reads: Vec<u32> = Vec::new();
+    let mut reads_whole: Vec<u32> = Vec::new();
+    let mut reads_slice: Vec<(u32, u16, u16)> = Vec::new();
     // idx_map[i] = lowered index of the first lowered insn at-or-after
     // 4-state index i (dropped insns map to their successor). Branch targets
     // are rewritten through it in a fixup pass.
     let mut idx_map: Vec<u32> = Vec::with_capacity(n + 1);
-    let mut note_read = |sig: usize, reads: &mut Vec<u32>| {
-        let s32 = sig as u32;
-        if !reads.contains(&s32) {
-            reads.push(s32);
+    // ≤64-bit signals are checked whole (one raw_bits each) regardless of
+    // which part is read; only WIDE signals get slice entries.
+    let mut note_read = |sig: usize,
+                         lo: u32,
+                         w: u32,
+                         narrow: bool,
+                         rw_: &mut Vec<u32>,
+                         rs_: &mut Vec<(u32, u16, u16)>| {
+        if narrow {
+            let s32 = sig as u32;
+            if !rw_.contains(&s32) {
+                rw_.push(s32);
+            }
+        } else {
+            let t = (sig as u32, lo as u16, w as u16);
+            if !rs_.contains(&t) {
+                rs_.push(t);
+            }
         }
     };
+    // Whole-value loads need the value in one u64; selects only need the
+    // addressed slice, so they accept ANY signal width (the exec reads the
+    // slice via raw_bits_slice).
     let sig_ok = |sig: usize| -> bool {
         sig < signal_widths.len() && signal_widths[sig] <= 64 && !signal_real[sig]
+    };
+    let sig_ok_slice = |sig: usize| -> bool {
+        sig < signal_widths.len() && !signal_real[sig]
     };
     let clean_const = |k: &Value| -> Option<u64> {
         if k.width > 64 || k.is_real || k.is_signed || k.is_fill {
@@ -6324,7 +6352,7 @@ pub fn lower_two_state(
                 if !sig_ok(sig) || signal_signed[sig] {
                     return None;
                 }
-                note_read(sig, &mut reads);
+                note_read(sig, 0, signal_widths[sig], true, &mut reads_whole, &mut reads_slice);
                 def!(rw, *d, signal_widths[sig]);
                 out.push(TsInsn::LoadSig { d: *d as u16, sig: sig as u32 });
             }
@@ -6335,27 +6363,46 @@ pub fn lower_two_state(
             }
             Insn::LoadSignalBit(d, sig, idx) => {
                 let sig = *sig as usize;
-                if !sig_ok(sig) || *idx >= signal_widths[sig] {
+                if !sig_ok_slice(sig) || *idx >= signal_widths[sig] || *idx > u16::MAX as u32 {
                     return None;
                 }
-                note_read(sig, &mut reads);
+                let narrow = signal_widths[sig] <= 64;
+                note_read(sig, *idx, 1, narrow, &mut reads_whole, &mut reads_slice);
                 def!(rw, *d, 1);
-                out.push(TsInsn::SigBit { d: *d as u16, sig: sig as u32, bit: *idx as u8 });
+                out.push(if narrow {
+                    TsInsn::SigBit { d: *d as u16, sig: sig as u32, bit: *idx as u16 }
+                } else {
+                    TsInsn::SigBitW { d: *d as u16, sig: sig as u32, bit: *idx as u16 }
+                });
             }
             Insn::LoadSignalRange(d, sig, l, r) => {
                 let sig = *sig as usize;
                 let (hi, lo) = (*l.max(r), *l.min(r));
-                if !sig_ok(sig) || hi >= signal_widths[sig] {
+                if !sig_ok_slice(sig) || hi >= signal_widths[sig] || hi > u16::MAX as u32 {
                     return None;
                 }
-                note_read(sig, &mut reads);
                 let w = hi - lo + 1;
+                if w > 64 {
+                    return None;
+                }
+                let narrow = signal_widths[sig] <= 64;
+                note_read(sig, lo, w, narrow, &mut reads_whole, &mut reads_slice);
                 def!(rw, *d, w);
-                out.push(TsInsn::SigRange {
-                    d: *d as u16,
-                    sig: sig as u32,
-                    lo: lo as u8,
-                    mask: ts_mask(w),
+                out.push(if narrow {
+                    TsInsn::SigRange {
+                        d: *d as u16,
+                        sig: sig as u32,
+                        lo: lo as u16,
+                        mask: ts_mask(w),
+                    }
+                } else {
+                    TsInsn::SigRangeW {
+                        d: *d as u16,
+                        sig: sig as u32,
+                        lo: lo as u16,
+                        w: w as u16,
+                        mask: ts_mask(w),
+                    }
                 });
             }
             Insn::BitSelectConst(d, s, idx) => {
@@ -6504,13 +6551,22 @@ pub fn lower_two_state(
             }
             Insn::BranchIfSignalFalse(sig, t, bit) => {
                 let sig = *sig as usize;
-                if !sig_ok(sig) {
-                    return None;
+                if *bit == u32::MAX {
+                    // Whole-value truthiness needs the value in one word.
+                    if !sig_ok(sig) {
+                        return None;
+                    }
+                    note_read(sig, 0, signal_widths[sig], true, &mut reads_whole, &mut reads_slice);
+                } else {
+                    if !sig_ok_slice(sig)
+                        || *bit >= signal_widths[sig]
+                        || *bit > u16::MAX as u32
+                    {
+                        return None;
+                    }
+                    let narrow = signal_widths[sig] <= 64;
+                    note_read(sig, *bit, 1, narrow, &mut reads_whole, &mut reads_slice);
                 }
-                if *bit != u32::MAX && *bit >= signal_widths[sig] {
-                    return None;
-                }
-                note_read(sig, &mut reads);
                 out.push(TsInsn::BrSigFalse { sig: sig as u32, bit: *bit, t: *t });
             }
             Insn::BranchIfFalse(c, t) => {
@@ -6592,7 +6648,8 @@ pub fn lower_two_state(
     Some(TwoStateBlock {
         insns: out,
         num_regs: cb.num_regs,
-        read_sigs: reads.into_boxed_slice(),
+        reads_whole: reads_whole.into_boxed_slice(),
+        reads_slice: reads_slice.into_boxed_slice(),
         has_ctrl,
     })
 }
