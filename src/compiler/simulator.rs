@@ -20501,6 +20501,105 @@ impl Simulator {
             );
         }
 
+        // Amalgamate straight-line compiled cont-assigns that share one read
+        // set (typically the N same-shape port connects of N instances all
+        // fed by one testbench net). One worklist dispatch then evaluates the
+        // whole wave via a single concatenated instruction stream instead of
+        // N pops + N exec setups. Members are independent by construction:
+        // identical read sets and no member writing into the shared read set
+        // means no member observes another's output, so concatenation order
+        // (ascending entry index) cannot change the fixpoint.
+        {
+            let mut ca_groups: HashMap<Vec<usize>, Vec<usize>> = HashMap::default();
+            for (eidx, e) in entries.iter().enumerate() {
+                let CombItem::CompiledContAssign { compiled } = &e.item else {
+                    continue;
+                };
+                if e.has_unresolved_reads || e.cold.read_signal_ids.is_empty() {
+                    continue;
+                }
+                // Straight-line only: no branch targets to rebase, and no AST
+                // fallbacks (those would need per-member scope hints).
+                use super::bytecode::Insn as I;
+                if compiled.instructions.iter().any(|i| {
+                    matches!(
+                        i,
+                        I::Jump(..)
+                            | I::BranchIfFalse(..)
+                            | I::BranchUnlessZero(..)
+                            | I::BranchIfSignalFalse(..)
+                            | I::StmtFallback(..)
+                            | I::EvalExprFallback(..)
+                    )
+                }) {
+                    continue;
+                }
+                if e.cold
+                    .write_signal_ids
+                    .iter()
+                    .any(|w| e.cold.read_signal_ids.contains(w))
+                {
+                    continue;
+                }
+                let mut key = e.cold.read_signal_ids.clone();
+                key.sort_unstable();
+                key.dedup();
+                ca_groups.entry(key).or_default().push(eidx);
+            }
+            let mut batches: Vec<Vec<usize>> = ca_groups
+                .into_values()
+                .filter(|v| v.len() >= 4)
+                .collect();
+            // Deterministic order regardless of map iteration.
+            batches.sort_unstable_by_key(|v| v[0]);
+            if !batches.is_empty() {
+                let mut ca_skip = vec![false; entries.len()];
+                let mut ca_batch_members = 0usize;
+                for members in &batches {
+                    let first = members[0];
+                    let mut combined = match &entries[first].item {
+                        CombItem::CompiledContAssign { compiled } => compiled.clone(),
+                        _ => unreachable!("filtered above"),
+                    };
+                    let mut writes = entries[first].cold.write_signal_ids.clone();
+                    for &m in &members[1..] {
+                        let CombItem::CompiledContAssign { compiled } = &entries[m].item
+                        else {
+                            unreachable!("filtered above")
+                        };
+                        combined
+                            .instructions
+                            .extend(compiled.instructions.iter().cloned());
+                        combined.num_regs = combined.num_regs.max(compiled.num_regs);
+                        for &w in &entries[m].cold.write_signal_ids {
+                            if !writes.contains(&w) {
+                                writes.push(w);
+                            }
+                        }
+                        ca_skip[m] = true;
+                    }
+                    ca_batch_members += members.len();
+                    entries[first].item = CombItem::CompiledContAssign { compiled: combined };
+                    entries[first].cold.write_signal_ids = writes;
+                }
+                let batch_count = batches.len();
+                let mut grouped = Vec::with_capacity(
+                    entries.len() + batch_count - ca_batch_members,
+                );
+                for (eidx, entry) in entries.into_iter().enumerate() {
+                    if !ca_skip[eidx] {
+                        grouped.push(entry);
+                    }
+                }
+                entries = grouped;
+                sim_dbg_eprintln!(
+                    "[OPT] amalgamated {} compiled cont-assigns into {} shared-read batches",
+                    ca_batch_members,
+                    batch_count
+                );
+            }
+        }
+
         // Build reverse dependency index by signal ID using final entry
         // order. CSR layout: counts → prefix-sum → fill, all in flat
         // u32 Vecs. Avoids 585K × 24 B of empty Vec headers and 585K
