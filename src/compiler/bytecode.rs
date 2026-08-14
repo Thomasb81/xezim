@@ -1537,7 +1537,10 @@ impl<'a> BytecodeCompiler<'a> {
         // Without this, a module's local anon-enum FINISH=2 resolves to
         // pkg mult_state_e::FINISH=4 because the flat signal_name_to_id
         // registers BOTH `FINISH` (pkg) and `<scope>.FINISH` (local).
-        if !raw.contains('.') {
+        // A parent-rooted ident (substituted expression port actual) is an
+        // absolute name — the block's child scope hint must not qualify it.
+        let rooted = hier.root.is_some();
+        if !raw.contains('.') && !rooted {
             if let Some(scope) = &self.scope_hint {
                 let qualified = format!("{}.{}", scope, raw);
                 if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
@@ -1548,10 +1551,12 @@ impl<'a> BytecodeCompiler<'a> {
         if let Some(&id) = self.signal_name_to_id.get(raw.as_str()) {
             return Some(id);
         }
-        if let Some(scope) = &self.scope_hint {
-            let qualified = format!("{}.{}", scope, raw);
-            if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
-                return Some(id);
+        if !rooted {
+            if let Some(scope) = &self.scope_hint {
+                let qualified = format!("{}.{}", scope, raw);
+                if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
+                    return Some(id);
+                }
             }
         }
         if hier.path.len() == 1 {
