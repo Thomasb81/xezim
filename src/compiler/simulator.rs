@@ -45870,10 +45870,30 @@ impl Simulator {
                             // dynamic array of bytes, so the queries track its
                             // CURRENT length ($left 0, $right len-1) — not the
                             // 1024-bit placeholder width it fell through to.
+                            // BUT a FIXED-SIZE string-array member (`string[16]`)
+                            // must keep reporting its DECLARED element count, not
+                            // the current (empty) string value read back from the
+                            // array — `$size(a)` == 16, not 0. Resolve any
+                            // instance-scoped / module-scope fixed array first
+                            // and fall through to the array-dim branch below.
                             if self.expr_is_string_valued(arg) {
-                                let len =
-                                    self.eval_expr(arg).sv_string_bytes().len() as u64;
-                                return Self::dynamic_query_result(&sn, len);
+                                let mut is_fixed_array = false;
+                                if let ExprKind::Ident(h) = &arg.kind {
+                                    let rname = self.resolve_hier_name(h);
+                                    let fixed = |m: &str| {
+                                        self.module.arrays.contains_key(m)
+                                            || self.module.arrays_2d.contains_key(m)
+                                            || self.module.arrays_nd.contains_key(m)
+                                    };
+                                    is_fixed_array = self
+                                        .instance_assoc_member(&rname)
+                                        .map_or_else(|| fixed(&rname), |s| fixed(&s));
+                                }
+                                if !is_fixed_array {
+                                    let len =
+                                        self.eval_expr(arg).sv_string_bytes().len() as u64;
+                                    return Self::dynamic_query_result(&sn, len);
+                                }
                             }
                         }
                     }
