@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "scheduling/fork_children_start_in_spawn_slot.rs"]
+mod fork_children_start_in_spawn_slot;
 #[path = "scheduling/wait_fork_immediate_children.rs"]
 mod wait_fork_immediate_children;
 #[path = "scheduling/comb_collection_element_sensitivity.rs"]

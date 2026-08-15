@@ -1936,6 +1936,28 @@ impl TimingWheel {
         }
     }
 
+    /// Schedule at the FRONT of `time`'s slot, before entries already queued
+    /// there. §9.3.2: `fork` children start executing immediately, in the
+    /// spawning time slot — queueing them behind events already pending for
+    /// this timestamp (a clock toggle, say) let those run first, so a child
+    /// whose first act is `@(posedge clk)` armed AFTER the edge it was meant
+    /// to catch and slept a whole period.
+    ///
+    /// Children are inserted in reverse so the group keeps source order.
+    fn schedule_front(&mut self, time: u64, pid: usize, stmts: ProcCont) {
+        *self.pid_counts.entry(pid).or_insert(0) += 1;
+        if time < self.current_time + WHEEL_SIZE as u64 {
+            let s = Self::slot(time);
+            self.wheel[s].push_front((pid, stmts));
+            self.bitmap_set(s);
+        } else {
+            self.overflow
+                .entry(time)
+                .or_default()
+                .push_front((pid, stmts));
+        }
+    }
+
     /// Schedule multiple events at the given time.
     fn schedule_push(&mut self, time: u64, entry: (usize, ProcCont)) {
         self.schedule(time, entry.0, entry.1);
@@ -30816,6 +30838,10 @@ impl Simulator {
                 // the children snapshot them instead of racing over them.
                 let (spawnable, saved_auto_len) = self.exec_fork_block_decls(sub_stmts);
                 let mut child_pids = HashSet::default();
+                // §9.3.2 children start in THIS time slot, ahead of whatever
+                // is already queued for it; collected here and pushed to the
+                // slot front in reverse below so siblings keep source order.
+                let mut start_now: Vec<(usize, Statement)> = Vec::new();
                 for s in spawnable {
                     let pid_child = self.next_pid;
                     self.next_pid += 1;
@@ -30865,9 +30891,12 @@ impl Simulator {
                         }
                     }
                     // Schedule children to run at current time
-                    self.event_queue
-                        .schedule(self.time, pid_child, vec![s.clone()].into());
+                    start_now.push((pid_child, s.clone()));
                     child_pids.insert(pid_child);
+                }
+                for (pid_child, s) in start_now.into_iter().rev() {
+                    self.event_queue
+                        .schedule_front(self.time, pid_child, vec![s].into());
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
                 if let Some(nm) = block_name {
