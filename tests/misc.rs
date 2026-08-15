@@ -278,6 +278,8 @@ mod package_property_assertions;
 mod hier_force_holds_against_drivers;
 #[path = "misc/two_state_island_coverage.rs"]
 mod two_state_island_coverage;
+#[path = "misc/static_local_scope_isolation.rs"]
+mod static_local_scope_isolation;
 #[path = "misc/hier_iface_task_suspension.rs"]
 mod hier_iface_task_suspension;
 #[path = "misc/hier_port_drive_and_collision.rs"]
