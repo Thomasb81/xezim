@@ -33,6 +33,8 @@ mod class_local_typedef_aa;
 mod class_local_typedef_resolution;
 #[path = "classes/class_method_dispatch.rs"]
 mod class_method_dispatch;
+#[path = "classes/method_default_this_call.rs"]
+mod method_default_this_call;
 #[path = "classes/class_name_method_shadow.rs"]
 mod class_name_method_shadow;
 #[path = "classes/class_packed_and_type_params.rs"]

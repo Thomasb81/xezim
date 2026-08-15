@@ -92595,7 +92595,25 @@ impl Simulator {
                         // start(..., int this_priority = -1): missing arg
                         // must be -1, not 0, else `this_priority < -1`
                         // (read unsigned) fatals SEQPRI.
-                        self.eval_expr(def)
+                        //
+                        // §13.5.3: a default is evaluated at call time IN
+                        // THE CALLEE'S SCOPE, so it may reference `this` /
+                        // call another method on the receiving instance
+                        // (`uvm_event#(T)::trigger(T data =
+                        // get_default_data())`). The instance's `this` and
+                        // class context are only pushed AFTER this binding
+                        // loop, so evaluate the default with them pushed
+                        // (and the partially-bound formals visible) so a
+                        // `this`-dependent method default resolves instead
+                        // of silently evaluating to the type's zero value.
+                        self.this_stack.push(Some(handle));
+                        self.class_context_stack.push(Some(cname.clone()));
+                        self.push_local_frame(locals.clone());
+                        let v = self.eval_expr(def);
+                        self.pop_local_frame();
+                        self.class_context_stack.pop();
+                        self.this_stack.pop();
+                        v
                     } else {
                         Value::zero(32)
                     };
