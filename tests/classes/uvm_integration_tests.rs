@@ -1265,3 +1265,66 @@ fn uvm_2020_sequence_field_get_type_resolves_declared_type() {
         out.join("\n")
     );
 }
+
+/// A printer rendering an ENUM collection element must resolve the value's
+/// member name against the collection's element type (`numbers`), not a global
+/// scan that picks a larger outer-scope enum. UVM's own enums share the values
+/// 0..3 with `numbers`, so a freshly-defaulted empty enum array element used to
+/// render as UVM_NORADIX / UVM_PHASE_* instead of ONE/TWO/THREE/FOUR.
+const ENUM_ARRAY_PRINT_TEST: &str = r#"
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+typedef enum bit [1:0] { ONE, TWO, THREE, FOUR } numbers;
+
+class myobj extends uvm_object;
+  numbers numa[];
+  `uvm_object_utils_begin(myobj)
+    `uvm_field_array_enum(numbers, numa, UVM_DEFAULT)
+  `uvm_object_utils_end
+  function new(string n="myobj");
+    super.new(n);
+    numa = new[4];
+    for (int i=0;i<4;i++) numa[i]=numbers'(i);
+  endfunction
+endclass
+
+class my_test extends uvm_test;
+  `uvm_component_utils(my_test)
+  function new(string name="my_test", uvm_component parent=null);
+    super.new(name, parent);
+  endfunction
+  task run_phase(uvm_phase phase);
+    myobj o = new;
+    o.print();
+    phase.raise_objection(this);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module top;
+  initial run_test("my_test");
+endmodule
+"#;
+
+#[test]
+fn uvm_2020_printer_renders_enum_array_members() {
+    let sim = run_uvm("1800.2-2020", &[], ENUM_ARRAY_PRINT_TEST.to_string(), "top")
+        .expect("UVM 2020 enum-array printer test failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("ONE")
+            && joined.contains("TWO")
+            && joined.contains("THREE")
+            && joined.contains("FOUR"),
+        "printer must render the enum members:\n{}",
+        joined
+    );
+    assert!(
+        !joined.contains("UVM_NORADIX") && !joined.contains("UVM_PHASE_DORMANT"),
+        "enum array elements must NOT fall back to a foreign enum's labels:\n{}",
+        joined
+    );
+}
+

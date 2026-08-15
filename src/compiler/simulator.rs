@@ -93699,6 +93699,20 @@ impl Simulator {
                             }
                         }
                     }
+                    // §6.19/§21.2.1: an ENUM-typed collection element.
+                    // `array_elem_class` only records CLASS element types, so an
+                    // enum array (`numbers numa[]`) fell through to None and
+                    // `.name()`/one enum method rendered the value against a
+                    // GLOBAL scan, emitting a wrong (larger outer-scope) enum's
+                    // label (e.g. UVM_NORADIX for 0). The base array name itself
+                    // resolves to its element typedef (`numa` -> `numbers`), so
+                    // return that when the kernel knows it as an enum.
+                    let base_type = self.get_expr_type_name(cur);
+                    if let Some(t) = base_type {
+                        if self.module.enum_members.contains_key(&t) {
+                            return Some(t);
+                        }
+                    }
                 }
                 None
             }
