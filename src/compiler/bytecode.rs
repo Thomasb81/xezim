@@ -1183,6 +1183,68 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => None,
             }
         }
+        // Full dotted form of an Index lvalue's base ident.
+        fn lv_base_full(e: &Expression) -> Option<String> {
+            match &e.kind {
+                ExprKind::Index { expr, .. } => match &expr.kind {
+                    ExprKind::Ident(h) => Some(
+                        h.path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    ),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        // Does the rvalue read leaf `name` through a DIFFERENT dotted form
+        // than `full`? Same-form self-reads (`cnt[b] <= cnt[b]+1`) resolve
+        // through the identical lookup and cannot skew; the audited hazard
+        // was an elaboration-rewritten dotted lvalue paired with a bare read.
+        fn expr_reads_name_other_form(e: &Expression, name: &str, full: &str) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) => {
+                    if h.path.last().is_some_and(|s| s.name.name == name) {
+                        let f = h
+                            .path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        f != full
+                    } else {
+                        false
+                    }
+                }
+                ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                    expr_reads_name_other_form(operand, name, full)
+                }
+                ExprKind::Binary { left, right, .. } => {
+                    expr_reads_name_other_form(left, name, full)
+                        || expr_reads_name_other_form(right, name, full)
+                }
+                ExprKind::Conditional { condition, then_expr, else_expr } => {
+                    expr_reads_name_other_form(condition, name, full)
+                        || expr_reads_name_other_form(then_expr, name, full)
+                        || expr_reads_name_other_form(else_expr, name, full)
+                }
+                ExprKind::Index { expr, index } => {
+                    expr_reads_name_other_form(expr, name, full)
+                        || expr_reads_name_other_form(index, name, full)
+                }
+                ExprKind::RangeSelect { expr, left, right, .. } => {
+                    expr_reads_name_other_form(expr, name, full)
+                        || expr_reads_name_other_form(left, name, full)
+                        || expr_reads_name_other_form(right, name, full)
+                }
+                ExprKind::SystemCall { args, .. } | ExprKind::Concatenation(args) => {
+                    args.iter().any(|a| expr_reads_name_other_form(a, name, full))
+                }
+                _ => false,
+            }
+        }
         fn expr_reads_name(e: &Expression, name: &str) -> bool {
             match &e.kind {
                 ExprKind::Ident(h) => {
@@ -1222,9 +1284,12 @@ impl<'a> BytecodeCompiler<'a> {
                 // write paths can resolve the array through different
                 // aliases (port copy vs local), skewing the pre-edge read.
                 // Keep such loops on the audited AST path.
-                let self_read = lv_base_name(lvalue)
-                    .is_some_and(|n| expr_reads_name(rvalue, n));
-                lv_simple(lvalue) && expr_simple(rvalue) && !self_read
+                let self_read_skewed = match (lv_base_name(lvalue), lv_base_full(lvalue)) {
+                    (Some(n), Some(f)) => expr_reads_name_other_form(rvalue, n, &f),
+                    _ => false,
+                };
+                let _ = expr_reads_name; // superseded by the form-aware audit
+                lv_simple(lvalue) && expr_simple(rvalue) && !self_read_skewed
             }
             StatementKind::SeqBlock { stmts, .. } => {
                 stmts.iter().all(Self::for_body_is_simple)
@@ -1241,6 +1306,37 @@ impl<'a> BytecodeCompiler<'a> {
                         .as_ref()
                         .map(|e| Self::for_body_is_simple(e))
                         .unwrap_or(true)
+            }
+            // Case over a simple selector with simple arm bodies. The arb
+            // datapath loops a customer profile flagged (86% of wall time in
+            // the For_init_vardecl AST fallback, 364µs/execution) are exactly
+            // banks×entries nests of case-inside-for; a mid-body construct
+            // the compiler still can't handle bails the WHOLE loop as before
+            // (StmtFallback emission is forbidden inside reg-var loops), so
+            // widening this filter can't smuggle a half-compiled body.
+            StatementKind::Case { expr, items, .. } => {
+                expr_simple(expr)
+                    && items.iter().all(|it| {
+                        it.pattern.is_none()
+                            && it.patterns.iter().all(expr_simple)
+                            && Self::for_body_is_simple(&it.stmt)
+                    })
+            }
+            // Nested `for` — both the assign-init and VarDecl-init forms.
+            // The per-assign audits (simple lvalue, no member access, no
+            // self-reading array update) apply recursively through the body.
+            StatementKind::For { init, condition, step, body } => {
+                let init_ok = init.iter().all(|fi| match fi {
+                    crate::ast::stmt::ForInit::Assign { lvalue, rvalue } => {
+                        lv_simple(lvalue) && expr_simple(rvalue)
+                    }
+                    crate::ast::stmt::ForInit::VarDecl { init, .. } => expr_simple(init),
+                });
+                let step_ok = step.iter().all(expr_simple);
+                init_ok
+                    && condition.as_ref().map(|c| expr_simple(c)).unwrap_or(true)
+                    && step_ok
+                    && Self::for_body_is_simple(body)
             }
             _ => false,
         }
