@@ -6421,6 +6421,17 @@ pub enum TsInsn {
     /// Wide (65..=128-bit) slice of a SIGNAL into the wide bank; the two
     /// halves are prefiltered as ordinary ≤64 slices.
     WSigRange { d: u16, sig: u32, lo: u16, w: u16, mask_hi: u64 },
+    /// Logical shifts. `w` is the LEFT operand's width, which is also the
+    /// result width (`Value::shift_left`/`shift_right` keep `self.width`);
+    /// an amount ≥ w yields 0, matching those helpers exactly. The amount
+    /// register is X-free by construction, so the 4-state all-X result for
+    /// an X amount cannot arise here.
+    /// regs[d] = (regs[s] + k) & mask — the fused constant add. Counters
+    /// and address increments make this the most common shape in clocked
+    /// bodies, which the islands cover since the edge hook landed.
+    AddC { d: u16, s: u16, k: u64, mask: u64 },
+    Shl { d: u16, a: u16, b: u16, w: u32, mask: u64 },
+    Shr { d: u16, a: u16, b: u16, w: u32 },
     /// Narrow replicate: dst = {count{src}} with count*w ≤ 64.
     Repl { d: u16, s: u16, w: u8, count: u8 },
     /// Wide replicate (result 65..=128 bits) of a NARROW part.
@@ -6444,10 +6455,33 @@ pub struct TwoStateBlock {
     pub has_wide: bool,
     /// Wide (>64-bit) signals read WHOLE — X-checked via words128_if_clean.
     pub reads_wide: Box<[u32]>,
+    /// Signals this block WRITES (sorted, deduped). §9.3.1 force filtering
+    /// is per DESTINATION — `write_sig!` drops writes to forced signals and
+    /// the two-state stores bypass that check — so an active force only
+    /// makes a block unsafe when the block writes a forced signal. Reads of
+    /// a forced signal are exact (the forced value lives in the table).
+    pub writes: Box<[u32]>,
+    /// Array element-store spans `(first_id, count)`: a dynamic element
+    /// write can land on any id in the span, so a forced id inside one
+    /// disqualifies the block.
+    pub writes_span: Box<[(u32, u32)]>,
 }
 
 fn ts_mask(w: u32) -> u64 {
     if w >= 64 { u64::MAX } else { (1u64 << w) - 1 }
+}
+
+thread_local! {
+    /// Opcode the lowering was on when it gave up — the only way to answer
+    /// "why is this block not an island?" on a design you cannot read.
+    /// Reported by the XZ_TS_DBG dump.
+    static TS_BAIL_AT: std::cell::Cell<(usize, &'static str)> =
+        const { std::cell::Cell::new((0, "-")) };
+}
+
+/// (stream index, opcode) where the last `lower_two_state` call stopped.
+pub fn ts_last_bail() -> (usize, &'static str) {
+    TS_BAIL_AT.with(|c| c.get())
 }
 
 pub fn lower_two_state(
@@ -6548,11 +6582,25 @@ pub fn lower_two_state(
         Some((first, lo, hi))
     };
     let clean_const = |k: &Value| -> Option<u64> {
-        if k.width > 64 || k.is_real || k.is_signed || k.is_fill {
+        if k.width > 64 || k.is_real || k.is_fill {
             return None;
         }
         let (v, x) = k.raw_bits();
-        if x != 0 { None } else { Some(v & ts_mask(k.width)) }
+        if x != 0 {
+            return None;
+        }
+        let v = v & ts_mask(k.width);
+        // Bare decimal literals are SIGNED (§5.7.1), so rejecting every
+        // signed constant kept `x + 1`, `x >> 3` and `x == 5` — most of the
+        // RTL ever written — out of the islands. A NON-NEGATIVE signed
+        // constant is admissible: zero- and sign-extension agree on it, and
+        // every lowered register is unsigned by construction, so no
+        // operation's signedness can flip (§5.5.1). A negative one still
+        // bails, since its widening differs.
+        if k.is_signed && k.width > 0 && (v >> (k.width - 1)) & 1 == 1 {
+            return None;
+        }
+        Some(v)
     };
     macro_rules! def {
         ($rw:ident, $r:expr, $w:expr) => {{
@@ -6565,7 +6613,14 @@ pub fn lower_two_state(
             rc[r] = None;
         }};
     }
-    for insn in &cb.instructions {
+    // Tracking costs one thread-local store per instruction, so it is armed
+    // only when the dump is requested.
+    static TRACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let track = *TRACK.get_or_init(|| std::env::var("XZ_TS_DBG").is_ok());
+    for (ins_i, insn) in cb.instructions.iter().enumerate() {
+        if track {
+            TS_BAIL_AT.with(|c| c.set((ins_i, insn_opcode_name(insn))));
+        }
         idx_map.push(out.len() as u32);
         match insn {
             Insn::Nop => {}
@@ -6765,6 +6820,20 @@ pub fn lower_two_state(
                     TsInsn::Sub { d, a, b, mask: ts_mask(w) }
                 });
             }
+            // §11.4.10 logical shifts. Result width = LEFT operand width.
+            // AShr is excluded: every lowered register is unsigned, so an
+            // arithmetic shift would need sign tracking the bank lacks.
+            Insn::Shl(d, a, b) | Insn::Shr(d, a, b) => {
+                let wa = rw[*a as usize]?;
+                rw[*b as usize]?;
+                def!(rw, *d, wa);
+                let (d, a, b) = (*d as u16, *a as u16, *b as u16);
+                out.push(if matches!(insn, Insn::Shl(..)) {
+                    TsInsn::Shl { d, a, b, w: wa, mask: ts_mask(wa) }
+                } else {
+                    TsInsn::Shr { d, a, b, w: wa }
+                });
+            }
             // 1-bit results. CaseEq/CaseNeq equal Eq/Neq on X-free values.
             Insn::Eq(d, a, b) | Insn::CaseEq(d, a, b) => {
                 rw[*a as usize]?;
@@ -6824,10 +6893,12 @@ pub fn lower_two_state(
                     BinOpConstKind::Add => {
                         let wr = w.max(k.width);
                         def!(rw, *d, wr);
-                        // Reuse Add via a synthetic const register? Keep it
-                        // simple: constant add is rare in comb cones — bail.
-                        let _ = wr;
-                        return None;
+                        out.push(TsInsn::AddC {
+                            d: *d as u16,
+                            s: *s as u16,
+                            k: v,
+                            mask: ts_mask(wr),
+                        });
                     }
                 }
             }
@@ -7223,6 +7294,27 @@ pub fn lower_two_state(
         .filter(|&(_, sk)| !(apply_skip && sk))
         .map(|(x, _)| x)
         .collect();
+    let mut writes: Vec<u32> = Vec::new();
+    let mut writes_span: Vec<(u32, u32)> = Vec::new();
+    for i in out.iter() {
+        match i {
+            TsInsn::Store { sig, .. }
+            | TsInsn::StoreNba { sig, .. }
+            | TsInsn::WStore { sig, .. }
+            | TsInsn::WStoreNba { sig, .. } => writes.push(*sig),
+            TsInsn::NbaFromElem(op) => writes.push(op.dst),
+            TsInsn::ElemStore(op) | TsInsn::ElemStoreNba(op) => {
+                if op.hi >= op.lo {
+                    writes_span.push((op.first, (op.hi - op.lo + 1) as u32));
+                }
+            }
+            _ => {}
+        }
+    }
+    writes.sort_unstable();
+    writes.dedup();
+    writes_span.sort_unstable();
+    writes_span.dedup();
     Some(TwoStateBlock {
         insns: out,
         num_regs: cb.num_regs,
@@ -7231,6 +7323,8 @@ pub fn lower_two_state(
         has_ctrl,
         has_wide,
         reads_wide: reads_wide.into_boxed_slice(),
+        writes: writes.into_boxed_slice(),
+        writes_span: writes_span.into_boxed_slice(),
     })
 }
 
