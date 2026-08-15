@@ -127,3 +127,52 @@ endmodule
         "class virtual-interface task call did not suspend:\n{text}"
     );
 }
+
+#[test]
+fn nested_owner_vif_task_call_suspends() {
+    // The vif property's owner reached through a handle chain: binding
+    // written as `p.cfg.vif = u_if` (owner-chain store) and the call made
+    // as `cfg.vif.sample_one(t)` / `this.vif.sample_one(t)` — both legs
+    // exercised. Reference-verified: times 10,20.
+    let text = run(
+        "cfgvif",
+        r#"interface mon_if (input logic clk);
+  task automatic sample_one(output int t_out);
+    @(negedge clk);
+    t_out = $time;
+  endtask
+endinterface
+class cfg_c;
+  virtual mon_if vif;
+endclass
+class proxy;
+  cfg_c cfg;
+  int times[$];
+  task run();
+    int t;
+    cfg.vif.sample_one(t);
+    times.push_back(t);
+    this.cfg.vif.sample_one(t);
+    times.push_back(t);
+  endtask
+endclass
+module tb_top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  mon_if u_if (clk);
+  proxy p;
+  initial begin
+    p = new(); p.cfg = new(); p.cfg.vif = u_if;
+    #7;
+    p.run();
+    $display("CFGVIF times=%0d,%0d n=%0d", p.times[0], p.times[1], p.times.size());
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(
+        text.contains("CFGVIF times=10,20 n=2"),
+        "nested-owner vif task call did not suspend:\n{text}"
+    );
+}
