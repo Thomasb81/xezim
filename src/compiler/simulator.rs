@@ -4101,6 +4101,12 @@ pub struct Simulator {
     ts_wregs: Vec<[u64; 2]>,
     /// Two-state eval hits, for the profile report.
     prof_ts_evals: u64,
+    /// Why the two-state engine declined an eval — reported so a profile
+    /// from a real design says WHY islands are inert instead of just "0".
+    prof_ts_bail_warnx: u64,
+    prof_ts_bail_forced: u64,
+    prof_ts_bail_xread: u64,
+    prof_ts_bail_abort: u64,
     /// XEZIM_PROFILE_REPORT=1: reference-style ranked profile (by design
     /// unit / instance / construct). Implies per-entry and per-edge-block
     /// nanosecond attribution.
@@ -6823,6 +6829,10 @@ impl Simulator {
             ts_regs: Vec::new(),
             ts_wregs: Vec::new(),
             prof_ts_evals: 0,
+            prof_ts_bail_warnx: 0,
+            prof_ts_bail_forced: 0,
+            prof_ts_bail_xread: 0,
+            prof_ts_bail_abort: 0,
             profile_report: std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
             prof_entry_ns: Vec::new(),
             comb_dep_entries: Vec::new(),
@@ -15694,6 +15704,8 @@ impl Simulator {
                 &self.array_first_id,
             );
             if lowered.is_none() && std::env::var("XZ_TS_DBG").is_ok() {
+                let (bi, bop) = super::bytecode::ts_last_bail();
+                eprintln!("[TS-NO] bail at #{} opcode={}", bi, bop);
                 eprintln!(
                     "[TS-NO] edge={} idx={} insns={:?}",
                     edge,
@@ -15724,18 +15736,30 @@ impl Simulator {
     /// path), and every read X-free (width ≤ 64 was proven at lower time,
     /// so storage is Inline and raw_bits is exact).
     fn ts_guard_and_exec(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
-        if !self.forced_signals.is_empty() || self.warn_x {
+        if self.warn_x {
+            self.prof_ts_bail_warnx += 1;
+            return false;
+        }
+        // §9.3.1: a force only disqualifies a block that WRITES a forced
+        // signal (the 4-state `write_sig!` drops such writes; the two-state
+        // stores bypass that filter). Bailing on ANY active force made a
+        // single `force` anywhere — routine in a real bench — silently
+        // disable every island in the design.
+        if !self.forced_signals.is_empty() && self.ts_writes_forced(ts) {
+            self.prof_ts_bail_forced += 1;
             return false;
         }
         for &sig in ts.reads_whole.iter() {
             let (_, x) = self.signal_table[sig as usize].raw_bits();
             if x != 0 {
+                self.prof_ts_bail_xread += 1;
                 return false;
             }
         }
         for &(sig, lo, w) in ts.reads_slice.iter() {
             let (_, x) = Self::raw_bits_slice(&self.signal_table[sig as usize], lo, w);
             if x != 0 {
+                self.prof_ts_bail_xread += 1;
                 return false;
             }
         }
@@ -15743,15 +15767,31 @@ impl Simulator {
             let mut scratch = [0u64; 2];
             for &sig in ts.reads_wide.iter() {
                 if !self.signal_table[sig as usize].words128_if_clean(&mut scratch) {
+                    self.prof_ts_bail_xread += 1;
                     return false;
                 }
             }
         }
         if !self.exec_two_state(ts) {
+            self.prof_ts_bail_abort += 1;
             return false;
         }
         self.prof_ts_evals += 1;
         true
+    }
+
+    /// Does this block write any currently forced signal? Walks the FORCE
+    /// map (a handful of entries in practice) against the block's sorted
+    /// write set, so the cost stays proportional to the forces in flight.
+    fn ts_writes_forced(&self, ts: &super::bytecode::TwoStateBlock) -> bool {
+        self.forced_signals.keys().any(|&f| {
+            let f = f as u32;
+            ts.writes.binary_search(&f).is_ok()
+                || ts
+                    .writes_span
+                    .iter()
+                    .any(|&(first, count)| f >= first && f - first < count)
+        })
     }
 
     /// Returns false when the run ABORTED (dynamic element read hit X or an
@@ -15871,6 +15911,25 @@ impl Simulator {
                 TsInsn::Add { d, a, b, mask } => {
                     regs[*d as usize] =
                         regs[*a as usize].wrapping_add(regs[*b as usize]) & mask;
+                }
+                TsInsn::AddC { d, s: sr, k, mask } => {
+                    regs[*d as usize] = regs[*sr as usize].wrapping_add(*k) & mask;
+                }
+                TsInsn::Shl { d, a, b, w, mask } => {
+                    let amt = regs[*b as usize];
+                    regs[*d as usize] = if amt >= *w as u64 {
+                        0
+                    } else {
+                        (regs[*a as usize] << amt) & mask
+                    };
+                }
+                TsInsn::Shr { d, a, b, w } => {
+                    let amt = regs[*b as usize];
+                    regs[*d as usize] = if amt >= *w as u64 {
+                        0
+                    } else {
+                        regs[*a as usize] >> amt
+                    };
                 }
                 TsInsn::Sub { d, a, b, mask } => {
                     regs[*d as usize] =
@@ -16198,6 +16257,25 @@ impl Simulator {
                     regs[*d as usize] =
                         regs[*a as usize].wrapping_add(regs[*b as usize]) & mask;
                 }
+                TsInsn::AddC { d, s: sr, k, mask } => {
+                    regs[*d as usize] = regs[*sr as usize].wrapping_add(*k) & mask;
+                }
+                TsInsn::Shl { d, a, b, w, mask } => {
+                    let amt = regs[*b as usize];
+                    regs[*d as usize] = if amt >= *w as u64 {
+                        0
+                    } else {
+                        (regs[*a as usize] << amt) & mask
+                    };
+                }
+                TsInsn::Shr { d, a, b, w } => {
+                    let amt = regs[*b as usize];
+                    regs[*d as usize] = if amt >= *w as u64 {
+                        0
+                    } else {
+                        regs[*a as usize] >> amt
+                    };
+                }
                 TsInsn::Sub { d, a, b, mask } => {
                     regs[*d as usize] =
                         regs[*a as usize].wrapping_sub(regs[*b as usize]) & mask;
@@ -16448,6 +16526,25 @@ impl Simulator {
                 TsInsn::Add { d, a, b, mask } => {
                     regs[*d as usize] =
                         regs[*a as usize].wrapping_add(regs[*b as usize]) & mask;
+                }
+                TsInsn::AddC { d, s: sr, k, mask } => {
+                    regs[*d as usize] = regs[*sr as usize].wrapping_add(*k) & mask;
+                }
+                TsInsn::Shl { d, a, b, w, mask } => {
+                    let amt = regs[*b as usize];
+                    regs[*d as usize] = if amt >= *w as u64 {
+                        0
+                    } else {
+                        (regs[*a as usize] << amt) & mask
+                    };
+                }
+                TsInsn::Shr { d, a, b, w } => {
+                    let amt = regs[*b as usize];
+                    regs[*d as usize] = if amt >= *w as u64 {
+                        0
+                    } else {
+                        regs[*a as usize] >> amt
+                    };
                 }
                 TsInsn::Sub { d, a, b, mask } => {
                     regs[*d as usize] =
@@ -27362,6 +27459,20 @@ impl Simulator {
                 .filter(|s| matches!(s, TsSlot::Yes(_)))
                 .count()
         );
+        if self.prof_ts_bail_warnx
+            + self.prof_ts_bail_forced
+            + self.prof_ts_bail_xread
+            + self.prof_ts_bail_abort
+            > 0
+        {
+            eprintln!(
+                "[PROF] two_state_bail warn_x={} forced_write={} x_read={} run_abort={}",
+                self.prof_ts_bail_warnx,
+                self.prof_ts_bail_forced,
+                self.prof_ts_bail_xread,
+                self.prof_ts_bail_abort
+            );
+        }
         if self.profile_report {
             self.print_profile_report(t_nba, t_process, t_sched);
         }
@@ -37424,6 +37535,37 @@ impl Simulator {
                 let name = self.resolve_hier_name(hier);
                 let id = self.signal_name_to_id.get(name.as_str()).copied();
                 return Some((name, id));
+            }
+        }
+        // §10.6.2: a HIERARCHICAL target (`force u.internal = v`) parses as
+        // MemberAccess, not a dotted Ident, so it fell past both arms and
+        // returned None — the force degraded to a plain write that the
+        // target's own driver overwrote on its next evaluation (and a
+        // collapsed output port never showed it at all). Flatten the member
+        // chain and accept it only when it names real storage, so unrelated
+        // MemberAccess shapes (struct fields, class properties) keep the
+        // previous behaviour.
+        if let Some(name) = self.flat_member_name(lv) {
+            if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                return Some((name, Some(id)));
+            }
+            if self.signals.contains_key(&name) {
+                return Some((name, None));
+            }
+            // Instance-scoped force issued from inside a scope: retry under
+            // the active resolution hint, as the name-keyed paths do.
+            let hinted = self
+                .name_resolve_hint
+                .borrow()
+                .as_ref()
+                .map(|h| format!("{}.{}", h, name));
+            if let Some(hn) = hinted {
+                if let Some(&id) = self.signal_name_to_id.get(hn.as_str()) {
+                    return Some((hn, Some(id)));
+                }
+                if self.signals.contains_key(&hn) {
+                    return Some((hn, None));
+                }
             }
         }
         // §10.6.2: `force mem[i] = v` on a FIXED-array element. The element

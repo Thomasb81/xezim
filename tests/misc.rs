@@ -274,6 +274,10 @@ mod ref_struct_queue_and_local_shadow;
 mod nested_struct_string_member_display;
 #[path = "misc/package_property_assertions.rs"]
 mod package_property_assertions;
+#[path = "misc/hier_force_holds_against_drivers.rs"]
+mod hier_force_holds_against_drivers;
+#[path = "misc/two_state_island_coverage.rs"]
+mod two_state_island_coverage;
 #[path = "misc/hier_iface_task_suspension.rs"]
 mod hier_iface_task_suspension;
 #[path = "misc/hier_port_drive_and_collision.rs"]
