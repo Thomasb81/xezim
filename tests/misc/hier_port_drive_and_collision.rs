@@ -256,3 +256,54 @@ endmodule
     );
     assert!(text.contains("TEST_PASS"), "shadowed hier-assign rhs:\n{text}");
 }
+
+/// Two reference-verified mechanisms from one TB (§23.10.1 + §10.3.3):
+/// (a) `assign #N` INSIDE an inlined module keeps its delay — the pending
+///     inline path used to drop it, so a `#3` clock echo in the DUT tracked
+///     undelayed; (b) a bound module's upward reference (`u_core.clk` from a
+///     `bind` harness) resolves at entry-build time — unresolved, the echo
+///     copy evaluated on unrelated settle passes (right value, wrong time).
+/// The XOR err detector catches either failure as a >=1ns misalignment.
+#[test]
+fn bound_harness_sees_delayed_clock_echo_aligned() {
+    let text = run(
+        "bind_echo",
+        r#"module m_core (input logic i_clk, output logic [7:0] o_q);
+  logic clk;
+  assign #3 clk = i_clk;
+  always_ff @(posedge i_clk) o_q <= o_q + 8'h1;
+endmodule
+module m_wrap (input logic i_clk, output logic [7:0] o_q);
+  m_core u_core (.i_clk(i_clk), .o_q(o_q));
+endmodule
+module m_watch ();
+  wire clk;
+  assign clk = u_core.clk;
+endmodule
+bind m_wrap m_watch v_watch ();
+module tb_top;
+  logic tb_clk = 0;
+  wire tb_clk_d;
+  logic [7:0] q;
+  assign #3 tb_clk_d = tb_clk;
+  m_wrap uut (.i_clk(), .o_q(q));
+  assign tb_top.uut.u_core.i_clk = tb_clk;
+  logic err;
+  assign err = tb_clk_d ^ uut.v_watch.clk;
+  int bad = 0;
+  always @(posedge err) begin
+    #1;
+    if (err !== 0) bad++;
+  end
+  always #5 tb_clk = ~tb_clk;
+  initial begin
+    #200;
+    if (bad == 0) $display("TEST_PASS");
+    else $display("TEST_FAIL n=%0d", bad);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(text.contains("TEST_PASS"), "delayed echo through bind:\n{text}");
+}
