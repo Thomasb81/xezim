@@ -135,6 +135,8 @@ mod port_width_mismatch_explains;
 mod elaboration_runaway_guards;
 #[path = "misc/value_trace.rs"]
 mod value_trace;
+#[path = "misc/clocked_loop_case_nest_compiled.rs"]
+mod clocked_loop_case_nest_compiled;
 #[path = "misc/comb_regvar_loop_fallback.rs"]
 mod comb_regvar_loop_fallback;
 #[path = "misc/svtb_suite.rs"]
@@ -272,5 +274,7 @@ mod ref_struct_queue_and_local_shadow;
 mod nested_struct_string_member_display;
 #[path = "misc/package_property_assertions.rs"]
 mod package_property_assertions;
+#[path = "misc/hier_iface_task_suspension.rs"]
+mod hier_iface_task_suspension;
 #[path = "misc/hier_port_drive_and_collision.rs"]
 mod hier_port_drive_and_collision;
