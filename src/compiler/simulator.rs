@@ -80947,7 +80947,7 @@ impl Simulator {
                 // `exec_method_call` -> the §18.11 solver correctly. Route the
                 // built-in names through `exec_method_call` too (it intercepts
                 // them ahead of user dispatch), restoring bare `randomize()`
-                // inside `new`/functions (Questa honors it).
+                // inside `new`/functions (the reference simulator honors it).
                 if self.class_has_method(&ctx, name)
                     || matches!(name.as_str(), "randomize" | "srandom" | "get_randstate" | "set_randstate")
                 {
@@ -82033,19 +82033,25 @@ impl Simulator {
     /// nested helper (e.g. a timing `wait_for` wrapper around a revived task
     /// body) that merely surrounds the read/write without declaring `nm`.
     fn static_local_key_for(&self, nm: &str) -> Option<String> {
-        let sub_name = self
-            .static_local_syncs
+        // §13.4.2: a `static` local is ONE cell shared across calls of ITS OWN
+        // subroutine — and nothing else. Only the CURRENT frame may claim the
+        // name. Scanning outward (past frames that do not declare it) bound a
+        // callee's ordinary automatic local to an ancestor's same-named
+        // static: the callee then read the ancestor's cell instead of its own
+        // initialiser AND corrupted that cell on write, compounding across
+        // calls. Names like `cnt`/`i`/`idx` collide constantly, so nothing
+        // about such a design looks wrong.
+        //
+        // The frame stores the key computed when the declaration executed;
+        // reuse it rather than re-deriving one here, which also removes a
+        // per-read `format!` from this path and cannot drift when the class /
+        // specialization context differs between declaration and use.
+        self.static_local_syncs
+            .last()?
+            .1
             .iter()
-            .rev()
-            .find(|(_, syncs)| syncs.iter().any(|(n, _)| n == nm))
-            .map(|(n, _)| n.clone())?;
-        Some(match (self.class_context_stack.last().and_then(|c| c.as_ref()), self.current_spec.as_ref()) {
-            (Some(cn), Some((spec_base, sig))) if spec_base == cn => {
-                format!("{}#{}::{}::{}", cn, sig, sub_name, nm)
-            }
-            (Some(cn), _) => format!("{}::{}::{}", cn, sub_name, nm),
-            _ => format!("{}::{}", sub_name, nm),
-        })
+            .find(|(n, _)| n == nm)
+            .map(|(_, key)| key.clone())
     }
 
     /// §6.21: on subroutine return, copy each `static` local's final value from

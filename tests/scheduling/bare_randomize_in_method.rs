@@ -18,7 +18,7 @@ use std::process::Command;
 ///
 /// Both the bare and the `this.`-qualified call must yield 400 in-range draws
 /// from 400 solves. Matched byte-for-byte against the reference simulator
-/// (Questa):
+/// (the reference simulator):
 ///   TAG_BARESOLVE bare=400 qualified=400
 ///   TAG_PASS bare=400 qualified=400
 #[test]
