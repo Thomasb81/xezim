@@ -33,6 +33,8 @@ mod class_local_typedef_aa;
 mod class_local_typedef_resolution;
 #[path = "classes/class_method_dispatch.rs"]
 mod class_method_dispatch;
+#[path = "classes/method_default_this_call.rs"]
+mod method_default_this_call;
 #[path = "classes/class_name_method_shadow.rs"]
 mod class_name_method_shadow;
 #[path = "classes/class_packed_and_type_params.rs"]
@@ -57,10 +59,16 @@ mod constraint_algebra_inherit;
 mod constraint_array_sum;
 #[path = "classes/constraint_arrays_ordering.rs"]
 mod constraint_arrays_ordering;
+#[path = "classes/constraint_dyn_size_pinned_scalar.rs"]
+mod constraint_dyn_size_pinned_scalar;
 #[path = "classes/constraint_foreach_and_casts.rs"]
 mod constraint_foreach_and_casts;
 #[path = "classes/constraint_funcs_aggregates.rs"]
 mod constraint_funcs_aggregates;
+#[path = "classes/constraint_inline_enclosing_scope.rs"]
+mod constraint_inline_enclosing_scope;
+#[path = "classes/constraint_prefixed_inline_with.rs"]
+mod constraint_prefixed_inline_with;
 #[path = "classes/constraint_randc_soft_local.rs"]
 mod constraint_randc_soft_local;
 #[path = "classes/cov_covergroup_basic.rs"]
@@ -127,6 +135,8 @@ mod struct_with_class_handle;
 mod struct_output_inout_ref_formal;
 #[path = "classes/type_param_struct_formal.rs"]
 mod type_param_struct_formal;
+#[path = "classes/struct_formal_and_config_foreach.rs"]
+mod struct_formal_and_config_foreach;
 #[path = "classes/typename_param_class.rs"]
 mod typename_param_class;
 #[path = "classes/unpacked_struct_class_property_whole_value.rs"]
@@ -177,3 +187,5 @@ mod randomize_obj_array_property;
 mod static_assoc_struct_pool;
 #[path = "classes/vif_static_roundtrip.rs"]
 mod vif_static_roundtrip;
+#[path = "classes/nopack_member_array.rs"]
+mod nopack_member_array;

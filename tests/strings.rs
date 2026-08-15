@@ -63,3 +63,5 @@ mod string_methods_lrm;
 mod string_property_shadowed_by_local;
 #[path = "strings/system_task_gaps.rs"]
 mod system_task_gaps;
+#[path = "strings/fixed_string_array_dims.rs"]
+mod fixed_string_array_dims;

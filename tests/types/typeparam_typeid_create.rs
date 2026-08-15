@@ -20,7 +20,7 @@
 //! constructed object's virtual `get_type_name()` returned "", and the
 //! factory's `m_type_name` cache was built as `"uvm_reg_predictor #()"`
 //! instead of `"uvm_reg_predictor #(uvm_sequence_item)"`. This pins the
-//! type-parameter receiver case (UVM test 70regs/90Mantis/4191).
+//! type-parameter receiver case.
 
 use std::process::Command;
 
