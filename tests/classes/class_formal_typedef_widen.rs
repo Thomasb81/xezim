@@ -8,7 +8,7 @@
 //! as-is and read x in the high half — which is exactly how
 //! `uvm_packer::pack_field_int(uvm_integral_t value, int size)` corrupted
 //! packed `$realtobits(shortreal)` and negative values passed to a 64-bit
-//! packer formal (UVM 03data pack/record group).
+//! formal.
 
 use xezim::simulate;
 
