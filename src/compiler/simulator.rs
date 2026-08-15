@@ -2379,6 +2379,12 @@ struct ProcessContext {
 /// at the body's `ScopePop` sentinel so the process can suspend in between.
 #[derive(Debug, Clone, Default)]
 struct TaskCleanup {
+    /// Instance scope an inlined HIERARCHICAL/interface task body resolves
+    /// bare names under (`bus.snoop()` → "bus"). Installed at bind and on
+    /// every process RESUME while this frame is on top (a suspend inside the
+    /// body would otherwise lose it), restored to `prev_hint` at unwind.
+    frame_scope_hint: Option<String>,
+    prev_hint: Option<String>,
     /// §21.2.1.7 `%m`: the m_scope_stack to restore on task return (a task
     /// call RESETS the lexical scope to just the task, since tasks are
     /// declared at module/package level — the CALLER's scope is not part of
@@ -4110,8 +4116,17 @@ pub struct Simulator {
     ts_edge: Vec<TsSlot>,
     /// Two-state scratch register file (u64 words).
     ts_regs: Vec<u64>,
+    /// Wide (65..=128-bit) two-state register bank; same index space as
+    /// `ts_regs` (a register's bank is static, decided at lower time).
+    ts_wregs: Vec<[u64; 2]>,
     /// Two-state eval hits, for the profile report.
     prof_ts_evals: u64,
+    /// XEZIM_PROFILE_REPORT=1: reference-style ranked profile (by design
+    /// unit / instance / construct). Implies per-entry and per-edge-block
+    /// nanosecond attribution.
+    profile_report: bool,
+    /// Per-comb-entry accumulated eval time (profile_report only).
+    prof_entry_ns: Vec<u64>,
     comb_dep_entries: Vec<u32>,
     /// Bitvec: dirty_signals[signal_id] = true if signal changed since last settle.
     dirty_signals: Vec<bool>,
@@ -6701,7 +6716,9 @@ impl Simulator {
             cross_block_wakeup_count: Vec::new(),
             boundary_packet_count: Vec::new(),
             local_quiescence_iterations: Vec::new(),
-            edge_block_stats_enabled: std::env::var("XEZIM_EDGE_BLOCK_STATS").ok().as_deref()
+            edge_block_stats_enabled: std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref()
+                == Some("1")
+                || std::env::var("XEZIM_EDGE_BLOCK_STATS").ok().as_deref()
                 == Some("1"),
             edge_block_scope: Vec::new(),
             edge_block_needs_hint: Vec::new(),
@@ -6827,7 +6844,10 @@ impl Simulator {
             ts_comb: Vec::new(),
             ts_edge: Vec::new(),
             ts_regs: Vec::new(),
+            ts_wregs: Vec::new(),
             prof_ts_evals: 0,
+            profile_report: std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
+            prof_entry_ns: Vec::new(),
             comb_dep_entries: Vec::new(),
             dirty_signals: vec![false; num_signals],
             dirty_list: Vec::new(),
@@ -6957,7 +6977,8 @@ impl Simulator {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(100_000),
             prof_fallback_insns: 0,
-            profile_timing: std::env::var("XEZIM_PROFILE_TIMING").ok().as_deref() == Some("1"),
+            profile_timing: std::env::var("XEZIM_PROFILE_TIMING").ok().as_deref() == Some("1")
+                || std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
             prof_fallback_by_reason: HashMap::default(),
             prof_settle_dc_ns: 0,
             prof_settle_ca_ns: 0,
@@ -15503,6 +15524,161 @@ impl Simulator {
     /// the connect assign becomes a self-copy that `build_comb_entries`
     /// drops. Runs BEFORE edge-block compilation so bytecode binds the
     /// collapsed ids.
+    /// XEZIM_PROFILE_REPORT=1: ranked profile in the spirit of the
+    /// commercial simulators' reports — percentages by DESIGN UNIT (module
+    /// definition), by INSTANCE, and by CONSTRUCT — computed from measured
+    /// per-comb-entry and per-edge-block nanoseconds. Times outside those
+    /// two attributions (NBA apply, testbench processes, scheduling) are
+    /// reported as their own lines from the existing phase buckets.
+    fn print_profile_report(&self, t_nba: u64, t_process: u64, t_sched: u64) {
+        struct Agg {
+            ns: u64,
+            evals: u64,
+            instances: HashSet<String>,
+        }
+        // instance path for a comb entry: its scope hint, else the parent
+        // path of its first write target.
+        let entry_instance = |eidx: usize| -> String {
+            let e = &self.comb_entries[eidx];
+            if let Some(sc) = e.cold.scope_hint.as_deref() {
+                if !sc.is_empty() {
+                    return sc.to_string();
+                }
+            }
+            e.cold
+                .write_signal_ids
+                .first()
+                .and_then(|&id| self.id_to_name.get(id))
+                .and_then(|n| n.rsplit_once('.').map(|(p, _)| p.to_string()))
+                .unwrap_or_default()
+        };
+        // instance path -> defining module, walking up for generate scopes.
+        let def_of = |path: &str| -> String {
+            let mut p = path;
+            loop {
+                if p.is_empty() {
+                    return self.module.name.clone();
+                }
+                if let Some(inst) = self.instance_by_path(p) {
+                    return inst.def_name.clone();
+                }
+                match p.rsplit_once('.') {
+                    Some((up, _)) => p = up,
+                    None => return self.module.name.clone(),
+                }
+            }
+        };
+        let mut by_def: HashMap<String, Agg> = HashMap::default();
+        let mut by_inst: HashMap<String, (u64, u64)> = HashMap::default();
+        let mut constructs: Vec<(u64, u64, String)> = Vec::new();
+        let mut attributed: u64 = 0;
+        for (eidx, &ns) in self.prof_entry_ns.iter().enumerate() {
+            if ns == 0 || eidx >= self.comb_entries.len() {
+                continue;
+            }
+            let evals = self.prof_entry_counts.get(eidx).copied().unwrap_or(0);
+            let inst = entry_instance(eidx);
+            let def = def_of(&inst);
+            attributed += ns;
+            let a = by_def.entry(def).or_insert(Agg {
+                ns: 0,
+                evals: 0,
+                instances: HashSet::default(),
+            });
+            a.ns += ns;
+            a.evals += evals;
+            a.instances.insert(inst.clone());
+            let i = by_inst.entry(inst.clone()).or_insert((0, 0));
+            i.0 += ns;
+            i.1 += evals;
+            let label = self.comb_entry_trace_label(eidx, &self.comb_entries[eidx]);
+            constructs.push((ns, evals, label));
+        }
+        for (bi, &ns) in self.edge_block_exec_ns.iter().enumerate() {
+            if ns == 0 || bi >= self.edge_blocks.len() {
+                continue;
+            }
+            let inst = self.edge_blocks[bi].scope.clone();
+            let def = def_of(&inst);
+            attributed += ns;
+            let a = by_def.entry(def).or_insert(Agg {
+                ns: 0,
+                evals: 0,
+                instances: HashSet::default(),
+            });
+            a.ns += ns;
+            a.instances.insert(inst.clone());
+            let i = by_inst.entry(inst.clone()).or_insert((0, 0));
+            i.0 += ns;
+            constructs.push((
+                ns,
+                0,
+                format!(
+                    "always @(edge) at byte {} ({})",
+                    self.edge_blocks[bi].stmt.span.start,
+                    if inst.is_empty() { "top" } else { inst.as_str() }
+                ),
+            ));
+        }
+        let other = [
+            ("nba apply", t_nba),
+            ("processes", t_process),
+            ("scheduling", t_sched),
+        ];
+        let other_total: u64 = other.iter().map(|&(_, n)| n).sum();
+        let total = attributed + other_total;
+        if total == 0 {
+            eprintln!("[xezim-profile] no attributed time (run with XEZIM_PROFILE_REPORT=1 for a full simulation)");
+            return;
+        }
+        let pct = |ns: u64| ns as f64 * 100.0 / total as f64;
+        let ms = |ns: u64| ns as f64 / 1e6;
+        eprintln!("================ xezim profile report ================");
+        eprintln!(
+            "attributed {:.1}ms in comb/edge constructs, {:.1}ms elsewhere",
+            ms(attributed),
+            ms(other_total)
+        );
+        eprintln!("---- by design unit ----------------------------------");
+        eprintln!("{:>7}  {:>10}  {:>10}  {:>5}  unit", "%", "time", "evals", "insts");
+        let mut defs: Vec<_> = by_def.into_iter().collect();
+        defs.sort_by_key(|(_, a)| std::cmp::Reverse(a.ns));
+        for (name, a) in defs.into_iter().take(20) {
+            eprintln!(
+                "{:>6.1}%  {:>8.1}ms  {:>10}  {:>5}  {}",
+                pct(a.ns),
+                ms(a.ns),
+                a.evals,
+                a.instances.len(),
+                name
+            );
+        }
+        eprintln!("---- by instance (top 20) ----------------------------");
+        eprintln!("{:>7}  {:>10}  {:>10}  instance", "%", "time", "evals");
+        let mut insts: Vec<_> = by_inst.into_iter().collect();
+        insts.sort_by_key(|(_, (ns, _))| std::cmp::Reverse(*ns));
+        for (name, (ns, evals)) in insts.into_iter().take(20) {
+            eprintln!(
+                "{:>6.1}%  {:>8.1}ms  {:>10}  {}",
+                pct(ns),
+                ms(ns),
+                evals,
+                if name.is_empty() { "(top)" } else { name.as_str() }
+            );
+        }
+        eprintln!("---- by construct (top 20) ---------------------------");
+        eprintln!("{:>7}  {:>10}  {:>10}  construct", "%", "time", "evals");
+        constructs.sort_by_key(|&(ns, _, _)| std::cmp::Reverse(ns));
+        for (ns, evals, label) in constructs.into_iter().take(20) {
+            eprintln!("{:>6.1}%  {:>8.1}ms  {:>10}  {}", pct(ns), ms(ns), evals, label);
+        }
+        eprintln!("---- outside constructs ------------------------------");
+        for (name, ns) in other {
+            eprintln!("{:>6.1}%  {:>8.1}ms  {}", pct(ns), ms(ns), name);
+        }
+        eprintln!("======================================================");
+    }
+
     /// P5 two-state fast path for one comb entry. Returns true when the
     /// entry was fully evaluated in 2-state (the caller skips the 4-state
     /// stream); false = run the normal path (not lowerable, X present on a
@@ -15540,6 +15716,18 @@ impl Simulator {
                 &self.signal_real,
                 &self.array_first_id,
             );
+            if lowered.is_none() && std::env::var("XZ_TS_DBG").is_ok() {
+                eprintln!(
+                    "[TS-NO] edge={} idx={} insns={:?}",
+                    edge,
+                    eidx,
+                    compiled
+                        .instructions
+                        .iter()
+                        .map(super::bytecode::insn_opcode_name)
+                        .collect::<Vec<_>>()
+                );
+            }
             let slots = if edge { &mut self.ts_edge } else { &mut self.ts_comb };
             slots[eidx] = match lowered {
                 Some(ts) => TsSlot::Yes(std::sync::Arc::new(ts)),
@@ -15574,6 +15762,14 @@ impl Simulator {
                 return false;
             }
         }
+        if !ts.reads_wide.is_empty() {
+            let mut scratch = [0u64; 2];
+            for &sig in ts.reads_wide.iter() {
+                if !self.signal_table[sig as usize].words128_if_clean(&mut scratch) {
+                    return false;
+                }
+            }
+        }
         if !self.exec_two_state(ts) {
             return false;
         }
@@ -15585,11 +15781,382 @@ impl Simulator {
     /// out-of-range index) — lowering guarantees no side effect has been
     /// committed at that point, so the caller re-runs the 4-state stream.
     fn exec_two_state(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
-        if ts.has_ctrl {
+        if ts.has_wide {
+            self.exec_two_state_wide(ts)
+        } else if ts.has_ctrl {
             self.exec_two_state_ctrl(ts)
         } else {
             self.exec_two_state_line(ts)
         }
+    }
+
+    /// Wide writeback: mirrors ts_store's bookkeeping via Value::set_words128.
+    fn ts_store_wide(&mut self, id: usize, v: [u64; 2]) {
+        if self.signal_table[id].set_words128(v) {
+            if !self.dirty_signals[id] {
+                self.dirty_signals[id] = true;
+                self.dirty_list.push(id);
+            }
+            self.dirty_any = true;
+            self.table_modified = true;
+            self.after_signal_write(id);
+        }
+    }
+
+    fn ts_store_nba_wide(&mut self, id: usize, v: [u64; 2], w: u32) {
+        let val = Value::from_words128(v, w);
+        if let Some(i) = self.nba_fast_index.get(id) {
+            self.nba_fast[i].value = val;
+        } else if self.signal_table[id] != val {
+            self.nba_fast_index.insert(id, self.nba_fast.len());
+            self.nba_fast.push(NbaFast {
+                block_index: 0,
+                signal_id: id,
+                value: val,
+            });
+        } else {
+            self.prof_nba_elided += 1;
+        }
+    }
+
+    /// Executor for blocks containing wide (65..=128-bit) ops: full arm set
+    /// with a pc loop. Kept OUT of the narrow executors so their code size
+    /// (and the sbox-class dispatch) is unaffected.
+    fn exec_two_state_wide(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
+        use super::bytecode::TsInsn;
+        let mut regs = std::mem::take(&mut self.ts_regs);
+        let mut wregs = std::mem::take(&mut self.ts_wregs);
+        if regs.len() < ts.num_regs as usize {
+            regs.resize(ts.num_regs as usize, 0);
+        }
+        if wregs.len() < ts.num_regs as usize {
+            wregs.resize(ts.num_regs as usize, [0, 0]);
+        }
+        let insns_ptr = ts.insns.as_ptr();
+        let insns_len = ts.insns.len();
+        let mut pc = 0usize;
+        macro_rules! bail {
+            () => {{
+                self.ts_regs = regs;
+                self.ts_wregs = wregs;
+                return false;
+            }};
+        }
+        while pc < insns_len {
+            match unsafe { &*insns_ptr.add(pc) } {
+                TsInsn::LoadSig { d, sig } => {
+                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    regs[*d as usize] = v;
+                }
+                TsInsn::Const { d, v } => regs[*d as usize] = *v,
+                TsInsn::SigBit { d, sig, bit } => {
+                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    regs[*d as usize] = (v >> bit) & 1;
+                }
+                TsInsn::SigRange { d, sig, lo, mask } => {
+                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    regs[*d as usize] = (v >> lo) & mask;
+                }
+                TsInsn::SigBitW { d, sig, bit } => {
+                    let (v, _) =
+                        Self::raw_bits_slice(&self.signal_table[*sig as usize], *bit, 1);
+                    regs[*d as usize] = v;
+                }
+                TsInsn::SigRangeW { d, sig, lo, w, mask } => {
+                    let (v, _) =
+                        Self::raw_bits_slice(&self.signal_table[*sig as usize], *lo, *w);
+                    regs[*d as usize] = v & mask;
+                }
+                TsInsn::Bit { d, s, bit } => {
+                    regs[*d as usize] = (regs[*s as usize] >> bit) & 1;
+                }
+                TsInsn::Range { d, s, lo, mask } => {
+                    regs[*d as usize] = (regs[*s as usize] >> lo) & mask;
+                }
+                TsInsn::Xor { d, a, b } => {
+                    regs[*d as usize] = regs[*a as usize] ^ regs[*b as usize];
+                }
+                TsInsn::And { d, a, b } => {
+                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                }
+                TsInsn::Or { d, a, b } => {
+                    regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
+                }
+                TsInsn::Not { d, s, mask } => {
+                    regs[*d as usize] = !regs[*s as usize] & mask;
+                }
+                TsInsn::XorC { d, s, k } => {
+                    regs[*d as usize] = regs[*s as usize] ^ k;
+                }
+                TsInsn::EqC { d, s, k } => {
+                    regs[*d as usize] = (regs[*s as usize] == *k) as u64;
+                }
+                TsInsn::Add { d, a, b, mask } => {
+                    regs[*d as usize] =
+                        regs[*a as usize].wrapping_add(regs[*b as usize]) & mask;
+                }
+                TsInsn::Sub { d, a, b, mask } => {
+                    regs[*d as usize] =
+                        regs[*a as usize].wrapping_sub(regs[*b as usize]) & mask;
+                }
+                TsInsn::Eq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                }
+                TsInsn::Neq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] != regs[*b as usize]) as u64;
+                }
+                TsInsn::Lt { d, a, b } => {
+                    regs[*d as usize] = ((regs[*a as usize]) < (regs[*b as usize])) as u64;
+                }
+                TsInsn::Leq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] <= regs[*b as usize]) as u64;
+                }
+                TsInsn::Gt { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] > regs[*b as usize]) as u64;
+                }
+                TsInsn::Geq { d, a, b } => {
+                    regs[*d as usize] = (regs[*a as usize] >= regs[*b as usize]) as u64;
+                }
+                TsInsn::LogNot { d, s } => {
+                    regs[*d as usize] = (regs[*s as usize] == 0) as u64;
+                }
+                TsInsn::LogAnd { d, a, b } => {
+                    regs[*d as usize] =
+                        (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
+                }
+                TsInsn::LogOr { d, a, b } => {
+                    regs[*d as usize] =
+                        (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
+                }
+                TsInsn::Concat { d, parts } => {
+                    let mut acc = 0u64;
+                    for &(r, w) in parts.iter() {
+                        acc = (acc << w) | regs[r as usize];
+                    }
+                    regs[*d as usize] = acc;
+                }
+                TsInsn::Mask { d, mask } => {
+                    regs[*d as usize] &= mask;
+                }
+                TsInsn::Mul { d, a, b, mask } => {
+                    regs[*d as usize] =
+                        regs[*a as usize].wrapping_mul(regs[*b as usize]) & mask;
+                }
+                TsInsn::Repl { d, s, w, count } => {
+                    let part = regs[*s as usize];
+                    let mut acc = 0u64;
+                    for _ in 0..*count {
+                        acc = (acc << *w) | part;
+                    }
+                    regs[*d as usize] = acc;
+                }
+                TsInsn::WSigRange { d, sig, lo, w, mask_hi } => {
+                    let v = &self.signal_table[*sig as usize];
+                    let (lo0, _) = Self::raw_bits_slice(v, *lo, 64);
+                    let (hi0, _) = Self::raw_bits_slice(v, *lo + 64, *w - 64);
+                    wregs[*d as usize] = [lo0, hi0 & mask_hi];
+                }
+                TsInsn::WRepl { d, s, w, count } => {
+                    let part = regs[*s as usize];
+                    let mut acc = [0u64; 2];
+                    for _ in 0..*count {
+                        let w = *w as u32;
+                        acc = if w < 64 {
+                            [acc[0] << w, (acc[1] << w) | (acc[0] >> (64 - w))]
+                        } else {
+                            [0, acc[0]]
+                        };
+                        acc[0] |= part;
+                    }
+                    wregs[*d as usize] = acc;
+                }
+                TsInsn::BrSigFalse { sig, bit, t } => {
+                    let cond = if *bit == u32::MAX {
+                        let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                        v != 0
+                    } else {
+                        let (v, _) = Self::raw_bits_slice(
+                            &self.signal_table[*sig as usize],
+                            *bit as u16,
+                            1,
+                        );
+                        v != 0
+                    };
+                    if !cond {
+                        pc = *t as usize;
+                        continue;
+                    }
+                }
+                TsInsn::BrFalse { s, t } => {
+                    if regs[*s as usize] == 0 {
+                        pc = *t as usize;
+                        continue;
+                    }
+                }
+                TsInsn::BrNz { s, t } => {
+                    if regs[*s as usize] != 0 {
+                        pc = *t as usize;
+                        continue;
+                    }
+                }
+                TsInsn::Jmp { t } => {
+                    pc = *t as usize;
+                    continue;
+                }
+                TsInsn::ElemLoad(op) => {
+                    let i = regs[op.idx as usize] as i64;
+                    if i < op.lo || i > op.hi {
+                        bail!();
+                    }
+                    let eid = op.first as usize + (i - op.lo) as usize;
+                    let (v, x) = self.signal_table[eid].raw_bits();
+                    if x != 0 {
+                        bail!();
+                    }
+                    regs[op.s as usize] = v;
+                }
+                TsInsn::ElemStoreNba(op) => {
+                    let (first, lo, hi, idx, s, w, mask) =
+                        (op.first, op.lo, op.hi, op.idx, op.s, op.w, op.mask);
+                    let i = regs[idx as usize] as i64;
+                    if i >= lo && i <= hi {
+                        let eid = first as usize + (i - lo) as usize;
+                        let v = regs[s as usize] & mask;
+                        self.ts_store_nba(eid, v, w);
+                    }
+                }
+                TsInsn::ElemStore(op) => {
+                    let i = regs[op.idx as usize] as i64;
+                    if i >= op.lo && i <= op.hi {
+                        let eid = op.first as usize + (i - op.lo) as usize;
+                        let v = regs[op.s as usize] & op.mask;
+                        self.ts_store(eid, v, op.mask);
+                    }
+                }
+                TsInsn::NbaFromElem(op) => {
+                    let (iv, _) = self.signal_table[op.idx_sig as usize].raw_bits();
+                    let i = iv as i64;
+                    if i < op.lo || i > op.hi {
+                        bail!();
+                    }
+                    let eid = op.first as usize + (i - op.lo) as usize;
+                    let (ev, ex) = self.signal_table[eid].raw_bits();
+                    if ex != 0 {
+                        bail!();
+                    }
+                    let m = if op.w >= 64 { u64::MAX } else { (1u64 << op.w) - 1 };
+                    self.ts_store_nba(op.dst as usize, ev & m, op.w);
+                }
+                TsInsn::Store { sig, s, mask } => {
+                    let v = regs[*s as usize] & mask;
+                    self.ts_store(*sig as usize, v, *mask);
+                }
+                TsInsn::StoreNba { sig, s, w, mask } => {
+                    let v = regs[*s as usize] & mask;
+                    self.ts_store_nba(*sig as usize, v, *w);
+                }
+                // ---- wide bank ----
+                TsInsn::WLoadSig { d, sig } => {
+                    let mut w2 = [0u64; 2];
+                    // Prefilter proved cleanliness; a failure here means the
+                    // value changed representation mid-eval — bail safely.
+                    if !self.signal_table[*sig as usize].words128_if_clean(&mut w2) {
+                        bail!();
+                    }
+                    wregs[*d as usize] = w2;
+                }
+                TsInsn::WConst { d, v } => wregs[*d as usize] = **v,
+                TsInsn::WXor { d, a, b } => {
+                    let (x, y) = (wregs[*a as usize], wregs[*b as usize]);
+                    wregs[*d as usize] = [x[0] ^ y[0], x[1] ^ y[1]];
+                }
+                TsInsn::WAnd { d, a, b } => {
+                    let (x, y) = (wregs[*a as usize], wregs[*b as usize]);
+                    wregs[*d as usize] = [x[0] & y[0], x[1] & y[1]];
+                }
+                TsInsn::WOr { d, a, b } => {
+                    let (x, y) = (wregs[*a as usize], wregs[*b as usize]);
+                    wregs[*d as usize] = [x[0] | y[0], x[1] | y[1]];
+                }
+                TsInsn::WNot { d, s, mask_hi } => {
+                    let x = wregs[*s as usize];
+                    wregs[*d as usize] = [!x[0], !x[1] & mask_hi];
+                }
+                TsInsn::WRange { d, s, lo, mask_hi } => {
+                    let x = wregs[*s as usize];
+                    let sh = *lo as u32;
+                    let shifted = if sh == 0 {
+                        x
+                    } else if sh < 64 {
+                        [(x[0] >> sh) | (x[1] << (64 - sh)), x[1] >> sh]
+                    } else {
+                        [x[1] >> (sh - 64), 0]
+                    };
+                    wregs[*d as usize] = [shifted[0], shifted[1] & mask_hi];
+                }
+                TsInsn::RangeFromW { d, s, lo, mask } => {
+                    let x = wregs[*s as usize];
+                    let sh = *lo as u32;
+                    let v = if sh == 0 {
+                        x[0]
+                    } else if sh < 64 {
+                        (x[0] >> sh) | (x[1] << (64 - sh))
+                    } else {
+                        x[1] >> (sh - 64)
+                    };
+                    regs[*d as usize] = v & mask;
+                }
+                TsInsn::BitFromW { d, s, bit } => {
+                    let x = wregs[*s as usize];
+                    regs[*d as usize] = (x[(*bit >> 6) as usize] >> (*bit & 63)) & 1;
+                }
+                TsInsn::WConcat { d, parts } => {
+                    let mut acc = [0u64; 2];
+                    for &(r, w, wide) in parts.iter() {
+                        let w = w as u32;
+                        // acc <<= w (128-bit shift)
+                        acc = if w == 0 {
+                            acc
+                        } else if w < 64 {
+                            [acc[0] << w, (acc[1] << w) | (acc[0] >> (64 - w))]
+                        } else if w == 64 {
+                            [0, acc[0]]
+                        } else {
+                            [0, acc[0] << (w - 64)]
+                        };
+                        let part = if wide {
+                            wregs[r as usize]
+                        } else {
+                            [regs[r as usize], 0]
+                        };
+                        acc[0] |= part[0];
+                        acc[1] |= part[1];
+                    }
+                    wregs[*d as usize] = acc;
+                }
+                TsInsn::WMask { d, mask_hi } => {
+                    wregs[*d as usize][1] &= mask_hi;
+                }
+                TsInsn::WFromN { r } => {
+                    wregs[*r as usize] = [regs[*r as usize], 0];
+                }
+                TsInsn::NFromW { r, mask } => {
+                    regs[*r as usize] = wregs[*r as usize][0] & mask;
+                }
+                TsInsn::WStore { sig, s } => {
+                    let v = wregs[*s as usize];
+                    self.ts_store_wide(*sig as usize, v);
+                }
+                TsInsn::WStoreNba { sig, s, w } => {
+                    let v = wregs[*s as usize];
+                    self.ts_store_nba_wide(*sig as usize, v, *w);
+                }
+            }
+            pc += 1;
+        }
+        self.ts_regs = regs;
+        self.ts_wregs = wregs;
+        true
     }
 
     /// Straight-line executor — no pc bookkeeping, compact codegen for the
@@ -15697,63 +16264,70 @@ impl Simulator {
                 TsInsn::Mask { d, mask } => {
                     regs[*d as usize] &= mask;
                 }
-                TsInsn::ElemLoad { d, first, lo, hi, idx } => {
-                    let i = regs[*idx as usize] as i64;
-                    if i < *lo || i > *hi {
+                TsInsn::Mul { d, a, b, mask } => {
+                    regs[*d as usize] =
+                        regs[*a as usize].wrapping_mul(regs[*b as usize]) & mask;
+                }
+                TsInsn::Repl { d, s, w, count } => {
+                    let part = regs[*s as usize];
+                    let mut acc = 0u64;
+                    for _ in 0..*count {
+                        acc = (acc << *w) | part;
+                    }
+                    regs[*d as usize] = acc;
+                }
+                TsInsn::WSigRange { .. } => {
+                    unreachable!("wide insn outside the wide executor")
+                }
+                TsInsn::WRepl { .. } => {
+                    unreachable!("wide insn outside the wide executor")
+                }
+                TsInsn::ElemLoad(op) => {
+                    let i = regs[op.idx as usize] as i64;
+                    if i < op.lo || i > op.hi {
                         self.ts_regs = regs;
                         return false;
                     }
-                    let eid = *first as usize + (i - lo) as usize;
+                    let eid = op.first as usize + (i - op.lo) as usize;
                     let (v, x) = self.signal_table[eid].raw_bits();
                     if x != 0 {
                         self.ts_regs = regs;
                         return false;
                     }
-                    regs[*d as usize] = v;
+                    regs[op.s as usize] = v;
                 }
-                TsInsn::ElemStoreNba { first, lo, hi, idx, s, w, mask } => {
-                    let i = regs[*idx as usize] as i64;
-                    if i >= *lo && i <= *hi {
-                        let eid = *first as usize + (i - lo) as usize;
-                        // Mirrors the NbaAssignArray arm: elide-if-equal,
-                        // then index + push (no prior-entry lookup).
-                        let val = Value::from_u64(regs[*s as usize] & mask, *w);
-                        if self.signal_table[eid] != val {
-                            self.nba_fast_index.insert(eid, self.nba_fast.len());
-                            self.nba_fast.push(NbaFast {
-                                block_index: 0,
-                                signal_id: eid,
-                                value: val,
-                            });
-                        } else {
-                            self.prof_nba_elided += 1;
-                        }
+                TsInsn::ElemStoreNba(op) => {
+                    let i = regs[op.idx as usize] as i64;
+                    if i >= op.lo && i <= op.hi {
+                        let eid = op.first as usize + (i - op.lo) as usize;
+                        let v = regs[op.s as usize] & op.mask;
+                        self.ts_store_nba(eid, v, op.w);
                     }
                     // Out-of-range: silent drop, as in 4-state.
                 }
-                TsInsn::ElemStore { first, lo, hi, idx, s, mask } => {
-                    let i = regs[*idx as usize] as i64;
-                    if i >= *lo && i <= *hi {
-                        let eid = *first as usize + (i - lo) as usize;
-                        let v = regs[*s as usize] & mask;
-                        self.ts_store(eid, v, *mask);
+                TsInsn::ElemStore(op) => {
+                    let i = regs[op.idx as usize] as i64;
+                    if i >= op.lo && i <= op.hi {
+                        let eid = op.first as usize + (i - op.lo) as usize;
+                        let v = regs[op.s as usize] & op.mask;
+                        self.ts_store(eid, v, op.mask);
                     }
                 }
-                TsInsn::NbaFromElem { dst, first, lo, hi, idx_sig, w } => {
-                    let (iv, _) = self.signal_table[*idx_sig as usize].raw_bits();
+                TsInsn::NbaFromElem(op) => {
+                    let (iv, _) = self.signal_table[op.idx_sig as usize].raw_bits();
                     let i = iv as i64;
-                    if i < *lo || i > *hi {
+                    if i < op.lo || i > op.hi {
                         self.ts_regs = regs;
                         return false;
                     }
-                    let eid = *first as usize + (i - lo) as usize;
+                    let eid = op.first as usize + (i - op.lo) as usize;
                     let (ev, ex) = self.signal_table[eid].raw_bits();
                     if ex != 0 {
                         self.ts_regs = regs;
                         return false;
                     }
-                    let m = if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 };
-                    self.ts_store_nba(*dst as usize, ev & m, *w);
+                    let m = if op.w >= 64 { u64::MAX } else { (1u64 << op.w) - 1 };
+                    self.ts_store_nba(op.dst as usize, ev & m, op.w);
                 }
                 TsInsn::Store { sig, s, mask } => {
                     let v = regs[*s as usize] & mask;
@@ -15762,6 +16336,23 @@ impl Simulator {
                 TsInsn::StoreNba { sig, s, w, mask } => {
                     let v = regs[*s as usize] & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
+                }
+                TsInsn::WLoadSig { .. }
+                | TsInsn::WConst { .. }
+                | TsInsn::WXor { .. }
+                | TsInsn::WAnd { .. }
+                | TsInsn::WOr { .. }
+                | TsInsn::WNot { .. }
+                | TsInsn::WRange { .. }
+                | TsInsn::RangeFromW { .. }
+                | TsInsn::BitFromW { .. }
+                | TsInsn::WConcat { .. }
+                | TsInsn::WMask { .. }
+                | TsInsn::WFromN { .. }
+                | TsInsn::NFromW { .. }
+                | TsInsn::WStore { .. }
+                | TsInsn::WStoreNba { .. } => {
+                    unreachable!("wide insn outside the wide executor")
                 }
                 TsInsn::BrSigFalse { .. }
                 | TsInsn::BrFalse { .. }
@@ -15924,6 +16515,24 @@ impl Simulator {
                 TsInsn::Mask { d, mask } => {
                     regs[*d as usize] &= mask;
                 }
+                TsInsn::Mul { d, a, b, mask } => {
+                    regs[*d as usize] =
+                        regs[*a as usize].wrapping_mul(regs[*b as usize]) & mask;
+                }
+                TsInsn::Repl { d, s, w, count } => {
+                    let part = regs[*s as usize];
+                    let mut acc = 0u64;
+                    for _ in 0..*count {
+                        acc = (acc << *w) | part;
+                    }
+                    regs[*d as usize] = acc;
+                }
+                TsInsn::WSigRange { .. } => {
+                    unreachable!("wide insn outside the wide executor")
+                }
+                TsInsn::WRepl { .. } => {
+                    unreachable!("wide insn outside the wide executor")
+                }
                 TsInsn::BrSigFalse { sig, bit, t } => {
                     let cond = if *bit == u32::MAX {
                         // Whole-value form was lowered only for <=64-bit sigs.
@@ -15958,63 +16567,52 @@ impl Simulator {
                     pc = *t as usize;
                     continue;
                 }
-                TsInsn::ElemLoad { d, first, lo, hi, idx } => {
-                    let i = regs[*idx as usize] as i64;
-                    if i < *lo || i > *hi {
+                TsInsn::ElemLoad(op) => {
+                    let i = regs[op.idx as usize] as i64;
+                    if i < op.lo || i > op.hi {
                         self.ts_regs = regs;
                         return false;
                     }
-                    let eid = *first as usize + (i - lo) as usize;
+                    let eid = op.first as usize + (i - op.lo) as usize;
                     let (v, x) = self.signal_table[eid].raw_bits();
                     if x != 0 {
                         self.ts_regs = regs;
                         return false;
                     }
-                    regs[*d as usize] = v;
+                    regs[op.s as usize] = v;
                 }
-                TsInsn::ElemStoreNba { first, lo, hi, idx, s, w, mask } => {
-                    let i = regs[*idx as usize] as i64;
-                    if i >= *lo && i <= *hi {
-                        let eid = *first as usize + (i - lo) as usize;
-                        // Mirrors the NbaAssignArray arm: elide-if-equal,
-                        // then index + push (no prior-entry lookup).
-                        let val = Value::from_u64(regs[*s as usize] & mask, *w);
-                        if self.signal_table[eid] != val {
-                            self.nba_fast_index.insert(eid, self.nba_fast.len());
-                            self.nba_fast.push(NbaFast {
-                                block_index: 0,
-                                signal_id: eid,
-                                value: val,
-                            });
-                        } else {
-                            self.prof_nba_elided += 1;
-                        }
+                TsInsn::ElemStoreNba(op) => {
+                    let i = regs[op.idx as usize] as i64;
+                    if i >= op.lo && i <= op.hi {
+                        let eid = op.first as usize + (i - op.lo) as usize;
+                        let v = regs[op.s as usize] & op.mask;
+                        self.ts_store_nba(eid, v, op.w);
                     }
                     // Out-of-range: silent drop, as in 4-state.
                 }
-                TsInsn::ElemStore { first, lo, hi, idx, s, mask } => {
-                    let i = regs[*idx as usize] as i64;
-                    if i >= *lo && i <= *hi {
-                        let eid = *first as usize + (i - lo) as usize;
-                        let v = regs[*s as usize] & mask;
-                        self.ts_store(eid, v, *mask);
+                TsInsn::ElemStore(op) => {
+                    let i = regs[op.idx as usize] as i64;
+                    if i >= op.lo && i <= op.hi {
+                        let eid = op.first as usize + (i - op.lo) as usize;
+                        let v = regs[op.s as usize] & op.mask;
+                        self.ts_store(eid, v, op.mask);
                     }
                 }
-                TsInsn::NbaFromElem { dst, first, lo, hi, idx_sig, w } => {
-                    let (iv, _) = self.signal_table[*idx_sig as usize].raw_bits();
+                TsInsn::NbaFromElem(op) => {
+                    let (iv, _) = self.signal_table[op.idx_sig as usize].raw_bits();
                     let i = iv as i64;
-                    if i < *lo || i > *hi {
+                    if i < op.lo || i > op.hi {
                         self.ts_regs = regs;
                         return false;
                     }
-                    let eid = *first as usize + (i - lo) as usize;
+                    let eid = op.first as usize + (i - op.lo) as usize;
                     let (ev, ex) = self.signal_table[eid].raw_bits();
                     if ex != 0 {
                         self.ts_regs = regs;
                         return false;
                     }
-                    let m = if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 };
-                    self.ts_store_nba(*dst as usize, ev & m, *w);
+                    let m = if op.w >= 64 { u64::MAX } else { (1u64 << op.w) - 1 };
+                    self.ts_store_nba(op.dst as usize, ev & m, op.w);
                 }
                 TsInsn::Store { sig, s, mask } => {
                     let v = regs[*s as usize] & mask;
@@ -16023,6 +16621,23 @@ impl Simulator {
                 TsInsn::StoreNba { sig, s, w, mask } => {
                     let v = regs[*s as usize] & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
+                }
+                TsInsn::WLoadSig { .. }
+                | TsInsn::WConst { .. }
+                | TsInsn::WXor { .. }
+                | TsInsn::WAnd { .. }
+                | TsInsn::WOr { .. }
+                | TsInsn::WNot { .. }
+                | TsInsn::WRange { .. }
+                | TsInsn::RangeFromW { .. }
+                | TsInsn::BitFromW { .. }
+                | TsInsn::WConcat { .. }
+                | TsInsn::WMask { .. }
+                | TsInsn::WFromN { .. }
+                | TsInsn::NFromW { .. }
+                | TsInsn::WStore { .. }
+                | TsInsn::WStoreNba { .. } => {
+                    unreachable!("wide insn outside the wide executor")
                 }
             }
             pc += 1;
@@ -19693,7 +20308,12 @@ impl Simulator {
         let mut ca_compile_fail_samples = 0usize;
         for ca in cas
             .into_iter()
-            .chain(pending_ca.into_iter().map(|p| p.materialize()))
+            .chain({
+                let params_snapshot = self.module.parameters.clone();
+                pending_ca
+                    .into_iter()
+                    .map(move |p| p.materialize(&params_snapshot))
+            })
             .flat_map(|ca| {
                 match crate::compiler::elaborate::whole_array_assign_parts(
                     &ca.lhs, &ca.rhs, ca.delay, &arrays_snapshot,
@@ -20297,6 +20917,41 @@ impl Simulator {
                         if found {
                             break;
                         }
+                    }
+                }
+                if !found {
+                    // Last chance: the FULL runtime resolver, which knows the
+                    // §23.8/§23.10.1 upward walk a bound module's references
+                    // need (`assign x = target_child.sig;` inside a bind).
+                    // The static attempts above left such reads unresolved,
+                    // so the entry evaluated with an EMPTY read set — right
+                    // values, wrong times (it only re-ran when unrelated
+                    // settle activity happened to occur).
+                    let hier = HierarchicalIdentifier {
+                        root: None,
+                        path: r
+                            .split('.')
+                            .map(|seg| HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: seg.to_string(),
+                                    span: crate::ast::Span::dummy(),
+                                },
+                                selects: Vec::new(),
+                            })
+                            .collect(),
+                        span: crate::ast::Span::dummy(),
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    };
+                    let saved_hint = self.name_resolve_hint.borrow().clone();
+                    *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
+                    let full = self.resolve_hier_name(&hier);
+                    *self.name_resolve_hint.borrow_mut() = saved_hint;
+                    if let Some(&id) = self.signal_name_to_id.get(full.as_str()) {
+                        if !rids.contains(&id) {
+                            rids.push(id);
+                        }
+                        found = true;
                     }
                 }
                 if !found {
@@ -26730,6 +27385,9 @@ impl Simulator {
                 .filter(|s| matches!(s, TsSlot::Yes(_)))
                 .count()
         );
+        if self.profile_report {
+            self.print_profile_report(t_nba, t_process, t_sched);
+        }
             {
                 const NAMES: [&str; 12] = ["noop","fastcopy","dircopy","fastfanout","busfanout",
                     "andfanout","gate","udp","contassign_c","alwaysblk_c","contassign_ast","other"];
@@ -28012,6 +28670,16 @@ impl Simulator {
         } else {
             self.current_scope.clear();
         }
+        // A suspended-and-resumed process running INSIDE an inlined
+        // hierarchical/interface task must keep resolving the body's bare
+        // names under the task's instance scope, not the process's own.
+        if let Some(hint) = self
+            .task_cleanup
+            .last()
+            .and_then(|c| c.frame_scope_hint.clone())
+        {
+            *self.name_resolve_hint.borrow_mut() = Some(hint);
+        }
         // A process is not a comb/edge block, so the scope the settle loop
         // last recorded must not leak into this process's `%m`.
         self.m_block_scope.clear();
@@ -28743,6 +29411,104 @@ impl Simulator {
                                     // Chain the caller's tail instead of copying it onto the end of
                                     // the spliced body (ProcCont::pushed).
                                     self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Stage 1-hier: a call to a blocking HIERARCHICAL or interface
+            // task — `u_m.sample(args)` / `vif.sample(args)` (LRM §25.5.4,
+            // §25.9) — flattens to Call{func: Ident([...])} with 2+ segments.
+            // Stage 1 above only matches single-segment names, so these fell
+            // through to the synchronous path, whose event controls ABORT the
+            // body instead of suspending: a monitor BFM's `@(negedge pclk)`
+            // returned immediately and the proxy's forever loop spun at t=0
+            // (found running a public UVM AVIP). Resolve exactly like the
+            // synchronous Call arm (vif alias on the head, then the joined
+            // path, then hint-prefixed) and inline when the body blocks; the
+            // frame carries the instance scope so the body's bare interface
+            // member names resolve across suspends.
+            if let StatementKind::Expr(expr) = &stmt.kind {
+                if let ExprKind::Call { func, args } = &expr.kind {
+                    // `vif.task(args)` in a class body parses as MemberAccess
+                    // on the property, not a flattened Ident — normalize both
+                    // forms to (head, trailing segments).
+                    let hier_parts: Option<(String, Vec<String>)> = match &func.kind {
+                        ExprKind::Ident(h)
+                            if h.path.len() >= 2
+                                && h.path.iter().all(|sg| sg.selects.is_empty()) =>
+                        {
+                            Some((
+                                h.path[0].name.name.clone(),
+                                h.path[1..]
+                                    .iter()
+                                    .map(|sg| sg.name.name.clone())
+                                    .collect(),
+                            ))
+                        }
+                        ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
+                            ExprKind::Ident(h1)
+                                if h1.path.len() == 1
+                                    && h1.path[0].selects.is_empty() =>
+                            {
+                                Some((h1.path[0].name.name.clone(), vec![member.name.clone()]))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((head, tail)) = hier_parts {
+                        {
+                            let head = head.as_str();
+                            // §25.9 task-formal/variable alias, then the
+                            // §25.8 class-property binding on current `this`.
+                            let head_owned = self
+                                .iface_alias_for(head)
+                                .or_else(|| {
+                                    let this_h = self.this_stack.last().copied().flatten()?;
+                                    self.virtual_iface_bindings
+                                        .get(&(this_h, head.to_string()))
+                                        .map(|(bound, _)| bound.clone())
+                                })
+                                .unwrap_or_else(|| head.to_string());
+                            let mut segs: Vec<&str> = vec![head_owned.as_str()];
+                            segs.extend(tail.iter().map(|t| t.as_str()));
+                            let full = segs.join(".");
+                            let full = if self.module.tasks.contains_key(&full) {
+                                Some(full)
+                            } else {
+                                self.name_resolve_hint
+                                    .borrow()
+                                    .as_ref()
+                                    .map(|hint| format!("{}.{}", hint, full))
+                                    .filter(|p| self.module.tasks.contains_key(p))
+                            };
+                            if let Some(full) = full {
+                                let td = self.module.tasks.get(&full).cloned().unwrap();
+                                if self.stmts_have_blocking(&td.items) {
+                                    let scope = full
+                                        .rsplit_once('.')
+                                        .map(|(sc, _)| sc.to_string())
+                                        .unwrap_or_default();
+                                    let mut cleanup = self.bind_task_frame(&td, args);
+                                    cleanup.prev_hint =
+                                        self.name_resolve_hint.borrow().clone();
+                                    cleanup.frame_scope_hint = Some(scope.clone());
+                                    *self.name_resolve_hint.borrow_mut() =
+                                        Some(scope);
+                                    self.task_cleanup.push(cleanup);
+                                    let mut cont: Vec<Statement> = td.items.clone();
+                                    cont.push(Statement::new(
+                                        StatementKind::ScopePop,
+                                        stmt.span,
+                                    ));
+                                    self.run_process_stmts(
+                                        pid,
+                                        &pc.pushed(cont, pc.start + i + 1),
+                                    );
                                     return;
                                 }
                             }
@@ -30619,6 +31385,24 @@ impl Simulator {
         if !blocks {
             if let Some(f) = self.module.functions.get(name) {
                 blocks = self.stmts_have_blocking(&f.items);
+            }
+        }
+        if !blocks {
+            // Hierarchical / interface tasks are keyed by their FULL inlined
+            // path ("u_if.sample_one"), so the leaf-name lookup above misses
+            // them — a monitor BFM task with `@(negedge clk)` was classified
+            // non-blocking, executed synchronously, and its event control
+            // aborted the body instead of suspending (the caller's forever
+            // loop then spun at t=0). Over-approximate by leaf suffix: if ANY
+            // task keyed `*.name` blocks, treat the call as blocking (the
+            // suspend-aware path is correct for non-blocking bodies too,
+            // merely slower).
+            let dotted = format!(".{}", name);
+            for (key, t) in self.module.tasks.iter() {
+                if key.ends_with(dotted.as_str()) && self.stmts_have_blocking(&t.items) {
+                    blocks = true;
+                    break;
+                }
             }
         }
         if !blocks {
@@ -35633,6 +36417,33 @@ impl Simulator {
                         lhs_id = self.get_lhs_signal_id(lhs);
                     }
                 }
+                // A HIERARCHICAL lhs writes into a foreign scope, but the RHS
+                // is lexical to the WRITING scope. The lhs resolution above
+                // ratchets name_resolve_hint to the TARGET's parent, under
+                // which a bare RHS name binds to a same-named net inside the
+                // target — a TB `assign dut.core.rst_in = grst_l` read the
+                // DUT's own dead `grst_l` and forwarded x forever (its clock
+                // sibling worked only because that name had no deep twin).
+                // Restore the entry's own hint before evaluating the RHS.
+                // Bare-lhs entries keep the write-derived hint set above —
+                // their operands ARE target-scoped (submodule pattern CAs).
+                fn lhs_is_hier(e: &Expression) -> bool {
+                    match &e.kind {
+                        ExprKind::MemberAccess { expr, .. }
+                        | ExprKind::Index { expr, .. }
+                        | ExprKind::RangeSelect { expr, .. } => lhs_is_hier(expr),
+                        ExprKind::Ident(h) => {
+                            h.path.len() > 1
+                                || h.path
+                                    .first()
+                                    .is_some_and(|s| s.name.name.contains('.'))
+                        }
+                        _ => false,
+                    }
+                }
+                if lhs_is_hier(lhs) {
+                    *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
+                }
                 let w = self.infer_lhs_width(lhs);
                 // §7.4.2/§10.9: `assign x = '{...}` (or `assign x[i] = '{...}`
                 // on an array of packed vectors) converts each item to the
@@ -36094,6 +36905,14 @@ impl Simulator {
                     let label = self.comb_entry_trace_label(eidx, &entries[eidx]);
                     self.trace_always_fire(&label);
                 }
+                let report_t0 = if self.profile_report {
+                    if self.prof_entry_ns.len() != num_entries {
+                        self.prof_entry_ns.resize(num_entries, 0);
+                    }
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 match &entries[eidx].item {
                     CombItem::Noop => {}
                     CombItem::FastDirectCopy { dst_id, src_id } => {
@@ -36312,6 +37131,18 @@ impl Simulator {
                     CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
                         // Factored AST eval (shared with the BSP settle driver).
                         self.set_m_block_scope(entries[eidx].cold.scope_hint.as_deref());
+                        // `name_resolve_hint` is a ratchet every resolution
+                        // advances; without a reset here this entry resolves
+                        // bare names under whatever scope the PREVIOUS entry
+                        // left behind — and the shared-node cache then pins
+                        // the wrong binding forever. A TB's hierarchical
+                        // `assign dut.deep.rst_in = grst_l` evaluated after a
+                        // DUT-internal entry read the DUT's own dead `grst_l`
+                        // (the clock sibling worked only because its source
+                        // name had no deep twin). Same disease as the
+                        // edge-block fix in exec_bytecode.
+                        *self.name_resolve_hint.borrow_mut() =
+                            entries[eidx].cold.scope_hint.clone();
                         self.eval_ast_comb_entry(&entries[eidx]);
                         if self.proc_depth > 0
                             && matches!(entries[eidx].item, CombItem::AlwaysBlock { .. })
@@ -36448,6 +37279,9 @@ impl Simulator {
                         self.eval_udp_batch(*event_ref, indices);
                         n_dc += indices.len() as u64;
                     }
+                }
+                if let Some(t0) = report_t0 {
+                    self.prof_entry_ns[eidx] += t0.elapsed().as_nanos() as u64;
                 }
 
                 // Worklist propagation: any signals newly dirtied by this
@@ -58521,20 +59355,9 @@ impl Simulator {
             let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
             ((rv >> lo) & mask, (rx >> lo) & mask)
         } else {
-            let mut rv = 0u64;
-            let mut rx = 0u64;
-            for i in 0..w.min(64) {
-                match v.get_bit(lo + i) {
-                    LogicBit::One => rv |= 1 << i,
-                    LogicBit::X => rx |= 1 << i,
-                    LogicBit::Z => {
-                        rv |= 1 << i;
-                        rx |= 1 << i;
-                    }
-                    LogicBit::Zero => {}
-                }
-            }
-            (rv, rx)
+            // SWAR-chunked in core (out-of-range bits read 0/0, matching the
+            // get_bit loop this replaces: get_bit past the width is Zero).
+            v.slice_bits_swar(lo, w)
         }
     }
 
@@ -81465,6 +82288,9 @@ impl Simulator {
     /// the work that `exec_task_call` runs after the body. Mirrors the original
     /// inline cleanup exactly.
     fn unwind_task_frame(&mut self, c: TaskCleanup) {
+        if c.frame_scope_hint.is_some() {
+            *self.name_resolve_hint.borrow_mut() = c.prev_hint.clone();
+        }
         if let Some(tn) = &c.task_name {
             if let Some(set) = self.active_task_pids.get_mut(tn) {
                 set.remove(&self.current_pid);
@@ -81929,6 +82755,8 @@ impl Simulator {
         let m_leaf = tname.rsplit('.').next().unwrap_or(&tname).to_string();
         let saved_m_scope = std::mem::replace(&mut self.m_scope_stack, vec![m_leaf]);
         TaskCleanup {
+            frame_scope_hint: None,
+            prev_hint: None,
             saved_m_scope,
             task_name: Some(tname),
             array_writebacks,
