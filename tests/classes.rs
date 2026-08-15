@@ -185,3 +185,5 @@ mod randomize_obj_array_property;
 mod static_assoc_struct_pool;
 #[path = "classes/vif_static_roundtrip.rs"]
 mod vif_static_roundtrip;
+#[path = "classes/nopack_member_array.rs"]
+mod nopack_member_array;
