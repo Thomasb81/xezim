@@ -29410,59 +29410,9 @@ impl Simulator {
             // member names resolve across suspends.
             if let StatementKind::Expr(expr) = &stmt.kind {
                 if let ExprKind::Call { func, args } = &expr.kind {
-                    // `vif.task(args)` in a class body parses as MemberAccess
-                    // on the property, not a flattened Ident — normalize both
-                    // forms to (head, trailing segments).
-                    let hier_parts: Option<(String, Vec<String>)> = match &func.kind {
-                        ExprKind::Ident(h)
-                            if h.path.len() >= 2
-                                && h.path.iter().all(|sg| sg.selects.is_empty()) =>
+                    {
                         {
-                            Some((
-                                h.path[0].name.name.clone(),
-                                h.path[1..]
-                                    .iter()
-                                    .map(|sg| sg.name.name.clone())
-                                    .collect(),
-                            ))
-                        }
-                        ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
-                            ExprKind::Ident(h1)
-                                if h1.path.len() == 1
-                                    && h1.path[0].selects.is_empty() =>
-                            {
-                                Some((h1.path[0].name.name.clone(), vec![member.name.clone()]))
-                            }
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some((head, tail)) = hier_parts {
-                        {
-                            let head = head.as_str();
-                            // §25.9 task-formal/variable alias, then the
-                            // §25.8 class-property binding on current `this`.
-                            let head_owned = self
-                                .iface_alias_for(head)
-                                .or_else(|| {
-                                    let this_h = self.this_stack.last().copied().flatten()?;
-                                    self.virtual_iface_bindings
-                                        .get(&(this_h, head.to_string()))
-                                        .map(|(bound, _)| bound.clone())
-                                })
-                                .unwrap_or_else(|| head.to_string());
-                            let mut segs: Vec<&str> = vec![head_owned.as_str()];
-                            segs.extend(tail.iter().map(|t| t.as_str()));
-                            let full = segs.join(".");
-                            let full = if self.module.tasks.contains_key(&full) {
-                                Some(full)
-                            } else {
-                                self.name_resolve_hint
-                                    .borrow()
-                                    .as_ref()
-                                    .map(|hint| format!("{}.{}", hint, full))
-                                    .filter(|p| self.module.tasks.contains_key(p))
-                            };
+                            let full = self.resolve_hier_task_target(func);
                             if let Some(full) = full {
                                 let td = self.module.tasks.get(&full).cloned().unwrap();
                                 if self.stmts_have_blocking(&td.items) {
@@ -75226,6 +75176,17 @@ impl Simulator {
                 let handle = v.and_then(|x| x.to_u64()).unwrap_or(0) as usize;
                 (handle, prop)
             }
+            // `p.cfg.vif = bus;` — the vif property's OWNER is itself reached
+            // through a handle chain. Walk the chain to the owning object;
+            // without this arm the binding was silently dropped (handle 0).
+            ExprKind::Ident(h) if h.path.len() >= 3 => {
+                let n = h.path.len();
+                let mut owner = h.clone();
+                owner.path.truncate(n - 1);
+                let owner_expr = Expression::new(ExprKind::Ident(owner), lvalue.span);
+                let handle = self.eval_handle_expr(&owner_expr).unwrap_or(0);
+                (handle, h.path[n - 1].name.name.clone())
+            }
             ExprKind::MemberAccess { expr, member } => {
                 let obj_handle = match &expr.kind {
                     ExprKind::Ident(h) if h.path.len() == 1 => {
@@ -75246,7 +75207,9 @@ impl Simulator {
                     // usual shape in a constructor that takes the interface as
                     // an argument.
                     ExprKind::This => self.this_stack.last().copied().flatten().unwrap_or(0),
-                    _ => 0,
+                    // Nested receiver (`p.cfg.vif = bus` in MemberAccess
+                    // form) — resolve the owner chain to its handle.
+                    _ => self.eval_handle_expr(expr).unwrap_or(0),
                 };
                 (obj_handle, member.name.clone())
             }
@@ -75855,6 +75818,106 @@ impl Simulator {
             return None; // fast path: no vif variables bound anywhere
         }
         self.viface_var_aliases.get(name).cloned()
+    }
+
+    /// Resolve a dotted/interface task ENABLE target to its full key in
+    /// `module.tasks` ("u_if.sample_one"), or None if the callee is not a
+    /// known hierarchical/interface task. Handles both syntactic forms
+    /// (flattened multi-segment Ident, and MemberAccess in class bodies)
+    /// and both binding shapes: a vif alias/property on the HEAD name
+    /// (`vif.t()`), and a vif property reached through a handle chain
+    /// (`cfg.vif.t()`, `this.vif.t()` — the owner object is evaluated and
+    /// its property binding consulted).
+    fn resolve_hier_task_target(&self, func: &Expression) -> Option<String> {
+        let in_tasks = |full: String| -> Option<String> {
+            if self.module.tasks.contains_key(&full) {
+                Some(full)
+            } else {
+                self.name_resolve_hint
+                    .borrow()
+                    .as_ref()
+                    .map(|hint| format!("{}.{}", hint, full))
+                    .filter(|p| self.module.tasks.contains_key(p))
+            }
+        };
+        // Form 1: head-name binding — alias/formal, then the §25.8
+        // class-property binding on the current `this`.
+        let head_parts: Option<(String, Vec<String>)> = match &func.kind {
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|sg| sg.selects.is_empty()) =>
+            {
+                Some((
+                    h.path[0].name.name.clone(),
+                    h.path[1..].iter().map(|sg| sg.name.name.clone()).collect(),
+                ))
+            }
+            ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
+                ExprKind::Ident(h1) if h1.path.len() == 1 && h1.path[0].selects.is_empty() => {
+                    Some((h1.path[0].name.name.clone(), vec![member.name.clone()]))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((head, tail)) = head_parts {
+            let head_owned = self
+                .iface_alias_for(&head)
+                .or_else(|| {
+                    let this_h = self.this_stack.last().copied().flatten()?;
+                    self.virtual_iface_bindings
+                        .get(&(this_h, head.clone()))
+                        .map(|(bound, _)| bound.clone())
+                })
+                .unwrap_or(head);
+            let mut segs: Vec<&str> = vec![head_owned.as_str()];
+            segs.extend(tail.iter().map(|t| t.as_str()));
+            if let Some(full) = in_tasks(segs.join(".")) {
+                return Some(full);
+            }
+        }
+        // Form 2: nested owner — split the callee into
+        // (owner expr, vif property, method) and consult the owner OBJECT's
+        // property binding.
+        let (owner, prop, meth): (Expression, String, String) = match &func.kind {
+            ExprKind::Ident(h)
+                if h.path.len() >= 3 && h.path.iter().all(|sg| sg.selects.is_empty()) =>
+            {
+                let n = h.path.len();
+                let mut owner_h = h.clone();
+                owner_h.path.truncate(n - 2);
+                (
+                    Expression::new(ExprKind::Ident(owner_h), func.span),
+                    h.path[n - 2].name.name.clone(),
+                    h.path[n - 1].name.name.clone(),
+                )
+            }
+            ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
+                ExprKind::MemberAccess { expr: r2, member: p2 } => {
+                    ((**r2).clone(), p2.name.clone(), member.name.clone())
+                }
+                ExprKind::Ident(h1)
+                    if h1.path.len() >= 2
+                        && h1.path.iter().all(|sg| sg.selects.is_empty()) =>
+                {
+                    let n = h1.path.len();
+                    let mut owner_h = h1.clone();
+                    owner_h.path.truncate(n - 1);
+                    (
+                        Expression::new(ExprKind::Ident(owner_h), recv.span),
+                        h1.path[n - 1].name.name.clone(),
+                        member.name.clone(),
+                    )
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let oh = self.eval_handle_expr(&owner)?;
+        if oh == 0 {
+            return None;
+        }
+        let bound = self.virtual_iface_bindings.get(&(oh, prop))?.0.clone();
+        in_tasks(format!("{}.{}", bound, meth))
     }
 
     fn indexed_iface_alias_for(&self, expr: &Expression) -> Option<String> {
