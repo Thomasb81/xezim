@@ -10,7 +10,7 @@
 //
 // A recursive method that accumulates into a `static int` must see the whole
 // sequence (depth 4,3,2,1 -> 4 increments -> shared counter == 4), matching the
-// reference simulator (Questa) byte-for-byte:
+// reference simulator byte-for-byte:
 //   TAG_INNER4 depth=4 counter=1 saved=1
 //   TAG_OUTER4 depth=4 counter=4 saved=1
 //   TAG_PASS counter=4

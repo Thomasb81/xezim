@@ -19,7 +19,7 @@ use std::process::Command;
 /// is now resolved from the routine that actually *declared* the static.
 ///
 /// Discriminator: the test hangs/re-livspins (never prints PASSED) without
-/// the fix; with it, `*** UVM TEST PASSED ***` (matches Questa: 0 UVM_ERROR,
+/// the fix; with it, `*** UVM TEST PASSED ***` (matches the reference simulator: 0 UVM_ERROR,
 /// 0 UVM_FATAL).
 #[test]
 fn phase_jump_static_latch() {

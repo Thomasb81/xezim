@@ -13,7 +13,7 @@ use std::process::Command;
 ///
 /// This recursive method accumulates into a shared static; the outermost
 /// activation must read 4 after four increments. Matched byte-for-byte against
-/// the reference simulator (Questa):
+/// the reference simulator:
 ///   TAG_INNER4 depth=4 counter=1 saved=1
 ///   TAG_OUTER4 depth=4 counter=4 saved=1
 ///   TAG_PASS counter=4
