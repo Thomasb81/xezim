@@ -20279,7 +20279,12 @@ impl Simulator {
         let mut ca_compile_fail_samples = 0usize;
         for ca in cas
             .into_iter()
-            .chain(pending_ca.into_iter().map(|p| p.materialize()))
+            .chain({
+                let params_snapshot = self.module.parameters.clone();
+                pending_ca
+                    .into_iter()
+                    .map(move |p| p.materialize(&params_snapshot))
+            })
             .flat_map(|ca| {
                 match crate::compiler::elaborate::whole_array_assign_parts(
                     &ca.lhs, &ca.rhs, ca.delay, &arrays_snapshot,
@@ -20883,6 +20888,41 @@ impl Simulator {
                         if found {
                             break;
                         }
+                    }
+                }
+                if !found {
+                    // Last chance: the FULL runtime resolver, which knows the
+                    // §23.8/§23.10.1 upward walk a bound module's references
+                    // need (`assign x = target_child.sig;` inside a bind).
+                    // The static attempts above left such reads unresolved,
+                    // so the entry evaluated with an EMPTY read set — right
+                    // values, wrong times (it only re-ran when unrelated
+                    // settle activity happened to occur).
+                    let hier = HierarchicalIdentifier {
+                        root: None,
+                        path: r
+                            .split('.')
+                            .map(|seg| HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: seg.to_string(),
+                                    span: crate::ast::Span::dummy(),
+                                },
+                                selects: Vec::new(),
+                            })
+                            .collect(),
+                        span: crate::ast::Span::dummy(),
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    };
+                    let saved_hint = self.name_resolve_hint.borrow().clone();
+                    *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
+                    let full = self.resolve_hier_name(&hier);
+                    *self.name_resolve_hint.borrow_mut() = saved_hint;
+                    if let Some(&id) = self.signal_name_to_id.get(full.as_str()) {
+                        if !rids.contains(&id) {
+                            rids.push(id);
+                        }
+                        found = true;
                     }
                 }
                 if !found {
