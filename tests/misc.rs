@@ -274,5 +274,7 @@ mod ref_struct_queue_and_local_shadow;
 mod nested_struct_string_member_display;
 #[path = "misc/package_property_assertions.rs"]
 mod package_property_assertions;
+#[path = "misc/hier_iface_task_suspension.rs"]
+mod hier_iface_task_suspension;
 #[path = "misc/hier_port_drive_and_collision.rs"]
 mod hier_port_drive_and_collision;

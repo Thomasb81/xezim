@@ -2379,6 +2379,12 @@ struct ProcessContext {
 /// at the body's `ScopePop` sentinel so the process can suspend in between.
 #[derive(Debug, Clone, Default)]
 struct TaskCleanup {
+    /// Instance scope an inlined HIERARCHICAL/interface task body resolves
+    /// bare names under (`bus.snoop()` → "bus"). Installed at bind and on
+    /// every process RESUME while this frame is on top (a suspend inside the
+    /// body would otherwise lose it), restored to `prev_hint` at unwind.
+    frame_scope_hint: Option<String>,
+    prev_hint: Option<String>,
     /// §21.2.1.7 `%m`: the m_scope_stack to restore on task return (a task
     /// call RESETS the lexical scope to just the task, since tasks are
     /// declared at module/package level — the CALLER's scope is not part of
@@ -28641,6 +28647,16 @@ impl Simulator {
         } else {
             self.current_scope.clear();
         }
+        // A suspended-and-resumed process running INSIDE an inlined
+        // hierarchical/interface task must keep resolving the body's bare
+        // names under the task's instance scope, not the process's own.
+        if let Some(hint) = self
+            .task_cleanup
+            .last()
+            .and_then(|c| c.frame_scope_hint.clone())
+        {
+            *self.name_resolve_hint.borrow_mut() = Some(hint);
+        }
         // A process is not a comb/edge block, so the scope the settle loop
         // last recorded must not leak into this process's `%m`.
         self.m_block_scope.clear();
@@ -29372,6 +29388,104 @@ impl Simulator {
                                     // Chain the caller's tail instead of copying it onto the end of
                                     // the spliced body (ProcCont::pushed).
                                     self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Stage 1-hier: a call to a blocking HIERARCHICAL or interface
+            // task — `u_m.sample(args)` / `vif.sample(args)` (LRM §25.5.4,
+            // §25.9) — flattens to Call{func: Ident([...])} with 2+ segments.
+            // Stage 1 above only matches single-segment names, so these fell
+            // through to the synchronous path, whose event controls ABORT the
+            // body instead of suspending: a monitor BFM's `@(negedge pclk)`
+            // returned immediately and the proxy's forever loop spun at t=0
+            // (found running a public UVM AVIP). Resolve exactly like the
+            // synchronous Call arm (vif alias on the head, then the joined
+            // path, then hint-prefixed) and inline when the body blocks; the
+            // frame carries the instance scope so the body's bare interface
+            // member names resolve across suspends.
+            if let StatementKind::Expr(expr) = &stmt.kind {
+                if let ExprKind::Call { func, args } = &expr.kind {
+                    // `vif.task(args)` in a class body parses as MemberAccess
+                    // on the property, not a flattened Ident — normalize both
+                    // forms to (head, trailing segments).
+                    let hier_parts: Option<(String, Vec<String>)> = match &func.kind {
+                        ExprKind::Ident(h)
+                            if h.path.len() >= 2
+                                && h.path.iter().all(|sg| sg.selects.is_empty()) =>
+                        {
+                            Some((
+                                h.path[0].name.name.clone(),
+                                h.path[1..]
+                                    .iter()
+                                    .map(|sg| sg.name.name.clone())
+                                    .collect(),
+                            ))
+                        }
+                        ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
+                            ExprKind::Ident(h1)
+                                if h1.path.len() == 1
+                                    && h1.path[0].selects.is_empty() =>
+                            {
+                                Some((h1.path[0].name.name.clone(), vec![member.name.clone()]))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((head, tail)) = hier_parts {
+                        {
+                            let head = head.as_str();
+                            // §25.9 task-formal/variable alias, then the
+                            // §25.8 class-property binding on current `this`.
+                            let head_owned = self
+                                .iface_alias_for(head)
+                                .or_else(|| {
+                                    let this_h = self.this_stack.last().copied().flatten()?;
+                                    self.virtual_iface_bindings
+                                        .get(&(this_h, head.to_string()))
+                                        .map(|(bound, _)| bound.clone())
+                                })
+                                .unwrap_or_else(|| head.to_string());
+                            let mut segs: Vec<&str> = vec![head_owned.as_str()];
+                            segs.extend(tail.iter().map(|t| t.as_str()));
+                            let full = segs.join(".");
+                            let full = if self.module.tasks.contains_key(&full) {
+                                Some(full)
+                            } else {
+                                self.name_resolve_hint
+                                    .borrow()
+                                    .as_ref()
+                                    .map(|hint| format!("{}.{}", hint, full))
+                                    .filter(|p| self.module.tasks.contains_key(p))
+                            };
+                            if let Some(full) = full {
+                                let td = self.module.tasks.get(&full).cloned().unwrap();
+                                if self.stmts_have_blocking(&td.items) {
+                                    let scope = full
+                                        .rsplit_once('.')
+                                        .map(|(sc, _)| sc.to_string())
+                                        .unwrap_or_default();
+                                    let mut cleanup = self.bind_task_frame(&td, args);
+                                    cleanup.prev_hint =
+                                        self.name_resolve_hint.borrow().clone();
+                                    cleanup.frame_scope_hint = Some(scope.clone());
+                                    *self.name_resolve_hint.borrow_mut() =
+                                        Some(scope);
+                                    self.task_cleanup.push(cleanup);
+                                    let mut cont: Vec<Statement> = td.items.clone();
+                                    cont.push(Statement::new(
+                                        StatementKind::ScopePop,
+                                        stmt.span,
+                                    ));
+                                    self.run_process_stmts(
+                                        pid,
+                                        &pc.pushed(cont, pc.start + i + 1),
+                                    );
                                     return;
                                 }
                             }
@@ -31226,6 +31340,24 @@ impl Simulator {
         if !blocks {
             if let Some(f) = self.module.functions.get(name) {
                 blocks = self.stmts_have_blocking(&f.items);
+            }
+        }
+        if !blocks {
+            // Hierarchical / interface tasks are keyed by their FULL inlined
+            // path ("u_if.sample_one"), so the leaf-name lookup above misses
+            // them — a monitor BFM task with `@(negedge clk)` was classified
+            // non-blocking, executed synchronously, and its event control
+            // aborted the body instead of suspending (the caller's forever
+            // loop then spun at t=0). Over-approximate by leaf suffix: if ANY
+            // task keyed `*.name` blocks, treat the call as blocking (the
+            // suspend-aware path is correct for non-blocking bodies too,
+            // merely slower).
+            let dotted = format!(".{}", name);
+            for (key, t) in self.module.tasks.iter() {
+                if key.ends_with(dotted.as_str()) && self.stmts_have_blocking(&t.items) {
+                    blocks = true;
+                    break;
+                }
             }
         }
         if !blocks {
@@ -81426,6 +81558,9 @@ impl Simulator {
     /// the work that `exec_task_call` runs after the body. Mirrors the original
     /// inline cleanup exactly.
     fn unwind_task_frame(&mut self, c: TaskCleanup) {
+        if c.frame_scope_hint.is_some() {
+            *self.name_resolve_hint.borrow_mut() = c.prev_hint.clone();
+        }
         if let Some(tn) = &c.task_name {
             if let Some(set) = self.active_task_pids.get_mut(tn) {
                 set.remove(&self.current_pid);
@@ -81890,6 +82025,8 @@ impl Simulator {
         let m_leaf = tname.rsplit('.').next().unwrap_or(&tname).to_string();
         let saved_m_scope = std::mem::replace(&mut self.m_scope_stack, vec![m_leaf]);
         TaskCleanup {
+            frame_scope_hint: None,
+            prev_hint: None,
             saved_m_scope,
             task_name: Some(tname),
             array_writebacks,
