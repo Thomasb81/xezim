@@ -48097,6 +48097,103 @@ impl Simulator {
                         while let ExprKind::Index { expr: inner, .. } = &root.kind {
                             root = inner.as_ref();
                         }
+                        // §4c/: `obj.member[k] = new(...)` — the collection is
+                        // a MEMBER of a class handle (`mid.base[i] = new(...)`
+                        // in do_unpack, or the flattened nested
+                        // `a.mid.base[i] = new(...)`). The root unwraps to a
+                        // MemberAccess or a flattened >=3-seg Ident. Resolve
+                        // the element class from the RECEIVER's runtime class
+                        // property so the bare `new(...)` constructs the
+                        // declared element type instead of the enclosing
+                        // `this` class (which would run a component ctor and
+                        // trip the UVM ILLCRT guard deep inside the library).
+                        let recv_member: Option<(Expression, String)> = match &root.kind {
+                            ExprKind::MemberAccess { expr: recv, member } => {
+                                Some(((**recv).clone(), member.name.clone()))
+                            }
+                            ExprKind::Ident(ih) if ih.path.len() >= 3 => {
+                                let mut p = ih.clone();
+                                let member = p.path.pop().unwrap().name.name.clone();
+                                p.cached_signal_id = std::cell::Cell::new(None);
+                                Some((Expression::new(ExprKind::Ident(p), lvalue.span), member))
+                            }
+                            _ => None,
+                        };
+                        if let Some((recv, member_name)) = recv_member {
+                            let this_recv = matches!(&recv.kind, ExprKind::Ident(rh)
+                                if rh.path.len() == 1 && rh.path[0].name.name == "this");
+                            let handle = if this_recv {
+                                self.this_stack.last().copied().flatten().unwrap_or(0)
+                            } else {
+                                self.eval_handle_expr(&recv).unwrap_or(0)
+                            };
+                            if handle != 0 {
+                                let hcn = self
+                                    .heap
+                                    .get(handle)
+                                    .and_then(|o| o.as_ref())
+                                    .map(|i| i.class_name.clone());
+                                let mut mtn: Option<String> = None;
+                                let mut cur = hcn;
+                                while let Some(cn) = cur {
+                                    if let Some(cd) = self.module.classes.get(&cn) {
+                                        if let Some(tn) = cd
+                                            .properties
+                                            .get(&member_name)
+                                            .and_then(|s| s.type_name.clone())
+                                        {
+                                            mtn = Some(tn);
+                                            break;
+                                        }
+                                        cur = cd.extends.clone();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if let Some(mcls) = mtn
+                                    .as_deref()
+                                    .and_then(|t| {
+                                        self.resolve_typedef_spec(t)
+                                            .map(|(b, s)| (b.clone(), Some((b, s))))
+                                            .or_else(|| {
+                                                self.resolve_simple_typedef_class(t)
+                                                    .filter(|c| self.module.classes.contains_key(c))
+                                                    .map(|c| (c, None))
+                                            })
+                                            .or_else(|| {
+                                                self.extract_spec_from_string(t)
+                                                    .filter(|(b, _)| self.module.classes.contains_key(b))
+                                                    .map(|(b, s)| (b.clone(), Some((b, s))))
+                                            })
+                                            .or_else(|| {
+                                                self.module
+                                                    .classes
+                                                    .contains_key(t)
+                                                    .then(|| (t.to_string(), None))
+                                            })
+                                    })
+                                {
+                                    let ctor_args: &[Expression] = match &rvalue.kind {
+                                        ExprKind::Call { args, .. } => args,
+                                        _ => &[],
+                                    };
+                                    let (cn, spec) = mcls;
+                                    if let Some(cd) = self.module.classes.get(&cn).cloned() {
+                                        let v = if let Some((b, s)) = spec {
+                                            let saved = self.current_spec.take();
+                                            self.current_spec = Some((b, s));
+                                            let r = self.instantiate_class(&cd, ctor_args);
+                                            self.current_spec = saved;
+                                            r
+                                        } else {
+                                            self.instantiate_class(&cd, ctor_args)
+                                        };
+                                        self.assign_value(lvalue, &v);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                         if let ExprKind::Ident(bh) = &root.kind {
                             let bname = bh
                                 .path
@@ -48445,11 +48542,51 @@ impl Simulator {
                     if is_new && args.len() == 1 {
                         if let ExprKind::Ident(lh) = &lvalue.kind {
                             let mut lname = self.resolve_hier_name(lh);
-                            if let Some(s) = self.instance_assoc_member(&lname) {
-                                lname = s;
+                            if !(self.module.dynamic_arrays.contains(&lname)
+                                || self.module.arrays.contains_key(&lname))
+                            {
+                                // A class-member dynamic array reached either
+                                // via the CURRENT instance (`base` → this
+                                // context) or through an OBJECT HANDLE path
+                                // (`a.mid.base`, a flattened 3+ segment Ident).
+                                // Per-instance storage is `<handle>#member`,
+                                // not a module-scope array. Resolve that
+                                // scoped name so `= new[size]` sizes the right
+                                // instance's collection.
+                                let member = lh.path.last().map(|s| s.name.name.clone());
+                                let scoped: Option<String> = self
+                                    .instance_assoc_member(&lname)
+                                    .or_else(|| {
+                                        // Receiver path = all-but-last segment:
+                                        // `a.mid.base` → receiver `a.mid`.
+                                        let recv: Option<Expression> = if lh.path.len() >= 2 {
+                                            let mut p = lh.clone();
+                                            p.path.pop();
+                                            p.cached_signal_id =
+                                                std::cell::Cell::new(None);
+                                            Some(Expression::new(ExprKind::Ident(p), lvalue.span))
+                                        } else {
+                                            None
+                                        };
+                                        let h = recv
+                                            .as_ref()
+                                            .and_then(|r| self.eval_handle_expr(r))
+                                            .unwrap_or(0);
+                                        let m = member.clone().unwrap_or_default();
+                                        if h != 0 {
+                                            self.handle_collection_name(h, &m)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .or_else(|| self.expr_assoc_name(lvalue));
+                                if let Some(s) = scoped {
+                                    lname = s;
+                                }
                             }
                             if self.module.dynamic_arrays.contains(&lname)
                                 || self.module.arrays.contains_key(&lname)
+                                || lname.contains('#')
                             {
                             let size = self.eval_expr(&args[0]).to_u64().unwrap_or(0);
                             let w = self.module.arrays.get(&lname).map(|t| t.2).unwrap_or(32);
@@ -76954,6 +77091,38 @@ impl Simulator {
                     None
                 }
             }
+            // Flattened nested OBJECT handle: `a.mid.base` (path.len() >= 3).
+            // The receiver is an object chain (`a.mid`), not a static handle.
+            // Evaluate the receiver to a handle and scope the leaf member to it.
+            ExprKind::Ident(h)
+                if h.path.len() >= 3
+                    && !self.module.classes.contains_key(&h.path[0].name.name)
+                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let n = h.path.len();
+                let member = h.path[n - 1].name.name.clone();
+                let mut recv = h.clone();
+                recv.path.pop();
+                recv.cached_signal_id = std::cell::Cell::new(None);
+                let recv_expr = Expression::new(ExprKind::Ident(recv), h.span);
+                let hh = self.eval_handle_expr(&recv_expr).unwrap_or(0);
+                if hh != 0 {
+                    if let Some(cn) = self
+                        .heap
+                        .get(hh)
+                        .and_then(|x| x.as_ref())
+                        .map(|i| i.class_name.clone())
+                    {
+                        if self.class_assoc_member(&cn, &member) {
+                            return Some(format!("{}#{}", hh, member));
+                        }
+                        if self.prop_bound_collection(hh, &cn, &member) {
+                            return Some(format!("{}#{}", hh, member));
+                        }
+                    }
+                }
+                None
+            }
             ExprKind::MemberAccess { expr: base, member } => {
                 if let ExprKind::Ident(bh) = &base.kind {
                     if bh.path.len() == 1 {
@@ -77994,6 +78163,7 @@ impl Simulator {
     }
 
     fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
+
         // Normalize away Specialization wrappers for dispatch shape-matching
         // (the `#(...)` text is retained in the original AST + `current_spec`
         // for per-spec static keying). Keeps pre-Specialization dispatch exact.
