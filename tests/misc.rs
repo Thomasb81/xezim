@@ -135,6 +135,8 @@ mod port_width_mismatch_explains;
 mod elaboration_runaway_guards;
 #[path = "misc/value_trace.rs"]
 mod value_trace;
+#[path = "misc/clocked_loop_case_nest_compiled.rs"]
+mod clocked_loop_case_nest_compiled;
 #[path = "misc/comb_regvar_loop_fallback.rs"]
 mod comb_regvar_loop_fallback;
 #[path = "misc/svtb_suite.rs"]
