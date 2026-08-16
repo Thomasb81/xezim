@@ -189,6 +189,8 @@ mod unpacked_struct_func_arg;
 mod valparam_spec_cycle;
 #[path = "types/value_param_specialization.rs"]
 mod value_param_specialization;
+#[path = "types/packed_elem_shift_context_width.rs"]
+mod packed_elem_shift_context_width;
 #[path = "types/vcd_param_as_wire.rs"]
 mod vcd_param_as_wire;
 #[path = "types/wide_signed_arith_and_power.rs"]
