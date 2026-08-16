@@ -17,6 +17,8 @@ mod assign_pattern_aggregate;
 mod drive_strength_pull;
 #[path = "gates/dump_merged_sv.rs"]
 mod dump_merged_sv;
+#[path = "gates/fst_roundtrip.rs"]
+mod fst_roundtrip;
 #[path = "gates/specify_flags.rs"]
 mod specify_flags;
 #[path = "gates/tran_and_implicit_nets.rs"]
