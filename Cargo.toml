@@ -48,6 +48,12 @@ fst-writer = "0.3"
 libffi = { version = "3", features = ["system"] }
 
 [dev-dependencies]
+# `tests/gates/fst_roundtrip.rs` DECODES the FST dumps this crate writes, to
+# check var types, widths, aliases, values and the trailer's end_time. An FST
+# is block-compressed, so byte-level assertions cannot see any of that — and
+# shelling out to GTKWave's `fst2vcd` would put a system tool on the test path.
+# Reader half of the `fst-writer` above, same author and format revision.
+fst-reader = "0.17"
 # `tests/xtrace_conformance.rs` reads a zstd-compressed XTrace dump back to
 # check that its header declares the compression (XTrace §6.8). Same version
 # xezim-core writes the stream with.
