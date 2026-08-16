@@ -123,6 +123,8 @@ pub enum Insn {
     LoadSignal(RegId, SigId),      // (dest_reg, signal_id)
     /// Load a signal and mark it as signed.
     LoadSignalSigned(RegId, SigId),
+    /// Load a value from the active process's innermost local frame.
+    LoadProcessLocal(RegId, Box<str>),
     /// Resize register to given width.
     Resize(RegId, u32),
 
@@ -386,6 +388,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::LoadConst(..) => "Const",
         Insn::LoadSignal(..) => "Load",
         Insn::LoadSignalSigned(..) => "LoadS",
+        Insn::LoadProcessLocal(..) => "LoadLocal",
         Insn::Resize(..) => "Resize",
         Insn::Add(..) => "Add",
         Insn::Sub(..) => "Sub",
@@ -494,6 +497,10 @@ pub struct BytecodeCompiler<'a> {
     /// all (§12.7.1 makes it automatic and local to the loop). Without this the
     /// whole loop fell back to the AST interpreter.
     pub local_var_regs: std::collections::HashMap<String, (RegId, u32)>,
+    /// Names imported from an already-active process frame. These registers
+    /// are read-only for the compiled statement; writes leave compilation so
+    /// the process interpreter can preserve full local-lifetime semantics.
+    process_local_names: HashSet<String>,
     /// Depth of enclosing loops whose counter lives in a VM REGISTER
     /// (`for (int i = ...)`). While > 0, StmtFallback emission is FORBIDDEN:
     /// the AST interpreter cannot see VM registers, so a fallback statement
@@ -611,6 +618,7 @@ impl<'a> BytecodeCompiler<'a> {
             scope_hint: None,
             for_loop_var_ids: std::collections::HashMap::default(),
             local_var_regs: std::collections::HashMap::default(),
+            process_local_names: HashSet::default(),
             reg_var_loop_depth: 0,
             allow_expr_fallback: false,
             tasks: None,
@@ -628,6 +636,19 @@ impl<'a> BytecodeCompiler<'a> {
             string_signals: None,
             multi_dim_arrays: None,
             packed_struct_fields: None,
+        }
+    }
+
+    /// Make the active process's innermost frame visible to a compiled,
+    /// non-suspending statement. Each local is loaded once on block entry and
+    /// then behaves like any other register-backed operand.
+    pub fn set_process_locals(&mut self, locals: &HashMap<String, Value>) {
+        for (name, value) in locals {
+            let reg = self.alloc_reg();
+            self.emit(Insn::LoadProcessLocal(reg, name.clone().into_boxed_str()));
+            self.local_var_regs
+                .insert(name.clone(), (reg, value.width));
+            self.process_local_names.insert(name.clone());
         }
     }
 
@@ -1110,9 +1131,8 @@ impl<'a> BytecodeCompiler<'a> {
     /// Try to inline a zero-arg, non-blocking user task's body at this
     /// call site. Returns true if successfully inlined.
     /// Inline a call to a pure combinational function, yielding the register
-    /// holding its result. Accepts only the shape that cannot observe or
-    /// mutate anything: input-only formals, and a body that is a single
-    /// assignment to the function name or a single `return <expr>`.
+    /// holding its result. Accepts only argument-contained functions: input
+    /// formals and directly writable `ref` actuals, with no external reads.
     fn compile_pure_call(
         &mut self,
         func: &Expression,
@@ -1142,7 +1162,10 @@ impl<'a> BytecodeCompiler<'a> {
             || fd
                 .ports
                 .iter()
-                .any(|p| !matches!(p.direction, PortDirection::Input) || !p.dimensions.is_empty())
+                .any(|p| {
+                    !matches!(p.direction, PortDirection::Input | PortDirection::Ref)
+                        || !p.dimensions.is_empty()
+                })
         {
             self.bail("Expr_Call_ports");
             return None;
@@ -1180,7 +1203,15 @@ impl<'a> BytecodeCompiler<'a> {
         // Evaluate the arguments in the CALLER's scope first, then bind them as
         // register-backed locals while compiling the body.
         let mut binds: Vec<(String, (RegId, u32))> = Vec::with_capacity(args.len());
+        let mut ref_writes: Vec<(Expression, RegId, u32)> = Vec::new();
         for (p, a) in fd.ports.iter().zip(args) {
+            if matches!(p.direction, PortDirection::Ref)
+                && (matches!(&a.kind, ExprKind::Ident(h) if self.local_var_reg_of(h).is_some())
+                    || self.expr_to_signal_id(a).is_none())
+            {
+                self.bail("Expr_Call_ref_target");
+                return None;
+            }
             let w = self.decl_width(&p.data_type);
             let v = self.compile_expr(a, w)?;
             let slot = self.alloc_reg();
@@ -1189,6 +1220,9 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Resize(slot, w));
             }
             binds.push((p.name.name.clone(), (slot, w)));
+            if matches!(p.direction, PortDirection::Ref) {
+                ref_writes.push((a.clone(), slot, w));
+            }
         }
         // Elaboration rewrites an instantiated module's function body to
         // instance-qualified names, so the body assigns `u0.onehot` and reads
@@ -1228,7 +1262,15 @@ impl<'a> BytecodeCompiler<'a> {
         // the ordinary (correct) call path.
         let saved_fallback = self.allow_ast_fallback;
         self.allow_ast_fallback = false;
-        let ok = self.compile_pure_body(&items, ret_slot, ret_w, ctx_width);
+        let mut ok = self.compile_pure_body(&items, ret_slot, ret_w, ctx_width);
+        if ok {
+            for (target, value, width) in &ref_writes {
+                if !self.compile_blocking_target(target, *value, *width) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
         self.allow_ast_fallback = saved_fallback;
         self.inlining_stack.pop();
         self.local_var_regs = saved_locals;
@@ -1402,7 +1444,7 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     /// Would `compile_pure_call` accept this call? Mirrors its admission
-    /// tests (single-segment callee, arity, all-`input` scalar formals,
+    /// tests (single-segment callee, arity, supported scalar formals,
     /// argument-pure body, nothing that suspends) so the loop gate and the
     /// compiler agree on what "call-free after inlining" means.
     fn call_is_inlinable(&self, func: &Expression, args: &[Expression]) -> bool {
@@ -1417,7 +1459,8 @@ impl<'a> BytecodeCompiler<'a> {
         };
         if fd.ports.len() != args.len()
             || fd.ports.iter().any(|p| {
-                !matches!(p.direction, PortDirection::Input) || !p.dimensions.is_empty()
+                !matches!(p.direction, PortDirection::Input | PortDirection::Ref)
+                    || !p.dimensions.is_empty()
             })
         {
             return false;
@@ -1552,6 +1595,9 @@ impl<'a> BytecodeCompiler<'a> {
         }
         match &stmt.kind {
             StatementKind::Null => true,
+            StatementKind::VarDecl { declarators, .. } => declarators
+                .iter()
+                .all(|decl| decl.init.as_ref().map(&expr_simple).unwrap_or(true)),
             StatementKind::NonblockingAssign { lvalue, rvalue, .. }
             | StatementKind::BlockingAssign { lvalue, rvalue } => {
                 // A SELF-READING array update (`ptr[i] <= ptr[i] + 1`) is
@@ -2759,7 +2805,10 @@ impl<'a> BytecodeCompiler<'a> {
         if let StatementKind::VarDecl { declarators, .. } = &stmt.kind {
             if declarators
                 .iter()
-                .any(|d| self.signal_name_to_id.contains_key(d.name.name.as_str()))
+                .any(|d| {
+                    self.signal_name_to_id.contains_key(d.name.name.as_str())
+                        || self.process_local_names.contains(d.name.name.as_str())
+                })
             {
                 self.bail("VarDecl_shadows_signal");
                 return false;
@@ -2808,6 +2857,39 @@ impl<'a> BytecodeCompiler<'a> {
     fn compile_stmt_strict(&mut self, stmt: &Statement) -> bool {
         match &stmt.kind {
             StatementKind::Null => true,
+            StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } => {
+                for decl in declarators {
+                    if !decl.dimensions.is_empty() {
+                        self.bail("VarDecl_array");
+                        return false;
+                    }
+                    let width = self.decl_width(data_type);
+                    let slot = self.alloc_reg();
+                    match &decl.init {
+                        Some(expr) => {
+                            let Some(value) = self.compile_expr(expr, width) else {
+                                self.bail("VarDecl_init");
+                                return false;
+                            };
+                            self.emit(Insn::Move(slot, value));
+                        }
+                        None => {
+                            let value = self.type_default_value(data_type, width);
+                            self.emit(Insn::LoadConst(slot, Box::new(value)));
+                        }
+                    }
+                    if width > 0 {
+                        self.emit(Insn::Resize(slot, width));
+                    }
+                    self.local_var_regs
+                        .insert(decl.name.name.clone(), (slot, width));
+                }
+                true
+            }
             StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
@@ -2891,6 +2973,12 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(val_reg) = self.compile_expr(expr, 0) {
                     let mut end_jumps: Vec<usize> = Vec::new();
                     let mut default_item: Option<&Statement> = None;
+                    // Every pattern arm is mutually exclusive and jumps to the
+                    // case end after its body. Reuse its temporary registers so
+                    // a large constant map does not exhaust the register id
+                    // space merely by having many alternatives.
+                    let arm_reg_start = self.next_reg;
+                    let mut peak_reg = arm_reg_start;
                     for item in items {
                         if item.is_default {
                             default_item = Some(&item.stmt);
@@ -2919,6 +3007,8 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.emit(Insn::Jump(0));
                                 let next = self.insns.len() as u32;
                                 self.insns[branch_idx] = Insn::BranchIfFalse(cmp_reg, next);
+                                peak_reg = peak_reg.max(self.next_reg);
+                                self.next_reg = arm_reg_start;
                             } else {
                                 return false;
                             }
@@ -2929,7 +3019,9 @@ impl<'a> BytecodeCompiler<'a> {
                         if !self.compile_stmt(def_stmt) {
                             return false;
                         }
+                        peak_reg = peak_reg.max(self.next_reg);
                     }
+                    self.next_reg = peak_reg;
                     let end = self.insns.len() as u32;
                     for idx in end_jumps {
                         self.insns[idx] = Insn::Jump(end);
@@ -2940,11 +3032,14 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                let saved_locals = self.local_var_regs.clone();
                 for s in stmts {
                     if !self.compile_stmt(s) {
+                        self.local_var_regs = saved_locals;
                         return false;
                     }
                 }
+                self.local_var_regs = saved_locals;
                 true
             }
             // Bail out on anything else (timing controls, loops, system tasks, etc.)
@@ -4623,6 +4718,11 @@ impl<'a> BytecodeCompiler<'a> {
         // enclosing `for (int i = ...)`).
         if let ExprKind::Ident(hier) = &lhs.kind {
             if let Some((dst, w)) = self.local_var_reg_of(hier) {
+                let name = &hier.path[0].name.name;
+                if self.process_local_names.contains(name) {
+                    self.bail("blocking_process_local");
+                    return false;
+                }
                 self.emit(Insn::Move(dst, val_reg));
                 if w > 0 {
                     self.emit(Insn::Resize(dst, w));
@@ -5745,6 +5845,7 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::LoadConst(..)
             | Insn::LoadSignal(..)
             | Insn::LoadSignalSigned(..)
+            | Insn::LoadProcessLocal(..)
             | Insn::LoadSignalRange(..)
             | Insn::LoadSignalBit(..)
             | Insn::NbaAssignConst(..)
@@ -6412,6 +6513,7 @@ impl<'a> BytecodeCompiler<'a> {
                         .map(|w| (w, plain));
                     store(&mut rw, *d, f);
                 }
+                Insn::LoadProcessLocal(d, _) => store(&mut rw, *d, None),
                 // `Value::bit_select` is 1 bit on every path, including the
                 // §11.5.1 out-of-range read.
                 Insn::LoadSignalBit(d, _, _)

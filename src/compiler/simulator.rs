@@ -3831,6 +3831,10 @@ pub struct Simulator {
     t0_delay_deferred: HashSet<usize>,
     /// Prepared frames for loops that suspend once per iteration.
     suspended_loop_frames: HashMap<usize, HashMap<(usize, usize), Arc<[Statement]>>>,
+    /// Bytecode cached for non-suspending process loops after their enclosing
+    /// local frame is known.
+    process_loop_bytecode:
+        HashMap<(usize, usize, usize), Option<super::bytecode::CompiledBlock>>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
     /// §9.7 `process` class: PIDs explicitly suspended via `suspend()`. The
@@ -6853,6 +6857,7 @@ impl Simulator {
             warned_delay_spikes: HashSet::default(),
             t0_delay_deferred: HashSet::default(),
             suspended_loop_frames: HashMap::default(),
+            process_loop_bytecode: HashMap::default(),
             killed_pids: HashSet::default(),
             suspended_pids: HashSet::default(),
             suspended_proc_info: HashMap::default(),
@@ -17674,6 +17679,9 @@ impl Simulator {
                     v.is_signed = true;
                     vm_regs[*dest as usize] = v;
                 }
+                Insn::LoadProcessLocal(dest, _) => {
+                    vm_regs[*dest as usize] = Value::new(1);
+                }
                 Insn::Resize(reg, width) => {
                     let r = *reg as usize;
                     if vm_regs[r].width != *width {
@@ -18194,6 +18202,10 @@ impl Simulator {
                     let mut v = view[*sig_id].clone();
                     v.is_signed = true;
                     vm_regs[*dest as usize] = v;
+                }
+                Insn::LoadProcessLocal(dest, _) => {
+                    vm_regs[*dest as usize] = Value::new(1);
+                    unsupported = true;
                 }
                 Insn::Resize(reg, width) => {
                     let r = *reg as usize;
@@ -19097,6 +19109,15 @@ impl Simulator {
                     }
                     self.vm_regs[d].is_signed = true;
                 }
+                Insn::LoadProcessLocal(dest, name) => {
+                    let value = self
+                        .local_stack
+                        .last()
+                        .and_then(|frame| frame.get(name.as_ref()))
+                        .cloned()
+                        .unwrap_or_else(|| Value::new(1));
+                    self.vm_regs[*dest as usize] = value;
+                }
                 // 10.8% of all executed bytecode — the second most frequent
                 // opcode. Rewriting the register's two words and its width in
                 // place removes the fresh 32-byte `Value`, the 32-byte move
@@ -19648,33 +19669,10 @@ impl Simulator {
                         }
                     } else if let Some(i) = self.nba_fast_index.get(id) {
                         let target = &mut self.nba_fast[i].value;
-                        for bit_pos in low..=high {
-                            target.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
-                        }
+                        target.copy_bits_from(low as usize, &val, 0, w as usize);
                     } else {
-                        // Wide path: build merged value, compare against
-                        // signal_table[id], push only on real change.
-                        // Compare FIRST (no clone): flop reloads usually match, and
-                        // the unconditional clone of a wide signal (1 byte/bit Vec)
-                        // was a top allocator cost on c910. Clone + merge only from
-                        // the first differing bit.
-                        let mut first_diff = None;
-                        {
-                            let src = &self.signal_table[id];
-                            for bit_pos in low..=high {
-                                if src.get_bit(bit_pos as usize)
-                                    != val.get_bit((bit_pos - low) as usize)
-                                {
-                                    first_diff = Some(bit_pos);
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(start) = first_diff {
-                            let mut new_val = self.signal_table[id].clone();
-                            for bit_pos in start..=high {
-                                new_val.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
-                            }
+                        let mut new_val = self.signal_table[id].clone();
+                        if new_val.copy_bits_from(low as usize, &val, 0, w as usize) {
                             self.nba_fast_index.insert(id, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
                                 block_index: 0,
@@ -19696,6 +19694,7 @@ impl Simulator {
                     let id = *sig_id;
                     let sig_w = self.signal_widths[id];
                     let high_eff = high.min(sig_w.saturating_sub(1));
+                    let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;
 
                     if low == 0 && high_eff + 1 >= sig_w {
                         // Whole-signal write — same elision as the simple
@@ -19743,34 +19742,20 @@ impl Simulator {
                     } else {
                         if let Some(i) = self.nba_fast_index.get(id) {
                             let target = &mut self.nba_fast[i].value;
-                            for bit_pos in low..=high_eff {
-                                target.set_bit(
-                                    bit_pos as usize,
-                                    val.get_bit((bit_pos - low) as usize),
-                                );
-                            }
+                            target.copy_bits_from(
+                                low as usize,
+                                &val,
+                                0,
+                                copy_count,
+                            );
                         } else {
-                            // Compare FIRST (no clone): flop reloads usually match, and
-                            // the unconditional clone of a wide signal (1 byte/bit Vec)
-                            // was a top allocator cost on c910. Clone + merge only from
-                            // the first differing bit.
-                            let mut first_diff = None;
-                            {
-                                let src = &self.signal_table[id];
-                                for bit_pos in low..=high_eff {
-                                    if src.get_bit(bit_pos as usize)
-                                        != val.get_bit((bit_pos - low) as usize)
-                                    {
-                                        first_diff = Some(bit_pos);
-                                        break;
-                                    }
-                                }
-                            }
-                            if let Some(start) = first_diff {
-                                let mut new_val = self.signal_table[id].clone();
-                                for bit_pos in start..=high_eff {
-                                    new_val.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
-                                }
+                            let mut new_val = self.signal_table[id].clone();
+                            if new_val.copy_bits_from(
+                                low as usize,
+                                &val,
+                                0,
+                                copy_count,
+                            ) {
                                 self.nba_fast_index.insert(id, self.nba_fast.len());
                                 self.nba_fast.push(NbaFast {
                                     block_index: 0,
@@ -19934,6 +19919,7 @@ impl Simulator {
                     let id = *sig_id;
                     let sig_w = self.signal_widths[id];
                     let high_eff = high.min(sig_w.saturating_sub(1));
+                    let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;
 
                     if low == 0 && high_eff + 1 >= sig_w {
                         let mut v = val.resize_for_assign(sig_w);
@@ -19980,14 +19966,12 @@ impl Simulator {
                             self.after_signal_write(id);
                         }
                     } else {
-                        let mut changed = false;
-                        for bit_pos in low..=high_eff {
-                            let src_bit = val.get_bit((bit_pos - low) as usize);
-                            if self.signal_table[id].get_bit(bit_pos as usize) != src_bit {
-                                self.signal_table[id].set_bit(bit_pos as usize, src_bit);
-                                changed = true;
-                            }
-                        }
+                        let changed = self.signal_table[id].copy_bits_from(
+                            low as usize,
+                            &val,
+                            0,
+                            copy_count,
+                        );
                         if changed {
                             self.signal_table[id].is_signed = self.signal_signed[id];
                             if !self.dirty_signals[id] {
@@ -20010,6 +19994,7 @@ impl Simulator {
                     let id = *sig_id;
                     let sig_w = self.signal_widths[id];
                     let high_eff = high.min(sig_w.saturating_sub(1));
+                    let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;
 
                     if low == 0 && high_eff + 1 >= sig_w {
                         let mut v = val.resize_for_assign(sig_w);
@@ -20056,14 +20041,12 @@ impl Simulator {
                             self.after_signal_write(id);
                         }
                     } else {
-                        let mut changed = false;
-                        for bit_pos in low..=high_eff {
-                            let src_bit = val.get_bit((bit_pos - low) as usize);
-                            if self.signal_table[id].get_bit(bit_pos as usize) != src_bit {
-                                self.signal_table[id].set_bit(bit_pos as usize, src_bit);
-                                changed = true;
-                            }
-                        }
+                        let changed = self.signal_table[id].copy_bits_from(
+                            low as usize,
+                            &val,
+                            0,
+                            copy_count,
+                        );
                         if changed {
                             self.signal_table[id].is_signed = self.signal_signed[id];
                             if !self.dirty_signals[id] {
@@ -21475,7 +21458,7 @@ impl Simulator {
                     );
                     compiler.set_scope_hint(scope_hint.clone());
                     compiler.set_tasks(&self.module.tasks);
-                compiler.set_functions(&self.module.functions);
+                    compiler.set_functions(&self.module.functions);
                     compiler.set_params(&self.module.parameters);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
@@ -28190,6 +28173,7 @@ impl Simulator {
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
+            Insn::LoadProcessLocal(..) => "LoadProcessLocal",
             Insn::Resize(..) => "Resize",
             Insn::Add(..) => "Add",
             Insn::Sub(..) => "Sub",
@@ -29415,6 +29399,57 @@ impl Simulator {
     /// `pc.resume_at(pc.start + i + 1)` deep-cloned it, and
     /// `pc.pushed(body, pc.start + i + 1)` splices a task body or flattened block
     /// in front of the caller's tail without copying that tail.
+    fn try_exec_process_loop_bytecode(&mut self, pid: usize, stmt: &Statement) -> bool {
+        if !matches!(stmt.kind, StatementKind::For { .. })
+            || self.local_stack.is_empty()
+            || self.stmt_has_event_wait(stmt)
+            || stmt.span.start == 0 && stmt.span.end == 0
+        {
+            return false;
+        }
+        let key = (pid, stmt.span.start, stmt.span.end);
+        if !self.process_loop_bytecode.contains_key(&key) {
+            let scope_hint = self.process_scope_hint.get(&pid).cloned();
+            let mut compiler = super::bytecode::BytecodeCompiler::new(
+                &self.signal_name_to_id,
+                &self.signal_signed,
+                &self.signal_widths,
+                &self.module.arrays,
+                &self.widths,
+            );
+            compiler.set_ast_fallback(false);
+            compiler.set_scope_hint(scope_hint);
+            compiler.set_tasks(&self.module.tasks);
+            compiler.set_functions(&self.module.functions);
+            compiler.set_params(&self.module.parameters);
+            compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+            compiler.set_assoc_arrays(&self.module.associative_arrays);
+            compiler.set_packed_full_dims(&self.module.packed_full_dims);
+            compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
+            compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+            compiler.set_array_first_id(&self.array_first_id);
+            compiler.set_string_signals(&self.module.string_signals);
+            compiler.set_signal_real(&self.signal_real);
+            compiler.top_module_name = Some(self.module.name.clone());
+            compiler.set_process_locals(self.local_stack.last().unwrap());
+            let ok = compiler.compile_stmt(stmt);
+            let compiled = ok.then(|| compiler.finish());
+            self.process_loop_bytecode.insert(key, compiled);
+        }
+        let Some(Some(compiled)) = self.process_loop_bytecode.remove(&key) else {
+            self.process_loop_bytecode.entry(key).or_insert(None);
+            return false;
+        };
+        if self.vm_regs.len() < compiled.num_regs as usize {
+            self.vm_regs
+                .resize(compiled.num_regs as usize, Value::zero(1));
+        }
+        self.exec_insns(&compiled.instructions);
+        self.process_loop_bytecode.insert(key, Some(compiled));
+        true
+    }
+
     fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
         let stmts: &[Statement] = pc.frame();
         self.current_pid = pid;
@@ -31327,6 +31362,10 @@ impl Simulator {
                 // the NEXT iteration per §9.4.3). This replay-from-zero path
                 // remains for multi-variable / unhandled shapes that
                 // `foreach_materialize_keys_1d` declined.
+                if self.try_exec_process_loop_bytecode(pid, stmt) {
+                    i += 1;
+                    continue;
+                }
                 if matches!(&stmt.kind, StatementKind::Foreach { .. }) {
                     self.exec_park_cont = Some({
                         let mut c = vec![stmt.clone()];
@@ -32480,6 +32519,79 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// Queue an indexed write into a packed signal without retaining an AST
+    /// lvalue for the commit phase. The selected index is sampled now, while
+    /// the process locals are live, and subsequent writes to the same signal
+    /// merge into the existing pending value in source order.
+    fn try_schedule_packed_index_nba(&mut self, lhs: &Expression, val: &Value) -> bool {
+        let ExprKind::Index { expr: base, index } = &lhs.kind else {
+            return false;
+        };
+        let ExprKind::Ident(hier) = &base.kind else {
+            return false;
+        };
+        if hier.path.len() != 1 || !hier.path[0].selects.is_empty() {
+            return false;
+        }
+        let leaf = hier.path[0].name.name.as_str();
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|frame| frame.contains_key(leaf))
+        {
+            return false;
+        }
+        let name = self.resolve_hier_name(hier);
+        if self.module.arrays.contains_key(&name)
+            || self.module.queue_vars.contains(&name)
+            || self.module.dynamic_arrays.contains(&name)
+            || self.module.associative_arrays.contains_key(&name)
+        {
+            return false;
+        }
+        let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+            return false;
+        };
+        let selected = self.eval_expr(index);
+        if selected.has_xz() && !selected.is_real {
+            return true;
+        }
+        let Some(label) = selected.to_i64() else {
+            return true;
+        };
+        let elem_width = self
+            .module
+            .packed_signal_elem_widths
+            .get(&name)
+            .copied()
+            .unwrap_or(1);
+        let Some(low) = self.packed_elem_lsb(&name, label, elem_width) else {
+            return true;
+        };
+        if low.saturating_add(elem_width as usize) > self.signal_widths[id] as usize {
+            return true;
+        }
+        let piece = val.resize_for_assign(elem_width);
+        if let Some(entry_index) = self.nba_fast_index.get(id) {
+            self.nba_fast[entry_index]
+                .value
+                .copy_bits_from(low, &piece, 0, elem_width as usize);
+            return true;
+        }
+        let mut pending = self.signal_table[id].clone();
+        if pending.copy_bits_from(low, &piece, 0, elem_width as usize) {
+            self.nba_fast_index.insert(id, self.nba_fast.len());
+            self.nba_fast.push(NbaFast {
+                block_index: 0,
+                signal_id: id,
+                value: pending,
+            });
+        } else {
+            self.prof_nba_elided += 1;
+        }
+        true
     }
 
     /// JIT Stage 4 Tier C Path C1: drain the side queue populated by
@@ -40620,6 +40732,52 @@ impl Simulator {
                         return changed;
                     }
                 }
+                // A selected element of a fixed class-property array is stored
+                // as an instance-scoped value rather than a signal-table slot.
+                // Apply the part write to that element before the generic
+                // signal-id path, which cannot resolve the bare property name.
+                if let ExprKind::Index {
+                    expr: array_expr,
+                    index,
+                } = &expr.kind
+                {
+                    let index_value = self.eval_expr(index);
+                    if index_value.has_xz() && !index_value.is_real {
+                        return false;
+                    }
+                    let element_name = self
+                        .class_nd_elem_name(array_expr, index)
+                        .or_else(|| {
+                            let base = self.expr_assoc_name(array_expr)?;
+                            let index = index_value.to_i64()?;
+                            Some(format!("{}[{}]", base, index))
+                        });
+                    if let Some(element_name) = element_name {
+                        if let Some(mut current) = self.get_signal_value_by_name(&element_name) {
+                            let width = current.width as usize;
+                            let hi = msb.min(width.saturating_sub(1));
+                            let base = if src_base < 0 { src_base } else { lsb as i64 };
+                            let mut changed = false;
+                            if msb_i >= 0 && hi >= lsb {
+                                for bit in lsb..=hi {
+                                    let source = bit as i64 - base;
+                                    if source < 0 {
+                                        continue;
+                                    }
+                                    let next = val.get_bit(source as usize);
+                                    if current.get_bit(bit) != next {
+                                        current.set_bit(bit, next);
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            if changed {
+                                self.set_signal_value_by_name(&element_name, current);
+                            }
+                            return changed;
+                        }
+                    }
+                }
                 // Fast path: resolve target signal_id directly (avoids format!
                 // + HashMap lookup on every call for tight memory-init loops).
                 let target_id: Option<usize> = match &expr.kind {
@@ -48384,7 +48542,8 @@ impl Simulator {
                 // what makes a DECLARATION initializer work — elaboration
                 // lowers `T v[int] = '{...}` to `v = '{...}` in an initial block.
                 if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
-                    let spread = self.assign_class_collection_pattern(lvalue, items)
+                    let spread = self.assign_class_fixed_array_pattern(lvalue, items)
+                        || self.assign_class_collection_pattern(lvalue, items)
                         || if matches!(&lvalue.kind, ExprKind::Ident(_)) {
                             self.pattern_aggregate_names(lvalue).into_iter().any(|n| {
                                 self.assign_pattern_aggregate(&n, items)
@@ -51231,6 +51390,9 @@ impl Simulator {
                             signal_id: id,
                             value: val.resize_for_assign(w),
                         });
+                    } else if self.try_schedule_packed_index_nba(lvalue, &val) {
+                        // The packed slice has already been merged into the
+                        // pending whole-signal value.
                     } else if matches!(&lvalue.kind, ExprKind::Ident(h)
                         if h.path.len() == 1
                             && self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name)))
@@ -71714,6 +71876,65 @@ impl Simulator {
         if self.get_signal_value_by_name(&key).is_none() {
             self.set_signal_value_by_name(&key, Value::zero(1));
         }
+        true
+    }
+
+    /// Spread a whole-value pattern over a fixed unpacked array property.
+    /// Per-instance array elements live under an instance-scoped storage name,
+    /// while the bare property used inside a method has no scalar container.
+    fn assign_class_fixed_array_pattern(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> bool {
+        if items.is_empty() {
+            return false;
+        }
+        let Some(scoped) = self.expr_assoc_name(lvalue) else {
+            return false;
+        };
+        let Some((handle_text, member)) = scoped.split_once('#') else {
+            return false;
+        };
+        let Ok(handle) = handle_text.parse::<usize>() else {
+            return false;
+        };
+        let Some(class_name) = self
+            .heap
+            .get(handle)
+            .and_then(|entry| entry.as_ref())
+            .map(|instance| instance.class_name.clone())
+        else {
+            return false;
+        };
+
+        let mut current = Some(class_name);
+        let mut layout: Option<(Vec<(i64, i64)>, DataType)> = None;
+        while let Some(name) = current {
+            let Some(class_def) = self.module.classes.get(&name) else {
+                break;
+            };
+            if let Some((shape, _)) = class_def.array_nd_properties.get(member) {
+                if let Some(data_type) = class_def.property_types.get(member) {
+                    layout = Some((shape.clone(), data_type.clone()));
+                    break;
+                }
+            }
+            if let Some(&(low, high, _)) = class_def.array_properties.get(member) {
+                if let Some(data_type) = class_def.property_types.get(member) {
+                    layout = Some((vec![(low, high)], data_type.clone()));
+                    break;
+                }
+            }
+            current = class_def.extends.clone();
+        }
+        let Some((dimensions, data_type)) = layout else {
+            return false;
+        };
+        if dimensions.is_empty() {
+            return false;
+        }
+        self.assign_pattern_array(&scoped, &dimensions, &data_type, items, false);
         true
     }
 
