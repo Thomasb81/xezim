@@ -47828,6 +47828,9 @@ impl Simulator {
     ) -> bool {
         if self.warn_x
             || self.vcd_writer.is_some()
+            || self.xtrace_file.is_some()
+            || self.xtrace_writer.is_some()
+            || self.fst_file.is_some()
             || self.fst_writer.is_some()
             || !self.forced_signals.is_empty()
             || !self.forced_names.is_empty()
