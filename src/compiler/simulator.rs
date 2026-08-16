@@ -3401,6 +3401,13 @@ pub struct Simulator {
     /// read only by `report_zero_delay_stall` so a spinning pid can be
     /// traced back to the RTL construct that spawned it.
     process_origin: HashMap<usize, (crate::ast::Span, &'static str)>,
+    /// XEZIM_TRACE_SCHED=1|all|<t>|<t0>:<t1> — an ORDERED log of what runs
+    /// inside each time slot: the tick header, every clock-generator toggle,
+    /// and every process as it is popped from the timing wheel. A race is a
+    /// question about intra-timestamp ORDER, which the value/edge traces
+    /// cannot answer — they say what changed, never who went first. Windowed
+    /// by time because a whole run is unreadable.
+    trace_sched: Option<(u64, u64)>,
     /// Instance scope of the edge block currently executing (set around
     /// dispatch, cleared after). `current_module_def` prefers it over the
     /// per-pid hint so $time/%t scale to the BLOCK's module timescale, not
@@ -6676,6 +6683,22 @@ impl Simulator {
             process_scope_hint: HashMap::default(),
             process_m_label: HashMap::default(),
             process_origin: HashMap::default(),
+            trace_sched: std::env::var("XEZIM_TRACE_SCHED").ok().and_then(|v| {
+                let v = v.trim();
+                if v.is_empty() || v == "0" {
+                    return None;
+                }
+                if v == "1" || v.eq_ignore_ascii_case("all") {
+                    return Some((0, u64::MAX));
+                }
+                if let Some((a, b)) = v.split_once(':') {
+                    return Some((
+                        a.trim().parse().unwrap_or(0),
+                        b.trim().parse().unwrap_or(u64::MAX),
+                    ));
+                }
+                v.parse().ok().map(|t| (t, t))
+            }),
             timescale_scope_override: None,
             pending_ret_collection: None,
             current_scope: String::new(),
@@ -14900,6 +14923,10 @@ impl Simulator {
     fn fire_clock_generators(&mut self) {
 
         self.toggled_clock_positions.clear();
+        let trace = self.sched_trace_on();
+        // Collected inside the &mut borrow of `clock_generators`, printed
+        // after it ends (the names live in `id_to_name`).
+        let mut fired: Vec<(usize, u64)> = Vec::new();
         for cg in &mut self.clock_generators {
             if cg.next_toggle_time == self.time {
                 let cur = self.signal_table[cg.signal_id].bits_first();
@@ -14916,10 +14943,21 @@ impl Simulator {
                 self.dirty_any = true;
                 self.table_modified = true;
                 cg.next_toggle_time += cg.half_period;
+                if trace {
+                    fired.push((cg.signal_id, u64::from(cur != LogicBit::One)));
+                }
                 if cg.edge_signal_position != usize::MAX {
                     self.toggled_clock_positions.push(cg.edge_signal_position);
                 }
             }
+        }
+        for (sig, v) in fired {
+            eprintln!(
+                "[sched] t={} | clockgen {} -> {}",
+                self.time,
+                self.id_to_name.get(sig).map(|n| &**n).unwrap_or("?"),
+                v
+            );
         }
     }
 
@@ -25799,6 +25837,28 @@ impl Simulator {
         self.span_source_snippet_in(span, src_file)
     }
 
+    /// Is the scheduler trace armed for the CURRENT simulation time?
+    #[inline]
+    fn sched_trace_on(&self) -> bool {
+        match self.trace_sched {
+            Some((lo, hi)) => self.time >= lo && self.time <= hi,
+            None => false,
+        }
+    }
+
+    /// "<kind> at <file>:<line>" for a pid, or just the pid when unknown.
+    fn sched_pid_label(&self, pid: usize) -> String {
+        match self.process_origin.get(&pid) {
+            Some(&(span, kind)) => {
+                match self.span_file_line_in(span, self.stall_pid_src_file(pid)) {
+                    Some(loc) => format!("{kind} at {loc}"),
+                    None => kind.to_string(),
+                }
+            }
+            None => String::new(),
+        }
+    }
+
     fn stall_pid_identity(&mut self, pid: usize) -> String {
         let mut line = format!("                 process {}", pid);
         let src_file = self.stall_pid_src_file(pid);
@@ -26435,6 +26495,10 @@ impl Simulator {
         // after a posedge later this slot sees the pre-edge value.
         self.refresh_clocking_preponed();
 
+        if self.sched_trace_on() {
+            eprintln!("[sched] t={} +--- tick ---", self.time);
+        }
+
         if self.apply_delayed_updates() {
             self.settle_combinatorial();
             non_clock_change = true;
@@ -26465,6 +26529,14 @@ impl Simulator {
                 let Some((pid, stmts)) = self.event_queue.pop_front(self.time) else {
                     break;
                 };
+                if self.sched_trace_on() {
+                    eprintln!(
+                        "[sched] t={} | proc pid={} {}",
+                        self.time,
+                        pid,
+                        self.sched_pid_label(pid)
+                    );
+                }
                 if trace_loop {
                     eprintln!("[xezim]   running pid={} stmts={}", pid, stmts.len());
                     for (idx, s) in stmts.to_vec().iter().enumerate() {
