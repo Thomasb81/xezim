@@ -43,3 +43,56 @@ fn force_expression_tracks_operands() {
     assert_eq!(u(&sim, "v_post"), 0x22, "forced variable tracks src change");
     assert_eq!(u(&sim, "v_rel"), 0x22, "released variable holds last value");
   }
+
+const DEPENDENCY_FILTER_SRC: &str = r#"
+module dependency_filter_case;
+  logic [7:0] stimulus = 8'h03;
+  logic [7:0] observed;
+  logic [7:0] captured;
+  integer unrelated = 0;
+  initial begin
+    force observed = stimulus + 8'h1;
+    repeat (200)
+      unrelated = unrelated + 1;
+    stimulus = 8'h20;
+    #1 captured = observed;
+  end
+endmodule
+"#;
+
+#[test]
+fn active_force_skips_unrelated_procedural_writes() {
+    let sim = simulate(DEPENDENCY_FILTER_SRC, 10).expect("simulate failed");
+    assert_eq!(u(&sim, "captured"), 0x21);
+    let (evaluations, skips) = sim.active_force_work_counters();
+    assert!(
+        evaluations <= 2,
+        "clean writes caused too many RHS evaluations: {evaluations}"
+    );
+    assert!(
+        skips >= 100,
+        "dependency filter did not skip enough clean refreshes: {skips}"
+    );
+}
+
+const REVERSE_CHAIN_SRC: &str = r#"
+module reverse_chain_case;
+  logic [7:0] origin = 8'h01;
+  logic [7:0] middle;
+  logic [7:0] endpoint;
+  logic [7:0] captured;
+  initial begin
+    // Arm the downstream expression first to exercise reverse entry order.
+    force endpoint = middle + 8'h1;
+    force middle = origin + 8'h1;
+    origin = 8'h10;
+    #1 captured = endpoint;
+  end
+endmodule
+"#;
+
+#[test]
+fn active_force_dependency_chain_reaches_fixpoint() {
+    let sim = simulate(REVERSE_CHAIN_SRC, 10).expect("simulate failed");
+    assert_eq!(u(&sim, "captured"), 0x12);
+}

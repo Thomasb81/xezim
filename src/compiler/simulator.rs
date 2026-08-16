@@ -470,6 +470,7 @@ macro_rules! write_sig {
         // hashes the id even when the map is empty, and this macro runs on
         // EVERY signal write (measured ~2% of c906 memcpy cycles).
         if $self.forced_signals.is_empty() || !$self.forced_signals.contains_key(&__wsig_id) {
+            let __wsig_changed = $self.signal_table[__wsig_id] != __wsig_val;
             if __wsig_id < $self.signal_has_xz.len() {
                 $self.signal_has_xz[__wsig_id] = if __wsig_val.raw_bits().1 != 0 {
                     1u8
@@ -533,6 +534,17 @@ macro_rules! write_sig {
                 }
             }
             $self.signal_table[__wsig_id] = __wsig_val;
+            // Expression-backed procedural assignments use per-signal
+            // generations as their sensitivity set. Keep the usual no-active-
+            // assignment path to one branch; only real value changes advance
+            // the generation.
+            if __wsig_changed
+                && !$self.active_force_exprs.is_empty()
+                && __wsig_id < $self.active_force_signal_epochs.len()
+            {
+                $self.active_force_signal_epochs[__wsig_id] =
+                    $self.active_force_signal_epochs[__wsig_id].wrapping_add(1);
+            }
             // Incremental VCD: mark this write dirty (no-op when the dump is off
             // or the full scan is forced). Superset-safe — the flush re-checks
             // prev vs cur, so marking an unchanged write costs only a skip.
@@ -1584,6 +1596,16 @@ impl ProcCont {
             Some(Arc::new(self.resume_at(resume_at)))
         };
         ProcCont { stmts: Arc::from(stmts), start: 0, next }
+    }
+
+    /// Run a previously prepared statement frame, then resume this chain.
+    fn pushed_frame(&self, stmts: Arc<[Statement]>, resume_at: usize) -> Self {
+        let next = if resume_at >= self.stmts.len() {
+            self.next.clone()
+        } else {
+            Some(Arc::new(self.resume_at(resume_at)))
+        };
+        ProcCont { stmts, start: 0, next }
     }
 
     /// This frame only, from the cursor.
@@ -2724,6 +2746,23 @@ enum VcdVarKind {
     Parameter,
 }
 
+/// One expression-backed procedural continuous assignment/force.
+///
+/// Resolved signal reads carry the generation observed at the previous RHS
+/// evaluation. Reads that cannot be mapped to compact signal storage retain a
+/// conservative fallback so class/runtime-map expressions keep their prior
+/// semantics.
+#[derive(Clone)]
+struct ActiveForceExpr {
+    key: String,
+    lvalue: Expression,
+    rvalue: Expression,
+    hint: Option<String>,
+    read_signal_ids: Vec<usize>,
+    read_epochs: Vec<u64>,
+    has_unresolved_reads: bool,
+}
+
 impl VcdVarKind {
     /// The §21.7.2.1 `var_type` keyword.
     fn keyword(self) -> &'static str {
@@ -2758,7 +2797,15 @@ pub struct Simulator {
     /// its operands change until release. (target key, lvalue, rvalue,
     /// scope hint at arm time). One-shot snapshots diverged: `force n =
     /// src + 1` held the arm-time value forever.
-    active_force_exprs: Vec<(String, Expression, Expression, Option<String>)>,
+    active_force_exprs: Vec<ActiveForceExpr>,
+    /// Per-signal write generation used by `active_force_exprs`. Allocated
+    /// alongside the signal table and touched only while an expression-backed
+    /// override is active.
+    active_force_signal_epochs: Vec<u64>,
+    /// Deterministic work counters for regression tests: RHS evaluations and
+    /// clean dependency checks skipped.
+    active_force_evals: u64,
+    active_force_skips: u64,
     /// Fast signal table: indexed by signal_id for O(1) access.
     signal_table: Vec<Value>,
     /// Parallel array: 1 byte per signal_id, non-zero iff that signal
@@ -3782,6 +3829,8 @@ pub struct Simulator {
     /// clock's phase is fixed). Guards the one-shot re-park against a genuine
     /// zero-period loop re-parking forever at t=0.
     t0_delay_deferred: HashSet<usize>,
+    /// Prepared frames for loops that suspend once per iteration.
+    suspended_loop_frames: HashMap<usize, HashMap<(usize, usize), Arc<[Statement]>>>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
     /// §9.7 `process` class: PIDs explicitly suspended via `suspend()`. The
@@ -4573,6 +4622,11 @@ pub struct Simulator {
     /// Registered value-change callbacks per signal id. Triggered from
     /// `after_signal_write` whenever a signal value differs from its
     /// previous inline-bits snapshot.
+    /// XEZIM_METHOD_CENSUS=1: per-method call counts, dumped periodically.
+    prof_psettle_calls: u64,
+    prof_psettle_deferred: u64,
+    method_census: HashMap<String, u64>,
+    method_census_total: u64,
     dpi_value_change_cbs: HashMap<usize, Vec<DpiCbHandle>>,
     /// Registered cbNextSimTime callbacks with their registration time.
     /// Each is one-shot and fires when simulation time advances.
@@ -6541,6 +6595,9 @@ impl Simulator {
             forced_names: HashSet::default(),
             static_fn_ret: HashMap::default(),
             active_force_exprs: Vec::new(),
+            active_force_signal_epochs: vec![0; signal_table.len()],
+            active_force_evals: 0,
+            active_force_skips: 0,
             signal_has_xz: signal_has_xz_init,
             signal_inline_bits: Vec::new(),
             jit_nba_side_queue: Vec::new(),
@@ -6795,6 +6852,7 @@ impl Simulator {
             warned_assoc_index: HashSet::default(),
             warned_delay_spikes: HashSet::default(),
             t0_delay_deferred: HashSet::default(),
+            suspended_loop_frames: HashMap::default(),
             killed_pids: HashSet::default(),
             suspended_pids: HashSet::default(),
             suspended_proc_info: HashMap::default(),
@@ -7076,6 +7134,10 @@ impl Simulator {
             vpi_arg_cstrings: Vec::new(),
             vpi_argv: Vec::new(),
             dpi_scopes: HashMap::default(),
+            prof_psettle_calls: 0,
+            prof_psettle_deferred: 0,
+            method_census: HashMap::default(),
+            method_census_total: 0,
             dpi_value_change_cbs: HashMap::default(),
             dpi_next_time_cbs: Vec::new(),
             dpi_reset_cbs: Vec::new(),
@@ -16970,6 +17032,7 @@ impl Simulator {
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
+            compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
@@ -25602,6 +25665,7 @@ impl Simulator {
             self.settle_combinatorial();
             return;
         }
+        let __sc_before = self.settle_calls;
         self.proc_settle_defer = true;
         self.settle_combinatorial();
         self.proc_settle_defer = false;
@@ -25610,6 +25674,24 @@ impl Simulator {
         // process in the NEXT slot reads stale nets.
         if !self.deferred_proc_entries.is_empty() {
             self.dirty_any = true;
+        }
+        if std::env::var_os("XEZIM_PSETTLE_STATS").is_some() {
+            self.prof_psettle_calls += 1;
+            if self.settle_calls != __sc_before {
+                self.prof_psettle_deferred += 1;
+            }
+            if self.prof_psettle_calls % 20_000 == 0 {
+                eprintln!(
+                    "[PSETTLE] proc_writes={} did_work={} ({:.1}%) settle_calls={} deferred_entries={} dirty_list={} comb_entries={}",
+                    self.prof_psettle_calls,
+                    self.prof_psettle_deferred,
+                    100.0 * self.prof_psettle_deferred as f64 / self.prof_psettle_calls as f64,
+                    self.settle_calls,
+                    self.deferred_proc_entries.len(),
+                    self.dirty_list.len(),
+                    self.comb_entries.len(),
+                );
+            }
         }
     }
 
@@ -30869,14 +30951,33 @@ impl Simulator {
                     self.reset_hint_to_process_scope();
                     let cond_val = self.eval_expr(condition).is_true();
                     if cond_val {
-                        let body_stmts = match &body.kind {
-                            StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
-                            _ => vec![*body.clone()],
+                        let key = (stmt.span.start, stmt.span.end);
+                        let cached = (key != (0, 0))
+                            .then(|| {
+                                self.suspended_loop_frames
+                                    .get(&pid)
+                                    .and_then(|frames| frames.get(&key))
+                                    .cloned()
+                            })
+                            .flatten();
+                        let frame = if let Some(frame) = cached {
+                            frame
+                        } else {
+                            let mut prepared = match &body.kind {
+                                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                                _ => vec![*body.clone()],
+                            };
+                            prepared.push(stmt.clone());
+                            let frame: Arc<[Statement]> = Arc::from(prepared);
+                            if key != (0, 0) {
+                                self.suspended_loop_frames
+                                    .entry(pid)
+                                    .or_default()
+                                    .insert(key, Arc::clone(&frame));
+                            }
+                            frame
                         };
-                        let mut cont: Vec<Statement> = body_stmts;
-                        cont.push(stmt.clone());
-                        // Chain the caller's tail rather than copying it (ProcCont::pushed).
-                        let cont = pc.pushed(cont, pc.start + i + 1);
+                        let cont = pc.pushed_frame(frame, pc.start + i + 1);
                         self.continue_stmts_or_trampoline(pid, cont);
                         return;
                     } else {
@@ -34534,21 +34635,24 @@ impl Simulator {
                         } else {
                             let start = self.edge_block_off[bi] as usize;
                             let end = self.edge_block_off[bi + 1] as usize;
-                            // Store through `self.edge_block_snap_flat` forced
-                            // a reload of `edge_block_reads_flat`'s base on
-                            // every element; borrow both once (disjoint
-                            // fields) so the refresh is a straight
-                            // gather/scatter over registers-held bases.
-                            let st: &[Value] = &self.signal_table;
-                            let reads: &[u32] = &self.edge_block_reads_flat;
-                            let mets: &[(u16, u16)] = &self.edge_block_reads_meta;
-                            let snaps: &mut [(u64, u64)] = &mut self.edge_block_snap_flat;
-                            for k in start..end {
-                                let s = reads[k] as usize;
-                                let (lo, w) = mets[k];
-                                snaps[k] = Self::raw_bits_slice(&st[s], lo, w);
+                            let has_wide = self.edge_block_reads_meta[start..end]
+                                .iter()
+                                .any(|&(_, width)| width > 64);
+                            if has_wide {
+                                self.edge_block_snap_valid[bi] = false;
+                            } else {
+                                // Keep compact snapshots for narrow reads.
+                                let st: &[Value] = &self.signal_table;
+                                let reads: &[u32] = &self.edge_block_reads_flat;
+                                let mets: &[(u16, u16)] = &self.edge_block_reads_meta;
+                                let snaps: &mut [(u64, u64)] = &mut self.edge_block_snap_flat;
+                                for k in start..end {
+                                    let s = reads[k] as usize;
+                                    let (lo, w) = mets[k];
+                                    snaps[k] = Self::raw_bits_slice(&st[s], lo, w);
+                                }
+                                self.edge_block_snap_valid[bi] = true;
                             }
-                            self.edge_block_snap_valid[bi] = true;
                         }
                     }
                     triggered[w] = bi;
@@ -37669,6 +37773,12 @@ impl Simulator {
         let mut out = String::with_capacity(base.len() + 14);
         out.push_str(base);
         out.push('[');
+        Self::push_i64(&mut out, i);
+        out.push(']');
+        out
+    }
+
+    fn push_i64(out: &mut String, i: i64) {
         if i < 0 {
             out.push('-');
         }
@@ -37684,8 +37794,6 @@ impl Simulator {
             }
         }
         out.push_str(std::str::from_utf8(&buf[k..]).unwrap_or("0"));
-        out.push(']');
-        out
     }
 
     fn flat_member_name(&mut self, e: &Expression) -> Option<String> {
@@ -37752,8 +37860,11 @@ impl Simulator {
                 Some(Self::name_with_index(&base, i))
             }
             ExprKind::MemberAccess { expr, member } => {
-                let base = self.flat_member_name(expr)?;
-                Some(format!("{}.{}", base, member.name))
+                let mut base = self.flat_member_name(expr)?;
+                base.reserve(member.name.len() + 1);
+                base.push('.');
+                base.push_str(&member.name);
+                Some(base)
             }
             _ => None,
         }
@@ -37768,7 +37879,7 @@ impl Simulator {
     /// Track an active force/procedural-assign whose RHS reads any signal,
     /// replacing a previous entry for the same target (§10.6.1/§10.6.2).
     fn arm_force_expr(&mut self, key: String, lvalue: &Expression, rvalue: &Expression) {
-        self.active_force_exprs.retain(|(k, ..)| k != &key);
+        self.active_force_exprs.retain(|entry| entry.key != key);
         // A constant RHS never changes — no need to track it.
         let mut reads: HashSet<String> = HashSet::default();
         Self::collect_expr_reads(rvalue, &self.module, &mut reads);
@@ -37776,19 +37887,109 @@ impl Simulator {
             return;
         }
         let hint = self.name_resolve_hint.borrow().clone();
-        self.active_force_exprs
-            .push((key, lvalue.clone(), rvalue.clone(), hint));
+        let top_prefix = format!("{}.", self.module.name);
+        let mut read_signal_ids = Vec::with_capacity(reads.len());
+        let mut has_unresolved_reads = false;
+        for read in reads {
+            let mut id = self.resolve_read_name(&read, &top_prefix);
+            // A procedural assignment is armed while its process's instance
+            // scope is active. Bare RHS names therefore need the same scoped
+            // lookup as expression evaluation. Walk parent scopes as a
+            // conservative aid for nested blocks whose hint includes a block
+            // label below the declaring instance.
+            if id.is_none() && let Some(scope_hint) = hint.as_deref() {
+                let mut scope = scope_hint;
+                loop {
+                    let qualified = format!("{}.{}", scope, read);
+                    id = self.resolve_read_name(&qualified, &top_prefix);
+                    if id.is_some() {
+                        break;
+                    }
+                    let Some((parent, _)) = scope.rsplit_once('.') else {
+                        break;
+                    };
+                    scope = parent;
+                }
+            }
+            if let Some(id) = id {
+                read_signal_ids.push(id);
+            } else {
+                has_unresolved_reads = true;
+            }
+        }
+        read_signal_ids.sort_unstable();
+        read_signal_ids.dedup();
+        let read_epochs = read_signal_ids
+            .iter()
+            .map(|&id| self.active_force_signal_epochs.get(id).copied().unwrap_or(0))
+            .collect();
+        self.active_force_exprs.push(ActiveForceExpr {
+            key,
+            lvalue: lvalue.clone(),
+            rvalue: rvalue.clone(),
+            hint,
+            read_signal_ids,
+            read_epochs,
+            has_unresolved_reads,
+        });
     }
 
-    /// §10.6.2: re-evaluate every expression-RHS force; write through when
-    /// the value changed. Called from the settle loop, so operand changes
-    /// keep the forced target tracking like a continuous assignment.
+    /// §10.6.2: re-evaluate expression-RHS overrides whose operands changed
+    /// and write through when their value changed. Re-scan after each update
+    /// so reverse-ordered dependency chains reach a fixpoint in one settle.
+    /// Expressions containing non-signal reads retain the conservative prior
+    /// behavior and run once per refresh.
     fn refresh_active_forces(&mut self) {
         if self.active_force_exprs.is_empty() {
             return;
         }
-        let entries = self.active_force_exprs.clone();
-        for (key, lvalue, rvalue, hint) in entries {
+        let entry_count = self.active_force_exprs.len();
+        let mut conservative_done = vec![false; entry_count];
+        let mut evaluated = vec![false; entry_count];
+        // Malformed cyclic overrides can keep changing forever. The normal
+        // simulator settle loop also has a convergence limit; keep this local
+        // work bounded and allow a later settle call to continue propagation.
+        let budget = entry_count.saturating_mul(4).saturating_add(16);
+        let mut work = 0usize;
+
+        while work < budget {
+            let mut next = None;
+            for (idx, entry) in self.active_force_exprs.iter().enumerate() {
+                let needs_eval = if entry.has_unresolved_reads {
+                    !conservative_done[idx]
+                } else {
+                    entry
+                        .read_signal_ids
+                        .iter()
+                        .zip(entry.read_epochs.iter())
+                        .any(|(&id, &seen)| {
+                            self.active_force_signal_epochs.get(id).copied().unwrap_or(0) != seen
+                        })
+                };
+                if needs_eval {
+                    next = Some(idx);
+                    break;
+                }
+            }
+            let Some(idx) = next else {
+                break;
+            };
+            work += 1;
+            self.active_force_evals += 1;
+            evaluated[idx] = true;
+
+            let (lvalue, rvalue, hint, is_conservative) = {
+                let entry = &self.active_force_exprs[idx];
+                (
+                    entry.lvalue.clone(),
+                    entry.rvalue.clone(),
+                    entry.hint.clone(),
+                    entry.has_unresolved_reads,
+                )
+            };
+            if is_conservative {
+                conservative_done[idx] = true;
+            }
             let saved_hint = self.name_resolve_hint.borrow().clone();
             *self.name_resolve_hint.borrow_mut() = hint;
             let v = self.eval_expr(&rvalue);
@@ -37808,12 +38009,26 @@ impl Simulator {
                     self.assign_value(&lvalue, &v);
                     self.forced_names.insert(name);
                 }
-                None => {
-                    let _ = key;
-                }
+                None => {}
             }
             *self.name_resolve_hint.borrow_mut() = saved_hint;
+
+            // Snapshot after evaluation and target write. This prevents a
+            // self-referential override from immediately waking itself while
+            // still exposing a changed target to downstream entries.
+            let ids = self.active_force_exprs[idx].read_signal_ids.clone();
+            self.active_force_exprs[idx].read_epochs = ids
+                .iter()
+                .map(|&id| self.active_force_signal_epochs.get(id).copied().unwrap_or(0))
+                .collect();
         }
+
+        self.active_force_skips += self
+            .active_force_exprs
+            .iter()
+            .enumerate()
+            .filter(|(idx, entry)| !entry.has_unresolved_reads && !evaluated[*idx])
+            .count() as u64;
     }
 
     fn force_target(&mut self, lv: &Expression) -> Option<(String, Option<usize>)> {
@@ -38095,16 +38310,16 @@ impl Simulator {
     /// Walk a `.field` / `[const]` chain down to its root identifier, returning
     /// the root's flat storage name and the steps below it, outermost first.
     /// A step is `(Some(field), _)` or `(None, index)`.
-    fn packed_path_steps(
+    fn packed_path_steps<'e>(
         &mut self,
-        e: &Expression,
-    ) -> Option<(String, Vec<(Option<String>, i64)>)> {
-        let mut steps: Vec<(Option<String>, i64)> = Vec::new();
-        let mut cur: &Expression = e;
+        e: &'e Expression,
+    ) -> Option<(String, Vec<(Option<&'e str>, i64)>)> {
+        let mut steps: Vec<(Option<&'e str>, i64)> = Vec::new();
+        let mut cur: &'e Expression = e;
         loop {
             match &cur.kind {
                 ExprKind::MemberAccess { expr, member } => {
-                    steps.push((Some(member.name.clone()), 0));
+                    steps.push((Some(member.name.as_str()), 0));
                     cur = expr.as_ref();
                 }
                 ExprKind::Index { expr, index } => {
@@ -38124,9 +38339,9 @@ impl Simulator {
     /// Resolve a walked path over a PACKED aggregate to the
     /// `(backing_signal, lsb, width)` slice it denotes.
     ///
-    /// The steps ALTERNATE in the nested case — `n.wdata[0].wdata[0]` is field,
+    /// The steps alternate in the nested case — `node.words[0].words[0]` is field,
     /// index, field, index — so the path is rendered into the dotted-with-
-    /// indices key elaboration already registers (`wdata[0].wdata`) rather than
+    /// indices key elaboration already registers (`words[0].words`) rather than
     /// being matched against a fixed "indices then fields" shape. Matching that
     /// fixed shape resolved the first group and then gave up, so every access
     /// below one level of nesting read as 0.
@@ -38136,16 +38351,12 @@ impl Simulator {
     fn packed_path_slice(
         &mut self,
         root: &str,
-        steps: &[(Option<String>, i64)],
+        steps: &[(Option<&str>, i64)],
     ) -> Option<(String, u32, u32)> {
         // Leading indices apply to the root's own dimensions; the rest form the
         // field path, which may carry indices of its own.
-        let lead: Vec<i64> = steps
-            .iter()
-            .take_while(|(f, _)| f.is_none())
-            .map(|(_, i)| *i)
-            .collect();
-        let rest = &steps[lead.len()..];
+        let lead_len = steps.iter().take_while(|(field, _)| field.is_none()).count();
+        let rest = &steps[lead_len..];
         if rest.is_empty() {
             return None; // a pure index chain is not a field path
         }
@@ -38155,7 +38366,7 @@ impl Simulator {
         let mut storage = root.to_string();
         let mut consumed = 0usize;
         if self.module.arrays.contains_key(root) {
-            for &i in &lead {
+            for &(_, i) in &steps[..lead_len] {
                 let cand = format!("{}[{}]", storage, i);
                 if self.get_signal_value_by_name(&cand).is_some() {
                     storage = cand;
@@ -38168,8 +38379,8 @@ impl Simulator {
                 return None;
             }
         }
-        let pre: Vec<u64> = lead[consumed..].iter().map(|&i| i as u64).collect();
-        let fields = self.module.packed_struct_fields.get(root).cloned()?;
+        let pre = &steps[consumed..lead_len];
+        let fields = self.module.packed_struct_fields.get(root)?;
         // Width of ONE struct, taken from the field layout. NOT
         // `packed_signal_elem_widths[root]`: that is the width of an element of
         // the OUTERMOST dimension, which for `t [0:0][1:0]` is the whole [1:0]
@@ -38181,15 +38392,12 @@ impl Simulator {
         let slot = if pre.is_empty() {
             0
         } else {
-            let dims = self.module.packed_full_dims.get(root).cloned();
-            Self::flatten_packed_slot(&pre, dims.as_deref())?
+            let dims = self.module.packed_full_dims.get(root).map(Vec::as_slice);
+            Self::flatten_packed_slot_iter(pre.iter().map(|(_, index)| *index), dims)?
         };
-        // Render the field path with indices inline (the registered key shape)
-        // and index-free (how per-member element strides are keyed — one type
-        // per member, so the stride does not vary by slot).
-        let render = |steps: &[(Option<String>, i64)]| -> (String, String) {
-            use std::fmt::Write as _;
-            let (mut key, mut norm) = (String::new(), String::new());
+        // Render the field path with indices inline, matching the registered key.
+        let render_key = |steps: &[(Option<&str>, i64)]| -> String {
+            let mut key = String::new();
             for (f, i) in steps {
                 match f {
                     Some(f) => {
@@ -38197,22 +38405,21 @@ impl Simulator {
                             key.push('.');
                         }
                         key.push_str(f);
-                        if !norm.is_empty() {
-                            norm.push('.');
-                        }
-                        norm.push_str(f);
                     }
                     None => {
-                        let _ = write!(key, "[{}]", i);
+                        key.push('[');
+                        Self::push_i64(&mut key, *i);
+                        key.push(']');
                     }
                 }
             }
-            (key, norm)
+            key
         };
-        let (key, _norm) = render(rest);
+        let key = render_key(rest);
         let base = slot * struct_w;
         // Exact hit: the whole path names a registered field.
-        if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == &key).cloned() {
+        if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| m == &key) {
+            let (off, w) = (*off, *w);
             let total = self.get_signal_value_by_name(&storage)?.width;
             return (base + off + w <= total).then_some((storage, base + off, w));
         }
@@ -38224,8 +38431,18 @@ impl Simulator {
             return None;
         }
         let k = u32::try_from(last.1).ok()?;
-        let (key2, norm2) = render(init);
-        let (_, off, fw) = fields.iter().find(|(m, _, _)| m == &key2).cloned()?;
+        let key2 = render_key(init);
+        let mut norm2 = String::new();
+        for (field, _) in init {
+            if let Some(field) = field {
+                if !norm2.is_empty() {
+                    norm2.push('.');
+                }
+                norm2.push_str(field);
+            }
+        }
+        let (_, off, fw) = fields.iter().find(|(m, _, _)| m == &key2)?;
+        let (off, fw) = (*off, *fw);
         let elem_w = self
             .module
             .packed_signal_elem_widths
@@ -38264,16 +38481,16 @@ impl Simulator {
     /// Resolve `<...>.member` where the receiver is itself an indexed packed
     /// aggregate (`n.wdata[0].amask`). Used as a LAST resort, after every other
     /// member path has declined, so established lookups keep priority.
-    fn packed_member_slice(
+    fn packed_member_slice<'e>(
         &mut self,
-        expr: &Expression,
-        member: &str,
+        expr: &'e Expression,
+        member: &'e str,
     ) -> Option<(String, u32, u32)> {
         if !matches!(expr.kind, ExprKind::Index { .. }) {
             return None;
         }
         let (root, mut steps) = self.packed_path_steps(expr)?;
-        steps.push((Some(member.to_string()), 0));
+        steps.push((Some(member), 0));
         self.packed_path_slice(&root, &steps)
     }
 
@@ -38281,17 +38498,29 @@ impl Simulator {
     /// dimensions. `dims` are outermost-first `(left, right)` declared ranges;
     /// the trailing entries that describe the ELEMENT type are ignored.
     fn flatten_packed_slot(indices: &[u64], dims: Option<&[(i64, i64)]>) -> Option<u32> {
+        Self::flatten_packed_slot_iter(indices.iter().map(|&index| index as i64), dims)
+    }
+
+    fn flatten_packed_slot_iter(
+        indices: impl IntoIterator<Item = i64>,
+        dims: Option<&[(i64, i64)]>,
+    ) -> Option<u32> {
         let Some(dims) = dims else {
             // No declared dims on file: treat the chain as row-major over
             // equal-sized dimensions, which is the historical behaviour.
-            return indices.last().map(|&i| i as u32);
+            return indices
+                .into_iter()
+                .last()
+                .and_then(|index| u32::try_from(index).ok());
         };
         let mut slot: u64 = 0;
-        for (n, &i) in indices.iter().enumerate() {
+        let mut any = false;
+        for (n, i) in indices.into_iter().enumerate() {
+            any = true;
             let (l, r) = *dims.get(n)?;
             let (lo, hi) = (l.min(r), l.max(r));
             let count = (hi - lo + 1) as u64;
-            let off = (i as i64 - lo) as u64;
+            let off = (i - lo) as u64;
             if off >= count {
                 return None;
             }
@@ -38300,7 +38529,7 @@ impl Simulator {
             let s = if l >= r { off } else { count - 1 - off };
             slot = slot * count + s;
         }
-        u32::try_from(slot).ok()
+        any.then(|| u32::try_from(slot).ok()).flatten()
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
@@ -52976,7 +53205,7 @@ impl Simulator {
                     // §10.6.1 `deassign` likewise retains the last value.
                     if let Some((name, id)) = self.force_target(lvalue) {
                         self.forced_names.remove(&name);
-                        self.active_force_exprs.retain(|(k, ..)| k != &name);
+                        self.active_force_exprs.retain(|entry| entry.key != name);
                         if let Some(id) = id {
                             self.forced_signals.remove(&id);
                             // Re-evaluate continuous drivers (nets). For a
@@ -59963,6 +60192,14 @@ impl Simulator {
         if id >= self.signal_table.len() {
             return;
         }
+        // Direct/in-place write paths reach this hook after the old value is
+        // gone. Treat the write as a generation change while an expression-
+        // backed override is active. A redundant wakeup is conservative; the
+        // dependency filter still avoids all unrelated RHS evaluations.
+        if !self.active_force_exprs.is_empty() && id < self.active_force_signal_epochs.len() {
+            self.active_force_signal_epochs[id] =
+                self.active_force_signal_epochs[id].wrapping_add(1);
+        }
         // `raw_bits()` is NOT free: its `Wide` arm (any signal over 64 bits)
         // re-packs up to 64 `LogicBit` bytes one at a time. Its ONLY consumer
         // here is the compact `signal_inline_bits` mirror, which is allocated
@@ -60073,7 +60310,7 @@ impl Simulator {
                     Insn::LoadSignalRange(_, s, l, r) => {
                         let lo = (*l).min(*r);
                         let w = (*l).max(*r) - lo + 1;
-                        if lo <= u16::MAX as u32 && w <= 64 {
+                        if lo <= u16::MAX as u32 && w <= u16::MAX as u32 {
                             if seen.insert((*s as u32, lo as u16, w as u16)) {
                                 reads.push(*s as u32);
                                 metas.push((lo as u16, w as u16));
@@ -60146,11 +60383,11 @@ impl Simulator {
                     }
                 }
             }
-            // Wide-signal reads (>64b) would alias under raw_bits — degrade
-            // those blocks to non-gateable to keep the fast (v,x) compare
-            // sound. Most c910 flops read narrow ctrl/data bits.
+            // Wide values cannot use the compact snapshot. Write-armed mode
+            // can still gate them safely: no input write permits a skip, and
+            // any input write forces execution without a value comparison.
             let has_wide = metas.iter().any(|&(_, w)| w > 64);
-            gateable[bi] = !dynamic && !has_wide && !opaque;
+            gateable[bi] = !dynamic && !opaque && (!has_wide || self.armed_edge);
             data_reads[bi] = reads;
             data_metas[bi] = metas;
         }
@@ -61429,6 +61666,12 @@ impl Simulator {
     /// every functional test still passes.
     pub fn work_counters(&self) -> (u64, u64) {
         (self.entry_evals, self.prof_insns_executed)
+    }
+
+    /// Work counters for expression-backed procedural assignments:
+    /// `(RHS evaluations, clean dependency checks skipped)`.
+    pub fn active_force_work_counters(&self) -> (u64, u64) {
+        (self.active_force_evals, self.active_force_skips)
     }
 
     pub fn get_signal(&self, name: &str) -> Option<&Value> {
@@ -63065,6 +63308,7 @@ impl Simulator {
     }
 
     fn child_finished(&mut self, child_pid: usize) {
+        self.suspended_loop_frames.remove(&child_pid);
         // §9.7: wake any process awaiting this one's termination.
         let mut terminated = HashSet::default();
         terminated.insert(child_pid);
@@ -92972,6 +93216,21 @@ impl Simulator {
         if let Some(h) = reg_guard_obj {
             if !self.factory_reg_in_progress.insert(h) {
                 return Value::zero(32);
+            }
+        }
+        if std::env::var_os("XEZIM_METHOD_CENSUS").is_some() {
+            self.method_census_total += 1;
+            *self
+                .method_census
+                .entry(format!("{}::{}", start_class, method_name))
+                .or_insert(0) += 1;
+            if self.method_census_total % 2_000_000 == 0 {
+                let mut v: Vec<(&String, &u64)> = self.method_census.iter().collect();
+                v.sort_by(|a, b| b.1.cmp(a.1));
+                eprintln!("[CENSUS] total={} distinct={}", self.method_census_total, v.len());
+                for (k, c) in v.iter().take(15) {
+                    eprintln!("[CENSUS]   {:>12}  {}", c, k);
+                }
             }
         }
         let mut cur_class = Some(start_class.to_string());

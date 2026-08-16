@@ -674,6 +674,197 @@ impl<'a> BytecodeCompiler<'a> {
         Some((base_id, *off, *w))
     }
 
+    /// Resolve a packed-struct container and clone its flattened field layout.
+    /// The clone keeps later instruction emission free to mutably borrow the
+    /// compiler without retaining a borrow into elaboration metadata.
+    fn packed_struct_layout_for_hier(
+        &self,
+        hier: &HierarchicalIdentifier,
+    ) -> Option<(String, Vec<(String, u32, u32)>)> {
+        if hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let fields_map = self.packed_struct_fields?;
+        let raw = Self::hier_raw_name(hier);
+        let mut candidates = Vec::with_capacity(3);
+        candidates.push(raw.clone());
+        if !raw.contains('.') && let Some(scope) = &self.scope_hint {
+            candidates.push(format!("{}.{}", scope, raw));
+        }
+        if let Some(leaf) = hier.path.last() {
+            candidates.push(leaf.name.name.clone());
+        }
+        for candidate in candidates {
+            if let Some(fields) = fields_map.get(candidate.as_str()) {
+                return Some((candidate, fields.clone()));
+            }
+        }
+        None
+    }
+
+    /// Compile either a packed-struct signal or a selected element of a packed
+    /// array of structs, retaining the root layout used to interpret members.
+    fn compile_packed_struct_value(
+        &mut self,
+        expr: &Expression,
+    ) -> Option<(
+        RegId,
+        String,
+        HierarchicalIdentifier,
+        Vec<(String, u32, u32)>,
+    )> {
+        let mut unwrapped = expr;
+        while let ExprKind::Paren(inner) = &unwrapped.kind {
+            unwrapped = inner;
+        }
+        let hier = match &unwrapped.kind {
+            ExprKind::Ident(hier) => hier.clone(),
+            ExprKind::Index { expr: base, .. } => {
+                let ExprKind::Ident(hier) = &base.kind else {
+                    return None;
+                };
+                hier.clone()
+            }
+            _ => return None,
+        };
+        let (key, fields) = self.packed_struct_layout_for_hier(&hier)?;
+        let value = self.compile_expr(unwrapped, 0)?;
+        Some((value, key, hier, fields))
+    }
+
+    /// Metadata for a packed-array member of a packed struct. The elaborated
+    /// tables key member dimensions as `<container>.<member>`.
+    fn packed_member_array_shape(
+        &self,
+        root_key: &str,
+        hier: &HierarchicalIdentifier,
+        member: &str,
+    ) -> Option<(u32, Option<(i64, i64)>)> {
+        let widths = self.packed_elem_widths?;
+        let raw = Self::hier_raw_name(hier);
+        let mut candidates = Vec::with_capacity(4);
+        candidates.push(format!("{}.{}", root_key, member));
+        candidates.push(format!("{}.{}", raw, member));
+        if !raw.contains('.') && let Some(scope) = &self.scope_hint {
+            candidates.push(format!("{}.{}.{}", scope, raw, member));
+        }
+        if let Some(leaf) = hier.path.last() {
+            candidates.push(format!("{}.{}", leaf.name.name, member));
+        }
+        for candidate in candidates {
+            if let Some(&elem_w) = widths.get(candidate.as_str()).filter(|&&w| w > 0) {
+                let dim = self
+                    .packed_full_dims
+                    .and_then(|dims| dims.get(candidate.as_str()))
+                    .and_then(|dims| dims.first())
+                    .copied();
+                return Some((elem_w, dim));
+            }
+        }
+        None
+    }
+
+    /// Emit a dynamic element/field slice from a packed struct container.
+    fn emit_packed_member_slice(
+        &mut self,
+        root: RegId,
+        index: &Expression,
+        dim: Option<(i64, i64)>,
+        stride: u32,
+        base_offset: u32,
+        width: u32,
+    ) -> Option<RegId> {
+        let index = self.compile_expr(index, 0)?;
+        let slot = self.emit_packed_slot_index(dim, index);
+        let stride_reg = self.alloc_reg();
+        self.emit(Insn::LoadConst(
+            stride_reg,
+            Box::new(Value::from_u64(stride as u64, 32)),
+        ));
+        let dynamic_offset = self.alloc_reg();
+        self.emit(Insn::Mul(dynamic_offset, slot, stride_reg));
+        let lo = if base_offset == 0 {
+            dynamic_offset
+        } else {
+            let base = self.alloc_reg();
+            self.emit(Insn::LoadConst(
+                base,
+                Box::new(Value::from_u64(base_offset as u64, 32)),
+            ));
+            let lo = self.alloc_reg();
+            self.emit(Insn::Add(lo, dynamic_offset, base));
+            lo
+        };
+        let hi = if width == 1 {
+            lo
+        } else {
+            let delta = self.alloc_reg();
+            self.emit(Insn::LoadConst(
+                delta,
+                Box::new(Value::from_u64((width - 1) as u64, 32)),
+            ));
+            let hi = self.alloc_reg();
+            self.emit(Insn::Add(hi, lo, delta));
+            hi
+        };
+        let dest = self.alloc_reg();
+        self.emit(Insn::RangeSelect(dest, root, hi, lo));
+        Some(dest)
+    }
+
+    /// Compile `container.array_member[index]` when the member is a packed
+    /// array embedded in a packed struct.
+    fn compile_packed_member_index(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<RegId> {
+        let ExprKind::MemberAccess { expr: root, member } = &base.kind else {
+            return None;
+        };
+        let (root_value, root_key, hier, fields) =
+            self.compile_packed_struct_value(root)?;
+        let (_, field_offset, _) = fields.iter().find(|(name, _, _)| name == &member.name)?;
+        let (elem_w, dim) = self.packed_member_array_shape(&root_key, &hier, &member.name)?;
+        self.emit_packed_member_slice(
+            root_value,
+            index,
+            dim,
+            elem_w,
+            *field_offset,
+            elem_w,
+        )
+    }
+
+    /// Compile `container.array_member[index].field` using the flattened
+    /// packed-struct layout plus the member array's element stride.
+    fn compile_indexed_packed_member(
+        &mut self,
+        indexed: &Expression,
+        leaf: &str,
+    ) -> Option<RegId> {
+        let ExprKind::Index { expr: base, index } = &indexed.kind else {
+            return None;
+        };
+        let ExprKind::MemberAccess { expr: root, member } = &base.kind else {
+            return None;
+        };
+        let (root_value, root_key, hier, fields) =
+            self.compile_packed_struct_value(root)?;
+        let field_path = format!("{}.{}", member.name, leaf);
+        let (_, field_offset, field_width) =
+            fields.iter().find(|(name, _, _)| name == &field_path)?;
+        let (elem_w, dim) = self.packed_member_array_shape(&root_key, &hier, &member.name)?;
+        self.emit_packed_member_slice(
+            root_value,
+            index,
+            dim,
+            elem_w,
+            *field_offset,
+            *field_width,
+        )
+    }
+
     pub fn set_string_signals(&mut self, s: &'a HashSet<String>) {
         self.string_signals = Some(s);
     }
@@ -1163,7 +1354,10 @@ impl<'a> BytecodeCompiler<'a> {
     /// `compile_expr`'s normal paths.
     fn expr_loop_simple(&self, e: &Expression) -> bool {
         match &e.kind {
-            ExprKind::MemberAccess { .. } => false,
+            // Packed-struct member reads are lowered to bit slices. Unsupported
+            // member shapes still fail strict compilation later, which rolls
+            // the whole register-backed loop back to the interpreter.
+            ExprKind::MemberAccess { expr, .. } => self.expr_loop_simple(expr),
             ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
                 self.expr_loop_simple(operand)
             }
@@ -3683,6 +3877,17 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Paren(inner) => self.compile_expr(inner, ctx_width),
             ExprKind::Index { expr, index } => {
+                // A packed-array field embedded in a packed struct has no
+                // standalone signal id. Slice it directly from its container;
+                // the generic non-Ident index path below would otherwise take
+                // one bit instead of one packed element.
+                let member_start = self.insns.len();
+                let member_reg = self.next_reg;
+                if let Some(dest) = self.compile_packed_member_index(expr, index) {
+                    return Some(dest);
+                }
+                self.insns.truncate(member_start);
+                self.next_reg = member_reg;
                 // §7.4.1 CHAINED packed element select — `v[i][j][k]` on
                 // `logic [0:0][1:0][1:0]`. Only the innermost `Index` has an
                 // Ident base, so the outer ones fell through to the bit select
@@ -4063,6 +4268,40 @@ impl<'a> BytecodeCompiler<'a> {
                         None
                     }
             },
+            ExprKind::MemberAccess { expr: base, member } => {
+                let member_start = self.insns.len();
+                let member_reg = self.next_reg;
+                if let Some(dest) = self.compile_indexed_packed_member(base, &member.name) {
+                    return Some(dest);
+                }
+                self.insns.truncate(member_start);
+                self.next_reg = member_reg;
+
+                // Direct packed member (`container.field`). Nested field paths
+                // are already flattened in the layout table.
+                let direct_start = self.insns.len();
+                let direct_reg = self.next_reg;
+                if let Some((root, _, _, fields)) = self.compile_packed_struct_value(base)
+                    && let Some((_, off, width)) =
+                        fields.iter().find(|(name, _, _)| name == &member.name)
+                {
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::RangeSelectConst(
+                        dest,
+                        root,
+                        *off + *width - 1,
+                        *off,
+                    ));
+                    return Some(dest);
+                }
+                self.insns.truncate(direct_start);
+                self.next_reg = direct_reg;
+                if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "Expr_MemberAccess") {
+                    return Some(r);
+                }
+                self.bail("Expr_MemberAccess");
+                None
+            }
             // §13.4: inline a PURE function call — one whose body is a single
             // assignment to the function name (or a single `return`) over input
             // formals. That is the overwhelmingly common combinational-helper

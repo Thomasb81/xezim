@@ -14,3 +14,6 @@ mod report_stats;
 
 #[path = "perf/packed_matrix_workload.rs"]
 mod packed_matrix_workload;
+
+#[path = "perf/packed_record_edge_loop.rs"]
+mod packed_record_edge_loop;
