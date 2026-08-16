@@ -4402,6 +4402,9 @@ pub struct Simulator {
     event_epoch_fast_exec: u64,
     event_snapshot_checks: u64,
     settle_calls: u64,
+    /// Dynamic executions of the packed blocking-fill collapse. Reported with
+    /// profiling so regression tests can prove the fast path was exercised.
+    packed_blocking_fill_collapses: u64,
     // Profiling accumulators (nanoseconds)
     prof_settle: u64,
     prof_edges: u64,
@@ -6985,6 +6988,7 @@ impl Simulator {
             event_epoch_fast_exec: 0,
             event_snapshot_checks: 0,
             settle_calls: 0,
+            packed_blocking_fill_collapses: 0,
             settle_triggered: Vec::new(),
             settle_dirty_ids: Vec::new(),
             settle_prev_values: Vec::new(),
@@ -27423,6 +27427,14 @@ impl Simulator {
             "[FUSE] array-read-NBA fusions (static sites): {}",
             super::bytecode::array_read_nba_fusions()
         );
+        eprintln!(
+            "[FUSE] packed-loop NBA copies (static sites): {}",
+            super::bytecode::packed_loop_nba_copies()
+        );
+        eprintln!(
+            "[FUSE] packed blocking fills (dynamic executions): {}",
+            self.packed_blocking_fill_collapses
+        );
         // Static count of `LoadConst;<binop>` pairs the peephole collapsed
         // into `Insn::BinOpConst` (see `BytecodeCompiler::fuse_binop_const`).
         {
@@ -47798,6 +47810,264 @@ impl Simulator {
         (processes, saved_auto_len)
     }
 
+    /// Collapse a canonical full-dimension packed fill into one write.
+    ///
+    /// The hot stimulus shape is
+    /// `for (int i = LO; i <= HI; i++) packed_prefix[i] = invariant;`.
+    /// Interpreting it element-by-element is expensive because the generic
+    /// packed-index lvalue path rebuilds dimension and name state per store.
+    /// When the loop covers one complete declared packed dimension and the RHS
+    /// is pure and loop-invariant, the final operation is one replication.
+    /// Uncertain shapes use the ordinary loop.
+    fn try_exec_full_packed_fill(
+        &mut self,
+        init: &[ForInit],
+        condition: Option<&Expression>,
+        step: &[Expression],
+        body: &Statement,
+    ) -> bool {
+        if self.warn_x
+            || self.vcd_writer.is_some()
+            || self.fst_writer.is_some()
+            || !self.forced_signals.is_empty()
+            || !self.forced_names.is_empty()
+            || !self.active_force_exprs.is_empty()
+        {
+            return false;
+        }
+
+        let [ForInit::VarDecl {
+            name: loop_id,
+            init: start_expr,
+            ..
+        }] = init else {
+            return false;
+        };
+        let loop_name = loop_id.name.as_str();
+        let Some(condition) = condition else { return false };
+        let ExprKind::Binary {
+            op: cmp,
+            left,
+            right: bound_expr,
+        } = &condition.kind else {
+            return false;
+        };
+        if !matches!(cmp, BinaryOp::Lt | BinaryOp::Leq)
+            || Self::plain_ident_name(left).as_deref() != Some(loop_name)
+            || !Self::packed_fill_expr_is_pure(bound_expr, loop_name)
+        {
+            return false;
+        }
+        let [step_expr] = step else { return false };
+        let ExprKind::Unary { op, operand } = &step_expr.kind else {
+            return false;
+        };
+        if !matches!(op, UnaryOp::PreIncr | UnaryOp::PostIncr)
+            || Self::plain_ident_name(operand).as_deref() != Some(loop_name)
+            || !Self::packed_fill_expr_is_pure(start_expr, loop_name)
+        {
+            return false;
+        }
+        // The collapse assumes the trip count cannot change while procedural
+        // writes trigger eager settle work. Numeric constant expressions are
+        // sufficient for the hot stimulus loops; parameter/signal bounds use
+        // the normal implementation until const metadata is available here.
+        let mut bound_reads: HashSet<String> = HashSet::default();
+        Self::collect_leaf_idents(start_expr, &mut bound_reads);
+        Self::collect_leaf_idents(bound_expr, &mut bound_reads);
+        if !bound_reads.is_empty() {
+            return false;
+        }
+
+        let Some(start) = self.eval_expr(start_expr).to_i64() else {
+            return false;
+        };
+        let Some(bound) = self.eval_expr(bound_expr).to_i64() else {
+            return false;
+        };
+        let end = if matches!(cmp, BinaryOp::Lt) {
+            match bound.checked_sub(1) {
+                Some(v) => v,
+                None => return false,
+            }
+        } else {
+            bound
+        };
+        if end < start {
+            return false;
+        }
+        let count = match usize::try_from(end - start + 1) {
+            Ok(n) if n > 1 && n <= (1 << 20) => n,
+            _ => return false,
+        };
+
+        let body_stmts: &[Statement] = match &body.kind {
+            StatementKind::SeqBlock { stmts, .. } => stmts,
+            _ => std::slice::from_ref(body),
+        };
+        if body_stmts.is_empty() {
+            return false;
+        }
+
+        // Evaluate invariant RHSes only after proving none reads a destination
+        // written by this collapsed loop.
+        let mut dest_roots: HashSet<String> = HashSet::default();
+        for st in body_stmts {
+            let StatementKind::BlockingAssign { lvalue, .. } = &st.kind else {
+                return false;
+            };
+            let ExprKind::Index { expr: prefix, index } = &lvalue.kind else {
+                return false;
+            };
+            if Self::plain_ident_name(index).as_deref() != Some(loop_name) {
+                return false;
+            }
+            let Some((root, _)) = Self::packed_fill_root_and_depth(prefix) else {
+                return false;
+            };
+            let Some(leaf) = root.path.last().map(|s| s.name.name.clone()) else {
+                return false;
+            };
+            if !dest_roots.insert(leaf) {
+                return false;
+            }
+        }
+
+        let mut writes: Vec<(Expression, Value)> = Vec::with_capacity(body_stmts.len());
+        for st in body_stmts {
+            let StatementKind::BlockingAssign { lvalue, rvalue } = &st.kind else {
+                return false;
+            };
+            if !Self::packed_fill_expr_is_pure(rvalue, loop_name) {
+                return false;
+            }
+            let mut rhs_reads: HashSet<String> = HashSet::default();
+            Self::collect_leaf_idents(rvalue, &mut rhs_reads);
+            if rhs_reads.iter().any(|n| dest_roots.contains(n)) {
+                return false;
+            }
+
+            let ExprKind::Index { expr: prefix, .. } = &lvalue.kind else {
+                return false;
+            };
+            let Some((root, depth)) = Self::packed_fill_root_and_depth(prefix) else {
+                return false;
+            };
+            let root_name = self.resolve_hier_name(root);
+            if self.module.arrays.contains_key(&root_name)
+                || self.module.arrays_2d.contains_key(&root_name)
+                || self.module.arrays_nd.contains_key(&root_name)
+                || self.module.dynamic_arrays.contains(&root_name)
+                || self.module.associative_arrays.contains_key(&root_name)
+            {
+                return false;
+            }
+            let Some(&(decl_l, decl_r)) = self
+                .module
+                .packed_full_dims
+                .get(&root_name)
+                .and_then(|dims| dims.get(depth))
+            else {
+                return false;
+            };
+            let (decl_lo, decl_hi) = (decl_l.min(decl_r), decl_l.max(decl_r));
+            if start != decl_lo || end != decl_hi || count != (decl_hi - decl_lo + 1) as usize {
+                return false;
+            }
+
+            let elem_w = self.infer_lhs_width(lvalue).max(1);
+            let prefix_w = self.infer_lhs_width(prefix).max(1);
+            if (elem_w as usize).saturating_mul(count) != prefix_w as usize {
+                return false;
+            }
+            let piece = self.eval_expr(rvalue).resize_for_assign(elem_w);
+            let fill = Value::concat_refs(std::iter::repeat_n(&piece, count));
+            writes.push(((**prefix).clone(), fill));
+        }
+
+        for (target, fill) in writes {
+            self.assign_value(&target, &fill);
+            self.settle_after_proc_write();
+        }
+        self.packed_blocking_fill_collapses += 1;
+        true
+    }
+
+    /// Root identifier and number of already-consumed packed dimensions for a
+    /// plain `root[i][j]...` prefix.
+    fn packed_fill_root_and_depth(
+        mut expr: &Expression,
+    ) -> Option<(&HierarchicalIdentifier, usize)> {
+        let mut depth = 0usize;
+        while let ExprKind::Index { expr: inner, .. } = &expr.kind {
+            depth += 1;
+            expr = inner;
+        }
+        match &expr.kind {
+            ExprKind::Ident(h) => Some((h, depth)),
+            _ => None,
+        }
+    }
+
+    fn packed_fill_expr_is_pure(expr: &Expression, loop_name: &str) -> bool {
+        match &expr.kind {
+            ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
+            ExprKind::Ident(h) => {
+                !(h.path.len() == 1 && h.path[0].name.name == loop_name)
+                    && h.path.iter().all(|p| {
+                        p.selects
+                            .iter()
+                            .all(|s| Self::packed_fill_expr_is_pure(s, loop_name))
+                    })
+            }
+            ExprKind::Paren(e) => Self::packed_fill_expr_is_pure(e, loop_name),
+            ExprKind::Unary { op, operand } => {
+                !matches!(
+                    op,
+                    UnaryOp::PreIncr
+                        | UnaryOp::PostIncr
+                        | UnaryOp::PreDecr
+                        | UnaryOp::PostDecr
+                ) && Self::packed_fill_expr_is_pure(operand, loop_name)
+            }
+            ExprKind::Binary { op, left, right } => {
+                !matches!(op, BinaryOp::Assign)
+                    && Self::packed_fill_expr_is_pure(left, loop_name)
+                    && Self::packed_fill_expr_is_pure(right, loop_name)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::packed_fill_expr_is_pure(condition, loop_name)
+                    && Self::packed_fill_expr_is_pure(then_expr, loop_name)
+                    && Self::packed_fill_expr_is_pure(else_expr, loop_name)
+            }
+            ExprKind::Concatenation(parts) => parts
+                .iter()
+                .all(|e| Self::packed_fill_expr_is_pure(e, loop_name)),
+            ExprKind::Replication { count, exprs } => {
+                Self::packed_fill_expr_is_pure(count, loop_name)
+                    && exprs
+                        .iter()
+                        .all(|e| Self::packed_fill_expr_is_pure(e, loop_name))
+            }
+            ExprKind::Index { expr, index } => {
+                Self::packed_fill_expr_is_pure(expr, loop_name)
+                    && Self::packed_fill_expr_is_pure(index, loop_name)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::packed_fill_expr_is_pure(expr, loop_name)
+                    && Self::packed_fill_expr_is_pure(left, loop_name)
+                    && Self::packed_fill_expr_is_pure(right, loop_name)
+            }
+            _ => false,
+        }
+    }
+
     pub fn exec_statement(&mut self, stmt: &Statement) {
 
         if self.finished
@@ -50920,6 +51190,9 @@ impl Simulator {
                 step,
                 body,
             } => {
+                if self.try_exec_full_packed_fill(init, condition.as_ref(), step, body) {
+                    return;
+                }
                 // §12.7 / §6.21: a for-loop-declared variable is automatic and
                 // scoped to the loop — it must SHADOW any same-named outer
                 // signal, not clobber it. Without a local frame the loop var

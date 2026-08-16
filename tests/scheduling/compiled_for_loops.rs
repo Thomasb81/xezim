@@ -163,3 +163,136 @@ endmodule
     assert_eq!(u(&sim, "a"), 15 * n);
     assert_eq!(u(&sim, "b"), 8 * n);
 }
+
+#[test]
+fn full_range_packed_nba_copy_keeps_residual_body_and_range_order() {
+    let src = r#"
+module tb;
+  logic clk = 0;
+  logic [3:0][7:0] src = 32'h1020_3040;
+  logic [3:0][7:0] copied = 0;
+  logic [3:0][7:0] mapped = 0;
+  logic [3:0][7:0] identity_wins = 0;
+  logic [3:0][7:0] compute_wins = 0;
+  logic [0:3][7:0] ascending = 0;
+  logic [3:0][7:0] reversed = 0;
+
+  function automatic [7:0] mix(input [7:0] v);
+    mix = v ^ 8'h5a;
+  endfunction
+
+  always #1 clk = ~clk;
+  always @(posedge clk) begin
+    for (int i = 0; i < 4; i++) begin
+      copied[i] <= src[i];
+      mapped[i] <= mix(src[i]);
+      reversed[i] <= ascending[i];
+    end
+  end
+  always @(posedge clk) begin
+    for (int j = 0; j < 4; j++) begin
+      identity_wins[j] <= mix(src[j]);
+      identity_wins[j] <= src[j];
+      compute_wins[j] <= src[j];
+      compute_wins[j] <= mix(src[j]);
+    end
+  end
+  initial begin
+    ascending[0] = 8'h11;
+    ascending[1] = 8'h22;
+    ascending[2] = 8'h33;
+    ascending[3] = 8'h44;
+    #4 $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "copied"), 0x1020_3040);
+    assert_eq!(u(&sim, "mapped"), 0x4a7a_6a1a);
+    assert_eq!(u(&sim, "identity_wins"), 0x1020_3040);
+    assert_eq!(u(&sim, "compute_wins"), 0x4a7a_6a1a);
+    assert_eq!(
+        u(&sim, "reversed"),
+        0x4433_2211,
+        "opposite packed orientations must use element-wise lowering"
+    );
+}
+
+#[test]
+fn full_range_packed_blocking_fill_preserves_x_and_guarded_fallbacks() {
+    let src = r#"
+module tb;
+  logic [2:0][3:0][1:0] filled;
+  logic [3:0][7:0] partial;
+  logic [3:0][7:0] carried;
+  logic [2:0] checks = 0;
+  initial begin
+    filled = '0;
+    for (int outer = 0; outer < 3; outer++) begin
+      for (int lane = 0; lane < 4; lane++) begin
+        filled[outer][lane] = 2'bx0;
+      end
+    end
+
+    partial = '0;
+    for (int i = 1; i < 3; i++) partial[i] = 8'ha0 + i;
+
+    carried = '0;
+    carried[0] = 1;
+    for (int i = 0; i < 4; i++) carried[i] = carried[0] + 1;
+
+    checks[0] = (filled === {12{2'bx0}});
+    checks[1] = (partial === 32'h00a2_a100);
+    checks[2] = (carried === 32'h0303_0302);
+    #1 $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("simulate failed");
+    assert_eq!(u(&sim, "checks"), 0b111);
+}
+
+#[test]
+fn packed_loop_fast_paths_respect_active_force() {
+    let src = r#"
+module tb;
+  logic clk = 0;
+  logic [3:0][7:0] sample_bus = 32'h1020_3040;
+  logic [3:0][7:0] stage_bus = '0;
+  logic [3:0][7:0] fill_bus = '0;
+  logic [31:0] stage_seen = '0;
+  logic [31:0] fill_seen = '0;
+  logic [1:0] checks = 0;
+
+  always #1 clk = ~clk;
+  always @(posedge clk) begin
+    for (int slot = 0; slot < 4; slot++)
+      stage_bus[slot] <= sample_bus[slot];
+  end
+
+  initial begin
+    force fill_bus = 32'h5aa5_6996;
+    for (int slot = 0; slot < 4; slot++)
+      fill_bus[slot] = 8'ha5;
+
+    force stage_bus = 32'hc35a_9669;
+    #4;
+    fill_seen = fill_bus;
+    stage_seen = stage_bus;
+    checks[0] = (fill_seen === 32'h5aa5_6996);
+    checks[1] = (stage_seen === 32'hc35a_9669);
+    release fill_bus;
+    release stage_bus;
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("simulate failed");
+    assert_eq!(
+        u(&sim, "checks"),
+        0b11,
+        "fill={:08x} stage={:08x}",
+        u(&sim, "fill_seen"),
+        u(&sim, "stage_seen")
+    );
+}
