@@ -63795,21 +63795,14 @@ impl Simulator {
 
     /// Render a Value as the FST bit-string: full width, MSB first, using
     /// '0'/'1'/'x'/'z'. Width-1 yields a single byte.
+    ///
+    /// The implementation lives in `fst_sink` because the WRITER thread calls
+    /// it — rendering is the bulk of a dump's per-change cost, and the
+    /// background writer exists to absorb it. This wrapper keeps the
+    /// simulator-side call site (the t=0 header snapshot) reading naturally.
+    #[inline]
     fn fst_format_value(val: &Value) -> Vec<u8> {
-        let w = val.width as usize;
-        if w == 0 {
-            return vec![b'0'];
-        }
-        let mut s = Vec::with_capacity(w);
-        for i in (0..w).rev() {
-            s.push(match val.get_bit(i) {
-                LogicBit::Zero => b'0',
-                LogicBit::One => b'1',
-                LogicBit::X => b'x',
-                LogicBit::Z => b'z',
-            });
-        }
-        s
+        super::fst_sink::fst_format_value(val)
     }
 
     /// Open the FST file, write the hierarchy (scopes + vars), transition to
@@ -63971,14 +63964,18 @@ impl Simulator {
         // Narrow the walk to the slots of signals actually written since the
         // last flush; the full scan is O(all traced nets) per time slot, which
         // on an unscoped dump dominates everything else (see `dump_dirty`).
-        let mut changes: Vec<(FstSignalId, Vec<u8>)> = Vec::new();
+        // Values are collected UNFORMATTED: the sink's writer thread renders
+        // them (`fst_sink::fst_format_value`). A `Value` <=64 bits wide is
+        // inline storage, so this clone is a 24-byte memcpy with no allocation
+        // — strictly cheaper than the per-bit `Vec<u8>` render it replaces.
+        let mut changes: Vec<(FstSignalId, Value)> = Vec::new();
         macro_rules! check_fst_slot {
             ($idx:expr_2021) => {{
                 let idx = $idx;
                 let tbl_id = self.fst_trace[idx].0;
                 let val = &self.signal_table[tbl_id];
                 if self.fst_prev_signals[idx] != *val {
-                    changes.push((self.fst_trace[idx].1, Self::fst_format_value(val)));
+                    changes.push((self.fst_trace[idx].1, val.clone()));
                     self.fst_prev_signals[idx] = val.clone();
                 }
             }};

@@ -18,17 +18,40 @@ use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
 use fst_writer::{FstBodyWriter, FstSignalId};
+use xezim_core::value::{LogicBit, Value};
 
 /// Timesteps buffered on the simulation thread before a channel send. Batching
 /// keeps the per-timestep send cost off the hot path without letting the writer
 /// fall so far behind that the queue grows without bound.
 const FST_BATCH_FLUSH: usize = 64;
 
-/// One time slot: the timestamp plus every value change at it, already rendered
-/// to the FST wire form (an ASCII bit string).
+/// One time slot: the timestamp plus every value change at it, still in VALUE
+/// form. Rendering to the FST wire form (an ASCII bit string) is the bulk of a
+/// dump's per-change cost and happens on the WRITER thread — the simulation
+/// thread only clones the `Value`, which for the <=64-bit signals that dominate
+/// any real design is an inline 24-byte memcpy with no allocation at all.
 pub struct FstTimestep {
     pub time: u64,
-    pub changes: Vec<(FstSignalId, Vec<u8>)>,
+    pub changes: Vec<(FstSignalId, Value)>,
+}
+
+/// Render a `Value` as the FST bit string: full width, MSB first, '0'/'1'/'x'/'z'.
+/// Width-0 yields a single '0' so the writer never sees an empty change.
+pub fn fst_format_value(val: &Value) -> Vec<u8> {
+    let w = val.width as usize;
+    if w == 0 {
+        return vec![b'0'];
+    }
+    let mut s = Vec::with_capacity(w);
+    for i in (0..w).rev() {
+        s.push(match val.get_bit(i) {
+            LogicBit::Zero => b'0',
+            LogicBit::One => b'1',
+            LogicBit::X => b'x',
+            LogicBit::Z => b'z',
+        });
+    }
+    s
 }
 
 enum Msg {
@@ -61,8 +84,8 @@ const FST_FLUSH_AT: usize = 64 * 1024 * 1024;
 
 fn apply(body: &mut FstBody, ts: &FstTimestep) {
     let _ = body.time_change(ts.time);
-    for (fid, bits) in &ts.changes {
-        let _ = body.signal_change(*fid, bits);
+    for (fid, val) in &ts.changes {
+        let _ = body.signal_change(*fid, &fst_format_value(val));
     }
     if body.size() >= FST_FLUSH_AT {
         let _ = body.flush();
