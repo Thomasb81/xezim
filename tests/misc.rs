@@ -278,6 +278,8 @@ mod package_property_assertions;
 mod hier_force_holds_against_drivers;
 #[path = "misc/two_state_island_coverage.rs"]
 mod two_state_island_coverage;
+#[path = "misc/loop_body_inlines_pure_call.rs"]
+mod loop_body_inlines_pure_call;
 #[path = "misc/sched_trace_orders_a_time_slot.rs"]
 mod sched_trace_orders_a_time_slot;
 #[path = "misc/static_local_scope_isolation.rs"]

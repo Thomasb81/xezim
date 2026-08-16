@@ -955,7 +955,7 @@ impl<'a> BytecodeCompiler<'a> {
         // un-rewritten copy whose free names belong to another scope. It also
         // keeps the AST path's sensitivity handling (which follows a callee's
         // reads) authoritative for such functions.
-        if !self.fn_is_pure(&fd) {
+        if !self.fn_is_pure_in(&fd, name.rsplit_once('.').map(|(p, _)| p)) {
             self.bail("Expr_Call_impure");
             return None;
         }
@@ -990,8 +990,17 @@ impl<'a> BytecodeCompiler<'a> {
             }
             binds.push((p.name.name.clone(), (slot, w)));
         }
+        // Elaboration rewrites an instantiated module's function body to
+        // instance-qualified names, so the body assigns `u0.onehot` and reads
+        // `u0.c` while these bindings are keyed on the bare spelling. Bind
+        // BOTH, or the inlined body's own result variable resolves to no
+        // signal and the enclosing statement bails.
+        let qpfx = name.rsplit_once('.').map(|(p, _)| p.to_string());
         let saved_locals = std::mem::take(&mut self.local_var_regs);
         for (n, b) in binds {
+            if let Some(pfx) = &qpfx {
+                self.local_var_regs.insert(format!("{pfx}.{n}"), b);
+            }
             self.local_var_regs.insert(n, b);
         }
         // The function's own name is its return variable (§13.4.1): give it a
@@ -1000,6 +1009,10 @@ impl<'a> BytecodeCompiler<'a> {
         let ret_slot = self.alloc_reg();
         let ret_init = self.type_default_value(&fd.return_type, ret_w);
         self.emit(Insn::LoadConst(ret_slot, Box::new(ret_init)));
+        if let Some(pfx) = &qpfx {
+            self.local_var_regs
+                .insert(format!("{}.{}", pfx, fd.name.name.name), (ret_slot, ret_w));
+        }
         self.local_var_regs
             .insert(fd.name.name.name.clone(), (ret_slot, ret_w));
         self.inlining_stack.push(name);
@@ -1136,34 +1149,93 @@ impl<'a> BytecodeCompiler<'a> {
     /// whose register/loop-var handling is not yet audited — those loops
     /// keep the old whole-loop AST fallback. Never regresses: these bodies
     /// always fell back before the new capabilities existed.
-    fn for_body_is_simple(stmt: &Statement) -> bool {
-        fn expr_simple(e: &Expression) -> bool {
-            // no member access anywhere; everything else is fine (reads
-            // resolve through compile_expr's normal paths).
-            match &e.kind {
-                ExprKind::MemberAccess { .. } => false,
-                ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
-                    expr_simple(operand)
-                }
-                ExprKind::Binary { left, right, .. } => {
-                    expr_simple(left) && expr_simple(right)
-                }
-                ExprKind::Conditional {
-                    condition,
-                    then_expr,
-                    else_expr,
-                } => expr_simple(condition) && expr_simple(then_expr) && expr_simple(else_expr),
-                ExprKind::Index { expr, index } => expr_simple(expr) && expr_simple(index),
-                ExprKind::RangeSelect { expr, left, right, .. } => {
-                    expr_simple(expr) && expr_simple(left) && expr_simple(right)
-                }
-                ExprKind::SystemCall { args, .. } | ExprKind::Concatenation(args) => {
-                    args.iter().all(expr_simple)
-                }
-                _ => !matches!(&e.kind, ExprKind::Call { .. }),
+    /// Is this expression compilable inside a register-backed loop body?
+    /// No member access anywhere; everything else resolves through
+    /// `compile_expr`'s normal paths.
+    fn expr_loop_simple(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::MemberAccess { .. } => false,
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.expr_loop_simple(operand)
             }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_loop_simple(left) && self.expr_loop_simple(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_loop_simple(condition)
+                    && self.expr_loop_simple(then_expr)
+                    && self.expr_loop_simple(else_expr)
+            }
+            ExprKind::Index { expr, index } => {
+                self.expr_loop_simple(expr) && self.expr_loop_simple(index)
+            }
+            ExprKind::RangeSelect { expr, left, right, .. } => {
+                self.expr_loop_simple(expr)
+                    && self.expr_loop_simple(left)
+                    && self.expr_loop_simple(right)
+            }
+            ExprKind::SystemCall { args, .. } | ExprKind::Concatenation(args) => {
+                args.iter().all(|a| self.expr_loop_simple(a))
+            }
+            // A call to a function `compile_pure_call` can INLINE is fine:
+            // it becomes ordinary expression code with no call at all. This
+            // gate used to reject every call, so one helper in a loop body
+            // (`vec[i] <= onehot(code[i])` — a ubiquitous RTL shape) dragged
+            // the whole loop, and every instance of the enclosing module,
+            // onto the AST interpreter. Being optimistic is safe: a body that
+            // fails to compile later bails the loop exactly as before,
+            // because `StmtFallback` cannot be emitted while
+            // `reg_var_loop_depth > 0`.
+            ExprKind::Call { func, args } => {
+                args.iter().all(|a| self.expr_loop_simple(a))
+                    && self.call_is_inlinable(func, args)
+            }
+            _ => true,
         }
-        fn lv_simple(e: &Expression) -> bool {
+    }
+
+    /// Would `compile_pure_call` accept this call? Mirrors its admission
+    /// tests (single-segment callee, arity, all-`input` scalar formals,
+    /// argument-pure body, nothing that suspends) so the loop gate and the
+    /// compiler agree on what "call-free after inlining" means.
+    fn call_is_inlinable(&self, func: &Expression, args: &[Expression]) -> bool {
+        let ExprKind::Ident(h) = &func.kind else {
+            return false;
+        };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return false;
+        }
+        let Some(fd) = self.functions.and_then(|f| f.get(&h.path[0].name.name)) else {
+            return false;
+        };
+        if fd.ports.len() != args.len()
+            || fd.ports.iter().any(|p| {
+                !matches!(p.direction, PortDirection::Input) || !p.dimensions.is_empty()
+            })
+        {
+            return false;
+        }
+        let pfx = h.path[0].name.name.rsplit_once('.').map(|(p, _)| p);
+        if !self.fn_is_pure_in(fd, pfx) {
+            return false;
+        }
+        let items: Vec<Statement> = match fd.items.as_slice() {
+            [one] => match &one.kind {
+                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                _ => vec![one.clone()],
+            },
+            other => other.to_vec(),
+        };
+        !items.iter().any(Self::stmt_is_blocking)
+    }
+
+    fn for_body_is_simple(&self, stmt: &Statement) -> bool {
+        let expr_simple = |e: &Expression| -> bool { self.expr_loop_simple(e) };
+        let lv_simple = |e: &Expression| -> bool {
             match &e.kind {
                 ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
                 ExprKind::Index { expr, index } => {
@@ -1173,7 +1245,7 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 _ => false,
             }
-        }
+        };
         fn lv_base_name(e: &Expression) -> Option<&str> {
             match &e.kind {
                 ExprKind::Index { expr, .. } => match &expr.kind {
@@ -1292,7 +1364,7 @@ impl<'a> BytecodeCompiler<'a> {
                 lv_simple(lvalue) && expr_simple(rvalue) && !self_read_skewed
             }
             StatementKind::SeqBlock { stmts, .. } => {
-                stmts.iter().all(Self::for_body_is_simple)
+                stmts.iter().all(|st| self.for_body_is_simple(st))
             }
             StatementKind::If {
                 condition,
@@ -1301,10 +1373,10 @@ impl<'a> BytecodeCompiler<'a> {
                 ..
             } => {
                 expr_simple(condition)
-                    && Self::for_body_is_simple(then_stmt)
+                    && self.for_body_is_simple(then_stmt)
                     && else_stmt
                         .as_ref()
-                        .map(|e| Self::for_body_is_simple(e))
+                        .map(|e| self.for_body_is_simple(e))
                         .unwrap_or(true)
             }
             // Case over a simple selector with simple arm bodies. The arb
@@ -1319,7 +1391,7 @@ impl<'a> BytecodeCompiler<'a> {
                     && items.iter().all(|it| {
                         it.pattern.is_none()
                             && it.patterns.iter().all(expr_simple)
-                            && Self::for_body_is_simple(&it.stmt)
+                            && self.for_body_is_simple(&it.stmt)
                     })
             }
             // Nested `for` — both the assign-init and VarDecl-init forms.
@@ -1336,7 +1408,7 @@ impl<'a> BytecodeCompiler<'a> {
                 init_ok
                     && condition.as_ref().map(|c| expr_simple(c)).unwrap_or(true)
                     && step_ok
-                    && Self::for_body_is_simple(body)
+                    && self.for_body_is_simple(body)
             }
             _ => false,
         }
@@ -1447,9 +1519,15 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         let seg = &hier.path[0];
-        if !seg.selects.is_empty() || seg.name.name.contains('.') {
+        if !seg.selects.is_empty() {
             return None;
         }
+        // A dotted name is normally a hierarchical reference and never a block
+        // local — except for the instance-qualified spellings an inlined
+        // function body uses for its OWN formals and result, which
+        // `compile_pure_call` binds explicitly. `local_var_regs` holds only
+        // names this compiler bound, so a hit here is by construction one of
+        // those, not a design signal that happens to be dotted.
         self.local_var_regs.get(&seg.name.name).copied()
     }
 
@@ -1457,18 +1535,42 @@ impl<'a> BytecodeCompiler<'a> {
     /// and compile-time constants — i.e. its result depends on nothing but the
     /// arguments. Conservative: any construct not understood here says "no".
     fn fn_is_pure(&self, fd: &FunctionDeclaration) -> bool {
+        self.fn_is_pure_in(fd, None)
+    }
+
+    /// `prefix` is the instance scope the function was registered under
+    /// (`u0` for a key `u0.onehot`). Elaboration rewrites an instantiated
+    /// module's function body to instance-qualified names, so its OWN
+    /// formals and result come back as `u0.c` / `u0.onehot`. Judging those
+    /// as free names made every function inside an instantiated module look
+    /// impure — i.e. inlinable only at the top level, which is nowhere in
+    /// real RTL. Stripping the function's own prefix restores the intended
+    /// test: is every name a formal, a local, or a constant?
+    fn fn_is_pure_in(&self, fd: &FunctionDeclaration, prefix: Option<&str>) -> bool {
         let mut bound: HashSet<String> = HashSet::default();
         bound.insert(fd.name.name.name.clone());
         for p in &fd.ports {
             bound.insert(p.name.name.clone());
         }
+        // Accept the qualified spellings of exactly those same names.
+        if let Some(pfx) = prefix {
+            for n in bound.clone() {
+                bound.insert(format!("{pfx}.{n}"));
+            }
+        }
         fn expr_ok(e: &Expression, bound: &HashSet<String>, me: &BytecodeCompiler) -> bool {
             match &e.kind {
                 ExprKind::Ident(h) => {
-                    if h.path.len() != 1 || h.path[0].name.name.contains('.') {
+                    if h.path.len() != 1 {
                         return false;
                     }
                     let n = &h.path[0].name.name;
+                    // A dotted name is only acceptable when it is one of the
+                    // qualified spellings inserted above; anything else
+                    // reaching outside the function stays impure.
+                    if n.contains('.') && !bound.contains(n) {
+                        return false;
+                    }
                     let known = bound.contains(n)
                         || me.params.is_some_and(|p| p.contains_key(n));
                     known && h.path[0].selects.iter().all(|sel| expr_ok(sel, bound, me))
@@ -2628,7 +2730,7 @@ impl<'a> BytecodeCompiler<'a> {
                             }
                         }
                         ForInit::VarDecl { data_type, name, init }
-                            if Self::for_body_is_simple(body) =>
+                            if self.for_body_is_simple(body) =>
                         {
                             // §12.7.1: `for (int i = ...)` — the loop var
                             // lives in a VM REGISTER (it has no signal).
@@ -2780,7 +2882,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 // path ("For_step_other") — ~30µs per edge.
                                 if let Some(id) = self
                                     .lookup_signal_id(h)
-                                    .filter(|_| Self::for_body_is_simple(body))
+                                    .filter(|_| self.for_body_is_simple(body))
                                 {
                                     let w = self
                                         .signal_widths
