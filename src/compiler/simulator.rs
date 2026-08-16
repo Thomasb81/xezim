@@ -64007,6 +64007,26 @@ impl Simulator {
     /// Finalize and close the FST file. Blocks until the writer thread has
     /// written the trailer, so the dump is complete when this returns.
     fn fst_finish(&mut self) {
+        if self.fst_writer.is_none() {
+            return;
+        }
+        // Flush this slot's changes before closing. `run()` calls the three
+        // `*_finish` methods after the `final` blocks, and a `final` block may
+        // write signals — the VCD and XTrace paths pick those up because their
+        // finish routines re-run change detection, and FST silently dropped
+        // them. Anything written since the last `dump_write_changes` belongs in
+        // the dump.
+        self.fst_write_changes();
+        // Close the wave window at the final simulation time. Without a
+        // trailing time record a viewer stops at the last TRANSITION, so a run
+        // to t=200 whose last toggle was at t=20 produces a dump that simply
+        // ends at 20 and a quiet tail is indistinguishable from a truncated
+        // file. VCD emits a closing `#t` and XTrace a closing `T,+delta` for
+        // exactly this reason; FST never did.
+        let time = self.time;
+        if let Some(sink) = self.fst_writer.as_mut() {
+            sink.post(super::fst_sink::FstTimestep { time, changes: Vec::new() });
+        }
         if let Some(sink) = self.fst_writer.take() {
             sink.finish();
         }
