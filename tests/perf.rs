@@ -11,3 +11,6 @@ mod bench_host_workloads;
 
 #[path = "perf/report_stats.rs"]
 mod report_stats;
+
+#[path = "perf/packed_matrix_workload.rs"]
+mod packed_matrix_workload;
