@@ -12,6 +12,7 @@ pub enum Opcode {
     LoadConst = 0,
     LoadSignal,
     LoadSignalSigned,
+    LoadProcessLocal,
     Resize,
     Add,
     Sub,
@@ -89,6 +90,7 @@ impl Opcode {
             Insn::LoadConst(_, _) => Self::LoadConst,
             Insn::LoadSignal(_, _) => Self::LoadSignal,
             Insn::LoadSignalSigned(_, _) => Self::LoadSignalSigned,
+            Insn::LoadProcessLocal(_, _) => Self::LoadProcessLocal,
             Insn::Resize(_, _) => Self::Resize,
             Insn::Add(_, _, _) => Self::Add,
             Insn::Sub(_, _, _) => Self::Sub,
@@ -171,7 +173,7 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 71;
+pub const NUM_OPCODES: usize = 72;
 
 /// Sizes the opcode-census arrays, which are indexed by `Opcode as usize`. A
 /// stale value panics at run time under `XEZIM_OPCODE_CENSUS=1`, so pin it to

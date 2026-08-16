@@ -296,3 +296,53 @@ endmodule
         u(&sim, "stage_seen")
     );
 }
+
+#[test]
+fn resumed_process_loop_keeps_locals_and_reference_updates() {
+    let src = r#"
+module loop_resume_probe;
+  logic tick = 0;
+  logic [3:0][15:0] bundle = '0;
+  logic [15:0] state = 16'h1234;
+  int completed = 0;
+
+  always #1 tick = ~tick;
+
+  function automatic logic [15:0] advance(ref logic [15:0] value);
+    value = (value >> 1) ^ (-(value & 1'b1) & 16'hb400);
+    return value;
+  endfunction
+
+  initial begin
+    for (int pass = 0; pass < 7; pass++) begin
+      @(negedge tick);
+      for (int slot = 0; slot < 4; slot++) begin
+        logic [15:0] item;
+        item = advance(state);
+        bundle[slot] <= item ^ pass;
+      end
+    end
+    #1;
+    completed = 1;
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+
+    let mut state = 0x1234u16;
+    let mut bundle = [0u16; 4];
+    for pass in 0..7u16 {
+        for item in &mut bundle {
+            state = (state >> 1) ^ if state & 1 != 0 { 0xb400 } else { 0 };
+            *item = state ^ pass;
+        }
+    }
+    let expected = bundle
+        .iter()
+        .rev()
+        .fold(0u64, |packed, item| (packed << 16) | u64::from(*item));
+    assert_eq!(u(&sim, "completed"), 1);
+    assert_eq!(u(&sim, "state"), u64::from(state));
+    assert_eq!(u(&sim, "bundle"), expected);
+}
