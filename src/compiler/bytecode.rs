@@ -5405,7 +5405,20 @@ impl<'a> BytecodeCompiler<'a> {
                         .unwrap_or_else(|| self.expr_max_width(base)),
                 }
             }
-            ExprKind::Index { .. } => 1,
+            // A bit-select of a plain vector is 1 bit — but an ELEMENT select
+            // of a packed multi-dimensional array is the whole element
+            // (`s[1]` on `logic [1:0][11:0] s` is 12 bits). Reporting 1 here
+            // under-sized the shift/divide context above, whose whole job is
+            // `ctx_width.max(expr_max_width(left))`: the left operand was then
+            // compiled at the ASSIGNMENT's width and the source's high bits
+            // were truncated BEFORE the shift, so
+            // `d[2] = s[1] >> N` (d's element narrower than s's) lost N extra
+            // high bits. The procedural interpreter got this right, so the bug
+            // only showed inside `always_comb`/compiled blocks.
+            ExprKind::Index { expr: base, .. } => match &base.kind {
+                ExprKind::Ident(hier) => self.packed_elem_width_of(hier).unwrap_or(1),
+                _ => 1,
+            },
             ExprKind::Replication { count, exprs } => {
                 let n = self.eval_const_expr(count).unwrap_or(0);
                 let inner: u32 = exprs.iter().map(|e| self.expr_max_width(e)).sum();
