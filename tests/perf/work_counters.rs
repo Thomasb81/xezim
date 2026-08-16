@@ -16,6 +16,36 @@
 
 use xezim::simulate;
 
+fn run_profiled_design(src: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "xezim_packed_loop_guard_{}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temporary directory");
+    let path = dir.join("design.sv");
+    std::fs::write(&path, src).expect("write temporary design");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--simulate", "-s", "top", path.to_str().unwrap(), "--no-cache"])
+        .env("XEZIM_PROFILE_TIMING", "1")
+        .output()
+        .expect("run profiled design");
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "profiled design failed:\n{text}");
+    text
+}
+
+fn profile_count(text: &str, prefix: &str) -> u64 {
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("missing profile counter `{prefix}`:\n{text}"))
+}
+
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
     sim.get_signal(n)
         .or_else(|| sim.get_signal(&format!("tb.{}", n)))
@@ -125,4 +155,124 @@ fn baseline() {
     let sim = simulate(DESIGN, 3000).expect("simulate failed");
     let (evals, insns) = sim.work_counters();
     println!("WORK BASELINE: entry_evals={} insns={}", evals, insns);
+}
+
+#[test]
+fn packed_loop_fast_paths_are_exercised_and_preserve_four_state_values() {
+    let text = run_profiled_design(
+        r#"
+module top;
+  logic clk = 0;
+  logic [5:8][3:0] sample_bus = 16'b10xz_0110_x001_zz10;
+  logic [5:8][3:0] stage_bus = '0;
+  logic [5:8][1:0] fill_bus;
+  logic [1:0] fill_value = 2'bx0;
+  logic check = 0;
+
+  always #1 clk = ~clk;
+  always @(posedge clk) begin
+    for (int slot = 5; slot <= 8; slot++)
+      stage_bus[slot] <= sample_bus[slot];
+  end
+
+  initial begin
+    fill_bus = '0;
+    for (int slot = 5; slot <= 8; slot++)
+      fill_bus[slot] = fill_value;
+    #4;
+    check = (stage_bus === sample_bus) && (fill_bus === {4{2'bx0}});
+    $display("CHECK=%0d", check);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(text.contains("CHECK=1"), "wrong packed-loop result:\n{text}");
+    assert!(
+        profile_count(
+            &text,
+            "[FUSE] packed-loop NBA copies (static sites): "
+        ) >= 1,
+        "packed NBA loop silently fell back:\n{text}"
+    );
+    assert!(
+        profile_count(
+            &text,
+            "[FUSE] packed blocking fills (dynamic executions): "
+        ) >= 1,
+        "packed blocking fill silently fell back:\n{text}"
+    );
+}
+
+#[test]
+fn unsafe_packed_loop_shapes_decline_both_fast_paths() {
+    let text = run_profiled_design(
+        r#"
+module top;
+  logic clk = 0;
+  logic [0:3][7:0] north_bus;
+  logic [3:0][7:0] south_bus = '0;
+  logic [3:0][7:0] base_bus = 32'h1020_3040;
+  logic [3:0][7:0] ordered_bus = '0;
+  logic [3:0][7:0] adaptive_bus = '0;
+  integer active_slots;
+  logic check = 0;
+
+  function automatic [7:0] scramble(input [7:0] value);
+    scramble = value ^ 8'h5a;
+  endfunction
+
+  always_comb active_slots = adaptive_bus[0][0] ? 2 : 4;
+  always #1 clk = ~clk;
+  always @(posedge clk) begin
+    // Opposite packed orientations require element-wise mapping.
+    for (int slot = 0; slot < 4; slot++)
+      south_bus[slot] <= north_bus[slot];
+
+    // The later identity assignment must remain later for NBA ordering.
+    for (int slot = 0; slot < 4; slot++) begin
+      ordered_bus[slot] <= scramble(base_bus[slot]);
+      ordered_bus[slot] <= base_bus[slot];
+    end
+  end
+
+  initial begin
+    north_bus[0] = 8'h11;
+    north_bus[1] = 8'h22;
+    north_bus[2] = 8'h33;
+    north_bus[3] = 8'h44;
+
+    // The first write changes active_slots from four to two. A mutable bound
+    // must remain element-wise so only slots zero and one are written.
+    adaptive_bus = '0;
+    for (int slot = 0; slot < active_slots; slot++)
+      adaptive_bus[slot] = 8'hff;
+
+    #4;
+    check = (south_bus === 32'h4433_2211)
+         && (ordered_bus === base_bus)
+         && (adaptive_bus === 32'h0000_ffff);
+    $display("CHECK=%0d", check);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(text.contains("CHECK=1"), "guarded fallback was wrong:\n{text}");
+    assert_eq!(
+        profile_count(
+            &text,
+            "[FUSE] packed-loop NBA copies (static sites): "
+        ),
+        0,
+        "unsafe packed NBA shape was vectorized:\n{text}"
+    );
+    assert_eq!(
+        profile_count(
+            &text,
+            "[FUSE] packed blocking fills (dynamic executions): "
+        ),
+        0,
+        "mutable-bound packed fill was collapsed:\n{text}"
+    );
 }

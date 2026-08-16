@@ -58,6 +58,15 @@ pub fn array_read_nba_fusions() -> u64 {
     FUSED_ARRAY_READ_NBA.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Number of element-wise packed identity NBA sites lowered to whole-vector
+/// NBAs across every block compiled in this process.
+static PACKED_LOOP_NBA_COPIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn packed_loop_nba_copies() -> u64 {
+    PACKED_LOOP_NBA_COPIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Per-kind count of `LoadConst ; <binop>` pairs collapsed into
 /// `Insn::BinOpConst`, indexed by `BinOpConstKind as usize`. See
 /// [`BytecodeCompiler::fuse_binop_const`].
@@ -2310,6 +2319,238 @@ impl<'a> BytecodeCompiler<'a> {
         None
     }
 
+    /// Hoist disjoint full-range `dst[i] <= src[i]` copies out of a canonical
+    /// packed loop. All slices are written in the same NBA region and the
+    /// sources are side-effect-free signal reads, so a single whole-vector NBA
+    /// is equivalent while avoiding loop-control and per-slice queue work.
+    /// Every uncertain shape returns None and uses normal lowering.
+    fn full_range_nba_copy_plan(
+        &self,
+        init: &[ForInit],
+        condition: Option<&Expression>,
+        step: &[Expression],
+        body: &Statement,
+    ) -> Option<(Vec<(usize, usize, u32)>, Statement)> {
+        let [ForInit::VarDecl {
+            name: loop_id,
+            init: start_expr,
+            ..
+        }] = init else {
+            return None;
+        };
+        let loop_name = loop_id.name.as_str();
+        let start = self.eval_const_expr(start_expr)? as i64;
+        let ExprKind::Binary {
+            op: cmp,
+            left,
+            right: bound_expr,
+        } = &condition?.kind else {
+            return None;
+        };
+        if !matches!(cmp, BinaryOp::Lt | BinaryOp::Leq)
+            || Self::plain_loop_ident(left) != Some(loop_name)
+        {
+            return None;
+        }
+        let bound = self.eval_const_expr(bound_expr)? as i64;
+        let end = if matches!(cmp, BinaryOp::Lt) {
+            bound.checked_sub(1)?
+        } else {
+            bound
+        };
+        if end < start {
+            return None;
+        }
+        let [step_expr] = step else { return None };
+        let ExprKind::Unary { op, operand } = &step_expr.kind else {
+            return None;
+        };
+        if !matches!(op, UnaryOp::PreIncr | UnaryOp::PostIncr)
+            || Self::plain_loop_ident(operand) != Some(loop_name)
+        {
+            return None;
+        }
+        let count = u32::try_from(end - start + 1).ok()?;
+        if count <= 1 {
+            return None;
+        }
+
+        let (block_name, stmts): (Option<_>, &[Statement]) = match &body.kind {
+            StatementKind::SeqBlock { name, stmts } => (name.clone(), stmts),
+            _ => (None, std::slice::from_ref(body)),
+        };
+        // A blocking assignment, timing control, or call-as-statement could
+        // change a copied source between iterations. The target loop is all
+        // delay-free NBAs, whose queued updates cannot affect later samples.
+        if !stmts.iter().all(|st| {
+            matches!(
+                &st.kind,
+                StatementKind::NonblockingAssign { delay: None, .. }
+            )
+        }) {
+            return None;
+        }
+
+        let mut candidates: Vec<(usize, usize, usize, u32)> = Vec::new();
+        for (si, st) in stmts.iter().enumerate() {
+            let StatementKind::NonblockingAssign {
+                lvalue,
+                delay: None,
+                rvalue,
+            } = &st.kind else {
+                continue;
+            };
+            let Some((dst_h, dst_idx)) = Self::plain_indexed_signal(lvalue) else {
+                continue;
+            };
+            let Some((src_h, src_idx)) = Self::plain_indexed_signal(rvalue) else {
+                continue;
+            };
+            if Self::plain_loop_ident(dst_idx) != Some(loop_name)
+                || Self::plain_loop_ident(src_idx) != Some(loop_name)
+            {
+                continue;
+            }
+            if self.lookup_array_name(dst_h).is_some() || self.lookup_array_name(src_h).is_some() {
+                continue;
+            }
+            let Some(dst_dim) = self.packed_outer_dim(dst_h) else {
+                continue;
+            };
+            let Some(src_dim) = self.packed_outer_dim(src_h) else {
+                continue;
+            };
+            let covers = |(l, r): (i64, i64)| {
+                start == l.min(r) && end == l.max(r) && count as i64 == (l - r).abs() + 1
+            };
+            // A whole assignment preserves element identity only when source
+            // and destination use the same declared orientation.
+            if dst_dim != src_dim || !covers(dst_dim) || !covers(src_dim) {
+                continue;
+            }
+            let Some(dst) = self.lookup_signal_id(dst_h) else {
+                continue;
+            };
+            let Some(src) = self.lookup_signal_id(src_h) else {
+                continue;
+            };
+            let Some(&dw) = self.signal_widths.get(dst) else {
+                continue;
+            };
+            let Some(&sw) = self.signal_widths.get(src) else {
+                continue;
+            };
+            let de = self.infer_lhs_width(lvalue).max(1);
+            let se = self.infer_lhs_width(rvalue).max(1);
+            if dw != sw
+                || de != se
+                || de.checked_mul(count) != Some(dw)
+                || se.checked_mul(count) != Some(sw)
+                || dst == src
+            {
+                continue;
+            }
+            candidates.push((si, dst, src, dw));
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let mut unique_dests: HashSet<usize> = HashSet::default();
+        if candidates
+            .iter()
+            .any(|(_, dst, _, _)| !unique_dests.insert(*dst))
+        {
+            return None;
+        }
+        // Sampling may move ahead of the residual loop only when no copied
+        // source is also written by another hoisted copy.
+        let dests: HashSet<usize> = candidates.iter().map(|(_, d, _, _)| *d).collect();
+        if candidates.iter().any(|(_, _, s, _)| dests.contains(s)) {
+            return None;
+        }
+        let skipped: HashSet<usize> = candidates.iter().map(|(i, ..)| *i).collect();
+        // Preserve last-NBA-wins ordering. A non-identity NBA to a candidate
+        // destination may occur before or after the identity copy in the
+        // original body; moving every identity copy ahead of the loop would
+        // otherwise reverse one of those cases.
+        for (i, st) in stmts.iter().enumerate() {
+            if skipped.contains(&i) {
+                continue;
+            }
+            let StatementKind::NonblockingAssign { lvalue, .. } = &st.kind else {
+                return None;
+            };
+            let Some(root) = Self::plain_selected_signal_root(lvalue) else {
+                return None;
+            };
+            let Some(id) = self.lookup_signal_id(root) else {
+                return None;
+            };
+            if dests.contains(&id) {
+                return None;
+            }
+        }
+        let kept: Vec<Statement> = stmts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !skipped.contains(i))
+            .map(|(_, st)| st.clone())
+            .collect();
+        let pruned = if matches!(&body.kind, StatementKind::SeqBlock { .. }) {
+            Statement::new(
+                StatementKind::SeqBlock {
+                    name: block_name,
+                    stmts: kept,
+                },
+                body.span,
+            )
+        } else {
+            Statement::new(StatementKind::Null, body.span)
+        };
+        let plans = candidates
+            .into_iter()
+            .map(|(_, d, s, w)| (d, s, w))
+            .collect();
+        Some((plans, pruned))
+    }
+
+    fn plain_loop_ident(expr: &Expression) -> Option<&str> {
+        match &expr.kind {
+            ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+                Some(h.path[0].name.name.as_str())
+            }
+            ExprKind::Paren(inner) => Self::plain_loop_ident(inner),
+            _ => None,
+        }
+    }
+
+    fn plain_indexed_signal(
+        expr: &Expression,
+    ) -> Option<(&HierarchicalIdentifier, &Expression)> {
+        let ExprKind::Index { expr: base, index } = &expr.kind else {
+            return None;
+        };
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.path.iter().any(|seg| !seg.selects.is_empty()) {
+            return None;
+        }
+        Some((h, index))
+    }
+
+    fn plain_selected_signal_root(expr: &Expression) -> Option<&HierarchicalIdentifier> {
+        match &expr.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|seg| seg.selects.is_empty()) => Some(h),
+            ExprKind::Paren(inner)
+            | ExprKind::Index { expr: inner, .. }
+            | ExprKind::RangeSelect { expr: inner, .. } => {
+                Self::plain_selected_signal_root(inner)
+            }
+            _ => None,
+        }
+    }
+
     /// Compile a statement. Returns true on success.
     /// When `allow_ast_fallback` is set, any nested failure rolls back and
     /// emits a single `StmtFallback` for the whole statement.
@@ -2651,6 +2892,16 @@ impl<'a> BytecodeCompiler<'a> {
                 step,
                 body,
             } => {
+                let (vector_plans, vectorized_body) = match self.full_range_nba_copy_plan(
+                    init,
+                    condition.as_ref(),
+                    step,
+                    body,
+                ) {
+                    Some((plans, pruned)) => (plans, Some(pruned)),
+                    None => (Vec::new(), None),
+                };
+                let body_to_compile = vectorized_body.as_ref().unwrap_or(body);
                 // LRM §12.7 — `break`/`continue` are now compiled to direct
                 // jumps; we push fresh patch lists on entry and apply them
                 // once we know the step-start and loop-end addresses.
@@ -2792,6 +3043,14 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
+                // The plan proves this canonical loop executes its complete
+                // packed range. Queue each identity copy once at the point
+                // where its first iteration would sample the source.
+                for &(dst, src, width) in &vector_plans {
+                    let r = self.alloc_reg();
+                    self.emit(Insn::LoadSignal(r, as_sig_id(src)));
+                    self.emit(Insn::NbaAssign(as_sig_id(dst), r, width));
+                }
                 let loop_start = self.insns.len() as u32;
                 let cond_branch_idx = if let Some(c) = condition {
                     let cond_reg = match self.compile_expr(c, 0) {
@@ -2811,7 +3070,7 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     None
                 };
-                if !self.compile_stmt(body) {
+                if !self.compile_stmt(body_to_compile) {
                     // Bail path — pop patches so they don't leak.
                     self.loop_break_patches.pop();
                     self.loop_continue_patches.pop();
@@ -2953,6 +3212,12 @@ impl<'a> BytecodeCompiler<'a> {
                 self.for_loop_var_ids = saved_for_vars;
                 self.local_var_regs = saved_locals;
                 self.reg_var_loop_depth -= reg_vars_registered.min(self.reg_var_loop_depth);
+                if !vector_plans.is_empty() {
+                    PACKED_LOOP_NBA_COPIES.fetch_add(
+                        vector_plans.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 true
             }
             StatementKind::Break => {
@@ -7429,4 +7694,3 @@ pub fn lower_two_state(
         writes_span: writes_span.into_boxed_slice(),
     })
 }
-
