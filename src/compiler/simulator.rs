@@ -37650,6 +37650,32 @@ impl Simulator {
     /// indexed signal name the elaborator pre-registers for unpacked aggregates
     /// (`c.nodes[1].status`, `arr[0].tag`). `None` for shapes it can't flatten
     /// (non-constant index, ranges, calls, …).
+    /// `<base>[<i>]` without the `core::fmt` machinery — this runs once per
+    /// dimension per element access on procedural array loops, where it and
+    /// its allocations were the single hottest thing in the profile.
+    fn name_with_index(base: &str, i: i64) -> String {
+        let mut out = String::with_capacity(base.len() + 14);
+        out.push_str(base);
+        out.push('[');
+        if i < 0 {
+            out.push('-');
+        }
+        let mut n = i.unsigned_abs();
+        let mut buf = [0u8; 20];
+        let mut k = buf.len();
+        loop {
+            k -= 1;
+            buf[k] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        out.push_str(std::str::from_utf8(&buf[k..]).unwrap_or("0"));
+        out.push(']');
+        out
+    }
+
     fn flat_member_name(&mut self, e: &Expression) -> Option<String> {
         match &e.kind {
             ExprKind::Ident(h) => {
@@ -37676,9 +37702,16 @@ impl Simulator {
                             .contains_key(h.path[0].name.name.as_str())
                         && !self.signals.contains_key(&h.path[0].name.name),
                 );
+                let segs = &h.path[skip..];
+                // The overwhelmingly common shape is a single segment; the
+                // Vec + join below allocates twice for it. This is the
+                // innermost call of every nested-index name build, so it runs
+                // once per element access in a procedural array loop.
+                if segs.len() == 1 {
+                    return Some(segs[0].name.name.clone());
+                }
                 Some(
-                    h.path[skip..]
-                        .iter()
+                    segs.iter()
                         .map(|s| s.name.name.as_str())
                         .collect::<Vec<_>>()
                         .join("."),
@@ -37693,10 +37726,18 @@ impl Simulator {
                 // registered read paths disagreed on the element's name.
                 if self.is_associative_array(&base) {
                     let key = self.assoc_key_str(&base, &iv);
-                    return Some(format!("{}[{}]", base, key));
+                    let mut out = String::with_capacity(base.len() + key.len() + 2);
+                    out.push_str(&base);
+                    out.push('[');
+                    out.push_str(&key);
+                    out.push(']');
+                    return Some(out);
                 }
                 let i = iv.to_i64()?;
-                Some(format!("{}[{}]", base, i))
+                // `format!` drags in the whole core::fmt machinery, which the
+                // profile showed dominating this path. A nested index builds
+                // one of these per dimension, per access.
+                Some(Self::name_with_index(&base, i))
             }
             ExprKind::MemberAccess { expr, member } => {
                 let base = self.flat_member_name(expr)?;
