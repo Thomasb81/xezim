@@ -198,3 +198,7 @@ mod static_assoc_struct_pool;
 mod vif_static_roundtrip;
 #[path = "classes/nopack_member_array.rs"]
 mod nopack_member_array;
+#[path = "classes/class_localparam_array.rs"]
+mod class_localparam_array;
+#[path = "classes/member_collection_runtime_class.rs"]
+mod member_collection_runtime_class;
