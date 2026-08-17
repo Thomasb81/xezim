@@ -134,23 +134,23 @@ endmodule
 /// chasing a timestamp discrepancy, that names a scope that does not exist.
 const SUSPENDED_TASK_LEAK: &str = r#"
 `timescale 1ns/1ps
-module clkgen(output logic gclk, output logic grst);
+module clkgen(output logic clk, output logic rst);
   task drive();
-    gclk = 1'bx; grst = 1'bx;
-    #100 grst = 0; gclk = 0;
-    #500 gclk = 1;
+    clk = 1'bx; rst = 1'bx;
+    #100 rst = 0; clk = 0;
+    #500 clk = 1;
   endtask
   initial drive();
 endmodule
-module probe(input logic gclk, input logic grst);
-  initial $monitor("NOTE: %m gclk=%b grst=%b", gclk, grst);
+module probe(input logic clk, input logic rst);
+  initial $monitor("NOTE: %m clk=%b rst=%b", clk, rst);
 endmodule
 module testbench;
-  logic gclk, grst;
-  clkgen u_clkgen(.gclk(gclk), .grst(grst));
+  logic clk, rst;
+  clkgen u_clkgen(.clk(clk), .rst(rst));
   initial #700 $finish;
 endmodule
-bind testbench probe u_tb_binder(.gclk(testbench.gclk), .grst(testbench.grst));
+bind testbench probe u_tb_binder(.clk(testbench.clk), .rst(testbench.rst));
 "#;
 
 #[test]
@@ -159,9 +159,9 @@ fn monitor_m_ignores_unrelated_suspended_task() {
     assert_eq!(
         got,
         vec![
-            "NOTE: testbench.u_tb_binder gclk=x grst=x",
-            "NOTE: testbench.u_tb_binder gclk=0 grst=0",
-            "NOTE: testbench.u_tb_binder gclk=1 grst=0",
+            "NOTE: testbench.u_tb_binder clk=x rst=x",
+            "NOTE: testbench.u_tb_binder clk=0 rst=0",
+            "NOTE: testbench.u_tb_binder clk=1 rst=0",
         ],
         "%m must name the arming instance only; `.drive` belongs to a \
          suspended task in a different module"
