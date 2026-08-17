@@ -28834,7 +28834,13 @@ impl Simulator {
         // with each other AND with the change itself). A dump is worse off
         // than a late monitor — the VCD had no record for the timestamp at
         // all, and those changes were re-attributed to a later one.
-        let mut slot_pending = false;
+        // Starts TRUE, not false: the caller reaches here from a `#delay`,
+        // and the statements it ran at the CURRENT time — including the write
+        // immediately after the previous delay — have not been through a
+        // postponed region yet. Starting false skipped exactly that slot, so a
+        // `#50 sig = 1;` inside an edge block landed in the dump and the
+        // monitor at the NEXT serviced slot instead of at the write's own time.
+        let mut slot_pending = true;
         loop {
             // Advance to the EARLIEST of: event_queue, clock_generators,
             // and delayed-update queue (so a `#10` from inside an initial

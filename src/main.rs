@@ -154,6 +154,10 @@ fn print_usage() {
     eprintln!("                     [mod1,mod2=]<unit>/<prec>   explicit source-level timescale (the");
     eprintln!("                     named form limits it to the listed modules). Repeatable. Never");
     eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
+    eprintln!("  --timescale <unit>/<prec>  Alias for the un-named --module-timescale form,");
+    eprintln!("  -timescale <unit>/<prec>     spelled as other simulators spell it. Same rule:");
+    eprintln!("                     it is a DEFAULT for design elements with no timescale");
+    eprintln!("                     directive, and never overrides an explicit one.");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
     eprintln!("  --report-stats[=json]  Print an end-of-run statistics footer on stderr");
@@ -709,6 +713,22 @@ fn process_command_file(
                 }
                 _ if t.starts_with("--module-timescale=") => {
                     module_timescale_args.push(t["--module-timescale=".len()..].to_string());
+                }
+                // commercial-simulator-compatible spelling of the same thing:
+                // `-timescale <unit>/<prec>` supplies the DEFAULT for design
+                // elements that carry no timescale directive, and leaves an
+                // explicit one alone. Both dash forms, both separators.
+                "-timescale" | "--timescale" => {
+                    if i + 1 < toks.len() {
+                        i += 1;
+                        module_timescale_args.push(toks[i].to_string());
+                    }
+                }
+                _ if t.starts_with("-timescale=") => {
+                    module_timescale_args.push(t["-timescale=".len()..].to_string());
+                }
+                _ if t.starts_with("--timescale=") => {
+                    module_timescale_args.push(t["--timescale=".len()..].to_string());
                 }
                 // commercial-simulator-compatible seed aliases: `-svseed <n>` / `-svseed=<n>`
                 // (and `-seed` likewise) lower onto the `+seed=` plusarg the
@@ -1955,6 +1975,22 @@ fn run_main() -> i32 {
             }
             _ if arg.starts_with("--module-timescale=") => {
                 module_timescale_args.push(arg["--module-timescale=".len()..].to_string());
+            }
+            // commercial-simulator-compatible spelling of the same thing:
+            // `-timescale <unit>/<prec>` supplies the DEFAULT for design
+            // elements that carry no timescale directive, and does NOT
+            // override an explicit one — matching the switch it mirrors.
+            "-timescale" | "--timescale" => {
+                i += 1;
+                if i < args.len() {
+                    module_timescale_args.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("-timescale=") => {
+                module_timescale_args.push(arg["-timescale=".len()..].to_string());
+            }
+            _ if arg.starts_with("--timescale=") => {
+                module_timescale_args.push(arg["--timescale=".len()..].to_string());
             }
             // commercial-simulator-compatible seed aliases (undocumented): lower onto `+seed=`.
             "-svseed" | "-seed" => {
