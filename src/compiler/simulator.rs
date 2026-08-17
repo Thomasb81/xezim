@@ -96302,6 +96302,11 @@ mod vpi {
     pub const ARGUMENT: c_int = 89;
     pub const MEMORY: c_int = 29;
     pub const MODULE: c_int = 32;
+    /// The generic "instance" class (module/program/interface/package). It is
+    /// a SystemVerilog extension, so it lives in `sv_vpi_user.h` at 745 — NOT
+    /// in `vpi_user.h`. cocotb asks for this, not vpiModule, when discovering
+    /// the design root.
+    pub const INSTANCE: c_int = 745;
     pub const PARAMETER: c_int = 41;
     pub const PART_SELECT: c_int = 42;
     pub const SCOPE: c_int = 84;
@@ -97349,7 +97354,7 @@ pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *m
         // module is the one we elaborated.
         let scope_path = match scope_h {
             None => {
-                if type_ == vpi::MODULE {
+                if type_ == vpi::MODULE || type_ == vpi::INSTANCE {
                     let items = vec![unsafe {
                         *Box::from_raw(vpi_module_handle(sim, -1) as *mut VpiHandle)
                     }];
@@ -97362,7 +97367,7 @@ pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *m
         };
 
         // Child scopes / instances.
-        if type_ == vpi::MODULE || type_ == vpi::INTERNAL_SCOPE {
+        if type_ == vpi::MODULE || type_ == vpi::INSTANCE || type_ == vpi::INTERNAL_SCOPE {
             let items: Vec<VpiHandle> = sim
                 .module
                 .instances
@@ -97454,6 +97459,39 @@ pub extern "C" fn vpi_scan(iter: *mut libc::c_void) -> *mut libc::c_void {
 
 /// String-valued properties. The returned pointer addresses simulator-owned
 /// storage valid until the next `vpi_get_str` call on this thread.
+/// Spelling of a `vpiType` code, for `vpi_get_str(vpiType, h)`. Kept beside
+/// the `vpi` constant block it mirrors so the two cannot drift.
+fn vpi_type_name(code: libc::c_int) -> Option<&'static str> {
+    Some(match code {
+        vpi::CONSTANT => "vpiConstant",
+        vpi::ITERATOR => "vpiIterator",
+        vpi::INTEGER_VAR => "vpiIntegerVar",
+        vpi::MEMORY => "vpiMemory",
+        vpi::MODULE => "vpiModule",
+        vpi::NET => "vpiNet",
+        vpi::PARAMETER => "vpiParameter",
+        vpi::PART_SELECT => "vpiPartSelect",
+        vpi::REAL_VAR => "vpiRealVar",
+        vpi::REG => "vpiReg",
+        vpi::SCOPE => "vpiScope",
+        vpi::SYS_FUNC_CALL => "vpiSysFuncCall",
+        vpi::SYS_TASK_CALL => "vpiSysTaskCall",
+        vpi::TIME_VAR => "vpiTimeVar",
+        vpi::INTERNAL_SCOPE => "vpiInternalScope",
+        vpi::LONG_INT_VAR => "vpiLongIntVar",
+        vpi::SHORT_INT_VAR => "vpiShortIntVar",
+        vpi::INT_VAR => "vpiIntVar",
+        vpi::SHORT_REAL_VAR => "vpiShortRealVar",
+        vpi::BYTE_VAR => "vpiByteVar",
+        vpi::STRING_VAR => "vpiStringVar",
+        vpi::ENUM_VAR => "vpiEnumVar",
+        vpi::STRUCT_VAR => "vpiStructVar",
+        vpi::UNION_VAR => "vpiUnionVar",
+        vpi::BIT_VAR => "vpiBitVar",
+        _ => return None,
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_str(
     property: libc::c_int,
@@ -97466,6 +97504,20 @@ pub extern "C" fn vpi_get_str(
         vpi::NAME => h.name.clone(),
         vpi::FULL_NAME => h.full_name.clone(),
         vpi::DEF_NAME if h.kind == VpiKind::Module => h.def_name.clone(),
+        // §38.38: the STRING spelling of the object's type, which must agree
+        // with the code `vpi_get(vpiType, h)` reports. Clients print this in
+        // diagnostics — cocotb logs a warning for every object whose type it
+        // cannot name.
+        vpi::TYPE => match vpi_type_name(h.type_code) {
+            Some(n) => n.to_string(),
+            None => {
+                vpi_error(
+                    vpi::WARNING,
+                    format!("vpi_get_str: no name for vpiType {}", h.type_code),
+                );
+                return std::ptr::null_mut();
+            }
+        },
         _ => {
             vpi_error(
                 vpi::WARNING,
@@ -97764,10 +97816,15 @@ pub fn vpi_run_startup_routines(libs: &mut Vec<Library>, paths: &[String]) {
 /// Free a VPI handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn vpi_free_object(handle: *mut libc::c_void) -> libc::c_int {
-    if !handle.is_null() {
-        drop(unsafe { Box::from_raw(handle as *mut VpiHandle) });
+    // §38.24: 1 on SUCCESS, 0 on failure. This returned 0 unconditionally, so
+    // every free reported failure even though the handle was released — which
+    // is what made cocotb log "Attempting to free root iterator failed!" after
+    // a perfectly good root scan.
+    if handle.is_null() {
+        return 0;
     }
-    0
+    drop(unsafe { Box::from_raw(handle as *mut VpiHandle) });
+    1
 }
 
 /// Get a VPI property value. Returns `vpiUndefined` (-1) for a property

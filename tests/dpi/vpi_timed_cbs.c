@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "vpi_user.h"
+#include "sv_vpi_user.h"   /* vpiInstance */
 
 #define TOGGLES 8              /* 4 rising edges */
 #define STEP    10             /* ticks between toggles */
@@ -121,8 +122,42 @@ static PLI_INT32 tick_cb(p_cb_data cb) {
     return 0;
 }
 
+/* Object-model bits a VPI client uses before it can do anything useful.
+ * All three were wrong: vpi_iterate did not accept vpiInstance (the generic
+ * instance class, and what a client asks for to find the design root),
+ * vpi_get_str could not name a vpiType, and vpi_free_object returned 0 —
+ * "failure" per §38.24 — for every successful free. */
+static void check_object_model(void) {
+    vpiHandle it, top, sig;
+    PLI_BYTE8 *tn;
+
+    it = vpi_iterate(vpiInstance, NULL);
+    CHECK(it != NULL, "vpi_iterate(vpiInstance, NULL) finds the design root");
+    if (it) {
+        top = vpi_scan(it);
+        CHECK(top != NULL, "the root iterator yields the top instance");
+        if (top) {
+            tn = vpi_get_str(vpiType, top);
+            CHECK(tn != NULL && strcmp(tn, "vpiModule") == 0,
+                  "vpi_get_str(vpiType) names the top instance vpiModule");
+            /* §38.24: 1 on success, not 0. */
+            CHECK(vpi_free_object(top) == 1, "vpi_free_object returns 1 on success");
+        }
+    }
+
+    sig = vpi_handle_by_name("top.count", NULL);
+    CHECK(sig != NULL, "vpi_handle_by_name(top.count)");
+    if (sig) {
+        tn = vpi_get_str(vpiType, sig);
+        CHECK(tn != NULL, "vpi_get_str(vpiType) names a signal");
+        if (tn) vpi_printf("SIGTYPE: %s\n", tn);
+    }
+    CHECK(vpi_free_object(NULL) == 0, "vpi_free_object(NULL) is a failure");
+}
+
 static PLI_INT32 start_cb(p_cb_data cb) {
     (void)cb;
+    check_object_model();
     arm_synch();
     arm_timer();
     return 0;
