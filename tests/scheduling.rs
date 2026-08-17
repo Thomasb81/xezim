@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "scheduling/static_local_nba_per_instance.rs"]
+mod static_local_nba_per_instance;
 #[path = "scheduling/block_local_decl_ast_fallback.rs"]
 mod block_local_decl_ast_fallback;
 #[path = "scheduling/class_method_delay_timeunit.rs"]
