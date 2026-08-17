@@ -28764,6 +28764,17 @@ impl Simulator {
     /// Drain events in the scheduler whose fire time is at or before `target`.
     /// Used when a task-internal `#delay` needs to yield the simulator so
     /// concurrent processes can advance while this task sleeps.
+    /// §4.4.2.4 postponed region for ONE time slot: `$monitor`, `$strobe`,
+    /// then the waveform dump. Factored out of the main tick so the nested
+    /// `run_events_until` loop can service the slots it consumes. Every part
+    /// is a no-op when nothing is armed or nothing changed, so calling it once
+    /// per slot costs nothing on designs that dump or monitor nothing.
+    fn run_postponed_region(&mut self) {
+        self.check_monitor();
+        self.drain_pending_strobes();
+        self.dump_write_changes();
+    }
+
     fn run_events_until(&mut self, target: u64) {
         let saved_pid = self.current_pid;
         let saved_break = self.break_flag;
@@ -28771,6 +28782,16 @@ impl Simulator {
         // §4.4.2.3: `#0` continuations parked by earlier same-batch
         // processes must resume in THIS time slot, not drift to a later nt.
         self.promote_inactive_to_active();
+        // §4.4.2.4: this is a nested event loop — it advances `self.time`
+        // across whole time slots on its own. It used to run NONE of the
+        // postponed region for them, so every slot consumed inside a `#delay`
+        // was invisible to `$monitor` and to the waveform dump: a signal that
+        // changed there surfaced at whatever LATER slot each of those two
+        // happened to be serviced at (different mechanisms, so they disagreed
+        // with each other AND with the change itself). A dump is worse off
+        // than a late monitor — the VCD had no record for the timestamp at
+        // all, and those changes were re-attributed to a later one.
+        let mut slot_pending = false;
         loop {
             // Advance to the EARLIEST of: event_queue, clock_generators,
             // and delayed-update queue (so a `#10` from inside an initial
@@ -28789,6 +28810,13 @@ impl Simulator {
                 _ => break,
             };
             if nt > self.time {
+                // Leaving this timestamp — close out its postponed region
+                // before the clock moves, so $monitor and the dump report it
+                // at the time it actually happened.
+                if slot_pending {
+                    slot_pending = false;
+                    self.run_postponed_region();
+                }
                 self.time = nt;
             }
             // Commit delayed updates whose target time matches first —
@@ -28856,7 +28884,14 @@ impl Simulator {
             // has already run, so promote now — the next loop iteration
             // (next_eq == self.time <= target) resumes it with post-NBA
             // values, same ordering as the run_one_tick path.
+            slot_pending = true;
             self.promote_inactive_to_active();
+        }
+        // Final slot inside the window: its NBA/settle/edge work has already
+        // run above, so service it here rather than letting the caller's tick
+        // attribute it to the delay's target time.
+        if slot_pending {
+            self.run_postponed_region();
         }
         self.current_pid = saved_pid;
         self.break_flag = saved_break;
