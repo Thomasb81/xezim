@@ -189,3 +189,5 @@ mod bare_randomize_in_method;
 mod comb_self_member_sensitivity;
 #[path = "scheduling/waiter_cont_anyedge_wake.rs"]
 mod waiter_cont_anyedge_wake;
+#[path = "scheduling/nested_delay_slot_servicing.rs"]
+mod nested_delay_slot_servicing;
