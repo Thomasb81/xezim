@@ -65738,7 +65738,15 @@ impl Simulator {
         // A member of a nested packed struct / untagged union: slice it out of
         // the container rather than reading a stale lazily-created leaf.
         if let Some((base, off, w)) = self.packed_leaf_of_hier(name) {
-            if let Some(cur) = self.get_signal_value_by_name(&base) {
+            // Frame FIRST (§13.4 shadowing). A packed-struct subroutine formal
+            // or local keeps its bare name and lives in the CALL FRAME, but
+            // module inlining flattens `s.a` into the dotted ident `s.a`, which
+            // arrives here. Consulting signals only meant the base lookup
+            // missed and the member read came back X — or, where a same-named
+            // module-scope object existed, silently returned THAT object's
+            // field. The whole-struct read was correct throughout, which is
+            // what disguised this as an argument-passing bug.
+            if let Some(cur) = self.get_local_or_signal(&base) {
                 let mut v = cur.range_select((off + w - 1) as usize, off as usize);
                 // §7.2.1: the slice is a raw bit pattern — re-stamp the
                 // member's DECLARED signedness (`int s` in a packed struct
@@ -65888,14 +65896,15 @@ impl Simulator {
         // container's storage (§7.3) — splice into it instead of creating an
         // independent leaf that would silently stop aliasing its siblings.
         if let Some((base, off, w)) = self.packed_leaf_of_hier(name) {
-            if let Some(cur) = self.get_signal_value_by_name(&base) {
+            // Frame first, mirroring the read path above.
+            if let Some(cur) = self.get_local_or_signal(&base) {
                 let mut next = cur.clone();
                 let piece = val.resize(w);
                 for i in 0..w {
                     next.set_bit((off + i) as usize, piece.get_bit(i as usize));
                 }
                 if next != cur {
-                    self.set_signal_value_by_name(&base, next);
+                    self.set_local_or_signal(&base, next);
                 }
                 return;
             }
