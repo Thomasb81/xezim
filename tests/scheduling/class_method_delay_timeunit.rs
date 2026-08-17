@@ -13,12 +13,12 @@
 //! altogether rather than mis-scaled. (The module-task arm of that pass
 //! already carries a comment about the very same bug being fixed for tasks.)
 //!
-//! An interface has the SAME defect and is NOT fixed here: interfaces never
-//! enter the `eff_ts` timescale map (that walk visits `Description::Module`
-//! only), so routing them through the pass scales by the tick and is an
-//! identity. Fixing it means giving interfaces an effective timescale, which
-//! also feeds the global tick (`tick_s` is the MIN precision across the map) —
-//! a broader change than this one. The test below gates it.
+//! An INTERFACE had the same defect, for a second reason: interfaces never
+//! entered the `eff_ts` timescale map at all (that walk visited
+//! `Description::Module` only), so routing them through the pass scaled by the
+//! tick and was an identity. Interfaces and programs are now walked too — the
+//! preprocessor already recorded them — so a BFM's `#` delays count the
+//! interface's timeunit like any other scope.
 
 use xezim::simulate;
 
@@ -103,7 +103,6 @@ endmodule
 /// An interface task's `#` delay counts the interface's timeunit too — this is
 /// the shape a bus BFM uses to pace its drive routine.
 #[test]
-#[ignore = "interfaces have no entry in the eff_ts timescale map, so their delays are still raw ticks"]
 fn interface_task_delay_counts_timeunits() {
     let src = r#"
 `timescale 1ns/1ps
