@@ -147,7 +147,10 @@ typedef PLI_UINT32 *vpiHandle;
 
 /* --- callback reasons (Table 38-49) ----------------------------------- */
 #define cbValueChange          1
+#define cbReadWriteSynch       6
+#define cbReadOnlySynch        7
 #define cbNextSimTime          8
+#define cbAfterDelay           9
 #define cbStartOfSimulation   11
 #define cbEndOfSimulation     12
 #define cbStartOfReset        19
@@ -341,9 +344,17 @@ PLI_INT32 vpi_free_object(vpiHandle object);
 PLI_INT32 vpi_release_handle(vpiHandle object);
 PLI_INT32 vpi_get_vlog_info(p_vpi_vlog_info vlog_info_p);
 
-/* Only cbValueChange, cbNextSimTime, cbStartOfSimulation,
- * cbEndOfSimulation, and cbStartOfReset are dispatched. Any other reason
- * is rejected with a NULL return rather than silently accepted. When a
+/* Only cbValueChange, cbReadWriteSynch, cbReadOnlySynch, cbNextSimTime,
+ * cbAfterDelay, cbStartOfSimulation, cbEndOfSimulation, and cbStartOfReset
+ * are dispatched. Any other reason is rejected with a NULL return rather
+ * than silently accepted.
+ *
+ * cbAfterDelay takes its delay from cb_data_p->time, RELATIVE to now, and
+ * counts as pending simulation work — a testbench driven only from VPI
+ * timers keeps running rather than ending at time 0. cbReadWriteSynch and
+ * cbReadOnlySynch are one-shot end-of-time-step callbacks; writes applied
+ * from a cbReadWriteSynch open a fresh delta in the same slot, so a clock
+ * driven there triggers edge-sensitive blocks normally. When a
  * cbValueChange fires, cb_data_p->obj, ->time and ->value are populated;
  * ->value uses the format of the value struct supplied at registration
  * (vpiIntVal if none was given). */

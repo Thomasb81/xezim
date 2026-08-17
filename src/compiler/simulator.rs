@@ -26638,6 +26638,16 @@ impl Simulator {
         if let Some(t) = _t {
             accum.t_snap += t.elapsed().as_nanos() as u64;
         }
+        // §38.36 cbAfterDelay (cocotb's `Timer`) fires HERE: after this slot's
+        // edge snapshot and before `check_edges`, so a clock the callback
+        // drives registers as a real transition. Firing it before the snapshot
+        // meant the snapshot captured the value the callback had just written,
+        // so `always @(posedge clk)` compared 1 against 1 and saw no edge — a
+        // cocotb-driven DUT sat at x forever while level-sensitive
+        // `always @(clk)` blocks worked fine.
+        if self.fire_due_after_delay_cbs() {
+            self.dirty_any = true;
+        }
         // LRM §16.5.1: capture Preponed (slot-entry) samples of every
         // SVA-referenced signal BEFORE the active/NBA regions run, so a
         // clocked assertion firing later this slot (tick_sva_sites) samples
@@ -27384,7 +27394,6 @@ impl Simulator {
                     break;
                 }
             }
-            self.fire_due_after_delay_cbs();
             if self.time > old_time && !self.dpi_next_time_cbs.is_empty() {
                 let self_ptr = self as *mut Simulator;
                 let now = self.time;
@@ -28906,7 +28915,12 @@ impl Simulator {
             // After advancing time and any clock/delay fires, check for
             // edge triggers so always_ff blocks fire within this delay
             // window, then re-snapshot for the next iter.
-            if fired_clock || dly_applied || ran_process {
+            let vpi_fired = self.fire_due_after_delay_cbs();
+            if vpi_fired {
+                self.dirty_any = true;
+                self.settle_combinatorial();
+            }
+            if fired_clock || dly_applied || ran_process || vpi_fired {
                 self.check_edges();
                 let _ = self.drain_edge_cascade(self.cascade_limit);
                 self.snapshot_edge_signals();
@@ -28916,7 +28930,6 @@ impl Simulator {
             // has already run, so promote now — the next loop iteration
             // (next_eq == self.time <= target) resumes it with post-NBA
             // values, same ordering as the run_one_tick path.
-            self.fire_due_after_delay_cbs();
             slot_pending = true;
             self.promote_inactive_to_active();
         }
@@ -33151,13 +33164,13 @@ impl Simulator {
     /// Fire every `cbAfterDelay` now due. One-shot per §38.36 — each is removed
     /// before its routine runs, so a callback that re-registers (which cocotb
     /// does on every `Timer`) queues a fresh entry instead of re-firing this one.
-    fn fire_due_after_delay_cbs(&mut self) {
+    fn fire_due_after_delay_cbs(&mut self) -> bool {
         if self.dpi_after_delay_cbs.is_empty() {
-            return;
+            return false;
         }
         let now = self.time;
         if !self.dpi_after_delay_cbs.iter().any(|(_, t)| *t <= now) {
-            return;
+            return false;
         }
         let mut due: Vec<DpiCbHandle> = Vec::new();
         self.dpi_after_delay_cbs.retain(|(cb, t)| {
@@ -33169,9 +33182,11 @@ impl Simulator {
             }
         });
         let self_ptr = self as *mut Simulator;
+        let fired = !due.is_empty();
         for cb in due {
             dispatch_vpi_cb(self_ptr, now, None, &cb, vpi::CB_AFTER_DELAY);
         }
+        fired
     }
 
     /// End-of-time-step VPI synchronization callbacks (§38.36). Both are
@@ -33185,6 +33200,20 @@ impl Simulator {
             for cb in std::mem::take(&mut self.dpi_rw_synch_cbs) {
                 dispatch_vpi_cb(self_ptr, now, None, &cb, vpi::CB_READ_WRITE_SYNCH);
             }
+            // cbReadWriteSynch is where a VPI client applies its QUEUED signal
+            // writes — cocotb drives clocks and resets from here, not from the
+            // `Timer` callback itself. Writes landing after this slot's edge
+            // detection were invisible: the next slot's snapshot absorbed them
+            // as the new baseline, so `always @(posedge clk)` compared 1 to 1
+            // and a cocotb-clocked DUT never advanced. Open a fresh delta in
+            // this slot so they are evaluated like any other active-region
+            // write.
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            self.check_edges();
+            let _ = self.drain_edge_cascade(self.cascade_limit);
+            self.snapshot_edge_signals();
         }
         if !self.dpi_ro_synch_cbs.is_empty() {
             let now = self.time;
