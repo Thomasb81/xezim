@@ -4693,6 +4693,18 @@ pub struct Simulator {
     /// Registered cbNextSimTime callbacks with their registration time.
     /// Each is one-shot and fires when simulation time advances.
     dpi_next_time_cbs: Vec<(DpiCbHandle, u64)>,
+    /// §38.36 cbAfterDelay: one-shot callbacks paired with the ABSOLUTE
+    /// tick they are due at. This is what backs cocotb's `Timer`, so the
+    /// scheduler must also treat a pending entry as future work — a
+    /// cocotb-only testbench has no HDL events of its own and would
+    /// otherwise finish at time 0.
+    dpi_after_delay_cbs: Vec<(DpiCbHandle, u64)>,
+    /// §38.36 cbReadWriteSynch: end of the current time step, writes still
+    /// permitted. cocotb's `ReadWrite` trigger.
+    dpi_rw_synch_cbs: Vec<DpiCbHandle>,
+    /// §38.36 cbReadOnlySynch: postponed region, no writes. cocotb's
+    /// `ReadOnly` trigger.
+    dpi_ro_synch_cbs: Vec<DpiCbHandle>,
     /// Registered start-of-reset callbacks. Fired at simulation start.
     dpi_reset_cbs: Vec<DpiCbHandle>,
     /// Registered start-of-simulation callbacks. Fired once at sim start.
@@ -7211,6 +7223,9 @@ impl Simulator {
             prof_psettle_deferred: 0,
             dpi_value_change_cbs: HashMap::default(),
             dpi_next_time_cbs: Vec::new(),
+            dpi_after_delay_cbs: Vec::new(),
+            dpi_rw_synch_cbs: Vec::new(),
+            dpi_ro_synch_cbs: Vec::new(),
             dpi_reset_cbs: Vec::new(),
             dpi_start_sim_cbs: Vec::new(),
             dpi_end_sim_cbs: Vec::new(),
@@ -7400,6 +7415,9 @@ impl Drop for Simulator {
         }
         // Reset callbacks
         self.dpi_next_time_cbs.clear();
+        self.dpi_after_delay_cbs.clear();
+        self.dpi_rw_synch_cbs.clear();
+        self.dpi_ro_synch_cbs.clear();
         self.dpi_reset_cbs.clear();
         self.dpi_start_sim_cbs.clear();
         self.dpi_end_sim_cbs.clear();
@@ -26810,6 +26828,7 @@ impl Simulator {
         // region — so they observe post-edge state and this cycle's samples.
         self.drain_deferred_clocking_conts();
         self.drain_reactive_region();
+        self.fire_vpi_synch_cbs();
         self.check_monitor();
         self.drain_pending_strobes();
         // Deferred `$finish` from a waiters-first continuation: this time
@@ -27260,6 +27279,11 @@ impl Simulator {
                 && self.delayed_updates.is_empty()
                 && self.delayed_nba.is_empty()
                 && !has_reactive
+                // A pending cbAfterDelay is real future work even when the HDL
+                // side is idle — a cocotb testbench drives everything from VPI
+                // timers, so without this the run ends at time 0 and every
+                // `Timer` reports as never set up.
+                && self.dpi_after_delay_cbs.is_empty()
             {
                 break;
             }
@@ -27271,6 +27295,7 @@ impl Simulator {
                 && !has_clocks
                 && self.delayed_updates.is_empty()
                 && self.delayed_nba.is_empty()
+                && self.dpi_after_delay_cbs.is_empty()
             {
                 break;
             }
@@ -27290,6 +27315,7 @@ impl Simulator {
                 next_eq_time,
                 next_clk_time,
                 next_delayed,
+                self.next_vpi_cb_time(),
             ]
                 .into_iter()
                 .flatten()
@@ -27358,6 +27384,7 @@ impl Simulator {
                     break;
                 }
             }
+            self.fire_due_after_delay_cbs();
             if self.time > old_time && !self.dpi_next_time_cbs.is_empty() {
                 let self_ptr = self as *mut Simulator;
                 let now = self.time;
@@ -28770,6 +28797,7 @@ impl Simulator {
     /// is a no-op when nothing is armed or nothing changed, so calling it once
     /// per slot costs nothing on designs that dump or monitor nothing.
     fn run_postponed_region(&mut self) {
+        self.fire_vpi_synch_cbs();
         self.check_monitor();
         self.drain_pending_strobes();
         self.dump_write_changes();
@@ -28804,7 +28832,11 @@ impl Simulator {
                 .map(|c| c.next_toggle_time)
                 .min();
             let next_dly = self.next_delayed_time();
-            let nt_opt = [next_eq, next_clk, next_dly].into_iter().flatten().min();
+            let next_vpi = self.next_vpi_cb_time();
+            let nt_opt = [next_eq, next_clk, next_dly, next_vpi]
+                .into_iter()
+                .flatten()
+                .min();
             let nt = match nt_opt {
                 Some(t) if t <= target => t,
                 _ => break,
@@ -28884,6 +28916,7 @@ impl Simulator {
             // has already run, so promote now — the next loop iteration
             // (next_eq == self.time <= target) resumes it with post-NBA
             // values, same ordering as the run_one_tick path.
+            self.fire_due_after_delay_cbs();
             slot_pending = true;
             self.promote_inactive_to_active();
         }
@@ -33104,6 +33137,61 @@ impl Simulator {
             (Some(x), Some(y)) => Some(x.min(y)),
             (x, None) => x,
             (None, y) => y,
+        }
+    }
+
+    /// Earliest pending `cbAfterDelay` fire time. Folded into the scheduler's
+    /// next-time choice so a VPI timer counts as future work: a cocotb-only
+    /// testbench drives no HDL events, and without this the run ended at time
+    /// 0 with every `Timer` still outstanding.
+    fn next_vpi_cb_time(&self) -> Option<u64> {
+        self.dpi_after_delay_cbs.iter().map(|(_, t)| *t).min()
+    }
+
+    /// Fire every `cbAfterDelay` now due. One-shot per §38.36 — each is removed
+    /// before its routine runs, so a callback that re-registers (which cocotb
+    /// does on every `Timer`) queues a fresh entry instead of re-firing this one.
+    fn fire_due_after_delay_cbs(&mut self) {
+        if self.dpi_after_delay_cbs.is_empty() {
+            return;
+        }
+        let now = self.time;
+        if !self.dpi_after_delay_cbs.iter().any(|(_, t)| *t <= now) {
+            return;
+        }
+        let mut due: Vec<DpiCbHandle> = Vec::new();
+        self.dpi_after_delay_cbs.retain(|(cb, t)| {
+            if *t <= now {
+                due.push(*cb);
+                false
+            } else {
+                true
+            }
+        });
+        let self_ptr = self as *mut Simulator;
+        for cb in due {
+            dispatch_vpi_cb(self_ptr, now, None, &cb, vpi::CB_AFTER_DELAY);
+        }
+    }
+
+    /// End-of-time-step VPI synchronization callbacks (§38.36). Both are
+    /// one-shot. cbReadWriteSynch runs first, while writes are still legal;
+    /// cbReadOnlySynch runs in the postponed region. These back cocotb's
+    /// `ReadWrite` and `ReadOnly` triggers.
+    fn fire_vpi_synch_cbs(&mut self) {
+        if !self.dpi_rw_synch_cbs.is_empty() {
+            let now = self.time;
+            let self_ptr = self as *mut Simulator;
+            for cb in std::mem::take(&mut self.dpi_rw_synch_cbs) {
+                dispatch_vpi_cb(self_ptr, now, None, &cb, vpi::CB_READ_WRITE_SYNCH);
+            }
+        }
+        if !self.dpi_ro_synch_cbs.is_empty() {
+            let now = self.time;
+            let self_ptr = self as *mut Simulator;
+            for cb in std::mem::take(&mut self.dpi_ro_synch_cbs) {
+                dispatch_vpi_cb(self_ptr, now, None, &cb, vpi::CB_READ_ONLY_SYNCH);
+            }
         }
     }
 
@@ -53054,7 +53142,15 @@ impl Simulator {
                         self.check_edges();
                         let _ = self.drain_edge_cascade(self.cascade_limit);
                         self.snapshot_edge_signals();
-                        self.check_monitor();
+                        // The whole postponed region, not just `$monitor`. This
+                        // slot is reached by jumping `self.time` to the delay's
+                        // target, and the dump was left out — so the monitor
+                        // reported the slot and the waveform did not, and the
+                        // changes surfaced later at whatever tick next wrote the
+                        // dump. That is why a monitor and a VCD of the same
+                        // event disagreed with each other as well as with the
+                        // change itself.
+                        self.run_postponed_region();
                         *self.name_resolve_hint.borrow_mut() = saved_hint_nested;
                     }
                     TimingControl::Event(e) => {
@@ -96213,6 +96309,9 @@ mod vpi {
     pub const CB_NEXT_SIM_TIME: c_int = 8;
     pub const CB_START_OF_SIMULATION: c_int = 11;
     pub const CB_END_OF_SIMULATION: c_int = 12;
+    pub const CB_READ_WRITE_SYNCH: c_int = 6;
+    pub const CB_READ_ONLY_SYNCH: c_int = 7;
+    pub const CB_AFTER_DELAY: c_int = 9;
     pub const CB_START_OF_RESET: c_int = 19;
 }
 
@@ -96352,6 +96451,58 @@ fn vecval_to_value(vec: &[s_vpi_vecval], width: u32, is_signed: bool) -> Value {
 /// Radix string with 4-state digits, `bits_per_digit` of 1, 3 or 4.
 /// A digit is `z` when every bit in it is Z, otherwise `x` when any bit
 /// is unknown — the Verilog display rule.
+/// Inverse of [`vpi_radix_string`]: decode a `vpi*StrVal` payload into a
+/// `w`-bit `Value`.
+///
+/// `x`/`z` (and `?`, which the LRM accepts for z) cover a WHOLE digit, so one
+/// `x` in a hex string is four x bits. Digits are read LSB-first from the right;
+/// a string shorter than the signal left-extends with 0, longer is truncated.
+/// Underscores and surrounding whitespace are ignored (§38.16).
+fn vpi_value_from_radix_str(s: &str, bits_per_digit: u32, w: u32) -> Value {
+    let mut v = Value::zero(w);
+    let mut bit: u32 = 0;
+    for ch in s.chars().rev() {
+        if bit >= w {
+            break;
+        }
+        if ch == '_' || ch.is_whitespace() {
+            continue;
+        }
+        let lc = ch.to_ascii_lowercase();
+        let per_bit_code = match lc {
+            'x' => Some(2u8),
+            'z' | '?' => Some(3u8),
+            _ => None,
+        };
+        match per_bit_code {
+            Some(code) => {
+                for k in 0..bits_per_digit {
+                    if bit + k < w {
+                        v.set_bit_code((bit + k) as usize, code);
+                    }
+                }
+            }
+            None => {
+                // An unparsable digit is not silently a zero — leave the run
+                // as x so a malformed payload is visible rather than wrong.
+                let d = lc.to_digit(1u32 << bits_per_digit);
+                for k in 0..bits_per_digit {
+                    if bit + k >= w {
+                        break;
+                    }
+                    let code = match d {
+                        Some(dv) => ((dv >> k) & 1) as u8,
+                        None => 2u8,
+                    };
+                    v.set_bit_code((bit + k) as usize, code);
+                }
+            }
+        }
+        bit += bits_per_digit;
+    }
+    v
+}
+
 fn vpi_radix_string(v: &Value, bits_per_digit: usize) -> String {
     let w = v.width.max(1) as usize;
     let ndigits = w.div_ceil(bits_per_digit);
@@ -98090,6 +98241,63 @@ pub extern "C" fn vpi_put_value(
                 let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
                 vecval_to_value(vec, w, is_signed)
             }
+            // §38.16 string payloads. cocotb writes 4-state values this way
+            // (a `LogicArray` carrying x/z has no lossless integer form), so
+            // without these every cocotb drive of a clock or reset was
+            // rejected here and silently never reached the signal.
+            vpi::BIN_STR_VAL | vpi::OCT_STR_VAL | vpi::HEX_STR_VAL | vpi::DEC_STR_VAL
+            | vpi::STRING_VAL => {
+                let sp = unsafe { vp.value.str };
+                if sp.is_null() {
+                    vpi_error(
+                        vpi::ERROR,
+                        format!("vpi_put_value: null string for format {}; ignored", vp.format),
+                    );
+                    return std::ptr::null_mut();
+                }
+                let text = match unsafe { std::ffi::CStr::from_ptr(sp) }.to_str() {
+                    Ok(t) => t.trim(),
+                    Err(_) => {
+                        vpi_error(
+                            vpi::ERROR,
+                            "vpi_put_value: string payload is not valid UTF-8; ignored".into(),
+                        );
+                        return std::ptr::null_mut();
+                    }
+                };
+                let mut v = match vp.format {
+                    vpi::BIN_STR_VAL => vpi_value_from_radix_str(text, 1, w),
+                    vpi::OCT_STR_VAL => vpi_value_from_radix_str(text, 3, w),
+                    vpi::HEX_STR_VAL => vpi_value_from_radix_str(text, 4, w),
+                    vpi::DEC_STR_VAL => match text.parse::<i64>() {
+                        Ok(n) => Value::from_u64(n as u64, w),
+                        Err(_) => {
+                            vpi_error(
+                                vpi::ERROR,
+                                format!("vpi_put_value: '{}' is not a decimal; ignored", text),
+                            );
+                            return std::ptr::null_mut();
+                        }
+                    },
+                    // vpiStringVal: the payload is CHARACTERS, packed
+                    // right-aligned one byte per 8 bits.
+                    _ => {
+                        let mut sv = Value::zero(w);
+                        for (i, byte) in text.as_bytes().iter().rev().enumerate() {
+                            for k in 0..8u32 {
+                                let bit = i as u32 * 8 + k;
+                                if bit >= w {
+                                    break;
+                                }
+                                sv.set_bit_code(bit as usize, ((byte >> k) & 1) as u8);
+                            }
+                        }
+                        sv
+                    }
+                };
+                v.is_signed = is_signed;
+                v
+            }
             other => {
                 vpi_error(
                     vpi::ERROR,
@@ -98131,6 +98339,18 @@ pub extern "C" fn vpi_put_value(
         } else {
             // Normal write - write_sig! will skip if signal is forced
             write_sig!(sim, sig_id, value);
+            // A VPI deposit is an EXTERNAL write: no HDL driver stands behind
+            // it, so nothing else marks the signal dirty or re-snapshots it for
+            // edge detection. Without this a cocotb-driven clock landed in the
+            // signal table and propagated nowhere — `always @(posedge clk)` and
+            // even `always @(clk)` never fired, so the DUT sat at x while the
+            // Python side saw its own writes read back correctly.
+            sim.after_signal_write(sig_id);
+            if sig_id < sim.dirty_signals.len() && !sim.dirty_signals[sig_id] {
+                sim.dirty_signals[sig_id] = true;
+                sim.dirty_list.push(sig_id);
+            }
+            sim.dirty_any = true;
         }
 
         std::ptr::null_mut()
@@ -98260,6 +98480,9 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
     // handle that quietly never fires.
     if reason != vpi::CB_VALUE_CHANGE
         && reason != vpi::CB_NEXT_SIM_TIME
+        && reason != vpi::CB_AFTER_DELAY
+        && reason != vpi::CB_READ_WRITE_SYNCH
+        && reason != vpi::CB_READ_ONLY_SYNCH
         && reason != vpi::CB_START_OF_RESET
         && reason != vpi::CB_START_OF_SIMULATION
         && reason != vpi::CB_END_OF_SIMULATION
@@ -98299,6 +98522,27 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
                     .push(unsafe { *handle });
             }
             vpi::CB_NEXT_SIM_TIME => sim.dpi_next_time_cbs.push((unsafe { *handle }, sim.time)),
+            vpi::CB_AFTER_DELAY => {
+                // §38.36: the delay is RELATIVE to now, in the units named
+                // by `time->type`. vpiSimTime is a 64-bit tick count split
+                // across high/low; vpiScaledRealTime is a double in the
+                // object's timeunit, which for a NULL obj is the global one
+                // — the same base `self.time` counts in, so no rescale.
+                let delay = if cb_data.time.is_null() {
+                    0u64
+                } else {
+                    let t = unsafe { &*cb_data.time };
+                    if t.type_ == vpi::SCALED_REAL_TIME {
+                        if t.real > 0.0 { t.real as u64 } else { 0 }
+                    } else {
+                        ((t.high as u64) << 32) | (t.low as u64)
+                    }
+                };
+                sim.dpi_after_delay_cbs
+                    .push((unsafe { *handle }, sim.time.saturating_add(delay)));
+            }
+            vpi::CB_READ_WRITE_SYNCH => sim.dpi_rw_synch_cbs.push(unsafe { *handle }),
+            vpi::CB_READ_ONLY_SYNCH => sim.dpi_ro_synch_cbs.push(unsafe { *handle }),
             vpi::CB_START_OF_RESET => sim.dpi_reset_cbs.push(unsafe { *handle }),
             vpi::CB_START_OF_SIMULATION => sim.dpi_start_sim_cbs.push(unsafe { *handle }),
             vpi::CB_END_OF_SIMULATION => sim.dpi_end_sim_cbs.push(unsafe { *handle }),

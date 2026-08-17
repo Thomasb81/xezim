@@ -108,3 +108,83 @@ fn dump_keeps_slots_crossed_by_the_nested_loop() {
         );
     }
 }
+
+/// The `$monitor` and the waveform dump must agree with EACH OTHER, at every
+/// change, not merely each be "close".
+///
+/// Two separate holes produced two different lags, which is why the two views
+/// disagreed with each other as well as with the change:
+///   * slots crossed INSIDE `run_events_until` serviced neither, and
+///   * the slot reached by jumping `self.time` to the delay's target serviced
+///     `$monitor` but not the dump.
+///
+/// `b` here changes exactly AT the target of the `#500`, which is the second
+/// hole specifically.
+const AGREEMENT: &str = r#"
+`timescale 1ns/1ps
+module top;
+  logic tick = 0;
+  logic a = 0, b = 0, c = 0;
+
+  always #50 tick = ~tick;
+  always @(posedge tick) begin
+    #500;                 // nested window, target at 550ns
+  end
+
+  initial #100 a = 1;     // inside the window
+  initial #550 b = 1;     // exactly AT the target
+  initial #600 c = 1;     // after it
+
+  // $time is excluded from change detection, so the watched
+  // signals must be in the argument list or the monitor never
+  // re-fires after its first print.
+  initial $monitor("MON %0t a=%b b=%b c=%b", $time, a, b, c);
+  initial begin
+    $dumpfile("@VCD@");
+    $dumpvars(0, top);
+    #900 $finish;
+  end
+endmodule
+"#;
+
+#[test]
+fn monitor_and_dump_agree_on_every_change_time() {
+    let mut path = std::env::temp_dir();
+    path.push(format!("xezim_slot_agree_{}.vcd", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let src = AGREEMENT.replace("@VCD@", path.to_str().unwrap());
+    let sim = simulate(&src, 100_000_000).expect("simulate failed");
+
+    let mon_times: Vec<u64> = sim
+        .output
+        .iter()
+        .filter_map(|o| {
+            o.message
+                .trim()
+                .strip_prefix("MON ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|t| t.parse().ok())
+        })
+        .collect();
+
+    let text = std::fs::read_to_string(&path).expect("VCD not written");
+    let stamps: Vec<u64> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix('#'))
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        mon_times.contains(&550_000),
+        "monitor never reported the delay-target slot: {mon_times:?}"
+    );
+    for t in &mon_times {
+        assert!(
+            stamps.contains(t),
+            "monitor reported t={t} but the dump has no record for it; \
+             dump stamps were {stamps:?}"
+        );
+    }
+}
