@@ -3149,6 +3149,16 @@ pub struct Simulator {
     /// arguments. `$monitor` re-prints only when one of these changes
     /// (LRM §21.2.3); `None` forces a print (fresh registration).
     monitor_arg_prev: Option<Vec<Value>>,
+    /// Instance scope in force when `$monitor`/`$fmonitor` was ARMED.
+    ///
+    /// `check_monitor` re-formats the saved format string at the end of every
+    /// time slot, long after the arming statement returned — so a `%m` in it
+    /// used whatever scope happened to be executing then (usually none, which
+    /// degrades to the top module). §21.2.1.7 ties `%m` to the scope of the
+    /// statement that CONTAINS it, so a `$fmonitor(fd, "%m")` inside a bound
+    /// instance must keep reporting that instance. Captured here at arm time
+    /// and reinstalled around the re-format.
+    monitor_scope: String,
     /// Active tag for a tagged union variable: signal name → tag name.
     pub active_union_tag: HashMap<String, String>,
     pub max_time: u64,
@@ -6657,6 +6667,7 @@ impl Simulator {
             warned_system_tasks: HashSet::default(),
             monitor_prev: HashMap::default(),
             monitor_arg_prev: None,
+            monitor_scope: String::new(),
             pending_strobes: Vec::new(),
             pending_observed: Vec::new(),
             sva_sites: Vec::new(),
@@ -56018,6 +56029,7 @@ impl Simulator {
                 // not at arming — values written later in this same step
                 // (another initial block's `v = 0`) must be reflected.
                 self.monitor = Some((name.to_string(), args.to_vec()));
+                self.monitor_scope = self.active_instance_scope();
                 self.monitor_arg_prev = None; // fresh arm ⇒ slot-end print
             }
             // §21.2.3 file variant: SHARES the single $monitor slot (xezim
@@ -56027,6 +56039,7 @@ impl Simulator {
             // the file descriptor in args[0] and watches args[1..].
             "$fmonitor" | "$fmonitorb" | "$fmonitorh" | "$fmonitoro" => {
                 self.monitor = Some((name.to_string(), args.to_vec()));
+                self.monitor_scope = self.active_instance_scope();
                 self.monitor_arg_prev = None; // fresh arm ⇒ slot-end print
             }
             "$monitoroff" => {
@@ -58881,6 +58894,17 @@ impl Simulator {
             if matches!(name.as_str(), "$time" | "$stime" | "$realtime"))
     }
 
+    /// The instance scope currently executing — the same precedence `%m` uses:
+    /// a sensitivity-driven block records `m_block_scope`, a procedural process
+    /// records `current_scope`.
+    fn active_instance_scope(&self) -> String {
+        if !self.m_block_scope.is_empty() {
+            self.m_block_scope.clone()
+        } else {
+            self.current_scope.clone()
+        }
+    }
+
     fn check_monitor(&mut self) {
         if self.monitor_paused {
             return;
@@ -58906,6 +58930,11 @@ impl Simulator {
                 .collect();
             let changed = self.monitor_arg_prev.as_deref() != Some(cur.as_slice());
             if changed {
+                // Reinstall the ARMING scope so a `%m` in the format string
+                // names the instance that armed the monitor, not whatever the
+                // slot-end check happens to run under.
+                let saved_block = std::mem::take(&mut self.m_block_scope);
+                self.m_block_scope = self.monitor_scope.clone();
                 if is_file {
                     let tn2 = format!("$monitor{}", &tn["$fmonitor".len()..]);
                     let _ = self.write_file_handle_named(&args, true, &tn2);
@@ -58914,6 +58943,7 @@ impl Simulator {
                     self.record_output(m.clone());
                     self.stdout_writeln(&m);
                 }
+                self.m_block_scope = saved_block;
                 self.monitor_arg_prev = Some(cur);
             }
         }

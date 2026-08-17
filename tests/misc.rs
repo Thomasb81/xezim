@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "misc/monitor_percent_m_scope.rs"]
+mod monitor_percent_m_scope;
 #[path = "misc/artifact_compression_modes.rs"]
 mod artifact_compression_modes;
 #[path = "misc/assign_z_passthrough.rs"]
