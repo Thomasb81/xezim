@@ -27,3 +27,5 @@ mod tran_and_implicit_nets;
 mod udp_primitives;
 #[path = "gates/vcd_lrm_compliance.rs"]
 mod vcd_lrm_compliance;
+#[path = "gates/dump_formats_agree.rs"]
+mod dump_formats_agree;
