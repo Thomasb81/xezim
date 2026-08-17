@@ -21,10 +21,14 @@ mod class_formal_typedef_widen;
 mod assoc_typedef_element_class;
 #[path = "classes/bit_class_property_signedness.rs"]
 mod bit_class_property_signedness;
+#[path = "classes/blocking_task_super_dispatch.rs"]
+mod blocking_task_super_dispatch;
 #[path = "classes/class_field_named_event.rs"]
 mod class_field_named_event;
 #[path = "classes/class_handle_return_preservation.rs"]
 mod class_handle_return_preservation;
+#[path = "classes/class_output_handle_copyback.rs"]
+mod class_output_handle_copyback;
 #[path = "classes/typedef_extends_cast.rs"]
 mod typedef_extends_cast;
 #[path = "classes/class_local_typedef_aa.rs"]
@@ -67,6 +71,8 @@ mod constraint_foreach_and_casts;
 mod constraint_funcs_aggregates;
 #[path = "classes/constraint_inline_enclosing_scope.rs"]
 mod constraint_inline_enclosing_scope;
+#[path = "classes/constraint_logical_or.rs"]
+mod constraint_logical_or;
 #[path = "classes/constraint_prefixed_inline_with.rs"]
 mod constraint_prefixed_inline_with;
 #[path = "classes/constraint_randc_soft_local.rs"]
