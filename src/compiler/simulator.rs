@@ -3171,6 +3171,14 @@ pub struct Simulator {
     /// instance must keep reporting that instance. Captured here at arm time
     /// and reinstalled around the re-format.
     monitor_scope: String,
+    /// The LEXICAL half of that `%m` (process block label + task / function /
+    /// named-block chain), captured at the same moment. `monitor_scope` alone
+    /// only pins the INSTANCE: a slot-end check that fires while some
+    /// unrelated task is mid-flight would otherwise append that task's name.
+    monitor_m_suffix: String,
+    /// Set only while `check_monitor` re-formats, so the `%m` arm uses the
+    /// captured suffix instead of the live scope stack.
+    monitor_m_active: bool,
     /// Active tag for a tagged union variable: signal name → tag name.
     pub active_union_tag: HashMap<String, String>,
     pub max_time: u64,
@@ -3473,6 +3481,12 @@ pub struct Simulator {
     /// name-resolution hint so AST-evaluated bare names in a multiply-
     /// instantiated module resolve to THIS instance's signals.
     process_scope_hint: HashMap<usize, String>,
+    /// §21.2.1.7 `%m`: each process's own lexical scope chain, parked here
+    /// while it is suspended. `m_scope_stack` is a single global stack, so a
+    /// task that suspends at a `#delay` used to leave its own name installed
+    /// for whatever process ran next — every later `%m`, including a
+    /// `$monitor` arming in an unrelated instance, inherited that name.
+    process_m_scope: HashMap<usize, Vec<String>>,
     /// §21.2.1.7 `%m`: label of a named `initial begin : lbl` / `always
     /// begin : lbl`, per pid. The scheduler FLATTENS a process's outermost
     /// `begin`/`end` into its statement stream (see `run_process_stmts`), so
@@ -6680,6 +6694,8 @@ impl Simulator {
             monitor_prev: HashMap::default(),
             monitor_arg_prev: None,
             monitor_scope: String::new(),
+            monitor_m_suffix: String::new(),
+            monitor_m_active: false,
             pending_strobes: Vec::new(),
             pending_observed: Vec::new(),
             sva_sites: Vec::new(),
@@ -6783,6 +6799,7 @@ impl Simulator {
             process_parents: HashMap::default(),
             process_contexts: HashMap::default(),
             process_scope_hint: HashMap::default(),
+            process_m_scope: HashMap::default(),
             process_m_label: HashMap::default(),
             process_origin: HashMap::default(),
             trace_sched: std::env::var("XEZIM_TRACE_SCHED").ok().and_then(|v| {
@@ -28937,12 +28954,27 @@ impl Simulator {
     /// keeps a triggered `always @(*)` from running in the middle of another
     /// process's statement sequence.
     fn run_scheduled_process(&mut self, pid: usize, stmts: &ProcCont) {
+        // §21.2.1.7: swap in THIS process's lexical `%m` chain for the run and
+        // park it again on the way out. The single entry/exit here is why the
+        // save/restore lives in the outer wrapper — `_inner` has several early
+        // returns.
+        let outer_m_scope = std::mem::replace(
+            &mut self.m_scope_stack,
+            self.process_m_scope.remove(&pid).unwrap_or_default(),
+        );
 
         self.proc_depth += 1;
         self.run_scheduled_process_inner(pid, stmts);
         self.proc_depth -= 1;
         if self.proc_depth == 0 {
             self.drain_deferred_comb();
+        }
+
+        let mine = std::mem::replace(&mut self.m_scope_stack, outer_m_scope);
+        // Non-empty ⇒ suspended mid-task; keep it for the resume. A process
+        // that ran to completion unwound its own pushes and parks nothing.
+        if !mine.is_empty() {
+            self.process_m_scope.insert(pid, mine);
         }
     }
 
@@ -56070,6 +56102,7 @@ impl Simulator {
                 // (another initial block's `v = 0`) must be reflected.
                 self.monitor = Some((name.to_string(), args.to_vec()));
                 self.monitor_scope = self.active_instance_scope();
+                self.monitor_m_suffix = self.m_lexical_suffix();
                 self.monitor_arg_prev = None; // fresh arm ⇒ slot-end print
             }
             // §21.2.3 file variant: SHARES the single $monitor slot (xezim
@@ -56080,6 +56113,7 @@ impl Simulator {
             "$fmonitor" | "$fmonitorb" | "$fmonitorh" | "$fmonitoro" => {
                 self.monitor = Some((name.to_string(), args.to_vec()));
                 self.monitor_scope = self.active_instance_scope();
+                self.monitor_m_suffix = self.m_lexical_suffix();
                 self.monitor_arg_prev = None; // fresh arm ⇒ slot-end print
             }
             "$monitoroff" => {
@@ -57772,15 +57806,25 @@ impl Simulator {
                                 // `m_scope_stack` with its own frame and is
                                 // named from its DECLARING scope, not the
                                 // caller's block.
-                                if self.func_call_stack.is_empty() {
-                                    if let Some(l) = self.process_m_label.get(&self.current_pid) {
-                                        out.push('.');
-                                        out.push_str(l);
+                                if self.monitor_m_active {
+                                    // Slot-end $monitor re-render: replay the
+                                    // chain captured at arm time. The live
+                                    // stack belongs to whatever process the
+                                    // postponed-region check ran under.
+                                    out.push_str(&self.monitor_m_suffix);
+                                } else {
+                                    if self.func_call_stack.is_empty() {
+                                        if let Some(l) =
+                                            self.process_m_label.get(&self.current_pid)
+                                        {
+                                            out.push('.');
+                                            out.push_str(l);
+                                        }
                                     }
-                                }
-                                for sc in &self.m_scope_stack {
-                                    out.push('.');
-                                    out.push_str(sc);
+                                    for sc in &self.m_scope_stack {
+                                        out.push('.');
+                                        out.push_str(sc);
+                                    }
                                 }
                                 result.push_str(&out);
                             } else if !self.m_scope_stack.is_empty() {
@@ -58945,6 +58989,25 @@ impl Simulator {
         }
     }
 
+    /// The lexical half of `%m`: the process's flattened block label plus the
+    /// task / function / named-block chain that follows the instance path.
+    /// §21.2.1.7 — `%m` names the scope CONTAINING it, so `$monitor` captures
+    /// this at arm time and `check_monitor` replays it verbatim.
+    fn m_lexical_suffix(&self) -> String {
+        let mut out = String::new();
+        if self.func_call_stack.is_empty() {
+            if let Some(l) = self.process_m_label.get(&self.current_pid) {
+                out.push('.');
+                out.push_str(l);
+            }
+        }
+        for sc in &self.m_scope_stack {
+            out.push('.');
+            out.push_str(sc);
+        }
+        out
+    }
+
     fn check_monitor(&mut self) {
         if self.monitor_paused {
             return;
@@ -58975,6 +59038,7 @@ impl Simulator {
                 // slot-end check happens to run under.
                 let saved_block = std::mem::take(&mut self.m_block_scope);
                 self.m_block_scope = self.monitor_scope.clone();
+                self.monitor_m_active = true;
                 if is_file {
                     let tn2 = format!("$monitor{}", &tn["$fmonitor".len()..]);
                     let _ = self.write_file_handle_named(&args, true, &tn2);
@@ -58983,6 +59047,7 @@ impl Simulator {
                     self.record_output(m.clone());
                     self.stdout_writeln(&m);
                 }
+                self.monitor_m_active = false;
                 self.m_block_scope = saved_block;
                 self.monitor_arg_prev = Some(cur);
             }

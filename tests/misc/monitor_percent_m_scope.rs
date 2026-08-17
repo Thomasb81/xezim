@@ -122,3 +122,48 @@ endmodule
         "a top-level monitor must name the top, got {:?}", n
     );
 }
+
+/// §21.2.1.7 again, one level deeper: `m_scope_stack` — the task / function /
+/// named-block chain that follows the instance path — was a single GLOBAL
+/// stack. A task that suspends at a `#delay` leaves its own name installed,
+/// so the next process to run inherited it.
+///
+/// Here `clkgen`'s `drive()` suspends at `#100` before `probe`'s initial block
+/// arms its monitor. Every `%m` then read `testbench.u_tb_binder.drive` — an
+/// instance path glued to an unrelated module's task. Under `bind`, while
+/// chasing a timestamp discrepancy, that names a scope that does not exist.
+const SUSPENDED_TASK_LEAK: &str = r#"
+`timescale 1ns/1ps
+module clkgen(output logic gclk, output logic grst);
+  task drive();
+    gclk = 1'bx; grst = 1'bx;
+    #100 grst = 0; gclk = 0;
+    #500 gclk = 1;
+  endtask
+  initial drive();
+endmodule
+module probe(input logic gclk, input logic grst);
+  initial $monitor("NOTE: %m gclk=%b grst=%b", gclk, grst);
+endmodule
+module testbench;
+  logic gclk, grst;
+  clkgen u_clkgen(.gclk(gclk), .grst(grst));
+  initial #700 $finish;
+endmodule
+bind testbench probe u_tb_binder(.gclk(testbench.gclk), .grst(testbench.grst));
+"#;
+
+#[test]
+fn monitor_m_ignores_unrelated_suspended_task() {
+    let got = notes(SUSPENDED_TASK_LEAK);
+    assert_eq!(
+        got,
+        vec![
+            "NOTE: testbench.u_tb_binder gclk=x grst=x",
+            "NOTE: testbench.u_tb_binder gclk=0 grst=0",
+            "NOTE: testbench.u_tb_binder gclk=1 grst=0",
+        ],
+        "%m must name the arming instance only; `.drive` belongs to a \
+         suspended task in a different module"
+    );
+}
