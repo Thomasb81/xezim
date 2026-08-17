@@ -3860,6 +3860,14 @@ pub struct Simulator {
     /// continuation `[stmt, stmts[i+1..]]` before calling `exec_statement`, and
     /// `exec_statement`'s Wait handler reads it to park the process.
     exec_park_cont: Option<ProcCont>,
+    /// No-progress guard for the `foreach` replay fallback: how many times
+    /// a given `(pid, statement offset)` has parked without the loop ever
+    /// completing. That fallback restarts at index 0 on every resume, so a
+    /// run of parks means the loop is stuck rather than iterating.
+    foreach_replay_parks: HashMap<(usize, usize), u32>,
+    /// Consecutive parks tolerated before the guard fires. 0 disables it.
+    /// Override with `XEZIM_FOREACH_REPLAY_LIMIT`.
+    foreach_replay_limit: u32,
     /// SV-2023: target named block for `disable <name>` propagation.
     disable_target: Option<String>,
     /// Label of a process-level named block (`initial begin : worker`) -> its
@@ -6905,6 +6913,11 @@ impl Simulator {
             rs_return_flag: false,
             parked_from_exec: false,
             exec_park_cont: None,
+            foreach_replay_parks: HashMap::default(),
+            foreach_replay_limit: std::env::var("XEZIM_FOREACH_REPLAY_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(64),
             disable_target: None,
             disable_labels: HashMap::default(),
             fork_block_children: HashMap::default(),
@@ -31263,7 +31276,16 @@ impl Simulator {
                     // and another process shrunk the collection), re-check the
                     // LIVE size instead of the frozen key count.
                     let exhausted = if let Some(ln) = live_size_name {
-                        *idx as u64 >= self.get_queue_size(ln)
+                        // §12.7.3: the iteration set is fixed when the loop
+                        // starts. The live size is re-read ONLY so a collection
+                        // shrunk by another process (while the body was
+                        // suspended) exits early instead of indexing past the
+                        // end — growth must not extend the loop. A `push_back`
+                        // in the body grew the bound exactly as fast as `idx`
+                        // advanced, so the loop never exhausted: it ran to max
+                        // simulation time with no diagnostic at all. Clamping to
+                        // the entry count makes ForeachTail provably terminate.
+                        *idx as u64 >= self.get_queue_size(ln).min(keys.len() as u64)
                     } else {
                         *idx >= keys.len()
                     };
@@ -31430,7 +31452,8 @@ impl Simulator {
                     i += 1;
                     continue;
                 }
-                if matches!(&stmt.kind, StatementKind::Foreach { .. }) {
+                let is_foreach_fallback = matches!(&stmt.kind, StatementKind::Foreach { .. });
+                if is_foreach_fallback {
                     self.exec_park_cont = Some({
                         let mut c = vec![stmt.clone()];
                         // Chain the caller's tail rather than copying it (ProcCont::pushed).
@@ -31439,6 +31462,54 @@ impl Simulator {
                     });
                 }
                 self.exec_statement(stmt);
+                // NO-PROGRESS GUARD. This fallback replays the foreach from
+                // index 0 on every resume, so a body that parks here makes no
+                // forward progress: it re-runs iteration 0, parks again, and
+                // repeats — historically forever, with no diagnostic. One or
+                // two parks may still complete legitimately (the wait is
+                // satisfied on resume and the loop finishes synchronously), so
+                // only a run of them is treated as stuck. Naming the array and
+                // its source offset turns an unbounded hang into one line.
+                if is_foreach_fallback {
+                    if self.parked_from_exec {
+                        let key = (pid, stmt.span.start);
+                        let n = self.foreach_replay_parks.entry(key).or_insert(0);
+                        *n += 1;
+                        if self.foreach_replay_limit > 0 && *n > self.foreach_replay_limit {
+                            let what = match &stmt.kind {
+                                StatementKind::Foreach { array, .. } => match &array.kind {
+                                    ExprKind::Ident(h) => h
+                                        .path
+                                        .iter()
+                                        .map(|seg| seg.name.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("."),
+                                    _ => "<expr>".to_string(),
+                                },
+                                _ => "<foreach>".to_string(),
+                            };
+                            eprintln!(
+                                "Error: `foreach ({what}[...])` at offset {} made no progress \
+                                 across {} suspensions.",
+                                stmt.span.start, self.foreach_replay_limit
+                            );
+                            eprintln!(
+                                "               Its index shape could not be materialized, so \
+                                 each resume restarts the loop at index 0."
+                            );
+                            eprintln!(
+                                "               Multi-variable `foreach` over a blocking body is \
+                                 the usual cause. Raise or disable with \
+                                 XEZIM_FOREACH_REPLAY_LIMIT=<n> (0 = never check)."
+                            );
+                            self.finished = true;
+                        }
+                    } else {
+                        // Completed without parking — clear any earlier streak
+                        // so a foreach inside an outer loop cannot accumulate.
+                        self.foreach_replay_parks.remove(&(pid, stmt.span.start));
+                    }
+                }
                 self.exec_park_cont = None;
                 self.parked_from_exec = false;
             }
