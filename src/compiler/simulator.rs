@@ -2418,6 +2418,17 @@ struct ProcessContext {
     local_dyn: Vec<HashMap<String, String>>,
 }
 
+#[derive(Debug, Clone)]
+struct FormalMetadataSnapshot {
+    name: String,
+    declared_type: Option<DataType>,
+    packed_fields: Option<Vec<(String, u32, u32)>>,
+    packed_element_widths: Vec<(String, u32)>,
+    packed_dimensions: Option<Vec<(i64, i64)>>,
+    class_type: Option<String>,
+    typedef_type: Option<String>,
+}
+
 /// Deferred teardown for an inlined blocking task/method call: the work
 /// `exec_task_call` would normally run synchronously after the body, replayed
 /// at the body's `ScopePop` sentinel so the process can suspend in between.
@@ -2458,6 +2469,7 @@ struct TaskCleanup {
     /// Default false (free-task/same-`this` inlines don't touch those stacks).
     pushed_method_this: bool,
     saved_spec: Option<(String, String)>,
+    formal_metadata: Vec<FormalMetadataSnapshot>,
 }
 
 /// Scalar kind of a DPI-EXPORT subroutine's port or return, for the generated
@@ -3421,6 +3433,11 @@ pub struct Simulator {
     /// declared type, so `prop = new(...)` constructs the wrong class (and can
     /// recurse infinitely when the wrong class is the enclosing class itself).
     method_local_base: Vec<usize>,
+    /// Immutable method bodies cached after their first dispatch. Runtime
+    /// execution mutates object state, never declarations, so sharing the
+    /// parsed body avoids rebuilding a deep AST on every call.
+    class_method_cache:
+        HashMap<String, HashMap<String, Option<Arc<crate::ast::decl::ClassMethod>>>>,
     /// Current covergroup instance if in sampling context.
     cg_this: Option<usize>,
     /// Processes waiting for join
@@ -4626,11 +4643,8 @@ pub struct Simulator {
     /// Registered value-change callbacks per signal id. Triggered from
     /// `after_signal_write` whenever a signal value differs from its
     /// previous inline-bits snapshot.
-    /// XEZIM_METHOD_CENSUS=1: per-method call counts, dumped periodically.
     prof_psettle_calls: u64,
     prof_psettle_deferred: u64,
-    method_census: HashMap<String, u64>,
-    method_census_total: u64,
     dpi_value_change_cbs: HashMap<usize, Vec<DpiCbHandle>>,
     /// Registered cbNextSimTime callbacks with their registration time.
     /// Each is one-shot and fires when simulation time advances.
@@ -6740,6 +6754,7 @@ impl Simulator {
             local_stack: vec![],
             class_context_stack: vec![],
             method_local_base: vec![],
+            class_method_cache: HashMap::default(),
             cg_this: None,
             join_waiters: Vec::new(),
             process_parents: HashMap::default(),
@@ -7141,8 +7156,6 @@ impl Simulator {
             dpi_scopes: HashMap::default(),
             prof_psettle_calls: 0,
             prof_psettle_deferred: 0,
-            method_census: HashMap::default(),
-            method_census_total: 0,
             dpi_value_change_cbs: HashMap::default(),
             dpi_next_time_cbs: Vec::new(),
             dpi_reset_cbs: Vec::new(),
@@ -29812,14 +29825,14 @@ impl Simulator {
             // tasks with no top-level wait) keep the synchronous path.
             if let StatementKind::Expr(expr) = &stmt.kind {
                 if let ExprKind::Call { func, args } = &expr.kind {
-                    let resolved: Option<(usize, String, bool)> = match &func.kind {
-                        // (receiver_handle, method_name, this_changes)
+                    let resolved: Option<(usize, String)> = match &func.kind {
+                        // (receiver_handle, method_name)
                         ExprKind::Ident(h) if h.path.len() == 1 => self
                             .this_stack
                             .last()
                             .copied()
                             .flatten()
-                            .map(|hh| (hh, h.path[0].name.name.clone(), false)),
+                            .map(|hh| (hh, h.path[0].name.name.clone())),
                         // `a.m(args)` and deeper chains `a.b.m(args)` both
                         // parse as a flattened multi-segment Ident; the
                         // receiver is the path minus the trailing method
@@ -29835,20 +29848,17 @@ impl Simulator {
                             let recv =
                                 Expression::new(ExprKind::Ident(head), expr.span);
                             self.eval_handle_expr(&recv)
-                                .map(|hh| (hh, last.name.name, true))
+                                .map(|hh| (hh, last.name.name))
                         }
                         ExprKind::MemberAccess { expr: recv, member } => self
                             .eval_handle_expr(recv)
-                            .map(|hh| (hh, member.name.clone(), true)),
+                            .map(|hh| (hh, member.name.clone())),
                         _ => None,
                     };
-                    if let Some((rh, mn, mut this_changes)) = resolved {
+                    if let Some((rh, mn)) = resolved {
                         if rh != 0 {
                             let is_super = matches!(&func.kind, ExprKind::MemberAccess { expr: recv, .. }
                                 if matches!(&recv.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "super"));
-                            if is_super {
-                                this_changes = false;
-                            }
                             let cls = if is_super {
                                 self.class_context_stack
                                     .last()
@@ -29866,11 +29876,10 @@ impl Simulator {
                                 if let Some((td, mclass)) = self.resolve_class_task(&cls, &mn) {
                                     if self.stmts_have_blocking(&td.items) {
                                         let mut cleanup = self.bind_task_frame(&td, args);
-                                        if this_changes {
-                                            self.this_stack.push(Some(rh));
-                                            self.class_context_stack.push(Some(mclass));
-                                            cleanup.pushed_method_this = true;
-                                        }
+                                        // Even a same-object bare call changes
+                                        // the defining-class context used by
+                                        // `super`; push both stacks uniformly.
+                                        self.push_task_method_this(Some(rh), mclass, &mut cleanup);
                                         self.task_cleanup.push(cleanup);
                                         let mut cont: Vec<Statement> = td.items.clone();
                                         cont.push(Statement::new(
@@ -79099,14 +79108,18 @@ impl Simulator {
         }
         let mut cur = Some(class_name.to_string());
         while let Some(cname) = cur {
-            if let Some(cd) = self.module.classes.get(&cname).cloned() {
-                if cd.methods.contains_key(method_name) {
-                    return Some(self.exec_method_in_class_hierarchy(0, &cname, method_name, args));
-                }
-                cur = cd.extends.clone();
-            } else {
+            let Some((has_method, parent)) = self
+                .module
+                .classes
+                .get(&cname)
+                .map(|cd| (cd.methods.contains_key(method_name), cd.extends.clone()))
+            else {
                 break;
+            };
+            if has_method {
+                return Some(self.exec_method_in_class_hierarchy(0, &cname, method_name, args));
             }
+            cur = parent;
         }
         None
     }
@@ -79123,14 +79136,18 @@ impl Simulator {
         }
         let mut cur = Some(class_name.to_string());
         while let Some(cname) = cur {
-            if let Some(cd) = self.module.classes.get(&cname).cloned() {
-                if cd.methods.contains_key(method_name) {
-                    return Some(self.exec_method_in_class_hierarchy(0, &cname, method_name, args));
-                }
-                cur = cd.extends.clone();
-            } else {
+            let Some((has_method, parent)) = self
+                .module
+                .classes
+                .get(&cname)
+                .map(|cd| (cd.methods.contains_key(method_name), cd.extends.clone()))
+            else {
                 break;
+            };
+            if has_method {
+                return Some(self.exec_method_in_class_hierarchy(0, &cname, method_name, args));
             }
+            cur = parent;
         }
         None
     }
@@ -83018,6 +83035,16 @@ impl Simulator {
         let normalized = Self::normalize_call_args(&fd.ports, args);
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
 
+        let mut metadata_names = std::collections::HashSet::new();
+        let formal_metadata: Vec<FormalMetadataSnapshot> = fd
+            .ports
+            .iter()
+            .map(|port| port.name.name.as_str())
+            .chain(std::iter::once(fd.name.name.name.as_str()))
+            .filter(|name| metadata_names.insert((*name).to_string()))
+            .map(|name| self.snapshot_formal_metadata(name))
+            .collect();
+
 
         // Set up local scope with parameters
         let mut locals = HashMap::default();
@@ -83551,6 +83578,9 @@ impl Simulator {
             self.writeback_queue_param(&tmp, &caller);
             self.drop_staged_queue(&tmp);
         }
+        for saved in formal_metadata.into_iter().rev() {
+            self.restore_formal_metadata(saved);
+        }
         result
     }
 
@@ -83679,6 +83709,9 @@ impl Simulator {
             self.writeback_queue_param(&tmp, &caller);
             self.drop_staged_queue(&tmp);
         }
+        for saved in c.formal_metadata.into_iter().rev() {
+            self.restore_formal_metadata(saved);
+        }
     }
 
     /// Register the structural metadata a task/function FORMAL needs so that
@@ -83703,8 +83736,80 @@ impl Simulator {
         dt.clone()
     }
 
+    fn snapshot_formal_metadata(&self, name: &str) -> FormalMetadataSnapshot {
+        let prefix = format!("{}.", name);
+        FormalMetadataSnapshot {
+            name: name.to_string(),
+            declared_type: self.module.var_decl_types.get(name).cloned(),
+            packed_fields: self.module.packed_struct_fields.get(name).cloned(),
+            packed_element_widths: self
+                .module
+                .packed_signal_elem_widths
+                .iter()
+                .filter(|(key, _)| key.as_str() == name || key.starts_with(&prefix))
+                .map(|(key, width)| (key.clone(), *width))
+                .collect(),
+            packed_dimensions: self.module.packed_full_dims.get(name).cloned(),
+            class_type: self.var_class_types.get(name).cloned(),
+            typedef_type: self.var_typedef_types.get(name).cloned(),
+        }
+    }
+
+    fn clear_formal_metadata(&mut self, name: &str) {
+        let prefix = format!("{}.", name);
+        self.module.var_decl_types.remove(name);
+        self.module.packed_struct_fields.remove(name);
+        self.module
+            .packed_signal_elem_widths
+            .retain(|key, _| key.as_str() != name && !key.starts_with(&prefix));
+        self.module.packed_full_dims.remove(name);
+        self.var_class_types.remove(name);
+        self.var_typedef_types.remove(name);
+    }
+
+    fn restore_formal_metadata(&mut self, saved: FormalMetadataSnapshot) {
+        self.clear_formal_metadata(&saved.name);
+        if let Some(data_type) = saved.declared_type {
+            self.module
+                .var_decl_types
+                .insert(saved.name.clone(), data_type);
+        }
+        if let Some(fields) = saved.packed_fields {
+            self.module
+                .packed_struct_fields
+                .insert(saved.name.clone(), fields);
+        }
+        for (key, width) in saved.packed_element_widths {
+            self.module.packed_signal_elem_widths.insert(key, width);
+        }
+        if let Some(dimensions) = saved.packed_dimensions {
+            self.module
+                .packed_full_dims
+                .insert(saved.name.clone(), dimensions);
+        }
+        if let Some(class_type) = saved.class_type {
+            self.var_class_types
+                .insert(saved.name.clone(), class_type);
+        }
+        if let Some(typedef_type) = saved.typedef_type {
+            self.var_typedef_types
+                .insert(saved.name, typedef_type);
+        }
+    }
+
     fn register_formal_type_metadata(&mut self, name: &str, dt: &DataType, no_unpacked_dims: bool) {
+        self.clear_formal_metadata(name);
         self.module.var_decl_types.insert(name.to_string(), dt.clone());
+        if let DataType::TypeReference { name: type_name, .. } = dt {
+            let type_name = type_name.name.name.clone();
+            if self.module.enum_members.contains_key(&type_name)
+                || self.module.typedefs.contains_key(&type_name)
+            {
+                self.var_typedef_types.insert(name.to_string(), type_name);
+            } else if self.module.classes.contains_key(&type_name) {
+                self.var_class_types.insert(name.to_string(), type_name);
+            }
+        }
         if !no_unpacked_dims {
             return;
         }
@@ -83752,6 +83857,14 @@ impl Simulator {
         use crate::ast::types::PortDirection;
         let normalized = Self::normalize_call_args(&td.ports, args);
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
+        let mut metadata_names = std::collections::HashSet::new();
+        let formal_metadata: Vec<FormalMetadataSnapshot> = td
+            .ports
+            .iter()
+            .map(|port| port.name.name.as_str())
+            .filter(|name| metadata_names.insert((*name).to_string()))
+            .map(|name| self.snapshot_formal_metadata(name))
+            .collect();
         // Evaluate input args and collect output/ref arg expressions
         let mut locals = HashMap::default();
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
@@ -84071,6 +84184,7 @@ impl Simulator {
             prev_static,
             pushed_method_this: false,
             saved_spec: None,
+            formal_metadata,
         }
     }
 
@@ -85106,13 +85220,14 @@ impl Simulator {
 
     fn params_with_class_spec(&mut self) -> Option<HashMap<String, Value>> {
         let (base, _) = self.current_spec.clone()?;
-        let cd = self.module.classes.get(&base).cloned()?;
-        let names: Vec<String> = cd
-            .param_order
-            .iter()
-            .filter(|n| !cd.type_param_names.iter().any(|t| t == *n))
-            .cloned()
-            .collect();
+        let names: Vec<String> = {
+            let cd = self.module.classes.get(&base)?;
+            cd.param_order
+                .iter()
+                .filter(|n| !cd.type_param_names.iter().any(|t| t == *n))
+                .cloned()
+                .collect()
+        };
         if names.is_empty() {
             return None;
         }
@@ -85140,28 +85255,36 @@ impl Simulator {
         VALPARAM_RESOLVING.with(|r| r.borrow_mut().push(name.to_string()));
         let _guard = ValparamResolveGuard;
         let (base, sig) = self.current_spec.clone()?;
-        let cd = self.module.classes.get(&base)?.clone();
-        // Type parameters are resolved elsewhere — don't shadow them.
-        if cd.type_param_names.iter().any(|t| t == name) {
-            return None;
-        }
-        // Match `param_order` exactly like `class_param_arg_map` (with the
-        // same legacy fallback for older caches lacking `param_order`).
-        let legacy_order: Vec<String>;
-        let order: &[String] = if cd.param_order.is_empty()
-            && !(cd.param_defaults.is_empty() && cd.type_param_names.is_empty())
-        {
-            legacy_order = cd
-                .param_defaults
-                .iter()
-                .map(|(n, _)| n.clone())
-                .chain(cd.type_param_names.iter().cloned())
-                .collect();
-            &legacy_order
-        } else {
-            &cd.param_order
+        let (idx, local_init, first_parent) = {
+            let cd = self.module.classes.get(&base)?;
+            // Type parameters are resolved elsewhere — don't shadow them.
+            if cd.type_param_names.iter().any(|t| t == name) {
+                return None;
+            }
+            // Match `param_order` exactly like `class_param_arg_map` (with the
+            // same legacy fallback for older caches lacking `param_order`).
+            let idx = if cd.param_order.is_empty()
+                && !(cd.param_defaults.is_empty() && cd.type_param_names.is_empty())
+            {
+                cd.param_defaults
+                    .iter()
+                    .map(|(n, _)| n)
+                    .chain(cd.type_param_names.iter())
+                    .position(|p| p == name)
+            } else {
+                cd.param_order.iter().position(|p| p == name)
+            };
+            let local_init = if idx.is_none() {
+                cd.param_defaults
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .and_then(|(_, e)| e.clone())
+            } else {
+                None
+            };
+            (idx, local_init, cd.extends.clone())
         };
-        let Some(idx) = order.iter().position(|p| p == name) else {
+        let Some(idx) = idx else {
             // Not a positional class parameter — but a class-BODY localparam
             // is a class constant that may be sized from the parameters
             // (`localparam int MYW = W;`). Its property value was baked at
@@ -85169,12 +85292,7 @@ impl Simulator {
             // default. Re-evaluate the declared initializer with the active
             // specialization bound; the cycle guard above covers a
             // self-referential initializer.
-            if let Some(init) = cd
-                .param_defaults
-                .iter()
-                .find(|(n, _)| n == name)
-                .and_then(|(_, e)| e.clone())
-            {
+            if let Some(init) = local_init {
                 return Some(self.eval_expr(&init));
             }
             // Declared by an ANCESTOR: `return W;` in a method inherited
@@ -85183,18 +85301,32 @@ impl Simulator {
             // from the leaf bindings (ancestor_spec evaluates expression
             // extends-args) and read the argument there. Without this,
             // every inherited parameter read fell back to its default.
-            let mut cur = cd.extends.clone();
+            let mut cur = first_parent;
             while let Some(anc) = cur {
-                let Some(acd) = self.module.classes.get(&anc).cloned() else {
+                let Some((declares, ancestor_idx, ancestor_init, next_parent)) = self
+                    .module
+                    .classes
+                    .get(&anc)
+                    .map(|acd| {
+                        (
+                            acd.param_order.iter().any(|p| p == name)
+                                || acd.param_defaults.iter().any(|(n, _)| n == name),
+                            acd.param_order.iter().position(|p| p == name),
+                            acd.param_defaults
+                                .iter()
+                                .find(|(n, _)| n == name)
+                                .and_then(|(_, e)| e.clone()),
+                            acd.extends.clone(),
+                        )
+                    })
+                else {
                     break;
                 };
-                let declares = acd.param_order.iter().any(|p| p == name)
-                    || acd.param_defaults.iter().any(|(n, _)| n == name);
                 if declares {
                     let Some(asig) = self.ancestor_spec(&base, &sig, &anc) else {
                         break;
                     };
-                    if let Some(aidx) = acd.param_order.iter().position(|p| p == name) {
+                    if let Some(aidx) = ancestor_idx {
                         let frags = Self::split_spec_args(&asig);
                         if let Some(frag) = frags.get(aidx).cloned() {
                             let saved = self.current_spec.clone();
@@ -85206,12 +85338,7 @@ impl Simulator {
                             }
                         }
                     }
-                    if let Some(init) = acd
-                        .param_defaults
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .and_then(|(_, e)| e.clone())
-                    {
+                    if let Some(init) = ancestor_init {
                         let saved = self.current_spec.clone();
                         self.current_spec = Some((anc.clone(), asig));
                         let v = self.eval_expr(&init);
@@ -85220,7 +85347,7 @@ impl Simulator {
                     }
                     break;
                 }
-                cur = acd.extends.clone();
+                cur = next_parent;
             }
             return None;
         };
@@ -91892,6 +92019,33 @@ impl Simulator {
                     );
                     a || b
                 }
+                // §18.5.12 — a disjunction needs at least one satisfiable
+                // branch. Preserve an already-valid draw; otherwise try each
+                // branch in source order and stop as soon as the complete
+                // expression becomes true.
+                ExprKind::Binary {
+                    op: BinaryOp::LogOr,
+                    left,
+                    right,
+                } => {
+                    if self.cons_expr_true(e) {
+                        return false;
+                    }
+                    let mut changed = self.solve_forced(
+                        handle,
+                        &ConstraintItem::Expr((**left).clone()),
+                        rand_set,
+                    );
+                    if self.cons_expr_true(e) {
+                        return changed;
+                    }
+                    changed |= self.solve_forced(
+                        handle,
+                        &ConstraintItem::Expr((**right).clone()),
+                        rand_set,
+                    );
+                    changed
+                }
                 // §18.5 relational constraint (`tag > 3'd4`, `leaf_val > 8'd50`).
                 // When the current draw already satisfies it, leave it alone;
                 // otherwise re-pick the rand side uniformly from the half-open
@@ -93410,6 +93564,39 @@ impl Simulator {
         target
     }
 
+    fn cached_class_method(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+    ) -> Option<Arc<crate::ast::decl::ClassMethod>> {
+        if let Some(cached) = self
+            .class_method_cache
+            .get(class_name)
+            .and_then(|methods| methods.get(method_name))
+        {
+            return cached.clone();
+        }
+        let method = self
+            .module
+            .classes
+            .get(class_name)
+            .and_then(|class_def| class_def.methods.get(method_name))
+            .filter(|method| {
+                matches!(
+                    method.kind,
+                    crate::ast::decl::ClassMethodKind::Function(_)
+                        | crate::ast::decl::ClassMethodKind::Task(_)
+                )
+            })
+            .cloned()
+            .map(Arc::new);
+        self.class_method_cache
+            .entry(class_name.to_string())
+            .or_default()
+            .insert(method_name.to_string(), method.clone());
+        method
+    }
+
     fn exec_method_in_class_hierarchy(
         &mut self,
         handle: usize,
@@ -93417,7 +93604,7 @@ impl Simulator {
         method_name: &str,
         args: &[Expression],
     ) -> Value {
-        use crate::ast::decl::{ClassMethod, ClassMethodKind};
+        use crate::ast::decl::ClassMethodKind;
         // Re-entrant registration guard: a factory `register(obj)` whose
         // body calls `obj.get_type_name()` can trigger a parameterized class
         // specialization's lazy static init, which re-enters
@@ -93439,46 +93626,14 @@ impl Simulator {
                 return Value::zero(32);
             }
         }
-        if std::env::var_os("XEZIM_METHOD_CENSUS").is_some() {
-            self.method_census_total += 1;
-            *self
-                .method_census
-                .entry(format!("{}::{}", start_class, method_name))
-                .or_insert(0) += 1;
-            if self.method_census_total % 2_000_000 == 0 {
-                let mut v: Vec<(&String, &u64)> = self.method_census.iter().collect();
-                v.sort_by(|a, b| b.1.cmp(a.1));
-                eprintln!("[CENSUS] total={} distinct={}", self.method_census_total, v.len());
-                for (k, c) in v.iter().take(15) {
-                    eprintln!("[CENSUS]   {:>12}  {}", c, k);
-                }
-            }
-        }
         let mut cur_class = Some(start_class.to_string());
         while let Some(cname) = cur_class {
-            // Resolve the matched method + parent-class pointer in a scoped
-            // borrow, cloning AT MOST the single matched method — never the
-            // whole ElaboratedClass. Cloning the entire class (every method,
-            // property, constraint, param map, …) on each lookup made method
-            // dispatch O(class_size × call_count); under heavy call load
-            // through deep inheritance hierarchies that is pathological. Now
-            // only the matched Function/Task body is ever cloned; a miss
-            // (absent / extern / pure) walks up for free.
-            let (method_opt, parent): (Option<ClassMethod>, Option<String>) =
-                match self.module.classes.get(&cname) {
-                    Some(class_def) => (
-                        class_def
-                            .methods
-                            .get(method_name)
-                            .filter(|m| matches!(
-                                m.kind,
-                                ClassMethodKind::Function(_) | ClassMethodKind::Task(_)
-                            ))
-                            .cloned(),
-                        class_def.extends.clone(),
-                    ),
-                    None => (None, None),
-                };
+            let parent = self
+                .module
+                .classes
+                .get(&cname)
+                .and_then(|class_def| class_def.extends.clone());
+            let method_opt = self.cached_class_method(&cname, method_name);
             cur_class = parent;
             if let Some(method) = method_opt {
                 let (ports, body) = match &method.kind {
@@ -93499,6 +93654,14 @@ impl Simulator {
                     ClassMethodKind::Function(f) => Some(f.name.name.name.clone()),
                     _ => None,
                 };
+                let mut metadata_names = std::collections::HashSet::new();
+                let formal_metadata: Vec<FormalMetadataSnapshot> = ports
+                    .iter()
+                    .map(|port| port.name.name.as_str())
+                    .chain(fn_ret_name.iter().map(String::as_str))
+                    .filter(|name| metadata_names.insert((*name).to_string()))
+                    .map(|name| self.snapshot_formal_metadata(name))
+                    .collect();
                 let ret_is_string = matches!(&method.kind,
                     ClassMethodKind::Function(f) if Self::is_string_data_type(&f.return_type));
                 // A packed return type whose range references a CLASS
@@ -93548,6 +93711,13 @@ impl Simulator {
                 // whole-value `output_bindings` path (see exec_function_call).
                 let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
                 for (i, port) in ports.iter().enumerate() {
+                    if matches!(self.resolve_dt(&port.data_type), DataType::Struct(_)) {
+                        self.register_formal_type_metadata(
+                            &port.name.name,
+                            &port.data_type,
+                            port.dimensions.is_empty(),
+                        );
+                    }
                     let is_assoc = self.port_is_assoc_array(port);
                     // An associative-array `output`/`inout`/`ref` formal
                     // is copied back via the assoc-param signal-namespace
@@ -94248,6 +94418,9 @@ impl Simulator {
                         self.writeback_assoc_param(&param, &caller);
                     }
                     self.purge_assoc_param(&param);
+                }
+                for saved in formal_metadata.into_iter().rev() {
+                    self.restore_formal_metadata(saved);
                 }
                 if let Some(h) = reg_guard_obj {
                     self.factory_reg_in_progress.remove(&h);
