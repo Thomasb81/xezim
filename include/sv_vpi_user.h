@@ -23,4 +23,9 @@
  * The full Accellera header defines these via vpi_user.h + vpi_compatibility.h;
  * for xezim, both types are already available from vpi_user.h. */
 
+
+/* Generic instance class (module/program/interface/package). Accepted by
+ * vpi_iterate to enumerate the design root and a scope's child instances. */
+#define vpiInstance 745
+
 #endif /* SV_VPI_USER_H */

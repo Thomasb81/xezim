@@ -340,6 +340,8 @@ vpiHandle vpi_put_value(vpiHandle object, p_vpi_value value_p,
  * vpiSimTime fills high/low, vpiScaledRealTime fills real. */
 void vpi_get_time(vpiHandle object, p_vpi_time time_p);
 
+/* Releases a handle obtained from vpi_handle, vpi_iterate or vpi_scan.
+ * Returns 1 on success, 0 on failure (including a NULL handle). */
 PLI_INT32 vpi_free_object(vpiHandle object);
 PLI_INT32 vpi_release_handle(vpiHandle object);
 PLI_INT32 vpi_get_vlog_info(p_vpi_vlog_info vlog_info_p);
