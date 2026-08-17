@@ -188,3 +188,73 @@ fn monitor_and_dump_agree_on_every_change_time() {
         );
     }
 }
+
+/// The write that follows a `#delay` belongs to the slot the delay resumed in.
+///
+/// `run_events_until` closes out a slot when it is about to advance past it,
+/// but its "this slot has unserviced work" flag started FALSE. A process
+/// reaches that loop from a `#delay`, so by then it has already executed the
+/// statements after its PREVIOUS delay — at the current time, and with no
+/// postponed region yet. Starting false skipped exactly that slot.
+///
+/// Here `sig = 1` executes at t=100 (a `#50` resuming inside an edge block
+/// that fired at t=50). Both `$monitor` and the dump reported it at 150 — the
+/// next slot that happened to be serviced — while an internal trace of the
+/// write said 100. Every view must say 100.
+const WRITE_AFTER_DELAY: &str = r#"
+`timescale 1ns/1ps
+module top;
+  logic tick = 0;
+  logic sig  = 0;
+  always #50 tick = ~tick;
+
+  always @(posedge tick) begin
+    #50  sig = 1;     // resumes and writes at t=100
+    #500 sig = 0;     // and at t=600
+  end
+
+  initial $monitor("MON %0t sig=%b", $time, sig);
+  initial begin
+    $dumpfile("@VCD@");
+    $dumpvars(0, top);
+    #900 $finish;
+  end
+endmodule
+"#;
+
+#[test]
+fn write_after_a_delay_is_reported_in_its_own_slot() {
+    let mut path = std::env::temp_dir();
+    path.push(format!("xezim_after_delay_{}.vcd", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let src = WRITE_AFTER_DELAY.replace("@VCD@", path.to_str().unwrap());
+    let sim = simulate(&src, 100_000_000).expect("simulate failed");
+
+    let mons: Vec<String> = sim
+        .output
+        .iter()
+        .map(|o| o.message.trim().to_string())
+        .filter(|l| l.starts_with("MON "))
+        .collect();
+    let text = std::fs::read_to_string(&path).expect("VCD not written");
+    let stamps: Vec<u64> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix('#'))
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        mons.contains(&"MON 100000 sig=1".to_string()),
+        "the t=100ns write must be monitored at 100000ps, got {mons:?}"
+    );
+    assert!(
+        stamps.contains(&100_000),
+        "the dump must hold a record at #100000; stamps were {stamps:?}"
+    );
+    assert!(
+        stamps.contains(&600_000),
+        "and at #600000 for the second write; stamps were {stamps:?}"
+    );
+}
