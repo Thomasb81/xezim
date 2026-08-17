@@ -356,3 +356,35 @@ fn dpi_typedef_vec_test() {
         "tests/dpi/typedef_dpi_test.sv",
     );
 }
+
+/// IEEE 1800-2017 §38.36 timed and synchronization callbacks, plus the string
+/// value formats a 4-state VPI client deposits with.
+///
+/// This is the surface a cocotb testbench runs on. Every piece of it was
+/// missing or inert: `cbAfterDelay`/`cbReadWriteSynch`/`cbReadOnlySynch` were
+/// rejected by `vpi_register_cb`; a pending timer was not future work, so a
+/// VPI-only testbench ended at time 0; `vpi_put_value` dropped `vpiBinStrVal`
+/// silently; a deposit never marked the signal dirty; and writes applied from
+/// `cbReadWriteSynch` landed after edge detection, so a VPI-driven clock never
+/// triggered `always @(posedge clk)`.
+///
+/// The DUT counts rising edges of a clock the C module drives entirely over
+/// VPI, so any of those regressing shows up as a wrong count rather than as a
+/// vague hang.
+#[test]
+fn vpi_timed_and_synch_callbacks() {
+    let so = compile_dpi_lib("tests/dpi/vpi_timed_cbs.c", "vpi_timed_cbs");
+    let log = run_xezim_with_vpi_timeout(&so, "tests/dpi/vpi_timed_cbs.sv", 60);
+    assert!(
+        log.contains("RESULT: PASSED"),
+        "vpi_timed_cbs missing RESULT: PASSED:\n{}",
+        log
+    );
+    // Pin the count explicitly: "PASSED" alone would still hold if the C side
+    // never reached its checks.
+    assert!(
+        log.contains("COUNT: 4"),
+        "a VPI-driven clock must produce 4 counted posedges:\n{}",
+        log
+    );
+}
