@@ -497,6 +497,23 @@ pub struct BytecodeCompiler<'a> {
     /// all (§12.7.1 makes it automatic and local to the loop). Without this the
     /// whole loop fell back to the AST interpreter.
     pub local_var_regs: std::collections::HashMap<String, (RegId, u32)>,
+    /// Names introduced by a `VarDecl` INSIDE the compiled block that live only
+    /// in a VM register — the interpreter never ran the declaration, so it has
+    /// no storage for them at all.
+    ///
+    /// A per-statement `StmtFallback` re-runs one statement in the interpreter.
+    /// If that statement touches one of these names it reads a signal that does
+    /// not exist (x), while the compiled statements around it read the register
+    /// — one block, two different variables. `always_ff begin item_t item; …
+    /// q.push_back(item); end` pushed an all-x item on every cycle because the
+    /// push could not be compiled and fell back. Same failure mode as
+    /// `reg_var_loop_depth`, which guards the loop-counter case; this guards
+    /// the block-local-declaration case.
+    ///
+    /// Distinct from `local_var_regs`, which ALSO holds `set_process_locals`
+    /// bindings — those do have an interpreter home and must not block a
+    /// fallback.
+    decl_local_regs: std::collections::HashSet<String>,
     /// Names imported from an already-active process frame. These registers
     /// are read-only for the compiled statement; writes leave compilation so
     /// the process interpreter can preserve full local-lifetime semantics.
@@ -618,6 +635,7 @@ impl<'a> BytecodeCompiler<'a> {
             scope_hint: None,
             for_loop_var_ids: std::collections::HashMap::default(),
             local_var_regs: std::collections::HashMap::default(),
+            decl_local_regs: std::collections::HashSet::default(),
             process_local_names: HashSet::default(),
             reg_var_loop_depth: 0,
             allow_expr_fallback: false,
@@ -1719,6 +1737,11 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn emit_fallback(&mut self, stmt: &Statement) -> bool {
+        if !self.decl_local_regs.is_empty() {
+            // See decl_local_regs — the interpreter has no storage for a
+            // register-backed block local, so bail the whole block instead.
+            return false;
+        }
         if self.reg_var_loop_depth > 0 {
             // See reg_var_loop_depth — a fallback here would mis-read the
             // register-backed loop var; force the whole loop to bail.
@@ -2836,7 +2859,7 @@ impl<'a> BytecodeCompiler<'a> {
         // while the entry reported success. Fail the statement instead so
         // the whole loop (or block) rolls back to one AST-interpreted unit
         // where the loop var is a real interpreter local.
-        if self.allow_ast_fallback && self.reg_var_loop_depth == 0 {
+        if self.allow_ast_fallback && self.reg_var_loop_depth == 0 && self.decl_local_regs.is_empty() {
             let reason = self
                 .bail_reason
                 .unwrap_or_else(|| Self::stmt_kind_label(stmt));
@@ -2887,6 +2910,7 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     self.local_var_regs
                         .insert(decl.name.name.clone(), (slot, width));
+                    self.decl_local_regs.insert(decl.name.name.clone());
                 }
                 true
             }
@@ -3033,13 +3057,16 @@ impl<'a> BytecodeCompiler<'a> {
             }
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 let saved_locals = self.local_var_regs.clone();
+                let saved_decl_locals = self.decl_local_regs.clone();
                 for s in stmts {
                     if !self.compile_stmt(s) {
                         self.local_var_regs = saved_locals;
+                        self.decl_local_regs = saved_decl_locals;
                         return false;
                     }
                 }
                 self.local_var_regs = saved_locals;
+                self.decl_local_regs = saved_decl_locals;
                 true
             }
             // Bail out on anything else (timing controls, loops, system tasks, etc.)

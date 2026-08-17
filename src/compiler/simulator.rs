@@ -95887,6 +95887,12 @@ mod vpi {
     pub const NAME: c_int = 2;
     pub const FULL_NAME: c_int = 3;
     pub const SIZE: c_int = 4;
+    /// §38.35 Table 38-4: simulation time unit / precision as a base-10
+    /// exponent of seconds. Both are GLOBAL properties — the standard permits
+    /// (and cocotb uses) a NULL object handle to ask for the simulation-wide
+    /// value.
+    pub const TIME_UNIT: c_int = 11;
+    pub const TIME_PRECISION: c_int = 12;
     pub const DEF_NAME: c_int = 9;
     pub const SCALAR: c_int = 17;
     pub const VECTOR: c_int = 18;
@@ -97337,6 +97343,19 @@ pub extern "C" fn vpi_free_object(handle: *mut libc::c_void) -> libc::c_int {
 /// xezim does not model, rather than a plausible-looking 0.
 #[unsafe(no_mangle)]
 pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> libc::c_int {
+    // vpiTimeUnit / vpiTimePrecision are answered BEFORE the handle is
+    // dereferenced: they are simulation-wide, and a NULL `obj` is the standard
+    // way to ask for the whole simulation's value. Deref-first returned
+    // `vpiUndefined` (-1) for them, and a consumer that reads the result as a
+    // base-10 exponent then believes the timebase is 1e-1 s — which is exactly
+    // how cocotb reported "simulator precision of 1e-1" and made every `Timer`
+    // unrepresentable.
+    if property == vpi::TIME_UNIT || property == vpi::TIME_PRECISION {
+        if let Some(exp) = try_active_sim("vpi_get", |sim| Self_secs_to_exp(sim.module.tick_s)) {
+            return exp;
+        }
+        return vpi::UNDEFINED;
+    }
     let Some(h) = (unsafe { vpi_deref(handle) }) else {
         return vpi::UNDEFINED;
     };
@@ -97382,6 +97401,16 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
         }
     })
     .unwrap_or(vpi::UNDEFINED)
+}
+
+/// Base-10 exponent of a seconds value, as VPI reports time unit/precision.
+/// Mirrors `Simulator::secs_to_exp`, which is a private associated fn.
+fn Self_secs_to_exp(s: f64) -> libc::c_int {
+    if s <= 0.0 {
+        -9
+    } else {
+        s.log10().round() as libc::c_int
+    }
 }
 
 /// Store `s` into the thread-local string scratch as a NUL-terminated C
