@@ -956,6 +956,18 @@ struct NbaEntry {
     lhs: Option<Expression>,
     value: Value,
     resolved_id: Option<usize>,
+    /// §6.21: persistent-store key when the target is a `static` subroutine
+    /// local, resolved AT SCHEDULE TIME.
+    ///
+    /// `assign_value` resolves such a target through `static_local_key_for`,
+    /// which reads the CURRENT call frame — correct while the statement is
+    /// executing, wrong in the NBA region, where the declaring frame is no
+    /// longer on top. With two instances of the same interface each running a
+    /// task that does `count <= count + 1`, the two applies raced over whichever
+    /// frame happened to be current: one instance's counter never advanced at
+    /// all while the other advanced at double rate, so its `forever` divider
+    /// never reached its threshold and the clock it drove never toggled.
+    static_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -32810,6 +32822,13 @@ impl Simulator {
         // mem::take achieves the same release without the clones.
         let queue = std::mem::take(&mut self.nba_queue);
         for entry in queue {
+            // A `static` subroutine local commits to the key captured when the
+            // NBA was SCHEDULED; re-resolving here would consult whichever call
+            // frame is current in the NBA region (see NbaEntry::static_key).
+            if let Some(key) = entry.static_key {
+                self.static_local_vars.insert(key, entry.value);
+                continue;
+            }
             if let Some(lhs) = entry.lhs {
                 self.assign_value(&lhs, &entry.value);
             }
@@ -51396,6 +51415,23 @@ impl Simulator {
                         .unwrap_or(0),
                 };
                 if d == 0 {
+                    // A `static` subroutine local is checked BEFORE the signal
+                    // resolution below: it is backed by a persistent store keyed
+                    // per declaring subroutine, but `resolve_nba_target` finds a
+                    // bare same-named SIGNAL, which every instance of an
+                    // interface shares. Two instances each running
+                    // `task Gen; static int count; … count <= count + 1;` then
+                    // wrote one cell — one instance's counter never advanced and
+                    // the divider it fed never reached its threshold.
+                    if let Some(key) = self.nba_static_key_for_lvalue(lvalue) {
+                        self.nba_queue.push(NbaEntry {
+                            lhs: None,
+                            value: val.resize_for_assign(w),
+                            resolved_id: None,
+                            static_key: Some(key),
+                        });
+                        return;
+                    }
                     let id_opt = self.resolve_nba_target(lvalue);
                     if let Some(id) = id_opt {
                         // Track via index map so subsequent partial-NBAs
@@ -51433,10 +51469,12 @@ impl Simulator {
                         } else {
                             val.resize_for_assign(w)
                         };
+                        let static_key = self.nba_static_key_for_lvalue(lvalue);
                         self.nba_queue.push(NbaEntry {
                             lhs: Some(frozen),
                             value: qval,
                             resolved_id: None,
+                            static_key,
                         });
                     }
                 } else if let Some(id) = self.resolve_nba_target(lvalue) {
@@ -51454,10 +51492,12 @@ impl Simulator {
                     } else {
                         val.resize_for_assign(w)
                     };
+                    let static_key = self.nba_static_key_for_lvalue(lvalue);
                     self.nba_queue.push(NbaEntry {
                         lhs: Some(frozen),
                         value: qval,
                         resolved_id: None,
+                        static_key,
                     });
                 }
             }
@@ -82988,6 +83028,27 @@ impl Simulator {
     /// the one that registered `nm`) — NOT the innermost frame, which may be a
     /// nested helper (e.g. a timing `wait_for` wrapper around a revived task
     /// body) that merely surrounds the read/write without declaring `nm`.
+    /// The persistent-store key an NBA must target when its lvalue is a
+    /// `static` subroutine local. Resolved while the declaring frame is still
+    /// current; see `NbaEntry::static_key`.
+    fn nba_static_key_for_lvalue(&self, lvalue: &Expression) -> Option<String> {
+        if self.in_const_param_eval || self.static_local_names.is_empty() {
+            return None;
+        }
+        let ExprKind::Ident(h) = &lvalue.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let n = &h.path[0].name.name;
+        if !self.static_local_names.contains(n.as_str()) {
+            return None;
+        }
+        let k = self.static_local_key_for(n)?;
+        if self.static_local_keys.contains(&k) { Some(k) } else { None }
+    }
+
     fn static_local_key_for(&self, nm: &str) -> Option<String> {
         // §13.4.2: a `static` local is ONE cell shared across calls of ITS OWN
         // subroutine — and nothing else. Only the CURRENT frame may claim the
