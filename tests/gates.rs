@@ -31,3 +31,5 @@ mod vcd_lrm_compliance;
 mod dump_formats_agree;
 #[path = "gates/fst_time_table_breakeven.rs"]
 mod fst_time_table_breakeven;
+#[path = "gates/interrupt_finalizes_dumps.rs"]
+mod interrupt_finalizes_dumps;
