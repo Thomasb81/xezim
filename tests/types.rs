@@ -296,3 +296,5 @@ mod task_fsm_compile;
 mod case_jump_dispatch;
 #[path = "types/case_wildcard_signed_extension.rs"]
 mod case_wildcard_signed_extension;
+#[path = "types/case_mask_jump_dispatch.rs"]
+mod case_mask_jump_dispatch;
