@@ -4181,6 +4181,22 @@ pub struct Simulator {
     /// cannot affect the expression. Conservative: anything the walker does
     /// not positively recognise as safe is recorded impure.
     fn_pure_cache: HashMap<String, bool>,
+    /// Lazily-built index over `module.packed_signal_elem_widths`: every
+    /// dot-terminated prefix of every key, i.e. exactly the set of names for
+    /// which some `name.<rest>` key exists. Formal-metadata bookkeeping runs
+    /// on EVERY function/task call and used to answer that question by
+    /// linear-scanning the whole map — three times per call (snapshot,
+    /// clear, and clear again inside restore). The map scales with the
+    /// DESIGN (packed arrays and struct members everywhere), so on a
+    /// 55k-signal design a single assign with four function calls on its
+    /// RHS cost ~10ms per evaluation. With the index, a formal with no
+    /// dotted keys — every non-struct formal — is O(1).
+    ///
+    /// Invariant: MAY over-approximate (stale entries only cost a scan),
+    /// must NEVER under-approximate — every insertion of a dotted key goes
+    /// through `note_elem_width_key`. Built on first use so every
+    /// construction path (fresh elaboration, artifact load) is covered.
+    elem_dotted_bases: RefCell<Option<HashSet<String>>>,
     /// Compact per-net trace table: (signal_table index, FST signal id).
     fst_trace: Vec<(usize, FstSignalId)>,
     /// Signal id → `fst_trace` slots, for the shared incremental dirty-set
@@ -7032,6 +7048,7 @@ impl Simulator {
             fst_path: None,
             fn_decl_cache: HashMap::default(),
             fn_pure_cache: HashMap::default(),
+            elem_dotted_bases: RefCell::new(None),
             fst_trace: Vec::new(),
             fst_id_to_trace: Vec::new(),
             fst_prev_signals: Vec::new(),
@@ -54117,6 +54134,7 @@ impl Simulator {
                                 ) {
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", d.name.name, mdecl.name.name);
+                                        self.note_elem_width_key(&key);
                                         self.module.packed_signal_elem_widths.insert(key, ew);
                                     }
                                 }
@@ -84587,19 +84605,70 @@ impl Simulator {
         dt.clone()
     }
 
+    /// Does some `name.<rest>` key exist in `packed_signal_elem_widths`?
+    /// Backed by the lazily-built prefix index — see `elem_dotted_bases`.
+    fn elem_base_has_dotted(&self, name: &str) -> bool {
+        let mut cell = self.elem_dotted_bases.borrow_mut();
+        let set = cell.get_or_insert_with(|| {
+            let mut s: HashSet<String> = HashSet::default();
+            for key in self.module.packed_signal_elem_widths.keys() {
+                let bytes = key.as_bytes();
+                for (i, b) in bytes.iter().enumerate() {
+                    if *b == b'.' {
+                        s.insert(key[..i].to_string());
+                    }
+                }
+            }
+            s
+        });
+        set.contains(name)
+    }
+
+    /// Keep the prefix index in step with a key being INSERTED into
+    /// `packed_signal_elem_widths`. No-op until the index is first built —
+    /// the build scan will see the key.
+    fn note_elem_width_key(&self, key: &str) {
+        if !key.contains('.') {
+            return;
+        }
+        if let Some(set) = self.elem_dotted_bases.borrow_mut().as_mut() {
+            let bytes = key.as_bytes();
+            for (i, b) in bytes.iter().enumerate() {
+                if *b == b'.' {
+                    set.insert(key[..i].to_string());
+                }
+            }
+        }
+    }
+
     fn snapshot_formal_metadata(&self, name: &str) -> FormalMetadataSnapshot {
-        let prefix = format!("{}.", name);
+        // Fast path: no dotted `name.<member>` key exists, so the only
+        // possible entry is the exact key — one lookup instead of a scan of
+        // the whole design-sized map.
+        let packed_element_widths = if self.elem_base_has_dotted(name) {
+            self.module
+                .packed_signal_elem_widths
+                .iter()
+                .filter(|(key, _)| {
+                    key.as_str() == name
+                        || key
+                            .strip_prefix(name)
+                            .is_some_and(|rest| rest.starts_with('.'))
+                })
+                .map(|(key, width)| (key.clone(), *width))
+                .collect()
+        } else {
+            self.module
+                .packed_signal_elem_widths
+                .get_key_value(name)
+                .map(|(key, width)| vec![(key.clone(), *width)])
+                .unwrap_or_default()
+        };
         FormalMetadataSnapshot {
             name: name.to_string(),
             declared_type: self.module.var_decl_types.get(name).cloned(),
             packed_fields: self.module.packed_struct_fields.get(name).cloned(),
-            packed_element_widths: self
-                .module
-                .packed_signal_elem_widths
-                .iter()
-                .filter(|(key, _)| key.as_str() == name || key.starts_with(&prefix))
-                .map(|(key, width)| (key.clone(), *width))
-                .collect(),
+            packed_element_widths,
             packed_dimensions: self.module.packed_full_dims.get(name).cloned(),
             class_type: self.var_class_types.get(name).cloned(),
             typedef_type: self.var_typedef_types.get(name).cloned(),
@@ -84607,12 +84676,24 @@ impl Simulator {
     }
 
     fn clear_formal_metadata(&mut self, name: &str) {
-        let prefix = format!("{}.", name);
         self.module.var_decl_types.remove(name);
         self.module.packed_struct_fields.remove(name);
-        self.module
-            .packed_signal_elem_widths
-            .retain(|key, _| key.as_str() != name && !key.starts_with(&prefix));
+        if self.elem_base_has_dotted(name) {
+            self.module.packed_signal_elem_widths.retain(|key, _| {
+                key.as_str() != name
+                    && !key
+                        .strip_prefix(name)
+                        .is_some_and(|rest| rest.starts_with('.'))
+            });
+            // Every `name.…` key is gone; later calls for this base take the
+            // fast path again. (Deeper stale prefixes like `name.sub` may
+            // linger — over-approximation, costs a scan, never correctness.)
+            if let Some(set) = self.elem_dotted_bases.borrow_mut().as_mut() {
+                set.remove(name);
+            }
+        } else {
+            self.module.packed_signal_elem_widths.remove(name);
+        }
         self.module.packed_full_dims.remove(name);
         self.var_class_types.remove(name);
         self.var_typedef_types.remove(name);
@@ -84631,6 +84712,7 @@ impl Simulator {
                 .insert(saved.name.clone(), fields);
         }
         for (key, width) in saved.packed_element_widths {
+            self.note_elem_width_key(&key);
             self.module.packed_signal_elem_widths.insert(key, width);
         }
         if let Some(dimensions) = saved.packed_dimensions {
@@ -84688,9 +84770,9 @@ impl Simulator {
                     &m.data_type, &self.module.parameters, &self.module.typedefs,
                 ) {
                     for mdecl in &m.declarators {
-                        self.module
-                            .packed_signal_elem_widths
-                            .insert(format!("{}.{}", name, mdecl.name.name), ew);
+                        let key = format!("{}.{}", name, mdecl.name.name);
+                        self.note_elem_width_key(&key);
+                        self.module.packed_signal_elem_widths.insert(key, ew);
                     }
                 }
             }
