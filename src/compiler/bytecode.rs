@@ -2019,6 +2019,48 @@ impl<'a> BytecodeCompiler<'a> {
             .join(".")
     }
 
+    /// §7.2.1: `base.member` where `base` resolves to a packed-struct SIGNAL
+    /// and `member` is a field of its recorded layout — a constant bit slice
+    /// of the container. The interpreter served every such read through the
+    /// metadata tables at ~7us a piece; ibex's CSR and interrupt logic does
+    /// ~8 of them per cycle (`mstatus_q.mpp`, `irqs_i.irq_fast`, ...), which
+    /// made this the largest single fallback after the named-cast fix.
+    fn compile_packed_member_read(&mut self, hier: &HierarchicalIdentifier) -> Option<RegId> {
+        let fields_tbl = self.packed_struct_fields?;
+        if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let raw = Self::hier_raw_name(hier);
+        let (base, member) = raw.rsplit_once('.')?;
+        // Resolve the BASE like a plain identifier: scope-qualified first,
+        // then flat.
+        let mut resolved: Option<(usize, String)> = None;
+        if let Some(scope) = &self.scope_hint {
+            let q = format!("{}.{}", scope, base);
+            if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
+                resolved = Some((id, q));
+            }
+        }
+        if resolved.is_none() {
+            if let Some(&id) = self.signal_name_to_id.get(base) {
+                resolved = Some((id, base.to_string()));
+            }
+        }
+        let (base_id, key) = resolved?;
+        let layout = fields_tbl
+            .get(&key)
+            .or_else(|| fields_tbl.get(base))?;
+        let &(_, off, w) = layout.iter().find(|(m, _, _)| m == member)?;
+        if w == 0 {
+            return None;
+        }
+        let root = self.alloc_reg();
+        self.emit(Insn::LoadSignal(root, as_sig_id(base_id)));
+        let dest = self.alloc_reg();
+        self.emit(Insn::RangeSelectConst(dest, root, off + w - 1, off));
+        Some(dest)
+    }
+
     fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
         let raw = Self::hier_raw_name(hier);
         // Targeted override for for-loop variables — see for_loop_var_ids
@@ -3655,6 +3697,14 @@ impl<'a> BytecodeCompiler<'a> {
                     let r = self.alloc_reg();
                     self.emit(Insn::LoadConst(r, Box::new(v)));
                     return Some(r);
+                }
+                if let Some(r) = self.compile_packed_member_read(hier) {
+                    return Some(r);
+                }
+                if std::env::var_os("XEZIM_PROBE_IDENT").is_some() {
+                    if let ExprKind::Ident(h) = &expr.kind {
+                        eprintln!("[IDENT_FALLBACK] {}", Self::hier_raw_name(h));
+                    }
                 }
                 if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "ident_lookup") {
                     return Some(r);
