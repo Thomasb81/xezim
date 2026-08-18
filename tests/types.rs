@@ -278,3 +278,5 @@ mod struct_real_member_roundtrip;
 mod assoc_keys_and_handles;
 #[path = "types/zero_mask_call_elision.rs"]
 mod zero_mask_call_elision;
+#[path = "types/formal_metadata_shadow_roundtrip.rs"]
+mod formal_metadata_shadow_roundtrip;
