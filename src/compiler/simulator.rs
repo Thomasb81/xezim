@@ -4168,6 +4168,14 @@ pub struct Simulator {
     /// Path of the open FST dump, kept so `fst_finish` can repair the file
     /// after the writer has closed it. See `fst_repair_time_tables`.
     fst_path: Option<String>,
+    /// `module.functions` holds each `FunctionDeclaration` by value, so the
+    /// obvious `get(name).cloned()` deep-copies a whole function AST — body,
+    /// statements and all — on EVERY call. On a design that calls a function
+    /// from a continuous assign that is the dominant cost: cloning the decl
+    /// and the allocator traffic behind it accounted for roughly a third of
+    /// the run. Hand out a refcounted handle instead; the deep copy happens
+    /// once per function, then it is a refcount bump.
+    fn_decl_cache: HashMap<String, std::rc::Rc<FunctionDeclaration>>,
     /// Compact per-net trace table: (signal_table index, FST signal id).
     fst_trace: Vec<(usize, FstSignalId)>,
     /// Signal id → `fst_trace` slots, for the shared incremental dirty-set
@@ -7017,6 +7025,7 @@ impl Simulator {
             fst_scopes: Vec::new(),
             fst_writer: None,
             fst_path: None,
+            fn_decl_cache: HashMap::default(),
             fst_trace: Vec::new(),
             fst_id_to_trace: Vec::new(),
             fst_prev_signals: Vec::new(),
@@ -9539,7 +9548,7 @@ impl Simulator {
                 }
             })
             .collect();
-        if let Some(fd) = self.module.functions.get(&name).cloned() {
+        if let Some(fd) = self.fn_decl_rc(&name) {
             let r = self.exec_function_call(&fd, &arg_exprs);
             return match ret_kind {
                 DpiExpKind::Real => r.to_f64().to_bits() as i64,
@@ -79844,7 +79853,7 @@ impl Simulator {
                     if h.path.len() == 1 && h.path[0].selects.is_empty() {
                         if let Some(idx) = self.eval_scalar_self(index) {
                             let name = format!("{}[{}].{}", h.path[0].name.name, idx, member.name);
-                            if let Some(fd) = self.module.functions.get(&name).cloned() {
+                            if let Some(fd) = self.fn_decl_rc(&name) {
                                 return self.exec_function_call(&fd, args);
                             }
                             if let Some(td) = self.module.tasks.get(&name).cloned() {
@@ -79870,7 +79879,7 @@ impl Simulator {
                 let joined = segs.join(".");
                 // Interface (or generate-scope) subroutine under its
                 // hierarchical key.
-                if let Some(fd) = self.module.functions.get(&joined).cloned() {
+                if let Some(fd) = self.fn_decl_rc(&joined) {
                     return self.exec_function_call(&fd, args);
                 }
                 if let Some(td) = self.module.tasks.get(&joined).cloned() {
@@ -82462,7 +82471,7 @@ impl Simulator {
                 if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
                     let pkg = pkg.clone();
                     let qual = format!("{}::{}", pkg, name);
-                    if let Some(fd) = self.module.functions.get(&qual).cloned() {
+                    if let Some(fd) = self.fn_decl_rc(&qual) {
                         self.pending_pkg_scope = Some(pkg);
                         return self.exec_function_call(&fd, args);
                     }
@@ -82474,7 +82483,7 @@ impl Simulator {
                 }
             }
             // Module-level function call
-            if let Some(fd) = self.module.functions.get(name).cloned() {
+            if let Some(fd) = self.fn_decl_rc(name) {
                 self.pending_pkg_scope = self.bare_call_pkg_scope(name, hier.path.len());
                 return self.exec_function_call(&fd, args);
             }
@@ -83537,6 +83546,20 @@ impl Simulator {
         } else {
             v.to_u64().unwrap_or(0)
         }
+    }
+
+    /// Refcounted handle to a module-scope function declaration. Clones the
+    /// AST at most once per name; every later call is a pointer copy. Returns
+    /// `None` for a name this module does not declare, exactly like the map
+    /// lookup it replaces.
+    fn fn_decl_rc(&mut self, name: &str) -> Option<std::rc::Rc<FunctionDeclaration>> {
+        if let Some(rc) = self.fn_decl_cache.get(name) {
+            return Some(rc.clone());
+        }
+        let fd = self.module.functions.get(name)?.clone();
+        let rc = std::rc::Rc::new(fd);
+        self.fn_decl_cache.insert(name.to_string(), rc.clone());
+        Some(rc)
     }
 
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
