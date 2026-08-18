@@ -4466,6 +4466,44 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::Resize(r, n));
                         Some(r)
                     }
+                    // §20.6.2: `$bits` of a statically-known operand is a
+                    // COMPILE-TIME constant. Restricted to the shapes the
+                    // tables answer exactly: a name in `cast_widths` (typedef
+                    // or enum — the `$bits(ibex_mubi_t)` form ibex's unused-
+                    // signal reductions use ~4x per cycle) or a plain SIGNAL
+                    // (declared width). Anything else — strings, class
+                    // handles, unpacked aggregates — keeps the interpreter.
+                    "$bits" => {
+                        let w: Option<u32> = args.first().and_then(|a| match &a.kind {
+                            ExprKind::Ident(h)
+                                if h.root.is_none()
+                                    && h.path.len() == 1
+                                    && h.path[0].selects.is_empty() =>
+                            {
+                                let nm = &h.path[0].name.name;
+                                self.cast_widths
+                                    .and_then(|m| m.get(nm).map(|&(w, _)| w))
+                                    .or_else(|| {
+                                        self.lookup_signal_id(h)
+                                            .map(|id| self.signal_widths[id])
+                                    })
+                            }
+                            _ => None,
+                        });
+                        if let Some(w) = w.filter(|&w| w > 0) {
+                            let r = self.alloc_reg();
+                            self.emit(Insn::LoadConst(r, Box::new(Value::from_u64(w as u64, 32))));
+                            Some(r)
+                        } else {
+                            if let Some(r) =
+                                self.emit_expr_fallback(expr, ctx_width, "SystemCall_bits")
+                            {
+                                return Some(r);
+                            }
+                            self.bail("SystemCall_bits");
+                            None
+                        }
+                    }
                     // §6.24.1 named cast, statically resolvable target. The
                     // cast type is the CONTEXT for its operand, so the operand
                     // compiles at the target width, then Resize + sign mark.
