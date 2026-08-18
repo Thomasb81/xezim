@@ -276,3 +276,5 @@ mod assoc_enum_key_name;
 mod struct_real_member_roundtrip;
 #[path = "types/assoc_keys_and_handles.rs"]
 mod assoc_keys_and_handles;
+#[path = "types/zero_mask_call_elision.rs"]
+mod zero_mask_call_elision;

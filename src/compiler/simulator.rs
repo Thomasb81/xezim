@@ -4176,6 +4176,11 @@ pub struct Simulator {
     /// the run. Hand out a refcounted handle instead; the deep copy happens
     /// once per function, then it is a refcount bump.
     fn_decl_cache: HashMap<String, std::rc::Rc<FunctionDeclaration>>,
+    /// Memoized answer to "is this module-scope function side-effect free?",
+    /// used to decide whether a call may be skipped when its result provably
+    /// cannot affect the expression. Conservative: anything the walker does
+    /// not positively recognise as safe is recorded impure.
+    fn_pure_cache: HashMap<String, bool>,
     /// Compact per-net trace table: (signal_table index, FST signal id).
     fst_trace: Vec<(usize, FstSignalId)>,
     /// Signal id → `fst_trace` slots, for the shared incremental dirty-set
@@ -7026,6 +7031,7 @@ impl Simulator {
             fst_writer: None,
             fst_path: None,
             fn_decl_cache: HashMap::default(),
+            fn_pure_cache: HashMap::default(),
             fst_trace: Vec::new(),
             fst_id_to_trace: Vec::new(),
             fst_prev_signals: Vec::new(),
@@ -43775,6 +43781,29 @@ impl Simulator {
                     }
                 }
                 let mut l = self.eval_expr_ctx(left, self_det_w);
+                // §11.4.8 zero-mask elision. `0 & anything` is 0 for EVERY
+                // value the other side can take — `0 & x` and `0 & z` are both
+                // 0 — so the result cannot depend on the call. Gating a
+                // function result with a reset mask (`{N{rst_n}} & f(..)`) is
+                // ordinary RTL, and evaluating `f` for a result that is thrown
+                // away dominated such a design: on a 200k-cycle benchmark the
+                // call cost the same during reset as out of it.
+                //
+                // The LRM does evaluate both operands of a bitwise `&` (unlike
+                // `&&`), so this is only legal for a callee with no observable
+                // effect — hence the purity check. `self_det_w` already carries
+                // the max of both operand widths, computed by INFERENCE rather
+                // than evaluation, so the skipped side still sizes the result.
+                // Restricted to <=64 bits, where `raw_bits` sees every bit.
+                if matches!(op, BinaryOp::BitAnd) && l.width <= 64 && l.raw_bits() == (0, 0) {
+                    if let ExprKind::Call { func, .. } = &Self::peel_parens(right).kind {
+                        if let Some(fname) = Self::call_target_name(func) {
+                            if self.fn_is_pure(&fname) {
+                                return Value::zero(self_det_w.max(1));
+                            }
+                        }
+                    }
+                }
                 let is_shift_op = matches!(
                     op,
                     BinaryOp::ShiftLeft
@@ -83545,6 +83574,198 @@ impl Simulator {
             v.to_i64().unwrap_or(0).max(0) as u64
         } else {
             v.to_u64().unwrap_or(0)
+        }
+    }
+
+    /// Is `name` a module-scope function with no observable side effects?
+    ///
+    /// "Pure" here means: calling it, or not calling it, cannot be told apart
+    /// from outside. It may read anything; it may not WRITE anything a later
+    /// read could see, and it may not produce output. The walker whitelists —
+    /// every construct it does not explicitly understand makes the function
+    /// impure, so a wrong answer costs a missed optimization, never a wrong
+    /// simulation.
+    ///
+    /// Impure: `ref`/`output`/`inout` formals (the caller sees the write), a
+    /// write to anything not declared inside the function, any system task or
+    /// task call, timing controls, assertions, and any call to a function that
+    /// is itself impure. Recursion is treated as impure rather than solved.
+    fn fn_is_pure(&mut self, name: &str) -> bool {
+        if let Some(&p) = self.fn_pure_cache.get(name) {
+            return p;
+        }
+        // Guard against recursion: assume impure while we are deciding, so a
+        // self- or mutually-recursive function settles on `false` instead of
+        // looping.
+        self.fn_pure_cache.insert(name.to_string(), false);
+        let Some(fd) = self.fn_decl_rc(name) else {
+            return false;
+        };
+
+        // Formals that let a write escape make it impure outright.
+        for port in &fd.ports {
+            if !matches!(port.direction, crate::ast::types::PortDirection::Input) {
+                return false;
+            }
+        }
+
+        // Names a write may legally target: the return value and anything
+        // declared inside (formals included).
+        let mut locals: HashSet<String> = HashSet::default();
+        locals.insert(fd.name.name.name.clone());
+        for port in &fd.ports {
+            locals.insert(port.name.name.clone());
+        }
+        Self::collect_decl_names(&fd.items, &mut locals);
+
+        let pure = self.stmts_are_pure(&fd.items, &locals);
+        self.fn_pure_cache.insert(name.to_string(), pure);
+        pure
+    }
+
+    /// Variable names declared anywhere inside a statement list.
+    fn collect_decl_names(stmts: &[Statement], out: &mut HashSet<String>) {
+        for st in stmts {
+            match &st.kind {
+                StatementKind::VarDecl { declarators, .. } => {
+                    for d in declarators {
+                        out.insert(d.name.name.clone());
+                    }
+                }
+                StatementKind::SeqBlock { stmts, .. } => Self::collect_decl_names(stmts, out),
+                StatementKind::If { then_stmt, else_stmt, .. } => {
+                    Self::collect_decl_names(std::slice::from_ref(then_stmt), out);
+                    if let Some(e) = else_stmt {
+                        Self::collect_decl_names(std::slice::from_ref(e), out);
+                    }
+                }
+                StatementKind::Case { items, .. } => {
+                    for it in items {
+                        Self::collect_decl_names(std::slice::from_ref(&it.stmt), out);
+                    }
+                }
+                StatementKind::For { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Foreach { body, .. } => {
+                    Self::collect_decl_names(std::slice::from_ref(body), out)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn stmts_are_pure(&mut self, stmts: &[Statement], locals: &HashSet<String>) -> bool {
+        stmts.iter().all(|st| self.stmt_is_pure(st, locals))
+    }
+
+    fn stmt_is_pure(&mut self, st: &Statement, locals: &HashSet<String>) -> bool {
+        match &st.kind {
+            StatementKind::Null | StatementKind::VarDecl { .. } => true,
+            StatementKind::Break | StatementKind::Continue => true,
+            StatementKind::Return(e) => {
+                e.as_ref().is_none_or(|e| self.expr_is_pure(e, locals))
+            }
+            StatementKind::BlockingAssign { lvalue, rvalue } => {
+                Self::lvalue_is_local(lvalue, locals)
+                    && self.expr_is_pure(lvalue, locals)
+                    && self.expr_is_pure(rvalue, locals)
+            }
+            StatementKind::SeqBlock { stmts, .. } => self.stmts_are_pure(stmts, locals),
+            StatementKind::If { condition, then_stmt, else_stmt, .. } => {
+                self.expr_is_pure(condition, locals)
+                    && self.stmt_is_pure(then_stmt, locals)
+                    && else_stmt.as_ref().is_none_or(|e| self.stmt_is_pure(e, locals))
+            }
+            StatementKind::Case { expr, items, .. } => {
+                self.expr_is_pure(expr, locals)
+                    && items.iter().all(|it| {
+                        it.patterns.iter().all(|e| self.expr_is_pure(e, locals))
+                            && self.stmt_is_pure(&it.stmt, locals)
+                    })
+            }
+            StatementKind::For { condition, step, body, .. } => {
+                condition.as_ref().is_none_or(|c| self.expr_is_pure(c, locals))
+                    && step.iter().all(|e| self.expr_is_pure(e, locals))
+                    && self.stmt_is_pure(body, locals)
+            }
+            StatementKind::While { condition, body } | StatementKind::DoWhile { condition, body } => {
+                self.expr_is_pure(condition, locals) && self.stmt_is_pure(body, locals)
+            }
+            StatementKind::Repeat { count, body } => {
+                self.expr_is_pure(count, locals) && self.stmt_is_pure(body, locals)
+            }
+            // Everything else — timing, tasks, assertions, forks, triggers,
+            // nonblocking assigns — is either observable or not understood.
+            _ => false,
+        }
+    }
+
+    /// A write is safe only when its ultimate base name is declared inside the
+    /// function. `a.b[i]` is judged by `a`.
+    fn lvalue_is_local(lv: &Expression, locals: &HashSet<String>) -> bool {
+        match &lv.kind {
+            ExprKind::Ident(h) => {
+                h.path.len() == 1 && locals.contains(&h.path[0].name.name)
+            }
+            ExprKind::Index { expr, .. } | ExprKind::MemberAccess { expr, .. } => {
+                Self::lvalue_is_local(expr, locals)
+            }
+            ExprKind::Paren(e) => Self::lvalue_is_local(e, locals),
+            _ => false,
+        }
+    }
+
+    fn expr_is_pure(&mut self, e: &Expression, locals: &HashSet<String>) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) | ExprKind::StringLiteral(_) | ExprKind::Ident(_) => true,
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => self.expr_is_pure(x, locals),
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_is_pure(left, locals) && self.expr_is_pure(right, locals)
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                self.expr_is_pure(condition, locals)
+                    && self.expr_is_pure(then_expr, locals)
+                    && self.expr_is_pure(else_expr, locals)
+            }
+            ExprKind::Concatenation(xs) => xs.iter().all(|x| self.expr_is_pure(x, locals)),
+            ExprKind::Replication { count, exprs } => {
+                self.expr_is_pure(count, locals)
+                    && exprs.iter().all(|x| self.expr_is_pure(x, locals))
+            }
+            ExprKind::Index { expr, index } => {
+                self.expr_is_pure(expr, locals) && self.expr_is_pure(index, locals)
+            }
+            ExprKind::MemberAccess { expr, .. } => self.expr_is_pure(expr, locals),
+            // A nested call is fine only if it is itself pure. A system call
+            // ($display, $random, $time) never is.
+            ExprKind::Call { func, args } => {
+                let Some(fname) = Self::call_target_name(func) else {
+                    return false;
+                };
+                args.iter().all(|a| self.expr_is_pure(a, locals)) && self.fn_is_pure(&fname)
+            }
+            _ => false,
+        }
+    }
+
+    /// Strip redundant parentheses so a wrapped call is still recognised.
+    fn peel_parens(e: &Expression) -> &Expression {
+        let mut cur = e;
+        while let ExprKind::Paren(inner) = &cur.kind {
+            cur = inner;
+        }
+        cur
+    }
+
+    /// Bare, unqualified name of a call target; `None` for anything dotted or
+    /// computed, which this analysis does not attempt to resolve.
+    fn call_target_name(name: &Expression) -> Option<String> {
+        match &name.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                Some(h.path[0].name.name.clone())
+            }
+            _ => None,
         }
     }
 
