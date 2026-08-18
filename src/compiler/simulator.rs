@@ -18125,6 +18125,23 @@ impl Simulator {
                     pc = *target as usize;
                     continue;
                 }
+                Insn::CaseJump(src, cj) => {
+                    // Compile gate guarantees the selector is unsigned and
+                    // <=64 bits, so raw numeric dispatch matches the ===
+                    // chain it replaces; any x/z bit matches no constant
+                    // pattern -> default (table holes also hold default).
+                    let s = &vm_regs[*src as usize];
+                    let t = if s.has_xz() {
+                        cj.default
+                    } else {
+                        match s.to_u64() {
+                            Some(i) => cj.table.get(i as usize).copied().unwrap_or(cj.default),
+                            None => cj.default,
+                        }
+                    };
+                    pc = t as usize;
+                    continue;
+                }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let sig_id = &(*sig_id as usize);
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
@@ -18651,6 +18668,23 @@ impl Simulator {
                 }
                 Insn::Jump(target) => {
                     pc = *target as usize;
+                    continue;
+                }
+                Insn::CaseJump(src, cj) => {
+                    // Compile gate guarantees the selector is unsigned and
+                    // <=64 bits, so raw numeric dispatch matches the ===
+                    // chain it replaces; any x/z bit matches no constant
+                    // pattern -> default (table holes also hold default).
+                    let s = &vm_regs[*src as usize];
+                    let t = if s.has_xz() {
+                        cj.default
+                    } else {
+                        match s.to_u64() {
+                            Some(i) => cj.table.get(i as usize).copied().unwrap_or(cj.default),
+                            None => cj.default,
+                        }
+                    };
+                    pc = t as usize;
                     continue;
                 }
                 Insn::Move(d, s) => {
@@ -19754,6 +19788,23 @@ impl Simulator {
                 }
                 Insn::Jump(target) => {
                     pc = *target as usize;
+                    continue;
+                }
+                Insn::CaseJump(src, cj) => {
+                    // Compile gate guarantees the selector is unsigned and
+                    // <=64 bits, so raw numeric dispatch matches the ===
+                    // chain it replaces; any x/z bit matches no constant
+                    // pattern -> default (table holes also hold default).
+                    let s = &self.vm_regs[*src as usize];
+                    let t = if s.has_xz() {
+                        cj.default
+                    } else {
+                        match s.to_u64() {
+                            Some(i) => cj.table.get(i as usize).copied().unwrap_or(cj.default),
+                            None => cj.default,
+                        }
+                    };
+                    pc = t as usize;
                     continue;
                 }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
@@ -28446,6 +28497,7 @@ impl Simulator {
         use super::bytecode::Insn;
         match insn {
             Insn::CaseLut(..) => "CaseLut",
+            Insn::CaseJump(..) => "CaseJump",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
