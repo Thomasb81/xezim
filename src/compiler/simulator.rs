@@ -26090,7 +26090,6 @@ impl Simulator {
         // recovery path is the last one that did not, and skipping it would
         // re-date the livelocked slot's changes onto `ft` in both `$monitor`
         // and the dump.
-        self.run_postponed_region();
         self.time = ft;
         self.stall_iters = 0;
         self.stall_time = ft;
