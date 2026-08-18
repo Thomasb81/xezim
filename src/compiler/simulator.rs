@@ -18161,6 +18161,9 @@ impl Simulator {
                     pc = t as usize;
                     continue;
                 }
+                Insn::Format(dst, f) => {
+                    vm_regs[*dst as usize] = Self::exec_format(f, vm_regs);
+                }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let sig_id = &(*sig_id as usize);
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
@@ -18346,6 +18349,7 @@ impl Simulator {
                 Insn::StmtFallback(..)
                 | Insn::EvalExprFallback(..)
                 | Insn::BlockingAssign(..)
+                | Insn::BlockingAssignString(..)
                 | Insn::BlockingAssignRange(..)
                 | Insn::BlockingAssignRangeDyn(..)
                 | Insn::BlockingAssignBitDyn(..)
@@ -18725,6 +18729,9 @@ impl Simulator {
                     pc = t as usize;
                     continue;
                 }
+                Insn::Format(dst, f) => {
+                    vm_regs[*dst as usize] = Self::exec_format(f, vm_regs);
+                }
                 Insn::Move(d, s) => {
                     vm_regs[*d as usize] = vm_regs[*s as usize].clone();
                 }
@@ -18783,6 +18790,13 @@ impl Simulator {
                         val.is_signed = signal_signed[id];
                         comb_write_full!(id, val);
                     }
+                }
+                Insn::BlockingAssignString(sig_id, val_reg) => {
+                    // §6.16: store as-is — the table width is a placeholder
+                    // and a resize would drop the front of the text.
+                    let id = *sig_id as usize;
+                    let val = vm_regs[*val_reg as usize].clone();
+                    comb_write_full!(id, val);
                 }
                 Insn::BlockingAssignRange(sig_id, hi, lo, val_reg) => {
                     let sig_id = &(*sig_id as usize);
@@ -19864,6 +19878,9 @@ impl Simulator {
                     pc = t as usize;
                     continue;
                 }
+                Insn::Format(dst, f) => {
+                    self.vm_regs[*dst as usize] = Self::exec_format(f, &self.vm_regs);
+                }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let sig_id = &(*sig_id as usize);
                     let val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
@@ -20180,6 +20197,26 @@ impl Simulator {
                     }
                     if !handled {
                         let val = self.fit_value_to_signal(id, &self.vm_regs[*val_reg as usize]);
+                        if self.signal_table[id] != val {
+                            if !self.dirty_signals[id] {
+                                self.dirty_signals[id] = true;
+                                self.dirty_list.push(id);
+                            }
+                            self.dirty_any = true;
+                            write_sig!(self, id, val);
+                            self.table_modified = true;
+                        }
+                    }
+                }
+                Insn::BlockingAssignString(sig_id, val_reg) => {
+                    // §6.16 string store: `fit_value_to_signal` keeps the
+                    // value's own width (string-aware), no fast masking path.
+                    let id = *sig_id as usize;
+                    let forced = !self.forced_signals.is_empty()
+                        && self.forced_signals.contains_key(&id);
+                    if !forced {
+                        let val =
+                            self.fit_value_to_signal(id, &self.vm_regs[*val_reg as usize]);
                         if self.signal_table[id] != val {
                             if !self.dirty_signals[id] {
                                 self.dirty_signals[id] = true;
@@ -28556,6 +28593,8 @@ impl Simulator {
             Insn::CaseLut(..) => "CaseLut",
             Insn::CaseJump(..) => "CaseJump",
             Insn::CaseMaskJump(..) => "CaseMaskJump",
+            Insn::Format(..) => "Format",
+            Insn::BlockingAssignString(..) => "BlockingAssignString",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
@@ -70660,6 +70699,128 @@ impl Simulator {
 
     /// §21.2.1.3: widest decimal string the operand's type can produce —
     /// `%d` with no explicit width space-pads to this.
+    /// Fill a compile-time-parsed `$sformatf` template from register
+    /// Values. Byte-identical to the AST formatter for the specs
+    /// `parse_format_template` admits — each arm calls the SAME value-level
+    /// cores the AST spec arms call.
+    fn exec_format(f: &super::bytecode::FormatData, regs: &[Value]) -> Value {
+        use super::bytecode::FmtSeg;
+        let mut out = String::new();
+        let mut ai = 0usize;
+        for seg in &f.segs {
+            match seg {
+                FmtSeg::Lit(t) => out.push_str(t),
+                FmtSeg::Spec {
+                    spec,
+                    width,
+                    left,
+                    str_valued,
+                } => {
+                    let v = &regs[f.args[ai] as usize];
+                    ai += 1;
+                    let pad = |out: &mut String, core: String, w: usize, left: bool| {
+                        if core.len() >= w {
+                            out.push_str(&core);
+                        } else if left {
+                            out.push_str(&core);
+                            for _ in 0..w - core.len() {
+                                out.push(' ');
+                            }
+                        } else {
+                            for _ in 0..w - core.len() {
+                                out.push(' ');
+                            }
+                            out.push_str(&core);
+                        }
+                    };
+                    match spec {
+                        'd' => {
+                            let core = v.to_dec_string();
+                            let w = match width {
+                                None => Self::dec_default_width(v.width, v.is_signed),
+                                Some(n) => *n as usize,
+                            };
+                            pad(&mut out, core, w, *left);
+                        }
+                        'b' => {
+                            let full = v.to_bin_string();
+                            match width {
+                                None => out.push_str(&full),
+                                Some(n) => {
+                                    Self::push_radix(&mut out, &full, *n as usize, *left)
+                                }
+                            }
+                        }
+                        'h' | 'x' => {
+                            let full = v.to_hex_string();
+                            match width {
+                                None => out.push_str(&full),
+                                Some(n) => {
+                                    Self::push_radix(&mut out, &full, *n as usize, *left)
+                                }
+                            }
+                        }
+                        'o' => {
+                            let full = Self::bin_to_oct_string(&v.to_bin_string());
+                            match width {
+                                None => out.push_str(&full),
+                                Some(n) => {
+                                    Self::push_radix(&mut out, &full, *n as usize, *left)
+                                }
+                            }
+                        }
+                        's' => {
+                            let w = width.unwrap_or(0) as usize;
+                            if *str_valued {
+                                pad(&mut out, v.to_sv_string(), w, *left);
+                            } else {
+                                // §21.2.1.3 packed operand: every byte
+                                // prints, NUL as space; %0s strips leading
+                                // NULs (minimal form).
+                                let minimal = matches!(width, Some(0));
+                                let nbytes = (v.width as usize).div_ceil(8);
+                                let mut bytes: Vec<u8> = Vec::with_capacity(nbytes);
+                                for bi in (0..nbytes).rev() {
+                                    let mut byte = 0u8;
+                                    for b in 0..8usize {
+                                        let idx = bi * 8 + b;
+                                        if idx < v.width as usize
+                                            && v.get_bit(idx) == LogicBit::One
+                                        {
+                                            byte |= 1 << b;
+                                        }
+                                    }
+                                    bytes.push(byte);
+                                }
+                                if minimal {
+                                    while bytes.first() == Some(&0) {
+                                        bytes.remove(0);
+                                    }
+                                }
+                                let sres: String = bytes
+                                    .iter()
+                                    .map(|&b| if b == 0 { ' ' } else { b as char })
+                                    .collect();
+                                pad(&mut out, sres, w, *left);
+                            }
+                        }
+                        'c' => {
+                            let b = (v.to_u64().unwrap_or(0) & 0xff) as u8;
+                            pad(
+                                &mut out,
+                                (b as char).to_string(),
+                                width.unwrap_or(0) as usize,
+                                *left,
+                            );
+                        }
+                        _ => unreachable!("unsupported spec in compiled template"),
+                    }
+                }
+            }
+        }
+        Value::from_string(&out)
+    }
+
     fn dec_default_width(bits: u32, signed: bool) -> usize {
         if bits == 0 {
             return 1;
