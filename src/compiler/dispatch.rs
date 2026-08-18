@@ -106,6 +106,9 @@ impl Opcode {
             Insn::Eq(_, _, _) => Self::Eq,
             Insn::Neq(_, _, _) => Self::Neq,
             Insn::CaseEq(_, _, _) => Self::CaseEq,
+            // Reuse the fallback-style slow path bucket: dispatch tables only
+            // need SOME opcode; CaseLut executes through the generic match.
+            Insn::CaseLut(_, _, _) => Self::CaseEq,
             Insn::CasezEq(_, _, _) => Self::CasezEq,
             Insn::CasexEq(_, _, _) => Self::CasexEq,
             Insn::Lt(_, _, _) => Self::Lt,

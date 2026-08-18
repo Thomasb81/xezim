@@ -290,3 +290,5 @@ mod tf_port_direction_inheritance;
 mod inside_const_members;
 #[path = "types/packed_struct_pattern_compile.rs"]
 mod packed_struct_pattern_compile;
+#[path = "types/task_fsm_compile.rs"]
+mod task_fsm_compile;

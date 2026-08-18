@@ -17195,7 +17195,17 @@ impl Simulator {
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
             compiler.top_module_name = Some(self.module.name.clone());
-            if compiler.compile_stmt(&block.stmt) {
+            let ok = compiler.compile_stmt(&block.stmt);
+            if !ok && std::env::var_os("XEZIM_EDGE_BLOCK_STATS").is_some() {
+                eprintln!(
+                    "[EDGE-BAIL] scope='{}' reason={} span={}..{}",
+                    block.scope,
+                    compiler.bail_reason.unwrap_or("unknown"),
+                    block.stmt.span.start,
+                    block.stmt.span.end
+                );
+            }
+            if ok {
                 let cb = compiler.finish();
                 if let Ok(limit) = std::env::var("XZ_BC_DUMP") {
                     let limit: usize = limit.parse().unwrap_or(0);
@@ -17204,10 +17214,17 @@ impl Simulator {
                             "[BC-DUMP] block#{} scope='{}' insns={:?}",
                             compiled.len(),
                             block.scope,
-                            cb.instructions
-                                .iter()
-                                .map(super::bytecode::insn_opcode_name)
-                                .collect::<Vec<_>>()
+                            if std::env::var_os("XZ_BC_DUMP_FULL").is_some() {
+                                cb.instructions
+                                    .iter()
+                                    .map(|i| format!("{:?}", i))
+                                    .collect::<Vec<_>>()
+                            } else {
+                                cb.instructions
+                                    .iter()
+                                    .map(|i| super::bytecode::insn_opcode_name(i).to_string())
+                                    .collect::<Vec<_>>()
+                            }
                         );
                     }
                 }
@@ -17889,6 +17906,15 @@ impl Simulator {
                 Insn::CaseEq(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].case_eq(&vm_regs[*r as usize]);
                 }
+                Insn::CaseLut(d, src, lut) => {
+                    let s = &vm_regs[*src as usize];
+                    let hit = if s.has_xz() {
+                        None
+                    } else {
+                        s.to_u64().and_then(|i| lut.table.get(i as usize))
+                    };
+                    vm_regs[*d as usize] = hit.unwrap_or(&lut.default).clone();
+                }
                 // Fused `LoadConst` + binop. Character-for-character the
                 // `Add`/`Eq`/`CaseEq` arms above with `&vm_regs[r]` replaced by
                 // the embedded constant, which the elided `LoadConst` would
@@ -18413,6 +18439,15 @@ impl Simulator {
                 }
                 Insn::CaseEq(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].case_eq(&vm_regs[*r as usize]);
+                }
+                Insn::CaseLut(d, src, lut) => {
+                    let s = &vm_regs[*src as usize];
+                    let hit = if s.has_xz() {
+                        None
+                    } else {
+                        s.to_u64().and_then(|i| lut.table.get(i as usize))
+                    };
+                    vm_regs[*d as usize] = hit.unwrap_or(&lut.default).clone();
                 }
                 // Fused `LoadConst` + binop. Character-for-character the
                 // `Add`/`Eq`/`CaseEq` arms above with `&vm_regs[r]` replaced by
@@ -19178,6 +19213,16 @@ impl Simulator {
                 census_prev = op;
             }
             match &insns[pc] {
+                Insn::CaseLut(d, src, lut) => {
+                    let sv = &self.vm_regs[*src as usize];
+                    let hit = if sv.has_xz() {
+                        None
+                    } else {
+                        sv.to_u64().and_then(|i| lut.table.get(i as usize))
+                    };
+                    let out = hit.unwrap_or(&lut.default).clone();
+                    self.vm_regs[*d as usize] = out;
+                }
                 Insn::LoadConst(dest, val) => {
                     // Reuse vm_regs[dest]'s buffer via copy_from — no alloc.
                     self.vm_regs[*dest as usize].copy_from(val.as_ref());
@@ -28400,6 +28445,7 @@ impl Simulator {
     fn edge_opcode_name(insn: &super::bytecode::Insn) -> &'static str {
         use super::bytecode::Insn;
         match insn {
+            Insn::CaseLut(..) => "CaseLut",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
