@@ -101,3 +101,12 @@ panic = "abort"
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+# Local patch of fst-writer 0.3.1. `write_time_table` used `>` where the format
+# needs `>=`: when zlib output is exactly the same size as its input it wrote
+# COMPRESSED bytes while recording equal compressed/uncompressed lengths, which
+# every reader reads as "stored raw". The dump then decodes to garbage
+# timestamps while passing every structural check. Upstream fix is one
+# character; drop this patch once a release carries it.
+[patch.crates-io]
+fst-writer = { path = "vendor/fst-writer" }
