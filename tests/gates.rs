@@ -29,3 +29,5 @@ mod udp_primitives;
 mod vcd_lrm_compliance;
 #[path = "gates/dump_formats_agree.rs"]
 mod dump_formats_agree;
+#[path = "gates/fst_time_table_breakeven.rs"]
+mod fst_time_table_breakeven;
