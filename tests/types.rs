@@ -286,3 +286,5 @@ mod decode_helper_assign_compiles;
 mod unpacked_elem_compare_width;
 #[path = "types/tf_port_direction_inheritance.rs"]
 mod tf_port_direction_inheritance;
+#[path = "types/inside_const_members.rs"]
+mod inside_const_members;

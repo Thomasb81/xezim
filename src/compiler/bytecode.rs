@@ -2061,6 +2061,21 @@ impl<'a> BytecodeCompiler<'a> {
         Some(dest)
     }
 
+    /// A set-membership member as a compile-time CONSTANT with no x/z bits —
+    /// the only shape `compile_inside` accepts (see there).
+    fn inside_member_const(&mut self, m: &Expression) -> Option<Value> {
+        let v = match &m.kind {
+            ExprKind::Number(num) => self.eval_number_static(num)?,
+            ExprKind::Ident(h) => self.lookup_param_value(h)?,
+            ExprKind::Paren(inner) => return self.inside_member_const(inner),
+            _ => return None,
+        };
+        if v.has_xz() || v.is_real {
+            return None;
+        }
+        Some(v)
+    }
+
     fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
         let raw = Self::hier_raw_name(hier);
         // Targeted override for for-loop variables — see for_loop_var_ids
@@ -4567,6 +4582,63 @@ impl<'a> BytecodeCompiler<'a> {
             // formals. That is the overwhelmingly common combinational-helper
             // shape in RTL (`lfsr32(s)`, `mix(a,b)`), and leaving it to the AST
             // interpreter dragged the whole enclosing block out of bytecode.
+            // §11.4.13 set membership, restricted to what makes `==?`
+            // degenerate to `==`: every member a compile-time constant with
+            // no x/z bits. That is the enum-list shape ibex's decoder and CSR
+            // logic use (`csr_op inside {CSR_OP_WRITE, ...}`) — ~2.6 such
+            // evaluations per cycle ran interpreted. An x in the OPERAND
+            // still propagates exactly per LRM: Eq yields x, and x|1 = 1,
+            // x|0 = x. Ranges and wildcard members keep the interpreter.
+            ExprKind::Inside { expr: e, ranges } => {
+                let mut members: Vec<Value> = Vec::with_capacity(ranges.len());
+                let mut ok = true;
+                for m in ranges {
+                    match self.inside_member_const(m) {
+                        Some(v) => members.push(v),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok || members.is_empty() {
+                    if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "Expr_Inside") {
+                        return Some(r);
+                    }
+                    self.bail("Expr_Inside");
+                    return None;
+                }
+                let wmax = members
+                    .iter()
+                    .map(|v| v.width)
+                    .fold(self.lrm_self_width(e), u32::max)
+                    .max(1);
+                let src = self.compile_expr(e, wmax)?;
+                // Fresh register: Resize/ClearSigned must not mutate a shared
+                // one (same rule as the named cast above).
+                let er = self.alloc_reg();
+                self.emit(Insn::Move(er, src));
+                self.emit(Insn::Resize(er, wmax));
+                self.emit(Insn::ClearSigned(er));
+                let mut acc: Option<RegId> = None;
+                for v in members {
+                    let mut c = v.resize(wmax);
+                    c.is_signed = false;
+                    let cr = self.alloc_reg();
+                    self.emit(Insn::LoadConst(cr, Box::new(c)));
+                    let t = self.alloc_reg();
+                    self.emit(Insn::Eq(t, er, cr));
+                    acc = Some(match acc {
+                        None => t,
+                        Some(a) => {
+                            let o = self.alloc_reg();
+                            self.emit(Insn::BitOr(o, a, t));
+                            o
+                        }
+                    });
+                }
+                acc
+            }
             ExprKind::Call { func, args } => self
                 .compile_pure_call(func, args, ctx_width)
                 .or_else(|| self.emit_expr_fallback(expr, ctx_width, "Expr_Call_impure")),
