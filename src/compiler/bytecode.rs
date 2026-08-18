@@ -1944,6 +1944,20 @@ impl<'a> BytecodeCompiler<'a> {
                         && step.iter().all(|e| expr_ok(e, &inner, me))
                         && stmt_ok(body, &mut inner, me)
                 }
+                // case/casez/casex — the shape of virtually every decode
+                // helper (`assign x = f(op)` over a big casez). Leaving this
+                // arm out branded ALL of them impure, which kept the whole
+                // enclosing assign on the AST interpreter. The `matches`
+                // pattern/guard form stays conservative.
+                StatementKind::Case { expr, items, .. } => {
+                    expr_ok(expr, bound, me)
+                        && items.iter().all(|it| {
+                            it.pattern.is_none()
+                                && it.guard.is_none()
+                                && it.patterns.iter().all(|p| expr_ok(p, bound, me))
+                                && stmt_ok(&it.stmt, &mut bound.clone(), me)
+                        })
+                }
                 _ => false,
             }
         }

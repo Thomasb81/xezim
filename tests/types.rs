@@ -280,3 +280,5 @@ mod assoc_keys_and_handles;
 mod zero_mask_call_elision;
 #[path = "types/formal_metadata_shadow_roundtrip.rs"]
 mod formal_metadata_shadow_roundtrip;
+#[path = "types/decode_helper_assign_compiles.rs"]
+mod decode_helper_assign_compiles;
