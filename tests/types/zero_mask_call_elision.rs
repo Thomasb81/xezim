@@ -45,6 +45,13 @@ module top;
   endfunction
 
   assign o_pure     = {10{mask}} & pf(5'd3);
+  // Same reasoning mirrored: the mask may sit on either side, and `1 | x` is
+  // `1` exactly as `0 & x` is `0`. A right-hand mask is only safe to evaluate
+  // first because the call it guards is pure.
+  logic [9:0] o_and_r, o_or_l, o_or_r;
+  assign o_and_r    = pf(5'd3) & {10{mask}};
+  assign o_or_l     = {10{~mask}} | pf(5'd3);
+  assign o_or_r     = pf(5'd3) | {10{~mask}};
   assign o_impure   = {10{mask}} & imf(5'd3);
   assign o_unmasked = {10{1'b1}} & pf(5'd3);
   // An X mask is NOT all-zero, so nothing may be skipped: 'x & 10 is not 0.
@@ -57,6 +64,9 @@ module top;
     $display("NOTE: impure=%0d", o_impure);
     $display("NOTE: unmasked=%0d", o_unmasked);
     $display("NOTE: xmask=%b", o_x);
+    $display("NOTE: and_r=%0d", o_and_r);
+    $display("NOTE: or_l=%0d", o_or_l);
+    $display("NOTE: or_r=%0d", o_or_r);
     $display("NOTE: called=%0d", calls > 0);
     #1 $finish;
   end
@@ -78,6 +88,10 @@ fn zero_mask_elides_only_pure_calls() {
         got.contains(&"NOTE: called=1".to_string()),
         "the impure function MUST still run; eliding it drops a side effect: {got:?}"
     );
+    // The mask may sit on either operand, and OR absorbs with all-ones.
+    assert!(got.contains(&"NOTE: and_r=0".to_string()), "{got:?}");
+    assert!(got.contains(&"NOTE: or_l=1023".to_string()), "{got:?}");
+    assert!(got.contains(&"NOTE: or_r=1023".to_string()), "{got:?}");
     assert!(
         got.iter().any(|l| l.starts_with("NOTE: xmask=") && l.contains('x')),
         "an x mask is not all-zero, so the result must carry x: {got:?}"
