@@ -43780,6 +43780,27 @@ impl Simulator {
                         return Value::from_u64(res as u64, 1);
                     }
                 }
+                // §11.4.8 gated-call elision, RIGHT-hand mask. Handled BEFORE
+                // the left operand is evaluated, because the left operand is
+                // the call we are trying to avoid. Evaluating the mask first is
+                // unobservable precisely because the call is pure — it has no
+                // effects to reorder against.
+                let mut pre_r: Option<Value> = None;
+                if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr)
+                    && self.pure_call_name(left).is_some()
+                {
+                    let want_ones = matches!(op, BinaryOp::BitOr);
+                    let r0 = self.eval_expr_ctx(right, self_det_w);
+                    if Self::absorbs_operand(&r0, want_ones) {
+                        let w = self_det_w.max(1);
+                        return if want_ones {
+                            Value::ones(w)
+                        } else {
+                            Value::zero(w)
+                        };
+                    }
+                    pre_r = Some(r0);
+                }
                 let mut l = self.eval_expr_ctx(left, self_det_w);
                 // §11.4.8 zero-mask elision. `0 & anything` is 0 for EVERY
                 // value the other side can take — `0 & x` and `0 & z` are both
@@ -43795,13 +43816,17 @@ impl Simulator {
                 // the max of both operand widths, computed by INFERENCE rather
                 // than evaluation, so the skipped side still sizes the result.
                 // Restricted to <=64 bits, where `raw_bits` sees every bit.
-                if matches!(op, BinaryOp::BitAnd) && l.width <= 64 && l.raw_bits() == (0, 0) {
-                    if let ExprKind::Call { func, .. } = &Self::peel_parens(right).kind {
-                        if let Some(fname) = Self::call_target_name(func) {
-                            if self.fn_is_pure(&fname) {
-                                return Value::zero(self_det_w.max(1));
-                            }
-                        }
+                if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr) && pre_r.is_none() {
+                    let want_ones = matches!(op, BinaryOp::BitOr);
+                    if Self::absorbs_operand(&l, want_ones)
+                        && self.pure_call_name(right).is_some()
+                    {
+                        let w = self_det_w.max(1);
+                        return if want_ones {
+                            Value::ones(w)
+                        } else {
+                            Value::zero(w)
+                        };
                     }
                 }
                 let is_shift_op = matches!(
@@ -43811,7 +43836,9 @@ impl Simulator {
                         | BinaryOp::ArithShiftLeft
                         | BinaryOp::ArithShiftRight
                 );
-                let mut r = if is_shift_op {
+                let mut r = if let Some(v) = pre_r {
+                    v
+                } else if is_shift_op {
                     let rw = self.infer_width(right);
                     self.eval_expr_ctx(right, rw)
                 } else {
@@ -83747,6 +83774,33 @@ impl Simulator {
             }
             _ => false,
         }
+    }
+
+    /// Name of a pure, module-scope function this expression calls directly,
+    /// if it is one. Parentheses are transparent.
+    fn pure_call_name(&mut self, e: &Expression) -> Option<String> {
+        let ExprKind::Call { func, .. } = &Self::peel_parens(e).kind else {
+            return None;
+        };
+        let name = Self::call_target_name(func)?;
+        self.fn_is_pure(&name).then_some(name)
+    }
+
+    /// Does `v` absorb the other operand of this op? `0` absorbs `&`, all-ones
+    /// absorbs `|` — in both cases for EVERY value the other side could take,
+    /// X and Z included (`0 & x` is 0, `1 | x` is 1). X or Z anywhere in the
+    /// mask itself disqualifies it. Limited to <=64 bits, the width at which
+    /// `raw_bits` sees every bit.
+    fn absorbs_operand(v: &Value, want_ones: bool) -> bool {
+        if v.width == 0 || v.width > 64 {
+            return false;
+        }
+        let (bits, xz) = v.raw_bits();
+        if xz != 0 {
+            return false;
+        }
+        let mask = if v.width == 64 { u64::MAX } else { (1u64 << v.width) - 1 };
+        if want_ones { bits & mask == mask } else { bits & mask == 0 }
     }
 
     /// Strip redundant parentheses so a wrapped call is still recognised.
