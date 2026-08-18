@@ -35,6 +35,9 @@ cranelift-jit = { version = "0.134", optional = true }
 cranelift-module = { version = "0.134", optional = true }
 cranelift-native = { version = "0.134", optional = true }
 fst-writer = "0.3"
+# Inflate only, for the FST time-table repair in `fst_finish`. Already in the
+# tree via fst-writer, so this adds no build cost.
+miniz_oxide = "0.8"
 
 # macOS: link the SDK's libffi instead of building libffi-sys's vendored copy.
 # The vendored autoconf build breaks on aarch64 with modern clang two ways —
@@ -101,12 +104,3 @@ panic = "abort"
 inherits = "release"
 lto = "fat"
 codegen-units = 1
-
-# Local patch of fst-writer 0.3.1. `write_time_table` used `>` where the format
-# needs `>=`: when zlib output is exactly the same size as its input it wrote
-# COMPRESSED bytes while recording equal compressed/uncompressed lengths, which
-# every reader reads as "stored raw". The dump then decodes to garbage
-# timestamps while passing every structural check. Upstream fix is one
-# character; drop this patch once a release carries it.
-[patch.crates-io]
-fst-writer = { path = "vendor/fst-writer" }
