@@ -18142,6 +18142,25 @@ impl Simulator {
                     pc = t as usize;
                     continue;
                 }
+                Insn::CaseMaskJump(src, mj) => {
+                    // Dispatch on the always-defined window; any x/z there
+                    // (or non-inline storage) walks the full chain instead.
+                    let s = &vm_regs[*src as usize];
+                    let t = match s.inline_bits() {
+                        Some((v, xz)) if !s.is_fill => {
+                            let m = if s.width >= 64 { u64::MAX } else { (1u64 << s.width) - 1 };
+                            let wmask = (1u64 << mj.width) - 1;
+                            if ((xz & m) >> mj.lo) & wmask == 0 {
+                                mj.table[((((v & m) >> mj.lo)) & wmask) as usize]
+                            } else {
+                                mj.xz_path
+                            }
+                        }
+                        _ => mj.xz_path,
+                    };
+                    pc = t as usize;
+                    continue;
+                }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let sig_id = &(*sig_id as usize);
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
@@ -18683,6 +18702,25 @@ impl Simulator {
                             Some(i) => cj.table.get(i as usize).copied().unwrap_or(cj.default),
                             None => cj.default,
                         }
+                    };
+                    pc = t as usize;
+                    continue;
+                }
+                Insn::CaseMaskJump(src, mj) => {
+                    // Dispatch on the always-defined window; any x/z there
+                    // (or non-inline storage) walks the full chain instead.
+                    let s = &vm_regs[*src as usize];
+                    let t = match s.inline_bits() {
+                        Some((v, xz)) if !s.is_fill => {
+                            let m = if s.width >= 64 { u64::MAX } else { (1u64 << s.width) - 1 };
+                            let wmask = (1u64 << mj.width) - 1;
+                            if ((xz & m) >> mj.lo) & wmask == 0 {
+                                mj.table[((((v & m) >> mj.lo)) & wmask) as usize]
+                            } else {
+                                mj.xz_path
+                            }
+                        }
+                        _ => mj.xz_path,
                     };
                     pc = t as usize;
                     continue;
@@ -19803,6 +19841,25 @@ impl Simulator {
                             Some(i) => cj.table.get(i as usize).copied().unwrap_or(cj.default),
                             None => cj.default,
                         }
+                    };
+                    pc = t as usize;
+                    continue;
+                }
+                Insn::CaseMaskJump(src, mj) => {
+                    // Dispatch on the always-defined window; any x/z there
+                    // (or non-inline storage) walks the full chain instead.
+                    let s = &self.vm_regs[*src as usize];
+                    let t = match s.inline_bits() {
+                        Some((v, xz)) if !s.is_fill => {
+                            let m = if s.width >= 64 { u64::MAX } else { (1u64 << s.width) - 1 };
+                            let wmask = (1u64 << mj.width) - 1;
+                            if ((xz & m) >> mj.lo) & wmask == 0 {
+                                mj.table[((((v & m) >> mj.lo)) & wmask) as usize]
+                            } else {
+                                mj.xz_path
+                            }
+                        }
+                        _ => mj.xz_path,
                     };
                     pc = t as usize;
                     continue;
@@ -28498,6 +28555,7 @@ impl Simulator {
         match insn {
             Insn::CaseLut(..) => "CaseLut",
             Insn::CaseJump(..) => "CaseJump",
+            Insn::CaseMaskJump(..) => "CaseMaskJump",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",

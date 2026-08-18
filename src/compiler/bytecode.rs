@@ -120,6 +120,19 @@ pub struct CaseJumpData {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CaseMaskJumpData {
+    /// Contiguous selector bit window `[lo, lo+width)` in which every
+    /// pattern is fully defined; the dispatch index is those bits.
+    pub lo: u32,
+    pub width: u32,
+    /// Bucket-chain entry pc per window value (`1 << width` entries).
+    pub table: Vec<u32>,
+    /// Full sequential compare chain, taken when the selector's window has
+    /// any x/z bit (a wildcard selector can match several buckets).
+    pub xz_path: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CaseLutData {
     pub table: Vec<Value>,
     pub default: Value,
@@ -170,6 +183,12 @@ pub enum Insn {
     /// covers the CSR-read mux / decoder shape — dozens of arms evaluated
     /// every cycle, previously ~2 executed insns per SKIPPED arm.
     CaseJump(RegId, Box<CaseJumpData>),
+    /// Two-level dispatch for dense `casez`/`casex` with constant wildcard
+    /// patterns (the RISC-V tracer/decoder shape): jump-table on a window of
+    /// always-defined bits, then a short residual compare chain per bucket.
+    /// Replaces an average of half the arms' CasezEq+branch pairs per
+    /// execution with one table hop plus ~1-3 compares.
+    CaseMaskJump(RegId, Box<CaseMaskJumpData>),
     CasezEq(RegId, RegId, RegId),
     CasexEq(RegId, RegId, RegId),
     Lt(RegId, RegId, RegId),
@@ -433,6 +452,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::CaseEq(..) => "CaseEq",
         Insn::CaseLut(..) => "CaseLut",
         Insn::CaseJump(..) => "CaseJump",
+        Insn::CaseMaskJump(..) => "CaseMaskJump",
         Insn::CasezEq(..) => "CasezEq",
         Insn::CasexEq(..) => "CasexEq",
         Insn::Lt(..) => "Lt",
@@ -2827,6 +2847,289 @@ impl<'a> BytecodeCompiler<'a> {
         true
     }
 
+    /// Two-level lowering for dense `casez`/`casex` with constant patterns
+    /// (wildcard bits allowed). Picks the contiguous selector-bit window in
+    /// which EVERY pattern is fully defined that best discriminates the
+    /// patterns, then emits:
+    ///
+    ///   CaseMaskJump sel -> table[window bits] -> per-bucket residual chain
+    ///                    -> xz_path (full chain) when the window has x/z
+    ///
+    /// Buckets are mutually exclusive for a defined-window selector (two
+    /// patterns in different buckets differ in a bit both define), so
+    /// per-bucket order == global order and §12.5 first-match-wins holds.
+    /// The selector gate mirrors `compile_case_jump`: unsigned and <=64 bits,
+    /// so extension is zero-fill and the window read equals the chain's
+    /// CasezEq/CasexEq view of those bits.
+    fn compile_case_mask_jump(
+        &mut self,
+        kind: &crate::ast::stmt::CaseKind,
+        expr: &Expression,
+        items: &[crate::ast::stmt::CaseItem],
+    ) -> bool {
+        use crate::ast::stmt::CaseKind;
+        let casex = matches!(kind, CaseKind::Casex);
+        if self.expr_signedness(expr) != Some(false) {
+            return false;
+        }
+        let sel_w = self.expr_max_width(expr);
+        if sel_w == 0 || sel_w > 64 {
+            return false;
+        }
+        if std::env::var("XEZIM_CASEJUMP_OFF").is_ok() {
+            return false;
+        }
+        // ---- shape scan: constant patterns, wildcard masks ----
+        let mut default_seen = false;
+        // (item index, value bits, defined mask) per pattern
+        let mut pats: Vec<(usize, u64, u64)> = Vec::new();
+        let mut w_cmp = sel_w;
+        for (ii, it) in items.iter().enumerate() {
+            if it.pattern.is_some() || it.guard.is_some() {
+                return false;
+            }
+            if it.is_default {
+                if default_seen {
+                    return false;
+                }
+                default_seen = true;
+                continue;
+            }
+            for pat in &it.patterns {
+                let pv = match &pat.kind {
+                    ExprKind::Number(n) => self.eval_number_static(n),
+                    ExprKind::Ident(h) => self.lookup_param_value(h),
+                    _ => None,
+                };
+                let Some(pv) = pv else { return false };
+                if pv.is_real || pv.is_signed || pv.width == 0 || pv.width > 64 || pv.is_fill {
+                    return false;
+                }
+                let Some((v, xz)) = pv.inline_bits() else { return false };
+                let m = if pv.width >= 64 { u64::MAX } else { (1u64 << pv.width) - 1 };
+                let (v, xz) = (v & m, xz & m);
+                // casez: Z (val&xz both set) is wild; a plain X in the
+                // pattern can match nothing defined -> keep it on the chain.
+                let wild = if casex { xz } else { v & xz };
+                if !casex && (xz & !wild) != 0 {
+                    return false;
+                }
+                w_cmp = w_cmp.max(pv.width);
+                // Bits past the pattern's width zero-extend (defined 0s).
+                pats.push((ii, v & !wild, !wild | !m));
+            }
+        }
+        if pats.len() < 8 {
+            return false;
+        }
+        // ---- window choice: contiguous, all-defined, best discrimination ----
+        let all_defined = pats.iter().fold(u64::MAX, |acc, (_, _, d)| acc & d)
+            & if w_cmp >= 64 { u64::MAX } else { (1u64 << w_cmp) - 1 };
+        let mut best: Option<(u32, u32, usize)> = None; // (lo, width, distinct)
+        for lo in 0..w_cmp {
+            if all_defined & (1u64 << lo) == 0 {
+                continue;
+            }
+            let max_k = 12.min(w_cmp - lo);
+            for k in 1..=max_k {
+                if all_defined & (1u64 << (lo + k - 1)) == 0 {
+                    break;
+                }
+                let wmask = (1u64 << k) - 1;
+                let mut vals: Vec<u64> = pats.iter().map(|(_, v, _)| (v >> lo) & wmask).collect();
+                vals.sort_unstable();
+                vals.dedup();
+                let distinct = vals.len();
+                let better = match best {
+                    None => true,
+                    Some((_, bk, bd)) => {
+                        distinct > bd || (distinct == bd && k < bk)
+                    }
+                };
+                if better {
+                    best = Some((lo, k, distinct));
+                }
+            }
+        }
+        let Some((lo, wk, distinct)) = best else { return false };
+        // A window that cannot split the patterns at all buys nothing.
+        if distinct < 2 {
+            return false;
+        }
+        let wmask = (1u64 << wk) - 1;
+        // ---- emission with all-or-nothing rollback ----
+        let start = self.insns.len();
+        let start_reg = self.next_reg;
+        let Some(sel) = self.compile_expr(expr, 0) else {
+            self.insns.truncate(start);
+            self.next_reg = start_reg;
+            return false;
+        };
+        let mj_idx = self.insns.len();
+        self.emit(Insn::CaseMaskJump(
+            sel,
+            Box::new(CaseMaskJumpData {
+                lo,
+                width: wk,
+                table: Vec::new(),
+                xz_path: 0,
+            }),
+        ));
+        // Arm bodies, compiled once each, ending in Jump(end).
+        let mut body_entry: Vec<u32> = vec![0; items.len()];
+        let mut default_entry: Option<u32> = None;
+        let mut end_jumps: Vec<usize> = Vec::new();
+        let arm_reg_start = self.next_reg;
+        let mut peak_reg = arm_reg_start;
+        let mut ok = true;
+        for (ii, it) in items.iter().enumerate() {
+            let entry = self.insns.len() as u32;
+            body_entry[ii] = entry;
+            if it.is_default {
+                default_entry = Some(entry);
+            }
+            if !self.compile_stmt(&it.stmt) {
+                ok = false;
+                break;
+            }
+            end_jumps.push(self.insns.len());
+            self.emit(Insn::Jump(0));
+            peak_reg = peak_reg.max(self.next_reg);
+            self.next_reg = arm_reg_start;
+        }
+        let mut bucket_entries: Vec<u32> = Vec::new();
+        let mut xz_entry: u32 = 0;
+        if ok {
+            // Per-bucket residual chains.
+            let n_buckets = 1usize << wk;
+            bucket_entries = vec![0; n_buckets];
+            'buckets: for b in 0..n_buckets {
+                let subset: Vec<usize> = pats
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, v, _))| ((v >> lo) & wmask) as usize == b)
+                    .map(|(pi, _)| pi)
+                    .collect();
+                if subset.is_empty() {
+                    bucket_entries[b] = u32::MAX; // patched to default later
+                    continue;
+                }
+                bucket_entries[b] = self.insns.len() as u32;
+                for pi in subset {
+                    let (ii, _, _) = pats[pi];
+                    let pat_expr = Self::nth_pattern(items, pi);
+                    let Some(pat_reg) = self.compile_expr(pat_expr, 0) else {
+                        ok = false;
+                        break 'buckets;
+                    };
+                    let cmp = self.alloc_reg();
+                    self.emit(if casex {
+                        Insn::CasexEq(cmp, sel, pat_reg)
+                    } else {
+                        Insn::CasezEq(cmp, sel, pat_reg)
+                    });
+                    let bidx = self.insns.len();
+                    self.emit(Insn::BranchIfFalse(cmp, 0));
+                    self.emit(Insn::Jump(body_entry[ii]));
+                    let next = self.insns.len() as u32;
+                    self.insns[bidx] = Insn::BranchIfFalse(cmp, next);
+                    peak_reg = peak_reg.max(self.next_reg);
+                    self.next_reg = arm_reg_start;
+                }
+                let dj = self.insns.len();
+                self.emit(Insn::Jump(0)); // -> default, patched below
+                end_jumps.push(usize::MAX - dj); // marker: default jump
+            }
+        }
+        if ok {
+            // Full chain for wildcard selectors.
+            xz_entry = self.insns.len() as u32;
+            for pi in 0..pats.len() {
+                let (ii, _, _) = pats[pi];
+                let pat_expr = Self::nth_pattern(items, pi);
+                let Some(pat_reg) = self.compile_expr(pat_expr, 0) else {
+                    ok = false;
+                    break;
+                };
+                let cmp = self.alloc_reg();
+                self.emit(if casex {
+                    Insn::CasexEq(cmp, sel, pat_reg)
+                } else {
+                    Insn::CasezEq(cmp, sel, pat_reg)
+                });
+                let bidx = self.insns.len();
+                self.emit(Insn::BranchIfFalse(cmp, 0));
+                self.emit(Insn::Jump(body_entry[ii]));
+                let next = self.insns.len() as u32;
+                self.insns[bidx] = Insn::BranchIfFalse(cmp, next);
+                peak_reg = peak_reg.max(self.next_reg);
+                self.next_reg = arm_reg_start;
+            }
+            let dj = self.insns.len();
+            self.emit(Insn::Jump(0));
+            end_jumps.push(usize::MAX - dj);
+        }
+        if !ok {
+            self.insns.truncate(start);
+            self.next_reg = start_reg;
+            return false;
+        }
+        self.next_reg = peak_reg;
+        let end = self.insns.len() as u32;
+        let default = default_entry.unwrap_or(end);
+        for ej in end_jumps {
+            if ej > usize::MAX / 2 {
+                self.insns[usize::MAX - ej] = Insn::Jump(default);
+            } else {
+                self.insns[ej] = Insn::Jump(end);
+            }
+        }
+        let table: Vec<u32> = bucket_entries
+            .into_iter()
+            .map(|t| if t == u32::MAX { default } else { t })
+            .collect();
+        self.insns[mj_idx] = Insn::CaseMaskJump(
+            sel,
+            Box::new(CaseMaskJumpData {
+                lo,
+                width: wk,
+                table,
+                xz_path: xz_entry,
+            }),
+        );
+        static CMJ_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = CMJ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var("XEZIM_CASEJUMP_TRACE").is_ok() {
+            eprintln!(
+                "[CASEMASKJUMP] #{n} pats={} lo={lo} w={wk} distinct={distinct} scope={:?}",
+                pats.len(),
+                self.scope_hint
+            );
+        }
+        true
+    }
+
+    /// The `pi`-th pattern in flat (item, pattern) order — the order
+    /// `compile_case_mask_jump`'s scan built its `pats` list in.
+    fn nth_pattern<'e>(
+        items: &'e [crate::ast::stmt::CaseItem],
+        pi: usize,
+    ) -> &'e Expression {
+        let mut k = 0usize;
+        for it in items {
+            if it.is_default {
+                continue;
+            }
+            for pat in &it.patterns {
+                if k == pi {
+                    return pat;
+                }
+                k += 1;
+            }
+        }
+        unreachable!("pattern index out of range")
+    }
+
     /// A set-membership member as a compile-time CONSTANT with no x/z bits —
     /// the only shape `compile_inside` accepts (see there).
     fn inside_member_const(&mut self, m: &Expression) -> Option<Value> {
@@ -3918,6 +4221,13 @@ impl<'a> BytecodeCompiler<'a> {
                     if self.compile_case_jump(expr, items) {
                         return true;
                     }
+                }
+                if matches!(
+                    kind,
+                    crate::ast::stmt::CaseKind::Casez | crate::ast::stmt::CaseKind::Casex
+                ) && self.compile_case_mask_jump(kind, expr, items)
+                {
+                    return true;
                 }
                 if let Some(val_reg) = self.compile_expr(expr, 0) {
                     let mut end_jumps: Vec<usize> = Vec::new();
@@ -7188,6 +7498,7 @@ impl<'a> BytecodeCompiler<'a> {
         match insn {
             Insn::CaseLut(_, src, _) => *src == r,
             Insn::CaseJump(src, _) => *src == r,
+            Insn::CaseMaskJump(src, _) => *src == r,
             Insn::LoadConst(..)
             | Insn::LoadSignal(..)
             | Insn::LoadSignalSigned(..)
@@ -7297,6 +7608,13 @@ impl<'a> BytecodeCompiler<'a> {
             match insn {
                 Insn::CaseJump(_, cj) => {
                     for &t in cj.table.iter().chain(std::iter::once(&cj.default)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::CaseMaskJump(_, mj) => {
+                    for &t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
                         if (t as usize) < is_target.len() {
                             is_target[t as usize] = true;
                         }
@@ -7541,6 +7859,13 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
+                Insn::CaseMaskJump(_, mj) => {
+                    for &t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
                 Insn::BranchIfFalse(_, t)
                 | Insn::BranchUnlessZero(_, t)
                 | Insn::BranchIfSignalFalse(_, t, _)
@@ -7661,6 +7986,13 @@ impl<'a> BytecodeCompiler<'a> {
             match insn {
                 Insn::CaseJump(_, cj) => {
                     for &t in cj.table.iter().chain(std::iter::once(&cj.default)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::CaseMaskJump(_, mj) => {
+                    for &t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
                         if (t as usize) < is_target.len() {
                             is_target[t as usize] = true;
                         }
@@ -7823,6 +8155,13 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
+                Insn::CaseMaskJump(_, mj) => {
+                    for &t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
                 Insn::BranchIfFalse(_, t)
                 | Insn::BranchUnlessZero(_, t)
                 | Insn::BranchIfSignalFalse(_, t, _)
@@ -7867,7 +8206,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // Result width varies per entry; drop tracking for the dest.
                 Insn::CaseLut(d, ..) => store(&mut rw, *d, None),
                 // Control only; defines nothing.
-                Insn::CaseJump(..) => {}
+                Insn::CaseJump(..) | Insn::CaseMaskJump(..) => {}
 
                 // The exec arms clone the boxed `Value` verbatim.
                 Insn::LoadConst(d, v) => {
@@ -8144,6 +8483,13 @@ impl<'a> BytecodeCompiler<'a> {
             match insn {
                 Insn::CaseJump(_, cj) => {
                     for t in cj.table.iter_mut().chain(std::iter::once(&mut cj.default)) {
+                        if let Some(&m) = map.get(*t as usize) {
+                            *t = m;
+                        }
+                    }
+                }
+                Insn::CaseMaskJump(_, mj) => {
+                    for t in mj.table.iter_mut().chain(std::iter::once(&mut mj.xz_path)) {
                         if let Some(&m) = map.get(*t as usize) {
                             *t = m;
                         }
@@ -8945,6 +9291,7 @@ pub fn lower_two_state(
             // to the 2-state pipeline.
             Insn::CaseLut(..) => return None,
             Insn::CaseJump(..) => return None,
+            Insn::CaseMaskJump(..) => return None,
             // 1-bit results. CaseEq/CaseNeq equal Eq/Neq on X-free values.
             Insn::Eq(d, a, b) | Insn::CaseEq(d, a, b) => {
                 rw[*a as usize]?;
