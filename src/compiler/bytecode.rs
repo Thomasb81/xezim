@@ -544,6 +544,9 @@ pub struct BytecodeCompiler<'a> {
     /// bytecode compilation can fold module params (e.g. `CARRY_CHAIN`) into
     /// the compile-time widths of `+:` / `-:` range selects.
     params: Option<&'a HashMap<String, Value>>,
+    /// Named-cast targets known at compile time: name -> (width, signed).
+    /// See the simulator's `cast_widths`.
+    cast_widths: Option<&'a HashMap<String, (u32, bool)>>,
     /// Top-module name (e.g. "tb"). When a hierarchical identifier reads a
     /// signal whose absolute path is `<top>.<rest>` (e.g. xezim's
     /// port-rewriting baked the top name into a cross-hierarchical
@@ -644,6 +647,7 @@ impl<'a> BytecodeCompiler<'a> {
             inlining_stack: Vec::new(),
             tasks_inlined: 0,
             params: None,
+            cast_widths: None,
             top_module_name: None,
             packed_elem_widths: None,
             assoc_elem_widths: None,
@@ -1048,6 +1052,10 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
         self.scope_hint = scope;
+    }
+
+    pub fn set_cast_widths(&mut self, m: &'a HashMap<String, (u32, bool)>) {
+        self.cast_widths = Some(m);
     }
 
     pub fn set_functions(&mut self, functions: &'a HashMap<String, FunctionDeclaration>) {
@@ -4393,8 +4401,74 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::Resize(r, n));
                         Some(r)
                     }
+                    // §6.24.1 named cast, statically resolvable target. The
+                    // cast type is the CONTEXT for its operand, so the operand
+                    // compiles at the target width, then Resize + sign mark.
+                    // A Call operand keeps the interpreter path (it may return
+                    // a collection the runtime packs — see the AST handler),
+                    // as does a target that is a runtime signal or a real type.
+                    "$__xz_named_cast" => {
+                        let target = args.first().and_then(|a| match &a.kind {
+                            ExprKind::Ident(h) => {
+                                h.path.last().map(|s| s.name.name.clone())
+                            }
+                            _ => None,
+                        });
+                        let inner_is_call =
+                            matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
+                        let known = target.as_ref().and_then(|nm| {
+                            self.cast_widths
+                                .and_then(|m| m.get(nm).copied())
+                                .or_else(|| {
+                                    // Parameter-valued SIZE cast: `N'(x)` with
+                                    // N a constant parameter.
+                                    self.params
+                                        .and_then(|p| p.get(nm))
+                                        .and_then(|v| v.to_u64())
+                                        .map(|n| ((n as u32).max(1), false))
+                                })
+                        });
+                        if let (Some((w, signed)), false) = (known, inner_is_call) {
+                            // Mirror the interpreter EXACTLY: the operand is
+                            // evaluated self-determined, then resized. (§6.24.1
+                            // arguably makes the cast type the operand's
+                            // context, but the interpreter — and the reference
+                            // simulator, per the bit-exact ibex traces — do
+                            // not widen the operand's intermediate arithmetic.)
+                            let src = self.compile_expr(args.get(1)?, 0)?;
+                            // NEVER resize `src` in place: for a bare local
+                            // (a loop variable, say) compile_expr hands back
+                            // the variable's OWN register, and an in-place
+                            // Resize would truncate the variable itself —
+                            // `NumBitsDeviceSel'(device)` inside ibex's bus
+                            // arbiter loop corrupted `device` for the rest of
+                            // the loop exactly this way.
+                            let r = self.alloc_reg();
+                            self.emit(Insn::Move(r, src));
+                            self.emit(Insn::Resize(r, w));
+                            if signed {
+                                self.emit(Insn::SetSigned(r));
+                            } else {
+                                self.emit(Insn::ClearSigned(r));
+                            }
+                            Some(r)
+                        } else {
+                            if let Some(r) = self.emit_expr_fallback(
+                                expr,
+                                ctx_width,
+                                "SystemCall_named_cast",
+                            ) {
+                                return Some(r);
+                            }
+                            self.bail("SystemCall_named_cast");
+                            None
+                        }
+                    }
                     other => {
                         let _ = other;
+                        if std::env::var_os("XEZIM_PROBE_SYSCALL").is_some() {
+                            eprintln!("[SYSCALL_FALLBACK] {}", name);
+                        }
                         if let Some(r) =
                             self.emit_expr_fallback(expr, ctx_width, "SystemCall_other")
                         {
@@ -5796,7 +5870,27 @@ impl<'a> BytecodeCompiler<'a> {
             // high bits. The procedural interpreter got this right, so the bug
             // only showed inside `always_comb`/compiled blocks.
             ExprKind::Index { expr: base, .. } => match &base.kind {
-                ExprKind::Ident(hier) => self.packed_elem_width_of(hier).unwrap_or(1),
+                // An index select is ONE BIT only when the base is a plain
+                // vector. A packed-array element has its element width — and
+                // so does an UNPACKED-array element, which this arm used to
+                // miss: `(addr_i[0] & mask[0]) == base[0]` sized the compare
+                // operands at max(1,1), truncated both sides of the `&` to a
+                // single bit, and ibex's bus decoder never matched an address
+                // once its enclosing block compiled. The sibling of the
+                // `expr_max_width returned 1 for every index select` bug fixed
+                // in the simulator earlier — same disease, other table.
+                ExprKind::Ident(hier) => self
+                    .packed_elem_width_of(hier)
+                    .or_else(|| {
+                        self.lookup_array_name(hier)
+                            .and_then(|n| self.arrays.get(&n).map(|&(_, _, w)| w))
+                    })
+                    .or_else(|| {
+                        self.lookup_array_name(hier).and_then(|n| {
+                            self.assoc_elem_widths.and_then(|m| m.get(&n).copied())
+                        })
+                    })
+                    .unwrap_or(1),
                 _ => 1,
             },
             ExprKind::Replication { count, exprs } => {
