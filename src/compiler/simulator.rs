@@ -17184,6 +17184,7 @@ impl Simulator {
                 compiler.set_functions(&self.module.functions);
             compiler.set_params(&self.module.parameters);
                 compiler.set_cast_widths(&self.cast_widths);
+                compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -17248,6 +17249,7 @@ impl Simulator {
                 compiler.set_functions(&self.module.functions);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_cast_widths(&self.cast_widths);
+                compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -17276,6 +17278,7 @@ impl Simulator {
                 delay_compiler.set_functions(&self.module.functions);
                 delay_compiler.set_params(&self.module.parameters);
                 delay_compiler.set_cast_widths(&self.cast_widths);
+                delay_compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 delay_compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -20989,6 +20992,7 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_cast_widths(&self.cast_widths);
+                compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -21055,6 +21059,7 @@ impl Simulator {
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
                 compiler.set_cast_widths(&self.cast_widths);
+                compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -21628,6 +21633,7 @@ impl Simulator {
                     compiler.set_functions(&self.module.functions);
                     compiler.set_params(&self.module.parameters);
                 compiler.set_cast_widths(&self.cast_widths);
+                compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -29713,6 +29719,7 @@ impl Simulator {
             compiler.set_functions(&self.module.functions);
             compiler.set_params(&self.module.parameters);
                 compiler.set_cast_widths(&self.cast_widths);
+                compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
