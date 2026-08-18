@@ -302,3 +302,5 @@ mod case_mask_jump_dispatch;
 mod packed_member_self_determined_width;
 #[path = "types/zero_width_select_confidence.rs"]
 mod zero_width_select_confidence;
+#[path = "types/typedef_chain_local_namespace.rs"]
+mod typedef_chain_local_namespace;

@@ -35,7 +35,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
         match def {
             SourceDefinition::Class(c) => check_class(c, &mut errs),
             SourceDefinition::Typedef(t) => {
-                check_typedef(t, elab, &mut errs);
+                check_typedef(t, elab, &Default::default(), &mut errs);
                 // Width-identifier check is restricted to TOP-LEVEL typedefs
                 // (no enclosing module scope), where every value parameter is
                 // global and present in `elab.parameters` — so an unresolved
@@ -43,8 +43,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_struct_typedef_widths(t, elab, &mut errs);
             }
             SourceDefinition::Module(m) => {
+                let mut local_types = std::collections::HashSet::new();
+                collect_local_type_names(&m.params, &m.items, &mut local_types);
                 for it in &m.items {
-                    check_module_item(it, elab, &mut errs);
+                    check_module_item(it, elab, &local_types, &mut errs);
                 }
                 check_proc_net_assign(&m.items, &mut errs);
                 check_enum_assign(&m.items, elab, &mut errs);
@@ -55,8 +57,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
             }
             SourceDefinition::Interface(m) => {
+                let mut local_types = std::collections::HashSet::new();
+                collect_local_type_names(&m.params, &m.items, &mut local_types);
                 for it in &m.items {
-                    check_module_item(it, elab, &mut errs);
+                    check_module_item(it, elab, &local_types, &mut errs);
                 }
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
@@ -64,8 +68,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
             }
             SourceDefinition::Program(m) => {
+                let mut local_types = std::collections::HashSet::new();
+                collect_local_type_names(&m.params, &m.items, &mut local_types);
                 for it in &m.items {
-                    check_module_item(it, elab, &mut errs);
+                    check_module_item(it, elab, &local_types, &mut errs);
                 }
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
@@ -94,10 +100,15 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
 }
 
 /// Classes can appear nested inside module/interface/program bodies.
-fn check_module_item(item: &ModuleItem, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+fn check_module_item(
+    item: &ModuleItem,
+    elab: &ElaboratedModule,
+    local_types: &std::collections::HashSet<String>,
+    errs: &mut Vec<String>,
+) {
     match item {
         ModuleItem::ClassDeclaration(c) => check_class(c, errs),
-        ModuleItem::TypedefDeclaration(t) => check_typedef(t, elab, errs),
+        ModuleItem::TypedefDeclaration(t) => check_typedef(t, elab, local_types, errs),
         ModuleItem::DataDeclaration(d) => {
             check_enum_type(&d.data_type, elab, errs);
             check_packed_dims(&d.data_type, elab, errs);
@@ -132,25 +143,25 @@ fn check_module_item(item: &ModuleItem, elab: &ElaboratedModule, errs: &mut Vec<
         // the library resolver's).
         ModuleItem::GenerateRegion(gr) => {
             for it in &gr.items {
-                check_module_item(it, elab, errs);
+                check_module_item(it, elab, local_types, errs);
             }
         }
         ModuleItem::GenerateIf(gi) => {
             for (_c, items) in &gi.branches {
                 for it in items {
-                    check_module_item(it, elab, errs);
+                    check_module_item(it, elab, local_types, errs);
                 }
             }
         }
         ModuleItem::GenerateFor(gf) => {
             for it in &gf.items {
-                check_module_item(it, elab, errs);
+                check_module_item(it, elab, local_types, errs);
             }
         }
         ModuleItem::GenerateCase(gc) => {
             for arm in &gc.arms {
                 for it in &arm.items {
-                    check_module_item(it, elab, errs);
+                    check_module_item(it, elab, local_types, errs);
                 }
             }
         }
@@ -1261,12 +1272,72 @@ fn check_super_new_first(stmts: &[Statement], errs: &mut Vec<String>) {
     }
 }
 
+/// Collect every type NAME a module/interface/program declares itself:
+/// `parameter type` / `localparam type` names (header and body) and local
+/// typedef names, recursing through generate constructs. The §6.18 check
+/// below runs over LIBRARY definitions that may never be elaborated, so
+/// `elab.typedefs` knows nothing about their locals — without this set a
+/// typedef chain rooted at a type parameter (`parameter type req_data_t =
+/// logic; typedef req_data_t wbuf_data_t; typedef wbuf_data_t ...`), the
+/// hpdcache/cva6 and black-parrot idiom, was reported as "base type not
+/// declared" on every link of the chain.
+fn collect_local_type_names(
+    params: &[xezim_core::ast::decl::ParameterDeclaration],
+    items: &[ModuleItem],
+    out: &mut std::collections::HashSet<String>,
+) {
+    use xezim_core::ast::decl::ParameterKind;
+    for p in params {
+        if let ParameterKind::Type { assignments } = &p.kind {
+            for a in assignments {
+                out.insert(a.name.name.clone());
+            }
+        }
+    }
+    fn walk(items: &[ModuleItem], out: &mut std::collections::HashSet<String>) {
+        use xezim_core::ast::decl::ParameterKind;
+        for it in items {
+            match it {
+                ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
+                    if let ParameterKind::Type { assignments } = &p.kind {
+                        for a in assignments {
+                            out.insert(a.name.name.clone());
+                        }
+                    }
+                }
+                ModuleItem::TypedefDeclaration(t) => {
+                    out.insert(t.name.name.clone());
+                }
+                ModuleItem::GenerateRegion(g) => walk(&g.items, out),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, branch) in &g.branches {
+                        walk(branch, out);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => walk(&g.items, out),
+                ModuleItem::GenerateCase(g) => {
+                    for arm in &g.arms {
+                        walk(&arm.items, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(items, out);
+}
+
 /// §6.18: a non-forward `typedef <T> name;` whose base type `<T>` is a bare,
 /// undeclared simple identifier is an error. Conservative: only fires when the
 /// base is a single-segment name (no `::`), is not a built-in keyword type, and
 /// is absent from every elaborated type namespace (typedefs, classes, enums,
 /// interfaces, packages, parameters).
-fn check_typedef(t: &TypedefDeclaration, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+fn check_typedef(
+    t: &TypedefDeclaration,
+    elab: &ElaboratedModule,
+    local_types: &std::collections::HashSet<String>,
+    errs: &mut Vec<String>,
+) {
     if t.forward {
         return;
     }
@@ -1283,7 +1354,8 @@ fn check_typedef(t: &TypedefDeclaration, elab: &ElaboratedModule, errs: &mut Vec
         if is_builtin_type(n) {
             return;
         }
-        let known = elab.typedefs.contains_key(n)
+        let known = local_types.contains(n.as_str())
+            || elab.typedefs.contains_key(n)
             || elab.classes.contains_key(n)
             || elab.enum_members.contains_key(n)
             || elab.interfaces.contains(n)
@@ -1555,6 +1627,14 @@ fn check_unpacked_dims(
     for d in dims {
         match d {
             UnpackedDimension::Expression { expr, .. } => {
+                // Same confidence gate as the §11.5.1 zero-width check: the
+                // const evaluator answers 0 for references it cannot resolve
+                // (struct-parameter members, per-instance type params), and
+                // cva6's `logic [W-1:0] mem[$clog2(Cfg.MemWords)]`-style
+                // declarations were rejected as size-0 arrays on legal RTL.
+                if !width_is_confident(expr, elab) {
+                    continue;
+                }
                 if let Some(v) = xezim_core::elaborate::const_eval_i64_with_params(expr, params) {
                     if v <= 0 {
                         errs.push(format!(
