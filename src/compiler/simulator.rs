@@ -4168,6 +4168,10 @@ pub struct Simulator {
     /// Path of the open FST dump, kept so `fst_finish` can repair the file
     /// after the writer has closed it. See `fst_repair_time_tables`.
     fst_path: Option<String>,
+    /// Named-cast targets resolvable at COMPILE time: name -> (width,
+    /// signed). Built once at construction; handed to every bytecode
+    /// compiler so `type'(expr)` compiles instead of falling back.
+    cast_widths: HashMap<String, (u32, bool)>,
     /// `module.functions` holds each `FunctionDeclaration` by value, so the
     /// obvious `get(name).cloned()` deep-copies a whole function AST — body,
     /// statements and all — on EVERY call. On a design that calls a function
@@ -6682,6 +6686,31 @@ impl Simulator {
             }
         }
 
+        // §6.24.1 named casts: pre-resolve every statically-known cast
+        // target (typedef, enum, width-only typedef) to (width, signed) so
+        // the bytecode compiler can emit Resize/SetSigned instead of bailing
+        // the whole expression to the interpreter. On ibex this cast appears
+        // ~8x per cycle and its interpreted evaluation was 43% of a 3M-cycle
+        // run. Real-typed targets are deliberately absent (interpreter path).
+        let cast_widths: HashMap<String, (u32, bool)> = {
+            let mut m: HashMap<String, (u32, bool)> = HashMap::default();
+            for (name, dt) in &module.typedef_types {
+                if super::elaborate::is_type_real(dt) {
+                    continue;
+                }
+                let w = super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&module.parameters),
+                    Some(&module.typedefs),
+                )
+                .max(1);
+                m.insert(name.clone(), (w, super::elaborate::is_type_signed(dt)));
+            }
+            for (name, &w) in &module.typedefs {
+                m.entry(name.clone()).or_insert((w.max(1), false));
+            }
+            m
+        };
         let mut sim = Self {
             prev_val,
             prev_xz,
@@ -7046,6 +7075,7 @@ impl Simulator {
             fst_scopes: Vec::new(),
             fst_writer: None,
             fst_path: None,
+            cast_widths,
             fn_decl_cache: HashMap::default(),
             fn_pure_cache: HashMap::default(),
             elem_dotted_bases: RefCell::new(None),
@@ -17153,6 +17183,7 @@ impl Simulator {
             compiler.set_tasks(&self.module.tasks);
                 compiler.set_functions(&self.module.functions);
             compiler.set_params(&self.module.parameters);
+                compiler.set_cast_widths(&self.cast_widths);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -17216,6 +17247,7 @@ impl Simulator {
                 compiler.set_tasks(&self.module.tasks);
                 compiler.set_functions(&self.module.functions);
                 compiler.set_params(&self.module.parameters);
+                compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -17243,6 +17275,7 @@ impl Simulator {
                 delay_compiler.set_tasks(&self.module.tasks);
                 delay_compiler.set_functions(&self.module.functions);
                 delay_compiler.set_params(&self.module.parameters);
+                delay_compiler.set_cast_widths(&self.cast_widths);
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 delay_compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -20955,6 +20988,7 @@ impl Simulator {
                 );
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
+                compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -21020,6 +21054,7 @@ impl Simulator {
                 );
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
+                compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -21592,6 +21627,7 @@ impl Simulator {
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_functions(&self.module.functions);
                     compiler.set_params(&self.module.parameters);
+                compiler.set_cast_widths(&self.cast_widths);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
@@ -29676,6 +29712,7 @@ impl Simulator {
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
             compiler.set_params(&self.module.parameters);
+                compiler.set_cast_widths(&self.cast_widths);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);

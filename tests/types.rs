@@ -282,3 +282,5 @@ mod zero_mask_call_elision;
 mod formal_metadata_shadow_roundtrip;
 #[path = "types/decode_helper_assign_compiles.rs"]
 mod decode_helper_assign_compiles;
+#[path = "types/unpacked_elem_compare_width.rs"]
+mod unpacked_elem_compare_width;
