@@ -4165,6 +4165,9 @@ pub struct Simulator {
     /// Value packing, block compression and I/O run on a background thread
     /// (`XEZIM_DUMP_INLINE=1` keeps them here); see `fst_sink::FstSink`.
     fst_writer: Option<super::fst_sink::FstSink>,
+    /// Path of the open FST dump, kept so `fst_finish` can repair the file
+    /// after the writer has closed it. See `fst_repair_time_tables`.
+    fst_path: Option<String>,
     /// Compact per-net trace table: (signal_table index, FST signal id).
     fst_trace: Vec<(usize, FstSignalId)>,
     /// Signal id → `fst_trace` slots, for the shared incremental dirty-set
@@ -7013,6 +7016,7 @@ impl Simulator {
             fst_file: None,
             fst_scopes: Vec::new(),
             fst_writer: None,
+            fst_path: None,
             fst_trace: Vec::new(),
             fst_id_to_trace: Vec::new(),
             fst_prev_signals: Vec::new(),
@@ -64740,6 +64744,7 @@ impl Simulator {
         self.enable_dump_dirty_tracking();
         self.fst_trace = trace;
         self.fst_prev_signals = prev;
+        self.fst_path = Some(filename.to_string());
         self.fst_writer = Some(if self.dump_writer_threaded() {
             super::fst_sink::FstSink::threaded(body)
         } else {
@@ -64823,6 +64828,104 @@ impl Simulator {
         if let Some(sink) = self.fst_writer.take() {
             sink.finish();
         }
+        // `finish()` joined the writer thread, so the trailer is on disk and
+        // the file is ours again.
+        if let Some(path) = self.fst_path.take() {
+            Self::fst_repair_time_tables(&path);
+        }
+    }
+
+    /// Undo `fst-writer`'s break-even time-table encoding.
+    ///
+    /// `write_time_table` picks raw vs zlib storage with `compressed.len() >
+    /// raw.len()`. The format needs `>=`: a reader treats "compressed length ==
+    /// uncompressed length" as the sentinel for a section stored RAW, so when
+    /// zlib output comes out EXACTLY the size of its input the writer emits
+    /// compressed bytes while recording equal lengths. Readers then skip the
+    /// inflate and parse zlib's own header as varints — the first two
+    /// timestamps decode from the `78 5e` magic as 120 and 214 for any design.
+    ///
+    /// Nothing else about such a file is wrong: header, block chain, GEOM and
+    /// the declared start/end times all validate, so it passes every structural
+    /// check and only the per-change times are nonsense. gtkwave's `fst2vcd`
+    /// "succeeds" on one and prints times orders of magnitude off, which reads
+    /// as a simulator timing bug rather than a dump bug.
+    ///
+    /// Break-even needs only a short run whose delta-encoded table is small and
+    /// incompressible — 19 irregular time steps is enough — so this is not a
+    /// rare corner. Repairing here keeps the fix inside xezim instead of
+    /// carrying a patched copy of the crate.
+    ///
+    /// Best-effort by construction: every failure path leaves the file exactly
+    /// as the writer left it, because a dump that is merely mis-flagged is far
+    /// better than one this pass half-rewrote.
+    fn fst_repair_time_tables(path: &str) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        const ZLIB_MAGIC: [[u8; 2]; 4] = [[0x78, 0x9c], [0x78, 0x5e], [0x78, 0x01], [0x78, 0xda]];
+        // Value-change block types that carry a trailing time table.
+        const VC_TYPES: [u8; 3] = [1, 5, 8];
+
+        let Ok(mut f) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
+            return;
+        };
+        let Ok(size) = f.metadata().map(|m| m.len()) else {
+            return;
+        };
+        let mut off: u64 = 0;
+        while off < size {
+            if f.seek(SeekFrom::Start(off)).is_err() {
+                return;
+            }
+            let mut head = [0u8; 9];
+            if f.read_exact(&mut head).is_err() {
+                return;
+            }
+            let btype = head[0];
+            let blen = u64::from_be_bytes(head[1..9].try_into().unwrap_or([0; 8]));
+            if blen == 0 || off + 1 + blen > size {
+                return; // malformed chain: leave everything alone
+            }
+            let end = off + 1 + blen;
+            if VC_TYPES.contains(&btype) {
+                // Trailer is (uncompressed_len, compressed_len, item_count).
+                let mut tr = [0u8; 24];
+                if f.seek(SeekFrom::Start(end - 24)).is_ok() && f.read_exact(&mut tr).is_ok() {
+                    let unc = u64::from_be_bytes(tr[0..8].try_into().unwrap_or([0; 8]));
+                    let comp = u64::from_be_bytes(tr[8..16].try_into().unwrap_or([0; 8]));
+                    if unc == comp && comp >= 2 && comp <= blen {
+                        let start = end - 24 - comp;
+                        let mut payload = vec![0u8; comp as usize];
+                        if f.seek(SeekFrom::Start(start)).is_ok()
+                            && f.read_exact(&mut payload).is_ok()
+                            && ZLIB_MAGIC.iter().any(|m| payload[..2] == *m)
+                        {
+                            if let Ok(raw) =
+                                miniz_oxide::inflate::decompress_to_vec_zlib(&payload)
+                            {
+                                if raw.len() as u64 == comp {
+                                    // The break-even case itself: the lengths are
+                                    // LEGITIMATELY equal, so correcting a length
+                                    // would change nothing. Store what should have
+                                    // been stored. Same byte count, so no offset in
+                                    // the file moves.
+                                    let _ = f
+                                        .seek(SeekFrom::Start(start))
+                                        .and_then(|_| f.write_all(&raw));
+                                } else {
+                                    // They only looked equal; recording the true
+                                    // uncompressed length makes the reader inflate.
+                                    let _ = f
+                                        .seek(SeekFrom::Start(end - 24))
+                                        .and_then(|_| f.write_all(&(raw.len() as u64).to_be_bytes()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            off = end;
+        }
+        let _ = f.flush();
     }
 
     /// Declared element width of an associative array, when the elaborator
