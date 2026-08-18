@@ -138,6 +138,32 @@ pub enum FmtSeg {
     },
 }
 
+/// Native string operation. Semantics mirror the AST interpreter's
+/// implementations byte-for-byte (§6.16); each op reads its operands from
+/// registers and writes a fresh Value to the destination — the two mutator
+/// shapes (PutC, the *toa family) return the MODIFIED string and the
+/// compiler emits the store-back separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StrOpKind {
+    Len,      // [s]        -> 32-bit byte count
+    GetC,     // [s, i]     -> 8-bit byte, 0 out of range
+    Substr,   // [s, a, b]  -> inclusive byte slice, "" out of range
+    ToUpper,  // [s]
+    ToLower,  // [s]
+    Compare,  // [a, b]     -> signed 32 strcmp difference
+    ICompare, // [a, b]     -> case-folded strcmp
+    AToI,     // [s]        -> longest radix-10 prefix
+    AToHex,   // [s]
+    AToOct,   // [s]
+    AToBin,   // [s]
+    Concat,   // [parts...] -> joined bytes (§11.4.12 string concat)
+    PutC,     // [s, i, c]  -> s with byte i replaced (unchanged if OOB/NUL)
+    IToA,     // [v]        -> signed decimal text
+    HexToA,   // [v]
+    OctToA,   // [v]
+    BinToA,   // [v]
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FormatData {
     pub segs: Vec<FmtSeg>,
@@ -219,6 +245,8 @@ pub enum Insn {
     /// whole-call AST fallback that made every tracer decode helper cost
     /// ~24µs per retired instruction.
     Format(RegId, Box<FormatData>),
+    /// dst = op(args) over string Values — see `StrOpKind`.
+    StrOp(RegId, StrOpKind, Box<Vec<RegId>>),
     /// Store to a `string` signal (§6.16): the value keeps its own width —
     /// the table width is a placeholder, and `BlockingAssign`'s resize
     /// would truncate the FRONT of the text.
@@ -488,6 +516,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::CaseJump(..) => "CaseJump",
         Insn::CaseMaskJump(..) => "CaseMaskJump",
         Insn::Format(..) => "Format",
+        Insn::StrOp(..) => "StrOp",
         Insn::BlockingAssignString(..) => "BlockingAssignString",
         Insn::CasezEq(..) => "CasezEq",
         Insn::CasexEq(..) => "CasexEq",
@@ -700,6 +729,12 @@ pub struct BytecodeCompiler<'a> {
     /// values — drives `%s` semantics and resize suppression. Name-based on
     /// purpose: register ids are recycled across arms, names are not.
     local_var_is_string: HashSet<String>,
+    /// Active inline return context: (result register — None for a void
+    /// function or task —, resize width; 0 = none, e.g. strings). `return`
+    /// compiles to result-move + jump; the jump indexes collect in
+    /// `inline_ret_jumps` and the inliner patches them to its body end.
+    inline_ret: Option<(Option<RegId>, u32)>,
+    inline_ret_jumps: Vec<usize>,
     /// Base names of 2D/ND UNPACKED arrays. When a continuous-assign LHS
     /// `m[0][j]` targets one of these, the flattening short-circuit
     /// (`flattened_outer_const_signal_id`) must NOT fire — the
@@ -765,6 +800,8 @@ impl<'a> BytecodeCompiler<'a> {
             loop_continue_patches: Vec::new(),
             string_signals: None,
             local_var_is_string: HashSet::default(),
+            inline_ret: None,
+            inline_ret_jumps: Vec::new(),
             multi_dim_arrays: None,
             packed_struct_fields: None,
         }
@@ -1339,15 +1376,27 @@ impl<'a> BytecodeCompiler<'a> {
             self.bail("Expr_Call_blocking");
             return None;
         }
-        let ret_w = crate::compiler::elaborate::resolve_type_width(
-            &fd.return_type,
-            self.params,
-            None,
+        let ret_is_string = matches!(
+            fd.return_type,
+            crate::ast::types::DataType::Simple {
+                kind: crate::ast::types::SimpleType::String,
+                ..
+            }
         );
+        let ret_w = if ret_is_string {
+            0
+        } else {
+            crate::compiler::elaborate::resolve_type_width(
+                &fd.return_type,
+                self.params,
+                None,
+            )
+        };
         // Evaluate the arguments in the CALLER's scope first, then bind them as
         // register-backed locals while compiling the body.
         let mut binds: Vec<(String, (RegId, u32))> = Vec::with_capacity(args.len());
         let mut ref_writes: Vec<(Expression, RegId, u32)> = Vec::new();
+        let mut string_formal_names: Vec<String> = Vec::new();
         for (i, (p, a)) in fd.ports.iter().zip(args).enumerate() {
             if matches!(p.direction, PortDirection::Ref)
                 && (matches!(&a.kind, ExprKind::Ident(h) if self.local_var_reg_of(h).is_some())
@@ -1356,7 +1405,18 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail("Expr_Call_ref_target");
                 return None;
             }
-            let w = self.port_effective_width(&fd.ports, i);
+            let formal_is_string = matches!(
+                &p.data_type,
+                crate::ast::types::DataType::Simple {
+                    kind: crate::ast::types::SimpleType::String,
+                    ..
+                }
+            );
+            let w = if formal_is_string {
+                0
+            } else {
+                self.port_effective_width(&fd.ports, i)
+            };
             let slot = self.alloc_reg();
             if matches!(p.direction, PortDirection::Output) {
                 // §13.5.3: an output formal does NOT read the actual; it
@@ -1370,6 +1430,9 @@ impl<'a> BytecodeCompiler<'a> {
             if w > 0 {
                 self.emit(Insn::Resize(slot, w));
             }
+            if formal_is_string {
+                string_formal_names.push(p.name.name.clone());
+            }
             binds.push((p.name.name.clone(), (slot, w)));
             if matches!(p.direction, PortDirection::Ref | PortDirection::Output) {
                 ref_writes.push((a.clone(), slot, w));
@@ -1382,11 +1445,25 @@ impl<'a> BytecodeCompiler<'a> {
         // signal and the enclosing statement bails.
         let qpfx = name.rsplit_once('.').map(|(p, _)| p.to_string());
         let saved_locals = std::mem::take(&mut self.local_var_regs);
+        let saved_local_strings = std::mem::take(&mut self.local_var_is_string);
         for (n, b) in binds {
             if let Some(pfx) = &qpfx {
                 self.local_var_regs.insert(format!("{pfx}.{n}"), b);
             }
             self.local_var_regs.insert(n, b);
+        }
+        for n in &string_formal_names {
+            if let Some(pfx) = &qpfx {
+                self.local_var_is_string.insert(format!("{pfx}.{n}"));
+            }
+            self.local_var_is_string.insert(n.clone());
+        }
+        if ret_is_string {
+            if let Some(pfx) = &qpfx {
+                self.local_var_is_string
+                    .insert(format!("{}.{}", pfx, fd.name.name.name));
+            }
+            self.local_var_is_string.insert(fd.name.name.name.clone());
         }
         // The function's own name is its return variable (§13.4.1): give it a
         // register too, so a body that assigns it (possibly across several
@@ -1413,7 +1490,18 @@ impl<'a> BytecodeCompiler<'a> {
         // the ordinary (correct) call path.
         let saved_fallback = self.allow_ast_fallback;
         self.allow_ast_fallback = false;
+        let saved_ret = self.inline_ret;
+        let saved_ret_jumps = std::mem::take(&mut self.inline_ret_jumps);
+        self.inline_ret = Some((Some(ret_slot), ret_w));
         let mut ok = self.compile_pure_body(&items, ret_slot, ret_w, ctx_width);
+        // Early returns land HERE — after the body, before the output-formal
+        // copy-out, which §13.5.3 performs on every return path.
+        let body_end = self.insns.len() as u32;
+        for j in std::mem::take(&mut self.inline_ret_jumps) {
+            self.insns[j] = Insn::Jump(body_end);
+        }
+        self.inline_ret = saved_ret;
+        self.inline_ret_jumps = saved_ret_jumps;
         if ok {
             for (target, value, width) in &ref_writes {
                 if !self.compile_blocking_target(target, *value, *width) {
@@ -1425,6 +1513,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_ast_fallback = saved_fallback;
         self.inlining_stack.pop();
         self.local_var_regs = saved_locals;
+        self.local_var_is_string = saved_local_strings;
         if !ok {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
                 eprintln!(
@@ -1464,7 +1553,14 @@ impl<'a> BytecodeCompiler<'a> {
                             self.bail("Expr_Call_local_array");
                             return false;
                         }
-                        let w = self.decl_width(data_type);
+                        let is_string = matches!(
+                            data_type,
+                            crate::ast::types::DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        );
+                        let w = if is_string { 0 } else { self.decl_width(data_type) };
                         let slot = self.alloc_reg();
                         match &d.init {
                             Some(e) => {
@@ -1481,19 +1577,18 @@ impl<'a> BytecodeCompiler<'a> {
                         if w > 0 {
                             self.emit(Insn::Resize(slot, w));
                         }
+                        if is_string {
+                            self.local_var_is_string.insert(d.name.name.clone());
+                        }
                         self.local_var_regs.insert(d.name.name.clone(), (slot, w));
                     }
                 }
-                StatementKind::Return(Some(e)) => {
-                    if idx + 1 != items.len() {
-                        self.bail("Expr_Call_early_return");
+                // `return` — early or final — compiles via compile_stmt's
+                // Return arm (result move + jump patched by the caller).
+                StatementKind::Return(_) => {
+                    if !self.compile_stmt(st) {
                         return false;
                     }
-                    let w = if ret_w > 0 { ret_w } else { ctx_width };
-                    let Some(v) = self.compile_expr(e, w) else {
-                        return false;
-                    };
-                    self.emit(Insn::Move(ret_slot, v));
                 }
                 _ => {
                     if !self.compile_stmt(st) {
@@ -1626,12 +1721,22 @@ impl<'a> BytecodeCompiler<'a> {
             let saved_fallback = self.allow_ast_fallback;
             self.allow_ast_fallback = false;
             self.inlining_stack.push(task_name.to_string());
+            let saved_ret = self.inline_ret;
+            let saved_ret_jumps = std::mem::take(&mut self.inline_ret_jumps);
+            self.inline_ret = Some((None, 0));
             for st in &body {
                 if !self.compile_stmt(st) {
                     ok = false;
                     break;
                 }
             }
+            // `return;` sites jump here, BEFORE the §13.5.3 output copy-out.
+            let body_end = self.insns.len() as u32;
+            for j in std::mem::take(&mut self.inline_ret_jumps) {
+                self.insns[j] = Insn::Jump(body_end);
+            }
+            self.inline_ret = saved_ret;
+            self.inline_ret_jumps = saved_ret_jumps;
             if ok {
                 for (target, value, width) in &out_writes {
                     if !self.compile_blocking_target(target, *value, *width) {
@@ -2141,6 +2246,16 @@ impl<'a> BytecodeCompiler<'a> {
                 // `mix_column` calls `xtime(a ^ b)`; without this arm the
                 // whole helper — and the task enclosing it — was branded
                 // impure and stayed on the interpreter.
+                // Pure formatting/interpretation builtins: value depends
+                // only on the (checked) arguments. `$sformatf` here is what
+                // lets the string decode helpers (get_csr_name-style: a big
+                // case of returns with a formatted default) inline at all.
+                ExprKind::SystemCall { name, args } => {
+                    matches!(
+                        name.as_str(),
+                        "$sformatf" | "$psprintf" | "$signed" | "$unsigned"
+                    ) && args.iter().all(|a| expr_ok(a, bound, me))
+                }
                 ExprKind::Call { func, args } => {
                     let ExprKind::Ident(h) = &func.kind else { return false };
                     if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
@@ -2256,6 +2371,17 @@ impl<'a> BytecodeCompiler<'a> {
     /// function's return variable makes a partially-assigned function return 0
     /// where it must return x.
     fn type_default_value(&self, dt: &crate::ast::types::DataType, w: u32) -> Value {
+        if matches!(
+            dt,
+            crate::ast::types::DataType::Simple {
+                kind: crate::ast::types::SimpleType::String,
+                ..
+            }
+        ) {
+            // §6.16: a string variable initializes to "" — and its Value
+            // must never be resized to the 1024-bit placeholder width.
+            return Value::from_string("");
+        }
         let w = if w > 0 { w } else { 32 };
         if crate::compiler::elaborate::is_type_two_state(dt) {
             Value::zero(w)
@@ -2305,8 +2431,117 @@ impl<'a> BytecodeCompiler<'a> {
                     ss.contains(&raw) || ss.contains(leaf)
                 })
             }
+            ExprKind::Concatenation(parts) => {
+                !parts.is_empty() && parts.iter().all(|p| self.expr_is_string_static(p))
+            }
+            ExprKind::Call { func, .. } => {
+                let ExprKind::Ident(h) = &func.kind else { return false };
+                // String method with a string result on a string receiver.
+                if h.path.len() >= 2 {
+                    let m = h.path.last().unwrap().name.name.as_str();
+                    if matches!(m, "substr" | "toupper" | "tolower") {
+                        let mut recv = h.clone();
+                        recv.path.pop();
+                        let recv_expr =
+                            Expression::new(ExprKind::Ident(recv), func.span);
+                        if self.expr_is_string_static(&recv_expr) {
+                            return true;
+                        }
+                    }
+                }
+                let raw = Self::hier_raw_name(h);
+                self.functions
+                    .and_then(|f| {
+                        f.get(&raw).or_else(|| {
+                            raw.rsplit('.').next().and_then(|l| f.get(l))
+                        })
+                    })
+                    .is_some_and(|fd| {
+                        matches!(
+                            fd.return_type,
+                            crate::ast::types::DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        )
+                    })
+            }
             _ => false,
         }
+    }
+
+    /// `recv.method(args)` where the receiver is a statically-known STRING
+    /// (dotted-Ident call shape). Returns the receiver as its own Ident
+    /// expression plus the method leaf, or None when the shape/typing does
+    /// not match.
+    fn string_method_shape<'e>(
+        &self,
+        func: &'e Expression,
+        span: crate::ast::Span,
+    ) -> Option<(Expression, &'e str)> {
+        let ExprKind::Ident(h) = &func.kind else { return None };
+        if h.root.is_some() || h.path.len() < 2 {
+            return None;
+        }
+        if h.path.iter().any(|seg| !seg.selects.is_empty()) {
+            return None;
+        }
+        let method = h.path.last().unwrap().name.name.as_str();
+        let mut recv = h.clone();
+        recv.path.pop();
+        let recv_expr = Expression::new(ExprKind::Ident(recv), span);
+        if !self.expr_is_string_static(&recv_expr) {
+            return None;
+        }
+        Some((recv_expr, method))
+    }
+
+    /// Compile a PURE string method call to a `StrOp`. Mutators (putc, the
+    /// *toa family) are handled at statement level, not here.
+    fn compile_string_method(
+        &mut self,
+        func: &Expression,
+        args: &[Expression],
+        span: crate::ast::Span,
+    ) -> Option<RegId> {
+        let (recv, method) = self.string_method_shape(func, span)?;
+        let (kind, nargs) = match method {
+            "len" => (StrOpKind::Len, 0),
+            "getc" => (StrOpKind::GetC, 1),
+            "substr" => (StrOpKind::Substr, 2),
+            "toupper" => (StrOpKind::ToUpper, 0),
+            "tolower" => (StrOpKind::ToLower, 0),
+            "compare" => (StrOpKind::Compare, 1),
+            "icompare" => (StrOpKind::ICompare, 1),
+            "atoi" => (StrOpKind::AToI, 0),
+            "atohex" => (StrOpKind::AToHex, 0),
+            "atooct" => (StrOpKind::AToOct, 0),
+            "atobin" => (StrOpKind::AToBin, 0),
+            _ => return None,
+        };
+        if args.len() != nargs {
+            return None;
+        }
+        let start = self.insns.len();
+        let start_reg = self.next_reg;
+        let mut regs: Vec<RegId> = Vec::with_capacity(1 + nargs);
+        let Some(r) = self.compile_expr(&recv, 0) else {
+            return None;
+        };
+        regs.push(r);
+        for a in args {
+            match self.compile_expr(a, 0) {
+                Some(r) => regs.push(r),
+                None => {
+                    self.insns.truncate(start);
+                    self.next_reg = start_reg;
+                    return None;
+                }
+            }
+        }
+        let dst = self.alloc_reg();
+        self.emit(Insn::StrOp(dst, kind, Box::new(regs)));
+        Some(dst)
     }
 
     fn signal_is_string_name(&self, hier: &HierarchicalIdentifier) -> bool {
@@ -4197,6 +4432,32 @@ impl<'a> BytecodeCompiler<'a> {
     fn compile_stmt_strict(&mut self, stmt: &Statement) -> bool {
         match &stmt.kind {
             StatementKind::Null => true,
+            // §13.4.1 early return inside an INLINED body: move the value
+            // into the result register and jump to the body end (patched by
+            // the inliner). Outside an inline there is nothing to return to.
+            StatementKind::Return(e) => {
+                let Some((slot, w)) = self.inline_ret else {
+                    self.bail("Return_outside_inline");
+                    return false;
+                };
+                if let Some(e) = e {
+                    let Some(slot) = slot else {
+                        self.bail("Return_value_in_void");
+                        return false;
+                    };
+                    let Some(v) = self.compile_expr(e, w) else {
+                        return false;
+                    };
+                    self.emit(Insn::Move(slot, v));
+                    if w > 0 {
+                        self.emit(Insn::Resize(slot, w));
+                    }
+                }
+                let j = self.insns.len();
+                self.emit(Insn::Jump(0));
+                self.inline_ret_jumps.push(j);
+                true
+            }
             StatementKind::VarDecl {
                 data_type,
                 declarators,
@@ -4257,7 +4518,17 @@ impl<'a> BytecodeCompiler<'a> {
                             .insert(decl.name.name.clone(), (base, ew, len, lo));
                         continue;
                     }
-                    let width = self.decl_width(data_type);
+                    // §6.16 string local: no declared width — bind at width
+                    // 0 so no Resize ever lands on it, and mark it for the
+                    // %s / string-assign paths.
+                    let is_string = matches!(
+                        data_type,
+                        crate::ast::types::DataType::Simple {
+                            kind: crate::ast::types::SimpleType::String,
+                            ..
+                        }
+                    );
+                    let width = if is_string { 0 } else { self.decl_width(data_type) };
                     let slot = self.alloc_reg();
                     match &decl.init {
                         Some(expr) => {
@@ -4274,6 +4545,9 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if width > 0 {
                         self.emit(Insn::Resize(slot, width));
+                    }
+                    if is_string {
+                        self.local_var_is_string.insert(decl.name.name.clone());
                     }
                     self.local_var_regs
                         .insert(decl.name.name.clone(), (slot, width));
@@ -4586,6 +4860,56 @@ impl<'a> BytecodeCompiler<'a> {
                     // ordinary expression path below, discarding its (empty)
                     // result register.
                     ExprKind::Call { func, args } => {
+                        // §6.16.4/§6.16.10 in-place string mutators as
+                        // statements: compute the modified text natively,
+                        // store it back to the receiver.
+                        if let Some((recv, method)) =
+                            self.string_method_shape(func, e.span)
+                        {
+                            let kind = match (method, args.len()) {
+                                ("putc", 2) => Some(StrOpKind::PutC),
+                                ("itoa", 1) => Some(StrOpKind::IToA),
+                                ("hextoa", 1) => Some(StrOpKind::HexToA),
+                                ("octtoa", 1) => Some(StrOpKind::OctToA),
+                                ("bintoa", 1) => Some(StrOpKind::BinToA),
+                                _ => None,
+                            };
+                            if let Some(kind) = kind {
+                                let start = self.insns.len();
+                                let start_reg = self.next_reg;
+                                let mut regs: Vec<RegId> = Vec::new();
+                                let mut ok = true;
+                                // PutC reads the current text; the *toa
+                                // family overwrites it wholesale.
+                                if kind == StrOpKind::PutC {
+                                    match self.compile_expr(&recv, 0) {
+                                        Some(r) => regs.push(r),
+                                        None => ok = false,
+                                    }
+                                }
+                                if ok {
+                                    for a in args {
+                                        match self.compile_expr(a, 0) {
+                                            Some(r) => regs.push(r),
+                                            None => {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if ok {
+                                    let dst = self.alloc_reg();
+                                    self.emit(Insn::StrOp(dst, kind, Box::new(regs)));
+                                    if self.compile_blocking_target(&recv, dst, 0) {
+                                        return true;
+                                    }
+                                }
+                                self.insns.truncate(start);
+                                self.next_reg = start_reg;
+                                // fall through to the task/AST paths
+                            }
+                        }
                         if let ExprKind::Ident(h) = &func.kind {
                             let raw = Self::hier_raw_name(h);
                             if self.try_inline_task_args(&raw, args) {
@@ -5362,6 +5686,33 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::CaseEq(dest, l, r));
                         self.emit(Insn::LogNot(dest, dest));
                     }
+                    // §6.16.6: relational operators on STRING operands are
+                    // lexicographic. The numeric Lt/Gt insns compare packed
+                    // magnitudes, which diverges once lengths differ
+                    // ("abc" < "b" is TRUE lexicographically, false
+                    // numerically) — route through the native strcmp and
+                    // compare its signed difference against zero.
+                    BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
+                        if self.expr_is_string_static(left)
+                            && self.expr_is_string_static(right) =>
+                    {
+                        let cmp = self.alloc_reg();
+                        self.emit(Insn::StrOp(
+                            cmp,
+                            StrOpKind::Compare,
+                            Box::new(vec![l, r]),
+                        ));
+                        let z = self.alloc_reg();
+                        let mut zero = Value::from_u64(0, 32);
+                        zero.is_signed = true;
+                        self.emit(Insn::LoadConst(z, Box::new(zero)));
+                        self.emit(match op {
+                            BinaryOp::Lt => Insn::Lt(dest, cmp, z),
+                            BinaryOp::Leq => Insn::Leq(dest, cmp, z),
+                            BinaryOp::Gt => Insn::Gt(dest, cmp, z),
+                            _ => Insn::Geq(dest, cmp, z),
+                        });
+                    }
                     BinaryOp::Lt => self.emit(Insn::Lt(dest, l, r)),
                     BinaryOp::Leq => self.emit(Insn::Leq(dest, l, r)),
                     BinaryOp::Gt => self.emit(Insn::Gt(dest, l, r)),
@@ -5833,6 +6184,32 @@ impl<'a> BytecodeCompiler<'a> {
                 // we bail to the AST interpreter which has the special
                 // case at `eval_expr_ctx::Concatenation`.
                 if parts.iter().any(|p| self.expr_is_string_concat_operand(p)) {
+                    // §11.4.12: with every operand statically string-valued,
+                    // this is a byte-level join — one native op. A MIXED
+                    // concat (some operands of unknown type) keeps the AST
+                    // path, whose type knowledge is authoritative.
+                    if parts.iter().all(|p| self.expr_is_string_static(p)) {
+                        let start = self.insns.len();
+                        let start_reg = self.next_reg;
+                        let mut regs: Vec<RegId> = Vec::with_capacity(parts.len());
+                        let mut ok = true;
+                        for p in parts {
+                            match self.compile_expr(p, 0) {
+                                Some(r) => regs.push(r),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok {
+                            let dst = self.alloc_reg();
+                            self.emit(Insn::StrOp(dst, StrOpKind::Concat, Box::new(regs)));
+                            return Some(dst);
+                        }
+                        self.insns.truncate(start);
+                        self.next_reg = start_reg;
+                    }
                     self.bail("Concat_string");
                     return None;
                 }
@@ -6180,9 +6557,13 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 acc
             }
-            ExprKind::Call { func, args } => self
-                .compile_pure_call(func, args, ctx_width)
-                .or_else(|| self.emit_expr_fallback(expr, ctx_width, "Expr_Call_impure")),
+            ExprKind::Call { func, args } => {
+                if let Some(r) = self.compile_string_method(func, args, expr.span) {
+                    return Some(r);
+                }
+                self.compile_pure_call(func, args, ctx_width)
+                    .or_else(|| self.emit_expr_fallback(expr, ctx_width, "Expr_Call_impure"))
+            }
             other => {
                 let n: &'static str = match other {
                     ExprKind::StringLiteral(_) => "Expr_StringLiteral",
@@ -6955,6 +7336,14 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some((_, w)) = self.local_var_reg_of(hier) {
                     if w > 0 {
                         return w;
+                    }
+                    // A width-0 STRING local is deliberate: falling through
+                    // to the 32-bit default truncated the text to 4 chars.
+                    if self
+                        .local_var_is_string
+                        .contains(&Self::hier_raw_name(hier))
+                    {
+                        return 0;
                     }
                 }
                 if let Some(id) = self.lookup_signal_id(hier) {
@@ -7740,6 +8129,7 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::CaseJump(src, _) => *src == r,
             Insn::CaseMaskJump(src, _) => *src == r,
             Insn::Format(_, f) => f.args.contains(&r),
+            Insn::StrOp(_, _, args) => args.contains(&r),
             Insn::BlockingAssignString(_, v) => *v == r,
             Insn::LoadConst(..)
             | Insn::LoadSignal(..)
@@ -8451,6 +8841,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::CaseJump(..) | Insn::CaseMaskJump(..) => {}
                 // String result: width is the text length, not static.
                 Insn::Format(d, ..) => store(&mut rw, *d, None),
+                Insn::StrOp(d, ..) => store(&mut rw, *d, None),
                 Insn::BlockingAssignString(..) => {}
 
                 // The exec arms clone the boxed `Value` verbatim.
@@ -9538,6 +9929,7 @@ pub fn lower_two_state(
             Insn::CaseJump(..) => return None,
             Insn::CaseMaskJump(..) => return None,
             Insn::Format(..) => return None,
+            Insn::StrOp(..) => return None,
             Insn::BlockingAssignString(..) => return None,
             // 1-bit results. CaseEq/CaseNeq equal Eq/Neq on X-free values.
             Insn::Eq(d, a, b) | Insn::CaseEq(d, a, b) => {

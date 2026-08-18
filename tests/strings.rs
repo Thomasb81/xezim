@@ -67,3 +67,7 @@ mod system_task_gaps;
 mod fixed_string_array_dims;
 #[path = "strings/compiled_sformatf_native.rs"]
 mod compiled_sformatf_native;
+#[path = "strings/native_string_ops.rs"]
+mod native_string_ops;
+#[path = "strings/string_returning_fn_inline.rs"]
+mod string_returning_fn_inline;
