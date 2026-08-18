@@ -284,3 +284,5 @@ mod formal_metadata_shadow_roundtrip;
 mod decode_helper_assign_compiles;
 #[path = "types/unpacked_elem_compare_width.rs"]
 mod unpacked_elem_compare_width;
+#[path = "types/tf_port_direction_inheritance.rs"]
+mod tf_port_direction_inheritance;
