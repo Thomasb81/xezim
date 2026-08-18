@@ -1244,6 +1244,9 @@ impl<'a> BytecodeCompiler<'a> {
         // keeps the AST path's sensitivity handling (which follows a callee's
         // reads) authoritative for such functions.
         if !self.fn_is_pure_in(&fd, name.rsplit_once('.').map(|(p, _)| p)) {
+            if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
+                eprintln!("[INLINE-FAIL] fn {} reason=impure", name);
+            }
             self.bail("Expr_Call_impure");
             return None;
         }
@@ -1347,6 +1350,13 @@ impl<'a> BytecodeCompiler<'a> {
         self.inlining_stack.pop();
         self.local_var_regs = saved_locals;
         if !ok {
+            if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
+                eprintln!(
+                    "[INLINE-FAIL] fn {} reason={}",
+                    fd.name.name.name,
+                    self.bail_reason.unwrap_or("unknown")
+                );
+            }
             return None;
         }
         if ret_w > 0 {
