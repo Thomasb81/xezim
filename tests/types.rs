@@ -288,3 +288,5 @@ mod unpacked_elem_compare_width;
 mod tf_port_direction_inheritance;
 #[path = "types/inside_const_members.rs"]
 mod inside_const_members;
+#[path = "types/packed_struct_pattern_compile.rs"]
+mod packed_struct_pattern_compile;

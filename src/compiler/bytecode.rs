@@ -544,6 +544,12 @@ pub struct BytecodeCompiler<'a> {
     /// bytecode compilation can fold module params (e.g. `CARRY_CHAIN`) into
     /// the compile-time widths of `+:` / `-:` range selects.
     params: Option<&'a HashMap<String, Value>>,
+    /// Packed-struct field layout of the CURRENT assignment's destination,
+    /// installed by the assign arms around their rvalue compile so an
+    /// `'{...}` assignment pattern can compile to a Concat. An assignment
+    /// pattern is otherwise context-free at expression level — its meaning
+    /// depends entirely on the target type.
+    pattern_layout: Option<Vec<(String, u32, u32)>>,
     /// Named-cast targets known at compile time: name -> (width, signed).
     /// See the simulator's `cast_widths`.
     cast_widths: Option<&'a HashMap<String, (u32, bool)>>,
@@ -648,6 +654,7 @@ impl<'a> BytecodeCompiler<'a> {
             tasks_inlined: 0,
             params: None,
             cast_widths: None,
+            pattern_layout: None,
             top_module_name: None,
             packed_elem_widths: None,
             assoc_elem_widths: None,
@@ -2025,6 +2032,94 @@ impl<'a> BytecodeCompiler<'a> {
     /// metadata tables at ~7us a piece; ibex's CSR and interrupt logic does
     /// ~8 of them per cycle (`mstatus_q.mpp`, `irqs_i.irq_fast`, ...), which
     /// made this the largest single fallback after the named-cast fix.
+    /// Field layout of `lv` when it names a packed-struct SIGNAL directly.
+    fn lvalue_struct_layout(&self, lv: &Expression) -> Option<Vec<(String, u32, u32)>> {
+        let fields_tbl = self.packed_struct_fields?;
+        let ExprKind::Ident(h) = &lv.kind else { return None };
+        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let raw = Self::hier_raw_name(h);
+        if let Some(scope) = &self.scope_hint {
+            let q = format!("{}.{}", scope, raw);
+            if let Some(l) = fields_tbl.get(&q) {
+                return Some(l.clone());
+            }
+        }
+        fields_tbl.get(&raw).cloned()
+    }
+
+    /// §10.9.2: an assignment pattern applied to a PACKED-struct target is a
+    /// concatenation of its members in declared order (first field = MSBs).
+    /// Named items bind by field, `default:` fills whatever is left, ordered
+    /// items map by position. Every field must be covered exactly once, and
+    /// each member expression compiles at ITS OWN field's width — that is
+    /// what makes this exactly the interpreter's member-wise semantics.
+    /// ibex's CSR write logic rebuilds `mstatus_d`/`mcause_d` this way every
+    /// cycle; the pattern bail dragged the whole block (11% of the bench)
+    /// onto the AST path.
+    fn compile_packed_struct_pattern(
+        &mut self,
+        items: &[crate::ast::expr::AssignmentPatternItem],
+        layout: &[(String, u32, u32)],
+    ) -> Option<RegId> {
+        use crate::ast::expr::AssignmentPatternItem as Item;
+        if layout.is_empty() {
+            return None;
+        }
+        // MSB-first: highest offset first.
+        let mut fields: Vec<(String, u32, u32)> = layout.to_vec();
+        fields.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut named: Vec<(usize, &Expression)> = Vec::new();
+        let mut ordered: Vec<&Expression> = Vec::new();
+        let mut default: Option<&Expression> = None;
+        for it in items {
+            match it {
+                Item::Named(id, e) => {
+                    let idx = fields.iter().position(|(n, _, _)| *n == id.name)?;
+                    if named.iter().any(|(i, _)| *i == idx) {
+                        return None;
+                    }
+                    named.push((idx, e));
+                }
+                Item::Ordered(e) => ordered.push(e),
+                Item::Default(e) => {
+                    if default.is_some() {
+                        return None;
+                    }
+                    default = Some(e);
+                }
+                _ => return None,
+            }
+        }
+        // Mixed ordered+named is not a legal pattern; ordered must cover all.
+        if !ordered.is_empty() && (!named.is_empty() || default.is_some()) {
+            return None;
+        }
+        if !ordered.is_empty() && ordered.len() != fields.len() {
+            return None;
+        }
+        let mut regs: Vec<RegId> = Vec::with_capacity(fields.len());
+        for (idx, (_, _, w)) in fields.iter().enumerate() {
+            let expr = if !ordered.is_empty() {
+                ordered[idx]
+            } else if let Some((_, e)) = named.iter().find(|(i, _)| *i == idx) {
+                e
+            } else {
+                default?
+            };
+            let src = self.compile_expr(expr, *w)?;
+            let r = self.alloc_reg();
+            self.emit(Insn::Move(r, src));
+            self.emit(Insn::Resize(r, *w));
+            regs.push(r);
+        }
+        let dest = self.alloc_reg();
+        self.emit(Insn::Concat(dest, Box::new(regs)));
+        Some(dest)
+    }
+
     fn compile_packed_member_read(&mut self, hier: &HierarchicalIdentifier) -> Option<RegId> {
         let fields_tbl = self.packed_struct_fields?;
         if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
@@ -2997,7 +3092,10 @@ impl<'a> BytecodeCompiler<'a> {
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
-                if let Some(val_reg) = self.compile_expr(rvalue, width) {
+                self.pattern_layout = self.lvalue_struct_layout(lvalue);
+                let compiled = self.compile_expr(rvalue, width);
+                self.pattern_layout = None;
+                if let Some(val_reg) = compiled {
                     // Note: NbaAssign itself performs §10.7 assignment-padding resize,
                     // so we don't emit a generic (zero-extending) Resize here — that
                     // would strip X/Z from the MSB before the assignment could X/Z-extend.
@@ -3017,7 +3115,10 @@ impl<'a> BytecodeCompiler<'a> {
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
-                if let Some(val_reg) = self.compile_expr(rvalue, width) {
+                self.pattern_layout = self.lvalue_struct_layout(lvalue);
+                let compiled = self.compile_expr(rvalue, width);
+                self.pattern_layout = None;
+                if let Some(val_reg) = compiled {
                     if width > 0 {
                         self.emit(Insn::Resize(val_reg, width));
                     }
@@ -4620,6 +4721,20 @@ impl<'a> BytecodeCompiler<'a> {
             // formals. That is the overwhelmingly common combinational-helper
             // shape in RTL (`lfsr32(s)`, `mix(a,b)`), and leaving it to the AST
             // interpreter dragged the whole enclosing block out of bytecode.
+            // §10.9.2 assignment pattern with a KNOWN packed-struct target —
+            // the assign arms install the destination's layout around the
+            // rvalue compile. Without a layout it stays on the AST path.
+            ExprKind::AssignmentPattern(items) => {
+                if let Some(layout) = self.pattern_layout.take() {
+                    let r = self.compile_packed_struct_pattern(items, &layout);
+                    self.pattern_layout = Some(layout);
+                    if let Some(r) = r {
+                        return Some(r);
+                    }
+                }
+                self.bail("Expr_AssignmentPattern");
+                None
+            }
             // §11.4.13 set membership, restricted to what makes `==?`
             // degenerate to `==`: every member a compile-time constant with
             // no x/z bits. That is the enum-list shape ibex's decoder and CSR
