@@ -290,3 +290,5 @@ mod static_local_scope_isolation;
 mod hier_iface_task_suspension;
 #[path = "misc/hier_port_drive_and_collision.rs"]
 mod hier_port_drive_and_collision;
+#[path = "misc/recursive_function_in_continuous_assign.rs"]
+mod recursive_function_in_continuous_assign;

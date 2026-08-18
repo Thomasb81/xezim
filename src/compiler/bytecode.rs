@@ -725,6 +725,14 @@ pub struct BytecodeCompiler<'a> {
     /// Set via `set_string_signals`. None = no string info available, in
     /// which case the compiler can only catch the literal-operand case.
     string_signals: Option<&'a HashSet<String>>,
+    /// Recursion guard for `fn_is_pure_in`: its `Call` arm recurses into the
+    /// CALLEE's purity, so a self- or mutually-recursive function walked the
+    /// call graph forever and overflowed the stack (an `assign w = fact(6);`
+    /// with a recursive `fact` aborted the process; the same call from an
+    /// initial block was fine because only the compiled path asks about
+    /// purity). Past the cap the answer is "not pure", which merely keeps the
+    /// call on the AST interpreter — where recursion already works.
+    purity_depth: std::cell::Cell<u32>,
     /// Local/formal names (in the current inline scope) bound to STRING
     /// values — drives `%s` semantics and resize suppression. Name-based on
     /// purpose: register ids are recycled across arms, names are not.
@@ -800,6 +808,7 @@ impl<'a> BytecodeCompiler<'a> {
             loop_continue_patches: Vec::new(),
             string_signals: None,
             local_var_is_string: HashSet::default(),
+            purity_depth: std::cell::Cell::new(0),
             inline_ret: None,
             inline_ret_jumps: Vec::new(),
             multi_dim_arrays: None,
@@ -2184,6 +2193,17 @@ impl<'a> BytecodeCompiler<'a> {
     /// real RTL. Stripping the function's own prefix restores the intended
     /// test: is every name a formal, a local, or a constant?
     fn fn_is_pure_in(&self, fd: &FunctionDeclaration, prefix: Option<&str>) -> bool {
+        const MAX_PURITY_DEPTH: u32 = 8;
+        if self.purity_depth.get() >= MAX_PURITY_DEPTH {
+            return false;
+        }
+        self.purity_depth.set(self.purity_depth.get() + 1);
+        let ok = self.fn_is_pure_in_inner(fd, prefix);
+        self.purity_depth.set(self.purity_depth.get() - 1);
+        ok
+    }
+
+    fn fn_is_pure_in_inner(&self, fd: &FunctionDeclaration, prefix: Option<&str>) -> bool {
         let mut bound: HashSet<String> = HashSet::default();
         bound.insert(fd.name.name.name.clone());
         for p in &fd.ports {
@@ -7913,6 +7933,12 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Ident(hier) => self
                 .lookup_signal_id(hier)
                     .map(|id| self.signal_widths[id])
+                // A packed-struct MEMBER read (`req.addr`) is not a signal of
+                // its own, so the lookup above misses and the old fallback of
+                // 0 made every SELF-DETERMINED use of it 1 bit wide: inside a
+                // concatenation, `{(req.addr >> 5), lsbs}` resized the shift's
+                // operand to 1 bit and the whole term evaluated to 0.
+                .or_else(|| self.packed_struct_member_target(hier).map(|(_, _, mw)| mw))
                 .unwrap_or(0),
             ExprKind::Number(n) => self.eval_number_static(n).map(|v| v.width).unwrap_or(32),
             ExprKind::Binary { op, left, right } => {
@@ -8045,6 +8071,19 @@ impl<'a> BytecodeCompiler<'a> {
                 let n = self.eval_const_expr(count).unwrap_or(0);
                 let inner: u32 = exprs.iter().map(|e| self.expr_max_width(e)).sum();
                 n * inner
+            }
+            // `base.member` in MemberAccess spelling — the same packed-struct
+            // member width as the dotted-Ident form above.
+            ExprKind::MemberAccess { expr: base, member } => {
+                let ExprKind::Ident(bh) = &base.kind else { return 0 };
+                let mut h = bh.clone();
+                h.path.push(crate::ast::expr::HierPathSegment {
+                    name: member.clone(),
+                    selects: Vec::new(),
+                });
+                self.packed_struct_member_target(&h)
+                    .map(|(_, _, mw)| mw)
+                    .unwrap_or(0)
             }
             _ => 0,
         }
