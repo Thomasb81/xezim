@@ -112,6 +112,12 @@ impl BinOpConstKind {
 /// Each instruction specifies source and destination registers explicitly,
 /// enabling the VM to iterate a flat Vec<Insn> with predictable memory access.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CaseLutData {
+    pub table: Vec<Value>,
+    pub default: Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Insn {
     /// Load a constant value into a register. `Box<Value>` keeps the
     /// variant small (8 B instead of 32 B for the inline Value) — LoadConst
@@ -143,6 +149,13 @@ pub enum Insn {
     Eq(RegId, RegId, RegId),
     Neq(RegId, RegId, RegId),
     CaseEq(RegId, RegId, RegId),
+    /// Constant-selector, constant-result `case` lowered to a table:
+    /// `dst = table[src]`, `default` when `src` has x/z bits or is out of
+    /// range. Built only for a plain `case` whose arms all assign constants
+    /// to one variable — an S-box style decode ROM. Replaces a compare-and-
+    /// branch chain of two insns per PATTERN per execution (~500 for AES's
+    /// 256-entry S-box) with one.
+    CaseLut(RegId, RegId, Box<CaseLutData>),
     CasezEq(RegId, RegId, RegId),
     CasexEq(RegId, RegId, RegId),
     Lt(RegId, RegId, RegId),
@@ -404,6 +417,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::Eq(..) => "Eq",
         Insn::Neq(..) => "Neq",
         Insn::CaseEq(..) => "CaseEq",
+        Insn::CaseLut(..) => "CaseLut",
         Insn::CasezEq(..) => "CasezEq",
         Insn::CasexEq(..) => "CasexEq",
         Insn::Lt(..) => "Lt",
@@ -544,6 +558,16 @@ pub struct BytecodeCompiler<'a> {
     /// bytecode compilation can fold module params (e.g. `CARRY_CHAIN`) into
     /// the compile-time widths of `+:` / `-:` range selects.
     params: Option<&'a HashMap<String, Value>>,
+    /// Loop variables bound to COMPILE-TIME constants by the unroller. Read
+    /// before every other name source, so `state[col*4]` folds to a constant
+    /// index while `col` is unrolled.
+    local_const_vars: HashMap<String, Value>,
+    /// Register-bank locals: a small fixed-size local unpacked array whose
+    /// elements live in consecutive VM registers. name -> (base reg, element
+    /// width, length, declared lo index). Only CONSTANT indexes can address a
+    /// bank — the registers have no runtime indexing — so any dynamic access
+    /// fails the enclosing compile, which rolls back to the AST path.
+    local_array_regs: HashMap<String, (RegId, u32, usize, i64)>,
     /// Packed-struct field layout of the CURRENT assignment's destination,
     /// installed by the assign arms around their rvalue compile so an
     /// `'{...}` assignment pattern can compile to a Concat. An assignment
@@ -655,6 +679,8 @@ impl<'a> BytecodeCompiler<'a> {
             params: None,
             cast_widths: None,
             pattern_layout: None,
+            local_const_vars: HashMap::default(),
+            local_array_regs: HashMap::default(),
             top_module_name: None,
             packed_elem_widths: None,
             assoc_elem_widths: None,
@@ -1196,8 +1222,14 @@ impl<'a> BytecodeCompiler<'a> {
                 .ports
                 .iter()
                 .any(|p| {
-                    !matches!(p.direction, PortDirection::Input | PortDirection::Ref)
-                        || !p.dimensions.is_empty()
+                    // §13.5.2 output formals ride the existing ref-writeback
+                    // machinery: the body sees a register, the caller's actual
+                    // is written on return. AES-style helpers
+                    // (`mix_column(c0.., r0..)`) are exactly this shape.
+                    !matches!(
+                        p.direction,
+                        PortDirection::Input | PortDirection::Ref | PortDirection::Output
+                    ) || !p.dimensions.is_empty()
                 })
         {
             self.bail("Expr_Call_ports");
@@ -1237,7 +1269,7 @@ impl<'a> BytecodeCompiler<'a> {
         // register-backed locals while compiling the body.
         let mut binds: Vec<(String, (RegId, u32))> = Vec::with_capacity(args.len());
         let mut ref_writes: Vec<(Expression, RegId, u32)> = Vec::new();
-        for (p, a) in fd.ports.iter().zip(args) {
+        for (i, (p, a)) in fd.ports.iter().zip(args).enumerate() {
             if matches!(p.direction, PortDirection::Ref)
                 && (matches!(&a.kind, ExprKind::Ident(h) if self.local_var_reg_of(h).is_some())
                     || self.expr_to_signal_id(a).is_none())
@@ -1245,15 +1277,22 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail("Expr_Call_ref_target");
                 return None;
             }
-            let w = self.decl_width(&p.data_type);
-            let v = self.compile_expr(a, w)?;
+            let w = self.port_effective_width(&fd.ports, i);
             let slot = self.alloc_reg();
-            self.emit(Insn::Move(slot, v));
+            if matches!(p.direction, PortDirection::Output) {
+                // §13.5.3: an output formal does NOT read the actual; it
+                // starts at its type's default and is copied out on return.
+                let init = self.type_default_value(&p.data_type, w);
+                self.emit(Insn::LoadConst(slot, Box::new(init)));
+            } else {
+                let v = self.compile_expr(a, w)?;
+                self.emit(Insn::Move(slot, v));
+            }
             if w > 0 {
                 self.emit(Insn::Resize(slot, w));
             }
             binds.push((p.name.name.clone(), (slot, w)));
-            if matches!(p.direction, PortDirection::Ref) {
+            if matches!(p.direction, PortDirection::Ref | PortDirection::Output) {
                 ref_writes.push((a.clone(), slot, w));
             }
         }
@@ -1381,6 +1420,21 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn try_inline_task(&mut self, task_name: &str) -> bool {
+        self.try_inline_task_args(task_name, &[])
+    }
+
+    /// Inline a non-blocking task call, arguments included. Input formals
+    /// bind the actual's value to a register-backed local; output formals get
+    /// a default-initialized register and are copied back to the caller's
+    /// lvalue on return (§13.5.3 — an output does not read its actual).
+    /// Everything is rolled back on failure, so a task the compiler cannot
+    /// handle costs nothing and keeps the AST path.
+    ///
+    /// This is what lets a task-structured FSM compile at all: an AES round
+    /// (`sub_bytes(); shift_rows(); mix_columns(); add_round_key(round+1);`)
+    /// was ONE interpreted 280µs block per clock because a single call with
+    /// an argument bailed the whole always_ff.
+    fn try_inline_task_args(&mut self, task_name: &str, args: &[Expression]) -> bool {
         if self.inlining_stack.len() >= MAX_INLINE_DEPTH {
             return false;
         }
@@ -1395,26 +1449,98 @@ impl<'a> BytecodeCompiler<'a> {
             Some(t) => t,
             None => return false,
         };
-        if !td.ports.is_empty() {
+        if td.ports.len() != args.len()
+            || td.ports.iter().any(|p| {
+                !matches!(p.direction, PortDirection::Input | PortDirection::Output)
+                    || !p.dimensions.is_empty()
+            })
+        {
             return false;
         }
         if td.items.iter().any(Self::stmt_is_blocking) {
             return false;
         }
         let body: Vec<Statement> = td.items.clone();
-        self.inlining_stack.push(task_name.to_string());
+        let ports: Vec<_> = td.ports.clone();
+        let start = self.insns.len();
+        let start_reg = self.next_reg;
+
+        // Evaluate input actuals in the CALLER's scope, before any binding.
+        let mut binds: Vec<(String, (RegId, u32))> = Vec::with_capacity(ports.len());
+        let mut out_writes: Vec<(Expression, RegId, u32)> = Vec::new();
         let mut ok = true;
-        for s in &body {
-            if !self.compile_stmt(s) {
-                ok = false;
-                break;
+        for (i, (p, a)) in ports.iter().zip(args).enumerate() {
+            let w = self.port_effective_width(&ports, i);
+            let slot = self.alloc_reg();
+            if matches!(p.direction, PortDirection::Output) {
+                let init = self.type_default_value(&p.data_type, w);
+                self.emit(Insn::LoadConst(slot, Box::new(init)));
+                out_writes.push((a.clone(), slot, w));
+            } else {
+                match self.compile_expr(a, w) {
+                    Some(v) => self.emit(Insn::Move(slot, v)),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
             }
+            if w > 0 {
+                self.emit(Insn::Resize(slot, w));
+            }
+            binds.push((p.name.name.clone(), (slot, w)));
         }
-        self.inlining_stack.pop();
+
         if ok {
-            self.tasks_inlined += 1;
+            // Formals shadow for the body only. The qualified spellings cover
+            // elaboration's instance-rewritten bodies, same as pure calls.
+            let qpfx = task_name.rsplit_once('.').map(|(p, _)| p.to_string());
+            let saved_locals = self.local_var_regs.clone();
+            for (n, b) in &binds {
+                if let Some(pfx) = &qpfx {
+                    self.local_var_regs.insert(format!("{pfx}.{n}"), *b);
+                }
+                self.local_var_regs.insert(n.clone(), *b);
+            }
+            // No AST fallback inside: formals live in registers the
+            // interpreter cannot see, so a deferred statement would read and
+            // write the wrong storage (silently). All-or-nothing.
+            let saved_fallback = self.allow_ast_fallback;
+            self.allow_ast_fallback = false;
+            self.inlining_stack.push(task_name.to_string());
+            for st in &body {
+                if !self.compile_stmt(st) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                for (target, value, width) in &out_writes {
+                    if !self.compile_blocking_target(target, *value, *width) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            self.inlining_stack.pop();
+            self.allow_ast_fallback = saved_fallback;
+            self.local_var_regs = saved_locals;
         }
-        ok
+        if !ok {
+            if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
+                eprintln!(
+                    "[INLINE-FAIL] task {} reason={}",
+                    task_name,
+                    self.bail_reason.unwrap_or("unknown")
+                );
+            }
+            // A half-emitted body writes REAL signals — roll everything back.
+            self.insns.truncate(start);
+            self.next_reg = start_reg;
+            return false;
+        }
+        self.tasks_inlined += 1;
+        true
     }
 
     /// Conservative structural test for loop bodies that the NEW for-loop
@@ -1891,6 +2017,32 @@ impl<'a> BytecodeCompiler<'a> {
                         && expr_ok(left, bound, me)
                         && expr_ok(right, bound, me)
                 }
+                // A nested call keeps the function pure iff the CALLEE is
+                // itself pure-in-arguments and every argument is. AES's
+                // `mix_column` calls `xtime(a ^ b)`; without this arm the
+                // whole helper — and the task enclosing it — was branded
+                // impure and stayed on the interpreter.
+                ExprKind::Call { func, args } => {
+                    let ExprKind::Ident(h) = &func.kind else { return false };
+                    if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+                        return false;
+                    }
+                    let name = BytecodeCompiler::hier_raw_name(h);
+                    let Some(fd2) = me.functions.and_then(|f| {
+                        f.get(&name).or_else(|| {
+                            name.rsplit('.').next().and_then(|leaf| f.get(leaf))
+                        })
+                    }) else {
+                        return false;
+                    };
+                    // Input-only callees here (an output arg would write a
+                    // caller name this walker cannot track).
+                    fd2.ports
+                        .iter()
+                        .all(|p| matches!(p.direction, PortDirection::Input))
+                        && args.iter().all(|a| expr_ok(a, bound, me))
+                        && me.fn_is_pure(fd2)
+                }
                 _ => false,
             }
         }
@@ -1995,6 +2147,21 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// Declared width of a block-local variable's data type, resolved against
     /// the module's parameters/typedefs (0 when unknown, meaning "leave as-is").
+    /// §13.5.2: a formal that omits its type inherits the PREVIOUS formal's.
+    /// The parser leaves such a port's data_type Implicit, and sizing it
+    /// directly gives 1 bit — `input logic [7:0] a0, a1` bound a1 one bit
+    /// wide and truncated every argument passed through it.
+    fn port_effective_width(&self, ports: &[crate::ast::decl::FunctionPort], i: usize) -> u32 {
+        for k in (0..=i).rev() {
+            let dt = &ports[k].data_type;
+            if !matches!(dt, crate::ast::types::DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+            {
+                return self.decl_width(dt);
+            }
+        }
+        self.decl_width(&ports[i].data_type)
+    }
+
     fn decl_width(&self, dt: &crate::ast::types::DataType) -> u32 {
         crate::compiler::elaborate::resolve_type_width(dt, self.params, None)
     }
@@ -2154,6 +2321,339 @@ impl<'a> BytecodeCompiler<'a> {
         let dest = self.alloc_reg();
         self.emit(Insn::RangeSelectConst(dest, root, off + w - 1, off));
         Some(dest)
+    }
+
+    /// Does this statement read or write a register-bank local array? Such a
+    /// body needs CONSTANT indexes, i.e. the unroller — a register-backed
+    /// runtime loop variable can never address the bank.
+    fn stmt_touches_reg_bank(&self, st: &Statement) -> bool {
+        if self.local_array_regs.is_empty() {
+            return false;
+        }
+        fn expr_hits(e: &Expression, banks: &HashMap<String, (RegId, u32, usize, i64)>) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) => {
+                    h.path.len() == 1 && banks.contains_key(&h.path[0].name.name)
+                }
+                ExprKind::Index { expr, index } => {
+                    expr_hits(expr, banks) || expr_hits(index, banks)
+                }
+                ExprKind::Paren(i) | ExprKind::Unary { operand: i, .. } => expr_hits(i, banks),
+                ExprKind::Binary { left, right, .. } => {
+                    expr_hits(left, banks) || expr_hits(right, banks)
+                }
+                ExprKind::Conditional { condition, then_expr, else_expr } => {
+                    expr_hits(condition, banks)
+                        || expr_hits(then_expr, banks)
+                        || expr_hits(else_expr, banks)
+                }
+                ExprKind::Concatenation(xs) => xs.iter().any(|x| expr_hits(x, banks)),
+                ExprKind::Replication { count, exprs } => {
+                    expr_hits(count, banks) || exprs.iter().any(|x| expr_hits(x, banks))
+                }
+                ExprKind::RangeSelect { expr, left, right, .. } => {
+                    expr_hits(expr, banks) || expr_hits(left, banks) || expr_hits(right, banks)
+                }
+                ExprKind::Call { args, .. } | ExprKind::SystemCall { args, .. } => {
+                    args.iter().any(|a| expr_hits(a, banks))
+                }
+                _ => false,
+            }
+        }
+        let banks = &self.local_array_regs;
+        fn walk(st: &Statement, banks: &HashMap<String, (RegId, u32, usize, i64)>) -> bool {
+            match &st.kind {
+                StatementKind::BlockingAssign { lvalue, rvalue }
+                | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                    expr_hits(lvalue, banks) || expr_hits(rvalue, banks)
+                }
+                StatementKind::Expr(e) => expr_hits(e, banks),
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    stmts.iter().any(|s| walk(s, banks))
+                }
+                StatementKind::If { condition, then_stmt, else_stmt, .. } => {
+                    expr_hits(condition, banks)
+                        || walk(then_stmt, banks)
+                        || else_stmt.as_ref().is_some_and(|e| walk(e, banks))
+                }
+                StatementKind::Case { expr, items, .. } => {
+                    expr_hits(expr, banks)
+                        || items.iter().any(|it| {
+                            it.patterns.iter().any(|p| expr_hits(p, banks))
+                                || walk(&it.stmt, banks)
+                        })
+                }
+                StatementKind::For { init, condition, step, body } => {
+                    init.iter().any(|fi| match fi {
+                        ForInit::VarDecl { init, .. } => expr_hits(init, banks),
+                        ForInit::Assign { lvalue, rvalue } => {
+                            expr_hits(lvalue, banks) || expr_hits(rvalue, banks)
+                        }
+                    }) || condition.as_ref().is_some_and(|c| expr_hits(c, banks))
+                        || step.iter().any(|e| expr_hits(e, banks))
+                        || walk(body, banks)
+                }
+                _ => false,
+            }
+        }
+        walk(st, banks)
+    }
+
+    /// Compile-time unroll of `for (int i = C; cond(i); i += C2)` with a
+    /// small constant trip count. The loop variable becomes a per-iteration
+    /// COMPILE-TIME constant, so array indexes fold (`state[col*4]`), local
+    /// register-bank arrays become addressable, and call statements inline
+    /// per iteration. All-or-nothing: any statement that fails rolls the
+    /// whole unroll back and the loop takes the pre-existing paths.
+    fn try_unroll_for(
+        &mut self,
+        name: &crate::ast::Identifier,
+        init: &Expression,
+        condition: &Option<Expression>,
+        step: &[Expression],
+        body: &Statement,
+    ) -> bool {
+        const MAX_TRIPS: usize = 64;
+        let Some(cond) = condition else { return false };
+        if step.len() != 1 {
+            return false;
+        }
+        // A body that can SUSPEND must go one iteration at a time through the
+        // scheduler — an unrolled copy would run synchronously through the
+        // wait. And break/continue need per-iteration jump targets the unroll
+        // does not lay down; leave those loops to the AST path.
+        if Self::stmt_is_blocking(body) || Self::stmt_has_break_or_continue(body) {
+            return false;
+        }
+        // Step: i++/++i/i--/--i, or (i = i + C) / (i += C) via AssignExpr.
+        let vname = name.name.clone();
+        let step_delta: i64 = match &step[0].kind {
+            ExprKind::Unary { op, operand } => {
+                let ExprKind::Ident(h) = &operand.kind else { return false };
+                if Self::hier_raw_name(h) != vname {
+                    return false;
+                }
+                match op {
+                    UnaryOp::PostIncr | UnaryOp::PreIncr => 1,
+                    UnaryOp::PostDecr | UnaryOp::PreDecr => -1,
+                    _ => return false,
+                }
+            }
+            ExprKind::AssignExpr { lvalue, rvalue } => {
+                let ExprKind::Ident(h) = &lvalue.kind else { return false };
+                if Self::hier_raw_name(h) != vname {
+                    return false;
+                }
+                let ExprKind::Binary { op, left, right } = &rvalue.kind else {
+                    return false;
+                };
+                let ExprKind::Ident(lh) = &left.kind else { return false };
+                if Self::hier_raw_name(lh) != vname {
+                    return false;
+                }
+                let Some(c) = self.fold_const(right).and_then(|v| v.to_u64()) else {
+                    return false;
+                };
+                match op {
+                    BinaryOp::Add => c as i64,
+                    BinaryOp::Sub => -(c as i64),
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        if step_delta == 0 {
+            return false;
+        }
+        let Some(mut cur) = self
+            .fold_const(init)
+            .and_then(|v| v.to_u64())
+            .map(|v| v as i64)
+        else {
+            return false;
+        };
+
+        let start = self.insns.len();
+        let start_reg = self.next_reg;
+        let outer_const = self.local_const_vars.remove(&vname);
+        let mut ok = true;
+        let mut trips = 0usize;
+        loop {
+            self.local_const_vars
+                .insert(vname.clone(), Value::from_u64(cur as u64, 32));
+            let c = match self.fold_const(cond) {
+                Some(v) => v.is_true(),
+                None => {
+                    ok = false;
+                    break;
+                }
+            };
+            if !c {
+                break;
+            }
+            trips += 1;
+            if trips > MAX_TRIPS {
+                ok = false;
+                break;
+            }
+            // The interpreter cannot see the const-bound loop variable (or
+            // any register bank), so a statement deferring to AST fallback
+            // inside the body would silently read the WRONG storage. Compile
+            // fully or roll the whole unroll back.
+            let saved_fb = self.allow_ast_fallback;
+            self.allow_ast_fallback = false;
+            let body_ok = self.compile_stmt(body);
+            self.allow_ast_fallback = saved_fb;
+            if !body_ok {
+                ok = false;
+                break;
+            }
+            cur += step_delta;
+        }
+        self.local_const_vars.remove(&vname);
+        if let Some(v) = outer_const {
+            self.local_const_vars.insert(vname.clone(), v);
+        }
+        if !ok {
+            self.insns.truncate(start);
+            self.next_reg = start_reg;
+            return false;
+        }
+        true
+    }
+
+    /// Fold `e` to a compile-time constant, consulting unrolled loop vars.
+    /// Conservative: 4-state-clean integers only.
+    fn fold_const(&mut self, e: &Expression) -> Option<Value> {
+        let v = match &e.kind {
+            ExprKind::Number(n) => self.eval_number_static(n)?,
+            ExprKind::Paren(i) => return self.fold_const(i),
+            ExprKind::Ident(h) => {
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    if let Some(v) = self.local_const_vars.get(&h.path[0].name.name) {
+                        v.clone()
+                    } else {
+                        self.lookup_param_value(h)?
+                    }
+                } else {
+                    self.lookup_param_value(h)?
+                }
+            }
+            ExprKind::Unary { op, operand } => {
+                let v = self.fold_const(operand)?;
+                match op {
+                    UnaryOp::Plus => v,
+                    UnaryOp::Minus => Value::zero(v.width.max(32)).sub(&v),
+                    UnaryOp::BitNot => v.bitwise_not(),
+                    UnaryOp::LogNot => v.logic_not(),
+                    _ => return None,
+                }
+            }
+            ExprKind::Binary { op, left, right } => {
+                let l = self.fold_const(left)?;
+                let r = self.fold_const(right)?;
+                match op {
+                    BinaryOp::Add => l.add(&r),
+                    BinaryOp::Sub => l.sub(&r),
+                    BinaryOp::Mul => l.mul(&r),
+                    BinaryOp::Div => l.div(&r),
+                    BinaryOp::Mod => l.modulo(&r),
+                    BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => l.shift_left(&r),
+                    BinaryOp::ShiftRight => l.shift_right(&r),
+                    BinaryOp::BitAnd => l.bitwise_and(&r),
+                    BinaryOp::BitOr => l.bitwise_or(&r),
+                    BinaryOp::BitXor => l.bitwise_xor(&r),
+                    BinaryOp::Lt => l.less_than(&r),
+                    BinaryOp::Leq => l.less_equal(&r),
+                    BinaryOp::Gt => l.greater_than(&r),
+                    BinaryOp::Geq => l.greater_equal(&r),
+                    BinaryOp::Eq => l.is_equal(&r),
+                    BinaryOp::Neq => l.is_not_equal(&r),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        (!v.has_xz() && !v.is_real).then_some(v)
+    }
+
+    /// Detect the ROM `case` shape: every arm `L = <const>` with constant
+    /// patterns, optional `default: L = <const>`. Returns the shared lvalue,
+    /// the dense table (default-filled holes), the default value, and the
+    /// result width. Bounded at 4096 entries so a sparse 32-bit decode cannot
+    /// balloon the block.
+    fn case_lut_shape(
+        &mut self,
+        items: &[crate::ast::stmt::CaseItem],
+    ) -> Option<(Expression, Vec<Value>, Value, u32)> {
+        let mut lhs: Option<Expression> = None;
+        let mut entries: Vec<(u64, Value)> = Vec::new();
+        let mut default: Option<Value> = None;
+        let mut same_lhs = |l: &Expression, lhs: &mut Option<Expression>| -> bool {
+            let ExprKind::Ident(h) = &l.kind else { return false };
+            if h.path.iter().any(|s| !s.selects.is_empty()) {
+                return false;
+            }
+            match lhs {
+                None => {
+                    *lhs = Some(l.clone());
+                    true
+                }
+                Some(prev) => {
+                    let ExprKind::Ident(ph) = &prev.kind else { return false };
+                    Self::hier_raw_name(ph) == Self::hier_raw_name(h)
+                }
+            }
+        };
+        let const_of = |me: &mut Self, e: &Expression| -> Option<Value> {
+            let v = match &e.kind {
+                ExprKind::Number(n) => me.eval_number_static(n)?,
+                ExprKind::Ident(h) => me.lookup_param_value(h)?,
+                _ => return None,
+            };
+            (!v.has_xz() && !v.is_real).then_some(v)
+        };
+        for it in items {
+            if it.pattern.is_some() || it.guard.is_some() {
+                return None;
+            }
+            let StatementKind::BlockingAssign { lvalue, rvalue } = &it.stmt.kind else {
+                return None;
+            };
+            if !same_lhs(lvalue, &mut lhs) {
+                return None;
+            }
+            let rv = const_of(self, rvalue)?;
+            if it.is_default {
+                if default.is_some() {
+                    return None;
+                }
+                default = Some(rv);
+                continue;
+            }
+            for pat in &it.patterns {
+                let pv = const_of(self, pat)?;
+                let idx = pv.to_u64()?;
+                if idx >= 4096 {
+                    return None;
+                }
+                entries.push((idx, rv.clone()));
+            }
+        }
+        let lhs = lhs?;
+        let default = default?; // no default: keep the generic chain (lhs holds)
+        let res_w = entries
+            .iter()
+            .map(|(_, v)| v.width)
+            .chain(std::iter::once(default.width))
+            .max()
+            .unwrap_or(1);
+        let size = entries.iter().map(|(i, _)| *i + 1).max().unwrap_or(0) as usize;
+        let mut table = vec![default.clone(); size];
+        for (i, v) in entries {
+            table[i as usize] = v;
+        }
+        Some((lhs, table, default, res_w))
     }
 
     /// A set-membership member as a compile-time CONSTANT with no x/z bits —
@@ -3061,8 +3561,58 @@ impl<'a> BytecodeCompiler<'a> {
             } => {
                 for decl in declarators {
                     if !decl.dimensions.is_empty() {
-                        self.bail("VarDecl_array");
-                        return false;
+                        // One constant-bounded unpacked dimension, small: a
+                        // register bank. (`logic [7:0] tmp [0:15]` in an
+                        // inlined AES shift_rows / rcon table.) Every access
+                        // must fold to a constant index or the enclosing
+                        // compile fails and rolls back.
+                        use crate::ast::types::UnpackedDimension as UD;
+                        let bounds = if decl.dimensions.len() == 1 {
+                            match &decl.dimensions[0] {
+                                UD::Range { left, right, .. } => {
+                                    let l = self.fold_const(left).and_then(|v| v.to_u64());
+                                    let r = self.fold_const(right).and_then(|v| v.to_u64());
+                                    match (l, r) {
+                                        (Some(l), Some(r)) => {
+                                            let (lo, hi) =
+                                                (l.min(r) as i64, l.max(r) as i64);
+                                            Some((lo, (hi - lo + 1) as usize))
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                UD::Expression { expr, .. } => self
+                                    .fold_const(expr)
+                                    .and_then(|v| v.to_u64())
+                                    .filter(|&n| n > 0)
+                                    .map(|n| (0i64, n as usize)),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let Some((lo, len)) = bounds.filter(|&(_, n)| n <= 64) else {
+                            self.bail("VarDecl_array");
+                            return false;
+                        };
+                        if decl.init.is_some() {
+                            self.bail("VarDecl_array_init");
+                            return false;
+                        }
+                        let ew = self.decl_width(data_type);
+                        let base = self.next_reg;
+                        for _ in 0..len {
+                            let slot = self.alloc_reg();
+                            let init = self.type_default_value(data_type, ew);
+                            self.emit(Insn::LoadConst(slot, Box::new(init)));
+                        }
+                        let Ok(base) = RegId::try_from(base) else {
+                            self.bail("VarDecl_array");
+                            return false;
+                        };
+                        self.local_array_regs
+                            .insert(decl.name.name.clone(), (base, ew, len, lo));
+                        continue;
                     }
                     let width = self.decl_width(data_type);
                     let slot = self.alloc_reg();
@@ -3174,6 +3724,27 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::Case {
                 kind, expr, items, ..
             } => {
+                // ROM shape: plain `case` whose every arm assigns a CONSTANT
+                // to the SAME variable, constant patterns throughout. One
+                // table lookup replaces the whole compare chain. `===`
+                // semantics hold exactly: the patterns are fully defined, so
+                // a selector with any x/z bit matches none of them → default.
+                if matches!(kind, crate::ast::stmt::CaseKind::Case) {
+                    if let Some((lhs, table, default, res_w)) = self.case_lut_shape(items) {
+                        if let Some(sel) = self.compile_expr(expr, 0) {
+                            let dst = self.alloc_reg();
+                            self.emit(Insn::CaseLut(
+                                dst,
+                                sel,
+                                Box::new(CaseLutData { table, default }),
+                            ));
+                            if self.compile_blocking_target(&lhs, dst, res_w) {
+                                return true;
+                            }
+                        }
+                        // fall through to the generic chain on any failure
+                    }
+                }
                 if let Some(val_reg) = self.compile_expr(expr, 0) {
                     let mut end_jumps: Vec<usize> = Vec::new();
                     let mut default_item: Option<&Statement> = None;
@@ -3356,6 +3927,29 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("Expr_PreDecr");
                         return self.emit_fallback(stmt);
                     }
+                    // Call-as-statement: a task enable with arguments, or a
+                    // void function. Tasks first (they are not in the function
+                    // table); a void function call compiles through the
+                    // ordinary expression path below, discarding its (empty)
+                    // result register.
+                    ExprKind::Call { func, args } => {
+                        if let ExprKind::Ident(h) = &func.kind {
+                            let raw = Self::hier_raw_name(h);
+                            if self.try_inline_task_args(&raw, args) {
+                                return true;
+                            }
+                            if let Some(leaf) = raw.rsplit('.').next() {
+                                if leaf != raw && self.try_inline_task_args(leaf, args) {
+                                    return true;
+                                }
+                            }
+                        }
+                        if self.compile_expr(e, 0).is_some() {
+                            return true;
+                        }
+                        self.bail("Expr_Call");
+                        return self.emit_fallback(stmt);
+                    }
                     _ => {}
                 }
                 let n: &'static str = match &e.kind {
@@ -3476,8 +4070,15 @@ impl<'a> BytecodeCompiler<'a> {
                                 }
                             }
                         }
+                        // NOTE the ORDER: the register-backed path (below)
+                        // keeps every loop the specialized fast paths
+                        // (vectorized packed-copy, fused array NBA) know how
+                        // to handle; the unroller is the CATCH-ALL for bodies
+                        // they cannot compile at all — task/function calls,
+                        // register-bank locals, const-index folding.
                         ForInit::VarDecl { data_type, name, init }
-                            if self.for_body_is_simple(body) =>
+                            if self.for_body_is_simple(body)
+                                && !self.stmt_touches_reg_bank(body) =>
                         {
                             // §12.7.1: `for (int i = ...)` — the loop var
                             // lives in a VM REGISTER (it has no signal).
@@ -3529,6 +4130,18 @@ impl<'a> BytecodeCompiler<'a> {
                             self.local_var_regs.insert(name.name.clone(), (slot, w));
                             self.reg_var_loop_depth += 1;
                             reg_vars_registered += 1;
+                        }
+                        // Catch-all: bodies the specialized paths above
+                        // decline (task/function calls, register-bank locals,
+                        // const-index folding) unroll with a const-bound loop
+                        // variable.
+                        #[allow(unreachable_patterns)]
+                        ForInit::VarDecl { name, init, .. }
+                            if self.try_unroll_for(name, init, condition, step, body) =>
+                        {
+                            self.for_loop_var_ids = saved_for_vars;
+                            self.local_var_regs = saved_locals;
+                            return true;
                         }
                         #[allow(unreachable_patterns)]
                         ForInit::VarDecl { .. } => {
@@ -3793,6 +4406,22 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(r)
             }
             ExprKind::Ident(hier) => {
+                // An UNROLLED loop variable is a compile-time constant and
+                // shadows everything else.
+                if hier.root.is_none()
+                    && hier.path.len() == 1
+                    && hier.path[0].selects.is_empty()
+                {
+                    if let Some(v) = self
+                        .local_const_vars
+                        .get(&hier.path[0].name.name)
+                        .cloned()
+                    {
+                        let r = self.alloc_reg();
+                        self.emit(Insn::LoadConst(r, Box::new(v)));
+                        return Some(r);
+                    }
+                }
                 // A register-backed block local (a for-loop variable) shadows
                 // any same-named signal for the duration of its loop.
                 if let Some((src, _)) = self.local_var_reg_of(hier) {
@@ -4187,6 +4816,35 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Paren(inner) => self.compile_expr(inner, ctx_width),
             ExprKind::Index { expr, index } => {
+                // Register-bank local array with a CONSTANT (possibly folded
+                // through an unrolled loop var) index: a plain register move.
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.root.is_none()
+                        && h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                    {
+                        if let Some(&(base, ew, len, lo)) =
+                            self.local_array_regs.get(&h.path[0].name.name)
+                        {
+                            let Some(iv) =
+                                self.fold_const(index).and_then(|v| v.to_u64())
+                            else {
+                                // Dynamic index into registers is impossible.
+                                self.bail("local_array_dyn_index");
+                                return None;
+                            };
+                            let slot = (iv as i64) - lo;
+                            if slot < 0 || slot as usize >= len {
+                                self.bail("local_array_oob");
+                                return None;
+                            }
+                            let r = self.alloc_reg();
+                            self.emit(Insn::Move(r, base + slot as RegId));
+                            let _ = ew;
+                            return Some(r);
+                        }
+                    }
+                }
                 // A packed-array field embedded in a packed struct has no
                 // standalone signal id. Slice it directly from its container;
                 // the generic non-Ident index path below would otherwise take
@@ -4618,9 +5276,19 @@ impl<'a> BytecodeCompiler<'a> {
                             }
                             _ => None,
                         });
+                        // `8'(x)` — the size is a literal, no name lookup.
+                        let literal_w: Option<u32> = args.first().and_then(|a| {
+                            if let ExprKind::Number(n) = &a.kind {
+                                self.eval_number_static(n)
+                                    .and_then(|v| v.to_u64())
+                                    .map(|n| (n as u32).max(1))
+                            } else {
+                                None
+                            }
+                        });
                         let inner_is_call =
                             matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
-                        let known = target.as_ref().and_then(|nm| {
+                        let known = literal_w.map(|w| (w, false)).or_else(|| target.as_ref().and_then(|nm| {
                             self.cast_widths
                                 .and_then(|m| m.get(nm).copied())
                                 .or_else(|| {
@@ -4631,7 +5299,7 @@ impl<'a> BytecodeCompiler<'a> {
                                         .and_then(|v| v.to_u64())
                                         .map(|n| ((n as u32).max(1), false))
                                 })
-                        });
+                        }));
                         if let (Some((w, signed)), false) = (known, inner_is_call) {
                             // Mirror the interpreter EXACTLY: the operand is
                             // evaluated self-determined, then resized. (§6.24.1
@@ -5029,7 +5697,14 @@ impl<'a> BytecodeCompiler<'a> {
                         return true;
                     }
                 }
-                // Handle mem[i][hi:lo] <= val
+                // Handle mem[i][range] <= val — ALL range kinds. This arm
+                // used to pass `left`/`right` straight through as (hi, lo),
+                // which is only correct for the constant `[hi:lo]` form: for
+                // `[base +: W]` they are (base, WIDTH), so a masked byte-lane
+                // RAM write (`mem[addr][i*8 +: 8] <= ...`, the lowRISC
+                // prim_ram_2p shape) wrote a 9-bit slice at the WRONG offset
+                // and corrupted neighbouring lanes. Convert per §11.5.1
+                // before emitting.
                 if let ExprKind::Index {
                     expr: arr_expr,
                     index,
@@ -5038,9 +5713,51 @@ impl<'a> BytecodeCompiler<'a> {
                     if let ExprKind::Ident(hier) = &arr_expr.kind {
                         if let Some(name) = self.lookup_array_name(hier) {
                             if let Some(idx_reg) = self.compile_expr(index, 0) {
-                                if let (Some(hi_reg), Some(lo_reg)) =
-                                    (self.compile_expr(left, 0), self.compile_expr(right, 0))
-                                {
+                                let regs = match kind {
+                                    RangeKind::Constant => {
+                                        match (
+                                            self.compile_expr(left, 0),
+                                            self.compile_expr(right, 0),
+                                        ) {
+                                            (Some(h), Some(l)) => Some((h, l)),
+                                            _ => None,
+                                        }
+                                    }
+                                    RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                                        let base = self.compile_expr(left, 0);
+                                        let w = self
+                                            .fold_const(right)
+                                            .and_then(|v| v.to_u64())
+                                            .filter(|&w| w > 0);
+                                        match (base, w) {
+                                            (Some(b), Some(w)) => {
+                                                let other = self.alloc_reg();
+                                                let delta = Value::from_u64(w - 1, 32);
+                                                if matches!(kind, RangeKind::IndexedUp) {
+                                                    // hi = base + w - 1, lo = base
+                                                    self.emit(Insn::BinOpConst(
+                                                        other,
+                                                        b,
+                                                        Box::new(delta),
+                                                        BinOpConstKind::Add,
+                                                    ));
+                                                    Some((other, b))
+                                                } else {
+                                                    // hi = base, lo = base - w + 1
+                                                    let dreg = self.alloc_reg();
+                                                    self.emit(Insn::LoadConst(
+                                                        dreg,
+                                                        Box::new(delta),
+                                                    ));
+                                                    self.emit(Insn::Sub(other, b, dreg));
+                                                    Some((b, other))
+                                                }
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                };
+                                if let Some((hi_reg, lo_reg)) = regs {
                                     let array = self.array_operand(name);
                                     self.emit(Insn::NbaAssignArrayRange(
                                         array, idx_reg, hi_reg, lo_reg, val_reg,
@@ -5104,6 +5821,30 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
+        // Register-bank local array element (constant index only).
+        if let ExprKind::Index { expr, index } = &lhs.kind {
+            if let ExprKind::Ident(h) = &expr.kind {
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    if let Some(&(base, ew, len, lo)) =
+                        self.local_array_regs.get(&h.path[0].name.name)
+                    {
+                        let Some(iv) = self.fold_const(index).and_then(|v| v.to_u64()) else {
+                            self.bail("local_array_dyn_index");
+                            return false;
+                        };
+                        let slot = (iv as i64) - lo;
+                        if slot < 0 || slot as usize >= len {
+                            self.bail("local_array_oob");
+                            return false;
+                        }
+                        let dst = base + slot as RegId;
+                        self.emit(Insn::Move(dst, val_reg));
+                        self.emit(Insn::Resize(dst, ew));
+                        return true;
+                    }
+                }
+            }
+        }
         // Assignment to a register-backed block local (the loop variable of an
         // enclosing `for (int i = ...)`).
         if let ExprKind::Ident(hier) = &lhs.kind {
@@ -5483,6 +6224,15 @@ impl<'a> BytecodeCompiler<'a> {
     fn infer_lhs_width(&self, lhs: &Expression) -> u32 {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
+                // Register-backed locals FIRST — they shadow any same-named
+                // signal, and they are absent from every signal table, so the
+                // fallthrough guessed 32 bits: a 128-bit local accumulator in
+                // an inlined task truncated on every assignment.
+                if let Some((_, w)) = self.local_var_reg_of(hier) {
+                    if w > 0 {
+                        return w;
+                    }
+                }
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.signal_widths[id]
                 } else if let Some((_, _, mw)) = self.packed_struct_member_target(hier) {
@@ -5494,6 +6244,16 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Index { expr, .. } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
+                    // Register-bank local array element: the declared element
+                    // width. Missing this returned the 1-bit default and a
+                    // bank store truncated every value to its LSB.
+                    if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                        if let Some(&(_, ew, _, _)) =
+                            self.local_array_regs.get(&hier.path[0].name.name)
+                        {
+                            return ew;
+                        }
+                    }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some((_, _, elem_w)) = self.arrays.get(&name) {
                             return *elem_w;
@@ -6252,6 +7012,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// is still consumed later, so every variant must be enumerated.
     fn insn_reads_reg(insn: &Insn, r: RegId) -> bool {
         match insn {
+            Insn::CaseLut(_, src, _) => *src == r,
             Insn::LoadConst(..)
             | Insn::LoadSignal(..)
             | Insn::LoadSignalSigned(..)
@@ -6899,6 +7660,9 @@ impl<'a> BytecodeCompiler<'a> {
             match &insns[i] {
                 // Handled above.
                 Insn::Resize(..) => {}
+
+                // Result width varies per entry; drop tracking for the dest.
+                Insn::CaseLut(d, ..) => store(&mut rw, *d, None),
 
                 // The exec arms clone the boxed `Value` verbatim.
                 Insn::LoadConst(d, v) => {
@@ -7965,6 +8729,9 @@ pub fn lower_two_state(
                     TsInsn::Shr { d, a, b, w: wa }
                 });
             }
+            // 4-state table semantics (x/z selector -> default) cannot lower
+            // to the 2-state pipeline.
+            Insn::CaseLut(..) => return None,
             // 1-bit results. CaseEq/CaseNeq equal Eq/Neq on X-free values.
             Insn::Eq(d, a, b) | Insn::CaseEq(d, a, b) => {
                 rw[*a as usize]?;
