@@ -294,3 +294,5 @@ mod packed_struct_pattern_compile;
 mod task_fsm_compile;
 #[path = "types/case_jump_dispatch.rs"]
 mod case_jump_dispatch;
+#[path = "types/case_wildcard_signed_extension.rs"]
+mod case_wildcard_signed_extension;
