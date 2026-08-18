@@ -65,3 +65,5 @@ mod string_property_shadowed_by_local;
 mod system_task_gaps;
 #[path = "strings/fixed_string_array_dims.rs"]
 mod fixed_string_array_dims;
+#[path = "strings/compiled_sformatf_native.rs"]
+mod compiled_sformatf_native;

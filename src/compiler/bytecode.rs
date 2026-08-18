@@ -119,6 +119,31 @@ pub struct CaseJumpData {
     pub default: u32,
 }
 
+/// One parsed piece of a `$sformatf` template — literal text or a single
+/// `%` conversion. Parsed ONCE at compile time; `Insn::Format` fills it from
+/// register Values with the same value-level cores the AST formatter uses,
+/// so the output is byte-identical for the supported specs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum FmtSeg {
+    Lit(String),
+    /// `width`: None = spec's default width, Some(0) = minimal (`%0d`),
+    /// Some(n) = explicit field width. `str_valued` applies to `%s` only:
+    /// render the packed bytes as text (string variable/literal) rather
+    /// than the §21.2.1.3 packed-operand byte dump.
+    Spec {
+        spec: char,
+        width: Option<u32>,
+        left: bool,
+        str_valued: bool,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FormatData {
+    pub segs: Vec<FmtSeg>,
+    pub args: Vec<RegId>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CaseMaskJumpData {
     /// Contiguous selector bit window `[lo, lo+width)` in which every
@@ -189,6 +214,15 @@ pub enum Insn {
     /// Replaces an average of half the arms' CasezEq+branch pairs per
     /// execution with one table hop plus ~1-3 compares.
     CaseMaskJump(RegId, Box<CaseMaskJumpData>),
+    /// `$sformatf` with a literal format string and supported specs,
+    /// template-parsed at compile time and filled natively. Removes the
+    /// whole-call AST fallback that made every tracer decode helper cost
+    /// ~24µs per retired instruction.
+    Format(RegId, Box<FormatData>),
+    /// Store to a `string` signal (§6.16): the value keeps its own width —
+    /// the table width is a placeholder, and `BlockingAssign`'s resize
+    /// would truncate the FRONT of the text.
+    BlockingAssignString(SigId, RegId),
     CasezEq(RegId, RegId, RegId),
     CasexEq(RegId, RegId, RegId),
     Lt(RegId, RegId, RegId),
@@ -453,6 +487,8 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::CaseLut(..) => "CaseLut",
         Insn::CaseJump(..) => "CaseJump",
         Insn::CaseMaskJump(..) => "CaseMaskJump",
+        Insn::Format(..) => "Format",
+        Insn::BlockingAssignString(..) => "BlockingAssignString",
         Insn::CasezEq(..) => "CasezEq",
         Insn::CasexEq(..) => "CasexEq",
         Insn::Lt(..) => "Lt",
@@ -660,6 +696,10 @@ pub struct BytecodeCompiler<'a> {
     /// Set via `set_string_signals`. None = no string info available, in
     /// which case the compiler can only catch the literal-operand case.
     string_signals: Option<&'a HashSet<String>>,
+    /// Local/formal names (in the current inline scope) bound to STRING
+    /// values — drives `%s` semantics and resize suppression. Name-based on
+    /// purpose: register ids are recycled across arms, names are not.
+    local_var_is_string: HashSet<String>,
     /// Base names of 2D/ND UNPACKED arrays. When a continuous-assign LHS
     /// `m[0][j]` targets one of these, the flattening short-circuit
     /// (`flattened_outer_const_signal_id`) must NOT fire — the
@@ -724,6 +764,7 @@ impl<'a> BytecodeCompiler<'a> {
             loop_break_patches: Vec::new(),
             loop_continue_patches: Vec::new(),
             string_signals: None,
+            local_var_is_string: HashSet::default(),
             multi_dim_arrays: None,
             packed_struct_fields: None,
         }
@@ -1486,27 +1527,31 @@ impl<'a> BytecodeCompiler<'a> {
         if self.inlining_stack.iter().any(|n| n == task_name) {
             return false;
         }
-        let tasks = match self.tasks {
-            Some(t) => t,
-            None => return false,
-        };
-        let td = match tasks.get(task_name) {
-            Some(t) => t,
-            None => return false,
-        };
-        if td.ports.len() != args.len()
-            || td.ports.iter().any(|p| {
+        // §13.4.1: a VOID function called as a statement is a task enable in
+        // all but name — inline it through the same machinery. (Non-void
+        // returns would need a result variable; those stay on the AST.)
+        let (ports, body): (Vec<crate::ast::decl::FunctionPort>, Vec<Statement>) =
+            if let Some(td) = self.tasks.and_then(|t| t.get(task_name)) {
+                (td.ports.clone(), td.items.clone())
+            } else if let Some(fd) = self.functions.and_then(|f| f.get(task_name)) {
+                if !matches!(fd.return_type, crate::ast::types::DataType::Void(_)) {
+                    return false;
+                }
+                (fd.ports.clone(), fd.items.clone())
+            } else {
+                return false;
+            };
+        if ports.len() != args.len()
+            || ports.iter().any(|p| {
                 !matches!(p.direction, PortDirection::Input | PortDirection::Output)
                     || !p.dimensions.is_empty()
             })
         {
             return false;
         }
-        if td.items.iter().any(Self::stmt_is_blocking) {
+        if body.iter().any(Self::stmt_is_blocking) {
             return false;
         }
-        let body: Vec<Statement> = td.items.clone();
-        let ports: Vec<_> = td.ports.clone();
         let start = self.insns.len();
         let start_reg = self.next_reg;
 
@@ -1514,10 +1559,28 @@ impl<'a> BytecodeCompiler<'a> {
         let mut binds: Vec<(String, (RegId, u32))> = Vec::with_capacity(ports.len());
         let mut out_writes: Vec<(Expression, RegId, u32)> = Vec::new();
         let mut ok = true;
+        let mut string_formals: Vec<String> = Vec::new();
         for (i, (p, a)) in ports.iter().zip(args).enumerate() {
-            let w = self.port_effective_width(&ports, i);
+            // §6.16 string formal: no declared width, so no Resize — a
+            // resize would truncate the front of the text.
+            let is_string = matches!(
+                &p.data_type,
+                crate::ast::types::DataType::Simple {
+                    kind: crate::ast::types::SimpleType::String,
+                    ..
+                }
+            );
+            let w = if is_string {
+                0
+            } else {
+                self.port_effective_width(&ports, i)
+            };
             let slot = self.alloc_reg();
             if matches!(p.direction, PortDirection::Output) {
+                if is_string {
+                    ok = false;
+                    break;
+                }
                 let init = self.type_default_value(&p.data_type, w);
                 self.emit(Insn::LoadConst(slot, Box::new(init)));
                 out_writes.push((a.clone(), slot, w));
@@ -1533,6 +1596,9 @@ impl<'a> BytecodeCompiler<'a> {
             if w > 0 {
                 self.emit(Insn::Resize(slot, w));
             }
+            if is_string {
+                string_formals.push(p.name.name.clone());
+            }
             binds.push((p.name.name.clone(), (slot, w)));
         }
 
@@ -1541,11 +1607,18 @@ impl<'a> BytecodeCompiler<'a> {
             // elaboration's instance-rewritten bodies, same as pure calls.
             let qpfx = task_name.rsplit_once('.').map(|(p, _)| p.to_string());
             let saved_locals = self.local_var_regs.clone();
+            let saved_local_strings = self.local_var_is_string.clone();
             for (n, b) in &binds {
                 if let Some(pfx) = &qpfx {
                     self.local_var_regs.insert(format!("{pfx}.{n}"), *b);
                 }
                 self.local_var_regs.insert(n.clone(), *b);
+            }
+            for n in &string_formals {
+                if let Some(pfx) = &qpfx {
+                    self.local_var_is_string.insert(format!("{pfx}.{n}"));
+                }
+                self.local_var_is_string.insert(n.clone());
             }
             // No AST fallback inside: formals live in registers the
             // interpreter cannot see, so a deferred statement would read and
@@ -1570,6 +1643,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.inlining_stack.pop();
             self.allow_ast_fallback = saved_fallback;
             self.local_var_regs = saved_locals;
+            self.local_var_is_string = saved_local_strings;
         }
         if !ok {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
@@ -2209,6 +2283,101 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn decl_width(&self, dt: &crate::ast::types::DataType) -> u32 {
         crate::compiler::elaborate::resolve_type_width(dt, self.params, None)
+    }
+
+    /// Is this expression statically known to produce a STRING value?
+    /// (Literal, `string` signal, `string`-bound formal, or a nested
+    /// `$sformatf`.) Conservative: false means "unknown", not "packed".
+    fn expr_is_string_static(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::StringLiteral(_) => true,
+            ExprKind::Paren(inner) => self.expr_is_string_static(inner),
+            ExprKind::SystemCall { name, .. } => {
+                matches!(name.as_str(), "$sformatf" | "$psprintf")
+            }
+            ExprKind::Ident(h) => {
+                let raw = Self::hier_raw_name(h);
+                if self.local_var_is_string.contains(&raw) {
+                    return true;
+                }
+                let leaf = h.path.last().map(|p| p.name.name.as_str()).unwrap_or("");
+                self.string_signals.is_some_and(|ss| {
+                    ss.contains(&raw) || ss.contains(leaf)
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn signal_is_string_name(&self, hier: &HierarchicalIdentifier) -> bool {
+        let raw = Self::hier_raw_name(hier);
+        let leaf = hier.path.last().map(|p| p.name.name.as_str()).unwrap_or("");
+        self.string_signals
+            .is_some_and(|ss| ss.contains(&raw) || ss.contains(leaf))
+    }
+
+    /// Parse a `$sformatf` template into segments, or None when any piece
+    /// falls outside the natively-supported subset (specs d/b/h/x/o/s/c and
+    /// `%%`; optional `-` flag and numeric width; no `+`, no precision, no
+    /// t/p/m/u/z/e/f/g/v). The consumed-argument COUNT must be settled here
+    /// so the compile arm can match it against the actual list.
+    fn parse_format_template(fmt: &str) -> Option<(Vec<FmtSeg>, usize)> {
+        let mut segs: Vec<FmtSeg> = Vec::new();
+        let mut lit = String::new();
+        let mut nargs = 0usize;
+        let mut chars = fmt.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                lit.push(c);
+                continue;
+            }
+            let mut left = false;
+            if chars.peek() == Some(&'-') {
+                left = true;
+                chars.next();
+            }
+            if chars.peek() == Some(&'+') {
+                return None;
+            }
+            let mut wstr = String::new();
+            while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                wstr.push(chars.next().unwrap());
+            }
+            if chars.peek() == Some(&'.') {
+                return None;
+            }
+            let spec = chars.next()?;
+            if spec == '%' {
+                if left || !wstr.is_empty() {
+                    return None;
+                }
+                lit.push('%');
+                continue;
+            }
+            let spec_lc = spec.to_ascii_lowercase();
+            if !matches!(spec_lc, 'd' | 'b' | 'h' | 'x' | 'o' | 's' | 'c') {
+                return None;
+            }
+            let width = if wstr.is_empty() {
+                None
+            } else {
+                Some(wstr.parse::<u32>().ok()?)
+            };
+            if !lit.is_empty() {
+                segs.push(FmtSeg::Lit(std::mem::take(&mut lit)));
+            }
+            segs.push(FmtSeg::Spec {
+                spec: spec_lc,
+                width,
+                left,
+                str_valued: false,
+            });
+            nargs += 1;
+        }
+        if !lit.is_empty() {
+            segs.push(FmtSeg::Lit(lit));
+        }
+        Some((segs, nargs))
     }
 
     fn bail(&mut self, reason: &'static str) {
@@ -5677,6 +5846,73 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dest)
             }
             ExprKind::SystemCall { name, args } => match name.as_str() {
+                    // §21.3.3 `$sformatf` with a LITERAL template and specs the
+                    // native filler covers exactly — parsed once here, filled
+                    // from register Values at exec. Anything else (non-literal
+                    // fmt, %t/%p/%m/…, arg-count mismatch) keeps the AST path.
+                    "$sformatf" | "$psprintf" => {
+                        let mut native: Option<(Vec<FmtSeg>, Vec<RegId>)> = None;
+                        if let Some(ExprKind::StringLiteral(fmt)) =
+                            args.first().map(|a| &a.kind)
+                        {
+                            if let Some((segs, nargs)) = Self::parse_format_template(fmt) {
+                                if nargs == args.len() - 1 {
+                                    let start = self.insns.len();
+                                    let start_reg = self.next_reg;
+                                    let mut arg_regs: Vec<RegId> =
+                                        Vec::with_capacity(nargs);
+                                    let mut ok = true;
+                                    for a in &args[1..] {
+                                        match self.compile_expr(a, 0) {
+                                            Some(r) => arg_regs.push(r),
+                                            None => {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if ok {
+                                        native = Some((segs, arg_regs));
+                                    } else {
+                                        self.insns.truncate(start);
+                                        self.next_reg = start_reg;
+                                    }
+                                }
+                            }
+                        }
+                        let Some((mut segs, arg_regs)) = native else {
+                            // Same escape hatch as the `other` arm: one
+                            // expression-level fallback, not a whole-stmt bail.
+                            if let Some(r) = self.emit_expr_fallback(
+                                expr,
+                                ctx_width,
+                                "SystemCall_sformatf",
+                            ) {
+                                return Some(r);
+                            }
+                            self.bail("SystemCall_sformatf");
+                            return None;
+                        };
+                        let mut ai = 0usize;
+                        for seg in segs.iter_mut() {
+                            if let FmtSeg::Spec { spec, str_valued, .. } = seg {
+                                if *spec == 's' {
+                                    *str_valued =
+                                        self.expr_is_string_static(&args[1 + ai]);
+                                }
+                                ai += 1;
+                            }
+                        }
+                        let dst = self.alloc_reg();
+                        self.emit(Insn::Format(
+                            dst,
+                            Box::new(FormatData {
+                                segs,
+                                args: arg_regs,
+                            }),
+                        ));
+                        Some(dst)
+                    }
                     "$signed" => {
                         let r = self.compile_expr(args.first()?, 0)?;
                         self.emit(Insn::SetSigned(r));
@@ -6364,7 +6600,11 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Ident(hier) => {
                 if let Some(id) = self.lookup_signal_id(hier) {
-                    self.emit(Insn::BlockingAssign(as_sig_id(id), val_reg, width));
+                    if self.signal_is_string_name(hier) {
+                        self.emit(Insn::BlockingAssignString(as_sig_id(id), val_reg));
+                    } else {
+                        self.emit(Insn::BlockingAssign(as_sig_id(id), val_reg, width));
+                    }
                     true
                 } else if let Some((base_id, off, mw)) = self.packed_struct_member_target(hier) {
                     // Packed-struct member write (`s.m0 = …`): splice the value
@@ -7499,6 +7739,8 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::CaseLut(_, src, _) => *src == r,
             Insn::CaseJump(src, _) => *src == r,
             Insn::CaseMaskJump(src, _) => *src == r,
+            Insn::Format(_, f) => f.args.contains(&r),
+            Insn::BlockingAssignString(_, v) => *v == r,
             Insn::LoadConst(..)
             | Insn::LoadSignal(..)
             | Insn::LoadSignalSigned(..)
@@ -8207,6 +8449,9 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::CaseLut(d, ..) => store(&mut rw, *d, None),
                 // Control only; defines nothing.
                 Insn::CaseJump(..) | Insn::CaseMaskJump(..) => {}
+                // String result: width is the text length, not static.
+                Insn::Format(d, ..) => store(&mut rw, *d, None),
+                Insn::BlockingAssignString(..) => {}
 
                 // The exec arms clone the boxed `Value` verbatim.
                 Insn::LoadConst(d, v) => {
@@ -9292,6 +9537,8 @@ pub fn lower_two_state(
             Insn::CaseLut(..) => return None,
             Insn::CaseJump(..) => return None,
             Insn::CaseMaskJump(..) => return None,
+            Insn::Format(..) => return None,
+            Insn::BlockingAssignString(..) => return None,
             // 1-bit results. CaseEq/CaseNeq equal Eq/Neq on X-free values.
             Insn::Eq(d, a, b) | Insn::CaseEq(d, a, b) => {
                 rw[*a as usize]?;

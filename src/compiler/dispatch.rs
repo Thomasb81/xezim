@@ -111,6 +111,8 @@ impl Opcode {
             Insn::CaseLut(_, _, _) => Self::CaseEq,
             Insn::CaseJump(_, _) => Self::Jump,
             Insn::CaseMaskJump(_, _) => Self::Jump,
+            Insn::Format(_, _) => Self::CaseEq,
+            Insn::BlockingAssignString(_, _) => Self::BlockingAssign,
             Insn::CasezEq(_, _, _) => Self::CasezEq,
             Insn::CasexEq(_, _, _) => Self::CasexEq,
             Insn::Lt(_, _, _) => Self::Lt,
