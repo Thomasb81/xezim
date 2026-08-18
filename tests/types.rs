@@ -292,3 +292,5 @@ mod inside_const_members;
 mod packed_struct_pattern_compile;
 #[path = "types/task_fsm_compile.rs"]
 mod task_fsm_compile;
+#[path = "types/case_jump_dispatch.rs"]
+mod case_jump_dispatch;
