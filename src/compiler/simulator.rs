@@ -27038,7 +27038,30 @@ impl Simulator {
         self.event_loop_singlethread(None);
     }
 
+    /// Ask the event loop to stop at the next slot boundary and finalize.
+    ///
+    /// Ctrl-C used to kill the process where it stood, and for FST that means
+    /// losing EVERYTHING: value changes live in an in-memory block that is only
+    /// written by `fst_finish`, so an interrupted run left a header, hierarchy
+    /// and geometry with no data at all — a 17MB run reduced to 577 bytes. VCD
+    /// and XTrace fare better (they stream) but still lose their tail and any
+    /// closing time record.
+    ///
+    /// The handler itself only stores a flag, which is async-signal-safe; the
+    /// loop below polls it and exits through the normal path so `run()` reaches
+    /// `vcd_finish`/`xtrace_finish`/`fst_finish`. A SECOND signal restores the
+    /// default disposition and re-raises, so an interrupt is never ignored if
+    /// finalizing is itself what is stuck.
+    fn install_interrupt_handler() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            libc::signal(libc::SIGINT, handle_interrupt as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, handle_interrupt as libc::sighandler_t);
+        });
+    }
+
     fn event_loop_singlethread(&mut self, tick_barrier: Option<&crate::multikernel::ClockBarrier>) {
+        Self::install_interrupt_handler();
         let sim_start = std::time::Instant::now();
         let mut iters: u64 = 0;
         let max_iters = self.max_time * 1000;
@@ -27302,6 +27325,16 @@ impl Simulator {
                 next_progress += std::time::Duration::from_secs(progress_interval);
             }
 
+            // Ctrl-C / SIGTERM: leave through the normal exit so the dumps are
+            // finalized rather than truncated.
+            if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[xezim] interrupted at time {} — finalizing waveform dumps",
+                    self.time
+                );
+                self.finished = true;
+                break;
+            }
             let has_timed = !self.event_queue.is_empty();
             let has_waiters = !self.event_waiters.is_empty();
             let has_clocks = !self.clock_generators.is_empty();
@@ -96981,6 +97014,22 @@ fn vpi_radix_string(v: &Value, bits_per_digit: usize) -> String {
         s.push('0');
     }
     s
+}
+
+/// Set by the SIGINT/SIGTERM handler; polled by the event loop so an
+/// interrupted run still finalizes its waveform dumps.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Signal handler. Does the minimum that is async-signal-safe: set a flag. A
+/// second signal restores the default action and re-raises, so the user can
+/// always force the issue.
+extern "C" fn handle_interrupt(sig: libc::c_int) {
+    if INTERRUPTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
 }
 
 /// Thread-local pointer to the current simulator instance.
