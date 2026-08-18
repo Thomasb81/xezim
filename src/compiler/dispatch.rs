@@ -112,6 +112,7 @@ impl Opcode {
             Insn::CaseJump(_, _) => Self::Jump,
             Insn::CaseMaskJump(_, _) => Self::Jump,
             Insn::Format(_, _) => Self::CaseEq,
+            Insn::StrOp(_, _, _) => Self::CaseEq,
             Insn::BlockingAssignString(_, _) => Self::BlockingAssign,
             Insn::CasezEq(_, _, _) => Self::CasezEq,
             Insn::CasexEq(_, _, _) => Self::CasexEq,

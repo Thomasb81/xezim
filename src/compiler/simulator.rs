@@ -18164,6 +18164,9 @@ impl Simulator {
                 Insn::Format(dst, f) => {
                     vm_regs[*dst as usize] = Self::exec_format(f, vm_regs);
                 }
+                Insn::StrOp(dst, kind, args) => {
+                    vm_regs[*dst as usize] = Self::exec_str_op(*kind, args, vm_regs);
+                }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let sig_id = &(*sig_id as usize);
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
@@ -18731,6 +18734,9 @@ impl Simulator {
                 }
                 Insn::Format(dst, f) => {
                     vm_regs[*dst as usize] = Self::exec_format(f, vm_regs);
+                }
+                Insn::StrOp(dst, kind, args) => {
+                    vm_regs[*dst as usize] = Self::exec_str_op(*kind, args, vm_regs);
                 }
                 Insn::Move(d, s) => {
                     vm_regs[*d as usize] = vm_regs[*s as usize].clone();
@@ -19880,6 +19886,10 @@ impl Simulator {
                 }
                 Insn::Format(dst, f) => {
                     self.vm_regs[*dst as usize] = Self::exec_format(f, &self.vm_regs);
+                }
+                Insn::StrOp(dst, kind, args) => {
+                    self.vm_regs[*dst as usize] =
+                        Self::exec_str_op(*kind, args, &self.vm_regs);
                 }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let sig_id = &(*sig_id as usize);
@@ -28594,6 +28604,7 @@ impl Simulator {
             Insn::CaseJump(..) => "CaseJump",
             Insn::CaseMaskJump(..) => "CaseMaskJump",
             Insn::Format(..) => "Format",
+            Insn::StrOp(..) => "StrOp",
             Insn::BlockingAssignString(..) => "BlockingAssignString",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
@@ -70699,6 +70710,100 @@ impl Simulator {
 
     /// §21.2.1.3: widest decimal string the operand's type can produce —
     /// `%d` with no explicit width space-pads to this.
+    /// Evaluate one native string op — semantics mirror the AST
+    /// interpreter's §6.16 implementations byte-for-byte (same helpers where
+    /// they exist: `sv_strcmp`, `sv_ato_value`, the substr highest-bit rule).
+    fn exec_str_op(
+        kind: super::bytecode::StrOpKind,
+        args: &[u16],
+        regs: &[Value],
+    ) -> Value {
+        use super::bytecode::StrOpKind as K;
+        let v = |i: usize| -> &Value { &regs[args[i] as usize] };
+        match kind {
+            K::Len => Value::from_u64(v(0).sv_string_bytes().len() as u64, 32),
+            K::GetC => {
+                let idx = v(1).to_u64().unwrap_or(0) as usize;
+                let b = v(0).sv_string_bytes().get(idx).copied().unwrap_or(0);
+                Value::from_u64(b as u64, 8)
+            }
+            K::Substr => {
+                // Mirror of the AST rule: length from the highest set bit,
+                // inclusive [start, end] byte slice, "" out of range.
+                let base = v(0);
+                let start = v(1).to_u64().unwrap_or(0) as usize;
+                let end = v(2).to_u64().unwrap_or(0) as usize;
+                let mut highest_bit = 0usize;
+                for i in (0..base.width as usize).rev() {
+                    if base.get_bit(i) != LogicBit::Zero {
+                        highest_bit = i;
+                        break;
+                    }
+                }
+                let actual_len = highest_bit.div_ceil(8);
+                if actual_len > 0 && start < actual_len && end < actual_len && start <= end
+                {
+                    let l = (actual_len - 1 - start) * 8 + 7;
+                    let r = (actual_len - 1 - end) * 8;
+                    base.range_select(l, r)
+                } else {
+                    Value::zero(0)
+                }
+            }
+            K::ToUpper => Value::from_string(&v(0).to_sv_string().to_uppercase()),
+            K::ToLower => Value::from_string(&v(0).to_sv_string().to_lowercase()),
+            K::Compare | K::ICompare => {
+                let (a, b) = (v(0).to_sv_string(), v(1).to_sv_string());
+                let (a, b) = if kind == K::ICompare {
+                    (a.to_lowercase(), b.to_lowercase())
+                } else {
+                    (a, b)
+                };
+                let d = Self::sv_strcmp(&a, &b);
+                let mut out = Value::from_u64(d as u64, 32);
+                out.is_signed = true;
+                out
+            }
+            K::AToI => sv_ato_value(&v(0).to_sv_string(), 10),
+            K::AToHex => sv_ato_value(&v(0).to_sv_string(), 16),
+            K::AToOct => sv_ato_value(&v(0).to_sv_string(), 8),
+            K::AToBin => sv_ato_value(&v(0).to_sv_string(), 2),
+            K::Concat => {
+                let mut bytes: Vec<u8> = Vec::new();
+                for &r in args {
+                    bytes.extend(regs[r as usize].sv_string_bytes());
+                }
+                let text: String = bytes.into_iter().map(|b| b as char).collect();
+                Value::from_string(&text)
+            }
+            K::PutC => {
+                let cur = v(0).to_sv_string();
+                let idx = v(1).to_i64().unwrap_or(-1);
+                let ch = (v(2).to_u64().unwrap_or(0) & 0xFF) as u8;
+                if idx >= 0 && (idx as usize) < cur.len() && ch != 0 {
+                    let mut b: Vec<u8> = cur.chars().map(|c| c as u8).collect();
+                    b[idx as usize] = ch;
+                    let text: String = b.into_iter().map(|c| c as char).collect();
+                    Value::from_string(&text)
+                } else {
+                    v(0).clone()
+                }
+            }
+            K::IToA => {
+                let x = v(0);
+                let text = if x.width > 32 {
+                    format!("{}", x.to_i64().unwrap_or(0))
+                } else {
+                    format!("{}", x.to_u64().unwrap_or(0) as u32 as i32)
+                };
+                Value::from_string(&text)
+            }
+            K::HexToA => Value::from_string(&format!("{:x}", v(0).to_u64().unwrap_or(0))),
+            K::OctToA => Value::from_string(&format!("{:o}", v(0).to_u64().unwrap_or(0))),
+            K::BinToA => Value::from_string(&format!("{:b}", v(0).to_u64().unwrap_or(0))),
+        }
+    }
+
     /// Fill a compile-time-parsed `$sformatf` template from register
     /// Values. Byte-identical to the AST formatter for the specs
     /// `parse_format_template` admits — each arm calls the SAME value-level
