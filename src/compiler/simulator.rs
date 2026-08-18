@@ -20961,6 +20961,13 @@ impl Simulator {
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_array_first_id(&self.array_first_id);
+                // Without the function table, `compile_pure_call` cannot even
+                // LOOK UP a callee, so any RHS containing a function call
+                // bailed to the AST interpreter (`Expr_Call`) — dragging the
+                // hottest RTL idiom there is (`assign x = f(sel)` decode
+                // helpers) onto the slowest path. Every other compiler
+                // instantiation passes it; this one simply never did.
+                compiler.set_functions(&self.module.functions);
                 compiler.top_module_name = Some(self.module.name.clone());
                 if compiler.compile_cont_assign(&ca.rhs, dst_id, width) {
                     CombItem::CompiledContAssign {
@@ -21020,6 +21027,11 @@ impl Simulator {
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_array_first_id(&self.array_first_id);
+                // Same omission as the single-dest site above: without the
+                // function table a concat-LHS decode assign
+                // (`assign {a,b} = ({N{hit}} & f(w)) | ...`) could never
+                // inline its calls and stayed on the AST interpreter.
+                compiler.set_functions(&self.module.functions);
                 compiler.top_module_name = Some(self.module.name.clone());
                 let lhs_w = compiler.infer_lhs_width_pub(&ca.lhs);
                 if lhs_w > 0 && compiler.compile_cont_assign_lhs(&ca.lhs, &ca.rhs, lhs_w) {
