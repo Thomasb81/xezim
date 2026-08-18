@@ -536,9 +536,64 @@ fn for_each_proc_assign_lhs(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
 
 /// §11.5.1: the width of an indexed part-select (`[base +: w]` / `[base -: w]`)
 /// must be a positive constant — a width that constant-folds to 0 is illegal.
+/// Is this width expression one we can const-fold with CONFIDENCE?
+///
+/// `const_eval_i64_with_params` answers `Some(0)` for references it cannot
+/// actually resolve — a struct-typed parameter member (`Cfg.NrEntries`)
+/// routes through `eval_const_expr_val`, whose Value defaults to zero. Fed
+/// straight into the §11.5.1 check that read as "width 0" and rejected
+/// perfectly legal RTL: every cva6 and black-parrot configuration failed
+/// elaboration on `[base +: $clog2(CVA6Cfg.<field>)]`, which cannot be
+/// resolved at all without instance context (the parameter is registered
+/// per-instance, e.g. `u.Cfg`). Only literals and references that genuinely
+/// resolve are trusted; anything else leaves the select alone, which is the
+/// right bias for a lint that produces a hard error.
+fn width_is_confident(e: &Expression, elab: &ElaboratedModule) -> bool {
+    match &e.kind {
+        ExprKind::Number(_) => true,
+        ExprKind::Paren(i) => width_is_confident(i, elab),
+        ExprKind::Unary { operand, .. } => width_is_confident(operand, elab),
+        ExprKind::Binary { left, right, .. } => {
+            width_is_confident(left, elab) && width_is_confident(right, elab)
+        }
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            width_is_confident(condition, elab)
+                && width_is_confident(then_expr, elab)
+                && width_is_confident(else_expr, elab)
+        }
+        ExprKind::SystemCall { args, .. } => args.iter().all(|a| width_is_confident(a, elab)),
+        ExprKind::Ident(h) => {
+            let raw = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+            elab.parameters.contains_key(&raw)
+                || elab.parameters.contains_key(leaf)
+                || elab.parameters.keys().any(|k| {
+                    k.rsplit('.').next() == Some(leaf) || k.rsplit("::").next() == Some(leaf)
+                })
+        }
+        // A struct/interface member or an index: only trusted when the exact
+        // dotted key was seeded (interface-port parameters do this).
+        ExprKind::MemberAccess { expr: base, member } => {
+            let ExprKind::Ident(h) = &base.kind else { return false };
+            let b = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+            elab.parameters.contains_key(&format!("{b}.{}", member.name))
+                || elab.parameters.contains_key(&format!("{b}::{}", member.name))
+        }
+        _ => false,
+    }
+}
+
 fn check_zero_slice(e: &Expression, elab: &ElaboratedModule, errs: &mut Vec<String>) {
     if let ExprKind::RangeSelect { kind, right, .. } = &e.kind {
         if matches!(kind, RangeKind::IndexedUp | RangeKind::IndexedDown) {
+            if !width_is_confident(right, elab) {
+                return;
+            }
             if let Some(0) =
                 xezim_core::elaborate::const_eval_i64_with_params(right, Some(&elab.parameters))
             {

@@ -300,3 +300,5 @@ mod case_wildcard_signed_extension;
 mod case_mask_jump_dispatch;
 #[path = "types/packed_member_self_determined_width.rs"]
 mod packed_member_self_determined_width;
+#[path = "types/zero_width_select_confidence.rs"]
+mod zero_width_select_confidence;
