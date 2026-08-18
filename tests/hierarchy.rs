@@ -103,3 +103,5 @@ mod nested_modules_and_zpad;
 
 #[path = "hierarchy/iface_port_params.rs"]
 mod iface_port_params;
+#[path = "hierarchy/modport_shape_battery.rs"]
+mod modport_shape_battery;
