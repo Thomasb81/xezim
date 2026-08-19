@@ -25,6 +25,8 @@ mod bit_class_property_signedness;
 mod blocking_task_super_dispatch;
 #[path = "classes/class_field_named_event.rs"]
 mod class_field_named_event;
+#[path = "classes/this_chain_edge_sensitivity.rs"]
+mod this_chain_edge_sensitivity;
 #[path = "classes/class_handle_return_preservation.rs"]
 mod class_handle_return_preservation;
 #[path = "classes/class_output_handle_copyback.rs"]

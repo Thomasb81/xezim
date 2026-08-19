@@ -25267,7 +25267,7 @@ impl Simulator {
                     // expects — the chain form collected no identifiers and
                     // armed the wait on nothing.
                     let ee_norm;
-                    let ee = match Self::member_chain_as_flat_ident(&ee.expr) {
+                    let ee = match Self::member_chain_as_flat_ident_for_sens(&ee.expr) {
                         Some(flat) => {
                             ee_norm = crate::ast::stmt::EventExpr {
                                 edge: ee.edge,
@@ -25384,7 +25384,21 @@ impl Simulator {
                                 continue;
                             }
                         }
-                        let sig = self.resolve_hier_name(h);
+                        let mut sig = self.resolve_hier_name(h);
+                        // `@(bus.clk_i)` / `@(this.drv.bus.clk_i)` inside a
+                        // class: `resolve_hier_name` strips the handle prefix
+                        // to the LEAF, which is not a signal — late-bind the
+                        // raw chain through the live handles instead (the
+                        // snitch driver stall: every wait degenerated to a
+                        // same-time yield and the run never left time 0).
+                        if !self.signal_name_to_id.contains_key(sig.as_str())
+                            && !self.signals.contains_key(&sig)
+                        {
+                            let raw = segs.join(".");
+                            if let Some(resolved) = self.resolve_sens_name_via_handles(&raw) {
+                                sig = resolved;
+                            }
+                        }
                         let cb_key = self
                             .resolve_clocking_key(&segs)
                             .unwrap_or_else(|| sig.clone());
@@ -31051,6 +31065,19 @@ impl Simulator {
                             let mut cont = vec![*body.clone()];
                             // Chain the caller's tail rather than copying it (ProcCont::pushed).
                             let cont = pc.pushed(cont, pc.start + i + 1);
+                            // Late-bind virtual-interface / handle-chained
+                            // names to their concrete instance signals before
+                            // deciding whether anything real is waited on.
+                            let mut sens = sens;
+                            for se in sens.iter_mut() {
+                                if !self.signal_name_to_id.contains_key(se.signal_name.as_str()) {
+                                    if let Some(resolved) =
+                                        self.resolve_sens_name_via_handles(&se.signal_name)
+                                    {
+                                        se.signal_name = resolved;
+                                    }
+                                }
+                            }
                             let has_real = sens.iter().any(|s| {
                                 self.signal_name_to_id.contains_key(s.signal_name.as_str())
                             });
@@ -31069,6 +31096,12 @@ impl Simulator {
                             return;
                         }
                         // Star/empty sensitivity — just execute body
+                        if !is_star && std::env::var_os("XEZIM_TRACE_SPIN").is_some() {
+                            eprintln!(
+                                "[EMPTYSENS] pid={} t={} event={:?} span={:?}",
+                                pid, self.time, event, stmt.span
+                            );
+                        }
                     }
                 }
                 self.exec_statement(body);
@@ -36374,6 +36407,25 @@ impl Simulator {
                 }
                 settle_guard += 1;
                 if self.finished || settle_guard > 10_000 {
+                    if std::env::var_os("XEZIM_TRACE_SPIN").is_some() && !self.finished {
+                        eprintln!("[DRAINGUARD] t={} exhausted; {} waiters:", self.time, self.event_waiters.len());
+                        for w in self.event_waiters.iter().take(6) {
+                            let names: Vec<String> = w
+                                .resolved_sensitivities
+                                .iter()
+                                .map(|sid| {
+                                    let nm = self
+                                        .id_to_name
+                                        .get(sid.signal_id)
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| format!("id{}", sid.signal_id));
+                                    let cur = self.signal_table.get(sid.signal_id).map(|v| v.to_u64());
+                                    format!("{nm}:{:?} cur={:?} prev={:?}", sid.edge, cur, w.captured_prev.first())
+                                })
+                                .collect();
+                            eprintln!("  pid={} sens={:?}", w.pid, names);
+                        }
+                    }
                     break;
                 }
             }
@@ -55805,6 +55857,79 @@ impl Simulator {
     /// from outside the class had no identity at all — the waiter fell into
     /// the delta-yield and woke at t=0, and the trigger fired a name nothing
     /// was listening to.
+    /// Resolve a dotted sensitivity NAME through class-handle and
+    /// virtual-interface hops to a concrete signal name, at WAIT time.
+    /// `this.drv.bus.clk_i`: `this` -> live handle; `.drv` -> property
+    /// handle; `.bus` -> `virtual_iface_bindings` -> bound instance name;
+    /// the remaining tail joins that instance path. Snitch-style class
+    /// drivers block on exactly this shape (`@(posedge this.drv.bus.clk_i)`),
+    /// and without runtime resolution the waiter fell into the
+    /// "not a real signal" same-time yield — a time-0 livelock.
+    fn resolve_sens_name_via_handles(&self, dotted: &str) -> Option<String> {
+        if !dotted.contains('.') {
+            return None;
+        }
+        let segs: Vec<&str> = dotted.split('.').collect();
+        let mut i;
+        let mut handle: usize = if segs[0] == "this" || segs[0] == "super" {
+            i = 1;
+            self.this_stack.last().copied().flatten()?
+        } else if let Some(h) = self.eval_ident_handle(segs[0]) {
+            i = 1;
+            h
+        } else if self.this_stack.last().copied().flatten().is_some() {
+            // Class-scope shorthand: `bus.clk_i` inside a method is
+            // `this.bus.clk_i` (§8.11) — the driver classes' own
+            // `@(posedge bus.clk_i)` waits are exactly this shape.
+            i = 0;
+            self.this_stack.last().copied().flatten()?
+        } else {
+            return None;
+        };
+        while i < segs.len() {
+            let cn = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|o| o.class_name.clone())?;
+            let is_vif = self
+                .module
+                .classes
+                .get(&cn)
+                .map(|cd| cd.virtual_iface_properties.contains_key(segs[i]))
+                .unwrap_or(false);
+            if is_vif {
+                let (bound, _) = self
+                    .virtual_iface_bindings
+                    .get(&(handle, segs[i].to_string()))
+                    .cloned()?;
+                let rest = segs[i + 1..].join(".");
+                if rest.is_empty() {
+                    return None;
+                }
+                let target = format!("{bound}.{rest}");
+                return self
+                    .signal_name_to_id
+                    .contains_key(target.as_str())
+                    .then_some(target);
+            }
+            let v = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())?
+                .properties
+                .get(segs[i])?
+                .clone();
+            let h2 = v.to_u64()? as usize;
+            if h2 == 0 || self.heap.get(h2).and_then(|o| o.as_ref()).is_none() {
+                return None;
+            }
+            handle = h2;
+            i += 1;
+        }
+        None
+    }
+
     fn resolve_handle_event_field(&mut self, dotted: &str) -> Option<(usize, String)> {
         let (recv, field) = dotted.rsplit_once('.')?;
         if recv.contains('.') {
@@ -78418,14 +78543,38 @@ impl Simulator {
     /// and `vif.cb.data <= v` missed the clocking check and drove a phantom.
     /// `None` for any shape with indexing or calls.
     fn member_chain_as_flat_ident(e: &Expression) -> Option<Expression> {
-        fn collect(e: &Expression, out: &mut Vec<crate::ast::Identifier>) -> bool {
+        Self::member_chain_as_flat_ident_impl(e, false)
+    }
+
+    /// Sensitivity-list variant: also flattens chains rooted at a literal
+    /// `this` (`@(posedge this.drv.bus.clk_i)`). Such a chain collected
+    /// NOTHING, so the wait armed on an empty sensitivity and the event
+    /// control became a no-op: a `forever … @(posedge this.drv.bus.clk_i)`
+    /// monitor spun at time 0 forever (the snitch driver-class stall). The
+    /// literal "this" segment is resolved by the waiter's handle-chain late
+    /// binding. Lvalue call sites must NOT take this arm — an assignment
+    /// through `this.vif.member` has to keep its MemberAccess shape so the
+    /// handle walk applies the §25.8 virtual-interface redirect.
+    fn member_chain_as_flat_ident_for_sens(e: &Expression) -> Option<Expression> {
+        Self::member_chain_as_flat_ident_impl(e, true)
+    }
+
+    fn member_chain_as_flat_ident_impl(e: &Expression, allow_this: bool) -> Option<Expression> {
+        fn collect(e: &Expression, out: &mut Vec<crate::ast::Identifier>, allow_this: bool) -> bool {
             match &e.kind {
                 ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
                     out.extend(h.path.iter().map(|s| s.name.clone()));
                     true
                 }
+                ExprKind::This if allow_this => {
+                    out.push(crate::ast::Identifier {
+                        name: "this".to_string(),
+                        span: e.span,
+                    });
+                    true
+                }
                 ExprKind::MemberAccess { expr, member } => {
-                    if !collect(expr, out) {
+                    if !collect(expr, out, allow_this) {
                         return false;
                     }
                     out.push(member.clone());
@@ -78438,7 +78587,7 @@ impl Simulator {
             return None;
         }
         let mut names = Vec::new();
-        if !collect(e, &mut names) || names.len() < 2 {
+        if !collect(e, &mut names, allow_this) || names.len() < 2 {
             return None;
         }
         let span = e.span;
