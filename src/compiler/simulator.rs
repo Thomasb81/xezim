@@ -29170,6 +29170,27 @@ impl Simulator {
         // monitor at the NEXT serviced slot instead of at the write's own time.
         let mut slot_pending = true;
         loop {
+            // §20.2: `$finish` ends the SIMULATION, not just the process that
+            // called it. This nested loop drives whole time slots on its own
+            // (a `#delay` inside a process body), so without this check a
+            // finish raised by any process it services — or by the caller's
+            // own earlier statements — kept the loop running for as long as
+            // other processes kept scheduling. The visible form: an always
+            // block calls $finish while a fork..join_none child still loops
+            // on `#1` — the run hung forever, and because Ctrl-C/SIGTERM are
+            // polled at the OUTER loop's boundary only, even `timeout(1)`
+            // could not kill it (SIGKILL was needed). Poll both here.
+            if self.finished {
+                break;
+            }
+            if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[xezim] interrupted at time {} — finalizing waveform dumps",
+                    self.time
+                );
+                self.finished = true;
+                break;
+            }
             // Advance to the EARLIEST of: event_queue, clock_generators,
             // and delayed-update queue (so a `#10` from inside an initial
             // block doesn't silently jump over clock toggles OR inertial /
@@ -29397,9 +29418,26 @@ impl Simulator {
             self.process_m_scope.remove(&pid).unwrap_or_default(),
         );
 
+        // A PROCESS is never "inside" an edge block, whatever stack frame it
+        // happens to be serviced from. A fork child spawned by an edge block
+        // and serviced while that block's frame was still live inherited
+        // `in_edge_block=true` for the REST OF THE RUN once its `#delay`
+        // trapped the event loop in run_events_until — every subsequent
+        // signal write then took the edge-rescan path instead of ordinary
+        // edge detection (dirty_edge never set again), so no always block
+        // fired anymore: the design froze while the child spun, and $finish
+        // (a dead always block) could never come. Clear both flags for the
+        // process's execution and restore on the way out.
+        // `in_edge_cont` must SURVIVE into the servicing: waiter/inline
+        // continuations set it just before resuming so their writes join the
+        // §9.2 rescan (see waiter_cont_anyedge_wake). Only the edge-BLOCK
+        // flag is cleared here.
+        let saved_in_edge_block = std::mem::replace(&mut self.in_edge_block, false);
+
         self.proc_depth += 1;
         self.run_scheduled_process_inner(pid, stmts);
         self.proc_depth -= 1;
+        self.in_edge_block = saved_in_edge_block;
         if self.proc_depth == 0 {
             self.drain_deferred_comb();
         }
@@ -75308,6 +75346,20 @@ impl Simulator {
     /// `paths`/`queue` locals made `paths.size()` on a fresh uvm_queue
     /// handle report another subroutine's element count).
     fn bare_receiver_is_class_handle(&self, name: &str) -> bool {
+        // The most recent DECLARATION binding wins: a method-local bound to
+        // an enum typedef (`uvm_severity s;`) is an enum value even when the
+        // flat `var_class_types` map holds a class type for the same bare
+        // name from another scope, and even when its small integer payload
+        // matches a live heap index — that exact collision dispatched UVM's
+        // severity walk to heap object #1 (a uvm_callbacks_base) whenever
+        // s==1, so the report summary lost its zero-count severity rows.
+        if self
+            .var_typedef_types
+            .get(name)
+            .is_some_and(|tn| self.module.enum_members.contains_key(tn))
+        {
+            return false;
+        }
         let statically_class_typed = self.local_class_type_of(name).is_some()
             || self
                 .this_stack
@@ -76242,9 +76294,25 @@ impl Simulator {
                 .and_then(|id| self.signal_type_names.get(id).cloned());
             // Anonymous `enum {...} v;` variables have no typedef name, so the
             // member list is keyed by the variable name itself (§6.19.6).
-            let members_opt = tn_opt
-                .as_ref()
+            // The flat signal-name lookup collides across scopes: a
+            // METHOD-LOCAL `uvm_severity s;` resolved through whatever OTHER
+            // `s` the table held (UVM is full of `string s;`/enum locals of
+            // other types), so the walk in `reset_severity_counts()` stepped
+            // through a foreign 2-member enum and cycled 0,1,0,… — the
+            // missing `UVM_ERROR : 0` rows in every UVM report summary. The
+            // DECLARATION recorded the local's true typedef in
+            // `var_typedef_types`; that binding is the nearest scope, so it
+            // takes precedence; the flat signal type and the anonymous-enum
+            // key remain as fallbacks.
+            let members_opt = self
+                .var_typedef_types
+                .get(obj_name)
                 .and_then(|tn| self.module.enum_members.get(tn))
+                .or_else(|| {
+                    tn_opt
+                        .as_ref()
+                        .and_then(|tn| self.module.enum_members.get(tn))
+                })
                 .or_else(|| self.module.enum_members.get(obj_name))
                 .cloned();
             {
@@ -76273,7 +76341,16 @@ impl Simulator {
                         "first" => mk(members[0].1),
                         "last"  => mk(members[members.len()-1].1),
                         "next" | "prev" => {
-                            let cur_v = self.get_signal_value_by_name(obj_name);
+                            // Read the receiver like an ordinary identifier —
+                            // LOCAL FRAME first. `get_signal_value_by_name`
+                            // consults only the flat table, so a method-local
+                            // (`uvm_severity s`) read whatever same-named
+                            // variable that table held: `pos` never matched,
+                            // next() answered the invalid-value default and
+                            // UVM's severity walk cycled instead of advancing.
+                            let cur_v = self
+                                .get_local_or_signal(obj_name)
+                                .or_else(|| self.get_signal_value_by_name(obj_name));
                             let cur_xz = cur_v.as_ref().is_some_and(|v| v.has_xz());
                             let cur = cur_v.map(|v| v.to_u64().unwrap_or(0)).unwrap_or(0);
                             // Compare at the enum's WIDTH: the member table and
@@ -80719,7 +80796,25 @@ impl Simulator {
             // Gate on `expr_assoc_name(expr).is_none()` so a member-collection
             // receiver (`obj.member` / bare `member`) still takes the builtin
             // path below — only a plain class-handle receiver is rerouted.
-            if Self::is_array_builtin_method(mname) && self.expr_assoc_name(expr).is_none() {
+            // A bare receiver whose DECLARATION bound it to an enum typedef
+            // is an enum value, not a handle — its small integer payload can
+            // collide with a live heap index. `uvm_severity s; s = s.next()`
+            // inside a UVM method dispatched to heap object #1's `num`/`next`
+            // (a uvm_pool) whenever s==1, so the severity walk cycled 0,1,0…
+            // and the report summary lost its zero-count severities.
+            let enum_typed_receiver = matches!(mname,
+                    "first" | "last" | "num" | "next" | "prev" | "name")
+                && matches!(&expr.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && self
+                            .var_typedef_types
+                            .get(&h.path[0].name.name)
+                            .is_some_and(|tn| self.module.enum_members.contains_key(tn)));
+            if !enum_typed_receiver
+                && Self::is_array_builtin_method(mname)
+                && self.expr_assoc_name(expr).is_none()
+            {
                 if let Some(h) = self.eval_handle_expr(expr) {
                     if h != 0 {
                         let cn = self
@@ -81739,6 +81834,31 @@ impl Simulator {
                 }
             }
 
+            // §6.19.6: a bare receiver DECLARED as an enum typedef takes the
+            // enum methods — before any handle interpretation. The flat
+            // `class_of_var` map can claim the same name for a class type
+            // from another scope, and an enum payload of 1 is a plausible
+            // live heap index: UVM's `uvm_severity s; s = s.next()` walk
+            // dispatched to heap object #1 (`uvm_callbacks_base`) whenever
+            // s==1, cycling the severity seeding loop 0,1,0,… and dropping
+            // the zero-count rows from every report summary.
+            if let ExprKind::Ident(h) = &expr.kind {
+                if h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && matches!(member.name.as_str(),
+                        "first" | "last" | "num" | "next" | "prev" | "name")
+                    && self
+                        .var_typedef_types
+                        .get(&h.path[0].name.name)
+                        .is_some_and(|tn| self.module.enum_members.contains_key(tn))
+                {
+                    if let Some(v) =
+                        self.eval_builtin_method(&h.path[0].name.name, &member.name, args)
+                    {
+                        return v;
+                    }
+                }
+            }
             let base = self.eval_expr(expr);
             let handle = base.to_u64().unwrap_or(0) as usize;
             // LRM §8.7/§8.23: a STATIC method always dispatches to the
