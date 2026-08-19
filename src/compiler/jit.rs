@@ -737,6 +737,7 @@ mod enabled {
                     Insn::BranchIfFalse(_, t)
                     | Insn::Jump(t)
                     | Insn::BranchUnlessZero(_, t)
+                    | Insn::CmpBranch(_, _, _, _, t)
                     | Insn::BranchIfSignalFalse(_, t, _) => targets.push(*t as usize),
                     Insn::CaseJump(_, cj) => {
                         targets.extend(cj.table.iter().map(|&t| t as usize));
@@ -1019,6 +1020,61 @@ mod enabled {
                             exit_block
                         };
                         builder.ins().brif(nz, target_b, &[], fall_b, &[]);
+                        live = false;
+                    }
+                    // Fused compare+branch: compute the compare into the
+                    // embedded dead register with the SAME emitters as the
+                    // unfused insns, then branch on definite-true (v & ~x).
+                    Insn::CmpBranch(kind, l, r, tmp, target) => {
+                        use crate::compiler::bytecode::CmpKind as CK;
+                        match kind {
+                            CK::CaseEq => {
+                                let (lv, lx) =
+                                    ld2(&mut builder, pointer_type, &reg_slots, &xz_slots, *l);
+                                let (rv, rx) =
+                                    ld2(&mut builder, pointer_type, &reg_slots, &xz_slots, *r);
+                                let veq = builder.ins().icmp(IntCC::Equal, lv, rv);
+                                let xeq = builder.ins().icmp(IntCC::Equal, lx, rx);
+                                let both = builder.ins().band(veq, xeq);
+                                let ext = builder.ins().uextend(types::I64, both);
+                                let zero = builder.ins().iconst(types::I64, 0);
+                                st2(&mut builder, pointer_type, &reg_slots, &xz_slots, *tmp, ext, zero);
+                            }
+                            _ => {
+                                let cc = match kind {
+                                    CK::Eq => IntCC::Equal,
+                                    CK::Neq => IntCC::NotEqual,
+                                    CK::Lt => IntCC::UnsignedLessThan,
+                                    CK::Leq => IntCC::UnsignedLessThanOrEqual,
+                                    CK::Gt => IntCC::UnsignedGreaterThan,
+                                    CK::Geq => IntCC::UnsignedGreaterThanOrEqual,
+                                    CK::CaseEq => unreachable!(),
+                                };
+                                emit_cmp(
+                                    &mut builder,
+                                    pointer_type,
+                                    &reg_slots,
+                                    &xz_slots,
+                                    &reg_widths,
+                                    &reg_signed,
+                                    *tmp,
+                                    *l,
+                                    *r,
+                                    cc,
+                                );
+                            }
+                        }
+                        let (tv, tx) =
+                            ld2(&mut builder, pointer_type, &reg_slots, &xz_slots, *tmp);
+                        let ntx = builder.ins().bnot(tx);
+                        let known1 = builder.ins().band(tv, ntx);
+                        let target_b = resolve_target(*target as usize, &pc_to_block);
+                        let fall_b = if i + 1 < n {
+                            pc_to_block[i + 1].unwrap_or(exit_block)
+                        } else {
+                            exit_block
+                        };
+                        builder.ins().brif(known1, fall_b, &[], target_b, &[]);
                         live = false;
                     }
                     // Fused `if (!sig[bit]) goto target`. §12.4 truth: a bit
@@ -1812,6 +1868,92 @@ mod enabled {
                 let w = builder.ins().iconst(types::I32, *width as i64);
                 builder.ins().call(nba_ref, &[sim_ptr, id, v, w]);
             }
+            // Fused LoadConst + NbaAssign: both planes are compile-time
+            // constants. The gate rejected fill/real constants.
+            NbaAssignConst(sig_id, k, width) => {
+                let (kv, kx) = k.raw_bits();
+                let vc = builder.ins().iconst(types::I64, kv as i64);
+                let xc = builder.ins().iconst(types::I64, kx as i64);
+                let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                let wc = builder.ins().iconst(types::I32, *width as i64);
+                builder.ins().call(nba_4s_ref, &[sim_ptr, id, vc, xc, wc]);
+            }
+            // Dense-array non-blocking element store (`mem[addr] <= data`):
+            // same index rules as the blocking form, scheduled via the NBA
+            // bridge. Out-of-range (or unresolvable) indices store nowhere.
+            NbaAssignArray(arr, idx_reg, val_reg, width) => {
+                let crate::compiler::bytecode::ArrayOperand::Dense {
+                    first_id, lo, hi, ..
+                } = arr.as_ref()
+                else {
+                    return Err(());
+                };
+                let (iv, ix) = ld2(builder, pointer_type, regs, xz, *idx_reg);
+                let (vv, vx) = ld2(builder, pointer_type, regs, xz, *val_reg);
+                let nix = builder.ins().bnot(ix);
+                let eff = builder.ins().band(iv, nix);
+                let lo_c = builder.ins().iconst(types::I64, *lo);
+                let hi_c = builder.ins().iconst(types::I64, *hi);
+                let ge = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, eff, lo_c);
+                let le = builder.ins().icmp(IntCC::SignedLessThanOrEqual, eff, hi_c);
+                let inb = builder.ins().band(ge, le);
+                let store_b = builder.create_block();
+                let join_b = builder.create_block();
+                builder.ins().brif(inb, store_b, &[], join_b, &[]);
+                builder.switch_to_block(store_b);
+                let off = builder.ins().isub(eff, lo_c);
+                let first_c = builder.ins().iconst(types::I64, *first_id as i64);
+                let eid = builder.ins().iadd(first_c, off);
+                let eid32 = builder.ins().ireduce(types::I32, eid);
+                let wc = builder.ins().iconst(types::I32, *width as i64);
+                builder
+                    .ins()
+                    .call(nba_4s_ref, &[sim_ptr, eid32, vv, vx, wc]);
+                builder.ins().jump(join_b, &[]);
+                builder.switch_to_block(join_b);
+            }
+            // Fused `rdata <= mem[addr]` (LoadSignal + LoadArrayElem +
+            // NbaAssign): index comes straight from a signal, the element
+            // value goes straight to the NBA queue. Out-of-range reads
+            // schedule a 1-bit X, exactly like the interpreter composition.
+            NbaAssignArrayRead(dst_sig, arr, idx_sig, width) => {
+                let crate::compiler::bytecode::ArrayOperand::Dense {
+                    first_id, lo, hi, ..
+                } = arr.as_ref()
+                else {
+                    return Err(());
+                };
+                let idc = builder.ins().iconst(types::I32, *idx_sig as i64);
+                let call = builder.ins().call(load_ref, &[sim_ptr, idc]);
+                let iv = builder.inst_results(call)[0];
+                let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, idc]);
+                let ix = builder.inst_results(xcall)[0];
+                let nix = builder.ins().bnot(ix);
+                let eff = builder.ins().band(iv, nix);
+                let lo_c = builder.ins().iconst(types::I64, *lo);
+                let hi_c = builder.ins().iconst(types::I64, *hi);
+                let ge = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, eff, lo_c);
+                let le = builder.ins().icmp(IntCC::SignedLessThanOrEqual, eff, hi_c);
+                let inb = builder.ins().band(ge, le);
+                let off = builder.ins().isub(eff, lo_c);
+                let first_c = builder.ins().iconst(types::I64, *first_id as i64);
+                let eid = builder.ins().iadd(first_c, off);
+                let eid_safe = builder.ins().select(inb, eid, first_c);
+                let eid32 = builder.ins().ireduce(types::I32, eid_safe);
+                let vcall = builder.ins().call(load_ref, &[sim_ptr, eid32]);
+                let ev = builder.inst_results(vcall)[0];
+                let excall = builder.ins().call(load_xz_ref, &[sim_ptr, eid32]);
+                let ex = builder.inst_results(excall)[0];
+                let zero = builder.ins().iconst(types::I64, 0);
+                let one = builder.ins().iconst(types::I64, 1);
+                let minus1 = builder.ins().iconst(types::I64, -1);
+                let inb_mask = builder.ins().select(inb, minus1, zero);
+                let v = builder.ins().band(ev, inb_mask);
+                let x = builder.ins().select(inb, ex, one);
+                let dc = builder.ins().iconst(types::I32, *dst_sig as i64);
+                let wc = builder.ins().iconst(types::I32, *width as i64);
+                builder.ins().call(nba_4s_ref, &[sim_ptr, dc, v, x, wc]);
+            }
             NbaAssignRange(sig_id, hi, lo, val_reg) => {
                 let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
@@ -1946,6 +2088,32 @@ mod enabled {
                 let out_v = builder.ins().select(ct, tv, sel_ve);
                 let out_x = builder.ins().select(ct, tx, sel_xe);
                 st2(builder, pointer_type, regs, xz, *dest, out_v, out_x);
+            }
+            // Fused Move+Resize: resize the SOURCE register's planes into
+            // the destination. Same §11.8.1 sign-extension rule as Resize.
+            MoveResize(d, sr, width) => {
+                if *width > 64 {
+                    return Err(());
+                }
+                let (mut v, mut x) = ld2(builder, pointer_type, regs, xz, *sr);
+                let cur_w = reg_w.get(*sr as usize).copied().unwrap_or(0);
+                if reg_s.get(*sr as usize).copied().unwrap_or(false)
+                    && cur_w > 0
+                    && *width > cur_w
+                {
+                    let (ve, xe) = sext_planes(builder, v, x, cur_w);
+                    v = ve;
+                    x = xe;
+                }
+                let mask: u64 = if *width >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << *width) - 1
+                };
+                let mc = builder.ins().iconst(types::I64, mask as i64);
+                let mv = builder.ins().band(v, mc);
+                let mx = builder.ins().band(x, mc);
+                st2(builder, pointer_type, regs, xz, *d, mv, mx);
             }
             Resize(reg, width) => {
                 // Emulates Value::resize: narrowing masks; widening a SIGNED
@@ -2363,6 +2531,8 @@ mod enabled {
             ClearSigned(r) => reg_s[*r as usize] = false,
             Concat(d, _) => reg_s[*d as usize] = false,
             Replicate(d, ..) | CaseLut(d, ..) => reg_s[*d as usize] = false,
+            MoveResize(d, sr, _) => reg_s[*d as usize] = reg_s[*sr as usize],
+            CmpBranch(_, _, _, tmp, _) => reg_s[*tmp as usize] = false,
             BinOpConst(d, sr, k, kind) => {
                 use crate::compiler::bytecode::BinOpConstKind as K;
                 reg_s[*d as usize] = match kind {
@@ -2455,6 +2625,8 @@ mod enabled {
                 set(reg_w, d, if known && total <= 64 { total } else { 0 })
             }
             Resize(d, w) => set(reg_w, d, *w),
+            MoveResize(d, _, w) => set(reg_w, d, *w),
+            CmpBranch(_, _, _, tmp, _) => set(reg_w, tmp, 1),
             Replicate(d, sr, cnt) => {
                 let sw = get(reg_w, sr);
                 let total = (sw as u64) * (*cnt as u64);
@@ -2715,6 +2887,11 @@ mod enabled {
                 | Concat(..)
                 | BlockingAssignArray(..)
                 | BinOpConst(..)
+                | NbaAssignConst(..)
+                | NbaAssignArray(..)
+                | NbaAssignArrayRead(..)
+                | CmpBranch(..)
+                | MoveResize(..)
                 | Replicate(..)
                 | CaseLut(..)
                 | ReduceAnd(..)

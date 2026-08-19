@@ -233,9 +233,10 @@ pub fn gen_block_fn(
     for (i, insn) in insns.iter().enumerate() {
         let mut targets: Vec<usize> = Vec::new();
         match insn {
-            Insn::BranchIfFalse(_, t) | Insn::Jump(t) | Insn::BranchIfSignalFalse(_, t, _) => {
-                targets.push(*t as usize)
-            }
+            Insn::BranchIfFalse(_, t)
+            | Insn::Jump(t)
+            | Insn::BranchIfSignalFalse(_, t, _)
+            | Insn::CmpBranch(_, _, _, _, t) => targets.push(*t as usize),
             Insn::CaseJump(_, cj) => {
                 targets.extend(cj.table.iter().map(|&t| t as usize));
                 targets.push(cj.default as usize);
@@ -259,6 +260,7 @@ pub fn gen_block_fn(
             Insn::BranchIfFalse(..)
                 | Insn::Jump(..)
                 | Insn::BranchIfSignalFalse(..)
+                | Insn::CmpBranch(..)
                 | Insn::CaseJump(..)
         )
     });
@@ -339,6 +341,17 @@ fn emit_insn_rust(
         }
         Move(d, s) => {
             let _ = writeln!(w, "r{d}v = r{s}v; r{d}x = r{s}x;");
+        }
+        MoveResize(d, sr, width) => {
+            if *width > 64 {
+                return None;
+            }
+            let cw = rw(*sr);
+            let sg = rs(*sr);
+            let _ = writeln!(
+                w,
+                "let t = resize4(r{sr}v, r{sr}x, {cw}, {sg}, {width}); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         Add(d, l, r) => {
             let _ = writeln!(w, "let t = arith4(r{l}v.wrapping_add(r{r}v), r{l}x, r{r}x); r{d}v = t.0; r{d}x = t.1;");
@@ -586,6 +599,36 @@ fn emit_insn_rust(
         BranchIfFalse(cond, target) => {
             let t = jump_pc(*target as usize, n);
             let _ = writeln!(w, "if (r{cond}v & !r{cond}x) == 0 {{ pc = {t}; continue 'sm; }}");
+        }
+        CmpBranch(kind, l, r, tmp, target) => {
+            use crate::compiler::bytecode::CmpKind as CK;
+            let t = jump_pc(*target as usize, n);
+            match kind {
+                CK::CaseEq => {
+                    let _ = writeln!(
+                        w,
+                        "r{tmp}v = ((r{l}v == r{r}v) && (r{l}x == r{r}x)) as u64; r{tmp}x = 0;"
+                    );
+                }
+                _ => {
+                    let op = match kind {
+                        CK::Eq => 0,
+                        CK::Neq => 1,
+                        CK::Lt => 2,
+                        CK::Leq => 3,
+                        CK::Gt => 4,
+                        CK::Geq => 5,
+                        CK::CaseEq => unreachable!(),
+                    };
+                    let bs = rs(*l) && rs(*r);
+                    let (lw, rw_) = (rw(*l), rw(*r));
+                    let _ = writeln!(
+                        w,
+                        "let t = cmp4(r{l}v, r{l}x, r{r}v, r{r}x, {bs}, {lw}, {rw_}, {op}); r{tmp}v = t.0; r{tmp}x = t.1;"
+                    );
+                }
+            }
+            let _ = writeln!(w, "if (r{tmp}v & !r{tmp}x) == 0 {{ pc = {t}; continue 'sm; }}");
         }
         Jump(target) => {
             let t = jump_pc(*target as usize, n);
