@@ -97,6 +97,47 @@ pub unsafe extern "C" fn xezim_jit_load_signal_xz(sim: *mut u8, id: u32) -> u64 
     sim.jit_load_signal_xz(id as usize)
 }}
 
+/// Fused two-plane load: writes val/xz planes of `signal_table[id]`
+/// through out-pointers (the JIT passes its register stack-slot
+/// addresses), replacing two bridge calls per signal read with one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xezim_jit_load_signal2(
+    sim: *mut u8,
+    id: u32,
+    out_v: *mut u64,
+    out_x: *mut u64,
+) { unsafe {
+    let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
+    let (v, x) = sim.jit_load_signal2(id as usize);
+    *out_v = v;
+    *out_x = x;
+}}
+
+/// Slice load: value plane of `signal_table[id][lo +: w]` (any signal width,
+/// w <= 64). Wide-signal escape hatch for `LoadSignalRange`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xezim_jit_load_signal_slice(
+    sim: *mut u8,
+    id: u32,
+    lo: u32,
+    w: u32,
+) -> u64 { unsafe {
+    let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
+    sim.jit_load_signal_slice(id as usize, lo, w)
+}}
+
+/// Slice load: xz plane sibling of `xezim_jit_load_signal_slice`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xezim_jit_load_signal_slice_xz(
+    sim: *mut u8,
+    id: u32,
+    lo: u32,
+    w: u32,
+) -> u64 { unsafe {
+    let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
+    sim.jit_load_signal_slice_xz(id as usize, lo, w)
+}}
+
 /// 4-STATE store: write both planes, with the same dirty-tracking and
 /// `mark_dirty_id` behaviour as `Insn::BlockingAssign`.
 #[unsafe(no_mangle)]
@@ -272,7 +313,9 @@ mod enabled {
     use super::super::bytecode::Insn;
     use super::{
         xezim_jit_blocking_assign_range_dyn, xezim_jit_inputs_have_xz,
-        xezim_jit_load_array_elem, xezim_jit_load_signal, xezim_jit_load_signal_xz,
+        xezim_jit_load_array_elem, xezim_jit_load_signal, xezim_jit_load_signal2,
+        xezim_jit_load_signal_slice,
+        xezim_jit_load_signal_slice_xz, xezim_jit_load_signal_xz,
         xezim_jit_schedule_nba,
         xezim_jit_schedule_nba_bit_dyn, xezim_jit_schedule_nba_fast,
         xezim_jit_schedule_nba_4s, xezim_jit_schedule_nba_range_dyn, xezim_jit_store_signal,
@@ -333,6 +376,15 @@ mod enabled {
             let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
             // Register bridge function symbols so the JIT can link to them.
             builder.symbol("xezim_jit_load_signal", xezim_jit_load_signal as *const u8);
+            builder.symbol("xezim_jit_load_signal2", xezim_jit_load_signal2 as *const u8);
+            builder.symbol(
+                "xezim_jit_load_signal_slice",
+                xezim_jit_load_signal_slice as *const u8,
+            );
+            builder.symbol(
+                "xezim_jit_load_signal_slice_xz",
+                xezim_jit_load_signal_slice_xz as *const u8,
+            );
             builder.symbol(
                 "xezim_jit_load_signal_xz",
                 xezim_jit_load_signal_xz as *const u8,
@@ -565,6 +617,33 @@ mod enabled {
                 .module
                 .declare_function("xezim_jit_load_signal", Linkage::Import, &load_sig)
                 .map_err(|_| ())?;
+            let mut load2_sig = self.module.make_signature();
+            load2_sig.params.push(AbiParam::new(pointer_type)); // sim
+            load2_sig.params.push(AbiParam::new(types::I32)); // id
+            load2_sig.params.push(AbiParam::new(pointer_type)); // out_v
+            load2_sig.params.push(AbiParam::new(pointer_type)); // out_x
+            let load2_id: FuncId = self
+                .module
+                .declare_function("xezim_jit_load_signal2", Linkage::Import, &load2_sig)
+                .map_err(|_| ())?;
+            let mut load_slice_sig = self.module.make_signature();
+            load_slice_sig.params.push(AbiParam::new(pointer_type)); // sim
+            load_slice_sig.params.push(AbiParam::new(types::I32)); // id
+            load_slice_sig.params.push(AbiParam::new(types::I32)); // lo
+            load_slice_sig.params.push(AbiParam::new(types::I32)); // w
+            load_slice_sig.returns.push(AbiParam::new(types::I64));
+            let load_slice_id: FuncId = self
+                .module
+                .declare_function("xezim_jit_load_signal_slice", Linkage::Import, &load_slice_sig)
+                .map_err(|_| ())?;
+            let load_slice_xz_id: FuncId = self
+                .module
+                .declare_function(
+                    "xezim_jit_load_signal_slice_xz",
+                    Linkage::Import,
+                    &load_slice_sig,
+                )
+                .map_err(|_| ())?;
             let load_xz_id: FuncId = self
                 .module
                 .declare_function("xezim_jit_load_signal_xz", Linkage::Import, &load_sig)
@@ -657,6 +736,7 @@ mod enabled {
                 match insn {
                     Insn::BranchIfFalse(_, t)
                     | Insn::Jump(t)
+                    | Insn::BranchUnlessZero(_, t)
                     | Insn::BranchIfSignalFalse(_, t, _) => targets.push(*t as usize),
                     Insn::CaseJump(_, cj) => {
                         targets.extend(cj.table.iter().map(|&t| t as usize));
@@ -703,6 +783,15 @@ mod enabled {
             // so the prelude can call xz_check_ref before the per-Insn
             // codegen begins.
             let load_ref = self.module.declare_func_in_func(load_id, &mut builder.func);
+            let load2_ref = self
+                .module
+                .declare_func_in_func(load2_id, &mut builder.func);
+            let load_slice_ref = self
+                .module
+                .declare_func_in_func(load_slice_id, &mut builder.func);
+            let load_slice_xz_ref = self
+                .module
+                .declare_func_in_func(load_slice_xz_id, &mut builder.func);
             let load_xz_ref = self
                 .module
                 .declare_func_in_func(load_xz_id, &mut builder.func);
@@ -916,6 +1005,22 @@ mod enabled {
                         builder.ins().jump(target_b, &[]);
                         live = false;
                     }
+                    // Fused LogNot + BranchIfFalse: jump unless DEFINITE
+                    // zero — an X condition takes the branch, exactly like
+                    // the interpreter's `is_nonzero() != Some(false)`.
+                    Insn::BranchUnlessZero(cond, target) => {
+                        let (cv, cx) =
+                            ld2(&mut builder, pointer_type, &reg_slots, &xz_slots, *cond);
+                        let nz = builder.ins().bor(cv, cx);
+                        let target_b = resolve_target(*target as usize, &pc_to_block);
+                        let fall_b = if i + 1 < n {
+                            pc_to_block[i + 1].unwrap_or(exit_block)
+                        } else {
+                            exit_block
+                        };
+                        builder.ins().brif(nz, target_b, &[], fall_b, &[]);
+                        live = false;
+                    }
                     // Fused `if (!sig[bit]) goto target`. §12.4 truth: a bit
                     // is true iff it is a DEFINITE 1 (val=1, xz=0), so the
                     // branch condition is computed from both planes exactly —
@@ -1082,7 +1187,7 @@ mod enabled {
                         st2(&mut builder, pointer_type, &reg_slots, &xz_slots, *dest, val, xzv);
                     }
                     other => {
-                        emit_insn(
+                        let emitted = emit_insn(
                             &mut builder,
                             other,
                             sim_ptr,
@@ -1093,6 +1198,9 @@ mod enabled {
                             signal_widths,
                             load_ref,
                             load_xz_ref,
+                            load2_ref,
+                            load_slice_ref,
+                            load_slice_xz_ref,
                             store_4s_ref,
                             nba_4s_ref,
                             store_ref,
@@ -1102,7 +1210,17 @@ mod enabled {
                             blk_range_ref,
                             load_array_ref,
                             pointer_type,
-                        )?;
+                        );
+                        if emitted.is_err() {
+                            if std::env::var("XEZIM_JIT_BAIL_TRACE").is_ok() {
+                                eprintln!(
+                                    "[JITBAIL] pc={} {}",
+                                    i,
+                                    crate::compiler::bytecode::insn_opcode_name(other)
+                                );
+                            }
+                            return Err(());
+                        }
                         // Width mask: keep the result within the width the
                         // interpreter's `Value` would have had (see
                         // `insn_result_width`). Both planes — the whole-X
@@ -1176,6 +1294,9 @@ mod enabled {
         sig_w: &[u32],
         load_ref: FuncRef,
         load_xz_ref: FuncRef,
+        load2_ref: FuncRef,
+        load_slice_ref: FuncRef,
+        load_slice_xz_ref: FuncRef,
         store_4s_ref: FuncRef,
         nba_4s_ref: FuncRef,
         store_ref: FuncRef,
@@ -1191,6 +1312,178 @@ mod enabled {
         use Insn::*;
         match insn {
             Nop => {}
+            // Fused LoadConst+binop (§ the interpreter's BinOpConst arm):
+            // identical semantics to the reg-reg forms with the constant's
+            // planes folded in at compile time. The block gate already
+            // rejected fill/real constants.
+            BinOpConst(d, sr, k, kind) => {
+                use crate::compiler::bytecode::BinOpConstKind as K;
+                let (kv0, kx0) = k.raw_bits();
+                let (sv, sx) = ld2(builder, pointer_type, regs, xz, *sr);
+                match kind {
+                    K::Add => {
+                        if kx0 != 0 {
+                            let zero = builder.ins().iconst(types::I64, 0);
+                            let ones = builder.ins().iconst(types::I64, -1);
+                            st2(builder, pointer_type, regs, xz, *d, zero, ones);
+                        } else {
+                            let kc = builder.ins().iconst(types::I64, kv0 as i64);
+                            let res = builder.ins().iadd(sv, kc);
+                            let zero = builder.ins().iconst(types::I64, 0);
+                            let ones = builder.ins().iconst(types::I64, -1);
+                            let unk = builder.ins().icmp(IntCC::NotEqual, sx, zero);
+                            let out_v = builder.ins().select(unk, zero, res);
+                            let out_x = builder.ins().select(unk, ones, zero);
+                            st2(builder, pointer_type, regs, xz, *d, out_v, out_x);
+                        }
+                    }
+                    K::Xor => {
+                        let kvc = builder.ins().iconst(types::I64, kv0 as i64);
+                        let kxc = builder.ins().iconst(types::I64, kx0 as i64);
+                        let unk = builder.ins().bor(sx, kxc);
+                        let x0 = builder.ins().bxor(sv, kvc);
+                        let nunk = builder.ins().bnot(unk);
+                        let rv = builder.ins().band(x0, nunk);
+                        st2(builder, pointer_type, regs, xz, *d, rv, unk);
+                    }
+                    K::CaseEq => {
+                        let kvc = builder.ins().iconst(types::I64, kv0 as i64);
+                        let kxc = builder.ins().iconst(types::I64, kx0 as i64);
+                        let veq = builder.ins().icmp(IntCC::Equal, sv, kvc);
+                        let xeq = builder.ins().icmp(IntCC::Equal, sx, kxc);
+                        let both = builder.ins().band(veq, xeq);
+                        let ext = builder.ins().uextend(types::I64, both);
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        st2(builder, pointer_type, regs, xz, *d, ext, zero);
+                    }
+                    K::Eq => {
+                        // Mirror emit_cmp's Equal path with the rhs constant.
+                        let both_signed =
+                            reg_s.get(*sr as usize).copied().unwrap_or(false) && k.is_signed;
+                        let lw = reg_w.get(*sr as usize).copied().unwrap_or(0);
+                        let (mut lv, mut lx) = (sv, sx);
+                        let (mut kv, mut kx) = (kv0, kx0);
+                        if both_signed {
+                            if lw > 0 && lw < 64 {
+                                let sh = builder.ins().iconst(types::I64, (64 - lw) as i64);
+                                let vs = builder.ins().ishl(lv, sh);
+                                lv = builder.ins().sshr(vs, sh);
+                                let xs = builder.ins().ishl(lx, sh);
+                                lx = builder.ins().sshr(xs, sh);
+                            }
+                            let kw = k.width;
+                            if kw > 0 && kw < 64 {
+                                kv = (((kv << (64 - kw)) as i64) >> (64 - kw)) as u64;
+                                kx = (((kx << (64 - kw)) as i64) >> (64 - kw)) as u64;
+                            }
+                        }
+                        let kvc = builder.ins().iconst(types::I64, kv as i64);
+                        let kxc = builder.ins().iconst(types::I64, kx as i64);
+                        let cmp = builder.ins().icmp(IntCC::Equal, lv, kvc);
+                        let ext = builder.ins().uextend(types::I64, cmp);
+                        let anyx = builder.ins().bor(lx, kxc);
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        let one = builder.ins().iconst(types::I64, 1);
+                        let unknown = builder.ins().icmp(IntCC::NotEqual, anyx, zero);
+                        let out_v = builder.ins().select(unknown, zero, ext);
+                        let out_x = builder.ins().select(unknown, one, zero);
+                        let known = builder.ins().bnot(anyx);
+                        let diffv = builder.ins().bxor(lv, kvc);
+                        let diff_known = builder.ins().band(diffv, known);
+                        let decided = builder.ins().icmp(IntCC::NotEqual, diff_known, zero);
+                        let out_v = builder.ins().select(decided, zero, out_v);
+                        let out_x = builder.ins().select(decided, zero, out_x);
+                        st2(builder, pointer_type, regs, xz, *d, out_v, out_x);
+                    }
+                }
+            }
+            // §11.4.12.1 replication: n copies, high copy first — same
+            // unrolled shift/or shape as Concat.
+            Replicate(d, sr, cnt) => {
+                let pw = reg_w.get(*sr as usize).copied().unwrap_or(0);
+                if pw == 0 || (pw as u64) * (*cnt as u64) > 64 {
+                    return Err(());
+                }
+                if *cnt == 0 {
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    st2(builder, pointer_type, regs, xz, *d, zero, zero);
+                } else {
+                    let (pv, px) = ld2(builder, pointer_type, regs, xz, *sr);
+                    let m = builder.ins().iconst(types::I64, (mask_of(pw)) as i64);
+                    let pv = builder.ins().band(pv, m);
+                    let px = builder.ins().band(px, m);
+                    let mut av = pv;
+                    let mut ax = px;
+                    for _ in 1..*cnt {
+                        let sh = builder.ins().iconst(types::I64, pw as i64);
+                        let avs = builder.ins().ishl(av, sh);
+                        av = builder.ins().bor(avs, pv);
+                        let axs = builder.ins().ishl(ax, sh);
+                        ax = builder.ins().bor(axs, px);
+                    }
+                    st2(builder, pointer_type, regs, xz, *d, av, ax);
+                }
+            }
+            // §11.4.9 reduction AND: 1 iff every bit is a known 1, 0 if any
+            // bit is a known 0, else x. Needs the operand's width for the
+            // all-ones compare — available from the reg-width table now.
+            ReduceAnd(d, sr) => {
+                let sw = reg_w.get(*sr as usize).copied().unwrap_or(0);
+                if sw == 0 {
+                    return Err(());
+                }
+                let m = mask_of(sw);
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *sr);
+                let nx = builder.ins().bnot(x);
+                let known1 = builder.ins().band(v, nx);
+                let mc = builder.ins().iconst(types::I64, m as i64);
+                let all1 = builder.ins().icmp(IntCC::Equal, known1, mc);
+                let nv = builder.ins().bnot(v);
+                let known0m = builder.ins().band(nv, nx);
+                let known0m = builder.ins().band(known0m, mc);
+                let zero = builder.ins().iconst(types::I64, 0);
+                let any0 = builder.ins().icmp(IntCC::NotEqual, known0m, zero);
+                let one = builder.ins().iconst(types::I64, 1);
+                let t = builder.ins().uextend(types::I64, all1);
+                let known = builder.ins().bor(all1, any0);
+                let out_x = builder.ins().select(known, zero, one);
+                st2(builder, pointer_type, regs, xz, *d, t, out_x);
+            }
+            // Value-table lookup (fused constant case): x/z or out-of-range
+            // selector picks the default. The tables are leaked host-side
+            // and addressed as absolute constants, like the xz prelude.
+            CaseLut(d, src, lut) => {
+                let n_e = lut.table.len();
+                let mut vt: Vec<u64> = Vec::with_capacity(n_e + 1);
+                let mut xt: Vec<u64> = Vec::with_capacity(n_e + 1);
+                for e in lut.table.iter().chain(std::iter::once(&lut.default)) {
+                    if e.is_fill || e.is_real || e.width > 64 {
+                        return Err(());
+                    }
+                    let (ev, ex) = e.raw_bits();
+                    vt.push(ev);
+                    xt.push(ex);
+                }
+                let vt: &'static [u64] = Box::leak(vt.into_boxed_slice());
+                let xt: &'static [u64] = Box::leak(xt.into_boxed_slice());
+                let (sv, sx) = ld2(builder, pointer_type, regs, xz, *src);
+                let len = builder.ins().iconst(types::I64, n_e as i64);
+                let zero = builder.ins().iconst(types::I64, 0);
+                let defi = builder.ins().iconst(types::I64, n_e as i64);
+                let sx_nz = builder.ins().icmp(IntCC::NotEqual, sx, zero);
+                let oob = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sv, len);
+                let bad = builder.ins().bor(sx_nz, oob);
+                let idx = builder.ins().select(bad, defi, sv);
+                let eight = builder.ins().iconst(types::I64, 8);
+                let off = builder.ins().imul(idx, eight);
+                let vb = builder.ins().iconst(pointer_type, vt.as_ptr() as i64);
+                let xb = builder.ins().iconst(pointer_type, xt.as_ptr() as i64);
+                let va = builder.ins().iadd(vb, off);
+                let xa = builder.ins().iadd(xb, off);
+                let out_v = builder.ins().load(types::I64, MemFlagsData::trusted(), va, 0);
+                let out_x = builder.ins().load(types::I64, MemFlagsData::trusted(), xa, 0);
+                st2(builder, pointer_type, regs, xz, *d, out_v, out_x);
+            }
             // Signedness lives in the compile-time reg_s table
             // (update_reg_meta); the planes are unchanged.
             ClearSigned(_) => {}
@@ -1238,13 +1531,12 @@ mod enabled {
                 st2(builder, pointer_type, regs, xz, *dest, c, cx);
             }
             LoadSignal(dest, sig_id) | LoadSignalSigned(dest, sig_id) => {
+                // One fused bridge call; the bridge writes both planes
+                // directly into the destination register's stack slots.
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
-                let call = builder.ins().call(load_ref, &[sim_ptr, id]);
-                let val = builder.inst_results(call)[0];
-                let idx = builder.ins().iconst(types::I32, *sig_id as i64);
-                let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, idx]);
-                let xv = builder.inst_results(xcall)[0];
-                st2(builder, pointer_type, regs, xz, *dest, val, xv);
+                let vp = builder.ins().stack_addr(pointer_type, regs[*dest as usize], 0);
+                let xp = builder.ins().stack_addr(pointer_type, xz[*dest as usize], 0);
+                builder.ins().call(load2_ref, &[sim_ptr, id, vp, xp]);
             }
             Move(d, s) => {
                 let (v, x) = ld2(builder, pointer_type, regs, xz, *s);
@@ -1584,19 +1876,38 @@ mod enabled {
                 let lo = (*left).min(*right);
                 let hi = (*left).max(*right);
                 let w = left.abs_diff(*right) + 1;
-                if w >= 64 {
+                if w > 64 {
                     return Err(());
                 }
                 // §11.5.1: positions beyond the signal's width read x.
                 let sw = sig_w.get(*sig_id as usize).copied().unwrap_or(0);
+                let full = mask_of(w);
                 let oor: u64 = if sw > 0 && lo >= sw {
-                    (1u64 << w) - 1
+                    full
                 } else if sw > 0 && hi >= sw {
-                    let full = (1u64 << w) - 1;
                     (full >> (sw - lo)) << (sw - lo)
                 } else {
                     0
                 };
+                if sw > 64 {
+                    // Wide signal: the slice bridges hand back exactly the
+                    // addressed window, already shifted to bit 0.
+                    let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                    let loc = builder.ins().iconst(types::I32, lo as i64);
+                    let wc = builder.ins().iconst(types::I32, w as i64);
+                    let call = builder.ins().call(load_slice_ref, &[sim_ptr, id, loc, wc]);
+                    let v = builder.inst_results(call)[0];
+                    let xcall =
+                        builder.ins().call(load_slice_xz_ref, &[sim_ptr, id, loc, wc]);
+                    let x = builder.inst_results(xcall)[0];
+                    let keepc = builder.ins().iconst(types::I64, (full & !oor) as i64);
+                    let vm = builder.ins().band(v, keepc);
+                    let xm0 = builder.ins().band(x, keepc);
+                    let oc = builder.ins().iconst(types::I64, oor as i64);
+                    let xm = builder.ins().bor(xm0, oc);
+                    st2(builder, pointer_type, regs, xz, *dest, vm, xm);
+                    return Ok(());
+                }
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
                 let call = builder.ins().call(load_ref, &[sim_ptr, id]);
                 let v = builder.inst_results(call)[0];
@@ -1604,7 +1915,7 @@ mod enabled {
                 let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, id2]);
                 let x = builder.inst_results(xcall)[0];
                 let sh = builder.ins().iconst(types::I64, lo as i64);
-                let keepc = builder.ins().iconst(types::I64, (((1u64 << w) - 1) & !oor) as i64);
+                let keepc = builder.ins().iconst(types::I64, (full & !oor) as i64);
                 let vs = builder.ins().ushr(v, sh);
                 let vm = builder.ins().band(vs, keepc);
                 let xs = builder.ins().ushr(x, sh);
@@ -2010,6 +2321,20 @@ mod enabled {
                 }
             }
             Shl(d, l, _) | AShr(d, l, _) => need_mask(*d, rw(l)),
+            BinOpConst(d, sr, k, kind) => {
+                use crate::compiler::bytecode::BinOpConstKind as K;
+                match kind {
+                    K::Add => {
+                        let sw = rw(sr);
+                        if sw == 0 || k.width == 0 {
+                            None
+                        } else {
+                            need_mask(*d, sw.max(k.width))
+                        }
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -2037,6 +2362,14 @@ mod enabled {
             SetSigned(r) => reg_s[*r as usize] = true,
             ClearSigned(r) => reg_s[*r as usize] = false,
             Concat(d, _) => reg_s[*d as usize] = false,
+            Replicate(d, ..) | CaseLut(d, ..) => reg_s[*d as usize] = false,
+            BinOpConst(d, sr, k, kind) => {
+                use crate::compiler::bytecode::BinOpConstKind as K;
+                reg_s[*d as usize] = match kind {
+                    K::Add | K::Xor => reg_s[*sr as usize] && k.is_signed,
+                    K::Eq | K::CaseEq => false,
+                }
+            }
             LoadArrayElem(d, arr, _) => {
                 reg_s[*d as usize] = match arr.as_ref() {
                     crate::compiler::bytecode::ArrayOperand::Dense { first_id, .. } => {
@@ -2122,6 +2455,26 @@ mod enabled {
                 set(reg_w, d, if known && total <= 64 { total } else { 0 })
             }
             Resize(d, w) => set(reg_w, d, *w),
+            Replicate(d, sr, cnt) => {
+                let sw = get(reg_w, sr);
+                let total = (sw as u64) * (*cnt as u64);
+                set(reg_w, d, if sw != 0 && total <= 64 { total as u32 } else { 0 })
+            }
+            CaseLut(d, _, lut) => {
+                let w0 = lut.default.width;
+                let uniform = lut.table.iter().all(|e| e.width == w0);
+                set(reg_w, d, if uniform && w0 <= 64 { w0 } else { 0 })
+            }
+            BinOpConst(d, sr, k, kind) => {
+                use crate::compiler::bytecode::BinOpConstKind as K;
+                match kind {
+                    K::Eq | K::CaseEq => set(reg_w, d, 1),
+                    K::Add | K::Xor => {
+                        let sw = get(reg_w, sr);
+                        set(reg_w, d, if sw == 0 || k.width == 0 { 0 } else { sw.max(k.width) })
+                    }
+                }
+            }
             BitNot(d, s) | Negate(d, s) => {
                 let w = get(reg_w, s);
                 set(reg_w, d, w)
@@ -2142,6 +2495,10 @@ mod enabled {
             BitSelect(d, ..) | BitSelectConst(d, ..) => set(reg_w, d, 1),
             _ => {}
         }
+    }
+
+    fn mask_of(w: u32) -> u64 {
+        if w >= 64 { !0 } else { (1u64 << w) - 1 }
     }
 
     /// Sign-extend both planes of a (v, x) pair from bit `w-1` to 64 bits.
@@ -2357,6 +2714,11 @@ mod enabled {
                 | ClearSigned(..)
                 | Concat(..)
                 | BlockingAssignArray(..)
+                | BinOpConst(..)
+                | Replicate(..)
+                | CaseLut(..)
+                | ReduceAnd(..)
+                | BranchUnlessZero(..)
                 | BranchIfSignalFalse(..)
                 | CaseJump(..)
                 | Nop

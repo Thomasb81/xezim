@@ -15776,6 +15776,32 @@ impl Simulator {
             .iter()
             .map(|b| b.as_ref().map(|cb| self.block_signals_fit_u64(cb)).unwrap_or(false))
             .collect();
+        if std::env::var("XEZIM_JIT_BAIL_TRACE").is_ok() {
+            for (idx, b) in blocks.iter().enumerate() {
+                let Some(cb) = b else { continue };
+                if !safe[idx] {
+                    let reason = self.block_fit_u64_reason(cb);
+                    eprintln!(
+                        "[JITGATE] eidx={} insns={} reason={:?}",
+                        idx,
+                        cb.instructions.len(),
+                        reason
+                    );
+                    if reason.as_deref().is_some_and(|r| r.starts_with("fill const")) {
+                        for (k, insn) in cb.instructions.iter().enumerate() {
+                            let hit = matches!(insn, super::bytecode::Insn::LoadConst(_, v) if v.is_fill);
+                            if hit {
+                                let hi = (k + 3).min(cb.instructions.len());
+                                for j in k..hi {
+                                    eprintln!("[JITGATE]   insn[{j}] {:?}", cb.instructions[j]);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let xz_ptr = self.signal_has_xz.as_ptr() as u64;
         let xz_len = self.signal_has_xz.len() as u32;
         let mut n = 0usize;
@@ -15829,9 +15855,17 @@ impl Simulator {
                 if !safe[idx] {
                     continue;
                 }
-                if let Some(f) =
-                    jm.try_compile_with_xz(&cb.instructions, cb.num_regs, xz_ptr, xz_len)
-                {
+                let compiled_fn =
+                    jm.try_compile_with_xz(&cb.instructions, cb.num_regs, xz_ptr, xz_len);
+                if compiled_fn.is_none() && std::env::var("XEZIM_JIT_BAIL_TRACE").is_ok() {
+                    eprintln!(
+                        "[JITSKIP] eidx={} insns={} first_unsupported={:?}",
+                        idx,
+                        cb.instructions.len(),
+                        super::jit::first_unsupported(&cb.instructions)
+                    );
+                }
+                if let Some(f) = compiled_fn {
                     if std::env::var("XEZIM_JIT_DUMP_BLOCKS").is_ok() {
                         eprintln!("[JITCOMB] eidx={} insns:", idx);
                         for i in cb.instructions.iter() {
@@ -16104,6 +16138,11 @@ impl Simulator {
             let jit_bail = super::jit::first_unsupported(&compiled.instructions)
                 .unwrap_or("(all insns supported; width/other gate)");
             *jit_bail_hist.entry(jit_bail).or_insert(0) += c[2];
+            if rank < 20 {
+                if let Some(reason) = self.block_fit_u64_reason(&compiled) {
+                    eprintln!("[COMBPATH]     gate: {reason}");
+                }
+            }
             for insn in compiled.instructions.iter() {
                 *op_hist.entry(super::bytecode::insn_opcode_name(insn)).or_insert(0) += c[2];
             }
@@ -38499,6 +38538,25 @@ impl Simulator {
                         } else {
                         if self.trace_comb_paths {
                             self.note_comb_path(eidx, 2);
+                            #[cfg(feature = "jit")]
+                            if std::env::var("XEZIM_JIT_BAIL_TRACE").is_ok() {
+                                use std::cell::RefCell;
+                                thread_local! {
+                                    static SEEN: RefCell<std::collections::HashSet<usize>> =
+                                        RefCell::new(std::collections::HashSet::new());
+                                }
+                                SEEN.with(|m| {
+                                    if m.borrow_mut().insert(eidx) {
+                                        eprintln!(
+                                            "[JITNORUN] eidx={} slot_none={:?} fns_len={} strikes={:?}",
+                                            eidx,
+                                            self.comb_jit_fns.get(eidx).map(|f| f.is_none()),
+                                            self.comb_jit_fns.len(),
+                                            self.comb_jit_strikes.get(eidx)
+                                        );
+                                    }
+                                });
+                            }
                         }
                         // Bytecode path: BlockingAssign/NbaAssign insns mark
                         // dirty automatically; no pre/post value snapshot needed.
@@ -61901,22 +61959,86 @@ impl Simulator {
     /// width ≤ 64. Used as a pre-JIT guard: blocks that read or write a
     /// wider signal cannot use the u64-only JIT bridges without silent
     /// truncation.
+    /// Reason-reporting sibling of `block_signals_fit_u64` for the
+    /// XEZIM_COMB_PATHS census: names the first disqualifying item.
+    fn block_fit_u64_reason(&self, cb: &super::bytecode::CompiledBlock) -> Option<String> {
+        use super::bytecode::Insn;
+        for insn in &cb.instructions {
+            let sig_id = match insn {
+                Insn::LoadSignal(_, id)
+                | Insn::LoadSignalSigned(_, id)
+                | Insn::LoadSignalBit(_, id, _)
+                | Insn::NbaAssign(id, ..)
+                | Insn::NbaAssignConst(id, ..)
+                | Insn::BranchIfSignalFalse(id, _, _)
+                | Insn::NbaAssignRangeDyn(id, ..)
+                | Insn::NbaAssignBitDyn(id, ..)
+                | Insn::BlockingAssign(id, ..)
+                | Insn::BlockingAssignRangeDyn(id, ..)
+                | Insn::BlockingAssignBitDyn(id, ..)
+                | Insn::NbaAssignArrayRead(id, ..) => Some(*id),
+                Insn::LoadArrayElem(_, arr, _) | Insn::BlockingAssignArray(arr, ..) => {
+                    match arr.as_ref() {
+                        super::bytecode::ArrayOperand::Dense { first_id, .. } => {
+                            Some(*first_id as u32)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(id) = sig_id {
+                let id = id as usize;
+                if id < self.signal_widths.len() && self.signal_widths[id] > 64 {
+                    return Some(format!(
+                        "wide signal {} ({} bits) via {}",
+                        self.id_to_name
+                            .get(id)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("id{id}")),
+                        self.signal_widths[id],
+                        super::bytecode::insn_opcode_name(insn)
+                    ));
+                }
+                if self
+                    .signal_table
+                    .get(id)
+                    .map(|v| v.is_real)
+                    .unwrap_or(false)
+                {
+                    return Some(format!("real signal id{id}"));
+                }
+            }
+            if let Insn::LoadConst(_, v) = insn {
+                if v.is_fill {
+                    return Some(format!("fill const width {}", v.width));
+                }
+                if v.is_real {
+                    return Some("real const".to_string());
+                }
+            }
+            if let Insn::BinOpConst(_, _, v, _) = insn {
+                if v.is_fill || v.is_real {
+                    return Some("fill/real BinOpConst".to_string());
+                }
+            }
+        }
+        None
+    }
+
     fn block_signals_fit_u64(&self, cb: &super::bytecode::CompiledBlock) -> bool {
         use super::bytecode::Insn;
         for insn in &cb.instructions {
             let sig_id = match insn {
                 Insn::LoadSignal(_, id)
                 | Insn::LoadSignalSigned(_, id)
-                | Insn::LoadSignalRange(_, id, ..)
                 | Insn::LoadSignalBit(_, id, _)
                 | Insn::NbaAssign(id, ..)
                 | Insn::NbaAssignConst(id, ..)
                 | Insn::BranchIfSignalFalse(id, _, _)
-                | Insn::NbaAssignRange(id, ..)
                 | Insn::NbaAssignRangeDyn(id, ..)
                 | Insn::NbaAssignBitDyn(id, ..)
                 | Insn::BlockingAssign(id, ..)
-                | Insn::BlockingAssignRange(id, ..)
                 | Insn::BlockingAssignRangeDyn(id, ..)
                 | Insn::BlockingAssignBitDyn(id, ..)
                 // Only the destination is checked here; the index signal this
@@ -61934,6 +62056,35 @@ impl Simulator {
                     }
                     _ => None,
                 },
+                // STATIC-bound slice access tolerates a wide signal: the
+                // slice bridges move only the addressed <= 64-bit window.
+                // Whole-value and dynamic-bound forms above stay gated;
+                // real-typed signals are still rejected (planes are ints).
+                Insn::LoadSignalRange(_, id, l, r) => {
+                    if l.abs_diff(*r) + 1 > 64
+                        || self
+                            .signal_table
+                            .get(*id as usize)
+                            .map(|v| v.is_real)
+                            .unwrap_or(false)
+                    {
+                        return false;
+                    }
+                    None
+                }
+                Insn::BlockingAssignRange(id, hi, lo, _)
+                | Insn::NbaAssignRange(id, hi, lo, _) => {
+                    if hi.abs_diff(*lo) + 1 > 64
+                        || self
+                            .signal_table
+                            .get(*id as usize)
+                            .map(|v| v.is_real)
+                            .unwrap_or(false)
+                    {
+                        return false;
+                    }
+                    None
+                }
                 _ => None,
             };
             if let Some(id) = sig_id {
@@ -62007,6 +62158,34 @@ impl Simulator {
         self.signal_table[id].raw_bits().0
     }
 
+    /// JIT bridge: both planes in one call (see `xezim_jit_load_signal2`).
+    #[inline]
+    pub(crate) fn jit_load_signal2(&self, id: usize) -> (u64, u64) {
+        if id >= self.signal_table.len() {
+            return (0, 0);
+        }
+        self.signal_table[id].raw_bits()
+    }
+
+    /// JIT bridge: read a bit-slice [lo +: w] of a signal of ANY width as
+    /// u64 planes (w <= 64). The wide-signal escape hatch for
+    /// `LoadSignalRange` — whole-value loads stay gated to <= 64 bits.
+    #[inline]
+    pub(crate) fn jit_load_signal_slice(&self, id: usize, lo: u32, w: u32) -> u64 {
+        if id >= self.signal_table.len() {
+            return 0;
+        }
+        Self::raw_bits_slice(&self.signal_table[id], lo as u16, w as u16).0
+    }
+
+    #[inline]
+    pub(crate) fn jit_load_signal_slice_xz(&self, id: usize, lo: u32, w: u32) -> u64 {
+        if id >= self.signal_table.len() {
+            return 0;
+        }
+        Self::raw_bits_slice(&self.signal_table[id], lo as u16, w as u16).1
+    }
+
     /// JIT bridge: Path B X/Z pre-check. Returns true if ANY signal in
     /// `ids` currently has X or Z bits set (i.e. its raw_bits xz part
     /// is non-zero). Called from the JIT-emitted prelude. When true,
@@ -62066,6 +62245,17 @@ impl Simulator {
         let sig_w = self.signal_widths[id];
         let w = if width == 0 { sig_w } else { width };
         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        // No-change fast exit on raw planes — the overwhelmingly common case
+        // in a settled design — before any Value is built. Only exact-width
+        // Inline storage takes it; everything else falls through to the
+        // full compare (resize semantics, Wide, real).
+        if w == sig_w {
+            if let Some((ov, ox)) = self.signal_table[id].inline_planes() {
+                if ov == val_bits & mask && ox == xz_bits & mask {
+                    return;
+                }
+            }
+        }
         let mut new_val = Value::from_inline(val_bits & mask, xz_bits & mask, w);
         if w != sig_w {
             new_val = new_val.resize(sig_w);
@@ -62253,8 +62443,30 @@ impl Simulator {
         }
         let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
         let w = high - low + 1;
-        let val = Value::from_inline(val_bits, xz_bits, w);
         let sig_w = self.signal_widths[id];
+        // Word path: masked insert on the raw planes when everything fits
+        // one u64 — replaces the per-bit get_bit/set_bit loop (which was a
+        // top-five profile entry on ibex: every RAM byte-lane write walks
+        // this). Semantics identical: bits beyond the signal's width are
+        // silently dropped.
+        if sig_w <= 64 && low < 64 {
+            if let Some((ov, ox)) = self.signal_table[id].inline_planes() {
+                let span_mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let sig_mask = if sig_w >= 64 { u64::MAX } else { (1u64 << sig_w) - 1 };
+                let m = (span_mask << low) & sig_mask;
+                let nv = (ov & !m) | ((val_bits << low) & m);
+                let nx = (ox & !m) | ((xz_bits << low) & m);
+                if nv != ov || nx != ox {
+                    self.signal_table[id].set_inline_planes(nv, nx);
+                    self.signal_table[id].is_signed = self.signal_signed[id];
+                    self.mark_dirty_id(id);
+                    self.table_modified = true;
+                    self.after_signal_write(id);
+                }
+                return;
+            }
+        }
+        let val = Value::from_inline(val_bits, xz_bits, w);
         let high_eff = high.min(sig_w.saturating_sub(1));
         let mut changed = false;
         for bit_pos in low..=high_eff {

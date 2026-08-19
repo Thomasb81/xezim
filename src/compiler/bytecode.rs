@@ -8123,6 +8123,7 @@ impl<'a> BytecodeCompiler<'a> {
         let signal_widths = self.signal_widths;
         let num_regs = (self.next_reg as usize).min(u16::MAX as usize + 1);
         Self::elide_redundant_resizes(&mut self.insns, signal_widths, self.signal_real, num_regs);
+        Self::fold_fill_const_resize(&mut self.insns);
         // AFTER resize elision: an about-to-be-deleted `Resize` sitting between
         // the array read and the NBA would otherwise hide the triple. Still
         // before `compact_nops`, which removes the `Nop`s it leaves behind.
@@ -8522,6 +8523,89 @@ impl<'a> BytecodeCompiler<'a> {
     /// removed before execution, so the three really are consecutive in the
     /// stream that runs. `XEZIM_FUSE_ARRNBA=0` disables the pass (A/B escape
     /// hatch).
+    /// §5.7.1: `LoadConst` of a FILL literal (`'0`/`'1`/`'x`) immediately
+    /// resized to a concrete width becomes one concrete `LoadConst` —
+    /// `Value::resize` on a fill replicates the bit and clears `is_fill`.
+    /// Fill constants otherwise keep whole blocks off every fast path (the
+    /// two-state lowering and both native backends reject them), and the
+    /// ibex ALU/controller blocks all start with exactly this pair.
+    fn fold_fill_const_resize(insns: &mut [Insn]) {
+        if insns.len() < 2 {
+            return;
+        }
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::CaseJump(_, cj) => {
+                    for &t in cj.table.iter().chain(std::iter::once(&cj.default)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::CaseMaskJump(_, mj) => {
+                    for &t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() =>
+                {
+                    is_target[*t as usize] = true;
+                }
+                _ => {}
+            }
+        }
+        for i in 0..insns.len() - 1 {
+            let Insn::LoadConst(d, v) = &insns[i] else {
+                continue;
+            };
+            if !v.is_fill || v.width > 64 {
+                continue;
+            }
+            let d = *d;
+            // The consumer must be the direct successor and not a jump
+            // target (a branch landing on it would see the unfolded
+            // constant), and — for the width-adapting folds — the register
+            // must have no OTHER reader, since folding fixes its width.
+            if is_target[i + 1] {
+                continue;
+            }
+            let single_use = insns[i + 2..]
+                .iter()
+                .all(|x| !Self::insn_reads_reg(x, d));
+            match &insns[i + 1] {
+                Insn::Resize(rd, w) if *rd == d && *w <= 64 => {
+                    let folded = v.resize(*w);
+                    insns[i] = Insn::LoadConst(d, Box::new(folded));
+                    insns[i + 1] = Insn::Nop;
+                }
+                // Fill flowing straight into a store: the store's width IS
+                // the §5.7.1 consuming context.
+                Insn::BlockingAssign(_, r, w) | Insn::NbaAssign(_, r, w)
+                    if *r == d && *w <= 64 && single_use =>
+                {
+                    let folded = v.resize(*w);
+                    insns[i] = Insn::LoadConst(d, Box::new(folded));
+                }
+                // Reductions read the fill at its own (1-bit) width; the
+                // fold just clears is_fill.
+                Insn::ReduceXor(_, r) | Insn::ReduceOr(_, r) | Insn::ReduceAnd(_, r)
+                    if *r == d && single_use =>
+                {
+                    let folded = v.resize(v.width.max(1));
+                    insns[i] = Insn::LoadConst(d, Box::new(folded));
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn fuse_array_read_nba(insns: &mut [Insn]) {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
