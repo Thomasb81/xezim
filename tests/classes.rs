@@ -202,3 +202,5 @@ mod nopack_member_array;
 mod class_localparam_array;
 #[path = "classes/member_collection_runtime_class.rs"]
 mod member_collection_runtime_class;
+#[path = "classes/enum_local_shadows_flat_maps.rs"]
+mod enum_local_shadows_flat_maps;

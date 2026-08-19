@@ -174,7 +174,18 @@ fn uvm_2020_complete_bench_runs_traffic() {
         .expect("UVM 2020 complete bench failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
-        !out.iter().any(|l| l.contains("UVM_ERROR") || l.contains("UVM_FATAL")),
+        // The report SUMMARY legitimately prints zero-count rows
+        // ("UVM_ERROR :    0") — matching them made the assert fail the
+        // moment the summary became reference-correct. Match actual
+        // report lines ("UVM_ERROR @ <time>") and nonzero counts only.
+        !out.iter().flat_map(|m| m.lines()).any(|l| {
+            (l.contains("UVM_ERROR") || l.contains("UVM_FATAL"))
+                && !l
+                    .trim_end()
+                    .rsplit(':')
+                    .next()
+                    .is_some_and(|c| c.trim() == "0")
+        }),
         "UVM errors:\n{}",
         out.join("\n")
     );
