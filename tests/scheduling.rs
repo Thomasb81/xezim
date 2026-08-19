@@ -191,3 +191,5 @@ mod comb_self_member_sensitivity;
 mod waiter_cont_anyedge_wake;
 #[path = "scheduling/nested_delay_slot_servicing.rs"]
 mod nested_delay_slot_servicing;
+#[path = "scheduling/finish_with_live_fork_child.rs"]
+mod finish_with_live_fork_child;

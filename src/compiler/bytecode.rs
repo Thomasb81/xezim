@@ -4753,7 +4753,19 @@ impl<'a> BytecodeCompiler<'a> {
                     false
                 }
             }
-            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            // §9.3.2: a fork's children are CONCURRENT PROCESSES. Compiling
+            // a ParBlock like a SeqBlock ran them sequentially INLINE — for
+            // `fork ... join_none` with a delaying child that meant the edge
+            // block itself executed the child's infinite `#1` loop on its own
+            // stack: the design froze (no other always block could ever fire
+            // again, so even $finish became unreachable) and the run had to
+            // be SIGKILLed. Always leave fork/join to the AST interpreter's
+            // ParBlock arm, which spawns real child processes.
+            StatementKind::ParBlock { .. } => {
+                self.bail("Stmt_ParBlock");
+                self.emit_fallback(stmt)
+            }
+            StatementKind::SeqBlock { stmts, .. } => {
                 let saved_locals = self.local_var_regs.clone();
                 let saved_decl_locals = self.decl_local_regs.clone();
                 for s in stmts {
