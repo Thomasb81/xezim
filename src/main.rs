@@ -136,11 +136,12 @@ fn print_usage() {
     eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
+    eprintln!("  --show-env-avail Print every XEZIM_* environment variable with a description");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
     eprintln!("  --x-warn         Warn when a signal holding a valid 0/1 value takes an x bit");
     eprintln!("                   after time 0, naming the signal, its instance/module and its");
     eprintln!("                   drivers. Signals x/z from the start are never reported.");
-    eprintln!("                   Also enabled by +X_WARN or X_WARN=1 in the environment.");
+    eprintln!("                   Also enabled by +X_WARN or XEZIM_X_WARN=1 in the environment.");
     eprintln!("  --x-warn-limit N Cap --x-warn reports at N (default 50, 0 = unlimited).");
     eprintln!("                   Elaboration diagnostics (port width mismatches, implicit");
     eprintln!("                   nets, ...) are capped per KIND at 5; raise with");
@@ -1322,6 +1323,10 @@ fn run_main() -> i32 {
         match arg.as_str() {
             "-h" | "--help" => {
                 print_usage();
+                std::process::exit(0);
+            }
+            "--show-env-avail" => {
+                xezim::env_vars::print_env_avail();
                 std::process::exit(0);
             }
             "-I" => {
@@ -2543,7 +2548,7 @@ suppressed but the explicit SDF annotation still applies."
                     std::process::exit(1);
                 }
                 println!("Elaboration successful");
-                if std::env::var("XZ_INST_PROF").is_ok() {
+                if std::env::var("XEZIM_INST_PROF").is_ok() {
                     // Per-instantiation elaboration section timings (also
                     // prints one [IPROF] line per instance).
                     xezim::compiler::elaborate::iprof_dump();

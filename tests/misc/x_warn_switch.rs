@@ -101,7 +101,7 @@ fn off_by_default() {
 
 #[test]
 fn env_switch_reports_signal_module_and_drivers() {
-    let out = run("env", CHAIN, &[], &[("X_WARN", "1")]);
+    let out = run("env", CHAIN, &[], &[("XEZIM_X_WARN", "1")]);
     if out.is_empty() {
         return;
     }
@@ -142,8 +142,8 @@ fn all_switch_spellings() {
         ("upper", vec!["--X_WARN"], vec![]),
         ("dash", vec!["-X_WARN"], vec![]),
         ("plus", vec!["+X_WARN"], vec![]),
-        ("envv", vec![], vec![("X_WARN", "1")]),
-        ("envon", vec![], vec![("X_WARN", "on")]),
+        ("envv", vec![], vec![("XEZIM_X_WARN", "1")]),
+        ("envon", vec![], vec![("XEZIM_X_WARN", "on")]),
     ] {
         let out = run(tag, CHAIN, &args, &env);
         if out.is_empty() {
@@ -154,7 +154,7 @@ fn all_switch_spellings() {
             "spelling {tag} must enable the warning; got:\n{out}"
         );
     }
-    let off = run("envoff", CHAIN, &[], &[("X_WARN", "0")]);
+    let off = run("envoff", CHAIN, &[], &[("XEZIM_X_WARN", "0")]);
     if !off.is_empty() {
         assert!(
             !off.contains("warning] X on"),
@@ -166,7 +166,7 @@ fn all_switch_spellings() {
 /// The report cap is honoured and announces itself, via both spellings.
 #[test]
 fn report_limit_is_capped_and_announced() {
-    let out = run("lim", CHAIN, &[], &[("X_WARN", "1"), ("X_WARN_LIMIT", "1")]);
+    let out = run("lim", CHAIN, &[], &[("XEZIM_X_WARN", "1"), ("XEZIM_X_WARN_LIMIT", "1")]);
     if out.is_empty() {
         return;
     }
@@ -208,7 +208,7 @@ module top;
   end
 endmodule
 "#;
-    let out = run("once", src, &[], &[("X_WARN", "1")]);
+    let out = run("once", src, &[], &[("XEZIM_X_WARN", "1")]);
     if out.is_empty() {
         return;
     }
@@ -249,7 +249,7 @@ module top;
   end
 endmodule
 "#;
-    let out = run("excl", src, &[], &[("X_WARN", "1")]);
+    let out = run("excl", src, &[], &[("XEZIM_X_WARN", "1")]);
     if out.is_empty() {
         return;
     }
@@ -295,7 +295,7 @@ module top(input logic din);         // undriven input: x/z from the start
   end
 endmodule
 "#;
-    let out = run("frombeg", src, &[], &[("X_WARN", "1")]);
+    let out = run("frombeg", src, &[], &[("XEZIM_X_WARN", "1")]);
     if out.is_empty() {
         return;
     }

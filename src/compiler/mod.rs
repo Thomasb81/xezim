@@ -9,6 +9,8 @@ pub mod bytecode;
 pub mod dispatch;
 pub mod fst_sink;
 pub mod jit;
+#[cfg(feature = "jit")]
+pub mod aot;
 pub mod simulator;
 pub mod soa;
 
