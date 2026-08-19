@@ -5275,7 +5275,7 @@ impl Simulator {
                 continue;
             }
             found.sort_by(|a, b| a.0.cmp(&b.0));
-            let Some(cd) = module.classes.get_mut(&cn) else {
+            let Some(cd) = module.classes.get_mut(&cn).map(std::sync::Arc::make_mut) else {
                 continue;
             };
             for (pname, w, is_static, dims) in found {
@@ -77795,7 +77795,7 @@ impl Simulator {
                 match next {
                     Some(parent) if seen.contains(&parent) => {
                         // This edge closes a cycle — sever it.
-                        if let Some(cd) = self.module.classes.get_mut(&cname) {
+                        if let Some(cd) = self.module.classes.get_mut(&cname).map(std::sync::Arc::make_mut) {
                             eprintln!(
                                 "[xezim][warning] severed cyclic class inheritance: \
                                  '{}' extends '{}' (cycle)",
@@ -78135,7 +78135,7 @@ impl Simulator {
     }
 
     fn get_class_def<'a>(&'a self, name: &str) -> Option<&'a crate::compiler::elaborate::ElaboratedClass> {
-        self.module.classes.get(name)
+        self.module.classes.get(name).map(|c| c.as_ref())
     }
 
     fn substitute_spec_params(&self, frag: &str) -> String {
@@ -88105,7 +88105,7 @@ impl Simulator {
     fn pure_factory_lookup(
         &self,
         requested: &str,
-    ) -> Option<crate::compiler::elaborate::ElaboratedClass> {
+    ) -> Option<std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>> {
         use crate::ast::types::DataType;
         if let Some(cd) = self.module.classes.get(requested) {
             return Some(cd.clone());
@@ -88306,7 +88306,20 @@ impl Simulator {
         let arg_map: HashMap<String, Expression> = type_args
             .map(|ta| self.class_param_arg_map(class_def, ta))
             .unwrap_or_default();
-        let mut classes_to_init = vec![class_def.clone()];
+        // The whole ancestor chain used to be DEEP-CLONED here on every
+        // `new()` (ElaboratedClass includes method ASTs) — 30% of a UVM
+        // testbench run. `module.classes` now stores Arcs, so the chain
+        // walk below bumps refcounts; the leaf reuses its map Arc when the
+        // caller's reference IS that object (pointer-verified), and only
+        // an off-map def (factory-synthesized) pays a real clone.
+        let leaf_arc = self
+            .module
+            .classes
+            .get(&class_def.name)
+            .filter(|c| std::sync::Arc::as_ptr(c) == class_def as *const _)
+            .cloned()
+            .unwrap_or_else(|| std::sync::Arc::new(class_def.clone()));
+        let mut classes_to_init = vec![leaf_arc];
         let mut cur = class_def.extends.clone();
         // Cycle guard — `sanitize_class_hierarchy` already severs `extends`
         // cycles, but keep a defensive `seen` check so a stale chain can
@@ -88318,7 +88331,7 @@ impl Simulator {
                 break;
             }
             if let Some(cdef) = self.module.classes.get(&cname) {
-                classes_to_init.push(cdef.clone());
+                classes_to_init.push(std::sync::Arc::clone(cdef));
                 cur = cdef.extends.clone();
             } else {
                 break;
