@@ -292,3 +292,5 @@ mod hier_iface_task_suspension;
 mod hier_port_drive_and_collision;
 #[path = "misc/recursive_function_in_continuous_assign.rs"]
 mod recursive_function_in_continuous_assign;
+#[path = "misc/env_var_registry.rs"]
+mod env_var_registry;

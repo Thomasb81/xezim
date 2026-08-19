@@ -9756,7 +9756,7 @@ pub fn lower_two_state(
     // Tracking costs one thread-local store per instruction, so it is armed
     // only when the dump is requested.
     static TRACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let track = *TRACK.get_or_init(|| std::env::var("XZ_TS_DBG").is_ok());
+    let track = *TRACK.get_or_init(|| std::env::var("XEZIM_TS_DBG").is_ok());
     for (ins_i, insn) in cb.instructions.iter().enumerate() {
         if track {
             TS_BAIL_AT.with(|c| c.set((ins_i, insn_opcode_name(insn))));

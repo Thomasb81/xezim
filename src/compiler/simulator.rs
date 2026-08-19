@@ -206,7 +206,7 @@ fn warn_x_enabled() -> bool {
     }
     // `X_WARN=1` / `X_WARN=on`: same switch, settable without editing the
     // command line. Any value other than 0/off/no/false enables it.
-    match std::env::var("X_WARN") {
+    match std::env::var("XEZIM_X_WARN") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !v.is_empty() && v != "0" && v != "off" && v != "no" && v != "false"
@@ -216,7 +216,7 @@ fn warn_x_enabled() -> bool {
 }
 
 fn warn_x_limit() -> usize {
-    if let Ok(v) = std::env::var("X_WARN_LIMIT") {
+    if let Ok(v) = std::env::var("XEZIM_X_WARN_LIMIT") {
         if let Ok(n) = v.trim().parse::<usize>() {
             return n;
         }
@@ -351,7 +351,7 @@ fn cached_env_flag(name: &'static str, slot: &'static OnceLock<bool>) -> bool {
 
 fn xz_copy_debug_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("XZ_CP_DBG").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("XEZIM_CP_DBG").is_some())
 }
 
 fn pdes_parallel_apply_enabled() -> bool {
@@ -4654,6 +4654,10 @@ pub struct Simulator {
     /// Fine-grained phase timing calls `Instant::now` several times per
     /// simulation tick. Keep it opt-in so normal runs do not pay that cost.
     profile_timing: bool,
+    /// XEZIM_COMB_PATHS=1: per-comb-entry settle-path counters
+    /// [two_state, jit, interpreter], dumped ranked at end of sim.
+    trace_comb_paths: bool,
+    comb_path_counts: Vec<[u64; 3]>,
     prof_fallback_by_reason: HashMap<Arc<str>, (u64, u64)>,
     prof_settle_dc_ns: u64,
     prof_settle_ca_ns: u64,
@@ -7247,6 +7251,8 @@ impl Simulator {
             prof_fallback_insns: 0,
             profile_timing: std::env::var("XEZIM_PROFILE_TIMING").ok().as_deref() == Some("1")
                 || std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
+            trace_comb_paths: std::env::var("XEZIM_COMB_PATHS").ok().as_deref() == Some("1"),
+            comb_path_counts: Vec::new(),
             prof_fallback_by_reason: HashMap::default(),
             prof_settle_dc_ns: 0,
             prof_settle_ca_ns: 0,
@@ -15773,6 +15779,50 @@ impl Simulator {
         let xz_ptr = self.signal_has_xz.as_ptr() as u64;
         let xz_len = self.signal_has_xz.len() as u32;
         let mut n = 0usize;
+        // XEZIM_AOT=1: rustc-compiled native block fns instead of cranelift.
+        // One generated crate for every eligible block, compiled once,
+        // dlopen'd, and installed through the same JitFn slots.
+        if std::env::var("XEZIM_AOT").map(|v| v == "1").unwrap_or(false) {
+            let verbose = std::env::var("XEZIM_JIT_VERBOSE").is_ok();
+            let mut names: Vec<(usize, String)> = Vec::new();
+            let mut fns: Vec<String> = Vec::new();
+            for (idx, b) in blocks.iter().enumerate() {
+                let Some(cb) = b else { continue };
+                if !safe[idx] {
+                    continue;
+                }
+                let name = format!("xezim_aot_cb_{idx}");
+                if let Some(src) = super::aot::gen_block_fn(
+                    &name,
+                    &cb.instructions,
+                    cb.num_regs,
+                    &self.signal_widths,
+                    &self.signal_signed,
+                ) {
+                    names.push((idx, name));
+                    fns.push(src);
+                }
+            }
+            if !fns.is_empty() {
+                let src = super::aot::module_source(&fns);
+                if let Some(lib) = super::aot::compile_and_load(&src, verbose) {
+                    for (idx, name) in &names {
+                        if let Some(f) = lib.sym(name) {
+                            self.comb_jit_fns[*idx] = Some(f);
+                            n += 1;
+                        }
+                    }
+                    std::mem::forget(lib);
+                }
+            }
+            eprintln!(
+                "[AOT] comb entries compiled {}/{} (width-safe candidates {})",
+                n,
+                self.comb_entries.len(),
+                safe.iter().filter(|&&x| x).count()
+            );
+            return;
+        }
         if let Some(jm) = self.jit_module.as_mut() {
             for (idx, b) in blocks.iter().enumerate() {
                 let Some(cb) = b else { continue };
@@ -15974,6 +16024,115 @@ impl Simulator {
     /// entry was fully evaluated in 2-state (the caller skips the 4-state
     /// stream); false = run the normal path (not lowerable, X present on a
     /// read, forces active, or warn-x bookkeeping needed).
+    #[inline]
+    fn note_comb_path(&mut self, eidx: usize, path: usize) {
+        if eidx >= self.comb_path_counts.len() {
+            self.comb_path_counts.resize(eidx + 1, [0; 3]);
+        }
+        self.comb_path_counts[eidx][path] += 1;
+    }
+
+    /// XEZIM_COMB_PATHS=1 end-of-sim report: comb entries ranked by
+    /// interpreter-path executions, with the two-state lowering bail
+    /// opcode and a per-opcode census aggregated over the hot set —
+    /// the work list for widening the u64/native settle coverage.
+    fn dump_comb_paths(&mut self) {
+        if !self.trace_comb_paths {
+            return;
+        }
+        let mut ranked: Vec<(usize, [u64; 3])> = self
+            .comb_path_counts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c[2] > 0)
+            .map(|(i, c)| (i, *c))
+            .collect();
+        ranked.sort_by_key(|(_, c)| std::cmp::Reverse(c[2]));
+        let tot: [u64; 3] = self.comb_path_counts.iter().fold([0; 3], |mut a, c| {
+            a[0] += c[0];
+            a[1] += c[1];
+            a[2] += c[2];
+            a
+        });
+        eprintln!(
+            "[COMBPATH] totals: two_state={} jit={} interp={} ({} entries interp-bound)",
+            tot[0], tot[1], tot[2], ranked.len()
+        );
+        let mut bail_hist: HashMap<&'static str, u64> = HashMap::default();
+        let mut jit_bail_hist: HashMap<&'static str, u64> = HashMap::default();
+        let mut op_hist: HashMap<&'static str, u64> = HashMap::default();
+        for (rank, (eidx, c)) in ranked.iter().take(40).enumerate() {
+            let Some(entry) = self.comb_entries.get(*eidx) else { continue };
+            let compiled = match &entry.item {
+                CombItem::CompiledContAssign { compiled, .. }
+                | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled.clone(),
+                other => {
+                    eprintln!(
+                        "[COMBPATH] #{rank} eidx={eidx} interp={} shape={:?} (non-compiled)",
+                        c[2],
+                        std::mem::discriminant(other)
+                    );
+                    continue;
+                }
+            };
+            let lowered = super::bytecode::lower_two_state(
+                &compiled,
+                &self.signal_widths,
+                &self.signal_signed,
+                &self.signal_real,
+                &self.array_first_id,
+            );
+            let (bail, bail_i) = if lowered.is_some() {
+                // Lowered OK but still interp-bound: X/Z guard failures.
+                ("(lowers; xz-guard bails)", usize::MAX)
+            } else {
+                let (bi, op) = super::bytecode::ts_last_bail();
+                (op, bi)
+            };
+            if rank < 12 && bail_i != usize::MAX {
+                let lo = bail_i.saturating_sub(2);
+                let hi = (bail_i + 2).min(compiled.instructions.len());
+                for k in lo..hi {
+                    eprintln!(
+                        "[COMBPATH]     insn[{k}]{} {:?}",
+                        if k == bail_i { "*" } else { " " },
+                        compiled.instructions[k]
+                    );
+                }
+            }
+            *bail_hist.entry(bail).or_insert(0) += c[2];
+            let jit_bail = super::jit::first_unsupported(&compiled.instructions)
+                .unwrap_or("(all insns supported; width/other gate)");
+            *jit_bail_hist.entry(jit_bail).or_insert(0) += c[2];
+            for insn in compiled.instructions.iter() {
+                *op_hist.entry(super::bytecode::insn_opcode_name(insn)).or_insert(0) += c[2];
+            }
+            let scope = entry.cold.scope_hint.as_deref().unwrap_or("?");
+            eprintln!(
+                "[COMBPATH] #{rank} eidx={eidx} interp={} ts={} jit={} insns={} bail={} scope={}",
+                c[2], c[0], c[1], compiled.instructions.len(), bail, scope
+            );
+        }
+        let mut bh: Vec<_> = bail_hist.into_iter().collect();
+        bh.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        eprintln!("[COMBPATH] bail histogram (weighted by interp execs, top-40 set):");
+        for (op, n) in bh {
+            eprintln!("[COMBPATH]   {op}: {n}");
+        }
+        let mut oh: Vec<_> = op_hist.into_iter().collect();
+        oh.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let mut jh: Vec<_> = jit_bail_hist.into_iter().collect();
+        jh.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        eprintln!("[COMBPATH] JIT first-unsupported histogram (weighted, top-40 set):");
+        for (op, n) in jh {
+            eprintln!("[COMBPATH]   {op}: {n}");
+        }
+        eprintln!("[COMBPATH] opcode census over hot interp blocks (weighted):");
+        for (op, n) in oh.into_iter().take(25) {
+            eprintln!("[COMBPATH]   {op}: {n}");
+        }
+    }
+
     fn try_two_state(
         &mut self,
         eidx: usize,
@@ -16007,7 +16166,7 @@ impl Simulator {
                 &self.signal_real,
                 &self.array_first_id,
             );
-            if lowered.is_none() && std::env::var("XZ_TS_DBG").is_ok() {
+            if lowered.is_none() && std::env::var("XEZIM_TS_DBG").is_ok() {
                 let (bi, bop) = super::bytecode::ts_last_bail();
                 eprintln!("[TS-NO] bail at #{} opcode={}", bi, bop);
                 eprintln!(
@@ -17207,14 +17366,14 @@ impl Simulator {
             }
             if ok {
                 let cb = compiler.finish();
-                if let Ok(limit) = std::env::var("XZ_BC_DUMP") {
+                if let Ok(limit) = std::env::var("XEZIM_BC_DUMP") {
                     let limit: usize = limit.parse().unwrap_or(0);
                     if compiled.len() < limit {
                         eprintln!(
                             "[BC-DUMP] block#{} scope='{}' insns={:?}",
                             compiled.len(),
                             block.scope,
-                            if std::env::var_os("XZ_BC_DUMP_FULL").is_some() {
+                            if std::env::var_os("XEZIM_BC_DUMP_FULL").is_some() {
                                 cb.instructions
                                     .iter()
                                     .map(|i| format!("{:?}", i))
@@ -27924,6 +28083,7 @@ impl Simulator {
                 self.prof_par_ticks, self.prof_par_blocks
             );
         }
+        self.dump_comb_paths();
         eprintln!("[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
             self.prof_edge_detect as f64/1e6, self.prof_edge_exec as f64/1e6, self.prof_edges_fired,
             self.prof_insns_executed,
@@ -35553,7 +35713,7 @@ impl Simulator {
                     // because of exactly this. Accept the alias and always
                     // report the resolved configuration.
                     let w_env = std::env::var("XEZIM_EDGE_FIRE_WATCH")
-                        .or_else(|_| std::env::var("EDGE_FIRE_WATCH"));
+                        .or_else(|_| std::env::var("XEZIM_EDGE_FIRE_WATCH"));
                     if w_env.is_err() {
                         eprintln!(
                             "[EDGE-FIRE] trace active but XEZIM_EDGE_FIRE_WATCH is not set — \
@@ -38179,6 +38339,9 @@ impl Simulator {
                         // `continue` — the worklist propagation after this
                         // match must still see the stores' dirtied signals.
                         if self.try_two_state(eidx, compiled) {
+                            if self.trace_comb_paths {
+                                self.note_comb_path(eidx, 0);
+                            }
                             n_dc += 1;
                         } else {
                         // Native path (cfg-gated: compiled out of the default
@@ -38199,6 +38362,9 @@ impl Simulator {
                                     0 => {
                                         self.comb_jit_strikes[eidx] = 0;
                                         ran_native = true;
+                                        if self.trace_comb_paths {
+                                            self.note_comb_path(eidx, 1);
+                                        }
                                         if self.profile_timing {
                                             self.prof_comb_jit[0] += 1;
                                         }
@@ -38224,6 +38390,9 @@ impl Simulator {
                         #[cfg(not(feature = "jit"))]
                         let ran_native = false;
                         if !ran_native {
+                            if self.trace_comb_paths {
+                                self.note_comb_path(eidx, 2);
+                            }
                             if self.vm_regs.len() < compiled.num_regs as usize {
                                 self.vm_regs
                                     .resize(compiled.num_regs as usize, Value::zero(1));
@@ -38271,11 +38440,66 @@ impl Simulator {
                         // block has no fallbacks, so none of the scope /
                         // timescale bookkeeping below applies to it).
                         if self.try_two_state(eidx, compiled) {
+                            if self.trace_comb_paths {
+                                self.note_comb_path(eidx, 0);
+                            }
                             n_ab += 1;
                             if self.proc_depth > 0 {
                                 self.note_comb_ran_in_process(eidx, &entries[eidx]);
                             }
                         } else {
+                        // Native path, mirroring the CompiledContAssign arm:
+                        // rc 0 = ran; 1 = bailed pre-side-effect (strike);
+                        // >=2 = disable. JIT'd blocks contain no fallback
+                        // insns, so none of the scope/hint bookkeeping on the
+                        // interpreter path below applies to them.
+                        // No `continue` on the native path — it would skip
+                        // the worklist propagation after this match (same
+                        // trap the CompiledContAssign arm documents); route
+                        // through a flag and fall through instead.
+                        #[cfg(feature = "jit")]
+                        let mut ran_native = false;
+                        #[cfg(feature = "jit")]
+                        {
+                            if let Some(Some(f)) = self.comb_jit_fns.get(eidx).copied() {
+                                let sp: *mut u8 = self as *mut Self as *mut u8;
+                                match unsafe { f(sp) } {
+                                    0 => {
+                                        self.comb_jit_strikes[eidx] = 0;
+                                        ran_native = true;
+                                        if self.trace_comb_paths {
+                                            self.note_comb_path(eidx, 1);
+                                        }
+                                        if self.profile_timing {
+                                            self.prof_comb_jit[0] += 1;
+                                        }
+                                    }
+                                    1 => {
+                                        if self.profile_timing {
+                                            self.prof_comb_jit[1] += 1;
+                                        }
+                                        const XZ_STRIKE_LIMIT: u8 = 8;
+                                        let st = &mut self.comb_jit_strikes[eidx];
+                                        *st = st.saturating_add(1);
+                                        if *st >= XZ_STRIKE_LIMIT {
+                                            self.comb_jit_fns[eidx] = None;
+                                        }
+                                    }
+                                    _ => self.comb_jit_fns[eidx] = None,
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "jit"))]
+                        let ran_native = false;
+                        if ran_native {
+                            n_ab += 1;
+                            if self.proc_depth > 0 {
+                                self.note_comb_ran_in_process(eidx, &entries[eidx]);
+                            }
+                        } else {
+                        if self.trace_comb_paths {
+                            self.note_comb_path(eidx, 2);
+                        }
                         // Bytecode path: BlockingAssign/NbaAssign insns mark
                         // dirty automatically; no pre/post value snapshot needed.
                         if self.vm_regs.len() < compiled.num_regs as usize {
@@ -38317,6 +38541,7 @@ impl Simulator {
                         n_ab += 1;
                         if self.proc_depth > 0 {
                             self.note_comb_ran_in_process(eidx, &entries[eidx]);
+                        }
                         }
                         }
                     }
@@ -49962,7 +50187,7 @@ impl Simulator {
                                 }
                                 found
                             };
-                            if std::env::var("XZ_EC_DBG").is_ok() && bname == "pool" {
+                            if std::env::var("XEZIM_EC_DBG").is_ok() && bname == "pool" {
                                 eprintln!("[ECDBG] bname={} recv={:?} aec={:?} vct={:?} member={:?} decl={:?} ctx={:?}",
                                     bname, recv_elem_cls,
                                     self.module.array_elem_class.get(&bname).cloned(),
@@ -50164,7 +50389,7 @@ impl Simulator {
                                         }),
                                     None => None,
                                 };
-                            if std::env::var("XZ_EC_DBG").is_ok() && bname == "pool" {
+                            if std::env::var("XEZIM_EC_DBG").is_ok() && bname == "pool" {
                                 eprintln!("[ECDBG] final elem_cls={:?}", elem_cls);
                             }
                             if let Some((cn, spec)) = elem_cls {
@@ -61699,6 +61924,16 @@ impl Simulator {
                 // `JitModule::is_supported` rejects `NbaAssignArrayRead`
                 // outright, so a block containing one never reaches codegen.
                 | Insn::NbaAssignArrayRead(id, ..) => Some(*id),
+                // Dense-array element access in the JIT computes the element
+                // id arithmetically; the first element's decl stands for all,
+                // so gating on it gates the whole span.
+                Insn::LoadArrayElem(_, arr, _)
+                | Insn::BlockingAssignArray(arr, ..) => match arr.as_ref() {
+                    super::bytecode::ArrayOperand::Dense { first_id, .. } => {
+                        Some(*first_id as u32)
+                    }
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(id) = sig_id {
@@ -61763,7 +61998,13 @@ impl Simulator {
             id,
             self.signal_widths[id],
         );
-        self.signal_table[id].to_u64().unwrap_or(0)
+        // Raw val plane, NOT `to_u64()`: to_u64 zeroes bits under X/Z, so a
+        // Z bit (val=1, xz=1) entered JIT registers canonicalized to X and
+        // came back out corrupted through plane-preserving insns (Concat,
+        // CaseEq, stores). Every 4-state op table computes known-1 as
+        // `v & ~x`, and truthiness consumers mask the same way, so the raw
+        // plane is the correct feed.
+        self.signal_table[id].raw_bits().0
     }
 
     /// JIT bridge: Path B X/Z pre-check. Returns true if ANY signal in
@@ -85710,7 +85951,7 @@ impl Simulator {
                     ) {
                         continue;
                     }
-                    if std::env::var("XZ_REF_DBG").is_ok() {
+                    if std::env::var("XEZIM_REF_DBG").is_ok() {
                         eprintln!("[REFDBG] task-ref formal={} dims={}", port.name.name, port.dimensions.len());
                     }
                     // §13.5.2: a ref formal with UNPACKED dimensions
@@ -95476,7 +95717,7 @@ impl Simulator {
                         // §6.18/§6.20.3: typedef'd / type-param-bound
                         // formal — dims live on the type (see the same
                         // resolution in exec_function_call).
-                        if std::env::var("XZ_BD_DBG").is_ok() {
+                        if std::env::var("XEZIM_BD_DBG").is_ok() {
                             if let crate::ast::types::DataType::TypeReference { name, .. } =
                                 &port.data_type
                             {
