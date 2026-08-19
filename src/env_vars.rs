@@ -88,6 +88,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_INST_PROF", "Elab: profile per-instance elaboration cost"),
     ("XEZIM_JIT", "JIT: enable native compilation of bytecode blocks (needs --features jit build)"),
     ("XEZIM_JIT_BACKEND", "JIT: select backend (cranelift)"),
+    ("XEZIM_JIT_BAIL_TRACE", "JIT: print pc+opcode when native codegen aborts a block mid-emit"),
     ("XEZIM_JIT_CLIF", "JIT: dump cranelift IR for compiled blocks"),
     ("XEZIM_JIT_DENY", "JIT: comma-separated opcode names to exclude from native compilation (bisection)"),
     ("XEZIM_JIT_DUMP_BLOCKS", "JIT: dump the insn stream of each compiled block"),

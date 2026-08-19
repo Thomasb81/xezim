@@ -33,6 +33,11 @@ fn run(src: &str, two_state: bool) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
     cmd.args(["--simulate", "-s", "tb_shape", path.to_str().unwrap(), "--no-cache"])
         .env("XEZIM_PROFILE_TIMING", "1");
+    // These tests assert island-engagement STATISTICS; an ambient
+    // XEZIM_JIT=1 would route the same blocks to the native backend
+    // (checksums stay right, the island counters read zero).
+    cmd.env_remove("XEZIM_JIT");
+    cmd.env_remove("XEZIM_AOT");
     if !two_state {
         cmd.env("XEZIM_TWO_STATE", "0");
     }
