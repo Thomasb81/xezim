@@ -616,7 +616,7 @@ fn reinstall_ooc_constraint_bodies(
             {
                 continue;
             }
-            if let Some(cd) = elab.classes.get_mut(class_name) {
+            if let Some(cd) = elab.classes.get_mut(class_name).map(std::sync::Arc::make_mut) {
                 if let Some(con) = cd.constraints.get_mut(constraint_name) {
                     con.items = items.clone();
                     con.has_body = true;
