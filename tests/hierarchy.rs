@@ -105,3 +105,7 @@ mod nested_modules_and_zpad;
 mod iface_port_params;
 #[path = "hierarchy/modport_shape_battery.rs"]
 mod modport_shape_battery;
+#[path = "hierarchy/nonansi_modport_port_decl.rs"]
+mod nonansi_modport_port_decl;
+#[path = "hierarchy/library_dir_on_demand.rs"]
+mod library_dir_on_demand;
