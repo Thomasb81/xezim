@@ -91,6 +91,17 @@ pub fn binop_const_fusions() -> [u64; BinOpConstKind::COUNT] {
 /// keeps the `Insn` enum — and the ~25 analysis sites that match on it — with
 /// a single new case to reason about instead of three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CmpKind {
+    Eq,
+    Neq,
+    CaseEq,
+    Lt,
+    Leq,
+    Gt,
+    Geq,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum BinOpConstKind {
     /// `dst = src + K` — same `Value` semantics as [`Insn::Add`].
@@ -240,6 +251,15 @@ pub enum Insn {
     /// Replaces an average of half the arms' CasezEq+branch pairs per
     /// execution with one table hop plus ~1-3 compares.
     CaseMaskJump(RegId, Box<CaseMaskJumpData>),
+    /// Fused compare + `BranchIfFalse`: branch to the target when the
+    /// comparison is NOT true (X/Z compares are not-true, exactly like the
+    /// unfused pair). `tmp` is the dead register the eliminated compare
+    /// wrote — kept so the two-state lowering and the native backends can
+    /// decompose to the already-validated unfused forms.
+    CmpBranch(CmpKind, RegId, RegId, RegId, u32), // (kind, l, r, tmp, target)
+    /// Fused `Move` + `Resize` (either order, dead intermediate):
+    /// `dst = resize(src, w)`.
+    MoveResize(RegId, RegId, u32), // (dst, src, width)
     /// `$sformatf` with a literal format string and supported specs,
     /// template-parsed at compile time and filled natively. Removes the
     /// whole-call AST fallback that made every tracer decode helper cost
@@ -547,6 +567,8 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",
+        Insn::CmpBranch(..) => "CmpBr",
+        Insn::MoveResize(..) => "MovRz",
         Insn::BranchIfSignalFalse(..) => "BrSig",
         Insn::BranchUnlessZero(..) => "BrNz",
         Insn::LoadSignalBit(..) => "LoadBit",
@@ -8124,6 +8146,7 @@ impl<'a> BytecodeCompiler<'a> {
         let num_regs = (self.next_reg as usize).min(u16::MAX as usize + 1);
         Self::elide_redundant_resizes(&mut self.insns, signal_widths, self.signal_real, num_regs);
         Self::fold_fill_const_resize(&mut self.insns);
+        Self::propagate_copies(&mut self.insns);
         // AFTER resize elision: an about-to-be-deleted `Resize` sitting between
         // the array read and the NBA would otherwise hide the triple. Still
         // before `compact_nops`, which removes the `Nop`s it leaves behind.
@@ -8133,6 +8156,7 @@ impl<'a> BytecodeCompiler<'a> {
         // pattern is disjoint from `fuse_array_read_nba`'s, so the order
         // between the two does not matter.
         Self::fuse_binop_const(&mut self.insns);
+        Self::fuse_cmp_branch_move_resize(&mut self.insns);
         Self::compact_nops(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
@@ -8177,6 +8201,8 @@ impl<'a> BytecodeCompiler<'a> {
     /// is still consumed later, so every variant must be enumerated.
     fn insn_reads_reg(insn: &Insn, r: RegId) -> bool {
         match insn {
+            Insn::CmpBranch(_, l, rr, _, _) => *l == r || *rr == r,
+            Insn::MoveResize(_, s, _) => *s == r,
             Insn::CaseLut(_, src, _) => *src == r,
             Insn::CaseJump(src, _) => *src == r,
             Insn::CaseMaskJump(src, _) => *src == r,
@@ -8307,6 +8333,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::BranchIfFalse(_, t)
                 | Insn::BranchUnlessZero(_, t)
                 | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::CmpBranch(_, _, _, _, t)
                 | Insn::Jump(t)
                     if (*t as usize) < is_target.len() => {
                         is_target[*t as usize] = true;
@@ -8529,6 +8556,160 @@ impl<'a> BytecodeCompiler<'a> {
     /// Fill constants otherwise keep whole blocks off every fast path (the
     /// two-state lowering and both native backends reject them), and the
     /// ibex ALU/controller blocks all start with exactly this pair.
+    /// True when any branch in the block targets an earlier pc. Forward-only
+    /// blocks (the common case/if lowering) permit LINEAR liveness reasoning:
+    /// a register unread after position i is dead there. With a backward
+    /// branch, re-entry can reach earlier reads, so callers must fall back to
+    /// whole-block read checks.
+    fn has_backward_branch(insns: &[Insn]) -> bool {
+        insns.iter().enumerate().any(|(i, insn)| match insn {
+            Insn::BranchIfFalse(_, t)
+            | Insn::BranchUnlessZero(_, t)
+            | Insn::BranchIfSignalFalse(_, t, _)
+            | Insn::CmpBranch(_, _, _, _, t)
+            | Insn::Jump(t) => (*t as usize) <= i,
+            Insn::CaseJump(_, cj) => cj
+                .table
+                .iter()
+                .chain(std::iter::once(&cj.default))
+                .any(|&t| (t as usize) <= i),
+            Insn::CaseMaskJump(_, mj) => mj
+                .table
+                .iter()
+                .chain(std::iter::once(&mj.xz_path))
+                .any(|&t| (t as usize) <= i),
+            _ => false,
+        })
+    }
+
+    /// Producer -> `Move` copy propagation: when a pure register-producing
+    /// insn is immediately followed by `Move(d, a)` of its destination and
+    /// `a` is never read again, retarget the producer to write `d` directly
+    /// and drop the Move. `LoadConst -> Move` alone was 4.9% of all executed
+    /// insns on the ibex CoreMark census.
+    fn propagate_copies(insns: &mut [Insn]) {
+        if insns.len() < 2 {
+            return;
+        }
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::CaseJump(_, cj) => {
+                    for &t in cj.table.iter().chain(std::iter::once(&cj.default)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::CaseMaskJump(_, mj) => {
+                    for &t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::CmpBranch(_, _, _, _, t)
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() =>
+                {
+                    is_target[*t as usize] = true;
+                }
+                _ => {}
+            }
+        }
+        let fwd_only = !Self::has_backward_branch(insns);
+        // The producer's destination register, for the pure single-dest
+        // shapes this pass retargets. Anything with side effects, in-place
+        // semantics (`Resize`, `SetSigned`, ...) or multiple outputs is not
+        // listed and never rewritten.
+        fn producer_dest(insn: &mut Insn) -> Option<&mut u16> {
+            match insn {
+                Insn::LoadConst(d, _)
+                | Insn::LoadSignal(d, _)
+                | Insn::LoadSignalSigned(d, _)
+                | Insn::LoadSignalBit(d, _, _)
+                | Insn::LoadSignalRange(d, _, _, _)
+                | Insn::LoadArrayElem(d, _, _)
+                | Insn::Add(d, _, _)
+                | Insn::Sub(d, _, _)
+                | Insn::Mul(d, _, _)
+                | Insn::BitAnd(d, _, _)
+                | Insn::BitOr(d, _, _)
+                | Insn::BitXor(d, _, _)
+                | Insn::BitXnor(d, _, _)
+                | Insn::BitNot(d, _)
+                | Insn::Negate(d, _)
+                | Insn::LogAnd(d, _, _)
+                | Insn::LogOr(d, _, _)
+                | Insn::LogNot(d, _)
+                | Insn::Eq(d, _, _)
+                | Insn::Neq(d, _, _)
+                | Insn::CaseEq(d, _, _)
+                | Insn::CasezEq(d, _, _)
+                | Insn::CasexEq(d, _, _)
+                | Insn::Lt(d, _, _)
+                | Insn::Leq(d, _, _)
+                | Insn::Gt(d, _, _)
+                | Insn::Geq(d, _, _)
+                | Insn::Shl(d, _, _)
+                | Insn::Shr(d, _, _)
+                | Insn::AShr(d, _, _)
+                | Insn::ReduceAnd(d, _)
+                | Insn::ReduceOr(d, _)
+                | Insn::ReduceXor(d, _)
+                | Insn::Select(d, _, _, _)
+                | Insn::Concat(d, _)
+                | Insn::Replicate(d, _, _)
+                | Insn::BinOpConst(d, _, _, _)
+                | Insn::BitSelect(d, _, _)
+                | Insn::BitSelectConst(d, _, _)
+                | Insn::RangeSelect(d, _, _, _)
+                | Insn::RangeSelectConst(d, _, _, _)
+                | Insn::CaseLut(d, _, _) => Some(d),
+                _ => None,
+            }
+        }
+        for i in 0..insns.len() - 1 {
+            let Insn::Move(md, ms) = insns[i + 1] else {
+                continue;
+            };
+            if is_target[i + 1] || md == ms {
+                continue;
+            }
+            // The Move must be `ms`'s ONLY reader anywhere in the block —
+            // not just after it: a backward branch can re-enter code before
+            // the producer, so a linear "dead after" scan is not a liveness
+            // proof. The producer must also not read `md` (its dest write
+            // would clobber an operand) nor its own dest `ms` (an in-place
+            // accumulate shape would change meaning once retargeted).
+            if Self::insn_reads_reg(&insns[i], md) || Self::insn_reads_reg(&insns[i], ms) {
+                continue;
+            }
+            let dead = if fwd_only {
+                insns[i + 2..].iter().all(|x| !Self::insn_reads_reg(x, ms))
+            } else {
+                insns
+                    .iter()
+                    .enumerate()
+                    .all(|(k, x)| k == i + 1 || !Self::insn_reads_reg(x, ms))
+            };
+            if !dead {
+                continue;
+            }
+            let Some(dref) = producer_dest(&mut insns[i]) else {
+                continue;
+            };
+            if *dref != ms {
+                continue;
+            }
+            *dref = md;
+            insns[i + 1] = Insn::Nop;
+        }
+    }
+
     fn fold_fill_const_resize(insns: &mut [Insn]) {
         if insns.len() < 2 {
             return;
@@ -8553,6 +8734,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::BranchIfFalse(_, t)
                 | Insn::BranchUnlessZero(_, t)
                 | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::CmpBranch(_, _, _, _, t)
                 | Insn::Jump(t)
                     if (*t as usize) < is_target.len() =>
                 {
@@ -8606,6 +8788,127 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Late pair fusions (census-driven; run last, after every fact-based
+    /// pass, so no other pass has to understand the fused forms):
+    ///   cmp(d,l,r) ; BranchIfFalse(d,T)   -> CmpBranch(kind,l,r,d,T)
+    ///   Move(d,s)  ; Resize(d,w)          -> MoveResize(d,s,w)
+    ///   Resize(a,w); Move(d,a) [a dead]   -> MoveResize(d,a,w)
+    /// `Lt -> BranchIfFalse` alone was 2.7% and `Resize -> Move` 3.1% of all
+    /// executed insns on the ibex CoreMark census.
+    fn fuse_cmp_branch_move_resize(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_FUSE").as_deref(), Ok("0"))
+        }) || insns.len() < 2
+        {
+            return;
+        }
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::CaseJump(_, cj) => {
+                    for &t in cj.table.iter().chain(std::iter::once(&cj.default)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::CaseMaskJump(_, mj) => {
+                    for &t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::CmpBranch(_, _, _, _, t)
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() =>
+                {
+                    is_target[*t as usize] = true;
+                }
+                _ => {}
+            }
+        }
+        let fwd_only = !Self::has_backward_branch(insns);
+        for i in 0..insns.len() - 1 {
+            if is_target[i + 1] {
+                continue;
+            }
+            // cmp ; BranchIfFalse — the compare's dest must have no reader
+            // other than the branch (backward jumps make a linear liveness
+            // scan unsound, so the whole block is checked).
+            if let Insn::BranchIfFalse(c, t) = insns[i + 1] {
+                let kind = match &insns[i] {
+                    Insn::Eq(d, ..) if *d == c => Some(CmpKind::Eq),
+                    Insn::Neq(d, ..) if *d == c => Some(CmpKind::Neq),
+                    Insn::CaseEq(d, ..) if *d == c => Some(CmpKind::CaseEq),
+                    Insn::Lt(d, ..) if *d == c => Some(CmpKind::Lt),
+                    Insn::Leq(d, ..) if *d == c => Some(CmpKind::Leq),
+                    Insn::Gt(d, ..) if *d == c => Some(CmpKind::Gt),
+                    Insn::Geq(d, ..) if *d == c => Some(CmpKind::Geq),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    let only_reader = if fwd_only {
+                        insns[i + 2..].iter().all(|x| !Self::insn_reads_reg(x, c))
+                    } else {
+                        insns
+                            .iter()
+                            .enumerate()
+                            .all(|(j, x)| j == i || j == i + 1 || !Self::insn_reads_reg(x, c))
+                    };
+                    if only_reader {
+                        let (l, r) = match &insns[i] {
+                            Insn::Eq(_, l, r)
+                            | Insn::Neq(_, l, r)
+                            | Insn::CaseEq(_, l, r)
+                            | Insn::Lt(_, l, r)
+                            | Insn::Leq(_, l, r)
+                            | Insn::Gt(_, l, r)
+                            | Insn::Geq(_, l, r) => (*l, *r),
+                            _ => unreachable!(),
+                        };
+                        insns[i] = Insn::CmpBranch(kind, l, r, c, t);
+                        insns[i + 1] = Insn::Nop;
+                        continue;
+                    }
+                }
+            }
+            // Move ; Resize of the same dest.
+            if let (&Insn::Move(d, sr), &Insn::Resize(rd, w)) = (&insns[i], &insns[i + 1]) {
+                if rd == d && d != sr {
+                    insns[i] = Insn::MoveResize(d, sr, w);
+                    insns[i + 1] = Insn::Nop;
+                    continue;
+                }
+            }
+            // Resize ; Move where the resized register dies at the Move:
+            // the fused form reads the PRE-resize value and resizes it into
+            // the Move's dest — identical result, and `a` stays stale-but-dead.
+            if let (&Insn::Resize(a, w), &Insn::Move(d, ms)) = (&insns[i], &insns[i + 1]) {
+                if ms == a && d != a {
+                    let only_reader = if fwd_only {
+                        insns[i + 2..].iter().all(|x| !Self::insn_reads_reg(x, a))
+                    } else {
+                        insns
+                            .iter()
+                            .enumerate()
+                            .all(|(j, x)| j == i + 1 || !Self::insn_reads_reg(x, a))
+                    };
+                    if only_reader {
+                        insns[i] = Insn::MoveResize(d, a, w);
+                        insns[i + 1] = Insn::Nop;
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
     fn fuse_array_read_nba(insns: &mut [Insn]) {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
@@ -8636,6 +8939,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::BranchIfFalse(_, t)
                 | Insn::BranchUnlessZero(_, t)
                 | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::CmpBranch(_, _, _, _, t)
                 | Insn::Jump(t)
                     if (*t as usize) < is_target.len() => {
                         is_target[*t as usize] = true;
@@ -8768,6 +9072,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::BranchIfFalse(_, t)
                 | Insn::BranchUnlessZero(_, t)
                 | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::CmpBranch(_, _, _, _, t)
                 | Insn::Jump(t)
                     if (*t as usize) < is_target.len() =>
                 {
@@ -8932,6 +9237,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::BranchIfFalse(_, t)
                 | Insn::BranchUnlessZero(_, t)
                 | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::CmpBranch(_, _, _, _, t)
                 | Insn::Jump(t)
                     if (*t as usize) < is_target.len() =>
                 {
@@ -8974,6 +9280,17 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::CaseLut(d, ..) => store(&mut rw, *d, None),
                 // Control only; defines nothing.
                 Insn::CaseJump(..) | Insn::CaseMaskJump(..) => {}
+                // Fused compare+branch: the embedded scratch gets the 1-bit
+                // compare result; the branch defines nothing else. (This
+                // pass runs BEFORE the late fusion pass, so these arms only
+                // matter for re-runs over already-fused streams.)
+                Insn::CmpBranch(_, _, _, tmp, _) => store(&mut rw, *tmp, Some((1, true))),
+                // `dst = resize(src, w)`: width is known, but a same-width
+                // source passes through `clone()` (fill/real preserved), so
+                // never claim plain-ness — conservative fact, no bad elision.
+                Insn::MoveResize(d, _, w) => {
+                    store(&mut rw, *d, ok(*w).map(|t| (t, false)));
+                }
                 // String result: width is the text length, not static.
                 Insn::Format(d, ..) => store(&mut rw, *d, None),
                 Insn::StrOp(d, ..) => store(&mut rw, *d, None),
@@ -9269,6 +9586,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::BranchIfFalse(_, t)
                 | Insn::BranchUnlessZero(_, t)
                 | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::CmpBranch(_, _, _, _, t)
                 | Insn::Jump(t) => {
                     if let Some(&m) = map.get(*t as usize) {
                         *t = m;
@@ -10222,6 +10540,23 @@ pub fn lower_two_state(
             Insn::BranchIfFalse(c, t) => {
                 rw[*c as usize]?;
                 out.push(TsInsn::BrFalse { s: *c as u16, t: *t });
+            }
+            // Fused compare+branch: decompose to the exact unfused lowering,
+            // reusing the embedded dead register as the compare scratch.
+            Insn::CmpBranch(kind, a, b, tmp, t) => {
+                rw[*a as usize]?;
+                rw[*b as usize]?;
+                def!(rw, *tmp, 1);
+                let (d, a, b) = (*tmp as u16, *a as u16, *b as u16);
+                out.push(match kind {
+                    CmpKind::Eq | CmpKind::CaseEq => TsInsn::Eq { d, a, b },
+                    CmpKind::Neq => TsInsn::Neq { d, a, b },
+                    CmpKind::Lt => TsInsn::Lt { d, a, b },
+                    CmpKind::Leq => TsInsn::Leq { d, a, b },
+                    CmpKind::Gt => TsInsn::Gt { d, a, b },
+                    CmpKind::Geq => TsInsn::Geq { d, a, b },
+                });
+                out.push(TsInsn::BrFalse { s: d, t: *t });
             }
             Insn::BranchUnlessZero(s, t) => {
                 rw[*s as usize]?;

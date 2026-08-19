@@ -81,6 +81,8 @@ pub enum Opcode {
     BinOpConstEq,
     BinOpConstCaseEq,
     BinOpConstXor,
+    CmpBranch,
+    MoveResize,
 }
 
 impl Opcode {
@@ -172,6 +174,8 @@ impl Opcode {
                 BinOpConstKind::CaseEq => Self::BinOpConstCaseEq,
                 BinOpConstKind::Xor => Self::BinOpConstXor,
             },
+            Insn::CmpBranch(..) => Self::CmpBranch,
+            Insn::MoveResize(..) => Self::MoveResize,
         }
     }
 
@@ -181,12 +185,12 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 72;
+pub const NUM_OPCODES: usize = 74;
 
 /// Sizes the opcode-census arrays, which are indexed by `Opcode as usize`. A
 /// stale value panics at run time under `XEZIM_OPCODE_CENSUS=1`, so pin it to
 /// the last discriminant at compile time instead.
-const _: () = assert!(NUM_OPCODES == Opcode::BinOpConstXor as usize + 1);
+const _: () = assert!(NUM_OPCODES == Opcode::MoveResize as usize + 1);
 
 /// Dispatch table - proof of concept.
 #[derive(Debug, Clone)]

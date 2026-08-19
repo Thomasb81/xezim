@@ -2802,8 +2802,97 @@ impl VcdVarKind {
     }
 }
 
+/// Name-keyed overflow signal store with a maintained ELEMENT INDEX:
+/// every key containing `[` is also recorded under its base name (the text
+/// before the first bracket), so collection machinery (queue/dynamic/assoc
+/// locals stored as `name[i]` entries) can enumerate a name's elements
+/// without scanning the whole map. The `starts_with` full-map scans in the
+/// queue-frame save/restore were 25%+ of a UVM AVIP run.
+///
+/// Reads go through `Deref<Target = HashMap<..>>`; every mutation that can
+/// add or drop a KEY must go through the inherent `insert`/`remove` below
+/// (inherent methods shadow the deref'd HashMap ones), keeping the index
+/// exact. `get_mut`-style value edits need no index work.
+pub struct SignalMap {
+    map: HashMap<String, Value>,
+    elems: HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl SignalMap {
+    fn base_of(k: &str) -> Option<&str> {
+        k.find('[').map(|i| &k[..i])
+    }
+
+    pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
+        if let Some(b) = Self::base_of(&k) {
+            if !self.map.contains_key(&k) {
+                self.elems
+                    .entry(b.to_string())
+                    .or_default()
+                    .insert(k.clone());
+            }
+        }
+        self.map.insert(k, v)
+    }
+
+    pub fn remove(&mut self, k: &str) -> Option<Value> {
+        let r = self.map.remove(k);
+        if r.is_some() {
+            if let Some(b) = Self::base_of(k) {
+                if let Some(set) = self.elems.get_mut(b) {
+                    set.remove(k);
+                    if set.is_empty() {
+                        self.elems.remove(b);
+                    }
+                }
+            }
+        }
+        r
+    }
+
+    /// All stored keys beginning with `prefix`, which must end with `[`.
+    /// Served from the element index: only the owning base name's keys are
+    /// touched, never the whole map. Handles nested-bracket prefixes
+    /// (`q[0].f[`) by indexing on the OUTERMOST base and filtering.
+    pub fn keys_with_elem_prefix(&self, prefix: &str) -> Vec<String> {
+        debug_assert!(prefix.ends_with('['));
+        let base = &prefix[..prefix.len() - 1];
+        let outer = Self::base_of(base).unwrap_or(base);
+        self.elems
+            .get(outer)
+            .map(|set| {
+                set.iter()
+                    .filter(|k| k.starts_with(prefix))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Keys of every `base[...]` element currently stored, unordered.
+    pub fn elem_keys(&self, base: &str) -> Vec<String> {
+        self.elems
+            .get(base)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+impl std::ops::Deref for SignalMap {
+    type Target = HashMap<String, Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for SignalMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
 pub struct Simulator {
-    pub signals: HashMap<String, Value>,
+    pub signals: SignalMap,
     /// Signals currently under force/release control (LRM §9.3.1).
     forced_signals: HashMap<usize, Value>,
     /// Flattened names currently under an active `force` (§10.6) or
@@ -5557,7 +5646,10 @@ impl Simulator {
         // targets). Eliminating the bulk-populate saves ~150–250 MB on
         // c910-scale designs (585K signals × 2 stores × name + Value
         // duplication).
-        let signals: HashMap<String, Value> = HashMap::default();
+        let signals = SignalMap {
+            map: HashMap::default(),
+            elems: HashMap::default(),
+        };
         let widths: HashMap<String, u32> = HashMap::default();
         let signed_signals: HashSet<String> = HashSet::default();
         let real_signals: HashSet<String> = HashSet::default();
@@ -17601,6 +17693,20 @@ impl Simulator {
         } else {
             Vec::new()
         };
+        if enable_jit && std::env::var("XEZIM_JIT_BAIL_TRACE").is_ok() {
+            for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
+                if let Some(cb) = cb_opt {
+                    if !block_jit_safe[idx] {
+                        eprintln!(
+                            "[EDGEGATE] idx={} insns={} reason={:?}",
+                            idx,
+                            cb.instructions.len(),
+                            self.block_fit_u64_reason(cb)
+                        );
+                    }
+                }
+            }
+        }
         if enable_jit {
             // Single backend: cranelift. (An LLVM backend once existed
             // behind XEZIM_JIT_BACKEND=llvm; it was removed — warn if
@@ -17662,6 +17768,7 @@ impl Simulator {
                             .ok()
                             .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
                             .unwrap_or_default();
+                        let trace_bails = std::env::var("XEZIM_JIT_BAIL_TRACE").is_ok();
                         for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
                             if let Some(cb) = cb_opt {
                                 if !block_jit_safe[idx] {
@@ -17681,12 +17788,21 @@ impl Simulator {
                                         eprintln!("[JITBLK]   {:?}", i);
                                     }
                                 }
-                                if let Some(f) = jm.try_compile_with_xz(
+                                let compiled_fn = jm.try_compile_with_xz(
                                     &cb.instructions,
                                     cb.num_regs,
                                     xz_ptr,
                                     xz_len,
-                                ) {
+                                );
+                                if compiled_fn.is_none() && trace_bails {
+                                    eprintln!(
+                                        "[EDGESKIP] idx={} insns={} first_unsupported={:?}",
+                                        idx,
+                                        cb.instructions.len(),
+                                        super::jit::first_unsupported(&cb.instructions)
+                                    );
+                                }
+                                if let Some(f) = compiled_fn {
                                     self.jit_fns[idx] = Some(f);
                                     jit_count += 1;
                                 }
@@ -18536,6 +18652,35 @@ impl Simulator {
                 Insn::Move(d, s) => {
                     vm_regs[*d as usize] = vm_regs[*s as usize].clone();
                 }
+                Insn::MoveResize(d, s, w) => {
+                    // Exact composition of Move+Resize, including the Resize
+                    // arm's runtime same-width skip (which preserves a fill
+                    // value's `is_fill` verbatim).
+                    let sv = &vm_regs[*s as usize];
+                    vm_regs[*d as usize] = if sv.width != *w {
+                        sv.resize(*w)
+                    } else {
+                        sv.clone()
+                    };
+                }
+                Insn::CmpBranch(kind, l, r, _tmp, target) => {
+                    use super::bytecode::CmpKind as CK;
+                    let a = &vm_regs[*l as usize];
+                    let b = &vm_regs[*r as usize];
+                    let res = match kind {
+                        CK::Eq => a.is_equal(b),
+                        CK::Neq => a.is_not_equal(b),
+                        CK::CaseEq => a.case_eq(b),
+                        CK::Lt => a.less_than(b),
+                        CK::Leq => a.less_equal(b),
+                        CK::Gt => a.greater_than(b),
+                        CK::Geq => a.greater_equal(b),
+                    };
+                    if !res.is_true() {
+                        pc = *target as usize;
+                        continue;
+                    }
+                }
                 Insn::SetSigned(reg) => {
                     vm_regs[*reg as usize].is_signed = true;
                 }
@@ -18938,6 +19083,35 @@ impl Simulator {
                 }
                 Insn::Move(d, s) => {
                     vm_regs[*d as usize] = vm_regs[*s as usize].clone();
+                }
+                Insn::MoveResize(d, s, w) => {
+                    // Exact composition of Move+Resize, including the Resize
+                    // arm's runtime same-width skip (which preserves a fill
+                    // value's `is_fill` verbatim).
+                    let sv = &vm_regs[*s as usize];
+                    vm_regs[*d as usize] = if sv.width != *w {
+                        sv.resize(*w)
+                    } else {
+                        sv.clone()
+                    };
+                }
+                Insn::CmpBranch(kind, l, r, _tmp, target) => {
+                    use super::bytecode::CmpKind as CK;
+                    let a = &vm_regs[*l as usize];
+                    let b = &vm_regs[*r as usize];
+                    let res = match kind {
+                        CK::Eq => a.is_equal(b),
+                        CK::Neq => a.is_not_equal(b),
+                        CK::CaseEq => a.case_eq(b),
+                        CK::Lt => a.less_than(b),
+                        CK::Leq => a.less_equal(b),
+                        CK::Gt => a.greater_than(b),
+                        CK::Geq => a.greater_equal(b),
+                    };
+                    if !res.is_true() {
+                        pc = *target as usize;
+                        continue;
+                    }
                 }
                 Insn::SetSigned(reg) => {
                     vm_regs[*reg as usize].is_signed = true;
@@ -19953,6 +20127,31 @@ impl Simulator {
                 }
                 Insn::BranchIfFalse(reg, target) => {
                     if !self.vm_regs[*reg as usize].is_true() {
+                        pc = *target as usize;
+                        continue;
+                    }
+                }
+                Insn::MoveResize(d, s, w) => {
+                    // Exact composition of Move+Resize (same-width runtime
+                    // skip preserves `is_fill` verbatim).
+                    let sv = &self.vm_regs[*s as usize];
+                    let nv = if sv.width != *w { sv.resize(*w) } else { sv.clone() };
+                    self.vm_regs[*d as usize] = nv;
+                }
+                Insn::CmpBranch(kind, l, r, _tmp, target) => {
+                    use super::bytecode::CmpKind as CK;
+                    let a = &self.vm_regs[*l as usize];
+                    let b = &self.vm_regs[*r as usize];
+                    let res = match kind {
+                        CK::Eq => a.is_equal(b),
+                        CK::Neq => a.is_not_equal(b),
+                        CK::CaseEq => a.case_eq(b),
+                        CK::Lt => a.less_than(b),
+                        CK::Leq => a.less_equal(b),
+                        CK::Gt => a.greater_than(b),
+                        CK::Geq => a.greater_equal(b),
+                    };
+                    if !res.is_true() {
                         pc = *target as usize;
                         continue;
                     }
@@ -28816,6 +29015,8 @@ impl Simulator {
             Insn::CaseLut(..) => "CaseLut",
             Insn::CaseJump(..) => "CaseJump",
             Insn::CaseMaskJump(..) => "CaseMaskJump",
+            Insn::CmpBranch(..) => "CmpBranch",
+            Insn::MoveResize(..) => "MoveResize",
             Insn::Format(..) => "Format",
             Insn::StrOp(..) => "StrOp",
             Insn::BlockingAssignString(..) => "BlockingAssignString",
@@ -43920,12 +44121,7 @@ impl Simulator {
                             }
                             if mname == "delete" {
                                 let prefix = format!("{}[", obj_name);
-                                let keys: Vec<String> = self
-                                    .signals
-                                    .keys()
-                                    .filter(|k| k.starts_with(&prefix))
-                                    .cloned()
-                                    .collect();
+                                let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
                                 for k in keys {
                                     self.signals.remove(&k);
                                 }
@@ -48690,12 +48886,7 @@ impl Simulator {
                         }
                         if mname == "delete" {
                             let prefix = format!("{}[", name);
-                            let keys: Vec<String> = self
-                                .signals
-                                .keys()
-                                .filter(|k| k.starts_with(&prefix))
-                                .cloned()
-                                .collect();
+                            let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
                             for k in keys {
                                 self.signals.remove(&k);
                             }
@@ -50566,12 +50757,7 @@ impl Simulator {
                             let w = self.module.arrays.get(&lname).map(|t| t.2).unwrap_or(32);
                             // Drop any stale elements, then size + zero-fill.
                             let prefix = format!("{}[", lname);
-                            let stale: Vec<String> = self
-                                .signals
-                                .keys()
-                                .filter(|k| k.starts_with(&prefix))
-                                .cloned()
-                                .collect();
+                            let stale: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
                             for k in stale {
                                 self.signals.remove(&k);
                             }
@@ -50756,12 +50942,7 @@ impl Simulator {
                         return;
                     }
                     let dst_prefix = format!("{}[", dst);
-                    let dst_keys: Vec<String> = self
-                        .signals
-                        .keys()
-                        .filter(|k| k.starts_with(&dst_prefix))
-                        .cloned()
-                        .collect();
+                    let dst_keys: Vec<String> = self.signals.keys_with_elem_prefix(&dst_prefix);
                     for k in dst_keys {
                         self.signals.remove(&k);
                     }
@@ -50770,9 +50951,12 @@ impl Simulator {
                     let src_prefix = format!("{}[", src);
                     let entries: Vec<(String, Value)> = self
                         .signals
-                        .iter()
-                        .filter(|(k, _)| k.starts_with(&src_prefix))
-                        .map(|(k, v)| (format!("{}{}", dst, &k[src.len()..]), v.clone()))
+                        .keys_with_elem_prefix(&src_prefix)
+                        .into_iter()
+                        .filter_map(|k| {
+                            let v = self.signals.get(&k)?.clone();
+                            Some((format!("{}{}", dst, &k[src.len()..]), v))
+                        })
                         .collect();
                     for (k, v) in entries {
                         self.signals.insert(k, v);
@@ -51846,11 +52030,13 @@ impl Simulator {
                         let prefix = format!("{}[", rname);
                         let entries: Vec<(String, Value)> = self
                             .signals
-                            .iter()
-                            .filter(|(k, _)| k.starts_with(&prefix) && k.ends_with(']'))
-                            .map(|(k, v)| {
+                            .keys_with_elem_prefix(&prefix)
+                            .into_iter()
+                            .filter(|k| k.ends_with(']'))
+                            .filter_map(|k| {
+                                let v = self.signals.get(&k)?.clone();
                                 let key = &k[prefix.len()..k.len() - 1];
-                                (format!("{}[{}]", lname, key), v.clone())
+                                Some((format!("{}[{}]", lname, key), v))
                             })
                             .collect();
                         for (k, v) in entries {
@@ -55133,9 +55319,9 @@ impl Simulator {
                                 let pre = format!("{}[", name);
                                 let stale: Vec<String> = self
                                     .signals
-                                    .keys()
-                                    .filter(|k| k.starts_with(&pre) && k.ends_with(']'))
-                                    .cloned()
+                                    .keys_with_elem_prefix(&pre)
+                                    .into_iter()
+                                    .filter(|k| k.ends_with(']'))
                                     .collect();
                                 for k in stale {
                                     self.signals.remove(&k);
@@ -62050,7 +62236,8 @@ impl Simulator {
                 // id arithmetically; the first element's decl stands for all,
                 // so gating on it gates the whole span.
                 Insn::LoadArrayElem(_, arr, _)
-                | Insn::BlockingAssignArray(arr, ..) => match arr.as_ref() {
+                | Insn::BlockingAssignArray(arr, ..)
+                | Insn::NbaAssignArray(arr, ..) => match arr.as_ref() {
                     super::bytecode::ArrayOperand::Dense { first_id, .. } => {
                         Some(*first_id as u32)
                     }
@@ -62110,6 +62297,32 @@ impl Simulator {
             if let Insn::LoadConst(_, v) = insn {
                 if v.is_fill || v.is_real {
                     return false;
+                }
+            }
+            if let Insn::NbaAssignConst(_, k, _) = insn {
+                if k.is_fill || k.is_real || k.width > 64 {
+                    return false;
+                }
+            }
+            // The fused array-read's INDEX is a signal the bridges load as
+            // u64; its element span is gated via the Dense arm above, and
+            // the destination via the id arm.
+            if let Insn::NbaAssignArrayRead(_, arr, idx_sig, _) = insn {
+                let i = *idx_sig as usize;
+                if i < self.signal_widths.len() && self.signal_widths[i] > 64 {
+                    return false;
+                }
+                match arr.as_ref() {
+                    super::bytecode::ArrayOperand::Dense { first_id, .. } => {
+                        let f = *first_id;
+                        if f < self.signal_widths.len() && self.signal_widths[f] > 64 {
+                            return false;
+                        }
+                        if self.signal_table.get(f).map(|v| v.is_real).unwrap_or(false) {
+                            return false;
+                        }
+                    }
+                    _ => return false,
                 }
             }
             // Same constant, just folded into the ALU op that consumes it —
@@ -62306,6 +62519,20 @@ impl Simulator {
         let sig_w = self.signal_widths[id];
         let w = if width == 0 { sig_w } else { width };
         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        // Unchanged-elision, mirroring the interpreter's NbaAssign arm: a
+        // value already equal to the signal is not queued — UNLESS an entry
+        // for this id is already pending, where §10.4.2 last-write-wins
+        // requires superseding it.
+        if w == sig_w {
+            if let Some((ov, ox)) = self.signal_table[id].inline_planes() {
+                if ov == val_bits & mask
+                    && ox == xz_bits & mask
+                    && self.nba_fast_index.get(id).is_none()
+                {
+                    return;
+                }
+            }
+        }
         let mut val = Value::from_inline(val_bits & mask, xz_bits & mask, w);
         if w != sig_w {
             val = val.resize(sig_w);
@@ -66798,9 +67025,9 @@ impl Simulator {
         // `special-:{ chars{}[0123456789] _` are legal assoc string keys,
         // §7.11) — take up to the LAST `]` so such brackets are not mistaken
         // for an index end.
-        let mut keys: Vec<String> = self
-            .signals
-            .keys()
+        let idx_keys = self.signals.keys_with_elem_prefix(&prefix);
+        let mut keys: Vec<String> = idx_keys
+            .iter()
             .map(|k| k.as_str())
             .chain(self.signal_name_to_id.keys().map(|k| &**k))
             .filter(|k| k.starts_with(&prefix))
@@ -68043,12 +68270,10 @@ impl Simulator {
         }
         let size_key = format!("{}.size", key);
         let elem_prefix = format!("{}[", key);
-        let stale: Vec<String> = self
-            .signals
-            .keys()
-            .filter(|k| **k == size_key || k.starts_with(&elem_prefix))
-            .cloned()
-            .collect();
+        let mut stale: Vec<String> = self.signals.keys_with_elem_prefix(&elem_prefix);
+        if self.signals.contains_key(&size_key) {
+            stale.push(size_key.clone());
+        }
         for k in stale {
             self.signals.remove(&k);
             self.widths.remove(&k);
@@ -68094,13 +68319,16 @@ impl Simulator {
             return;
         }
         let size_key = format!("{}.size", name);
-        let elem_prefix = format!("{}[", name);
-        let signals: Vec<(String, Value)> = self
+        // Element keys come from the SignalMap index — no full-map scan.
+        let mut signals: Vec<(String, Value)> = self
             .signals
-            .iter()
-            .filter(|(k, _)| **k == size_key || k.starts_with(&elem_prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .elem_keys(name)
+            .into_iter()
+            .filter_map(|k| self.signals.get(&k).map(|v| (k.clone(), v.clone())))
             .collect();
+        if let Some(v) = self.signals.get(&size_key) {
+            signals.push((size_key.clone(), v.clone()));
+        }
         let save = QueueLocalSave {
             signals,
             arrays_entry: self.module.arrays.get(name).copied(),
@@ -68132,16 +68360,10 @@ impl Simulator {
         let entries: Vec<(String, QueueLocalSave)> = frame.into_iter().collect();
         for (name, save) in entries {
             let size_key = format!("{}.size", name);
-            let elem_prefix = format!("{}[", name);
-            let stale: Vec<String> = self
-                .signals
-                .keys()
-                .filter(|k| **k == size_key || k.starts_with(&elem_prefix))
-                .cloned()
-                .collect();
-            for k in stale {
+            for k in self.signals.elem_keys(&name) {
                 self.signals.remove(&k);
             }
+            self.signals.remove(&size_key);
             // Restore the caller's collection registration AND signals. A
             // nested method that declared a local of the same name (e.g. its
             // own `int p`) removed the caller's queue from `module.*`; without
@@ -76477,14 +76699,12 @@ impl Simulator {
         }
         if let Some(parts) = literal_elems {
             // Clear any stale storage/registration for this bare param name.
-            let stale: Vec<String> = self
-                .signals
-                .keys()
-                .filter(|k| {
-                    **k == format!("{}.size", pname) || k.starts_with(&format!("{}[", pname))
-                })
-                .cloned()
-                .collect();
+            let mut stale: Vec<String> =
+                self.signals.keys_with_elem_prefix(&format!("{}[", pname));
+            let pn_size = format!("{}.size", pname);
+            if self.signals.contains_key(&pn_size) {
+                stale.push(pn_size);
+            }
             for k in stale {
                 self.signals.remove(&k);
             }
@@ -76618,10 +76838,13 @@ impl Simulator {
         let tmp = format!("@wb#{}", id);
         let sz_key = format!("{}.size", param);
         let pre = format!("{}[", param);
-        let moved: Vec<(String, Value)> = self
-            .signals
+        let mut moved_keys: Vec<String> = self.signals.keys_with_elem_prefix(&pre);
+        if self.signals.contains_key(&sz_key) {
+            moved_keys.push(sz_key.clone());
+        }
+        let moved: Vec<(String, Value)> = moved_keys
             .iter()
-            .filter(|(k, _)| **k == sz_key || k.starts_with(&pre))
+            .filter_map(|k| self.signals.get(k).map(|v| (k, v)))
             .map(|(k, v)| {
                 let nk = if **k == sz_key {
                     format!("{}.size", tmp)
@@ -76662,12 +76885,10 @@ impl Simulator {
     fn drop_staged_queue(&mut self, tmp: &str) {
         let sz_key = format!("{}.size", tmp);
         let pre = format!("{}[", tmp);
-        let keys: Vec<String> = self
-            .signals
-            .keys()
-            .filter(|k| **k == sz_key || k.starts_with(&pre))
-            .cloned()
-            .collect();
+        let mut keys: Vec<String> = self.signals.keys_with_elem_prefix(&pre);
+        if self.signals.contains_key(&sz_key) {
+            keys.push(sz_key.clone());
+        }
         for k in keys {
             self.signals.remove(&k);
         }
@@ -76693,10 +76914,7 @@ impl Simulator {
             .collect();
         let stale: Vec<String> = self
             .signals
-            .keys()
-            .filter(|k| k.starts_with(&format!("{}[", caller)))
-            .cloned()
-            .collect();
+            .keys_with_elem_prefix(&format!("{}[", caller));
         for k in stale {
             self.signals.remove(&k);
         }
@@ -76990,11 +77208,7 @@ impl Simulator {
             // paths and reads 0 for a true assoc array — sv_22.)
             if self.is_associative_array(obj_name) {
                 let prefix = format!("{}[", obj_name);
-                let c1 = self
-                    .signals
-                    .keys()
-                    .filter(|k| k.starts_with(&prefix))
-                    .count();
+                let c1 = self.signals.keys_with_elem_prefix(&prefix).len();
                 let c2 = self
                     .signal_name_to_id
                     .keys()
@@ -77470,12 +77684,7 @@ impl Simulator {
                     self.signals.remove(&elem_name);
                 } else {
                     let prefix = format!("{}[", obj_name);
-                    let keys: Vec<String> = self
-                        .signals
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix))
-                        .cloned()
-                        .collect();
+                    let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
                     for k in keys {
                         self.signals.remove(&k);
                     }
@@ -84513,11 +84722,13 @@ impl Simulator {
         let prefix = format!("{}[", caller);
         let entries: Vec<(String, Value)> = self
             .signals
-            .iter()
-            .filter(|(k, _)| k.starts_with(&prefix) && k.ends_with(']'))
-            .map(|(k, v)| {
+            .keys_with_elem_prefix(&prefix)
+            .into_iter()
+            .filter(|k| k.ends_with(']'))
+            .filter_map(|k| {
+                let v = self.signals.get(&k)?.clone();
                 let key = &k[prefix.len()..k.len() - 1];
-                (format!("{}[{}]", param, key), v.clone())
+                Some((format!("{}[{}]", param, key), v))
             })
             .collect();
         for (k, v) in entries {
@@ -84538,12 +84749,7 @@ impl Simulator {
     /// Drop a formal associative array's entries and registration.
     fn purge_assoc_param(&mut self, param: &str) {
         let prefix = format!("{}[", param);
-        let keys: Vec<String> = self
-            .signals
-            .keys()
-            .filter(|k| k.starts_with(&prefix))
-            .cloned()
-            .collect();
+        let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
         for k in keys {
             self.signals.remove(&k);
         }
@@ -84561,23 +84767,20 @@ impl Simulator {
             return;
         }
         let cprefix = format!("{}[", caller);
-        let old: Vec<String> = self
-            .signals
-            .keys()
-            .filter(|k| k.starts_with(&cprefix))
-            .cloned()
-            .collect();
+        let old: Vec<String> = self.signals.keys_with_elem_prefix(&cprefix);
         for k in old {
             self.signals.remove(&k);
         }
         let pprefix = format!("{}[", param);
         let entries: Vec<(String, Value)> = self
             .signals
-            .iter()
-            .filter(|(k, _)| k.starts_with(&pprefix) && k.ends_with(']'))
-            .map(|(k, v)| {
+            .keys_with_elem_prefix(&pprefix)
+            .into_iter()
+            .filter(|k| k.ends_with(']'))
+            .filter_map(|k| {
+                let v = self.signals.get(&k)?.clone();
                 let key = &k[pprefix.len()..k.len() - 1];
-                (format!("{}[{}]", caller, key), v.clone())
+                Some((format!("{}[{}]", caller, key), v))
             })
             .collect();
         for (k, v) in entries {
@@ -85573,12 +85776,7 @@ impl Simulator {
                 continue;
             }
             let prefix = format!("{}[", param);
-            let keys: Vec<String> = self
-                .signals
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
+            let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
             for k in keys {
                 self.signals.remove(&k);
             }
@@ -85737,12 +85935,7 @@ impl Simulator {
                 continue; // identity binding — the keys ARE the caller's
             }
             let prefix = format!("{}[", param_name);
-            let keys: Vec<String> = self
-                .signals
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
+            let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
             for k in keys {
                 self.signals.remove(&k);
             }
@@ -85760,12 +85953,7 @@ impl Simulator {
                 continue;
             }
             let prefix = format!("{}[", param_name);
-            let keys: Vec<String> = self
-                .signals
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
+            let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
             for k in keys {
                 self.signals.remove(&k);
             }
@@ -86116,11 +86304,13 @@ impl Simulator {
                     let prefix = format!("{}[", caller_name);
                     let entries: Vec<(String, Value)> = self
                         .signals
-                        .iter()
-                        .filter(|(k, _)| k.starts_with(&prefix) && k.ends_with(']'))
-                        .map(|(k, v)| {
+                        .keys_with_elem_prefix(&prefix)
+                        .into_iter()
+                        .filter(|k| k.ends_with(']'))
+                        .filter_map(|k| {
+                            let v = self.signals.get(&k)?.clone();
                             let key = &k[prefix.len()..k.len() - 1];
-                            (format!("{}[{}]", param_name, key), v.clone())
+                            Some((format!("{}[{}]", param_name, key), v))
                         })
                         .collect();
                     for (k, v) in entries {
@@ -87082,9 +87272,13 @@ impl Simulator {
                     .insert(n_name.clone(), is_str);
                 let entries: Vec<(String, Value)> = self
                     .signals
-                    .iter()
-                    .filter(|(k, _)| k.starts_with(&s_pre) && k.ends_with(']'))
-                    .map(|(k, v)| (k[s_pre.len()..k.len() - 1].to_string(), v.clone()))
+                    .keys_with_elem_prefix(&s_pre)
+                    .into_iter()
+                    .filter(|k| k.ends_with(']'))
+                    .filter_map(|k| {
+                        let v = self.signals.get(&k)?.clone();
+                        Some((k[s_pre.len()..k.len() - 1].to_string(), v))
+                    })
                     .collect();
                 for (key, v) in entries {
                     self.signals.insert(format!("{}[{}]", n_name, key), v);
@@ -89502,8 +89696,9 @@ impl Simulator {
         let prefix = format!("{}[", scoped);
         let mut keys: Vec<String> = self
             .signals
-            .keys()
-            .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
+            .keys_with_elem_prefix(&prefix)
+            .into_iter()
+            .filter(|k| k.ends_with(']'))
             .map(|k| k[prefix.len()..k.len() - 1].to_string())
             // A nested inner element (`m[0][1]`) or row-size shadow is not a key.
             .filter(|k| !k.contains('[') && !k.contains(']'))
@@ -91663,8 +91858,9 @@ impl Simulator {
                         let prefix = format!("{}[", coll_name);
                         let keys: Vec<String> = self
                             .signals
-                            .keys()
-                            .filter(|k| k.starts_with(&prefix) && k.ends_with(']'))
+                            .keys_with_elem_prefix(&prefix)
+                            .into_iter()
+                            .filter(|k| k.ends_with(']'))
                             .map(|k| k[prefix.len()..k.len() - 1].to_string())
                             .collect();
                         for key in keys {
