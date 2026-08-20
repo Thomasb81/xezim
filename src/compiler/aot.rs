@@ -33,12 +33,27 @@ pub struct AotBridge {
     pub nba_range: unsafe extern "C" fn(*mut u8, u32, u64, u64, u64, u64),
     pub nba_bit: unsafe extern "C" fn(*mut u8, u32, u64, u64, u64),
     pub blk_range: unsafe extern "C" fn(*mut u8, u32, u64, u64, u64, u64),
+    /// Wide-signal (>64-bit) slice loads — the same bridges the cranelift
+    /// path uses. Step 8 coverage: without these every block touching a
+    /// wide select was rejected outright (4,238 blocks on a C906 build).
+    pub load_slice: unsafe extern "C" fn(*mut u8, u32, u32, u32) -> u64,
+    pub load_slice_xz: unsafe extern "C" fn(*mut u8, u32, u32, u32) -> u64,
+    /// Native-backend step 1 (NativeCtx): base address of the SoA
+    /// val/xz planes (`signal_inline_bits`, `[u64; 2]` per id, so an
+    /// id's planes live at `planes + id*16`) and the signal count they
+    /// cover. `planes_len == 0` disables the direct path (mirror opted
+    /// out) and every load takes the FFI bridge. The pointer is baked
+    /// for the process lifetime — same contract the cranelift JIT's
+    /// `raw_sig_loads` already relies on (the mirror vec is allocated
+    /// to its final size before any native code is compiled).
+    pub planes: u64,
+    pub planes_len: u32,
 }
 
 /// Prelude of the generated crate: bridge plumbing + the per-insn plane
 /// helpers (ports of the cranelift arms; §-references live on those arms).
 const PRELUDE: &str = r#"
-#![allow(unused_variables, unused_mut, unused_parens, dead_code)]
+#![allow(unused_variables, unused_mut, unused_parens, dead_code, unreachable_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AotBridge {
@@ -49,6 +64,10 @@ pub struct AotBridge {
     pub nba_range: unsafe extern "C" fn(*mut u8, u32, u64, u64, u64, u64),
     pub nba_bit: unsafe extern "C" fn(*mut u8, u32, u64, u64, u64),
     pub blk_range: unsafe extern "C" fn(*mut u8, u32, u64, u64, u64, u64),
+    pub load_slice: unsafe extern "C" fn(*mut u8, u32, u32, u32) -> u64,
+    pub load_slice_xz: unsafe extern "C" fn(*mut u8, u32, u32, u32) -> u64,
+    pub planes: u64,
+    pub planes_len: u32,
 }
 static mut BRIDGE: Option<AotBridge> = None;
 #[no_mangle]
@@ -61,7 +80,32 @@ unsafe fn br() -> &'static AotBridge {
     (&raw const BRIDGE).as_ref().unwrap_unchecked().as_ref().unwrap_unchecked()
 }
 #[inline(always)] unsafe fn ld(sim: *mut u8, id: u32) -> (u64, u64) {
-    ((br().load)(sim, id), (br().load_xz)(sim, id))
+    // NativeCtx direct load: the val/xz planes live at planes + id*16.
+    // Blocks compiled here only touch fit-u64 signals (the same gate the
+    // cranelift raw loads rely on); ids past the baked snapshot (created
+    // at runtime) and the planes-disabled case take the FFI bridge.
+    let b = br();
+    if id < b.planes_len {
+        let p = (b.planes as *const u64).add((id as usize) * 2);
+        (*p, *p.add(1))
+    } else {
+        ((b.load)(sim, id), (b.load_xz)(sim, id))
+    }
+}
+#[inline(always)] unsafe fn st4(sim: *mut u8, id: u32, v: u64, x: u64, w: u32, mask: u64) {
+    // NativeCtx step 3 (store side): no-change fast exit directly on the
+    // planes — the overwhelmingly common case in a settled design — before
+    // paying the FFI call. Mirrors the bridge's own precheck; the generator
+    // emits this form only when the store width equals the signal's declared
+    // width (the condition under which the plane compare is exact). A
+    // CHANGED value still commits through the bridge, which owns the Value
+    // write, dirty marking and after-write side effects.
+    let b = br();
+    if id < b.planes_len {
+        let p = (b.planes as *const u64).add((id as usize) * 2);
+        if *p == v & mask && *p.add(1) == x & mask { return; }
+    }
+    (b.store4s)(sim, id, v, x, w);
 }
 #[inline(always)] fn mask_w(w: u32) -> u64 { if w >= 64 { !0u64 } else { (1u64 << w) - 1 } }
 #[inline(always)] fn and4(av: u64, ax: u64, bv: u64, bx: u64) -> (u64, u64) {
@@ -339,6 +383,80 @@ fn emit_insn_rust(
         LoadSignal(d, sig) | LoadSignalSigned(d, sig) => {
             let _ = writeln!(w, "let t = ld(sim, {sig}); r{d}v = t.0; r{d}x = t.1;");
         }
+        // §11.4.12.1 replication: n copies, high copy first — unrolled
+        // shift/or, same gating as the cranelift arm (result must fit u64).
+        Replicate(d, sr, cnt) => {
+            let pw = rw(*sr);
+            if pw == 0 || (pw as u64) * (*cnt as u64) > 64 {
+                return None;
+            }
+            if *cnt == 0 {
+                let _ = writeln!(w, "r{d}v = 0; r{d}x = 0;");
+            } else {
+                let m = if pw >= 64 { u64::MAX } else { (1u64 << pw) - 1 };
+                let _ = writeln!(
+                    w,
+                    "let pv = r{sr}v & {m:#x}; let px = r{sr}x & {m:#x}; let mut av = pv; let mut ax = px;"
+                );
+                for _ in 1..*cnt {
+                    let _ = writeln!(w, "av = (av << {pw}) | pv; ax = (ax << {pw}) | px;");
+                }
+                let _ = writeln!(w, "r{d}v = av; r{d}x = ax;");
+            }
+        }
+        // Fused const-operand ALU ops — ports of the cranelift BinOpConst
+        // arms (Add/Xor/CaseEq direct; Eq through the prelude cmp4, which
+        // carries the known-bit-decided rule and signed extension).
+        BinOpConst(d, sr, k, kind) => {
+            use super::bytecode::BinOpConstKind as K;
+            let (kv, kx) = k.raw_bits();
+            match kind {
+                K::Add => {
+                    if kx != 0 {
+                        let _ = writeln!(w, "r{d}v = 0; r{d}x = !0u64;");
+                    } else {
+                        let _ = writeln!(
+                            w,
+                            "if r{sr}x != 0 {{ r{d}v = 0; r{d}x = !0u64; }} else {{ r{d}v = r{sr}v.wrapping_add({kv:#x}); r{d}x = 0; }}"
+                        );
+                    }
+                }
+                K::Xor => {
+                    let _ = writeln!(
+                        w,
+                        "let unk = r{sr}x | {kx:#x}; r{d}v = (r{sr}v ^ {kv:#x}) & !unk; r{d}x = unk;"
+                    );
+                }
+                K::CaseEq => {
+                    let _ = writeln!(
+                        w,
+                        "r{d}v = ((r{sr}v == {kv:#x}) && (r{sr}x == {kx:#x})) as u64; r{d}x = 0;"
+                    );
+                }
+                K::Eq => {
+                    let both = rs(*sr) && k.is_signed;
+                    let lw = rw(*sr);
+                    let kw = k.width;
+                    let _ = writeln!(
+                        w,
+                        "let t = cmp4(r{sr}v, r{sr}x, {kv:#x}, {kx:#x}, {both}, {lw}, {kw}, 0); r{d}v = t.0; r{d}x = t.1;"
+                    );
+                }
+            }
+        }
+        // §11.4.9 reduction AND — 1 iff every bit known-1, 0 if any known-0,
+        // else x (mirror of the cranelift arm).
+        ReduceAnd(d, sr) => {
+            let sw = rw(*sr);
+            if sw == 0 || sw > 64 {
+                return None;
+            }
+            let m = if sw >= 64 { u64::MAX } else { (1u64 << sw) - 1 };
+            let _ = writeln!(
+                w,
+                "let known1 = (r{sr}v & !r{sr}x) & {m:#x}; let known0 = (!r{sr}v & !r{sr}x) & {m:#x}; if known0 != 0 {{ r{d}v = 0; r{d}x = 0; }} else if known1 == {m:#x} {{ r{d}v = 1; r{d}x = 0; }} else {{ r{d}v = 0; r{d}x = 1; }}"
+            );
+        }
         Move(d, s) => {
             let _ = writeln!(w, "r{d}v = r{s}v; r{d}x = r{s}x;");
         }
@@ -455,13 +573,23 @@ fn emit_insn_rust(
                 return None;
             }
             let _ = writeln!(w, "let mut av = 0u64; let mut ax = 0u64;");
-            for p in parts.iter() {
+            for (pi, p) in parts.iter().enumerate() {
                 let pw = rw(*p);
                 let m = mask_c(pw);
-                let _ = writeln!(
-                    w,
-                    "av = (av << {pw}) | (r{p}v & {m:#x}); ax = (ax << {pw}) | (r{p}x & {m:#x});"
-                );
+                if pi == 0 {
+                    // First part: no accumulated bits yet — skip the shift,
+                    // which rustc rejects outright at pw == 64.
+                    let _ = writeln!(w, "av = r{p}v & {m:#x}; ax = r{p}x & {m:#x};");
+                } else if pw >= 64 {
+                    // A later full-width part would need `<< 64` — the whole
+                    // concat exceeds u64 anyway; not AOT-eligible.
+                    return None;
+                } else {
+                    let _ = writeln!(
+                        w,
+                        "av = (av << {pw}) | (r{p}v & {m:#x}); ax = (ax << {pw}) | (r{p}x & {m:#x});"
+                    );
+                }
             }
             let _ = writeln!(w, "r{d}v = av; r{d}x = ax;");
         }
@@ -519,6 +647,13 @@ fn emit_insn_rust(
             let sw = sig_w.get(*sig as usize).copied().unwrap_or(0);
             if sw > 0 && *bit >= sw {
                 let _ = writeln!(w, "r{dest}v = 0; r{dest}x = 1;");
+            } else if *bit >= 64 {
+                // In-range bit of a WIDE signal: the u64 shift form would
+                // overflow — use the slice bridge (same as cranelift).
+                let _ = writeln!(
+                    w,
+                    "r{dest}v = (br().load_slice)(sim, {sig}, {bit}, 1); r{dest}x = (br().load_slice_xz)(sim, {sig}, {bit}, 1);"
+                );
             } else {
                 let _ = writeln!(
                     w,
@@ -532,6 +667,28 @@ fn emit_insn_rust(
             let wid = left.abs_diff(*right) + 1;
             if wid >= 64 {
                 return None;
+            }
+            // A select reaching past bit 63 lives on a WIDE signal — the
+            // u64 shift form would overflow (`deny(arithmetic_overflow)`,
+            // seen on a C906 `[127:120]` slice). Route through the slice
+            // bridge, exactly like cranelift; out-of-declared-range bits
+            // are X-marked with the same keep/oor masks as the narrow arm.
+            if hi >= 64 {
+                let sw = sig_w.get(*sig as usize).copied().unwrap_or(0);
+                let oor: u64 = if sw > 0 && lo >= sw {
+                    (1u64 << wid) - 1
+                } else if sw > 0 && hi >= sw {
+                    let full = (1u64 << wid) - 1;
+                    (full >> (sw - lo)) << (sw - lo)
+                } else {
+                    0
+                };
+                let keep = ((1u64 << wid) - 1) & !oor;
+                let _ = writeln!(
+                    w,
+                    "r{dest}v = (br().load_slice)(sim, {sig}, {lo}, {wid}) & {keep:#x}; r{dest}x = ((br().load_slice_xz)(sim, {sig}, {lo}, {wid}) & {keep:#x}) | {oor:#x};"
+                );
+                return Some(());
             }
             let sw = sig_w.get(*sig as usize).copied().unwrap_or(0);
             let oor: u64 = if sw > 0 && lo >= sw {
@@ -549,7 +706,20 @@ fn emit_insn_rust(
             );
         }
         BlockingAssign(sig, val, width) => {
-            let _ = writeln!(w, "(br().store4s)(sim, {sig}, r{val}v, r{val}x, {width});");
+            // Native no-change precheck only when the store width matches
+            // the signal's declared width (plane compare is exact then);
+            // width 0 means "signal width" in the bridge, same condition.
+            let sw = sig_w.get(*sig as usize).copied().unwrap_or(0);
+            let effw = if *width == 0 { sw } else { *width };
+            if effw == sw && (1..=64).contains(&effw) {
+                let mask = if effw >= 64 { u64::MAX } else { (1u64 << effw) - 1 };
+                let _ = writeln!(
+                    w,
+                    "st4(sim, {sig}, r{val}v, r{val}x, {width}, {mask:#x});"
+                );
+            } else {
+                let _ = writeln!(w, "(br().store4s)(sim, {sig}, r{val}v, r{val}x, {width});");
+            }
         }
         NbaAssign(sig, val, width) => {
             let _ = writeln!(w, "(br().nba4s)(sim, {sig}, r{val}v, r{val}x, {width});");
@@ -642,6 +812,13 @@ fn emit_insn_rust(
                     "let t = ld(sim, {sig}); if (t.0 & !t.1) == 0 {{ pc = {t_pc}; continue 'sm; }}",
                     t_pc = t
                 );
+            } else if *bit >= 64 {
+                // Wide-signal bit: slice bridge, then branch on the lsb.
+                let _ = writeln!(
+                    w,
+                    "let bv = (br().load_slice)(sim, {sig}, {bit}, 1); let bx = (br().load_slice_xz)(sim, {sig}, {bit}, 1); if (bv & !bx) & 1 == 0 {{ pc = {t_pc}; continue 'sm; }}",
+                    t_pc = t
+                );
             } else {
                 let _ = writeln!(
                     w,
@@ -704,7 +881,11 @@ impl AotLib {
     }
 }
 
-pub fn compile_and_load(source: &str, verbose: bool) -> Option<AotLib> {
+pub fn compile_and_load(
+    source: &str,
+    verbose: bool,
+    planes: (u64, u32),
+) -> Option<AotLib> {
     // Unique per COMPILE, not per process: several Simulators in one
     // process (cargo test threads) would otherwise overwrite each other's
     // crate — and dlopen caches by PATH, silently handing a test another
@@ -721,6 +902,11 @@ pub fn compile_and_load(source: &str, verbose: bool) -> Option<AotLib> {
     let so = dir.join("libxezim_aot.so");
     std::fs::write(&rs, source).ok()?;
     let t0 = std::time::Instant::now();
+    // XEZIM_AOT_OPT overrides the opt level (default 2; 3 measured neutral
+    // on ibex but may differ on larger generated crates). target-cpu=native
+    // lets LLVM use the host's vector/bit ops in the plane algebra.
+    let opt = std::env::var("XEZIM_AOT_OPT").unwrap_or_else(|_| "2".to_string());
+    let opt_arg = format!("opt-level={}", if matches!(opt.as_str(), "0" | "1" | "2" | "3") { opt.as_str() } else { "2" });
     let out = std::process::Command::new("rustc")
         .args([
             "--edition",
@@ -728,7 +914,9 @@ pub fn compile_and_load(source: &str, verbose: bool) -> Option<AotLib> {
             "--crate-type",
             "cdylib",
             "-C",
-            "opt-level=2",
+            opt_arg.as_str(),
+            "-C",
+            "target-cpu=native",
             "-C",
             "panic=abort",
             "-C",
@@ -756,9 +944,11 @@ pub fn compile_and_load(source: &str, verbose: bool) -> Option<AotLib> {
         return None;
     }
     let lib = AotLib { handle };
-    // Bind the bridge table before any block fn can run.
+    // Bind the bridge table before any block fn can run. Built at runtime
+    // because it now carries the SoA plane base pointer (NativeCtx step 1);
+    // the dylib copies the struct into its own static at bind.
     let bind = lib.sym("xezim_aot_bind")?;
-    static BRIDGE: AotBridge = AotBridge {
+    let bridge = AotBridge {
         load: super::jit::xezim_jit_load_signal,
         load_xz: super::jit::xezim_jit_load_signal_xz,
         store4s: super::jit::xezim_jit_store_signal_4s,
@@ -766,12 +956,16 @@ pub fn compile_and_load(source: &str, verbose: bool) -> Option<AotLib> {
         nba_range: super::jit::xezim_jit_schedule_nba_range_dyn,
         nba_bit: super::jit::xezim_jit_schedule_nba_bit_dyn,
         blk_range: super::jit::xezim_jit_blocking_assign_range_dyn,
+        load_slice: super::jit::xezim_jit_load_signal_slice,
+        load_slice_xz: super::jit::xezim_jit_load_signal_slice_xz,
+        planes: planes.0,
+        planes_len: planes.1,
     };
     // xezim_aot_bind has the JitFn ABI shape only by accident; cast through
     // the real signature.
     let bind_fn: unsafe extern "C" fn(*const AotBridge) =
         unsafe { std::mem::transmute::<JitFn, unsafe extern "C" fn(*const AotBridge)>(bind) };
-    unsafe { bind_fn(&BRIDGE as *const AotBridge) };
+    unsafe { bind_fn(&bridge as *const AotBridge) };
     Some(lib)
 }
 
