@@ -97,6 +97,29 @@ pub unsafe extern "C" fn xezim_jit_load_signal_xz(sim: *mut u8, id: u32) -> u64 
     sim.jit_load_signal_xz(id as usize)
 }}
 
+/// AST-statement escape hatch: run ONE fallback statement (a $display /
+/// $error / other non-compilable stmt) through the interpreter from JIT'd
+/// code, with the owning block's scope hint applied around it exactly like
+/// the interpreter's fallback path (timescale for %t, %m instance naming,
+/// bare-name resolution). `stmt` is the Arc payload baked into the block's
+/// StmtFallback insn — the CompiledBlock outlives the JIT fn, keeping it
+/// alive. `hint` is a leaked per-block scope string (may be null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xezim_jit_stmt_fallback(
+    sim: *mut u8,
+    stmt: *const crate::ast::stmt::Statement,
+    hint_ptr: *const u8,
+    hint_len: usize,
+) { unsafe {
+    let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
+    let hint = if hint_ptr.is_null() || hint_len == 0 {
+        None
+    } else {
+        std::str::from_utf8(std::slice::from_raw_parts(hint_ptr, hint_len)).ok()
+    };
+    sim.jit_exec_fallback_stmt(&*stmt, hint);
+}}
+
 /// Fused two-plane load: writes val/xz planes of `signal_table[id]`
 /// through out-pointers (the JIT passes its register stack-slot
 /// addresses), replacing two bridge calls per signal read with one.
@@ -301,6 +324,16 @@ mod stub {
         ) -> Option<JitFn> {
             None
         }
+        pub fn try_compile_with_xz_hint(
+            &mut self,
+            _insns: &[Insn],
+            _num_regs: u32,
+            _xz_ptr: u64,
+            _xz_len: u32,
+            _scope_hint: Option<&str>,
+        ) -> Option<JitFn> {
+            None
+        }
         pub fn set_inline_bits_storage(&mut self, _ptr: u64, _len: u32) {}
         pub fn set_signal_widths(&mut self, _widths: Vec<u32>) {}
         pub fn set_signal_signed(&mut self, _signed: Vec<bool>) {}
@@ -314,6 +347,7 @@ mod enabled {
     use super::{
         xezim_jit_blocking_assign_range_dyn, xezim_jit_inputs_have_xz,
         xezim_jit_load_array_elem, xezim_jit_load_signal, xezim_jit_load_signal2,
+        xezim_jit_stmt_fallback,
         xezim_jit_load_signal_slice,
         xezim_jit_load_signal_slice_xz, xezim_jit_load_signal_xz,
         xezim_jit_schedule_nba,
@@ -343,6 +377,9 @@ mod enabled {
         /// JitModule is constructed, by the simulator caller that knows
         /// the pointer and length.
         inline_bits_ptr: Option<(u64, u32)>,
+        /// Scope hint (leaked ptr, len) for the block currently being
+        /// compiled; baked into StmtFallback bridge calls.
+        block_scope_hint: Option<(u64, u64)>,
         /// JIT Stage 4 Tier A: snapshot of `Simulator::signal_widths` used
         /// at JIT-compile time to pick between the slow nba bridge (with
         /// width arg) and the leaner nba_fast bridge (assumes
@@ -377,6 +414,10 @@ mod enabled {
             // Register bridge function symbols so the JIT can link to them.
             builder.symbol("xezim_jit_load_signal", xezim_jit_load_signal as *const u8);
             builder.symbol("xezim_jit_load_signal2", xezim_jit_load_signal2 as *const u8);
+            builder.symbol(
+                "xezim_jit_stmt_fallback",
+                xezim_jit_stmt_fallback as *const u8,
+            );
             builder.symbol(
                 "xezim_jit_load_signal_slice",
                 xezim_jit_load_signal_slice as *const u8,
@@ -437,6 +478,7 @@ mod enabled {
                 module: ClJitModule::new(builder),
                 next_id: 0,
                 inline_bits_ptr: None,
+            block_scope_hint: None,
                 signal_widths_snapshot: Vec::new(),
                 signal_signed_snapshot: Vec::new(),
                 nba_side_queue: None,
@@ -522,6 +564,17 @@ mod enabled {
             xz_ptr: u64,
             xz_len: u32,
         ) -> Option<JitFn> {
+            self.try_compile_with_xz_hint(insns, num_regs, xz_ptr, xz_len, None)
+        }
+
+        pub fn try_compile_with_xz_hint(
+            &mut self,
+            insns: &[Insn],
+            num_regs: u32,
+            xz_ptr: u64,
+            xz_len: u32,
+            scope_hint: Option<&str>,
+        ) -> Option<JitFn> {
             for insn in insns {
                 if !is_supported(insn) {
                     return None;
@@ -541,6 +594,12 @@ mod enabled {
                     }
                 }
             }
+            // Fallback stmts carry the block's scope hint into the bridge;
+            // leak one copy per block (block count is static and small).
+            self.block_scope_hint = scope_hint.map(|h| {
+                let leaked: &'static str = Box::leak(h.to_string().into_boxed_str());
+                (leaked.as_ptr() as u64, leaked.len() as u64)
+            });
             self.codegen_block(insns, num_regs, &input_ids, xz_ptr, xz_len).ok()
         }
 
@@ -616,6 +675,15 @@ mod enabled {
             let load_id: FuncId = self
                 .module
                 .declare_function("xezim_jit_load_signal", Linkage::Import, &load_sig)
+                .map_err(|_| ())?;
+            let mut fb_sig = self.module.make_signature();
+            fb_sig.params.push(AbiParam::new(pointer_type)); // sim
+            fb_sig.params.push(AbiParam::new(pointer_type)); // stmt
+            fb_sig.params.push(AbiParam::new(pointer_type)); // hint ptr
+            fb_sig.params.push(AbiParam::new(types::I64)); // hint len
+            let fb_id: FuncId = self
+                .module
+                .declare_function("xezim_jit_stmt_fallback", Linkage::Import, &fb_sig)
                 .map_err(|_| ())?;
             let mut load2_sig = self.module.make_signature();
             load2_sig.params.push(AbiParam::new(pointer_type)); // sim
@@ -784,6 +852,9 @@ mod enabled {
             // so the prelude can call xz_check_ref before the per-Insn
             // codegen begins.
             let load_ref = self.module.declare_func_in_func(load_id, &mut builder.func);
+            let fb_ref = self
+                .module
+                .declare_func_in_func(fb_id, &mut builder.func);
             let load2_ref = self
                 .module
                 .declare_func_in_func(load2_id, &mut builder.func);
@@ -1083,12 +1154,21 @@ mod enabled {
                     // an X input takes the not-taken=false path just like the
                     // interpreter's `bit_select(..).is_true()`.
                     Insn::BranchIfSignalFalse(sig_id, target, bit) => {
-                        let id = builder.ins().iconst(types::I32, *sig_id as i64);
-                        let call = builder.ins().call(load_ref, &[sim_ptr, id]);
-                        let v = builder.inst_results(call)[0];
-                        let id2 = builder.ins().iconst(types::I32, *sig_id as i64);
-                        let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, id2]);
-                        let x = builder.inst_results(xcall)[0];
+                        let (v, x) = match raw_sig_loads(
+                            &mut builder,
+                            pointer_type,
+                            inline_storage,
+                            *sig_id,
+                        ) {
+                            Some(p) => p,
+                            None => {
+                                let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                                let call = builder.ins().call(load_ref, &[sim_ptr, id]);
+                                let v = builder.inst_results(call)[0];
+                                let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, id]);
+                                (v, builder.inst_results(xcall)[0])
+                            }
+                        };
                         let nx = builder.ins().bnot(x);
                         let mut known1 = builder.ins().band(v, nx);
                         if *bit != u32::MAX {
@@ -1242,6 +1322,18 @@ mod enabled {
                                 .load(types::I64, MemFlagsData::trusted(), base, offset + 8);
                         st2(&mut builder, pointer_type, &reg_slots, &xz_slots, *dest, val, xzv);
                     }
+                    // AST fallback statement: one bridge call into the
+                    // interpreter, scope hint applied around it. The Arc'd
+                    // Statement pointer is baked as a constant; the owning
+                    // CompiledBlock keeps it alive for the JIT fn's life.
+                    Insn::StmtFallback(payload) => {
+                        let stmt_ptr = std::sync::Arc::as_ptr(&payload.0) as i64;
+                        let sp = builder.ins().iconst(pointer_type, stmt_ptr);
+                        let (hp, hl) = self.block_scope_hint.unwrap_or((0, 0));
+                        let hpc = builder.ins().iconst(pointer_type, hp as i64);
+                        let hlc = builder.ins().iconst(types::I64, hl as i64);
+                        builder.ins().call(fb_ref, &[sim_ptr, sp, hpc, hlc]);
+                    }
                     other => {
                         let emitted = emit_insn(
                             &mut builder,
@@ -1252,6 +1344,7 @@ mod enabled {
                             &reg_widths,
                             &reg_signed,
                             signal_widths,
+                            inline_storage,
                             load_ref,
                             load_xz_ref,
                             load2_ref,
@@ -1295,15 +1388,22 @@ mod enabled {
                             let mx = builder.ins().band(x, mc);
                             builder.ins().stack_store(pointer_type, mx, xz_slots[d as usize], 0);
                         }
-                        update_reg_meta(
-                            other,
-                            &mut reg_widths,
-                            &mut reg_signed,
-                            signal_widths,
-                            signal_signed,
-                        );
                     }
                 }
+                // Register width/signedness tracking runs for EVERY insn —
+                // the inline arms above (Stage-2 loads, fast NBA, branches)
+                // used to skip it, so a LoadSignalSigned handled inline left
+                // its register unsigned and every later compare/mask on it
+                // was wrong (clearsigned battery: signed compares read
+                // unsigned once the SoA loads made the inline arm the
+                // default path).
+                update_reg_meta(
+                    insn,
+                    &mut reg_widths,
+                    &mut reg_signed,
+                    signal_widths,
+                    signal_signed,
+                );
             }
             // If control falls off the end still live, jump to exit.
             if live {
@@ -1348,6 +1448,7 @@ mod enabled {
         reg_w: &[u32],
         reg_s: &[bool],
         sig_w: &[u32],
+        inline_storage: Option<(u64, u32)>,
         load_ref: FuncRef,
         load_xz_ref: FuncRef,
         load2_ref: FuncRef,
@@ -1587,12 +1688,18 @@ mod enabled {
                 st2(builder, pointer_type, regs, xz, *dest, c, cx);
             }
             LoadSignal(dest, sig_id) | LoadSignalSigned(dest, sig_id) => {
-                // One fused bridge call; the bridge writes both planes
-                // directly into the destination register's stack slots.
-                let id = builder.ins().iconst(types::I32, *sig_id as i64);
-                let vp = builder.ins().stack_addr(pointer_type, regs[*dest as usize], 0);
-                let xp = builder.ins().stack_addr(pointer_type, xz[*dest as usize], 0);
-                builder.ins().call(load2_ref, &[sim_ptr, id, vp, xp]);
+                // SoA raw loads when the plane mirror covers the id (the
+                // default); one fused bridge call otherwise.
+                match raw_sig_loads(builder, pointer_type, inline_storage, *sig_id) {
+                    Some((v, x)) => st2(builder, pointer_type, regs, xz, *dest, v, x),
+                    None => {
+                        let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                        let vp =
+                            builder.ins().stack_addr(pointer_type, regs[*dest as usize], 0);
+                        let xp = builder.ins().stack_addr(pointer_type, xz[*dest as usize], 0);
+                        builder.ins().call(load2_ref, &[sim_ptr, id, vp, xp]);
+                    }
+                }
             }
             Move(d, s) => {
                 let (v, x) = ld2(builder, pointer_type, regs, xz, *s);
@@ -1923,11 +2030,17 @@ mod enabled {
                 else {
                     return Err(());
                 };
-                let idc = builder.ins().iconst(types::I32, *idx_sig as i64);
-                let call = builder.ins().call(load_ref, &[sim_ptr, idc]);
-                let iv = builder.inst_results(call)[0];
-                let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, idc]);
-                let ix = builder.inst_results(xcall)[0];
+                let (iv, ix) = match raw_sig_loads(builder, pointer_type, inline_storage, *idx_sig)
+                {
+                    Some(p) => p,
+                    None => {
+                        let idc = builder.ins().iconst(types::I32, *idx_sig as i64);
+                        let call = builder.ins().call(load_ref, &[sim_ptr, idc]);
+                        let iv = builder.inst_results(call)[0];
+                        let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, idc]);
+                        (iv, builder.inst_results(xcall)[0])
+                    }
+                };
                 let nix = builder.ins().bnot(ix);
                 let eff = builder.ins().band(iv, nix);
                 let lo_c = builder.ins().iconst(types::I64, *lo);
@@ -1939,11 +2052,18 @@ mod enabled {
                 let first_c = builder.ins().iconst(types::I64, *first_id as i64);
                 let eid = builder.ins().iadd(first_c, off);
                 let eid_safe = builder.ins().select(inb, eid, first_c);
-                let eid32 = builder.ins().ireduce(types::I32, eid_safe);
-                let vcall = builder.ins().call(load_ref, &[sim_ptr, eid32]);
-                let ev = builder.inst_results(vcall)[0];
-                let excall = builder.ins().call(load_xz_ref, &[sim_ptr, eid32]);
-                let ex = builder.inst_results(excall)[0];
+                let (ev, ex) = match inline_storage {
+                    Some((base_ptr, len)) if (*first_id as u64) < len as u64 => {
+                        raw_sig_loads_dyn(builder, pointer_type, base_ptr, eid_safe)
+                    }
+                    _ => {
+                        let eid32 = builder.ins().ireduce(types::I32, eid_safe);
+                        let vcall = builder.ins().call(load_ref, &[sim_ptr, eid32]);
+                        let ev = builder.inst_results(vcall)[0];
+                        let excall = builder.ins().call(load_xz_ref, &[sim_ptr, eid32]);
+                        (ev, builder.inst_results(excall)[0])
+                    }
+                };
                 let zero = builder.ins().iconst(types::I64, 0);
                 let one = builder.ins().iconst(types::I64, 1);
                 let minus1 = builder.ins().iconst(types::I64, -1);
@@ -1999,12 +2119,17 @@ mod enabled {
                     let one = builder.ins().iconst(types::I64, 1);
                     st2(builder, pointer_type, regs, xz, *dest, zero, one);
                 } else {
-                    let id = builder.ins().iconst(types::I32, *sig_id as i64);
-                    let call = builder.ins().call(load_ref, &[sim_ptr, id]);
-                    let v = builder.inst_results(call)[0];
-                    let id2 = builder.ins().iconst(types::I32, *sig_id as i64);
-                    let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, id2]);
-                    let x = builder.inst_results(xcall)[0];
+                    let (v, x) = match raw_sig_loads(builder, pointer_type, inline_storage, *sig_id)
+                    {
+                        Some(p) => p,
+                        None => {
+                            let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                            let call = builder.ins().call(load_ref, &[sim_ptr, id]);
+                            let v = builder.inst_results(call)[0];
+                            let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, id]);
+                            (v, builder.inst_results(xcall)[0])
+                        }
+                    };
                     let sh = builder.ins().iconst(types::I64, *bit as i64);
                     let one = builder.ins().iconst(types::I64, 1);
                     let vs = builder.ins().ushr(v, sh);
@@ -2050,12 +2175,16 @@ mod enabled {
                     st2(builder, pointer_type, regs, xz, *dest, vm, xm);
                     return Ok(());
                 }
-                let id = builder.ins().iconst(types::I32, *sig_id as i64);
-                let call = builder.ins().call(load_ref, &[sim_ptr, id]);
-                let v = builder.inst_results(call)[0];
-                let id2 = builder.ins().iconst(types::I32, *sig_id as i64);
-                let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, id2]);
-                let x = builder.inst_results(xcall)[0];
+                let (v, x) = match raw_sig_loads(builder, pointer_type, inline_storage, *sig_id) {
+                    Some(p) => p,
+                    None => {
+                        let id = builder.ins().iconst(types::I32, *sig_id as i64);
+                        let call = builder.ins().call(load_ref, &[sim_ptr, id]);
+                        let v = builder.inst_results(call)[0];
+                        let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, id]);
+                        (v, builder.inst_results(xcall)[0])
+                    }
+                };
                 let sh = builder.ins().iconst(types::I64, lo as i64);
                 let keepc = builder.ins().iconst(types::I64, (full & !oor) as i64);
                 let vs = builder.ins().ushr(v, sh);
@@ -2331,11 +2460,18 @@ mod enabled {
                 let first_c = builder.ins().iconst(types::I64, *first_id as i64);
                 let eid = builder.ins().iadd(first_c, off);
                 let eid_safe = builder.ins().select(inb, eid, first_c);
-                let eid32 = builder.ins().ireduce(types::I32, eid_safe);
-                let call = builder.ins().call(load_ref, &[sim_ptr, eid32]);
-                let val = builder.inst_results(call)[0];
-                let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, eid32]);
-                let xzv = builder.inst_results(xcall)[0];
+                let (val, xzv) = match inline_storage {
+                    Some((base_ptr, len)) if (*first_id as u64) < len as u64 => {
+                        raw_sig_loads_dyn(builder, pointer_type, base_ptr, eid_safe)
+                    }
+                    _ => {
+                        let eid32 = builder.ins().ireduce(types::I32, eid_safe);
+                        let call = builder.ins().call(load_ref, &[sim_ptr, eid32]);
+                        let val = builder.inst_results(call)[0];
+                        let xcall = builder.ins().call(load_xz_ref, &[sim_ptr, eid32]);
+                        (val, builder.inst_results(xcall)[0])
+                    }
+                };
                 let minus1 = builder.ins().iconst(types::I64, -1);
                 let inb_mask = builder.ins().select(inb, minus1, zero);
                 let v = builder.ins().band(val, inb_mask);
@@ -2710,6 +2846,45 @@ mod enabled {
         (t, f)
     }
 
+    /// Two-plane load straight from the always-maintained SoA planes
+    /// (`signal_inline_bits`): one 16-byte stride entry per signal, val at
+    /// +0, xz at +8. Returns None when the id is outside the mirror (the
+    /// caller keeps its FFI path).
+    fn raw_sig_loads(
+        builder: &mut FunctionBuilder,
+        pointer_type: Type,
+        inline_storage: Option<(u64, u32)>,
+        sig_id: u32,
+    ) -> Option<(Value, Value)> {
+        let (base_ptr, len) = inline_storage?;
+        if sig_id >= len {
+            return None;
+        }
+        let base = builder.ins().iconst(pointer_type, base_ptr as i64);
+        let off = (sig_id as i32) * 16;
+        let v = builder.ins().load(types::I64, MemFlagsData::trusted(), base, off);
+        let x = builder.ins().load(types::I64, MemFlagsData::trusted(), base, off + 8);
+        Some((v, x))
+    }
+
+    /// Runtime-indexed two-plane load: `entry = base + eid*16`. The caller
+    /// guarantees `eid` is a valid signal id (array spans are contiguous
+    /// valid ids, bounds-checked before the id is formed).
+    fn raw_sig_loads_dyn(
+        builder: &mut FunctionBuilder,
+        pointer_type: Type,
+        base_ptr: u64,
+        eid: Value,
+    ) -> (Value, Value) {
+        let base = builder.ins().iconst(pointer_type, base_ptr as i64);
+        let sixteen = builder.ins().iconst(types::I64, 16);
+        let off = builder.ins().imul(eid, sixteen);
+        let addr = builder.ins().iadd(base, off);
+        let v = builder.ins().load(types::I64, MemFlagsData::trusted(), addr, 0);
+        let x = builder.ins().load(types::I64, MemFlagsData::trusted(), addr, 8);
+        (v, x)
+    }
+
     /// Load both planes of a VM register.
     fn ld2(
         builder: &mut FunctionBuilder,
@@ -2889,6 +3064,7 @@ mod enabled {
                 | BinOpConst(..)
                 | NbaAssignConst(..)
                 | NbaAssignArray(..)
+                | StmtFallback(..)
                 | NbaAssignArrayRead(..)
                 | CmpBranch(..)
                 | MoveResize(..)
