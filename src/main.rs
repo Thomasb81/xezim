@@ -2287,8 +2287,14 @@ suppressed but the explicit SDF annotation still applies."
     if top_modules.len() > 1 {
         let wrap_name = "__xz_multitop__";
         let mut body = format!("module {wrap_name};\n");
-        for (i, t) in top_modules.iter().enumerate() {
-            body.push_str(&format!("  {} __xz_top_inst_{}();\n", t, i));
+        // Instance name = module name (legal — separate namespaces), so each
+        // top keeps its identity in hierarchical paths: `tb.u_m.u_i` from a
+        // sibling top (a $dumpvars scope, a monitor's cross reference)
+        // resolves, and dumped scopes match the reference simulator's
+        // naming. The old `__xz_top_inst_<i>` alias made every such path
+        // unmatchable.
+        for t in top_modules.iter() {
+            body.push_str(&format!("  {} {}();\n", t, t));
         }
         body.push_str("endmodule\n");
         sources.push(body);
