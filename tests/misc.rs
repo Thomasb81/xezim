@@ -19,6 +19,8 @@ mod artifact_compression_modes;
 mod assign_z_passthrough;
 #[path = "misc/audit_sibling_fixes.rs"]
 mod audit_sibling_fixes;
+#[path = "misc/bind_upward_refs.rs"]
+mod bind_upward_refs;
 #[path = "misc/blocking_task_call.rs"]
 mod blocking_task_call;
 #[path = "misc/c910_create_en_cont_assign.rs"]
