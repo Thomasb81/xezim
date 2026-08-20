@@ -680,6 +680,14 @@ pub struct BytecodeCompiler<'a> {
     /// bytecode compilation can fold module params (e.g. `CARRY_CHAIN`) into
     /// the compile-time widths of `+:` / `-:` range selects.
     params: Option<&'a HashMap<String, Value>>,
+    /// Typedef name -> total width (module + package scope), for local
+    /// declarations of typedef'd packed types inside inlined functions.
+    typedefs: Option<&'a HashMap<String, u32>>,
+    /// Typedef name -> packed ELEMENT width (`typedef u8_t [15:0] v_t` -> 8).
+    typedef_elems: Option<&'a HashMap<String, u32>>,
+    /// Register-backed local -> packed element width, for `local[i]`
+    /// splice/extract compilation.
+    pub local_var_elem: std::collections::HashMap<String, u32>,
     /// Loop variables bound to COMPILE-TIME constants by the unroller. Read
     /// before every other name source, so `state[col*4]` folds to a constant
     /// index while `col` is unrolled.
@@ -817,6 +825,9 @@ impl<'a> BytecodeCompiler<'a> {
             inlining_stack: Vec::new(),
             tasks_inlined: 0,
             params: None,
+            typedefs: None,
+            typedef_elems: None,
+            local_var_elem: std::collections::HashMap::new(),
             cast_widths: None,
             pattern_layout: None,
             local_const_vars: HashMap::default(),
@@ -1130,6 +1141,15 @@ impl<'a> BytecodeCompiler<'a> {
         self.packed_elem_widths = Some(w);
     }
 
+    pub fn set_typedefs(
+        &mut self,
+        widths: &'a HashMap<String, u32>,
+        elems: &'a HashMap<String, u32>,
+    ) {
+        self.typedefs = Some(widths);
+        self.typedef_elems = Some(elems);
+    }
+
     pub fn set_assoc_elem_widths(&mut self, w: &'a HashMap<String, u32>) {
         self.assoc_elem_widths = Some(w);
     }
@@ -1417,15 +1437,16 @@ impl<'a> BytecodeCompiler<'a> {
         let ret_w = if ret_is_string {
             0
         } else {
-            crate::compiler::elaborate::resolve_type_width(
-                &fd.return_type,
-                self.params,
-                None,
-            )
+            // Resolve through the typedef table (and the instance scope): the
+            // old bare `resolve_type_width(.., None)` call defaulted every
+            // typedef'd return type to 32 bits, silently truncating a wide
+            // result on `return`.
+            self.decl_width_in(&fd.return_type, Some(&name))
         };
         // Evaluate the arguments in the CALLER's scope first, then bind them as
         // register-backed locals while compiling the body.
         let mut binds: Vec<(String, (RegId, u32))> = Vec::with_capacity(args.len());
+        let mut elem_binds: Vec<(String, u32)> = Vec::new();
         let mut ref_writes: Vec<(Expression, RegId, u32)> = Vec::new();
         let mut string_formal_names: Vec<String> = Vec::new();
         for (i, (p, a)) in fd.ports.iter().zip(args).enumerate() {
@@ -1446,7 +1467,7 @@ impl<'a> BytecodeCompiler<'a> {
             let w = if formal_is_string {
                 0
             } else {
-                self.port_effective_width(&fd.ports, i)
+                self.port_effective_width(&fd.ports, i, Some(&name))
             };
             let slot = self.alloc_reg();
             if matches!(p.direction, PortDirection::Output) {
@@ -1465,6 +1486,11 @@ impl<'a> BytecodeCompiler<'a> {
                 string_formal_names.push(p.name.name.clone());
             }
             binds.push((p.name.name.clone(), (slot, w)));
+            if let Some(ew) = self.decl_elem_width_in(&p.data_type, Some(&name)) {
+                if ew > 0 && w > ew && w % ew == 0 {
+                    elem_binds.push((p.name.name.clone(), ew));
+                }
+            }
             if matches!(p.direction, PortDirection::Ref | PortDirection::Output) {
                 ref_writes.push((a.clone(), slot, w));
             }
@@ -1477,11 +1503,18 @@ impl<'a> BytecodeCompiler<'a> {
         let qpfx = name.rsplit_once('.').map(|(p, _)| p.to_string());
         let saved_locals = std::mem::take(&mut self.local_var_regs);
         let saved_local_strings = std::mem::take(&mut self.local_var_is_string);
+        let saved_local_elems = std::mem::take(&mut self.local_var_elem);
         for (n, b) in binds {
             if let Some(pfx) = &qpfx {
                 self.local_var_regs.insert(format!("{pfx}.{n}"), b);
             }
             self.local_var_regs.insert(n, b);
+        }
+        for (n, ew) in elem_binds {
+            if let Some(pfx) = &qpfx {
+                self.local_var_elem.insert(format!("{pfx}.{n}"), ew);
+            }
+            self.local_var_elem.insert(n, ew);
         }
         for n in &string_formal_names {
             if let Some(pfx) = &qpfx {
@@ -1545,6 +1578,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.inlining_stack.pop();
         self.local_var_regs = saved_locals;
         self.local_var_is_string = saved_local_strings;
+        self.local_var_elem = saved_local_elems;
         if !ok {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
                 eprintln!(
@@ -1610,6 +1644,11 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                         if is_string {
                             self.local_var_is_string.insert(d.name.name.clone());
+                        }
+                        if let Some(ew) = self.decl_elem_width(data_type) {
+                            if ew > 0 && w > ew && w % ew == 0 {
+                                self.local_var_elem.insert(d.name.name.clone(), ew);
+                            }
                         }
                         self.local_var_regs.insert(d.name.name.clone(), (slot, w));
                     }
@@ -1699,7 +1738,7 @@ impl<'a> BytecodeCompiler<'a> {
             let w = if is_string {
                 0
             } else {
-                self.port_effective_width(&ports, i)
+                self.port_effective_width(&ports, i, Some(task_name))
             };
             let slot = self.alloc_reg();
             if matches!(p.direction, PortDirection::Output) {
@@ -2438,19 +2477,100 @@ impl<'a> BytecodeCompiler<'a> {
     /// The parser leaves such a port's data_type Implicit, and sizing it
     /// directly gives 1 bit — `input logic [7:0] a0, a1` bound a1 one bit
     /// wide and truncated every argument passed through it.
-    fn port_effective_width(&self, ports: &[crate::ast::decl::FunctionPort], i: usize) -> u32 {
+    fn port_effective_width(
+        &self,
+        ports: &[crate::ast::decl::FunctionPort],
+        i: usize,
+        scope: Option<&str>,
+    ) -> u32 {
         for k in (0..=i).rev() {
             let dt = &ports[k].data_type;
             if !matches!(dt, crate::ast::types::DataType::Implicit { dimensions, .. } if dimensions.is_empty())
             {
-                return self.decl_width(dt);
+                return self.decl_width_in(dt, scope);
             }
         }
-        self.decl_width(&ports[i].data_type)
+        self.decl_width_in(&ports[i].data_type, scope)
     }
 
     fn decl_width(&self, dt: &crate::ast::types::DataType) -> u32 {
-        crate::compiler::elaborate::resolve_type_width(dt, self.params, None)
+        self.decl_width_in(dt, None)
+    }
+
+    /// Declared width with INSTANCE-SCOPED typedef fallback. Elaboration keys
+    /// a submodule's typedef as `<inst>.<name>` while a declaration inside an
+    /// inlined body still spells the bare name; the bare miss used to fall to
+    /// the 32-bit default, truncating every wide typedef'd local. `scope` is
+    /// the inlined subroutine's qualified name (`d.conv`) when the caller has
+    /// it; enclosing inline frames are tried otherwise.
+    fn decl_width_in(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> u32 {
+        if let crate::ast::types::DataType::TypeReference { name: tn, dimensions, .. } = dt {
+            if dimensions.is_empty() && tn.scope.is_none() {
+                let bare = tn.name.name.as_str();
+                if let Some(t) = self.typedefs {
+                    if !t.contains_key(bare) {
+                        if let Some(w) = self.scoped_typedef_hit(t, bare, scope) {
+                            if w > 0 {
+                                return w;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        crate::compiler::elaborate::resolve_type_width(dt, self.params, self.typedefs)
+    }
+
+    /// Look `<pfx>.<bare>` up in `t`, where `pfx` is the instance prefix of
+    /// `scope` or of an enclosing inline frame.
+    fn scoped_typedef_hit(
+        &self,
+        t: &HashMap<String, u32>,
+        bare: &str,
+        scope: Option<&str>,
+    ) -> Option<u32> {
+        let try_pfx = |p: &str| t.get(&format!("{p}.{bare}")).copied();
+        scope
+            .and_then(|s| s.rsplit_once('.'))
+            .and_then(|(p, _)| try_pfx(p))
+            .or_else(|| {
+                self.inlining_stack
+                    .iter()
+                    .rev()
+                    .find_map(|f| f.rsplit_once('.').and_then(|(p, _)| try_pfx(p)))
+            })
+    }
+
+    /// Packed ELEMENT width of a declared type, for register-backed locals:
+    /// direct packed-of-packed declarations resolve structurally; a bare
+    /// typedef name resolves through the elaborator's typedef elem table.
+    fn decl_elem_width(&self, dt: &crate::ast::types::DataType) -> Option<u32> {
+        self.decl_elem_width_in(dt, None)
+    }
+
+    fn decl_elem_width_in(
+        &self,
+        dt: &crate::ast::types::DataType,
+        scope: Option<&str>,
+    ) -> Option<u32> {
+        if let (Some(p), Some(t)) = (self.params, self.typedefs) {
+            if let Some(ew) = crate::compiler::elaborate::packed_inner_elem_width(dt, p, t) {
+                return Some(ew);
+            }
+        }
+        if let crate::ast::types::DataType::TypeReference { name, dimensions, .. } = dt {
+            if dimensions.is_empty() {
+                let bare = name.name.name.as_str();
+                let m = self.typedef_elems?;
+                // Scoped key FIRST: unlike the width table, the elem table has
+                // no save/restore rail, so a bare entry may belong to another
+                // instance's same-named typedef.
+                return self
+                    .scoped_typedef_hit(m, bare, scope)
+                    .or_else(|| m.get(bare).copied());
+            }
+        }
+        None
     }
 
     /// Is this expression statically known to produce a STRING value?
@@ -5959,6 +6079,39 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
+                // Packed element of a REGISTER-BACKED local (`x[i]` on a
+                // `u8_vec16_t x` formal/local inside an inlined function):
+                // slice [i*ew +: ew] straight out of the register. Assumes a
+                // [N-1:0] outer range (what a packed-of-packed typedef
+                // declares); locals with exotic outer bounds simply have no
+                // elem entry and keep the old path.
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let raw = Self::hier_raw_name(h);
+                    if let Some(&ew) = self.local_var_elem.get(&raw) {
+                        if let Some((src, _w)) = self.local_var_reg_of(h) {
+                            let idx_reg = self.compile_expr(index, 0)?;
+                            let ew_reg = self.alloc_reg();
+                            self.emit(Insn::LoadConst(
+                                ew_reg,
+                                Box::new(Value::from_u64(ew as u64, 32)),
+                            ));
+                            let lo_reg = self.alloc_reg();
+                            self.emit(Insn::Mul(lo_reg, idx_reg, ew_reg));
+                            self.emit(Insn::Resize(lo_reg, 32));
+                            let ewm1 = self.alloc_reg();
+                            self.emit(Insn::LoadConst(
+                                ewm1,
+                                Box::new(Value::from_u64((ew - 1) as u64, 32)),
+                            ));
+                            let hi_reg = self.alloc_reg();
+                            self.emit(Insn::Add(hi_reg, lo_reg, ewm1));
+                            self.emit(Insn::Resize(hi_reg, 32));
+                            let dest = self.alloc_reg();
+                            self.emit(Insn::RangeSelect(dest, src, hi_reg, lo_reg));
+                            return Some(dest);
+                        }
+                    }
+                }
                 // Element of a MULTI-dimensional unpacked array (`grid[i][j]`).
                 // The base of the outer Index is itself an Index, so none of
                 // the arms below match and the whole thing fell through to the
@@ -6976,6 +7129,65 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
+        // Packed element WRITE on a register-backed local (`y[i] = v` on a
+        // `u8_vec16_t y` inside an inlined function): mask-splice with plain
+        // ALU insns — y = (y & ~(elem_mask << i*ew)) | ((v & elem_mask) << i*ew).
+        // 4-state correct via the per-bit AND/OR plane tables (constant mask
+        // bits are known, so untouched bits pass through and X in `v` lands
+        // as X). An out-of-range index shifts the mask past the register's
+        // width and the write becomes a no-op. Assumes [N-1:0] outer bounds
+        // (the packed-of-packed typedef shape); other locals have no elem
+        // entry and keep the bail-to-AST behavior.
+        if let ExprKind::Index { expr, index } = &lhs.kind {
+            if let ExprKind::Ident(h) = &expr.kind {
+                let raw = Self::hier_raw_name(h);
+                if let Some(&ew) = self.local_var_elem.get(&raw).filter(|&&ew| ew <= 64) {
+                    if let Some((yreg, yw)) = self.local_var_reg_of(h) {
+                        if yw > 0 {
+                            let Some(idx_reg) = self.compile_expr(index, 0) else {
+                                self.bail("local_elem_idx");
+                                return false;
+                            };
+                            let ew_reg = self.alloc_reg();
+                            self.emit(Insn::LoadConst(
+                                ew_reg,
+                                Box::new(Value::from_u64(ew as u64, 32)),
+                            ));
+                            let lo_reg = self.alloc_reg();
+                            self.emit(Insn::Mul(lo_reg, idx_reg, ew_reg));
+                            self.emit(Insn::Resize(lo_reg, 32));
+                            // elem mask at the container's width
+                            let mask_reg = self.alloc_reg();
+                            let mut mv = if ew >= 64 {
+                                Value::from_u64(u64::MAX, 64)
+                            } else {
+                                Value::from_u64((1u64 << ew) - 1, ew)
+                            };
+                            mv = mv.resize(yw);
+                            self.emit(Insn::LoadConst(mask_reg, Box::new(mv)));
+                            let shifted_mask = self.alloc_reg();
+                            self.emit(Insn::Shl(shifted_mask, mask_reg, lo_reg));
+                            let inv = self.alloc_reg();
+                            self.emit(Insn::BitNot(inv, shifted_mask));
+                            let cleared = self.alloc_reg();
+                            self.emit(Insn::BitAnd(cleared, yreg, inv));
+                            // value: mask to elem width, widen, shift into place
+                            let vex = self.alloc_reg();
+                            self.emit(Insn::Move(vex, val_reg));
+                            self.emit(Insn::Resize(vex, ew));
+                            self.emit(Insn::Resize(vex, yw));
+                            let vsh = self.alloc_reg();
+                            self.emit(Insn::Shl(vsh, vex, lo_reg));
+                            let merged = self.alloc_reg();
+                            self.emit(Insn::BitOr(merged, cleared, vsh));
+                            self.emit(Insn::Move(yreg, merged));
+                            self.emit(Insn::Resize(yreg, yw));
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
         // Register-bank local array element (constant index only).
         if let ExprKind::Index { expr, index } = &lhs.kind {
             if let ExprKind::Ident(h) = &expr.kind {
@@ -7418,6 +7630,17 @@ impl<'a> BytecodeCompiler<'a> {
                         if let Some(&(_, ew, _, _)) =
                             self.local_array_regs.get(&hier.path[0].name.name)
                         {
+                            return ew;
+                        }
+                    }
+                    // Register-backed PACKED-of-packed local (`u8_vec16_t y`
+                    // in an inlined body): `y[i]` selects an ew-bit element,
+                    // not one bit. Falling through compiled the RHS at width
+                    // 1 and the splice wrote the value's LSB only.
+                    if let Some(&ew) =
+                        self.local_var_elem.get(&Self::hier_raw_name(hier))
+                    {
+                        if ew > 1 {
                             return ew;
                         }
                     }
