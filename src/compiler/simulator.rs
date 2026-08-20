@@ -16203,11 +16203,28 @@ impl Simulator {
                 ) {
                     names.push((idx, name));
                     fns.push(src);
+                } else if verbose {
+                    // Coverage census: name the first insn the emitter has
+                    // no arm for (cranelift compiles these blocks; the gap
+                    // is AOT-emitter breadth, not the width gate).
+                    let miss = cb
+                        .instructions
+                        .iter()
+                        .map(super::bytecode::insn_opcode_name)
+                        .collect::<std::collections::HashSet<_>>();
+                    eprintln!("[AOT-BAIL] eidx={} ops={:?}", idx, miss);
                 }
             }
             if !fns.is_empty() {
                 let src = super::aot::module_source(&fns);
-                if let Some(lib) = super::aot::compile_and_load(&src, verbose) {
+                // NativeCtx step 1: hand the generated code the SoA plane
+                // base so its loads skip the FFI bridge (empty mirror —
+                // XEZIM_INLINE_BITS=0 — passes len 0 and keeps the bridge).
+                let planes = (
+                    self.signal_inline_bits.as_ptr() as u64,
+                    self.signal_inline_bits.len() as u32,
+                );
+                if let Some(lib) = super::aot::compile_and_load(&src, verbose, planes) {
                     for (idx, name) in &names {
                         if let Some(f) = lib.sym(name) {
                             self.comb_jit_fns[*idx] = Some(f);
