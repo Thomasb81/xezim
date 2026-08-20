@@ -37,6 +37,13 @@ use xezim_core::elaborate::resolve_type_width;
 use xezim_core::hasher::{HashMap, HashSet};
 
 static SIM_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// First activations of a cached process-`if` condition also run the AST
+/// evaluator and compare (see `try_eval_process_cond_bytecode`). Small: each
+/// audit costs one redundant AST evaluation; divergence pins the span to the
+/// AST forever, so the window only needs to catch shape-level miscompiles,
+/// which show on the first data that exercises them.
+const COND_AUDIT_EVALS: u8 = 4;
 /// `--dump-timescales`: print every module's timescale before the run starts.
 static DUMP_TIMESCALES: AtomicBool = AtomicBool::new(false);
 static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
@@ -3997,6 +4004,20 @@ pub struct Simulator {
     /// local frame is known.
     process_loop_bytecode:
         HashMap<(usize, usize, usize), Option<super::bytecode::CompiledBlock>>,
+    /// Bytecode cached for the CONDITION of a per-cycle self-check `if` whose
+    /// statement as a whole cannot compile (e.g. its fail branch touches a
+    /// name-keyed initial-scope variable). The condition — typically a wide
+    /// compare against an inlinable helper call — is the hot part; the chosen
+    /// branch still executes through the AST path.
+    /// The u8 is the SELF-AUDIT countdown: the first activations evaluate the
+    /// condition through BOTH the bytecode and the AST and compare; any
+    /// disagreement permanently pins the span to the AST (None). Only
+    /// side-effect-free conditions are cached, so the double evaluation is
+    /// unobservable.
+    process_cond_bytecode: HashMap<
+        (usize, usize, usize),
+        Option<(super::bytecode::CompiledBlock, super::bytecode::RegId, u8)>,
+    >,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
     /// §9.7 `process` class: PIDs explicitly suspended via `suspend()`. The
@@ -7114,6 +7135,7 @@ impl Simulator {
             t0_delay_deferred: HashSet::default(),
             suspended_loop_frames: HashMap::default(),
             process_loop_bytecode: HashMap::default(),
+            process_cond_bytecode: HashMap::default(),
             killed_pids: HashSet::default(),
             suspended_pids: HashSet::default(),
             suspended_proc_info: HashMap::default(),
@@ -30972,11 +30994,64 @@ impl Simulator {
     /// `pc.pushed(body, pc.start + i + 1)` splices a task body or flattened block
     /// in front of the caller's tail without copying that tail.
     fn try_exec_process_loop_bytecode(&mut self, pid: usize, stmt: &Statement) -> bool {
-        if !matches!(stmt.kind, StatementKind::For { .. })
-            || self.local_stack.is_empty()
-            || self.stmt_has_event_wait(stmt)
-            || stmt.span.start == 0 && stmt.span.end == 0
+        // No call-frame gate: a process whose own variables were promoted to
+        // the signal table has an EMPTY local_stack, and that is fine — there
+        // are simply no frame locals to bind. Requiring a frame sent every
+        // top-level stimulus loop (`repeat (N) begin @(posedge clk); for …`)
+        // through the AST interpreter.
+        //
+        // `If` joins `For` because a per-cycle self-check
+        // (`if (out !== expected(...)) fail++;`) re-executes as many times as
+        // any loop — the (pid, span) cache amortizes its compile the same
+        // way. The deep, call-following suspend check replaces the shallow
+        // event-wait scan for it; anything the compiler cannot honestly
+        // express (waits, loop control with no enclosing compiled loop,
+        // returns) still bails to the AST path at compile time.
+        // Compiled writes land directly in the signal table and would punch
+        // through an active `force` (the AST path routes every assign through
+        // the force filter). Forces are rare and usually short-lived: fall
+        // back to the AST while ANY is active, per execution, keeping the
+        // cache intact for when they lift.
+        if !self.forced_signals.is_empty()
+            || !self.forced_names.is_empty()
+            || !self.active_force_exprs.is_empty()
         {
+            return false;
+        }
+        // The vectorized packed-fill fast path beats an N-iteration compiled
+        // loop and `exec_statement` would have tried it first — keep that
+        // priority now that this runs ahead of `exec_statement`.
+        if let StatementKind::For {
+            init,
+            condition,
+            step,
+            body,
+        } = &stmt.kind
+        {
+            if self.try_exec_full_packed_fill(init, condition.as_ref(), step, body) {
+                return true;
+            }
+        }
+        let eligible = match &stmt.kind {
+            StatementKind::For { .. } => !self.stmt_has_event_wait(stmt),
+            _ => false,
+        };
+        if !eligible || stmt.span.start == 0 && stmt.span.end == 0 {
+            if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some()
+                && matches!(
+                    stmt.kind,
+                    StatementKind::For { .. } | StatementKind::If { .. }
+                )
+            {
+                eprintln!(
+                    "[PROC-LOOP] pid={} span={}..{} gate: eligible={} span0={}",
+                    pid,
+                    stmt.span.start,
+                    stmt.span.end,
+                    eligible,
+                    stmt.span.start == 0 && stmt.span.end == 0
+                );
+            }
             return false;
         }
         let key = (pid, stmt.span.start, stmt.span.end);
@@ -31007,8 +31082,30 @@ impl Simulator {
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
             compiler.top_module_name = Some(self.module.name.clone());
-            compiler.set_process_locals(self.local_stack.last().unwrap());
-            let ok = compiler.compile_stmt(stmt);
+            if let Some(frame) = self.local_stack.last() {
+                compiler.set_process_locals(frame);
+            }
+            // The feedback walk is per-SPAN (cached below), not per
+            // activation — collect_stmt_reads is too heavy to re-run on a
+            // 10k-cycle stimulus loop.
+            let feedback = self.stmt_has_comb_feedback(stmt);
+            let ok = !feedback && compiler.compile_stmt(stmt);
+            if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some() {
+                eprintln!(
+                    "[PROC-LOOP] pid={} span={}..{} compiled={} reason={}",
+                    pid,
+                    stmt.span.start,
+                    stmt.span.end,
+                    ok,
+                    if ok {
+                        "-"
+                    } else if feedback {
+                        "comb_feedback"
+                    } else {
+                        compiler.bail_reason.unwrap_or("unknown")
+                    }
+                );
+            }
             let compiled = ok.then(|| compiler.finish());
             self.process_loop_bytecode.insert(key, compiled);
         }
@@ -31023,6 +31120,233 @@ impl Simulator {
         self.exec_insns(&compiled.instructions);
         self.process_loop_bytecode.insert(key, Some(compiled));
         true
+    }
+
+    /// Write→comb→read feedback check for the process statement caches: does
+    /// this statement WRITE a signal whose (transitive) combinational fan-out
+    /// produces a signal the statement also READS? The AST path settles
+    /// between statements and loop iterations, so such feedback re-reads a
+    /// FRESH value mid-statement (a mutable loop bound driven by always_comb
+    /// from the loop body's own writes); a straight-line compiled block only
+    /// settles at its boundary and would read stale state. Conservative:
+    /// unresolvable names are ignored (they compile-bail elsewhere).
+    fn stmt_has_comb_feedback(&self, stmt: &Statement) -> bool {
+        let mut reads: HashSet<String> = HashSet::default();
+        let mut writes: HashSet<String> = HashSet::default();
+        Self::collect_stmt_reads(stmt, &self.module, &mut reads, &mut writes);
+        if writes.is_empty() || reads.is_empty() {
+            return false;
+        }
+        let to_id = |n: &String| self.signal_name_to_id.get(n.as_str()).copied();
+        let read_ids: HashSet<usize> = reads.iter().filter_map(to_id).collect();
+        if read_ids.is_empty() {
+            return false;
+        }
+        let mut frontier: Vec<usize> = writes.iter().filter_map(to_id).collect();
+        let mut seen_entries: HashSet<u32> = HashSet::default();
+        while let Some(id) = frontier.pop() {
+            if id + 1 >= self.comb_dep_offsets.len() {
+                continue;
+            }
+            let lo = self.comb_dep_offsets[id] as usize;
+            let hi = self.comb_dep_offsets[id + 1] as usize;
+            for &e in &self.comb_dep_entries[lo..hi] {
+                if !seen_entries.insert(e) {
+                    continue;
+                }
+                for &out in &self.comb_entries[e as usize].cold.write_signal_ids {
+                    if read_ids.contains(&out) {
+                        return true;
+                    }
+                    frontier.push(out);
+                }
+            }
+        }
+        false
+    }
+
+    /// Is this expression free of side effects, structurally? Conservative:
+    /// unknown shapes are NOT effect-free. Calls are allowed — the bytecode
+    /// compiler only inlines functions that are pure in their arguments, and
+    /// anything else fails the compile — but increments, decrements and
+    /// assignment expressions mutate state and must not be double-evaluated
+    /// by the self-audit. System calls are limited to pure value readers.
+    fn cond_expr_is_effect_free(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) | ExprKind::StringLiteral(_) | ExprKind::Ident(_) => true,
+            ExprKind::Paren(i) => Self::cond_expr_is_effect_free(i),
+            ExprKind::Unary { op, operand } => {
+                !matches!(
+                    op,
+                    UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
+                ) && Self::cond_expr_is_effect_free(operand)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::cond_expr_is_effect_free(left) && Self::cond_expr_is_effect_free(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::cond_expr_is_effect_free(condition)
+                    && Self::cond_expr_is_effect_free(then_expr)
+                    && Self::cond_expr_is_effect_free(else_expr)
+            }
+            ExprKind::Concatenation(xs) => xs.iter().all(Self::cond_expr_is_effect_free),
+            ExprKind::Replication { count, exprs } => {
+                Self::cond_expr_is_effect_free(count)
+                    && exprs.iter().all(Self::cond_expr_is_effect_free)
+            }
+            ExprKind::Index { expr, index } => {
+                Self::cond_expr_is_effect_free(expr) && Self::cond_expr_is_effect_free(index)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::cond_expr_is_effect_free(expr)
+                    && Self::cond_expr_is_effect_free(left)
+                    && Self::cond_expr_is_effect_free(right)
+            }
+            ExprKind::MemberAccess { expr, .. } => Self::cond_expr_is_effect_free(expr),
+            ExprKind::SystemCall { name, args } => {
+                matches!(
+                    name.as_str(),
+                    "$signed"
+                        | "$unsigned"
+                        | "$bits"
+                        | "$clog2"
+                        | "$__xz_named_cast"
+                        | "$__xz_size_cast"
+                ) && args.iter().all(Self::cond_expr_is_effect_free)
+            }
+            ExprKind::Call { func, args } => {
+                matches!(func.kind, ExprKind::Ident(_))
+                    && args.iter().all(Self::cond_expr_is_effect_free)
+            }
+            _ => false,
+        }
+    }
+
+    /// Evaluate a per-cycle `if` CONDITION through cached bytecode, for the
+    /// self-check shape whose statement as a whole cannot compile (its fail
+    /// branch may touch a name-keyed initial-scope variable the VM cannot
+    /// address). The condition — a wide compare against an inlinable helper
+    /// call — is where the time goes; the branch still runs via the AST.
+    /// Returns the condition's truth, or None to fall back to `eval_expr`.
+    /// Same honesty contract as the statement cache: if the expression does
+    /// not fully compile (unknown name, un-inlinable call), the cache pins
+    /// None and the AST path stays authoritative.
+    fn try_eval_process_cond_bytecode(
+        &mut self,
+        pid: usize,
+        cond: &Expression,
+    ) -> Option<bool> {
+        if cond.span.start == 0 && cond.span.end == 0 {
+            return None;
+        }
+        // FRAMELESS only: inside a subroutine frame a `static` local needs
+        // the AST's dynamic scope (per-instance storage) that the compiled
+        // lookup cannot reproduce.
+        if !self.local_stack.is_empty() {
+            return None;
+        }
+        let key = (pid, cond.span.start, cond.span.end);
+        if !self.process_cond_bytecode.contains_key(&key) {
+            // Side effects would DOUBLE-FIRE during the self-audit below —
+            // only cache conditions that provably have none.
+            if !Self::cond_expr_is_effect_free(cond) {
+                self.process_cond_bytecode.insert(key, None);
+                return None;
+            }
+            let scope_hint = self.process_scope_hint.get(&pid).cloned();
+            let mut compiler = super::bytecode::BytecodeCompiler::new(
+                &self.signal_name_to_id,
+                &self.signal_signed,
+                &self.signal_widths,
+                &self.module.arrays,
+                &self.widths,
+            );
+            compiler.set_ast_fallback(false);
+            compiler.set_scope_hint(scope_hint);
+            compiler.set_tasks(&self.module.tasks);
+            compiler.set_functions(&self.module.functions);
+            compiler.set_params(&self.module.parameters);
+            compiler.set_cast_widths(&self.cast_widths);
+            compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
+            compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+            compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+            compiler.set_assoc_arrays(&self.module.associative_arrays);
+            compiler.set_packed_full_dims(&self.module.packed_full_dims);
+            compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+            compiler.set_array_first_id(&self.array_first_id);
+            compiler.set_string_signals(&self.module.string_signals);
+            compiler.set_signal_real(&self.signal_real);
+            compiler.top_module_name = Some(self.module.name.clone());
+            if let Some(frame) = self.local_stack.last() {
+                compiler.set_process_locals(frame);
+            }
+            let result = compiler.compile_root_expr(cond);
+            if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some() {
+                eprintln!(
+                    "[PROC-COND] pid={} span={}..{} compiled={} reason={}",
+                    pid,
+                    cond.span.start,
+                    cond.span.end,
+                    result.is_some(),
+                    if result.is_some() {
+                        "-"
+                    } else {
+                        compiler.bail_reason.unwrap_or("unknown")
+                    }
+                );
+            }
+            let compiled = result.map(|reg| (compiler.finish(), reg, COND_AUDIT_EVALS));
+            if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some() {
+                if let Some((cb, _, _)) = &compiled {
+                    eprintln!(
+                        "[PROC-COND-INSNS] {:?}",
+                        cb.instructions.iter().map(|i| format!("{:?}", i)).collect::<Vec<_>>()
+                    );
+                }
+            }
+            self.process_cond_bytecode.insert(key, compiled);
+        }
+        let Some(Some((compiled, reg, audits))) = self.process_cond_bytecode.remove(&key) else {
+            self.process_cond_bytecode.entry(key).or_insert(None);
+            return None;
+        };
+        if self.vm_regs.len() < compiled.num_regs as usize {
+            self.vm_regs
+                .resize(compiled.num_regs as usize, Value::zero(1));
+        }
+        self.exec_insns(&compiled.instructions);
+        let truth = self.vm_regs[reg as usize].is_true();
+        // Self-audit: the first activations (and every one under the audit
+        // env) also evaluate through the AST. A disagreement means the
+        // bytecode compiled this expression with different semantics — pin
+        // the span to the AST permanently and use the AST's answer.
+        if audits > 0 || std::env::var_os("XEZIM_PROC_COND_VERIFY").is_some() {
+            let ast = self.eval_expr(cond).is_true();
+            if ast != truth {
+                if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some()
+                    || std::env::var_os("XEZIM_PROC_COND_VERIFY").is_some()
+                {
+                    eprintln!(
+                        "[PROC-COND-DIVERGE] pid={} span={}..{} compiled={} ast={} — pinned to AST",
+                        pid, cond.span.start, cond.span.end, truth, ast
+                    );
+                }
+                self.process_cond_bytecode.insert(key, None);
+                return Some(ast);
+            }
+            self.process_cond_bytecode
+                .insert(key, Some((compiled, reg, audits.saturating_sub(1))));
+            return Some(truth);
+        }
+        self.process_cond_bytecode.insert(key, Some((compiled, reg, 0)));
+        Some(truth)
     }
 
     fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
@@ -32368,7 +32692,12 @@ impl Simulator {
                     // fall through to `exec_statement`, which evaluated it again
                     // — so any side effect in an `if` condition (`$random()`,
                     // `$urandom()`, a VPI `$systf`, `i++`) happened twice.
-                    let chosen: Option<&Statement> = if self.eval_expr(condition).is_true() {
+                    // The compiled-condition cache preserves the once-only
+                    // contract: the bytecode runs once per activation.
+                    let cond_true = self
+                        .try_eval_process_cond_bytecode(pid, condition)
+                        .unwrap_or_else(|| self.eval_expr(condition).is_true());
+                    let chosen: Option<&Statement> = if cond_true {
                         Some(then_stmt.as_ref())
                     } else {
                         else_stmt.as_ref().map(|b| b.as_ref())
