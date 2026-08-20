@@ -2293,6 +2293,13 @@ struct ClassInstance {
     /// `exec_method_in_class_hierarchy`. `None` for placeholder/stub
     /// instances and unspecialized constructions.
     spec: Option<(String, String)>,
+    /// §23.8 / §23.10.1: the INSTANCE scope whose process ran `new()`.
+    /// Hierarchical names in this object's methods resolve upward from
+    /// here, not from the caller's scope — a checker class constructed
+    /// inside a bound module must see its binder's host even when the
+    /// method is invoked from the top level (e.g. through a handle held
+    /// in an associative array). Empty for objects built at top scope.
+    creation_scope: String,
 }
 
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
@@ -3151,12 +3158,13 @@ pub struct Simulator {
     /// stubs ($save, $asserton, …) emit ONCE per distinct name so a task in
     /// a clocked loop cannot flood stderr.
     warned_system_tasks: HashSet<String>,
-    /// `$strobe` queue: formatted+printed at the end of the current
+    /// `$strobe` queue — (task name, args, arming instance scope, arming
+    /// `%m` lexical suffix): formatted+printed at the end of the current
     /// event-loop iteration, after `apply_nba` has committed scheduled
     /// non-blocking writes. Each entry is `(task_name, args)` and is
     /// re-evaluated at drain time so the printed values reflect the
     /// post-NBA state per IEEE 1800 §15.3.4 (postponed region).
-    pending_strobes: Vec<(String, Vec<Expression>)>,
+    pending_strobes: Vec<(String, Vec<Expression>, String, String)>,
     /// IEEE 1800-2017 §4.4 "observed region" — drained AFTER the NBA region
     /// has settled and BEFORE the postponed region runs. Concurrent
     /// property/sequence checkers (LRM §16) register a probe expression
@@ -11542,6 +11550,7 @@ impl Simulator {
                     properties: HashMap::default(),
                     type_bindings: HashMap::default(),
                 spec: None,
+                creation_scope: self.active_instance_scope(),
                 }));
                 if kind == "semaphore" {
                     self.semaphores.insert(ch, 0);
@@ -15748,7 +15757,17 @@ impl Simulator {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
         // rewritten as `return Some(...)`.)
-        if let Some((sens, body)) = self.extract_sensitivity(&ab.stmt) {
+        // `@*` inference resolves the body's reads; give it this block's own
+        // instance scope, or an upward reference from a bound module (e.g.
+        // `host_mod.clk` in a monitor bound under a `host_mod` instance)
+        // resolves to nothing and the block never re-fires after time 0.
+        let saved_hint = self.name_resolve_hint.borrow().clone();
+        if !ab.scope.is_empty() {
+            *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
+        }
+        let extracted = self.extract_sensitivity(&ab.stmt);
+        *self.name_resolve_hint.borrow_mut() = saved_hint;
+        if let Some((sens, body)) = extracted {
             if !sens.is_empty() {
                 let all_level = sens.iter().all(|s| s.edge == EdgeKind::AnyEdge);
                 let top_prefix = format!("{}.", self.module.name);
@@ -22809,6 +22828,45 @@ impl Simulator {
                             rids.push(id);
                         }
                     }
+                    // §23.8 / §23.10.1: a dotted read that resolved nowhere
+                    // may be an UPWARD reference (a bound module reading its
+                    // host through the host's module name — `host_mod.clk`
+                    // from a monitor bound under a `host_mod` instance). Run
+                    // the full hierarchical resolution anchored at the
+                    // block's own scope, or the entry gets no dependency
+                    // edge at all and never re-fires after time 0.
+                    if rids.len() == before && r.contains('.') {
+                        let span = crate::ast::Span::dummy();
+                        let ident = crate::ast::expr::HierarchicalIdentifier {
+                            root: None,
+                            path: vec![crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: r.clone(),
+                                    span,
+                                },
+                                selects: Vec::new(),
+                            }],
+                            span,
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        };
+                        let saved = self.name_resolve_hint.borrow().clone();
+                        if !ab.scope.is_empty() {
+                            *self.name_resolve_hint.borrow_mut() =
+                                Some(ab.scope.clone());
+                        }
+                        let resolved = self.resolve_hier_name(&ident);
+                        *self.name_resolve_hint.borrow_mut() = saved;
+                        if resolved != *r {
+                            if let Some(&id) =
+                                self.signal_name_to_id.get(resolved.as_str())
+                            {
+                                if !rids.contains(&id) {
+                                    rids.push(id);
+                                }
+                            }
+                        }
+                    }
                     // A MEMBER read ("req.vld") has no signal of its own —
                     // depend on the BASE signal, mirroring the cont-assign
                     // path. Without this, a block whose ONLY reads of a
@@ -26406,7 +26464,13 @@ impl Simulator {
         SKIP_FN_BODY_READS.with(|c| c.set(true));
         Self::collect_stmt_reads(body, &self.module, &mut reads, &mut writes);
         SKIP_FN_BODY_READS.with(|c| c.set(false));
-        let hint = self.name_resolve_hint.borrow().clone();
+        // Registration usually runs with the hint unset (the process body
+        // just executed); the executing instance's own scope is the correct
+        // resolution context either way.
+        let hint = self.name_resolve_hint.borrow().clone().or_else(|| {
+            let sc = self.active_instance_scope();
+            (!sc.is_empty()).then_some(sc)
+        });
         let mut out: Vec<Sensitivity> = Vec::new();
         let mut seen: HashSet<String> = HashSet::default();
         for r in reads.iter() {
@@ -26443,6 +26507,7 @@ impl Simulator {
                     cand.push(base.to_string());
                 }
             }
+            let mut matched = false;
             for c in cand {
                 let resolved = hint
                     .as_ref()
@@ -26458,7 +26523,45 @@ impl Simulator {
                             value_of: None,
                         });
                     }
+                    matched = true;
                     break;
+                }
+            }
+            // §23.8 / §23.10.1: a dotted read neither scope-local nor global
+            // may be an UPWARD reference (a bound module reading its host
+            // through the host's module name, e.g. `inner_mod.clk` from a
+            // monitor bound under an `inner_mod` instance). Run the full
+            // hierarchical resolution so the block re-fires on host-signal
+            // changes instead of executing exactly once at time 0.
+            if !matched && r.contains('.') {
+                let span = crate::ast::Span::dummy();
+                let ident = crate::ast::expr::HierarchicalIdentifier {
+                    root: None,
+                    path: vec![crate::ast::expr::HierPathSegment {
+                        name: crate::ast::Identifier {
+                            name: r.clone(),
+                            span,
+                        },
+                        selects: Vec::new(),
+                    }],
+                    span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                let saved = self.name_resolve_hint.borrow().clone();
+                *self.name_resolve_hint.borrow_mut() = hint.clone();
+                let resolved = self.resolve_hier_name(&ident);
+                *self.name_resolve_hint.borrow_mut() = saved;
+                if resolved != *r
+                    && self.signal_name_to_id.contains_key(resolved.as_str())
+                    && seen.insert(resolved.clone())
+                {
+                    out.push(Sensitivity {
+                        signal_name: resolved,
+                        edge: EdgeKind::AnyEdge,
+                        iff: None,
+                        value_of: None,
+                    });
                 }
             }
         }
@@ -53009,6 +53112,7 @@ impl Simulator {
                                     properties: HashMap::default(),
                                     type_bindings: HashMap::default(),
                                 spec: None,
+                                creation_scope: self.active_instance_scope(),
                                 }));
                                 if kind == "semaphore" {
                                     let n = args
@@ -53077,6 +53181,7 @@ impl Simulator {
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
                                     spec: None,
+                                    creation_scope: self.active_instance_scope(),
                                     }));
                                     let initial_count = args
                                         .first()
@@ -53091,6 +53196,7 @@ impl Simulator {
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
                                     spec: None,
+                                    creation_scope: self.active_instance_scope(),
                                     }));
                                     self.mailboxes
                                         .insert(handle, std::collections::VecDeque::new());
@@ -53160,6 +53266,7 @@ impl Simulator {
                                             properties: HashMap::default(),
                                             type_bindings: HashMap::default(),
                                         spec: None,
+                                        creation_scope: self.active_instance_scope(),
                                         }));
                                         Value::from_u64(h as u64, 32)
                                     }
@@ -53186,6 +53293,7 @@ impl Simulator {
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
                                     spec: None,
+                                    creation_scope: self.active_instance_scope(),
                                     }));
                                     Value::from_u64(h as u64, 32)
                                 }
@@ -58644,13 +58752,23 @@ impl Simulator {
             // in the active region. Variants $strobeb/h/o select
             // default radix exactly like $display variants.
             "$strobe" | "$strobeb" | "$strobeh" | "$strobeo" => {
-                self.pending_strobes.push((name.to_string(), args.to_vec()));
+                self.pending_strobes.push((
+                    name.to_string(),
+                    args.to_vec(),
+                    self.active_instance_scope(),
+                    self.m_lexical_suffix(),
+                ));
             }
             // §21.2.2 file variants: queue exactly like $strobe (postponed
             // region, so post-NBA values are printed); drain_pending_strobes
             // routes "$fstrobe*" entries to the file descriptor in args[0].
             "$fstrobe" | "$fstrobeb" | "$fstrobeh" | "$fstrobeo" => {
-                self.pending_strobes.push((name.to_string(), args.to_vec()));
+                self.pending_strobes.push((
+                    name.to_string(),
+                    args.to_vec(),
+                    self.active_instance_scope(),
+                    self.m_lexical_suffix(),
+                ));
             }
             // $value$plusargs and $test$plusargs return a bit but the
             // common pattern `$value$plusargs("...", var);` calls them as
@@ -59953,7 +60071,16 @@ impl Simulator {
         let mut result = String::new();
         let mut ai = 0;
         let mut chars = fmt.chars().peekable();
+        // §21.2.1.7 `%0p` (compact): the arm below marks where its output
+        // starts; the rewrite runs here on the NEXT iteration (or after the
+        // loop) because the arm has many early-continue exits.
+        let mut compact_from: Option<usize> = None;
         while let Some(c) = chars.next() {
+            if let Some(fp) = compact_from.take() {
+                let tail = Self::compact_p(&result[fp..]);
+                result.truncate(fp);
+                result.push_str(&tail);
+            }
             if c == '%' {
                 // §21.2.1.2: %[flags][width][.precision]<spec>. Flags: '-'
                 // left-justifies (pad spaces on the right), '+' forces a sign
@@ -60057,6 +60184,9 @@ impl Simulator {
                             }
                         }
                         'p' | 'P' => {
+                            if has_width && pad_width == 0 {
+                                compact_from = Some(result.len());
+                            }
                             if ai < args.len() {
                                 let arg = &args[ai];
                                 ai += 1;
@@ -60179,6 +60309,37 @@ impl Simulator {
                                         }
                                         result.push_str(&s);
                                         continue;
+                                    }
+                                }
+                                // A hierarchical spelling (`host_mod.payload`
+                                // from a bound checker, §23.8 upward naming)
+                                // is not the storage key — resolve it and
+                                // retry the type-directed render. Class-body
+                                // code parses the same reference as a
+                                // MemberAccess chain, so go through the flat
+                                // name rather than requiring an Ident shape.
+                                if let Some(flat) = self.flat_member_name(arg) {
+                                    if flat.contains('.') {
+                                        let ident = HierarchicalIdentifier {
+                                            root: None,
+                                            path: vec![HierPathSegment {
+                                                name: crate::ast::Identifier {
+                                                    name: flat.clone(),
+                                                    span: arg.span,
+                                                },
+                                                selects: Vec::new(),
+                                            }],
+                                            span: arg.span,
+                                            cached_signal_id: std::cell::Cell::new(None),
+                                            cached_resolved_name: std::cell::OnceCell::new(),
+                                        };
+                                        let resolved = self.resolve_hier_name(&ident);
+                                        if resolved != flat {
+                                            if let Some(s) = self.render_p_var(&resolved) {
+                                                result.push_str(&s);
+                                                continue;
+                                            }
+                                        }
                                     }
                                 }
                                 // Fallback: one-level named members (declared
@@ -60368,6 +60529,56 @@ impl Simulator {
                             // each comb/edge block and cleared by `run_process`,
                             // so a non-empty value always describes the block
                             // actually executing.
+                            // Reference behavior for `%m` INSIDE a class
+                            // method: the object's creation scope, then the
+                            // class name, then the method — regardless of
+                            // which process invoked the method. Guarded to
+                            // the method body itself: a free function/task
+                            // called FROM the method repopulates
+                            // `func_call_stack` / `m_scope_stack` and keeps
+                            // its own naming below.
+                            let class_m: Option<String> = if !self.monitor_m_active
+                                && self.func_call_stack.is_empty()
+                                && self.m_scope_stack.is_empty()
+                            {
+                                match self.class_context_stack.last() {
+                                    Some(Some(cname)) => {
+                                        let creation = self
+                                            .this_stack
+                                            .last()
+                                            .copied()
+                                            .flatten()
+                                            .and_then(|h| {
+                                                self.heap.get(h).and_then(|o| o.as_ref())
+                                            })
+                                            .map(|i| i.creation_scope.clone())
+                                            .unwrap_or_default();
+                                        let method = self
+                                            .static_local_syncs
+                                            .last()
+                                            .map(|(n, _)| n.clone())
+                                            .unwrap_or_default();
+                                        let mut out = self.module.name.clone();
+                                        if !creation.is_empty() {
+                                            out.push('.');
+                                            out.push_str(&creation);
+                                        }
+                                        out.push('.');
+                                        out.push_str(cname);
+                                        if !method.is_empty() {
+                                            out.push('.');
+                                            out.push_str(&method);
+                                        }
+                                        Some(out)
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(cm) = class_m {
+                                result.push_str(&cm);
+                            } else {
                             let inst_scope = if !self.m_block_scope.is_empty() {
                                 Some(self.m_block_scope.as_str())
                             } else if !self.current_scope.is_empty() {
@@ -60445,6 +60656,7 @@ impl Simulator {
                                 result.push_str(&format!("{}.{}", scope, fname));
                             } else {
                                 result.push_str(&self.module.name);
+                            }
                             }
                         }
                         _ => {
@@ -60692,6 +60904,11 @@ impl Simulator {
                 result.push(c);
             }
         }
+        if let Some(fp) = compact_from.take() {
+            let tail = Self::compact_p(&result[fp..]);
+            result.truncate(fp);
+            result.push_str(&tail);
+        }
         (result, ai)
     }
 
@@ -60703,7 +60920,21 @@ impl Simulator {
             return;
         }
         let queued = std::mem::take(&mut self.pending_strobes);
-        for (name, args) in queued {
+        for (name, args, scope, suffix) in queued {
+            // Reinstall the ARMING context (like the $monitor re-render): the
+            // postponed-region drain runs under whatever process happened to
+            // finish last, so `%m` and hierarchical argument names must
+            // resolve against the instance that executed the $strobe — a
+            // strobe in a module bound under `u_dut.x` names that path, not
+            // the top module.
+            let saved_block = std::mem::replace(&mut self.m_block_scope, scope.clone());
+            let saved_active = self.monitor_m_active;
+            let saved_suffix = std::mem::replace(&mut self.monitor_m_suffix, suffix);
+            self.monitor_m_active = true;
+            let saved_hint = self.name_resolve_hint.borrow().clone();
+            if !scope.is_empty() {
+                *self.name_resolve_hint.borrow_mut() = Some(scope);
+            }
             if let Some(radix_suffix) = name.strip_prefix("$fstrobe") {
                 // §21.2.2 $fstrobeX(fd, fmt, …): format with $strobeX radix
                 // rules, write to the file descriptor in args[0].
@@ -60714,6 +60945,10 @@ impl Simulator {
                 self.record_output(m.clone());
                 self.stdout_writeln(&m);
             }
+            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            self.monitor_m_suffix = saved_suffix;
+            self.monitor_m_active = saved_active;
+            self.m_block_scope = saved_block;
         }
     }
 
@@ -61984,6 +62219,17 @@ impl Simulator {
                 || this.module.arrays_2d.contains_key(name)
                 || this.module.arrays_nd.contains_key(name)
                 || this.module.dynamic_arrays.contains(name)
+                // An UNPACKED STRUCT has no container signal — its leaves are
+                // the storage — so a hierarchical reference to the struct
+                // itself (a bound checker's `host_mod.payload` read via §23.8
+                // upward naming, then rendered by %p) found no "signal" and
+                // fell through to x. The struct-variable registry knows the
+                // container name.
+                || this.module.struct_members.contains_key(name)
+                // ... and when that registry is empty (submodule-local
+                // typedef structs), the declared-type table still knows the
+                // container by its scoped name.
+                || this.module.var_decl_types.contains_key(name)
         };
         if check_known_or_signal(&raw, self) {
             if raw.contains('.') {
@@ -62139,8 +62385,10 @@ impl Simulator {
         // the target's — and any enclosing scope's — signals by naming those
         // scopes (e.g. `dut_top.top_secret` from a monitor bound under
         // `dut_top.sub.core`).
-        if hier.path.len() > 1 && !self.module.instances.is_empty() {
-            let (first, rest) = raw.split_once('.').unwrap();
+        if (hier.path.len() > 1 || raw.contains('.')) && !self.module.instances.is_empty() {
+            let Some((first, rest)) = raw.split_once('.') else {
+                return raw;
+            };
             let exists = |name: &str, this: &Self| -> bool {
                 this.signal_name_to_id.contains_key(name) || check_known_or_signal(name, this)
             };
@@ -62154,14 +62402,23 @@ impl Simulator {
             let hint_owned = self.name_resolve_hint.borrow().clone();
             // Walk from the stable executing scope first; the transient
             // resolve hint is a fallback for call sites that only set it.
+            // The hint is a RATCHET (every resolution re-points it at the
+            // resolved signal's parent), so a block's second upward
+            // reference can start the walk from the wrong ancestor — add
+            // the edge/comb block's own scope as a last resort so
+            // `host.sig <= other_scope.x` still finds the host after the
+            // RHS resolution moved the hint.
             let mut starts: Vec<&str> = Vec::new();
             if !self.current_scope.is_empty() {
                 starts.push(self.current_scope.as_str());
             }
             if let Some(h) = hint_owned.as_deref() {
-                if !h.is_empty() && starts.first() != Some(&h) {
+                if !h.is_empty() && !starts.contains(&h) {
                     starts.push(h);
                 }
+            }
+            if !self.m_block_scope.is_empty() && !starts.contains(&self.m_block_scope.as_str()) {
+                starts.push(self.m_block_scope.as_str());
             }
             if starts.is_empty() {
                 starts.push("");
@@ -77106,6 +77363,70 @@ impl Simulator {
 
     /// Render one `%p` member value: strings as quoted text, reals as reals,
     /// everything else in decimal (LRM §21.2.1.7 assignment-pattern form).
+    /// §21.2.1.7 `%0p`: rewrite a `%p` assignment-pattern rendering into the
+    /// reference simulator's compact form — braces, member names and comma
+    /// separators drop out, values separate with single spaces
+    /// (`'{id:777, active:1}` -> `777 1`). Quoted strings pass through
+    /// verbatim, including any braces or commas inside them.
+    fn compact_p(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut it = s.chars().peekable();
+        let mut in_str = false;
+        let mut expect_name = false;
+        while let Some(c) = it.next() {
+            if in_str {
+                out.push(c);
+                if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_str = true;
+                    expect_name = false;
+                    out.push(c);
+                }
+                '\'' if it.peek() == Some(&'{') => {
+                    it.next();
+                    expect_name = true;
+                }
+                '}' => {}
+                ',' => {
+                    if it.peek() == Some(&' ') {
+                        it.next();
+                    }
+                    if !out.is_empty() && !out.ends_with(' ') {
+                        out.push(' ');
+                    }
+                    expect_name = true;
+                }
+                _ if expect_name && (c.is_ascii_alphabetic() || c == '_') => {
+                    // Possible `name:` label — drop it only if a ':' follows.
+                    let mut ident = String::new();
+                    ident.push(c);
+                    while it
+                        .peek()
+                        .is_some_and(|&n| n.is_ascii_alphanumeric() || n == '_')
+                    {
+                        ident.push(it.next().unwrap());
+                    }
+                    if it.peek() == Some(&':') {
+                        it.next();
+                    } else {
+                        out.push_str(&ident);
+                    }
+                    expect_name = false;
+                }
+                _ => {
+                    expect_name = false;
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
     fn render_p_value(v: &Value, is_string: bool) -> String {
         if is_string {
             format!("\"{}\"", v.to_sv_string())
@@ -79329,6 +79650,7 @@ impl Simulator {
                     properties: HashMap::default(),
                     type_bindings: HashMap::default(),
                     spec: None,
+                    creation_scope: self.active_instance_scope(),
                 }));
                 if kind == "semaphore" {
                     self.semaphores.insert(ch, 0);
@@ -89743,6 +90065,7 @@ impl Simulator {
             properties: HashMap::default(),
             type_bindings: HashMap::default(),
             spec: None,
+            creation_scope: self.active_instance_scope(),
         };
         // §8.25: map the specialization's `#(...)` args onto the leaf
         // class's parameters BY NAME (type and value params interleave in
@@ -90230,6 +90553,7 @@ impl Simulator {
                         properties: HashMap::default(),
                         type_bindings: HashMap::default(),
                     spec: None,
+                    creation_scope: self.active_instance_scope(),
                     }));
                     if kind == "semaphore" {
                         self.semaphores.insert(ch, 0);
@@ -97986,6 +98310,27 @@ impl Simulator {
                     }
                 }
                 self.this_stack.push(Some(handle));
+                // §23.8 / §23.10.1: hierarchical names in the method body
+                // resolve upward from the object's CREATION scope, not the
+                // caller's. Installed as the resolve hint (the upward walk
+                // tries `current_scope` first, then the hint), so a proxy
+                // object built inside a bound module finds its binder's
+                // host signals even when the call comes from the top level.
+                let saved_resolve_hint = {
+                    let birth = self
+                        .heap
+                        .get(handle)
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.creation_scope.clone())
+                        .unwrap_or_default();
+                    if birth.is_empty() {
+                        None
+                    } else {
+                        let prev = self.name_resolve_hint.borrow().clone();
+                        *self.name_resolve_hint.borrow_mut() = Some(birth);
+                        Some(prev)
+                    }
+                };
                 self.push_local_frame(locals);
                 // Record the `local_stack` depth BEFORE this method's own
                 // frame (i.e. the count of caller frames) so that
@@ -98027,6 +98372,9 @@ impl Simulator {
                     self.string_signals.remove(n);
                 }
                 self.current_spec = saved_spec;
+                if let Some(prev) = saved_resolve_hint {
+                    *self.name_resolve_hint.borrow_mut() = prev;
+                }
                 self.local_iface_aliases.pop();
                 if self.parked_from_exec {
                     // The process was parked by exec_statement's Wait handler.
