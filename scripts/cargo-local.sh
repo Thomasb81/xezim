@@ -13,6 +13,13 @@ cd "$(dirname "$(readlink -f "$0")")/.."
 ARGS=("$@")
 [ ${#ARGS[@]} -eq 0 ] && ARGS=(build)
 
+# Local builds tune for this machine (CI's plain `cargo` stays portable).
+# Prepend so a caller's RUSTFLAGS (e.g. frame pointers for profiling) wins
+# on conflicts. XEZIM_NO_NATIVE_CPU=1 opts out.
+if [ -z "${XEZIM_NO_NATIVE_CPU:-}" ]; then
+  export RUSTFLAGS="-C target-cpu=native ${RUSTFLAGS:-}"
+fi
+
 if [ -f ../xezim-core/Cargo.toml ]; then
   exec cargo \
     --config 'patch."https://github.com/aionhw/xezim-core.git".xezim-core.path="../xezim-core"' \

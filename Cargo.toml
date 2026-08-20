@@ -85,10 +85,11 @@ name = "xezim"
 path = "src/lib.rs"
 
 [profile.release]
-# LTO miscompiled the (since-removed) LLVM JIT path; kept off until
-# it is validated against the cranelift JIT. The ~5-10% perf cost is
-# acceptable; the interpreter hot path was already memory-bound.
-lto = false
+# Thin-LTO: the LLVM-JIT miscompile that forced lto=false is gone with
+# that backend; cross-crate inlining of xezim-core Value accessors
+# (raw_bits was 6% of a CoreMark run un-inlined) is worth the build time.
+# Validated against the cranelift JIT + full suites on re-enable.
+lto = "thin"
 codegen-units = 1
 opt-level = 3
 debug = "line-tables-only"
