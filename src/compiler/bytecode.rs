@@ -15,7 +15,7 @@ const MAX_INLINE_DEPTH: usize = 8;
 /// A register in the bytecode VM. Registers hold Values. The compact u16
 /// encoding keeps each instruction at 24 bytes; the allocator uses a wider
 /// counter and falls back before an ID would overflow this representation.
-type RegId = u16;
+pub type RegId = u16;
 
 /// A signal-table index inside an instruction. `u32`, not `usize`: the
 /// largest design measured here has 35.1 M signals and `u32` covers 4.29 B,
@@ -1399,6 +1399,17 @@ impl<'a> BytecodeCompiler<'a> {
             self.bail("Expr_Call_ports");
             return None;
         }
+        // REAL-typed formals or return: register binding resizes through
+        // integral widths, which destroys real semantics (an integral actual
+        // must CONVERT to the real formal per §13.3.1, not bit-copy). The
+        // AST call path does this correctly; stay on it.
+        let dt_is_real = |dt: &crate::ast::types::DataType| {
+            crate::compiler::elaborate::is_type_real(dt)
+        };
+        if dt_is_real(&fd.return_type) || fd.ports.iter().any(|p| dt_is_real(&p.data_type)) {
+            self.bail("Expr_Call_real");
+            return None;
+        }
         // Only inline a function that is PURE IN ITS ARGUMENTS: every name its
         // body reads must be a formal, one of its own locals, or a constant.
         // A function that reads module signals must NOT be inlined here — the
@@ -2332,6 +2343,13 @@ impl<'a> BytecodeCompiler<'a> {
                 // lets the string decode helpers (get_csr_name-style: a big
                 // case of returns with a formatted default) inline at all.
                 ExprKind::SystemCall { name, args } => {
+                    // Casts desugar to these; the FIRST argument is the
+                    // target type/size NAME (not a data read), so only the
+                    // operand arguments gate purity — `u8v_t'(128'(x))` kept
+                    // branding its whole function impure.
+                    if matches!(name.as_str(), "$__xz_named_cast" | "$__xz_size_cast") {
+                        return args.iter().skip(1).all(|a| expr_ok(a, bound, me));
+                    }
                     matches!(
                         name.as_str(),
                         "$sformatf" | "$psprintf" | "$signed" | "$unsigned"
@@ -4277,6 +4295,13 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn lookup_array_name(&self, hier: &HierarchicalIdentifier) -> Option<String> {
+        // An ASSOCIATIVE array is never a dense array, whatever tables its
+        // name also appears in: a dense LoadArrayElem keyed by (say) a string
+        // literal reads garbage. Assoc lvalues have their own path
+        // (`is_assoc_target`); reads that land here must bail instead.
+        if self.is_assoc_target(hier) {
+            return None;
+        }
         let raw = Self::hier_raw_name(hier);
         if self.arrays.contains_key(&raw) {
             return Some(raw);
@@ -5580,6 +5605,20 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::Move(r, src));
                     return Some(r);
                 }
+                // A REAL-valued parameter wins over its signal-table twin: a
+                // header parameter gets a placeholder signal entry whose
+                // stored Value is integral/x, so loading the signal compared
+                // raw bits against a real literal and `r1 != 5.0` on
+                // `parameter real r1 = 5.0` came out true. The parameter
+                // table is authoritative and carries the f64. Integral
+                // parameters keep the historical signal-first order.
+                if let Some(v) = self.lookup_param_value(hier) {
+                    if v.is_real {
+                        let r = self.alloc_reg();
+                        self.emit(Insn::LoadConst(r, Box::new(v)));
+                        return Some(r);
+                    }
+                }
                 if let Some(id) = self.lookup_signal_id(hier) {
                     let r = self.alloc_reg();
                     if self.signal_signed[id] {
@@ -5849,6 +5888,32 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::LogOr(t1, nl, r));
                         self.emit(Insn::LogOr(dest, nr, l));
                         self.emit(Insn::LogAnd(dest, t1, dest));
+                    }
+                    // §6.16 / Table 6-9: `==`/`!=` on STRING operands are
+                    // 2-STATE textual compares. The integral Eq on the
+                    // 1024-bit packed storage returned X whenever either
+                    // side's unused capacity was X padding — an empty-string
+                    // compare always was. Same StrOp routing as the
+                    // relational arm below.
+                    BinaryOp::Eq | BinaryOp::Neq
+                        if self.expr_is_string_static(left)
+                            && self.expr_is_string_static(right) =>
+                    {
+                        let cmp = self.alloc_reg();
+                        self.emit(Insn::StrOp(
+                            cmp,
+                            StrOpKind::Compare,
+                            Box::new(vec![l, r]),
+                        ));
+                        let z = self.alloc_reg();
+                        let mut zero = Value::from_u64(0, 32);
+                        zero.is_signed = true;
+                        self.emit(Insn::LoadConst(z, Box::new(zero)));
+                        self.emit(if matches!(op, BinaryOp::Eq) {
+                            Insn::Eq(dest, cmp, z)
+                        } else {
+                            Insn::Neq(dest, cmp, z)
+                        });
                     }
                     BinaryOp::Eq => self.emit(Insn::Eq(dest, l, r)),
                     BinaryOp::Neq => self.emit(Insn::Neq(dest, l, r)),
@@ -6128,6 +6193,15 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 // Array element access
                 if let ExprKind::Ident(hier) = &expr.kind {
+                    // An ASSOCIATIVE array element has no dense storage and no
+                    // bit offset: falling through compiled `aa["bob"]` as a
+                    // BIT-SELECT of the array's placeholder signal, with the
+                    // packed string as the bit index. Fail the compile so the
+                    // read stays on the AST path.
+                    if self.is_assoc_target(hier) {
+                        self.bail("assoc_elem_read");
+                        return None;
+                    }
                     if let Some(name) = self.lookup_array_name(hier) {
                         let idx_reg = self.compile_expr(index, 0)?;
                         let dest = self.alloc_reg();
@@ -7938,9 +8012,12 @@ impl<'a> BytecodeCompiler<'a> {
             // cont-assign `(1.0/4.4)*1000.0` into integer `1/4*1000 = 0` (the
             // PLL clamp-mode `vcofbperiod` went to 0 → a #0 vclk livelock).
             NumberLiteral::Real(f) => Some(Value::from_f64(*f)),
-            // Time literal magnitude in tick units (1 ns), matching the
-            // interpreter's value-context handling.
-            NumberLiteral::Time(s) => Some(Value::from_u64((*s * 1e9) as u64, 64)),
+            // A time literal's VALUE depends on the active scope's timescale
+            // (§5.8: `30000ps` under 1ns/1ps is 30, not 30000 ns ticks) —
+            // context this compiler does not carry. The old hardcoded ×1e9
+            // silently mis-scaled every non-ns scope; decline instead so the
+            // AST path (which scales per scope) stays authoritative.
+            NumberLiteral::Time(_) => None,
             // §5.7.1: unbased-unsized literal — a 1-bit FILL value; the Value
             // binary ops and resize replicate it to the consuming context.
             NumberLiteral::UnbasedUnsized(c) => Some(Value::fill_of(*c)),
