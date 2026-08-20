@@ -151,6 +151,10 @@ mod mailbox_method_blocking;
 mod spec_static_and_pkg_queue;
 #[path = "misc/base1_packed_index.rs"]
 mod base1_packed_index;
+#[path = "misc/packed_elem_fn_inline.rs"]
+mod packed_elem_fn_inline;
+#[path = "misc/param_dim_array_nba.rs"]
+mod param_dim_array_nba;
 #[path = "misc/new_ctor_vs_shallow_copy.rs"]
 mod new_ctor_vs_shallow_copy;
 #[path = "misc/assoc_dotted_key.rs"]
