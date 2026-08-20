@@ -5648,6 +5648,239 @@ impl Simulator {
         }
     }
 
+    /// §9.4.2: an edge term that SELECTS into a signal — `posedge vec[1]`,
+    /// or the C910 PLIC shape `posedge arr[i][j]` (bit j of unpacked element
+    /// i) from an inlined `.clk(arr[i][j])` port connection — cannot be
+    /// expressed by the signal-id edge machinery, which watches a whole
+    /// signal's LSB. The base-name fallback silently watched the WRONG BIT
+    /// (or, for an unpacked base, resolved to no signal at all and the term
+    /// was dropped — a dead clock: C910's PLIC IE registers never latched
+    /// and cmark hung on the retire watchdog).
+    ///
+    /// Rewrite each such term to a synthesized 1-bit alias net driven by the
+    /// select expression: `assign __xz_edgesel<N> = arr[i][j];` and
+    /// `posedge __xz_edgesel<N>`. The alias updates in the same delta as its
+    /// operands (ordinary comb entry), so edge timing is unchanged. Only
+    /// constant indices rewrite; anything else keeps the old behavior.
+    fn rewrite_edge_select_sensitivities(module: &mut ElaboratedModule) {
+        fn const_index(e: &Expression) -> Option<i64> {
+            match &e.kind {
+                ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                    value.replace('_', "").parse::<i64>().ok()
+                }
+                ExprKind::Paren(inner) => const_index(inner),
+                _ => None,
+            }
+        }
+        // Peel an Index chain down to its base Ident; indices returned
+        // OUTERMOST-LAST (declaration order).
+        fn peel<'a>(mut e: &'a Expression, idxs: &mut Vec<i64>) -> Option<String> {
+            loop {
+                match &e.kind {
+                    ExprKind::Paren(inner) => e = inner,
+                    ExprKind::Index { expr, index } => {
+                        idxs.push(const_index(index)?);
+                        e = expr;
+                    }
+                    ExprKind::Ident(h) => {
+                        return Some(
+                            h.path
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("."),
+                        );
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        let mk_ident = |name: &str, span: crate::ast::Span| -> Expression {
+            Expression::new(
+                ExprKind::Ident(HierarchicalIdentifier {
+                    root: None,
+                    path: vec![HierPathSegment {
+                        name: crate::ast::Identifier {
+                            name: name.to_string(),
+                            span,
+                        },
+                        selects: Vec::new(),
+                    }],
+                    span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
+                span,
+            )
+        };
+        let mut aliases: HashMap<String, String> = HashMap::default(); // canon expr -> alias
+        let mut new_assigns: Vec<super::elaborate::ContinuousAssignment> = Vec::new();
+        let mut new_signals: Vec<String> = Vec::new();
+        let dbg = std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some();
+        // #7 keeps child always blocks PENDING (un-rewritten) until
+        // classification — but the select-on-port shape this pass fixes is
+        // only visible AFTER the per-instance rewrite. Materialize the always
+        // blocks here (pre-#7 eager semantics for this vec only; initial/CA
+        // stay lazy). classify_always_blocks drains an empty pending vec.
+        let pending = std::mem::take(&mut module.pending_always);
+        for p in pending {
+            module.always_blocks.push(p.materialize());
+        }
+        for ab in &mut module.always_blocks {
+            let StatementKind::TimingControl {
+                control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                ..
+            } = &mut ab.stmt.kind
+            else {
+                if dbg {
+                    eprintln!(
+                        "[EDGESEL] block scope='{}' not a TimingControl/EventExpr: {:?}",
+                        ab.scope,
+                        std::mem::discriminant(&ab.stmt.kind)
+                    );
+                }
+                continue;
+            };
+            for ee in exprs.iter_mut() {
+                if !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
+                    continue;
+                }
+                let mut idxs: Vec<i64> = Vec::new();
+                let Some(base) = peel(&ee.expr, &mut idxs) else {
+                    if dbg {
+                        eprintln!("[EDGESEL] scope='{}' peel failed: {:?}", ab.scope, ee.expr.kind);
+                    }
+                    continue;
+                };
+                if dbg {
+                    eprintln!("[EDGESEL] scope='{}' base={} idxs={:?}", ab.scope, base, idxs);
+                }
+                if idxs.is_empty() {
+                    continue;
+                }
+                idxs.reverse(); // declaration order: base[idxs[0]][idxs[1]]…
+                // The base must name a real signal or unpacked array (either
+                // spelled as-is post-inline or under the block's scope);
+                // events keep their own element machinery.
+                let spellings: Vec<String> = if ab.scope.is_empty() {
+                    vec![base.clone()]
+                } else {
+                    vec![format!("{}.{}", ab.scope, base), base.clone()]
+                };
+                let mut resolved: Option<String> = None;
+                let mut is_event = false;
+                'sp: for sp in &spellings {
+                    let mut name = sp.clone();
+                    if module.events.contains(name.as_str()) {
+                        is_event = true;
+                        break;
+                    }
+                    for &ix in &idxs {
+                        name = format!("{}[{}]", name, ix);
+                        if module.events.contains(name.as_str()) {
+                            is_event = true;
+                            break 'sp;
+                        }
+                    }
+                    if module.signals.contains_key(sp.as_str())
+                        || module.arrays.contains_key(sp.as_str())
+                    {
+                        resolved = Some(sp.clone());
+                        break;
+                    }
+                }
+                if is_event {
+                    continue;
+                }
+                let Some(resolved) = resolved else {
+                    if dbg {
+                        let leaf = base.rsplit('.').next().unwrap_or(&base);
+                        let sig_like: Vec<&String> = module
+                            .signals
+                            .keys()
+                            .filter(|k| k.ends_with(leaf))
+                            .take(3)
+                            .collect();
+                        let arr_like: Vec<&String> = module
+                            .arrays
+                            .keys()
+                            .filter(|k| k.ends_with(leaf))
+                            .take(3)
+                            .collect();
+                        eprintln!(
+                            "[EDGESEL] scope='{}' base '{}' unresolved; signals~{:?} arrays~{:?}",
+                            ab.scope, base, sig_like, arr_like
+                        );
+                    }
+                    continue;
+                };
+                // Skip the shape that already works: ONE index on an
+                // unpacked array whose element IS the watched signal.
+                if idxs.len() == 1 && module.arrays.contains_key(resolved.as_str()) {
+                    continue;
+                }
+                let canon = format!("{}|{:?}", resolved, idxs);
+                let span = ee.expr.span;
+                // The alias RHS is the ORIGINAL select expression (with the
+                // base respelled to the resolved name) — the cont-assign
+                // evaluator handles array-element and bit selects natively.
+                let mut rhs = mk_ident(&resolved, span);
+                for &ix in &idxs {
+                    rhs = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(rhs),
+                            index: Box::new(Expression::new(
+                                ExprKind::Number(NumberLiteral::Integer {
+                                    size: None,
+                                    signed: false,
+                                    base: NumberBase::Decimal,
+                                    value: ix.to_string(),
+                                    cached_val: std::cell::Cell::new(None),
+                                }),
+                                span,
+                            )),
+                        },
+                        span,
+                    );
+                }
+                let alias = aliases.entry(canon).or_insert_with(|| {
+                    let alias = format!("__xz_edgesel{}", new_signals.len());
+                    new_signals.push(alias.clone());
+                    new_assigns.push(super::elaborate::ContinuousAssignment {
+                        lhs: mk_ident(&alias, span),
+                        rhs,
+                        delay: 0,
+                        rhs_parent_scoped: false,
+                    });
+                    alias
+                });
+                if dbg {
+                    eprintln!(
+                        "[EDGESEL] scope='{}' {}{:?} -> {}",
+                        ab.scope, resolved, idxs, alias
+                    );
+                }
+                ee.expr = mk_ident(alias, ee.expr.span);
+            }
+        }
+        for name in new_signals {
+            module.signals.insert(
+                name.clone(),
+                Signal {
+                    name,
+                    width: 1,
+                    is_signed: false,
+                    is_real: false,
+                    is_const: false,
+                    direction: None,
+                    value: Value::new(1),
+                    type_name: None,
+                },
+            );
+        }
+        module.continuous_assigns.extend(new_assigns);
+    }
+
     pub fn new(mut module: ElaboratedModule, max_time: u64) -> Self {
         let phase_total = std::time::Instant::now();
         // The simulator counts ticks of `module.tick_s` (the finest timescale
@@ -5696,6 +5929,7 @@ impl Simulator {
 
         let phase_materialize = std::time::Instant::now();
         Self::materialize_implicit_contassign_nets(&mut module);
+        Self::rewrite_edge_select_sensitivities(&mut module);
         // §18.3/§18.4: publish class-local `typedef enum`/`typedef struct`
         // types into the module type tables so a rand property declared with
         // one gets its enum-member domain / packed bit layout.
@@ -11856,16 +12090,20 @@ impl Simulator {
         let ca_count_before = self.prof_settle_ca_count;
         let ab_ns_before = self.prof_settle_ab_ns;
         let ab_count_before = self.prof_settle_ab_count;
+        // Baseline edge snapshot BEFORE the time-0 settle: prev values = the
+        // PRE-settle actual state (x for uninitialized regs, z for undriven
+        // nets, declared initializers already applied). A signal the settle
+        // never touches compares equal (x==x — no phantom edge, which is what
+        // the old zero-initialized prev arrays got wrong), while a signal a
+        // cont-assign RESOLVES during the settle (`wire one = 1'b1`, X→1) is
+        // a genuine §10.3 update the first edge scan must deliver: the C910
+        // IDU's `always @(dep_bit)` decode blocks are clocked by exactly such
+        // constant nets, and the reference fires them once at t0. Snapshotting
+        // AFTER the settle erased that change and the blocks never ran.
+        self.snapshot_edge_signals();
         self.in_pre_process_settle = true;
         self.settle_combinatorial();
         self.in_pre_process_settle = false;
-        // Baseline edge snapshot: prev values = the SETTLED initial state
-        // (x for uninitialized regs, z for undriven nets). Without this the
-        // first check_edges compared against zero-initialized prev arrays and
-        // delivered phantom 0->x/0->z "edges" at time 0 — an `always @(y)`
-        // whose y never changed fired once with y=x/z (a reference simulator
-        // stays parked until a REAL change).
-        self.snapshot_edge_signals();
         mark_compile_phase("time-0 settle", &mut compile_phase_start);
         let dt = t_settle0.elapsed();
         if dt.as_millis() > 100 {
@@ -35034,6 +35272,38 @@ impl Simulator {
         self.delayed_updates.push((target_time, id, val));
     }
 
+    /// Base signal id + (physical lo bit, width) for a CONSTANT select LHS —
+    /// `sig[hi:lo]` or `sig[bit]` on a plain vector. Zero-based declared
+    /// ranges only (a non-zero-based base would need rebasing; returning None
+    /// keeps the caller's fallback behavior). Used by the delayed
+    /// cont-assign path, which historically handled bare idents only.
+    fn delayed_lhs_select_range(&mut self, lhs: &Expression) -> Option<(usize, u32, u32)> {
+        let (base, hi, lo) = match &lhs.kind {
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind: RangeKind::Constant,
+            } => {
+                let l = self.eval_expr(left).to_u64()?;
+                let r = self.eval_expr(right).to_u64()?;
+                (expr, l.max(r) as u32, l.min(r) as u32)
+            }
+            ExprKind::Index { expr, index } => {
+                let i = self.eval_expr(index).to_u64()? as u32;
+                (expr, i, i)
+            }
+            _ => return None,
+        };
+        let ExprKind::Ident(_) = &base.kind else { return None };
+        let id = self.get_lhs_signal_id(base)?;
+        let w = self.signal_widths[id] as u32;
+        if hi >= w {
+            return None;
+        }
+        Some((id, lo, hi - lo + 1))
+    }
+
     /// Get the signal ID for a simple LHS identifier expression.
     fn get_lhs_signal_id(&self, lhs: &Expression) -> Option<usize> {
         if let ExprKind::Ident(hier) = &lhs.kind {
@@ -37963,6 +38233,31 @@ impl Simulator {
                     } else {
                         self.cancel_delayed(id);
                     }
+                } else if let Some((base_id, lo, sel_w)) =
+                    self.delayed_lhs_select_range(lhs)
+                {
+                    // §10.3.3 delayed assign with a SELECT LHS
+                    // (`assign #1 nxt_st_dly[8:0] = nxt_st[8:0];` — the C910
+                    // AXI-to-AHB bridge's FSM next-state). `get_lhs_signal_id`
+                    // is bare-Ident-only, so this silently DROPPED the write:
+                    // the bridge's state register read z forever, its rvalid
+                    // X-poisoned the SoC read arbiter, and the first
+                    // speculative fetch into the error region deadlocked the
+                    // whole read path. Splice the slice into the current
+                    // value and schedule the merged whole-signal update — the
+                    // full-range spelling (the common case) is exact.
+                    let sel_val = val.resize(sel_w);
+                    let cur_slice = self.signal_table[base_id]
+                        .range_select((lo + sel_w - 1) as usize, lo as usize);
+                    if cur_slice != sel_val {
+                        let mut merged = self.signal_table[base_id].clone();
+                        for i in 0..sel_w as usize {
+                            merged.set_bit(lo as usize + i, sel_val.get_bit(i));
+                        }
+                        self.schedule_delayed_with_delay(base_id, merged, delay);
+                    } else {
+                        self.cancel_delayed(base_id);
+                    }
                 }
             } else if let Some(id) = lhs_id {
                 let width = self.signal_widths[id];
@@ -38935,6 +39230,24 @@ impl Simulator {
                             self.schedule_delayed_with_delay(id, val, delay);
                         } else {
                             self.cancel_delayed(id);
+                        }
+                    } else if let Some((base_id, lo, sel_w)) =
+                        self.delayed_lhs_select_range(lhs)
+                    {
+                        // Select-LHS delayed assign — same fix as the other
+                        // ContAssign eval site (see delayed_lhs_select_range):
+                        // this used to DROP the write silently.
+                        let sel_val = val.resize(sel_w);
+                        let cur_slice = self.signal_table[base_id]
+                            .range_select((lo + sel_w - 1) as usize, lo as usize);
+                        if cur_slice != sel_val {
+                            let mut merged = self.signal_table[base_id].clone();
+                            for i in 0..sel_w as usize {
+                                merged.set_bit(lo as usize + i, sel_val.get_bit(i));
+                            }
+                            self.schedule_delayed_with_delay(base_id, merged, delay);
+                        } else {
+                            self.cancel_delayed(base_id);
                         }
                     }
                 } else if let Some(id) = lhs_id {
@@ -58729,9 +59042,18 @@ impl Simulator {
                 let mut filter_scopes: Vec<String> = Vec::new();
                 for a in args.iter().skip(1) {
                     if let ExprKind::Ident(hier) = &a.kind {
-                        // Resolve to fully-qualified hierarchical name
-                        // by joining the hier path.
-                        let s = self.resolve_hier_name(hier);
+                        // The argument names a SCOPE path. Join it verbatim —
+                        // `resolve_hier_name` is a SIGNAL resolver whose
+                        // scope-stripping heuristics collapsed
+                        // `tb.u_m.u_i` to the leaf `u_i`, so a hierarchical
+                        // `$dumpvars(0, top.a.b)` selected nothing.
+                        // `dump_filter_prefixes` strips the top-module prefix.
+                        let s = hier
+                            .path
+                            .iter()
+                            .map(|seg| seg.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
                         if !s.is_empty() {
                             filter_scopes.push(s);
                         }
@@ -65002,9 +65324,9 @@ impl Simulator {
 
         let sig_names = self.dump_signal_names(&self.vcd_filter_scopes, self.vcd_dump_depth);
         eprintln!(
-            "[VCD] dumping {} signals (filter_scopes={}, depth={})",
+            "[VCD] dumping {} signals (filter_scopes={:?}, depth={})",
             sig_names.len(),
-            self.vcd_filter_scopes.len(),
+            self.vcd_filter_scopes,
             self.vcd_dump_depth
         );
 

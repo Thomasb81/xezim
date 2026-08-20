@@ -151,6 +151,8 @@ mod mailbox_method_blocking;
 mod spec_static_and_pkg_queue;
 #[path = "misc/base1_packed_index.rs"]
 mod base1_packed_index;
+#[path = "misc/edge_and_delay_select_fixes.rs"]
+mod edge_and_delay_select_fixes;
 #[path = "misc/packed_elem_fn_inline.rs"]
 mod packed_elem_fn_inline;
 #[path = "misc/param_dim_array_nba.rs"]
