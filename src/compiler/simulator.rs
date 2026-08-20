@@ -2891,6 +2891,18 @@ impl std::ops::DerefMut for SignalMap {
     }
 }
 
+#[derive(Clone)]
+enum CombPlan {
+    Unresolved,
+    /// Two-state island. The per-eval guard can still bail dynamically
+    /// (forces, X inputs); the plan then falls through JIT-then-interp,
+    /// exactly like the unplanned dispatch.
+    Ts(std::sync::Arc<super::bytecode::TwoStateBlock>),
+    #[cfg(feature = "jit")]
+    Jit(super::jit::JitFn),
+    Interp,
+}
+
 pub struct Simulator {
     pub signals: SignalMap,
     /// Signals currently under force/release control (LRM §9.3.1).
@@ -4380,6 +4392,13 @@ pub struct Simulator {
     /// entry, `Untried` until first evaluation. Cleared whenever the entry
     /// list is rebuilt.
     ts_comb: Vec<TsSlot>,
+    /// Per-comb-entry settle dispatch plan, resolved on first evaluation.
+    /// Collapses the per-eval chain (env OnceLock, TsSlot bounds+match,
+    /// comb_jit_fns bounds+copy, strike bookkeeping) — measured 15% of a
+    /// JIT'd ibex run as settle-loop self time — into one enum load.
+    /// `ts_comb`/`comb_jit_fns` stay the sources of truth at resolution;
+    /// a JIT strike-out downgrades the plan in place.
+    comb_plan: Vec<CombPlan>,
     /// Same, for edge blocks (indexed like `compiled_edge_blocks`).
     ts_edge: Vec<TsSlot>,
     /// Two-state scratch register file (u64 words).
@@ -7201,6 +7220,7 @@ impl Simulator {
             comb_time0_deferred_done: false,
             comb_dep_offsets: Vec::new(),
             ts_comb: Vec::new(),
+            comb_plan: Vec::new(),
             ts_edge: Vec::new(),
             ts_regs: Vec::new(),
             ts_wregs: Vec::new(),
@@ -8244,8 +8264,8 @@ impl Simulator {
         profile: Option<&Phase2Profile>,
         islands: Option<&[usize]>,
     ) -> Result<(usize, usize), String> {
-        use std::collections::HashMap;
         use std::io::Write;
+        use xezim_core::hasher::HashMap;
 
         // Step 1: collect parallel-eligible block ids. With Phase 3
         // islands, dedup by island root so each super-vertex (group
@@ -11402,7 +11422,11 @@ impl Simulator {
         // pointer in `set_inline_bits_storage`.  Otherwise Stage 2's
         // inline LoadSignal codegen falls back to the FFI path because
         // the storage is empty at JIT-compile time.
-        if std::env::var("XEZIM_INLINE_BITS").ok().as_deref() == Some("1")
+        // SoA planes are now AUTHORITATIVE-COHERENT by default: always
+        // allocated, maintained by write_sig!/the plane-sync helpers, and
+        // read by the native load paths. XEZIM_INLINE_BITS=0 opts out
+        // (diagnostic only — the FFI load bridges then serve everything).
+        if std::env::var("XEZIM_INLINE_BITS").ok().as_deref() != Some("0")
             && self.signal_inline_bits.is_empty()
         {
             let n = self.signal_table.len();
@@ -15947,8 +15971,13 @@ impl Simulator {
                 if !safe[idx] {
                     continue;
                 }
-                let compiled_fn =
-                    jm.try_compile_with_xz(&cb.instructions, cb.num_regs, xz_ptr, xz_len);
+                let compiled_fn = jm.try_compile_with_xz_hint(
+                    &cb.instructions,
+                    cb.num_regs,
+                    xz_ptr,
+                    xz_len,
+                    self.comb_entries[idx].cold.scope_hint.as_deref(),
+                );
                 if compiled_fn.is_none() && std::env::var("XEZIM_JIT_BAIL_TRACE").is_ok() {
                     eprintln!(
                         "[JITSKIP] eidx={} insns={} first_unsupported={:?}",
@@ -16150,6 +16179,339 @@ impl Simulator {
     /// entry was fully evaluated in 2-state (the caller skips the 4-state
     /// stream); false = run the normal path (not lowerable, X present on a
     /// read, forces active, or warn-x bookkeeping needed).
+    /// ARMOR-style template census (XEZIM_TEMPLATE_CENSUS=1): canonicalize
+    /// each compiled block's signal/array ids to first-use indices, hash the
+    /// canonical form (opcodes, registers, widths, constants, branch
+    /// targets), and report how much DYNAMIC execution the repeated
+    /// templates cover. This is the go/no-go measurement for generating one
+    /// parameterized native body per template instead of per block: worth
+    /// building if repeated templates cover >30-40% of native execution.
+    /// Wants XEZIM_COMB_PATHS=1 + XEZIM_EDGE_BLOCK_STATS=1 for the weights.
+    fn canon_block_hash(&self, cb: &super::bytecode::CompiledBlock) -> u64 {
+        use std::hash::{Hash, Hasher};
+        use super::bytecode::{ArrayOperand, Insn};
+        let mut h = std::hash::BuildHasher::build_hasher(
+            &xezim_core::hasher::DeterministicState::default(),
+        );
+        let mut sig_map: HashMap<u32, u32> = HashMap::default();
+        let mut arr_map: HashMap<usize, u32> = HashMap::default();
+        fn canon(map: &mut HashMap<u32, u32>, id: u32) -> u32 {
+            let next = map.len() as u32;
+            *map.entry(id).or_insert(next)
+        }
+        fn canon_arr(
+            map: &mut HashMap<usize, u32>,
+            smap: &mut HashMap<u32, u32>,
+            a: &ArrayOperand,
+        ) -> (u32, i64, i64) {
+            match a {
+                ArrayOperand::Dense { first_id, lo, hi, .. } => {
+                    let next = map.len() as u32;
+                    (*map.entry(*first_id).or_insert(next), *lo, *hi)
+                }
+                ArrayOperand::Named(n) => {
+                    // Name-keyed arrays canonicalize by first-use order too.
+                    let key = n.as_ptr() as usize;
+                    let next = map.len() as u32;
+                    (*map.entry(key).or_insert(next) | 0x8000_0000, 0, 0)
+                }
+            }
+            .into()
+        }
+        fn hv(h: &mut impl Hasher, v: &Value) {
+            let (b, x) = v.raw_bits();
+            (b, x, v.width, v.is_signed, v.is_real, v.is_fill).hash(h);
+        }
+        for insn in cb.instructions.iter() {
+            super::bytecode::insn_opcode_name(insn).hash(&mut h);
+            match insn {
+                Insn::LoadSignal(d, sig) | Insn::LoadSignalSigned(d, sig) => {
+                    (d, canon(&mut sig_map, *sig)).hash(&mut h)
+                }
+                Insn::LoadSignalBit(d, sig, b) => {
+                    (d, canon(&mut sig_map, *sig), b).hash(&mut h)
+                }
+                Insn::LoadSignalRange(d, sig, l, r) => {
+                    (d, canon(&mut sig_map, *sig), l, r).hash(&mut h)
+                }
+                Insn::BranchIfSignalFalse(sig, t, b) => {
+                    (canon(&mut sig_map, *sig), t, b).hash(&mut h)
+                }
+                Insn::BlockingAssign(sig, r, w) | Insn::NbaAssign(sig, r, w) => {
+                    (canon(&mut sig_map, *sig), r, w).hash(&mut h)
+                }
+                Insn::NbaAssignConst(sig, k, w) => {
+                    (canon(&mut sig_map, *sig), w).hash(&mut h);
+                    hv(&mut h, k);
+                }
+                Insn::BlockingAssignRange(sig, hi, lo, r)
+                | Insn::NbaAssignRange(sig, hi, lo, r) => {
+                    (canon(&mut sig_map, *sig), hi, lo, r).hash(&mut h)
+                }
+                Insn::BlockingAssignRangeDyn(sig, a, b, r)
+                | Insn::NbaAssignRangeDyn(sig, a, b, r) => {
+                    (canon(&mut sig_map, *sig), a, b, r).hash(&mut h)
+                }
+                Insn::BlockingAssignBitDyn(sig, i, r) | Insn::NbaAssignBitDyn(sig, i, r) => {
+                    (canon(&mut sig_map, *sig), i, r).hash(&mut h)
+                }
+                Insn::LoadArrayElem(d, arr, i) => {
+                    (d, canon_arr(&mut arr_map, &mut sig_map, arr), i).hash(&mut h)
+                }
+                Insn::BlockingAssignArray(arr, i, r, w) | Insn::NbaAssignArray(arr, i, r, w) => {
+                    (canon_arr(&mut arr_map, &mut sig_map, arr), i, r, w).hash(&mut h)
+                }
+                Insn::NbaAssignArrayRead(dst, arr, idx_sig, w) => {
+                    (
+                        canon(&mut sig_map, *dst),
+                        canon_arr(&mut arr_map, &mut sig_map, arr),
+                        canon(&mut sig_map, *idx_sig),
+                        w,
+                    )
+                        .hash(&mut h)
+                }
+                Insn::LoadConst(d, v) => {
+                    d.hash(&mut h);
+                    hv(&mut h, v);
+                }
+                Insn::BinOpConst(d, sr, k, kind) => {
+                    (d, sr, *kind as u8).hash(&mut h);
+                    hv(&mut h, k);
+                }
+                // Register-only / control insns carry no signal identity:
+                // their Debug form IS the canonical form.
+                other => format!("{:?}", other).hash(&mut h),
+            }
+        }
+        h.finish()
+    }
+
+    fn dump_template_census(&self) {
+        if std::env::var("XEZIM_TEMPLATE_CENSUS").is_err() {
+            return;
+        }
+        // (hash) -> (block count, total dyn execs, total insns exec'd, sample scope, insn len)
+        struct T {
+            blocks: u64,
+            execs: u64,
+            insn_execs: u64,
+            len: usize,
+            sample: String,
+        }
+        let mut map: HashMap<u64, T> = HashMap::default();
+        let mut total_execs: u64 = 0;
+        let mut total_insn_execs: u64 = 0;
+        let mut add = |map: &mut HashMap<u64, T>,
+                       hash: u64,
+                       execs: u64,
+                       len: usize,
+                       sample: &str| {
+            total_execs += execs;
+            total_insn_execs += execs * len as u64;
+            let e = map.entry(hash).or_insert_with(|| T {
+                blocks: 0,
+                execs: 0,
+                insn_execs: 0,
+                len,
+                sample: sample.to_string(),
+            });
+            e.blocks += 1;
+            e.execs += execs;
+            e.insn_execs += execs * len as u64;
+        };
+        for (eidx, entry) in self.comb_entries.iter().enumerate() {
+            let cb = match &entry.item {
+                CombItem::CompiledContAssign { compiled, .. }
+                | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled,
+                _ => continue,
+            };
+            let execs: u64 = self
+                .comb_path_counts
+                .get(eidx)
+                .map(|c| c.iter().sum())
+                .unwrap_or(0);
+            if execs == 0 {
+                continue;
+            }
+            let scope = entry.cold.scope_hint.as_deref().unwrap_or("?");
+            add(&mut map, self.canon_block_hash(cb), execs, cb.instructions.len(), scope);
+        }
+        for (bi, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
+            let Some(cb) = cb_opt else { continue };
+            let execs = self.edge_block_exec_counts.get(bi).copied().unwrap_or(0);
+            if execs == 0 {
+                continue;
+            }
+            add(&mut map, self.canon_block_hash(cb), execs, cb.instructions.len(), "edge");
+        }
+        let mut ts: Vec<(&u64, &T)> = map.iter().collect();
+        ts.sort_by_key(|(_, t)| std::cmp::Reverse(t.insn_execs));
+        let n_blocks: u64 = ts.iter().map(|(_, t)| t.blocks).sum();
+        let repeated_execs: u64 = ts.iter().filter(|(_, t)| t.blocks > 1).map(|(_, t)| t.execs).sum();
+        let repeated_insn_execs: u64 =
+            ts.iter().filter(|(_, t)| t.blocks > 1).map(|(_, t)| t.insn_execs).sum();
+        let top100_insn: u64 = ts.iter().take(100).map(|(_, t)| t.insn_execs).sum();
+        let max_mult = ts.iter().map(|(_, t)| t.blocks).max().unwrap_or(0);
+        eprintln!(
+            "[TEMPLATE] blocks={} templates={} max_multiplicity={}",
+            n_blocks,
+            ts.len(),
+            max_mult
+        );
+        eprintln!(
+            "[TEMPLATE] dyn evals: total={} in-repeated-templates={} ({:.1}%)",
+            total_execs,
+            repeated_execs,
+            100.0 * repeated_execs as f64 / total_execs.max(1) as f64
+        );
+        eprintln!(
+            "[TEMPLATE] dyn insns: total={} in-repeated-templates={} ({:.1}%) top100-templates={:.1}%",
+            total_insn_execs,
+            repeated_insn_execs,
+            100.0 * repeated_insn_execs as f64 / total_insn_execs.max(1) as f64,
+            100.0 * top100_insn as f64 / total_insn_execs.max(1) as f64
+        );
+        eprintln!("[TEMPLATE] top templates by dyn insns (mult x evals, len, sample):");
+        for (hash, t) in ts.iter().take(20) {
+            eprintln!(
+                "[TEMPLATE]   {:016x} mult={:<4} evals={:<10} len={:<5} insn_execs={:<12} {}",
+                hash, t.blocks, t.execs, t.len, t.insn_execs, t.sample
+            );
+        }
+    }
+
+    /// Resolve the dispatch plan for a comb entry: two-state island if the
+    /// block lowers, else the compiled native fn, else the interpreter.
+    /// Mirrors the decision order of the unplanned dispatch exactly.
+    fn resolve_comb_plan(
+        &mut self,
+        eidx: usize,
+        compiled: &super::bytecode::CompiledBlock,
+    ) -> CombPlan {
+        // Reuse try_two_state's lazy lowering slot (also keeps XEZIM_TWO_STATE
+        // and the XEZIM_TS_DBG bail reporting behavior identical).
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        let ts_on = *ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_TWO_STATE").as_deref(), Ok("0"))
+        });
+        if ts_on {
+            if eidx >= self.ts_comb.len() {
+                self.ts_comb.resize(eidx + 1, TsSlot::Untried);
+            }
+            if matches!(self.ts_comb[eidx], TsSlot::Untried) {
+                let lowered = super::bytecode::lower_two_state(
+                    compiled,
+                    &self.signal_widths,
+                    &self.signal_signed,
+                    &self.signal_real,
+                    &self.array_first_id,
+                );
+                self.ts_comb[eidx] = match lowered {
+                    Some(ts) => TsSlot::Yes(std::sync::Arc::new(ts)),
+                    None => TsSlot::No,
+                };
+            }
+            if let TsSlot::Yes(ts) = &self.ts_comb[eidx] {
+                return CombPlan::Ts(ts.clone());
+            }
+        }
+        #[cfg(feature = "jit")]
+        if let Some(Some(f)) = self.comb_jit_fns.get(eidx).copied() {
+            return CombPlan::Jit(f);
+        }
+        CombPlan::Interp
+    }
+
+    /// Execute a comb entry through its cached dispatch plan. Returns true
+    /// when the evaluation ran natively (two-state island or JIT); false
+    /// means the caller must interpret this evaluation. Semantics are the
+    /// exact unplanned chain: Ts guard-bail falls through to the JIT slot,
+    /// JIT rc 1 strikes toward disable, rc >= 2 disables immediately, and a
+    /// disabled JIT downgrades the plan so later evals skip the dead slot.
+    #[inline]
+    fn dispatch_comb_plan(
+        &mut self,
+        eidx: usize,
+        compiled: &super::bytecode::CompiledBlock,
+    ) -> bool {
+        if eidx >= self.comb_plan.len() {
+            self.comb_plan.resize(eidx + 1, CombPlan::Unresolved);
+        }
+        if matches!(self.comb_plan[eidx], CombPlan::Unresolved) {
+            let plan = self.resolve_comb_plan(eidx, compiled);
+            self.comb_plan[eidx] = plan;
+        }
+        match &self.comb_plan[eidx] {
+            CombPlan::Ts(ts) => {
+                let ts = ts.clone();
+                if self.ts_guard_and_exec(&ts) {
+                    if self.trace_comb_paths {
+                        self.note_comb_path(eidx, 0);
+                    }
+                    return true;
+                }
+                // Dynamic guard bail (force on a target, X input): the
+                // unplanned chain tried the JIT next. Rare path — the full
+                // slot lookup is fine here.
+                self.run_comb_jit_slot(eidx)
+            }
+            #[cfg(feature = "jit")]
+            CombPlan::Jit(_) => self.run_comb_jit_slot(eidx),
+            CombPlan::Interp | CombPlan::Unresolved => false,
+        }
+    }
+
+    /// The JIT half of the dispatch: call the slot if still armed, apply
+    /// the strike protocol, and downgrade the plan when the slot dies.
+    #[allow(unused_variables)]
+    fn run_comb_jit_slot(&mut self, eidx: usize) -> bool {
+        #[cfg(feature = "jit")]
+        {
+            if let Some(Some(f)) = self.comb_jit_fns.get(eidx).copied() {
+                let sp: *mut u8 = self as *mut Self as *mut u8;
+                match unsafe { f(sp) } {
+                    0 => {
+                        self.comb_jit_strikes[eidx] = 0;
+                        if self.trace_comb_paths {
+                            self.note_comb_path(eidx, 1);
+                        }
+                        if self.profile_timing {
+                            self.prof_comb_jit[0] += 1;
+                        }
+                        return true;
+                    }
+                    1 => {
+                        if self.profile_timing {
+                            self.prof_comb_jit[1] += 1;
+                        }
+                        const XZ_STRIKE_LIMIT: u8 = 8;
+                        let st = &mut self.comb_jit_strikes[eidx];
+                        *st = st.saturating_add(1);
+                        if *st >= XZ_STRIKE_LIMIT {
+                            self.comb_jit_fns[eidx] = None;
+                            self.downgrade_comb_plan(eidx);
+                        }
+                    }
+                    _ => {
+                        self.comb_jit_fns[eidx] = None;
+                        self.downgrade_comb_plan(eidx);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// A JIT slot died: re-plan without it (Ts entries keep their island —
+    /// only a Jit plan decays to Interp).
+    fn downgrade_comb_plan(&mut self, eidx: usize) {
+        #[cfg(feature = "jit")]
+        if matches!(self.comb_plan.get(eidx), Some(CombPlan::Jit(_))) {
+            self.comb_plan[eidx] = CombPlan::Interp;
+        }
+    }
+
     #[inline]
     fn note_comb_path(&mut self, eidx: usize, path: usize) {
         if eidx >= self.comb_path_counts.len() {
@@ -17021,11 +17383,13 @@ impl Simulator {
         let (dv, dx) = self.signal_table[id].raw_bits();
         if v != (dv & mask) || (dx & mask) != 0 {
             if self.signal_table[id].set_inline_bits(v, 0) {
+                self.sync_mirror(id);
                 self.signal_table[id].is_signed = self.signal_signed[id];
             } else {
                 let mut val = Value::from_u64(v, self.signal_widths[id]);
                 val.is_signed = self.signal_signed[id];
                 self.signal_table[id] = val;
+                self.sync_mirror(id);
             }
             if !self.dirty_signals[id] {
                 self.dirty_signals[id] = true;
@@ -17476,6 +17840,7 @@ impl Simulator {
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -17558,6 +17923,7 @@ impl Simulator {
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -17587,6 +17953,7 @@ impl Simulator {
                 delay_compiler.set_cast_widths(&self.cast_widths);
                 delay_compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                delay_compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                 delay_compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
                 delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -20591,6 +20958,7 @@ impl Simulator {
                         if src_v == (dst_v & mask) && src_x == (dst_x & mask) {
                             handled = true;
                         } else if self.signal_table[id].set_inline_bits(src_v, src_x) {
+                            self.sync_mirror(id);
                             self.signal_table[id].is_signed = self.signal_signed[id];
                             if !self.dirty_signals[id] {
                                 self.dirty_signals[id] = true;
@@ -20653,6 +21021,7 @@ impl Simulator {
                         let cur = self.signal_table[id].get_bit(idx);
                         if cur != bit {
                             self.signal_table[id].set_bit(idx, bit);
+                            self.sync_mirror(id);
                             self.signal_table[id].is_signed = self.signal_signed[id];
                             if !self.dirty_signals[id] {
                                 self.dirty_signals[id] = true;
@@ -20709,6 +21078,7 @@ impl Simulator {
                         };
                         if (base_v ^ new_v) & src_mask != 0 || (base_x ^ new_x) & src_mask != 0 {
                             self.signal_table[id].set_inline_bits(new_v, new_x);
+                            self.sync_mirror(id);
                             self.signal_table[id].is_signed = self.signal_signed[id];
                             if !self.dirty_signals[id] {
                                 self.dirty_signals[id] = true;
@@ -20784,6 +21154,7 @@ impl Simulator {
                         };
                         if (base_v ^ new_v) & src_mask != 0 || (base_x ^ new_x) & src_mask != 0 {
                             self.signal_table[id].set_inline_bits(new_v, new_x);
+                            self.sync_mirror(id);
                             self.signal_table[id].is_signed = self.signal_signed[id];
                             if !self.dirty_signals[id] {
                                 self.dirty_signals[id] = true;
@@ -21004,6 +21375,7 @@ impl Simulator {
                                 let src_bit = val.get_bit((bit_pos - low) as usize);
                                 if self.signal_table[eid].get_bit(bit_pos as usize) != src_bit {
                                     self.signal_table[eid].set_bit(bit_pos as usize, src_bit);
+                                    self.sync_mirror(eid);
                                     changed = true;
                                 }
                             }
@@ -21591,6 +21963,7 @@ impl Simulator {
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -21658,6 +22031,7 @@ impl Simulator {
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -22000,7 +22374,8 @@ impl Simulator {
         //
         // Only all-z signals are touched, so a net given a real initial value
         // (supply0/1, and the tri0/tri1 pull) keeps it.
-        for &id in &self.cont_driven {
+        let cont_driven: Vec<usize> = self.cont_driven.iter().copied().collect();
+        for id in cont_driven {
             if self.signal_real[id] {
                 continue;
             }
@@ -22014,6 +22389,7 @@ impl Simulator {
                 let mut v = Value::new(w); // all-x
                 v.is_signed = self.signal_signed[id];
                 self.signal_table[id] = v;
+                self.sync_mirror(id);
             }
         }
 
@@ -22232,6 +22608,7 @@ impl Simulator {
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                     compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -22846,6 +23223,223 @@ impl Simulator {
             }
         }
 
+        // Chain fusion: A writes s; B is s's ONLY comb reader and A its only
+        // writer — merge B's body into A's entry so the s hop skips the
+        // whole dispatch round trip (write -> mark dirty -> worklist ->
+        // re-dispatch). The ibex cone census: 51.8% of entries sit on such
+        // chains; fusing removes ~32% of entry dispatches. `s` is still
+        // WRITTEN (edge blocks / waiters / VCD see it); only its comb-CSR
+        // hop disappears, because the merged entry's read set drops `s`.
+        // B re-runs whenever A fires even if `s` did not change — comb
+        // bodies are idempotent, so that trades a possible extra eval for
+        // the dispatch. OPT-IN (XEZIM_FUSE_CHAINS=1): measured on ibex the
+        // guarded merge is timing-neutral-to-slightly-negative — the
+        // dispatch-plan cache already collected the cheap dispatches, and
+        // the safety guards (no sens widening, no feedback; the unguarded
+        // form was 11x SLOWER from union-sensitivity over-triggering)
+        // exclude most census candidates. Kept for designs with long
+        // pass-through chains.
+        if matches!(std::env::var("XEZIM_FUSE_CHAINS").as_deref(), Ok("1")) {
+            let n = entries.len();
+            let mergeable = |e: &CombEntry| {
+                matches!(
+                    e.item,
+                    CombItem::CompiledContAssign { .. } | CombItem::CompiledAlwaysBlock { .. }
+                ) && !match &e.item {
+                    CombItem::CompiledContAssign { compiled }
+                    | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled.has_fallback,
+                    _ => false,
+                }
+            };
+            // writer/reader maps over COMB entries only.
+            let mut writer: HashMap<usize, Option<usize>> = HashMap::default();
+            for (i, e) in entries.iter().enumerate() {
+                for &w in &e.cold.write_signal_ids {
+                    writer
+                        .entry(w)
+                        .and_modify(|v| *v = None)
+                        .or_insert(Some(i));
+                }
+            }
+            let mut readers: HashMap<usize, Vec<usize>> = HashMap::default();
+            for (i, e) in entries.iter().enumerate() {
+                for &r in &e.cold.read_signal_ids {
+                    readers.entry(r).or_default().push(i);
+                }
+            }
+            // next[a] = (b, link_signal) when a's write s links uniquely to b.
+            let mut next: Vec<Option<(usize, usize)>> = vec![None; n];
+            let mut has_pred: Vec<bool> = vec![false; n];
+            for (i, e) in entries.iter().enumerate() {
+                if !mergeable(&entries[i]) {
+                    continue;
+                }
+                let mut link: Option<(usize, usize)> = None;
+                let mut ok = true;
+                for &sw in &e.cold.write_signal_ids {
+                    let rs = readers.get(&sw).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let uniq: Vec<usize> = {
+                        let mut u: Vec<usize> = rs.iter().copied().filter(|&r| r != i).collect();
+                        u.sort_unstable();
+                        u.dedup();
+                        u
+                    };
+                    if uniq.len() == 1 {
+                        let b = uniq[0];
+                        if writer.get(&sw) == Some(&Some(i))
+                            && mergeable(&entries[b])
+                            && !entries[b].cold.write_signal_ids.contains(&sw)
+                        {
+                            match link {
+                                None => link = Some((b, sw)),
+                                // Two write signals both linking to the SAME
+                                // successor is fine; different successors is
+                                // not a simple chain — skip.
+                                Some((pb, _)) if pb == b => {}
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    } else if !uniq.is_empty() {
+                        // A write with multiple comb readers keeps its normal
+                        // dispatch; it does not block linking via another
+                        // single-reader write, but B must see EVERY A-write it
+                        // reads through the merge, which the union handles.
+                    }
+                }
+                if ok {
+                    if let Some((b, sw)) = link {
+                        if b != i {
+                            next[i] = Some((b, sw));
+                        }
+                    }
+                }
+            }
+            for &nx in next.iter() {
+                if let Some((b, _)) = nx {
+                    has_pred[b] = true;
+                }
+            }
+            // A successor with TWO predecessors would be duplicated into
+            // both — disallow: only keep a link when it is b's only one.
+            {
+                let mut pred_count = vec![0u32; n];
+                for &nx in next.iter() {
+                    if let Some((b, _)) = nx {
+                        pred_count[b] += 1;
+                    }
+                }
+                for slot in next.iter_mut() {
+                    if let Some((b, _)) = *slot {
+                        if pred_count[b] > 1 {
+                            *slot = None;
+                        }
+                    }
+                }
+                has_pred = vec![false; n];
+                for &nx in next.iter() {
+                    if let Some((b, _)) = nx {
+                        has_pred[b] = true;
+                    }
+                }
+            }
+            let mut absorbed = vec![false; n];
+            let mut n_links = 0usize;
+            for head in 0..n {
+                if has_pred[head] || next[head].is_none() || absorbed[head] {
+                    continue;
+                }
+                // Walk the chain from its head, absorbing successors.
+                let mut cur = head;
+                let mut in_chain: HashSet<usize> = HashSet::default();
+                in_chain.insert(head);
+                while let Some((b, sw)) = next[cur] {
+                    if absorbed[b] || in_chain.contains(&b) {
+                        break;
+                    }
+                    // GUARDS (the unguarded merge measured 11x SLOWER on
+                    // ibex: union sensitivity made every B-input change run
+                    // A+B, and B->A feedback re-triggered merged entries):
+                    //  1. no sens widening — B's other reads must already be
+                    //     in the head's read set, so the merged entry fires
+                    //     exactly when the head fired before;
+                    //  2. no feedback — nothing B writes may be read by the
+                    //     merged entry.
+                    {
+                        let he = &entries[head];
+                        let be = &entries[b];
+                        let widen = be
+                            .cold
+                            .read_signal_ids
+                            .iter()
+                            .any(|r| *r != sw && !he.cold.read_signal_ids.contains(r));
+                        let feedback = be.cold.write_signal_ids.iter().any(|w| {
+                            he.cold.read_signal_ids.contains(w)
+                                || be.cold.read_signal_ids.contains(w)
+                        });
+                        if widen || feedback {
+                            break;
+                        }
+                    }
+                    // Merge b into head.
+                    let (b_compiled, b_reads, b_writes) = {
+                        let be = &entries[b];
+                        let c = match &be.item {
+                            CombItem::CompiledContAssign { compiled }
+                            | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled.clone(),
+                            _ => break,
+                        };
+                        (
+                            c,
+                            be.cold.read_signal_ids.clone(),
+                            be.cold.write_signal_ids.clone(),
+                        )
+                    };
+                    {
+                        let he = &mut entries[head];
+                        let hc = match &mut he.item {
+                            CombItem::CompiledContAssign { compiled }
+                            | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled,
+                            _ => unreachable!(),
+                        };
+                        hc.instructions
+                            .extend(b_compiled.instructions.iter().cloned());
+                        hc.num_regs = hc.num_regs.max(b_compiled.num_regs);
+                        hc.has_fallback |= b_compiled.has_fallback;
+                        for r in b_reads {
+                            if r != sw && !he.cold.read_signal_ids.contains(&r) {
+                                he.cold.read_signal_ids.push(r);
+                            }
+                        }
+                        for w in b_writes {
+                            if !he.cold.write_signal_ids.contains(&w) {
+                                he.cold.write_signal_ids.push(w);
+                            }
+                        }
+                    }
+                    absorbed[b] = true;
+                    in_chain.insert(b);
+                    n_links += 1;
+                    cur = b;
+                }
+            }
+            if n_links > 0 {
+                let mut kept = Vec::with_capacity(n - n_links);
+                for (i, entry) in entries.into_iter().enumerate() {
+                    if !absorbed[i] {
+                        kept.push(entry);
+                    }
+                }
+                entries = kept;
+                sim_dbg_eprintln!(
+                    "[OPT] chain-fused {} comb entries into their producers",
+                    n_links
+                );
+            }
+        }
+
         // Build reverse dependency index by signal ID using final entry
         // order. CSR layout: counts → prefix-sum → fill, all in flat
         // u32 Vecs. Avoids 585K × 24 B of empty Vec headers and 585K
@@ -23024,11 +23618,11 @@ impl Simulator {
         // B's outputs. This pass counts how much of the graph is chain-shaped
         // so the merge transform is built (or rejected) on numbers.
         if std::env::var("XEZIM_CONE").is_ok() {
-            use std::collections::HashMap;
+            use xezim_core::hasher::HashMap;
             let n = entries.len();
             // signal -> reader entries / writer entries
-            let mut readers: HashMap<usize, Vec<usize>> = HashMap::new();
-            let mut writers: HashMap<usize, Vec<usize>> = HashMap::new();
+            let mut readers: HashMap<usize, Vec<usize>> = HashMap::default();
+            let mut writers: HashMap<usize, Vec<usize>> = HashMap::default();
             for (eidx, e) in entries.iter().enumerate() {
                 for &r in e.cold.read_signal_ids.iter() {
                     readers.entry(r).or_default().push(eidx);
@@ -23069,7 +23663,7 @@ impl Simulator {
             let mut in_chain = 0usize;
             let mut chains = 0usize;
             let mut longest = 0usize;
-            let mut len_hist: HashMap<usize, usize> = HashMap::new();
+            let mut len_hist: HashMap<usize, usize> = HashMap::default();
             for start in 0..n {
                 if chain_prev_cnt[start] != 0 || chain_next[start].is_none() {
                     continue;
@@ -23581,10 +24175,20 @@ impl Simulator {
         // sequential UDP to its `initial` start state (default x), a
         // combinational UDP to x until its first evaluation drives it. This is
         // visible when an instance `#delay` postpones the first real drive.
-        for rt in &self.udp_runtime {
-            let id = rt.out_ref.sig_id as usize;
-            let code = if rt.is_sequential { rt.state } else { 2 };
-            if self.signal_table[id].set_bit_code(rt.out_ref.bit as usize, code) {
+        let udp_inits: Vec<(usize, usize, u8)> = self
+            .udp_runtime
+            .iter()
+            .map(|rt| {
+                (
+                    rt.out_ref.sig_id as usize,
+                    rt.out_ref.bit as usize,
+                    if rt.is_sequential { rt.state } else { 2 },
+                )
+            })
+            .collect();
+        for (id, bit, code) in udp_inits {
+            if self.signal_table[id].set_bit_code(bit, code) {
+                self.sync_mirror(id);
                 self.table_modified = true;
             }
         }
@@ -23940,6 +24544,7 @@ impl Simulator {
                 });
             }
         } else if self.signal_table[id].set_bit_code(bit, new_code) {
+            self.sync_mirror(id);
             // Combinational UDP: propagate immediately, like a continuous assign.
             self.table_modified = true;
             self.after_signal_write(id);
@@ -27752,6 +28357,18 @@ impl Simulator {
         // JIT-redesign Stage 1: optional invariant check on
         // signal_inline_bits.  Walks every signal (~O(num_signals)),
         // gated by XEZIM_VERIFY_INLINE_BITS=1.
+        // Late-init writes (memory image loads, all_z nets initialized after
+        // the mirror allocation) bypass write_sig!; one O(n) re-snapshot at
+        // simulation start makes the planes exact before anything reads them.
+        if !self.signal_inline_bits.is_empty() {
+            for (i, v) in self.signal_table.iter().enumerate() {
+                let (vb, xb) = v.raw_bits();
+                self.signal_inline_bits[i] = [vb, xb];
+                if i < self.signal_has_xz.len() {
+                    self.signal_has_xz[i] = if v.has_xz() { 1 } else { 0 };
+                }
+            }
+        }
         let verify_inline_bits =
             std::env::var("XEZIM_VERIFY_INLINE_BITS").ok().as_deref() == Some("1");
         if verify_inline_bits {
@@ -28322,6 +28939,7 @@ impl Simulator {
             );
         }
         self.dump_comb_paths();
+        self.dump_template_census();
         eprintln!("[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
             self.prof_edge_detect as f64/1e6, self.prof_edge_exec as f64/1e6, self.prof_edges_fired,
             self.prof_insns_executed,
@@ -30379,6 +30997,7 @@ impl Simulator {
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+            compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -38492,6 +39111,7 @@ impl Simulator {
                             {
                                 continue;
                             }
+                            self.sync_mirror(dst_id);
                             self.table_modified = true;
                             self.after_signal_write(dst_id);
                             if capture_churn {
@@ -38578,58 +39198,10 @@ impl Simulator {
                         // P5: X-free evaluations run on u64 words. NO
                         // `continue` — the worklist propagation after this
                         // match must still see the stores' dirtied signals.
-                        if self.try_two_state(eidx, compiled) {
-                            if self.trace_comb_paths {
-                                self.note_comb_path(eidx, 0);
-                            }
+                        if self.dispatch_comb_plan(eidx, compiled) {
                             n_dc += 1;
                         } else {
-                        // Native path (cfg-gated: compiled out of the default
-                        // build entirely — a runtime check here measured
-                        // +2.0%). rc 0 = ran; 1 = bailed pre-side-effect
-                        // (interpret this eval, count a strike); >=2 = disable.
-                        // A `continue` here would skip the worklist
-                        // propagation after this match, so JIT-dirtied
-                        // signals would never trigger their dependents —
-                        // route through a flag and fall through instead.
-                        #[cfg(feature = "jit")]
-                        let mut ran_native = false;
-                        #[cfg(feature = "jit")]
                         {
-                            if let Some(Some(f)) = self.comb_jit_fns.get(eidx).copied() {
-                                let sp: *mut u8 = self as *mut Self as *mut u8;
-                                match unsafe { f(sp) } {
-                                    0 => {
-                                        self.comb_jit_strikes[eidx] = 0;
-                                        ran_native = true;
-                                        if self.trace_comb_paths {
-                                            self.note_comb_path(eidx, 1);
-                                        }
-                                        if self.profile_timing {
-                                            self.prof_comb_jit[0] += 1;
-                                        }
-                                    }
-                                    1 => {
-                                        if self.profile_timing {
-                                            self.prof_comb_jit[1] += 1;
-                                        }
-                                        const XZ_STRIKE_LIMIT: u8 = 8;
-                                        let st = &mut self.comb_jit_strikes[eidx];
-                                        *st = st.saturating_add(1);
-                                        if *st >= XZ_STRIKE_LIMIT {
-                                            self.comb_jit_fns[eidx] = None;
-                                        }
-                                    }
-                                    _ => self.comb_jit_fns[eidx] = None,
-                                }
-                            }
-                        }
-                        // `!ran_native` is a compile-time constant false in
-                        // the default build, so this folds to the plain
-                        // interpreter path with zero added cost.
-                        #[cfg(not(feature = "jit"))]
-                        let ran_native = false;
-                        if !ran_native {
                             if self.trace_comb_paths {
                                 self.note_comb_path(eidx, 2);
                             }
@@ -38679,64 +39251,13 @@ impl Simulator {
                         // P5: X-free evaluations run on u64 words (a lowered
                         // block has no fallbacks, so none of the scope /
                         // timescale bookkeeping below applies to it).
-                        if self.try_two_state(eidx, compiled) {
-                            if self.trace_comb_paths {
-                                self.note_comb_path(eidx, 0);
-                            }
+                        if self.dispatch_comb_plan(eidx, compiled) {
                             n_ab += 1;
                             if self.proc_depth > 0 {
                                 self.note_comb_ran_in_process(eidx, &entries[eidx]);
                             }
                         } else {
-                        // Native path, mirroring the CompiledContAssign arm:
-                        // rc 0 = ran; 1 = bailed pre-side-effect (strike);
-                        // >=2 = disable. JIT'd blocks contain no fallback
-                        // insns, so none of the scope/hint bookkeeping on the
-                        // interpreter path below applies to them.
-                        // No `continue` on the native path — it would skip
-                        // the worklist propagation after this match (same
-                        // trap the CompiledContAssign arm documents); route
-                        // through a flag and fall through instead.
-                        #[cfg(feature = "jit")]
-                        let mut ran_native = false;
-                        #[cfg(feature = "jit")]
                         {
-                            if let Some(Some(f)) = self.comb_jit_fns.get(eidx).copied() {
-                                let sp: *mut u8 = self as *mut Self as *mut u8;
-                                match unsafe { f(sp) } {
-                                    0 => {
-                                        self.comb_jit_strikes[eidx] = 0;
-                                        ran_native = true;
-                                        if self.trace_comb_paths {
-                                            self.note_comb_path(eidx, 1);
-                                        }
-                                        if self.profile_timing {
-                                            self.prof_comb_jit[0] += 1;
-                                        }
-                                    }
-                                    1 => {
-                                        if self.profile_timing {
-                                            self.prof_comb_jit[1] += 1;
-                                        }
-                                        const XZ_STRIKE_LIMIT: u8 = 8;
-                                        let st = &mut self.comb_jit_strikes[eidx];
-                                        *st = st.saturating_add(1);
-                                        if *st >= XZ_STRIKE_LIMIT {
-                                            self.comb_jit_fns[eidx] = None;
-                                        }
-                                    }
-                                    _ => self.comb_jit_fns[eidx] = None,
-                                }
-                            }
-                        }
-                        #[cfg(not(feature = "jit"))]
-                        let ran_native = false;
-                        if ran_native {
-                            n_ab += 1;
-                            if self.proc_depth > 0 {
-                                self.note_comb_ran_in_process(eidx, &entries[eidx]);
-                            }
-                        } else {
                         if self.trace_comb_paths {
                             self.note_comb_path(eidx, 2);
                             #[cfg(feature = "jit")]
@@ -40706,6 +41227,79 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                // §7.4.1: packed ELEMENT write on a plain packed-of-packed
+                // variable (`u8_vec16_t y; y[i] = v;`) — splice
+                // [i*ew +: ew], honoring the by-NAME storage of
+                // subroutine locals and formals. MUST run before the
+                // collection fallback below, which would otherwise invent a
+                // flat `y[i]` entry disconnected from the packed value (the
+                // pixel-conversion battery's silent-agreement bug).
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        let base = self.resolve_hier_name(h);
+                        let bare = &h.path[0].name.name;
+                        let elem_key = if self.module.packed_signal_elem_widths.contains_key(&base)
+                        {
+                            Some(base.clone())
+                        } else if self
+                            .module
+                            .packed_signal_elem_widths
+                            .contains_key(bare.as_str())
+                        {
+                            Some(bare.clone())
+                        } else {
+                            None
+                        };
+                        // Collections keep their own semantics.
+                        let is_collection = self.module.arrays.contains_key(&base)
+                            || self.module.arrays.contains_key(bare.as_str())
+                            || self.module.dynamic_arrays.contains(&base)
+                            || self.module.associative_arrays.contains_key(&base);
+                        if let Some(pkey) = elem_key.filter(|_| !is_collection) {
+                            let elem_w =
+                                *self.module.packed_signal_elem_widths.get(&pkey).unwrap();
+                            let idx_v = self.eval_expr(index);
+                            if idx_v.has_xz() {
+                                return false; // §11.5.1: x/z index selects nothing
+                            }
+                            let idx = idx_v.to_i64().unwrap_or(i64::MIN);
+                            // Frame-aware storage: subroutine locals live in
+                            // the call frame, module vars in the signal maps —
+                            // get/set_local_or_signal covers both.
+                            let storage_key = if self.get_local_or_signal(&base).is_some() {
+                                Some(base.clone())
+                            } else if self.get_local_or_signal(bare).is_some() {
+                                Some(bare.clone())
+                            } else {
+                                None
+                            };
+                            if let Some(key) = storage_key {
+                                if let Some(mut cur) = self.get_local_or_signal(&key) {
+                                    if cur.width > elem_w {
+                                        let piece = val.resize(elem_w);
+                                        let Some(lo) =
+                                            self.packed_elem_lsb(&pkey, idx, elem_w)
+                                        else {
+                                            return false;
+                                        };
+                                        if lo + (elem_w as usize) <= cur.width as usize {
+                                            let prev = cur.clone();
+                                            for i in 0..(elem_w as usize) {
+                                                cur.set_bit(lo + i, piece.get_bit(i));
+                                            }
+                                            let changed = cur != prev;
+                                            if changed {
+                                                self.set_local_or_signal(&key, cur);
+                                            }
+                                            return changed;
+                                        }
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // GitHub #86 fast path: `mem[i] = v` on a module-scope 1-D
                 // FIXED unpacked array resolves to a contiguous signal id with
                 // no string work (`array_first_id`), skipping the guard chain
@@ -40965,6 +41559,7 @@ impl Simulator {
                                 let changed = cur != prev;
                                 if changed {
                                     self.signal_table[id] = cur;
+                                    self.sync_mirror(id);
                                     self.table_modified = true;
                                     self.after_signal_write(id);
                                     self.mark_dirty(&nm);
@@ -41353,6 +41948,7 @@ impl Simulator {
                                     let changed = cur != prev;
                                     if changed {
                                         self.signal_table[id] = cur;
+                                        self.sync_mirror(id);
                                         self.table_modified = true;
                                         self.after_signal_write(id);
                                         self.mark_dirty(&base);
@@ -41638,11 +42234,49 @@ impl Simulator {
                                 let changed = cur != prev;
                                 if changed {
                                     self.signal_table[id] = cur;
+                                    self.sync_mirror(id);
                                     self.table_modified = true;
                                     self.after_signal_write(id);
                                     self.mark_dirty(&pkey);
                                 }
                                 return changed;
+                            }
+                        }
+                        // By-NAME storage (function/task locals, formals):
+                        // the same elem splice against the runtime signal map.
+                        // Without this a `u8_vec16_t y; y[i] = v;` inside a
+                        // subroutine degraded to a single-BIT write (the
+                        // pixel-conversion battery's silent-wrong-agreement
+                        // bug: reference models and DUT shared the defect).
+                        {
+                            let key = if self.get_signal_value_by_name(&name).is_some() {
+                                Some(name.clone())
+                            } else if self.get_signal_value_by_name(&pkey).is_some() {
+                                Some(pkey.clone())
+                            } else {
+                                None
+                            };
+                            if let Some(key) = key {
+                                if let Some(mut cur) = self.get_signal_value_by_name(&key) {
+                                    let piece = val.resize(elem_w);
+                                    let Some(lo) =
+                                        self.packed_elem_lsb(&pkey, idx as i64, elem_w)
+                                    else {
+                                        return false;
+                                    };
+                                    if lo + (elem_w as usize) <= cur.width as usize {
+                                        let prev = cur.clone();
+                                        for i in 0..(elem_w as usize) {
+                                            cur.set_bit(lo + i, piece.get_bit(i));
+                                        }
+                                        let changed = cur != prev;
+                                        if changed {
+                                            self.set_signal_value_by_name(&key, cur);
+                                        }
+                                        return changed;
+                                    }
+                                    return false;
+                                }
                             }
                         }
                         // Fallback: for struct field write where the underlying
@@ -41676,6 +42310,7 @@ impl Simulator {
                                                 let changed = cur != prev;
                                                 if changed {
                                                     self.signal_table[sid] = cur;
+                                                    self.sync_mirror(sid);
                                                     self.table_modified = true;
                                                     self.after_signal_write(sid);
                                                     self.mark_dirty(struct_var);
@@ -41742,6 +42377,7 @@ impl Simulator {
                             let c = old != nb;
                             if c {
                                 self.signal_table[id].set_bit(idx, nb);
+                                self.sync_mirror(id);
                                 self.table_modified = true;
                                 self.after_signal_write(id);
                                 self.mark_dirty(&name);
@@ -42063,6 +42699,7 @@ impl Simulator {
                             let nb = val.get_bit(src as usize);
                             if self.signal_table[id].get_bit(i) != nb {
                                 self.signal_table[id].set_bit(i, nb);
+                                self.sync_mirror(id);
                                 changed = true;
                             }
                         }
@@ -42125,6 +42762,7 @@ impl Simulator {
                                         }
                                         if changed {
                                             self.signal_table[id] = cur;
+                                            self.sync_mirror(id);
                                             self.table_modified = true;
                                             self.after_signal_write(id);
                                             self.mark_dirty(&root);
@@ -42357,6 +42995,7 @@ impl Simulator {
                                         }
                                         if changed {
                                             self.signal_table[id] = cur;
+                                            self.sync_mirror(id);
                                             self.table_modified = true;
                                             self.after_signal_write(id);
                                             self.mark_dirty(&base_name);
@@ -42438,6 +43077,7 @@ impl Simulator {
                                     }
                                     if changed {
                                         self.signal_table[id] = cur;
+                                        self.sync_mirror(id);
                                         self.table_modified = true;
                                         self.after_signal_write(id);
                                         self.mark_dirty(&arr_name);
@@ -42495,6 +43135,7 @@ impl Simulator {
                                         }
                                         if changed {
                                             self.signal_table[id] = cur;
+                                            self.sync_mirror(id);
                                             self.table_modified = true;
                                             self.after_signal_write(id);
                                             self.mark_dirty(root);
@@ -54858,6 +55499,7 @@ impl Simulator {
                         self.module.descending_arrays.remove(nm);
                         self.module.associative_arrays.remove(nm);
                         self.module.queue_max_sizes.remove(nm);
+                        self.module.packed_signal_elem_widths.remove(nm);
                         self.signals.remove(&format!("{}.size", nm));
                     }
                     // Register a *packed*-struct local's field layout so member
@@ -54892,6 +55534,21 @@ impl Simulator {
                     self.module
                         .var_decl_types
                         .insert(d.name.name.clone(), data_type.clone());
+                    // §7.4.1: a packed-of-packed local (`u8_vec16_t y;`)
+                    // needs its ELEMENT width registered, or `y[i]` reads
+                    // and writes degrade to single-BIT selects. This was the
+                    // long-standing AST bug behind self-checking TBs whose
+                    // reference functions silently agreed with equally-broken
+                    // DUT paths (pixel-conversion battery).
+                    if d.dimensions.is_empty() {
+                        if let Some(ew) = self.ast_decl_elem_width(data_type) {
+                            if ew > 0 && w > ew && w % ew == 0 {
+                                self.module
+                                    .packed_signal_elem_widths
+                                    .insert(d.name.name.clone(), ew);
+                            }
+                        }
+                    }
                     if d.dimensions.is_empty() {
                         // Packed multi-D local (`logic [1:0][3:0] m;`): record
                         // the per-element width so `m[i]` is an element slice,
@@ -59623,6 +60280,7 @@ impl Simulator {
     fn restore_preponed(&mut self, saved: Vec<(usize, Value)>) {
         for (id, v) in saved.into_iter().rev() {
             self.signal_table[id] = v;
+            self.sync_mirror(id);
         }
     }
 
@@ -60968,6 +61626,7 @@ impl Simulator {
             return false;
         }
         if self.signal_table[id].set_bit_code(dst.bit as usize, new_bit) {
+            self.sync_mirror(id);
             self.table_modified = true;
             self.after_signal_write(id);
             true
@@ -62371,6 +63030,63 @@ impl Simulator {
         self.signal_table[id].raw_bits().0
     }
 
+    /// Packed ELEMENT width of a declared type for the AST layer: direct
+    /// packed-of-packed shapes resolve structurally; a bare typedef name
+    /// resolves through the elaborator's typedef elem table.
+    fn ast_decl_elem_width(&self, dt: &crate::ast::types::DataType) -> Option<u32> {
+        if let Some(ew) = super::elaborate::packed_inner_elem_width(
+            dt,
+            &self.module.parameters,
+            &self.module.typedefs,
+        ) {
+            return Some(ew);
+        }
+        if let crate::ast::types::DataType::TypeReference { name, dimensions, .. } = dt {
+            if dimensions.is_empty() {
+                return self.module.typedef_elem_widths.get(&name.name.name).copied();
+            }
+        }
+        None
+    }
+
+    /// Re-sync the SoA plane mirror + has_xz for one signal after an
+    /// in-place mutation that bypassed `write_sig!` (raw-bit fast paths,
+    /// set_bit/splice paths, UDP bit writes, direct table stores). Cheap:
+    /// two u64 stores + one byte.
+    #[inline]
+    pub(crate) fn sync_mirror(&mut self, id: usize) {
+        if let Some(slot) = self.signal_inline_bits.get_mut(id) {
+            let (v, x) = self.signal_table[id].raw_bits();
+            *slot = [v, x];
+            if let Some(hx) = self.signal_has_xz.get_mut(id) {
+                *hx = if self.signal_table[id].has_xz() { 1 } else { 0 };
+            }
+        }
+    }
+
+    /// JIT bridge target: execute one AST fallback statement with the
+    /// owning block's scope hint applied, mirroring the interpreter path's
+    /// timescale/%m/name-resolution setup around fallback-bearing blocks.
+    pub(crate) fn jit_exec_fallback_stmt(
+        &mut self,
+        stmt: &crate::ast::stmt::Statement,
+        hint: Option<&str>,
+    ) {
+        let saved_ts = self.timescale_scope_override.take();
+        self.timescale_scope_override = hint.map(|h| h.to_string());
+        self.set_m_block_scope(hint);
+        let saved_hint = {
+            let prev = self.name_resolve_hint.borrow().clone();
+            if let Some(sc) = hint {
+                *self.name_resolve_hint.borrow_mut() = Some(sc.to_string());
+            }
+            prev
+        };
+        self.exec_statement(stmt);
+        *self.name_resolve_hint.borrow_mut() = saved_hint;
+        self.timescale_scope_override = saved_ts;
+    }
+
     /// JIT bridge: both planes in one call (see `xezim_jit_load_signal2`).
     #[inline]
     pub(crate) fn jit_load_signal2(&self, id: usize) -> (u64, u64) {
@@ -62463,7 +63179,11 @@ impl Simulator {
         // Inline storage takes it; everything else falls through to the
         // full compare (resize semantics, Wide, real).
         if w == sig_w {
-            if let Some((ov, ox)) = self.signal_table[id].inline_planes() {
+            if let Some([ov, ox]) = self.signal_inline_bits.get(id) {
+                if *ov == val_bits & mask && *ox == xz_bits & mask {
+                    return;
+                }
+            } else if let Some((ov, ox)) = self.signal_table[id].inline_planes() {
                 if ov == val_bits & mask && ox == xz_bits & mask {
                     return;
                 }
@@ -62524,7 +63244,14 @@ impl Simulator {
         // for this id is already pending, where §10.4.2 last-write-wins
         // requires superseding it.
         if w == sig_w {
-            if let Some((ov, ox)) = self.signal_table[id].inline_planes() {
+            if let Some([ov, ox]) = self.signal_inline_bits.get(id) {
+                if *ov == val_bits & mask
+                    && *ox == xz_bits & mask
+                    && self.nba_fast_index.get(id).is_none()
+                {
+                    return;
+                }
+            } else if let Some((ov, ox)) = self.signal_table[id].inline_planes() {
                 if ov == val_bits & mask
                     && ox == xz_bits & mask
                     && self.nba_fast_index.get(id).is_none()
@@ -62685,6 +63412,7 @@ impl Simulator {
                 let nx = (ox & !m) | ((xz_bits << low) & m);
                 if nv != ov || nx != ox {
                     self.signal_table[id].set_inline_planes(nv, nx);
+                    self.sync_mirror(id);
                     self.signal_table[id].is_signed = self.signal_signed[id];
                     self.mark_dirty_id(id);
                     self.table_modified = true;
@@ -62700,6 +63428,7 @@ impl Simulator {
             let src_bit = val.get_bit((bit_pos - low) as usize);
             if self.signal_table[id].get_bit(bit_pos as usize) != src_bit {
                 self.signal_table[id].set_bit(bit_pos as usize, src_bit);
+                self.sync_mirror(id);
                 changed = true;
             }
         }
@@ -85305,6 +86034,54 @@ impl Simulator {
                 .cloned()
         });
         let normalized = Self::normalize_call_args(&fd.ports, args);
+        // §7.4.1: packed-of-packed FORMALS (and the return variable) need
+        // their element width registered under the bare formal name, or the
+        // body's `x[i]` reads collapse to single-bit selects (same defect as
+        // the VarDecl path; see the local-declaration twin).
+        for port in fd.ports.iter() {
+            if !port.dimensions.is_empty() {
+                continue;
+            }
+            let w = super::elaborate::resolve_type_width(
+                &port.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            );
+            if let Some(ew) = self.ast_decl_elem_width(&port.data_type) {
+                if ew > 0 && w > ew && w % ew == 0 {
+                    self.module
+                        .packed_signal_elem_widths
+                        .insert(port.name.name.clone(), ew);
+                } else {
+                    self.module
+                        .packed_signal_elem_widths
+                        .remove(&port.name.name);
+                }
+            } else {
+                self.module
+                    .packed_signal_elem_widths
+                    .remove(&port.name.name);
+            }
+        }
+        {
+            let rw = super::elaborate::resolve_type_width(
+                &fd.return_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            );
+            let rname = &fd.name.name.name;
+            if let Some(ew) = self.ast_decl_elem_width(&fd.return_type) {
+                if ew > 0 && rw > ew && rw % ew == 0 {
+                    self.module
+                        .packed_signal_elem_widths
+                        .insert(rname.clone(), ew);
+                } else {
+                    self.module.packed_signal_elem_widths.remove(rname);
+                }
+            } else {
+                self.module.packed_signal_elem_widths.remove(rname);
+            }
+        }
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
 
         let mut metadata_names = std::collections::HashSet::new();
@@ -100363,6 +101140,7 @@ pub extern "C" fn vpi_put_value(
             // Write directly to signal_table (bypass write_sig! which would skip)
             if sig_id < sim.signal_table.len() {
                 sim.signal_table[sig_id] = value.clone();
+                sim.sync_mirror(sig_id);
                 if sig_id < sim.signal_has_xz.len() {
                     sim.signal_has_xz[sig_id] = if value.raw_bits().1 != 0 { 1u8 } else { 0u8 };
                 }
