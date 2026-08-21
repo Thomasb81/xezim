@@ -18432,9 +18432,72 @@ impl Simulator {
                             .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
                             .unwrap_or_default();
                         let trace_bails = std::env::var("XEZIM_JIT_BAIL_TRACE").is_ok();
+                        // XEZIM_AOT=1 (roadmap step 10): rustc-native edge
+                        // blocks through the same crate/bridge machinery as
+                        // comb entries — a second dylib, installed into the
+                        // same jit_fns slots. NBAs stay bridged. Cranelift
+                        // below fills whatever the AOT emitter couldn't.
+                        if std::env::var("XEZIM_AOT").map(|v| v == "1").unwrap_or(false) {
+                            let verbose = std::env::var("XEZIM_JIT_VERBOSE").is_ok();
+                            let mut names: Vec<(usize, String)> = Vec::new();
+                            let mut fns_src: Vec<String> = Vec::new();
+                            for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
+                                let Some(cb) = cb_opt else { continue };
+                                if !block_jit_safe[idx] {
+                                    continue;
+                                }
+                                let name = format!("xezim_aot_eb_{idx}");
+                                if let Some(src) = super::aot::gen_block_fn(
+                                    &name,
+                                    &cb.instructions,
+                                    cb.num_regs,
+                                    &self.signal_widths,
+                                    &self.signal_signed,
+                                ) {
+                                    names.push((idx, name));
+                                    fns_src.push(src);
+                                } else if verbose {
+                                    let miss = cb
+                                        .instructions
+                                        .iter()
+                                        .map(super::bytecode::insn_opcode_name)
+                                        .collect::<std::collections::HashSet<_>>();
+                                    eprintln!("[AOT-BAIL-EDGE] idx={} ops={:?}", idx, miss);
+                                }
+                            }
+                            if !fns_src.is_empty() {
+                                let src = super::aot::module_source(&fns_src);
+                                let planes = (
+                                    self.signal_inline_bits.as_ptr() as u64,
+                                    self.signal_inline_bits.len() as u32,
+                                );
+                                if let Some(lib) =
+                                    super::aot::compile_and_load(&src, verbose, planes)
+                                {
+                                    let mut n = 0usize;
+                                    for (idx, name) in &names {
+                                        if let Some(f) = lib.sym(name) {
+                                            self.jit_fns[*idx] = Some(f);
+                                            n += 1;
+                                        }
+                                    }
+                                    std::mem::forget(lib);
+                                    eprintln!(
+                                        "[AOT] edge blocks compiled {}/{}",
+                                        n,
+                                        self.compiled_edge_blocks.len()
+                                    );
+                                }
+                            }
+                        }
                         for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
                             if let Some(cb) = cb_opt {
                                 if !block_jit_safe[idx] {
+                                    continue;
+                                }
+                                // Slot already filled by the AOT branch above.
+                                if self.jit_fns[idx].is_some() {
+                                    jit_count += 1;
                                     continue;
                                 }
                                 if let Some(only) = &jit_only {
