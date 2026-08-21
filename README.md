@@ -78,9 +78,9 @@ Current capabilities include:
   synchronous callbacks.
 * **Native compilation** (`--features jit`) — hot bytecode compiles to machine
   code, either through the in-process JIT (`XEZIM_JIT=1`) or the AOT backend
-  (`XEZIM_AOT=1`), which emits Rust for eligible combinational entries, edge
-  blocks, and process FSMs, builds it with `rustc`, and caches the resulting
-  library across runs. See [below](#native-compilation).
+  (`XEZIM_JIT=1 XEZIM_AOT=1`), which emits Rust for eligible combinational
+  entries, edge blocks, and process FSMs, builds it with `rustc`, and caches
+  the resulting library across runs. See [below](#native-compilation).
 * **`bind` by instance path** (§23.11) — `bind top.u_dut.u_sub target_tb u_tb();`
   and the colon form bind only the named instances, with upward references from
   the bound module resolving against the instance they were bound into.
@@ -107,7 +107,7 @@ and testbench flows. Portable code should not rely on them.
 
 ### 0.10.1 – 0.10.3 — native compilation and process conformance (August 2026)
 
-* **AOT native backend** (`XEZIM_AOT=1`, needs a `--features jit` build) — the
+* **AOT native backend** (`XEZIM_JIT=1 XEZIM_AOT=1`, needs a `--features jit` build) — the
   compiler emits Rust for eligible combinational entries, edge blocks, and
   process FSMs, builds it with `rustc`, and loads it through a single exported
   API symbol. On the C910 CoreMark run 18,916 / 21,305 edge blocks and
@@ -482,7 +482,7 @@ Selected env knobs (off by default unless noted):
 |---|---|
 | `XEZIM_EVENT_EDGE=1` | Skip gateable clocked flop fires whose data is unchanged (1.13-1.30× wall on c910/c906) |
 | `XEZIM_JIT=1` | Compile bytecode blocks to machine code in-process (needs a `--features jit` build) |
-| `XEZIM_AOT=1` | Compile eligible blocks to native code via generated Rust + `rustc` (needs `--features jit`). See [below](#native-compilation) |
+| `XEZIM_AOT=1` | Compile eligible blocks to native code via generated Rust + `rustc` instead of cranelift. **Requires `XEZIM_JIT=1` as well** — on its own it is a no-op. Needs `--features jit`. See [below](#native-compilation) |
 | `XEZIM_AOT_OPT=0..3` | `rustc` optimization level for the generated crate (default 2) |
 | `XEZIM_PROC_FSM=1` | Compile blocking `always` bodies into bytecode state machines with wait instructions |
 | `XEZIM_NO_NATIVE_CACHE=1` | Disable the persistent native-library cache (`~/.cache/xezim/native`) |
@@ -517,10 +517,12 @@ cargo build --release --features jit
 XEZIM_JIT=1 ./target/release/xezim <sources> -s <top>
 
 # AOT: generate Rust, build it with rustc, load the result
-XEZIM_AOT=1 ./target/release/xezim <sources> -s <top>
+# (XEZIM_JIT=1 is required — XEZIM_AOT selects the backend, it does not
+#  enable native compilation on its own)
+XEZIM_JIT=1 XEZIM_AOT=1 ./target/release/xezim <sources> -s <top>
 
 # AOT plus compiled process state machines
-XEZIM_PROC_FSM=1 XEZIM_AOT=1 ./target/release/xezim <sources> -s <top>
+XEZIM_JIT=1 XEZIM_AOT=1 XEZIM_PROC_FSM=1 ./target/release/xezim <sources> -s <top>
 ```
 
 The AOT backend covers combinational entries, edge-sensitive blocks, and — when
