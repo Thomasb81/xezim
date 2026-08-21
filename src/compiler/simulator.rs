@@ -4737,6 +4737,12 @@ pub struct Simulator {
     event_epoch_fast_exec: u64,
     event_snapshot_checks: u64,
     settle_calls: u64,
+    /// Settle census: entry evaluations that actually changed a signal
+    /// (i.e. propagated), and dependency edges walked doing so. The ratio
+    /// against `entry_evals` says whether the lever is fewer triggers or
+    /// cheaper dispatch.
+    prof_settle_writes: u64,
+    prof_settle_dep_edges: u64,
     /// Dynamic executions of the packed blocking-fill collapse. Reported with
     /// profiling so regression tests can prove the fast path was exercised.
     packed_blocking_fill_collapses: u64,
@@ -7629,6 +7635,8 @@ impl Simulator {
             event_epoch_fast_exec: 0,
             event_snapshot_checks: 0,
             settle_calls: 0,
+            prof_settle_writes: 0,
+            prof_settle_dep_edges: 0,
             packed_blocking_fill_collapses: 0,
             settle_triggered: Vec::new(),
             settle_dirty_ids: Vec::new(),
@@ -11890,6 +11898,10 @@ impl Simulator {
                             CombItem::DirectCopy{..} => "dc", CombItem::FastDirectCopy{..} => "fdc",
                             CombItem::CompiledAlwaysBlock{..} => "cab", CombItem::AlwaysBlock{..} => "ab", _ => "other" },
                         e.has_unresolved_reads, rn, wn);
+                    if let CombItem::ContAssign { lhs, rhs, .. } = &e.item {
+                        eprintln!("[ENTRY]   lhs={lhs:?}");
+                        eprintln!("[ENTRY]   rhs={rhs:?}");
+                    }
                     // Full instruction stream for compiled entries — the tool
                     // for "the block fires but its writes don't land".
                     if let CombItem::CompiledAlwaysBlock { compiled, .. }
@@ -24814,6 +24826,36 @@ impl Simulator {
                 }
             })
             .collect();
+        // Unresolved entries re-evaluate on EVERY settle call, so a single
+        // AST-interpreted one can dominate a run (measured: 6.2s of 37.4s
+        // settle time on Ibex CoreMark, one eval per settle call). Name them
+        // so the cost is attributable instead of anonymous.
+        if std::env::var("XEZIM_UNRESOLVED_DUMP").is_ok() {
+            eprintln!(
+                "[UNRESOLVED] {} entries re-evaluate every settle call:",
+                self.comb_unresolved_idx.len()
+            );
+            for &i in self.comb_unresolved_idx.iter() {
+                let e = &entries[i];
+                let kind = match &e.item {
+                    CombItem::CompiledContAssign { .. } => "compiled-cont-assign",
+                    CombItem::ContAssign { .. } => "AST-cont-assign",
+                    CombItem::DirectCopy { .. } => "direct-copy",
+                    CombItem::FastDirectCopy { .. } => "fast-direct-copy",
+                    CombItem::CompiledAlwaysBlock { .. } => "compiled-always",
+                    CombItem::AlwaysBlock { .. } => "AST-always",
+                    _ => "other",
+                };
+                let wn: Vec<&str> = e
+                    .cold
+                    .write_signal_ids
+                    .iter()
+                    .filter_map(|&w| self.id_to_name.get(w).map(|s| s.as_ref()))
+                    .take(4)
+                    .collect();
+                eprintln!("[UNRESOLVED]   #{i} {kind} writes={wn:?}");
+            }
+        }
         self.comb_time0_idx = entries
             .iter()
             .enumerate()
@@ -26634,8 +26676,17 @@ impl Simulator {
                     }
                 }
             }
-            ExprKind::SystemCall { args, .. } => {
-                for a in args {
+            ExprKind::SystemCall { name, args } => {
+                // A named cast `some_type_e'(x)` lowers to
+                // `$__xz_named_cast(some_type_e, x)`, where arg 0 is a TYPE
+                // name, not a signal. Collecting it as a read leaves a name
+                // that can never resolve, which pins `has_unresolved_reads`
+                // and re-evaluates the entry on EVERY settle call for the
+                // life of the run. Measured on Ibex: 9 of 10 permanently
+                // unresolved comb entries were exactly this shape
+                // (`csr_num_e`, `pmp_cfg_t`, `ibex_mubi_t`, ...).
+                let skip_first = name == "$__xz_named_cast";
+                for a in args.iter().skip(usize::from(skip_first)) {
                     Self::collect_expr_reads(a, module, reads);
                 }
             }
@@ -30405,6 +30456,23 @@ impl Simulator {
         eprintln!("[PROF] settle_calls={} settle_iters={} max_iters={} entry_evals={} unresolved_entries={}/{}",
             self.settle_calls, self.settle_iters, self.max_settle_iters, self.entry_evals,
             unresolved, self.comb_entries.len());
+        let quiet_evals = self.entry_evals.saturating_sub(self.prof_settle_writes);
+        eprintln!(
+            "[PROF] settle_writes={} ({:.1}% of evals changed a signal, {} quiet) dep_edges={} ({:.1} per write)",
+            self.prof_settle_writes,
+            if self.entry_evals > 0 {
+                100.0 * self.prof_settle_writes as f64 / self.entry_evals as f64
+            } else {
+                0.0
+            },
+            quiet_evals,
+            self.prof_settle_dep_edges,
+            if self.prof_settle_writes > 0 {
+                self.prof_settle_dep_edges as f64 / self.prof_settle_writes as f64
+            } else {
+                0.0
+            }
+        );
         eprintln!(
             "[PROF] two_state_evals={} ({} entries lowered)",
             self.prof_ts_evals,
@@ -40923,6 +40991,9 @@ impl Simulator {
         let mut n_evals = 0u64;
         let mut n_dc = 0u64;
         let mut n_ab = 0u64;
+        // Settle census (folded back once, like the counters above).
+        let mut n_writes = 0u64;
+        let mut n_dep_edges = 0u64;
 
         // Trigger every comb entry that depends on signal `$id`, written by
         // entry `$eidx`. This is exactly what `mark_dirty_id($id)` plus the
@@ -40936,9 +41007,11 @@ impl Simulator {
         macro_rules! trigger_deps {
             ($id:expr, $eidx:expr) => {{
                 let __tid: usize = $id;
+                n_writes += 1;
                 if __tid + 1 < dep_offsets.len() {
                     let __lo = dep_offsets[__tid] as usize;
                     let __hi = dep_offsets[__tid + 1] as usize;
+                    n_dep_edges += (__hi - __lo) as u64;
                     for &__dep_u32 in &dep_entries[__lo..__hi] {
                         let __dep = __dep_u32 as usize;
                         if !triggered[__dep] {
@@ -41469,6 +41542,8 @@ impl Simulator {
         self.entry_evals += n_evals;
         self.prof_settle_dc_count += n_dc;
         self.prof_settle_ab_count += n_ab;
+        self.prof_settle_writes += n_writes;
+        self.prof_settle_dep_edges += n_dep_edges;
         self.comb_entries = entries;
         self.comb_dep_offsets = dep_offsets;
         self.comb_dep_entries = dep_entries;
