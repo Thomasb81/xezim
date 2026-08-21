@@ -18437,6 +18437,8 @@ impl Simulator {
                         // comb entries — a second dylib, installed into the
                         // same jit_fns slots. NBAs stay bridged. Cranelift
                         // below fills whatever the AOT emitter couldn't.
+                        // (The `aot` module only exists in jit builds.)
+                        #[cfg(feature = "jit")]
                         if std::env::var("XEZIM_AOT").map(|v| v == "1").unwrap_or(false) {
                             let verbose = std::env::var("XEZIM_JIT_VERBOSE").is_ok();
                             let mut names: Vec<(usize, String)> = Vec::new();
