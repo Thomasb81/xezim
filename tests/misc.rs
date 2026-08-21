@@ -176,6 +176,8 @@ mod call_returned_handle_assoc;
 mod factory_register_reentrant;
 #[path = "misc/pattern_replication_and_extends_args.rs"]
 mod pattern_replication_and_extends_args;
+#[path = "misc/proc_fsm.rs"]
+mod proc_fsm;
 #[path = "misc/program_block_reactive.rs"]
 mod program_block_reactive;
 #[path = "misc/property_bare_new_initializer.rs"]

@@ -2413,6 +2413,33 @@ struct AssertionStat {
     fail_count: u64,
 }
 
+/// Roadmap steps 11-12: a process compiled to bytecode WITH wait points.
+/// The scheduler keeps only (pid -> frame); a resume re-enters `exec_insns`
+/// at `pc` with the frame's registers swapped in, instead of re-walking the
+/// AST continuation chain. Registered only for `always` bodies whose whole
+/// statement tree compiles fallback-free (see `try_register_proc_fsm`).
+struct ProcFsm {
+    compiled: super::bytecode::CompiledBlock,
+    /// Event-control specs for WaitEdge insns, with the lazily resolved
+    /// sensitivity cached after the first suspension.
+    waits: Vec<(crate::ast::stmt::EventControl, Option<Vec<Sensitivity>>)>,
+    pc: u32,
+    regs: Vec<Value>,
+    scope: String,
+    /// Module-precision diff for delay quantization (§3.14.3), resolved on
+    /// first activation when the process scope is installed.
+    precision_diff: Option<i32>,
+}
+
+/// What a Wait insn suspended on: (payload). Paired with the resume pc in
+/// `Simulator::fsm_suspend`.
+enum FsmWait {
+    /// Delay in global ticks (already quantized).
+    Delay(u64),
+    /// Index into the frame's `waits` table.
+    Edge(u32),
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
@@ -3951,6 +3978,17 @@ pub struct Simulator {
     clock_generators: Vec<ClockGen>,
     /// Dynamic-delay simple assignments, keyed by their scheduled process id.
     fast_delay_always: HashMap<usize, FastDelayAlways>,
+    /// Compiled process FSMs by pid (roadmap 11-12, opt-in XEZIM_PROC_FSM=1).
+    proc_fsm: HashMap<usize, ProcFsm>,
+    /// Resume pc for the next `exec_insns` call (consumed at entry; 0 for
+    /// ordinary block executions).
+    fsm_start_pc: u32,
+    /// Set by the Wait insn arms: (resume pc, what to wait on). `exec_insns`
+    /// breaks its loop right after setting this.
+    fsm_suspend: Option<(u32, FsmWait)>,
+    /// Precision diff of the CURRENTLY EXECUTING process FSM (the Wait arm
+    /// needs it to quantize the delay register).
+    fsm_precision_diff: i32,
     event_queue: TimingWheel,
     next_pid: usize,
     current_pid: usize,
@@ -7354,6 +7392,10 @@ impl Simulator {
             vm_regs: Vec::new(),
             clock_generators: Vec::new(),
             fast_delay_always: HashMap::default(),
+            proc_fsm: HashMap::default(),
+            fsm_start_pc: 0,
+            fsm_suspend: None,
+            fsm_precision_diff: 0,
             event_queue: TimingWheel::new(),
             next_pid: 0,
             current_pid: 0,
@@ -15753,10 +15795,63 @@ impl Simulator {
         out
     }
 
+    /// Count the statement-level timing controls in a subtree (waits an FSM
+    /// would own). Intra-assignment delays are canonicalized into marker
+    /// CALLS by the elaborator and do not appear as TimingControl nodes.
+    fn count_timing_controls(stmt: &Statement) -> usize {
+        match &stmt.kind {
+            StatementKind::TimingControl { stmt: inner, .. } => {
+                1 + Self::count_timing_controls(inner)
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().map(Self::count_timing_controls).sum()
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::count_timing_controls(then_stmt)
+                    + else_stmt
+                        .as_ref()
+                        .map(|e| Self::count_timing_controls(e))
+                        .unwrap_or(0)
+            }
+            StatementKind::Case { items, .. } => {
+                items.iter().map(|it| Self::count_timing_controls(&it.stmt)).sum()
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. } => Self::count_timing_controls(body),
+            _ => 0,
+        }
+    }
+
     fn classify_one_always_block(&mut self, ab: AlwaysBlock) -> Option<AlwaysBlock> {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
         // rewritten as `return Some(...)`.)
+        // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a MULTI-WAIT always body
+        // (an event/delay head plus at least one more wait inside) is served
+        // by the edge path only through per-fire AST continuations — compile
+        // it into a process FSM instead when the whole tree compiles. Single-
+        // wait bodies stay on their (native) edge/clock-gen fast paths.
+        {
+            use std::sync::OnceLock;
+            static FSM_ON: OnceLock<bool> = OnceLock::new();
+            let fsm_on = *FSM_ON.get_or_init(|| {
+                std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1")
+            });
+            if fsm_on
+                && Self::count_timing_controls(&ab.stmt) >= 2
+                && self.try_register_proc_fsm(&ab)
+            {
+                return None;
+            }
+        }
         // `@*` inference resolves the body's reads; give it this block's own
         // instance scope, or an upward reference from a bound module (e.g.
         // `host_mod.clk` in a monitor bound under a `host_mod` instance)
@@ -16091,6 +16186,20 @@ impl Simulator {
                 return None;
             }
             if self.stmt_is_blocking(&ab.stmt) {
+                // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a blocking always
+                // body whose whole statement tree compiles fallback-free
+                // becomes a bytecode FSM — resumes re-enter at a saved pc
+                // instead of re-walking the AST continuation chain.
+                {
+                    use std::sync::OnceLock;
+                    static ON: OnceLock<bool> = OnceLock::new();
+                    let fsm_on = *ON.get_or_init(|| {
+                        std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1")
+                    });
+                    if fsm_on && self.try_register_proc_fsm(&ab) {
+                        return None;
+                    }
+                }
                 let forever_stmt = Statement::new(
                     StatementKind::Forever {
                         body: Box::new(ab.stmt.clone()),
@@ -16109,6 +16218,116 @@ impl Simulator {
             }
         }
         Some(ab)
+    }
+
+    /// Roadmap 11-12: compile an `always` body (waits included) into a
+    /// process FSM. Returns true when the whole tree compiled with no
+    /// fallback and at least one wait point; the pid is scheduled with the
+    /// empty payload marker that `run_process_payload` routes to
+    /// `run_proc_fsm`.
+    fn try_register_proc_fsm(&mut self, ab: &xezim_core::elaborate::AlwaysBlock) -> bool {
+        use super::bytecode::{BytecodeCompiler, Insn};
+        let scope_hint = if ab.scope.is_empty() {
+            None
+        } else {
+            Some(ab.scope.clone())
+        };
+        let mut compiler = BytecodeCompiler::new(
+            &self.signal_name_to_id,
+            &self.signal_signed,
+            &self.signal_widths,
+            &self.module.arrays,
+            &self.widths,
+        );
+        compiler.allow_waits = true;
+        compiler.set_scope_hint(scope_hint);
+        compiler.set_tasks(&self.module.tasks);
+        compiler.set_functions(&self.module.functions);
+        compiler.set_params(&self.module.parameters);
+        compiler.set_cast_widths(&self.cast_widths);
+        compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+        compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+        compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+        compiler.set_assoc_arrays(&self.module.associative_arrays);
+        compiler.set_packed_full_dims(&self.module.packed_full_dims);
+        compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
+        compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+        compiler.set_array_first_id(&self.array_first_id);
+        compiler.set_string_signals(&self.module.string_signals);
+        compiler.set_signal_real(&self.signal_real);
+        let dbg = std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some();
+        if !compiler.compile_stmt(&ab.stmt) {
+            if dbg {
+                eprintln!(
+                    "[PROC-FSM] scope '{}': body did not compile",
+                    ab.scope
+                );
+            }
+            return false;
+        }
+        let waits: Vec<(crate::ast::stmt::EventControl, Option<Vec<Sensitivity>>)> =
+            std::mem::take(&mut compiler.wait_specs)
+                .into_iter()
+                .map(|ev| (ev, None))
+                .collect();
+        let cb = compiler.finish();
+        // Gate: fallback-free, at least one wait (else it belongs on the
+        // comb/edge paths), and no process-local frame reads (the FSM has
+        // no AST call frames).
+        if cb.has_fallback
+            || cb.instructions
+                .iter()
+                .any(|i| matches!(i, Insn::LoadProcessLocal(..)))
+            || !cb
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Insn::WaitDelayReg(..) | Insn::WaitEdge(..)))
+        {
+            if dbg {
+                let ops: std::collections::HashSet<&str> = cb
+                    .instructions
+                    .iter()
+                    .map(super::bytecode::insn_opcode_name)
+                    .collect();
+                eprintln!(
+                    "[PROC-FSM] scope '{}': gated out (fallback={} insns={} ops={:?})",
+                    ab.scope,
+                    cb.has_fallback,
+                    cb.instructions.len(),
+                    ops
+                );
+            }
+            return false;
+        }
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        if !ab.scope.is_empty() {
+            self.process_scope_hint.insert(pid, ab.scope.clone());
+        }
+        self.process_origin
+            .insert(pid, (ab.stmt.span, "always block"));
+        self.proc_fsm.insert(
+            pid,
+            ProcFsm {
+                compiled: cb,
+                waits,
+                pc: 0,
+                regs: Vec::new(),
+                scope: ab.scope.clone(),
+                precision_diff: None,
+            },
+        );
+        if dbg || sim_debug_enabled() {
+            eprintln!(
+                "[PROC-FSM] registered pid {} scope '{}' ({} insns, {} waits)",
+                pid,
+                ab.scope,
+                self.proc_fsm[&pid].compiled.instructions.len(),
+                self.proc_fsm[&pid].waits.len()
+            );
+        }
+        self.event_queue.schedule(0, pid, Vec::new().into());
+        true
     }
 
     fn classify_always_blocks(&mut self) {
@@ -18881,6 +19100,12 @@ impl Simulator {
         let len = insns.len();
         while pc < len {
             match &insns[pc] {
+                // Process-FSM wait insns never appear in comb/edge blocks;
+                // an isolated evaluator cannot suspend — stop the block.
+                Insn::WaitDelayReg(..) | Insn::WaitEdge(..) => {
+                    debug_assert!(false, "wait insn in isolated comb exec");
+                    break;
+                }
                 Insn::LoadConst(dest, val) => {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
@@ -19486,6 +19711,12 @@ impl Simulator {
         let len = insns.len();
         while pc < len {
             match &insns[pc] {
+                // Process-FSM wait insns never appear in comb/edge blocks;
+                // an isolated evaluator cannot suspend — stop the block.
+                Insn::WaitDelayReg(..) | Insn::WaitEdge(..) => {
+                    debug_assert!(false, "wait insn in isolated comb exec");
+                    break;
+                }
                 Insn::LoadConst(dest, val) => {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
@@ -20367,7 +20598,9 @@ impl Simulator {
     #[inline]
     fn exec_insns(&mut self, insns: &[super::bytecode::Insn]) {
         use super::bytecode::Insn;
-        let mut pc: usize = 0;
+        // Process-FSM resume point; 0 (the ordinary case) unless
+        // `run_proc_fsm` set it just before this call.
+        let mut pc: usize = std::mem::take(&mut self.fsm_start_pc) as usize;
         let len = insns.len();
         let mut local_count: u64 = 0;
         // XEZIM_OPCODE_CENSUS: dynamic opcode + adjacent-pair counts. Both
@@ -20405,6 +20638,19 @@ impl Simulator {
                 census_prev = op;
             }
             match &insns[pc] {
+                // Process-FSM wait points (roadmap 11-12): record the resume
+                // pc + payload and stop executing; `run_proc_fsm` parks the
+                // process. Never present in edge/comb blocks.
+                Insn::WaitDelayReg(r) => {
+                    let v = self.vm_regs[*r as usize].clone();
+                    let t = self.fsm_delay_ticks(&v, self.fsm_precision_diff);
+                    self.fsm_suspend = Some((pc as u32 + 1, FsmWait::Delay(t)));
+                    break;
+                }
+                Insn::WaitEdge(ix) => {
+                    self.fsm_suspend = Some((pc as u32 + 1, FsmWait::Edge(*ix)));
+                    break;
+                }
                 Insn::CaseLut(d, src, lut) => {
                     let sv = &self.vm_regs[*src as usize];
                     let hit = if sv.has_xz() {
@@ -30400,6 +30646,8 @@ impl Simulator {
     fn edge_opcode_name(insn: &super::bytecode::Insn) -> &'static str {
         use super::bytecode::Insn;
         match insn {
+            Insn::WaitDelayReg(..) => "WaitDly",
+            Insn::WaitEdge(..) => "WaitEdge",
             Insn::CaseLut(..) => "CaseLut",
             Insn::CaseJump(..) => "CaseJump",
             Insn::CaseMaskJump(..) => "CaseMaskJump",
@@ -31321,6 +31569,16 @@ impl Simulator {
             *self.name_resolve_hint.borrow_mut() = saved_hint;
             return;
         }
+        // A compiled process FSM carries its whole state in its frame — the
+        // AST-context save/restore dance is unnecessary, same as fast-delay.
+        if stmts.is_empty() && self.proc_fsm.contains_key(&pid) {
+            let saved = self.take_process_context();
+            self.run_proc_fsm(pid);
+            self.restore_process_context(saved);
+            self.auto_loop_vars.truncate(saved_auto_len);
+            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            return;
+        }
         // Fast path: if we have no saved process context for this pid AND
         // the caller's execution context is empty, skip the full snapshot /
         // restore dance. Forever-loop bodies like `jclk = ~jclk` that run
@@ -31429,6 +31687,8 @@ impl Simulator {
     fn run_process_payload(&mut self, pid: usize, stmts: &ProcCont) {
         if stmts.is_empty() && self.fast_delay_always.contains_key(&pid) {
             self.run_fast_delay_always(pid);
+        } else if stmts.is_empty() && self.proc_fsm.contains_key(&pid) {
+            self.run_proc_fsm(pid);
         } else {
             self.run_process_stmts(pid, stmts);
         }
@@ -31445,6 +31705,119 @@ impl Simulator {
             self.settle_combinatorial();
             *self.name_resolve_hint.borrow_mut() = saved_hint;
         }
+    }
+
+    /// §3.14.3 delay quantization for a process-FSM WaitDelayReg value —
+    /// the register-value half of `delay_value_to_ticks`, without the
+    /// pathological-real diagnostics (no source expression at hand).
+    fn fsm_delay_ticks(&self, v: &Value, precision_diff: i32) -> u64 {
+        let raw = if v.is_real {
+            let f = v.to_f64();
+            if f.is_finite() && f > 0.0 {
+                f
+            } else {
+                0.0
+            }
+        } else {
+            v.to_u64().unwrap_or(0) as f64
+        };
+        if precision_diff > 0 {
+            let q = 10f64.powi(precision_diff);
+            let x = (raw / q) * (1.0 + 1e-12);
+            (x.round() * q).round() as u64
+        } else {
+            raw.round() as u64
+        }
+    }
+
+    /// Run a compiled process FSM activation: resume the bytecode at the
+    /// frame's pc with the frame's registers, park on the next wait point
+    /// (delay -> timing wheel, edge -> event waiter, both with the empty
+    /// payload marker), then settle — the same scheduling boundary
+    /// `run_fast_delay_always` maintains.
+    fn run_proc_fsm(&mut self, pid: usize) {
+        self.current_pid = pid;
+        let Some(mut f) = self.proc_fsm.remove(&pid) else {
+            return;
+        };
+        if f.regs.len() < f.compiled.num_regs as usize {
+            f.regs.resize(f.compiled.num_regs as usize, Value::zero(1));
+        }
+        std::mem::swap(&mut self.vm_regs, &mut f.regs);
+        let saved_hint = self.name_resolve_hint.borrow().clone();
+        if !f.scope.is_empty() {
+            *self.name_resolve_hint.borrow_mut() = Some(f.scope.clone());
+        }
+        let pd = *f.precision_diff.get_or_insert_with(|| {
+            let (_, prec_exp) = {
+                let def = self.current_module_def();
+                self.module
+                    .module_timescale_exp
+                    .get(def)
+                    .copied()
+                    .unwrap_or((self.module.timeunit_exp, self.module.timeprecision_exp))
+            };
+            prec_exp - Self::secs_to_exp(self.tick_s)
+        });
+        self.fsm_precision_diff = pd;
+        // An `always` body that completes without suspending restarts at
+        // pc 0; the guard bounds a wait-free pass count so a body whose
+        // waits are all branched around cannot livelock the scheduler.
+        let mut passes = 0u32;
+        loop {
+            self.fsm_start_pc = f.pc;
+            self.fsm_suspend = None;
+            self.exec_insns(&f.compiled.instructions);
+            if let Some((npc, kind)) = self.fsm_suspend.take() {
+                f.pc = npc;
+                match kind {
+                    FsmWait::Delay(t) => {
+                        if t == 0 {
+                            self.inactive_queue.push((pid, ProcCont::empty()));
+                        } else {
+                            self.event_queue.schedule(
+                                self.time.saturating_add(t),
+                                pid,
+                                Vec::new().into(),
+                            );
+                        }
+                    }
+                    FsmWait::Edge(ix) => {
+                        let sens = {
+                            let slot = &mut f.waits[ix as usize];
+                            if slot.1.is_none() {
+                                slot.1 = Some(self.event_to_sens(&slot.0));
+                            }
+                            slot.1.clone().unwrap_or_default()
+                        };
+                        let w = self.make_event_waiter_kind(
+                            pid,
+                            sens,
+                            ProcCont::empty(),
+                            false,
+                        );
+                        self.event_waiters.push(w);
+                    }
+                }
+                break;
+            }
+            if self.finished {
+                break;
+            }
+            f.pc = 0;
+            passes += 1;
+            if passes > 1000 {
+                eprintln!(
+                    "[xezim][error] compiled process (pid {}) looped {} times                      without reaching a wait — parking it (body's waits are                      unreachable this activation)",
+                    pid, passes
+                );
+                break;
+            }
+        }
+        std::mem::swap(&mut self.vm_regs, &mut f.regs);
+        *self.name_resolve_hint.borrow_mut() = saved_hint;
+        self.proc_fsm.insert(pid, f);
+        self.settle_combinatorial();
     }
 
     fn run_fast_delay_always(&mut self, pid: usize) {
