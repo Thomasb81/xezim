@@ -39,6 +39,8 @@ mod compliance_tests;
 mod cov_assertion_basic;
 #[path = "misc/dep_reg_entry_synth.rs"]
 mod dep_reg_entry_synth;
+#[path = "misc/delay_precision.rs"]
+mod delay_precision;
 #[path = "misc/deposit_task.rs"]
 mod deposit_task;
 #[path = "misc/duplicate_decl_locations.rs"]

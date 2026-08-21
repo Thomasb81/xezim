@@ -73452,6 +73452,20 @@ impl Simulator {
         match self
             .timescale_scope_override
             .as_ref()
+            .or_else(|| {
+                // §3.14.1: a delay inside an INLINED hierarchical/interface
+                // task body quantizes at the DECLARING instance's timescale,
+                // not the calling process's. The task frame carries that
+                // instance (same source the name-resolve hint uses on
+                // resume); without this, `#0.002` in a 1ns/1ns BFM module
+                // called from a 1ps-precision testbench kept a real 2ps
+                // duration instead of rounding to zero — and a delay-paced
+                // BFM loop that hits one such call is phase-shifted off the
+                // clock grid for the rest of the run.
+                self.task_cleanup
+                    .last()
+                    .and_then(|c| c.frame_scope_hint.as_ref())
+            })
             .or_else(|| self.process_scope_hint.get(&self.current_pid))
         {
             Some(s) if !s.is_empty() => {
