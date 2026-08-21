@@ -21738,6 +21738,9 @@ impl Simulator {
         self.prepared_comb_cache_path.is_some()
             && self.module.udp_instances.is_empty()
             && self.sdf_delays.is_empty()
+            // Region fusion (XEZIM_REGIONS) rewrites the entry list; a cache
+            // written under one setting must not be replayed under the other.
+            && !matches!(std::env::var("XEZIM_REGIONS").as_deref(), Ok("1"))
     }
 
     fn drop_comb_source_ast(&mut self) {
@@ -23771,6 +23774,328 @@ impl Simulator {
                 sim_dbg_eprintln!(
                     "[OPT] chain-fused {} comb entries into their producers",
                     n_links
+                );
+            }
+        }
+
+        // Step 9 (comb-region fusion, opt-in XEZIM_REGIONS=1): fuse
+        // dependency-connected COMPILED comb entries into one larger
+        // compiled block, so a value hop between members skips the whole
+        // dispatch round trip (write -> trigger -> worklist -> re-dispatch)
+        // and the two-state / JIT / AOT backends see one bigger body.
+        // Rules:
+        //  - members are COMB entries only — edge (flop) blocks are never
+        //    candidates; a flop-driven signal enters a region strictly as an
+        //    external input;
+        //  - classes never mix: cont-assign entries defer during a process's
+        //    post-write settle (#35) while always bodies stay eager, so a
+        //    region is all-cont-assign or all-always_comb;
+        //  - the fused read set is the FULL union of member reads (internal
+        //    link signals included), so the settle fixpoint semantics are
+        //    bit-identical — an internal value change re-triggers the region
+        //    for one extra converging pass instead of being assumed settled;
+        //  - member programs are self-contained register-wise (every reg is
+        //    written before read; vm_regs are never cleared between entries
+        //    today), so concatenation needs no register renumbering — but
+        //    BRANCH TARGETS are block-relative and DO get offset;
+        //  - members whose body contains fallback/NBA/process-local/jump-
+        //    table insns stay out (targets or side effects we can't carry).
+        if matches!(std::env::var("XEZIM_REGIONS").as_deref(), Ok("1")) {
+            use super::bytecode::Insn as RIns;
+            let max_members: usize = std::env::var("XEZIM_REGION_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v| v >= 2)
+                .unwrap_or(8);
+            let n = entries.len();
+            let insn_ok = |c: &super::bytecode::CompiledBlock| -> bool {
+                c.instructions.iter().all(|ins| {
+                    !matches!(
+                        ins,
+                        RIns::StmtFallback(..)
+                            | RIns::EvalExprFallback(..)
+                            | RIns::LoadProcessLocal(..)
+                            | RIns::Format(..)
+                            | RIns::CaseJump(..)
+                            | RIns::CaseMaskJump(..)
+                            | RIns::NbaAssign(..)
+                            | RIns::NbaAssignConst(..)
+                            | RIns::NbaAssignRange(..)
+                            | RIns::NbaAssignRangeDyn(..)
+                            | RIns::NbaAssignBitDyn(..)
+                            | RIns::NbaAssignArray(..)
+                            | RIns::NbaAssignArrayRange(..)
+                            | RIns::NbaAssignArrayRead(..)
+                    )
+                })
+            };
+            let mut writer_count: HashMap<usize, u32> = HashMap::default();
+            for e in entries.iter() {
+                for &w in &e.cold.write_signal_ids {
+                    *writer_count.entry(w).or_insert(0) += 1;
+                }
+            }
+            // Class per entry: 0 = cont-assign, 1 = always_comb,
+            // 2 = plain `always @(...)` (t0-deferred). Members fuse only
+            // within a class so the #35 defer split AND the §9.2.2.1 t0
+            // deferral stay uniform across the fused entry — a region of
+            // plain-always members keeps defer_at_time0 = true.
+            let mut class: Vec<Option<u8>> = Vec::with_capacity(n);
+            for e in entries.iter() {
+                let c = match &e.item {
+                    CombItem::CompiledContAssign { compiled }
+                        if !compiled.has_fallback && insn_ok(compiled) =>
+                    {
+                        Some(0u8)
+                    }
+                    CombItem::CompiledAlwaysBlock {
+                        compiled,
+                        is_always_comb,
+                    } if !compiled.has_fallback && insn_ok(compiled) => {
+                        Some(if *is_always_comb { 1 } else { 2 })
+                    }
+                    _ => None,
+                };
+                let ok = c.is_some()
+                    && !e.has_unresolved_reads
+                    && !e.cold.read_signal_ids.is_empty()
+                    && e.cold
+                        .write_signal_ids
+                        .iter()
+                        .all(|w| writer_count.get(w).copied().unwrap_or(0) == 1);
+                class.push(if ok { c } else { None });
+            }
+            let mut producer: HashMap<usize, usize> = HashMap::default();
+            for (i, e) in entries.iter().enumerate() {
+                if class[i].is_some() {
+                    for &w in &e.cold.write_signal_ids {
+                        producer.insert(w, i);
+                    }
+                }
+            }
+            let mut uf: Vec<usize> = (0..n).collect();
+            fn rfind(uf: &mut [usize], mut x: usize) -> usize {
+                while uf[x] != x {
+                    uf[x] = uf[uf[x]];
+                    x = uf[x];
+                }
+                x
+            }
+            for i in 0..n {
+                if class[i].is_none() {
+                    continue;
+                }
+                // Borrow dance: collect the producer links first.
+                let links: Vec<usize> = entries[i]
+                    .cold
+                    .read_signal_ids
+                    .iter()
+                    .filter_map(|r| producer.get(r).copied())
+                    .filter(|&p| p != i && class[p] == class[i])
+                    .collect();
+                for p in links {
+                    let (a, b) = (rfind(&mut uf, i), rfind(&mut uf, p));
+                    if a != b {
+                        uf[a] = b;
+                    }
+                }
+            }
+            let mut comps: HashMap<usize, Vec<usize>> = HashMap::default();
+            for i in 0..n {
+                if class[i].is_some() {
+                    let root = rfind(&mut uf, i);
+                    comps.entry(root).or_default().push(i);
+                }
+            }
+            let mut fused_regions = 0usize;
+            let mut fused_members = 0usize;
+            for (_, mut members) in comps {
+                if members.len() < 2 {
+                    continue;
+                }
+                members.sort_unstable();
+                // Entry-index order is NOT topo order (entries are built in
+                // declaration order): a consumer that precedes its producer
+                // inside a region reads a stale value on every evaluation and
+                // costs one extra converging settle pass per firing — chained
+                // across regions this measured ~33 passes/settle on ibex.
+                // Kahn-sort the component's members over the internal
+                // producer→consumer edges (idx as the deterministic
+                // tie-break); a cycle falls back to idx order for its
+                // remainder, which the kept feedback reads still converge.
+                let order: Vec<usize> = {
+                    let pos: HashMap<usize, usize> = members
+                        .iter()
+                        .enumerate()
+                        .map(|(k, &m)| (m, k))
+                        .collect();
+                    let mut indeg = vec![0usize; members.len()];
+                    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); members.len()];
+                    for (k, &m) in members.iter().enumerate() {
+                        for &r in &entries[m].cold.read_signal_ids {
+                            if let Some(&p) = producer.get(&r) {
+                                if let Some(&pk) = pos.get(&p) {
+                                    if pk != k {
+                                        succ[pk].push(k);
+                                        indeg[k] += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut ready: Vec<usize> =
+                        (0..members.len()).filter(|&k| indeg[k] == 0).collect();
+                    ready.sort_unstable_by_key(|&k| members[k]);
+                    let mut out: Vec<usize> = Vec::with_capacity(members.len());
+                    let mut done = vec![false; members.len()];
+                    while let Some(k) = ready.first().copied() {
+                        ready.remove(0);
+                        if done[k] {
+                            continue;
+                        }
+                        done[k] = true;
+                        out.push(members[k]);
+                        for &n in &succ[k] {
+                            indeg[n] = indeg[n].saturating_sub(1);
+                            if indeg[n] == 0 && !done[n] {
+                                let key = members[n];
+                                let at = ready
+                                    .binary_search_by_key(&key, |&x| members[x])
+                                    .unwrap_or_else(|e| e);
+                                ready.insert(at, n);
+                            }
+                        }
+                    }
+                    // Cycle remainder: append in idx order.
+                    for (k, &m) in members.iter().enumerate() {
+                        if !done[k] {
+                            out.push(m);
+                        }
+                    }
+                    out
+                };
+                for chunk in order.chunks(max_members) {
+                    if chunk.len() < 2 {
+                        continue;
+                    }
+                    // The fused entry lives at the LOWEST member slot so its
+                    // scheduling position (same-pass cascade is idx-ordered)
+                    // is never later than any member's was; the BODY executes
+                    // members in topo order regardless of slot choice.
+                    let head = chunk.iter().copied().min().unwrap();
+                    // RegId is u16: renumbering offsets member registers by a
+                    // running base, so the fused total must stay in range.
+                    let total_regs: u64 = chunk
+                        .iter()
+                        .map(|&m| match &entries[m].item {
+                            CombItem::CompiledContAssign { compiled }
+                            | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                                compiled.num_regs as u64
+                            }
+                            _ => 0,
+                        })
+                        .sum();
+                    if total_regs > u16::MAX as u64 {
+                        continue;
+                    }
+                    // Sensitivity: a link signal whose producer member runs
+                    // BEFORE every member that reads it is satisfied by the
+                    // region's own execution order and is DROPPED from the
+                    // fused read set — keeping it made each firing re-trigger
+                    // the region across settle passes (the historical 11x
+                    // over-trigger trap: a chain of L members cost ~L extra
+                    // full-region passes). Feedback reads (producer at or
+                    // after the consumer) stay, preserving the fixpoint.
+                    // Dropping is sound: candidates are the SINGLE comb
+                    // writer of their outputs, and a comb-driven variable has
+                    // no legal procedural co-driver (§10.3.2) — a flop can
+                    // only feed a region as an external input, never rewrite
+                    // an internal link.
+                    let mpos: HashMap<usize, usize> = chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(pos, &m)| (m, pos))
+                        .collect();
+                    let mut region_reads: Vec<usize> = Vec::new();
+                    let mut region_writes: Vec<usize> = Vec::new();
+                    for (pos, &m) in chunk.iter().enumerate() {
+                        for &r in &entries[m].cold.read_signal_ids {
+                            let satisfied = producer
+                                .get(&r)
+                                .and_then(|pm| mpos.get(pm))
+                                .is_some_and(|&ppos| ppos < pos);
+                            if !satisfied && !region_reads.contains(&r) {
+                                region_reads.push(r);
+                            }
+                        }
+                        for &w in &entries[m].cold.write_signal_ids {
+                            if !region_writes.contains(&w) {
+                                region_writes.push(w);
+                            }
+                        }
+                    }
+                    let mut fused = super::bytecode::CompiledBlock {
+                        instructions: Vec::new(),
+                        num_regs: 0,
+                        has_fallback: false,
+                        nba_dup_targets: false,
+                    };
+                    for &m in chunk {
+                        let mb = match &entries[m].item {
+                            CombItem::CompiledContAssign { compiled }
+                            | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled,
+                            _ => unreachable!("class gate admits only compiled items"),
+                        };
+                        let off = fused.instructions.len() as u32;
+                        let reg_base = fused.num_regs as u16;
+                        for ins in mb.instructions.iter() {
+                            let mut ins = ins.clone();
+                            let ok = ins.offset_regs_and_targets(reg_base, off);
+                            debug_assert!(ok, "insn_ok admitted an un-offsettable insn");
+                            fused.instructions.push(ins);
+                        }
+                        fused.num_regs += mb.num_regs;
+                        fused.nba_dup_targets |= mb.nba_dup_targets;
+                    }
+                    let is_ab = matches!(
+                        entries[head].item,
+                        CombItem::CompiledAlwaysBlock { .. }
+                    );
+                    let always_comb = chunk.iter().any(|&m| {
+                        matches!(
+                            entries[m].item,
+                            CombItem::CompiledAlwaysBlock {
+                                is_always_comb: true,
+                                ..
+                            }
+                        )
+                    });
+                    entries[head].item = if is_ab {
+                        CombItem::CompiledAlwaysBlock {
+                            compiled: fused,
+                            is_always_comb: always_comb,
+                        }
+                    } else {
+                        CombItem::CompiledContAssign { compiled: fused }
+                    };
+                    entries[head].cold.read_signal_ids = region_reads;
+                    entries[head].cold.write_signal_ids = region_writes;
+                    for &m in chunk {
+                        if m == head {
+                            continue;
+                        }
+                        entries[m].item = CombItem::Noop;
+                        entries[m].cold.read_signal_ids.clear();
+                        entries[m].cold.write_signal_ids.clear();
+                    }
+                    fused_regions += 1;
+                    fused_members += chunk.len();
+                }
+            }
+            if std::env::var("XEZIM_REGION_STATS").is_ok() {
+                eprintln!(
+                    "[REGION] fused {} members into {} regions (cap {}) of {} entries",
+                    fused_members, fused_regions, max_members, n
                 );
             }
         }

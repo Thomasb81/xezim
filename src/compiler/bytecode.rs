@@ -508,6 +508,101 @@ pub struct CompiledBlock {
     pub nba_dup_targets: bool,
 }
 
+impl Insn {
+    /// Region fusion (`build_comb_entries`): shift every register operand by
+    /// `rb` and every branch target by `ib` so one member block can be
+    /// appended after another WITHOUT register collisions — the two-state
+    /// lowering tracks one static width per register, so reusing a slot at a
+    /// different width would knock the whole fused block off the fast path.
+    /// Returns false for variants fusion must not carry (fallbacks, NBAs,
+    /// jump tables with internal targets, process-local reads); the caller
+    /// pre-filters with the same set and treats false as a bug.
+    pub fn offset_regs_and_targets(&mut self, rb: RegId, ib: u32) -> bool {
+        use Insn::*;
+        match self {
+            Nop => {}
+            Jump(t) => *t += ib,
+            BranchIfSignalFalse(_, t, _) => *t += ib,
+            BranchIfFalse(a, t) | BranchUnlessZero(a, t) => {
+                *a += rb;
+                *t += ib;
+            }
+            CmpBranch(_, a, b, c, t) => {
+                *a += rb;
+                *b += rb;
+                *c += rb;
+                *t += ib;
+            }
+            LoadConst(a, _)
+            | Resize(a, _)
+            | SetSigned(a)
+            | ClearSigned(a)
+            | LoadSignal(a, _)
+            | LoadSignalSigned(a, _)
+            | LoadSignalRange(a, _, _, _)
+            | LoadSignalBit(a, _, _)
+            | BlockingAssign(_, a, _)
+            | BlockingAssignRange(_, _, _, a)
+            | BlockingAssignString(_, a) => *a += rb,
+            Move(a, b)
+            | MoveResize(a, b, _)
+            | BitNot(a, b)
+            | LogNot(a, b)
+            | Negate(a, b)
+            | ReduceAnd(a, b)
+            | ReduceOr(a, b)
+            | ReduceXor(a, b)
+            | Replicate(a, b, _)
+            | BitSelectConst(a, b, _)
+            | RangeSelectConst(a, b, _, _)
+            | CaseLut(a, b, _)
+            | BinOpConst(a, b, _, _)
+            | BlockingAssignBitDyn(_, a, b)
+            | LoadArrayElem(a, _, b)
+            | BlockingAssignArray(_, a, b, _) => {
+                *a += rb;
+                *b += rb;
+            }
+            Add(a, b, c) | Sub(a, b, c) | Mul(a, b, c) | Div(a, b, c) | Mod(a, b, c)
+            | Pow(a, b, c) | BitAnd(a, b, c) | BitOr(a, b, c) | BitXor(a, b, c)
+            | BitXnor(a, b, c) | LogAnd(a, b, c) | LogOr(a, b, c) | Eq(a, b, c)
+            | Neq(a, b, c) | CaseEq(a, b, c) | CasezEq(a, b, c) | CasexEq(a, b, c)
+            | Lt(a, b, c) | Leq(a, b, c) | Gt(a, b, c) | Geq(a, b, c) | Shl(a, b, c)
+            | Shr(a, b, c) | AShr(a, b, c) | BitSelect(a, b, c)
+            | BlockingAssignRangeDyn(_, a, b, c) => {
+                *a += rb;
+                *b += rb;
+                *c += rb;
+            }
+            Select(a, b, c, d) | RangeSelect(a, b, c, d)
+            | BlockingAssignArrayRange(_, a, b, c, d) => {
+                *a += rb;
+                *b += rb;
+                *c += rb;
+                *d += rb;
+            }
+            Concat(a, v) => {
+                *a += rb;
+                for r in v.iter_mut() {
+                    *r += rb;
+                }
+            }
+            StrOp(a, _, v) => {
+                *a += rb;
+                for r in v.iter_mut() {
+                    *r += rb;
+                }
+            }
+            LoadProcessLocal(..) | Format(..) | CaseJump(..) | CaseMaskJump(..)
+            | StmtFallback(..) | EvalExprFallback(..) | NbaAssign(..)
+            | NbaAssignConst(..) | NbaAssignRange(..) | NbaAssignRangeDyn(..)
+            | NbaAssignBitDyn(..) | NbaAssignArray(..) | NbaAssignArrayRange(..)
+            | NbaAssignArrayRead(..) => return false,
+        }
+        true
+    }
+}
+
 /// Opcode name only (no operands) — used by the settle profiler to aggregate
 /// continuous-assignment RHS shapes across entries. Operands differ per
 /// instance; the SHAPE is what a fused fast path would have to match.
