@@ -186,6 +186,8 @@ mod prtest_runner;
 mod randcase_randsequence_weights;
 #[path = "misc/random_stability.rs"]
 mod random_stability;
+#[path = "misc/region_fusion.rs"]
+mod region_fusion;
 #[path = "misc/reg3456_pure_sv.rs"]
 mod reg3456_pure_sv;
 #[path = "misc/reg4712_visitor_traversal.rs"]
