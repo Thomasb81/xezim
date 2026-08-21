@@ -153,6 +153,9 @@ mod mailbox_method_blocking;
 mod spec_static_and_pkg_queue;
 #[path = "misc/base1_packed_index.rs"]
 mod base1_packed_index;
+// The AOT backend only exists in --features jit builds; without it the
+// binary ignores XEZIM_AOT and the coverage assertion can never hold.
+#[cfg(feature = "jit")]
 #[path = "misc/aot_native_paths.rs"]
 mod aot_native_paths;
 #[path = "misc/edge_and_delay_select_fixes.rs"]
