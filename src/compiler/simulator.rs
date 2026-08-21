@@ -16592,7 +16592,8 @@ impl Simulator {
                 }
             }
             if !fns.is_empty() {
-                let src = super::aot::module_source(&fns);
+                let ordered: Vec<String> = names.iter().map(|(_, n)| n.clone()).collect();
+                let src = super::aot::module_source_named(&fns, &ordered);
                 // NativeCtx step 1: hand the generated code the SoA plane
                 // base so its loads skip the FFI bridge (empty mirror —
                 // XEZIM_INLINE_BITS=0 — passes len 0 and keeps the bridge).
@@ -16601,10 +16602,24 @@ impl Simulator {
                     self.signal_inline_bits.len() as u32,
                 );
                 if let Some(lib) = super::aot::compile_and_load(&src, verbose, planes) {
-                    for (idx, name) in &names {
-                        if let Some(f) = lib.sym(name) {
-                            self.comb_jit_fns[*idx] = Some(f);
-                            n += 1;
+                    // Step 15: one exported table symbol instead of a
+                    // dlsym per block; per-name lookup stays as fallback.
+                    if let Some(api) = lib.api() {
+                        for (k, (idx, _)) in names.iter().enumerate() {
+                            let p = api(k as u32);
+                            if !p.is_null() {
+                                self.comb_jit_fns[*idx] = Some(unsafe {
+                                    std::mem::transmute::<*mut u8, super::jit::JitFn>(p)
+                                });
+                                n += 1;
+                            }
+                        }
+                    } else {
+                        for (idx, name) in &names {
+                            if let Some(f) = lib.sym(name) {
+                                self.comb_jit_fns[*idx] = Some(f);
+                                n += 1;
+                            }
                         }
                     }
                     std::mem::forget(lib);
@@ -18825,7 +18840,10 @@ impl Simulator {
                                 }
                             }
                             if !fns_src.is_empty() {
-                                let src = super::aot::module_source(&fns_src);
+                                let ordered: Vec<String> =
+                                    names.iter().map(|(_, n)| n.clone()).collect();
+                                let src =
+                                    super::aot::module_source_named(&fns_src, &ordered);
                                 let planes = (
                                     self.signal_inline_bits.as_ptr() as u64,
                                     self.signal_inline_bits.len() as u32,
@@ -18834,10 +18852,25 @@ impl Simulator {
                                     super::aot::compile_and_load(&src, verbose, planes)
                                 {
                                     let mut n = 0usize;
-                                    for (idx, name) in &names {
-                                        if let Some(f) = lib.sym(name) {
-                                            self.jit_fns[*idx] = Some(f);
-                                            n += 1;
+                                    if let Some(api) = lib.api() {
+                                        for (k, (idx, _)) in names.iter().enumerate() {
+                                            let p = api(k as u32);
+                                            if !p.is_null() {
+                                                self.jit_fns[*idx] = Some(unsafe {
+                                                    std::mem::transmute::<
+                                                        *mut u8,
+                                                        super::jit::JitFn,
+                                                    >(p)
+                                                });
+                                                n += 1;
+                                            }
+                                        }
+                                    } else {
+                                        for (idx, name) in &names {
+                                            if let Some(f) = lib.sym(name) {
+                                                self.jit_fns[*idx] = Some(f);
+                                                n += 1;
+                                            }
                                         }
                                     }
                                     std::mem::forget(lib);
@@ -31865,6 +31898,139 @@ impl Simulator {
             (x.round() * q).round() as u64
         } else {
             raw.round() as u64
+        }
+    }
+
+    /// Roadmap step 13 (XEZIM_AOT=1): compile every process FSM body that
+    /// the rustc emitter covers into ONE native dylib and install the fn
+    /// pointers. Bodies the emitter rejects (or that touch real-typed /
+    /// >64-bit signals) stay on the bytecode executor.
+    #[cfg(feature = "jit")]
+    fn aot_compile_proc_fsms(&mut self) {
+        if self.proc_fsm.is_empty()
+            || !std::env::var("XEZIM_AOT").map(|v| v == "1").unwrap_or(false)
+            || !std::env::var("XEZIM_JIT")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+        {
+            return;
+        }
+        use super::bytecode::Insn;
+        let verbose = std::env::var("XEZIM_JIT_VERBOSE").is_ok();
+        let mut names: Vec<(usize, String)> = Vec::new();
+        let mut fns_src: Vec<String> = Vec::new();
+        let pids: Vec<usize> = self.proc_fsm.keys().copied().collect();
+        if verbose {
+            eprintln!("[AOT] fsm pass over {} process FSMs", pids.len());
+        }
+        for pid in pids {
+            let f = &self.proc_fsm[&pid];
+            // Signal gate only: >64-bit or real-typed signals stay on the
+            // bytecode executor (the u64 planes would truncate / misread
+            // f64 bit patterns). Real CONSTANTS are fine — `gen_fsm_fn`
+            // itself proves a Real tick literal feeds only a delay wait and
+            // rejects any other real const (unlike the shared
+            // `block_signals_fit_u64`, whose real-const arm would throw the
+            // elaboration-quantized delay literals out wholesale).
+            let bad_signal = f.compiled.instructions.iter().any(|i| {
+                let sig = match i {
+                    Insn::LoadSignal(_, sig)
+                    | Insn::LoadSignalSigned(_, sig)
+                    | Insn::LoadSignalRange(_, sig, _, _)
+                    | Insn::LoadSignalBit(_, sig, _)
+                    | Insn::BranchIfSignalFalse(sig, _, _)
+                    | Insn::BlockingAssign(sig, _, _)
+                    | Insn::BlockingAssignRange(sig, _, _, _)
+                    | Insn::BlockingAssignRangeDyn(sig, _, _, _)
+                    | Insn::BlockingAssignBitDyn(sig, _, _)
+                    | Insn::NbaAssign(sig, _, _)
+                    | Insn::NbaAssignConst(sig, _, _)
+                    | Insn::NbaAssignRange(sig, _, _, _)
+                    | Insn::NbaAssignRangeDyn(sig, _, _, _)
+                    | Insn::NbaAssignBitDyn(sig, _, _)
+                    | Insn::NbaAssignArrayRead(sig, _, _, _) => Some(*sig as usize),
+                    Insn::LoadArrayElem(_, arr, _)
+                    | Insn::BlockingAssignArray(arr, _, _, _)
+                    | Insn::NbaAssignArray(arr, _, _, _) => match arr.as_ref() {
+                        super::bytecode::ArrayOperand::Dense { first_id, .. } => {
+                            Some(*first_id)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match sig {
+                    Some(id) => {
+                        self.signal_widths.get(id).copied().unwrap_or(0) > 64
+                            || self.signal_real.get(id).copied().unwrap_or(false)
+                            || self
+                                .signal_table
+                                .get(id)
+                                .map(|v| v.is_real)
+                                .unwrap_or(false)
+                    }
+                    None => false,
+                }
+            });
+            if bad_signal {
+                if verbose {
+                    eprintln!("[AOT-BAIL-FSM] pid={} (signal gate)", pid);
+                }
+                continue;
+            }
+            let name = format!("xezim_aot_fsm_{pid}");
+            if let Some(src) = super::aot::gen_fsm_fn(
+                &name,
+                &f.compiled.instructions,
+                f.compiled.num_regs,
+                &self.signal_widths,
+                &self.signal_signed,
+            ) {
+                names.push((pid, name));
+                fns_src.push(src);
+            } else if verbose {
+                eprintln!("[AOT-BAIL-FSM] pid={}", pid);
+            }
+        }
+        if fns_src.is_empty() {
+            return;
+        }
+        let ordered: Vec<String> = names.iter().map(|(_, n)| n.clone()).collect();
+        let src = super::aot::module_source_named(&fns_src, &ordered);
+        let planes = (
+            self.signal_inline_bits.as_ptr() as u64,
+            self.signal_inline_bits.len() as u32,
+        );
+        if let Some(lib) = super::aot::compile_and_load(&src, verbose, planes) {
+            let mut n = 0usize;
+            if let Some(api) = lib.api() {
+                for (k, (pid, _)) in names.iter().enumerate() {
+                    let p = api(k as u32);
+                    if !p.is_null() {
+                        if let Some(f) = self.proc_fsm.get_mut(pid) {
+                            f.native = Some(unsafe {
+                                std::mem::transmute::<*mut u8, super::aot::AotFsmFn>(p)
+                            });
+                            f.native_frame =
+                                vec![0u64; 2 * f.compiled.num_regs as usize];
+                            n += 1;
+                        }
+                    }
+                }
+            } else {
+                for (pid, name) in &names {
+                    if let Some(fp) = lib.sym_fsm(name) {
+                        if let Some(f) = self.proc_fsm.get_mut(pid) {
+                            f.native = Some(fp);
+                            f.native_frame =
+                                vec![0u64; 2 * f.compiled.num_regs as usize];
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            std::mem::forget(lib);
+            eprintln!("[AOT] process FSMs compiled {}/{}", n, self.proc_fsm.len());
         }
     }
 
