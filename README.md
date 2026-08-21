@@ -105,7 +105,7 @@ and testbench flows. Portable code should not rely on them.
 
 # What's new in 0.10
 
-### 0.10.1 – 0.10.2 — native compilation and process conformance (August 2026)
+### 0.10.1 – 0.10.3 — native compilation and process conformance (August 2026)
 
 * **AOT native backend** (`XEZIM_AOT=1`, needs a `--features jit` build) — the
   compiler emits Rust for eligible combinational entries, edge blocks, and
