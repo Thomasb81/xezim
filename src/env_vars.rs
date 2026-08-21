@@ -111,6 +111,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_NO_DYN_RENAME", "Disable dynamic renaming of user identifiers colliding with internals"),
     ("XEZIM_NO_LAZY_PREFIX", "Elab: disable lazy hierarchical-prefix interning"),
     ("XEZIM_NO_MEM_WATCHDOG", "Disable the OOM memory watchdog thread"),
+    ("XEZIM_NO_NATIVE_CACHE", "AOT: disable the persistent native-library cache (~/.cache/xezim/native)"),
     ("XEZIM_NO_PARALLEL", "Parallel: disable all multithreaded execution"),
     ("XEZIM_NO_PARALLEL_RANGE", "Parallel: disable parallel range-partitioned apply"),
     ("XEZIM_OPCODE_CENSUS", "Print executed-insn opcode histogram at end of sim"),

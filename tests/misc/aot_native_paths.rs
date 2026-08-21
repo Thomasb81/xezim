@@ -215,3 +215,56 @@ endmodule
     assert!(plain.starts_with("EDGE "), "interpreter run produced no result");
     assert_eq!(aot, plain, "AOT edge-block values must match the interpreter");
 }
+
+#[test]
+fn aot_native_cache_hits_on_second_run() {
+    // Roadmap step 16: the generated dylib is cached under
+    // ~/.cache/xezim/native keyed on a hash of the generated source; the
+    // second identical run must skip rustc. An isolated XEZIM_CACHE_DIR
+    // keeps this test independent of the user's real cache.
+    let body = r#"
+module tb;
+  reg [7:0] a, b;
+  wire [7:0] s;
+  assign s = a ^ b;
+  initial begin
+    a = 8'h21; b = 8'h42;
+    #10 $display("CACHED s=%h", s);
+    $finish;
+  end
+endmodule
+"#;
+    let dir = std::env::temp_dir().join(format!("xezim_aot_cache_{}", std::process::id()));
+    let cache = dir.join("cache");
+    let _ = std::fs::create_dir_all(&cache);
+    let f = dir.join("t.sv");
+    std::fs::write(&f, body).unwrap();
+    let run = || -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+            .args(["--no-cache", "-s", "tb", "--max-time", "1000"])
+            .arg(&f)
+            .env("XEZIM_JIT", "1")
+            .env("XEZIM_AOT", "1")
+            .env("XEZIM_JIT_VERBOSE", "1")
+            .env("XEZIM_CACHE_DIR", &cache)
+            .output()
+            .expect("run xezim");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let first = run();
+    assert!(
+        first.contains("rustc compiled") && first.contains("CACHED s=63"),
+        "first run must compile:\n{}",
+        first
+    );
+    let second = run();
+    assert!(
+        second.contains("native cache hit") && second.contains("CACHED s=63"),
+        "second run must hit the cache with identical values:\n{}",
+        second
+    );
+}

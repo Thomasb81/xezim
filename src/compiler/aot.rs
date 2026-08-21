@@ -356,6 +356,184 @@ pub fn gen_block_fn(
     Some(out)
 }
 
+/// Roadmap step 13: a PROCESS-FSM body as a native state machine — the
+/// same per-insn emitter as `gen_block_fn`, with three differences:
+///  - signature `(sim, start_pc, frame, out) -> next_pc`: registers load
+///    from `frame` (two u64 planes per reg) at entry and spill back at
+///    every suspension, so values survive across activations;
+///  - `WaitDelayReg` / `WaitEdge` SUSPEND: `out[0]` = 1 (delay) / 2
+///    (edge), `out[1]` = edge spec index, `out[2..4]` = the delay
+///    register's value/xz planes; the return value is the resume pc.
+///    Completion spills and sets `out[0] = 0`;
+///  - an INTEGRAL `Real` constant whose register feeds only
+///    `WaitDelayReg` emits as its integer tick count (elaboration folds
+///    quantized delays into Real tick literals, which the general
+///    emitter rejects).
+pub fn gen_fsm_fn(
+    fn_name: &str,
+    insns: &[Insn],
+    num_regs: u32,
+    sig_w: &[u32],
+    sig_signed: &[bool],
+) -> Option<String> {
+    use Insn::*;
+    let mut meta = RegMeta {
+        w: vec![0; num_regs as usize],
+        s: vec![false; num_regs as usize],
+    };
+    let n = insns.len();
+    let mut is_leader = vec![false; n.max(1)];
+    is_leader[0] = true;
+    for (i, insn) in insns.iter().enumerate() {
+        let mut targets: Vec<usize> = Vec::new();
+        match insn {
+            BranchIfFalse(_, t)
+            | Jump(t)
+            | BranchIfSignalFalse(_, t, _)
+            | BranchUnlessZero(_, t)
+            | CmpBranch(_, _, _, _, t) => targets.push(*t as usize),
+            CaseJump(_, cj) => {
+                targets.extend(cj.table.iter().map(|&t| t as usize));
+                targets.push(cj.default as usize);
+            }
+            // Resume points must be dispatchable.
+            WaitDelayReg(..) | WaitEdge(..) => {
+                if i + 1 < n {
+                    is_leader[i + 1] = true;
+                }
+            }
+            _ => {}
+        }
+        if !targets.is_empty() {
+            for t in targets {
+                if t < n {
+                    is_leader[t] = true;
+                }
+            }
+            if i + 1 < n {
+                is_leader[i + 1] = true;
+            }
+        }
+    }
+    // An integral Real constant loaded IMMEDIATELY before the WaitDelayReg
+    // that consumes it is a quantized tick literal (that adjacent pair is
+    // exactly what the statement compiler emits for `#const`); it may emit
+    // as an integer. Keyed by insn index — the register may be legitimately
+    // redefined and reused later.
+    let mut delay_const_ok: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (i, insn) in insns.iter().enumerate() {
+        if let LoadConst(d, v) = insn {
+            if v.is_real {
+                let f = v.to_f64();
+                let integral = f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f < 9.0e15;
+                let feeds_wait = matches!(insns.get(i + 1), Some(WaitDelayReg(r)) if r == d);
+                if integral && feeds_wait {
+                    delay_const_ok.insert(i);
+                }
+            }
+        }
+    }
+    let spill: String = (0..num_regs)
+        .map(|r| {
+            format!(
+                "*frame.add({}) = r{r}v; *frame.add({}) = r{r}x;
+",
+                2 * r as usize,
+                2 * r as usize + 1
+            )
+        })
+        .collect();
+    let mut body = String::new();
+    let mut tables = String::new();
+    let mut ntab = 0usize;
+    let w = &mut body;
+    for (i, insn) in insns.iter().enumerate() {
+        if is_leader[i] {
+            if i != 0 {
+                let _ = writeln!(w, "pc = {i}; continue 'sm; }}");
+            }
+            let _ = writeln!(w, "{i} => {{");
+        }
+        match insn {
+            WaitDelayReg(r) => {
+                w.push_str(&spill);
+                let _ = writeln!(
+                    w,
+                    "*out.add(0) = 1; *out.add(2) = r{r}v; *out.add(3) = r{r}x; return {};",
+                    i + 1
+                );
+                continue;
+            }
+            WaitEdge(ix) => {
+                w.push_str(&spill);
+                let _ = writeln!(w, "*out.add(0) = 2; *out.add(1) = {ix}; return {};", i + 1);
+                continue;
+            }
+            LoadConst(d, v) if v.is_real && delay_const_ok.contains(&i) => {
+                let ticks = v.to_f64() as u64;
+                let _ = writeln!(w, "r{d}v = {ticks}u64; r{d}x = 0;");
+                super::jit::update_reg_meta(insn, &mut meta.w, &mut meta.s, sig_w, sig_signed);
+                continue;
+            }
+            _ => {}
+        }
+        if emit_insn_rust(w, &mut tables, &mut ntab, insn, i, n, &meta, sig_w, sig_signed)
+            .is_none()
+        {
+            if std::env::var_os("XEZIM_JIT_VERBOSE").is_some() {
+                let lo = i.saturating_sub(2);
+                let hi = (i + 3).min(n);
+                let win: Vec<String> = insns[lo..hi]
+                    .iter()
+                    .enumerate()
+                    .map(|(k, x)| format!("#{}:{:?}", lo + k, x))
+                    .collect();
+                eprintln!("[AOT-FSM-EMIT] bail at #{i}: {}", win.join(" | "));
+            }
+            return None;
+        }
+        if let Some((d, mw)) = super::jit::insn_result_width(insn, &meta.w, sig_w) {
+            let m = (1u64 << mw) - 1;
+            let _ = writeln!(w, "r{d}v &= {m:#x}; r{d}x &= {m:#x};");
+        }
+        super::jit::update_reg_meta(insn, &mut meta.w, &mut meta.s, sig_w, sig_signed);
+    }
+    // Completion epilogue (fell past the last insn).
+    let _ = writeln!(w, "{}", spill);
+    let _ = writeln!(w, "*out.add(0) = 0; return 0; }}");
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "#[no_mangle]\npub unsafe extern \"C\" fn {fn_name}(sim: *mut u8, start_pc: u32, frame: *mut u64, out: *mut u64) -> u32 {{"
+    );
+    out.push_str(&tables);
+    for r in 0..num_regs {
+        let _ = writeln!(
+            out,
+            "let mut r{r}v = *frame.add({}); let mut r{r}x = *frame.add({});",
+            2 * r as usize,
+            2 * r as usize + 1
+        );
+    }
+    out.push_str("let mut pc: u32 = start_pc;
+'sm: loop { match pc {
+");
+    out.push_str(&body);
+    out.push_str("_ => { ");
+    out.push_str(&spill);
+    out.push_str("*out.add(0) = 0; return 0; }
+} }
+}
+");
+    Some(out)
+}
+
+
+
+/// Native process-FSM entry: (sim, start_pc, frame, out) -> resume pc.
+pub type AotFsmFn = unsafe extern "C" fn(*mut u8, u32, *mut u64, *mut u64) -> u32;
+
 /// One insn -> Rust statements. Returns None to reject the whole block
 /// (mirrors the `Err(())` bails in the cranelift emit path).
 #[allow(clippy::too_many_arguments)]
@@ -931,6 +1109,29 @@ pub struct AotLib {
 }
 
 impl AotLib {
+    /// Step 15: the single-symbol function table. Returns a resolver
+    /// closure over `xezim_native_api`.
+    pub fn api(&self) -> Option<impl Fn(u32) -> *mut u8 + '_> {
+        let c = std::ffi::CString::new("xezim_native_api").ok()?;
+        let p = unsafe { libc::dlsym(self.handle, c.as_ptr()) };
+        if p.is_null() {
+            return None;
+        }
+        let f: unsafe extern "C" fn(u32) -> *mut u8 =
+            unsafe { std::mem::transmute(p) };
+        Some(move |idx: u32| unsafe { f(idx) })
+    }
+
+    pub fn sym_fsm(&self, name: &str) -> Option<AotFsmFn> {
+        let c = std::ffi::CString::new(name).ok()?;
+        let p = unsafe { libc::dlsym(self.handle, c.as_ptr()) };
+        if p.is_null() {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute::<*mut libc::c_void, AotFsmFn>(p) })
+        }
+    }
+
     pub fn sym(&self, name: &str) -> Option<JitFn> {
         let c = std::ffi::CString::new(name).ok()?;
         let p = unsafe { libc::dlsym(self.handle, c.as_ptr()) };
@@ -961,12 +1162,63 @@ pub fn compile_and_load(
     std::fs::create_dir_all(&dir).ok()?;
     let rs = dir.join("xezim_aot.rs");
     let so = dir.join("libxezim_aot.so");
+    // Roadmap step 16: persistent native cache. The key hashes the FULL
+    // generated source (which transitively encodes the design: signal ids,
+    // widths, constants), the opt level, target-cpu mode and this xezim
+    // build — so any change to the design OR the generator misses cleanly.
+    // A hit skips rustc entirely; dlopen still goes through the unique temp
+    // path's COPY so per-process libraries never collide.
+    let opt_env = std::env::var("XEZIM_AOT_OPT").unwrap_or_else(|_| "2".to_string());
+    let cache_so: Option<std::path::PathBuf> =
+        if std::env::var_os("XEZIM_NO_NATIVE_CACHE").is_none() {
+            let mut h: u64 = 0xcbf29ce484222325;
+            let mut feed = |b: &[u8]| {
+                for &x in b {
+                    h ^= x as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+            };
+            feed(source.as_bytes());
+            feed(opt_env.as_bytes());
+            feed(b"native");
+            feed(
+                option_env!("XEZIM_GIT_HASH")
+                    .unwrap_or(env!("CARGO_PKG_VERSION"))
+                    .as_bytes(),
+            );
+            let base = std::env::var_os("XEZIM_CACHE_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from)
+                })
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(|hm| std::path::PathBuf::from(hm).join(".cache"))
+                });
+            base.map(|b| {
+                let d = b.join("xezim").join("native");
+                let _ = std::fs::create_dir_all(&d);
+                d.join(format!("{h:016x}.so"))
+            })
+        } else {
+            None
+        };
+    if let Some(cp) = &cache_so {
+        if cp.exists() && std::fs::copy(cp, &so).is_ok() {
+            if let Some(lib) = dlopen_and_bind(&so, planes) {
+                if verbose {
+                    eprintln!("[AOT] native cache hit ({})", cp.display());
+                }
+                return Some(lib);
+            }
+        }
+    }
     std::fs::write(&rs, source).ok()?;
     let t0 = std::time::Instant::now();
     // XEZIM_AOT_OPT overrides the opt level (default 2; 3 measured neutral
     // on ibex but may differ on larger generated crates). target-cpu=native
     // lets LLVM use the host's vector/bit ops in the plane algebra.
-    let opt = std::env::var("XEZIM_AOT_OPT").unwrap_or_else(|_| "2".to_string());
+    let opt = opt_env;
     let opt_arg = format!("opt-level={}", if matches!(opt.as_str(), "0" | "1" | "2" | "3") { opt.as_str() } else { "2" });
     let out = std::process::Command::new("rustc")
         .args([
@@ -998,6 +1250,20 @@ pub fn compile_and_load(
     if verbose {
         eprintln!("[AOT] rustc compiled {} bytes of source in {:.1}s", source.len(), t0.elapsed().as_secs_f64());
     }
+    if let Some(cp) = &cache_so {
+        // Atomic publish: write beside, rename over.
+        let tmp = cp.with_extension(format!("tmp{}", std::process::id()));
+        if std::fs::copy(&so, &tmp).is_ok() {
+            let _ = std::fs::rename(&tmp, cp);
+        }
+    }
+    dlopen_and_bind(&so, planes)
+}
+
+/// dlopen the compiled dylib and bind the runtime bridge table (which
+/// carries the SoA plane base — NativeCtx step 1). Shared by the fresh
+/// compile path and the step-16 cache-hit path.
+fn dlopen_and_bind(so: &std::path::Path, planes: (u64, u32)) -> Option<AotLib> {
     let c = std::ffi::CString::new(so.to_string_lossy().into_owned()).ok()?;
     let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW) };
     if handle.is_null() {
@@ -1005,9 +1271,6 @@ pub fn compile_and_load(
         return None;
     }
     let lib = AotLib { handle };
-    // Bind the bridge table before any block fn can run. Built at runtime
-    // because it now carries the SoA plane base pointer (NativeCtx step 1);
-    // the dylib copies the struct into its own static at bind.
     let bind = lib.sym("xezim_aot_bind")?;
     let bridge = AotBridge {
         load: super::jit::xezim_jit_load_signal,
@@ -1032,11 +1295,25 @@ pub fn compile_and_load(
 
 /// Assemble the full crate source from per-block fns.
 pub fn module_source(block_fns: &[String]) -> String {
+    module_source_named(block_fns, &[])
+}
+
+/// Roadmap step 15: alongside the per-fn symbols, export ONE
+/// `xezim_native_api(idx) -> *mut u8` table over `names` (in order), so the
+/// loader resolves a single symbol instead of one dlsym per block.
+pub fn module_source_named(block_fns: &[String], names: &[String]) -> String {
     let mut s = String::with_capacity(PRELUDE.len() + block_fns.iter().map(|b| b.len()).sum::<usize>());
     s.push_str(PRELUDE);
     for b in block_fns {
         s.push_str(b);
         s.push('\n');
+    }
+    if !names.is_empty() {
+        s.push_str("#[no_mangle]\npub unsafe extern \"C\" fn xezim_native_api(idx: u32) -> *mut u8 {\nmatch idx {\n");
+        for (i, n) in names.iter().enumerate() {
+            let _ = writeln!(s, "{i} => {n} as usize as *mut u8,");
+        }
+        s.push_str("_ => core::ptr::null_mut(),\n} }\n");
     }
     s
 }
