@@ -172,6 +172,8 @@ mod new_ctor_vs_shallow_copy;
 mod assoc_dotted_key;
 #[path = "misc/call_returned_handle_assoc.rs"]
 mod call_returned_handle_assoc;
+#[path = "misc/edge_task_call_process.rs"]
+mod edge_task_call_process;
 #[path = "misc/factory_register_reentrant.rs"]
 mod factory_register_reentrant;
 #[path = "misc/pattern_replication_and_extends_args.rs"]

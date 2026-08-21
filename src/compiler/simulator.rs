@@ -15901,6 +15901,90 @@ impl Simulator {
         }
     }
 
+    /// Does the subtree contain a statement-level call to a RESOLVABLE task
+    /// (or void function) whose body blocks? `stmt_is_blocking` cannot see
+    /// through calls, so an `always @(posedge clk) begin q <= d; if (go)
+    /// drv.step(); end` classified as an EDGE block — and when the callee
+    /// finally blocked, the synchronous executor advanced global time with
+    /// the slot's NBAs still queued (a `#1` inside the task committed
+    /// `q <= d` picoseconds late; the cv8s BFM reset-release skew). Such a
+    /// body must be a PROCESS: parking commits the slot's NBAs on time and
+    /// gives the §9.2.2 miss-edges-while-busy semantics the reference
+    /// implements. Unresolvable callees (class/virtual methods) keep the
+    /// old classification.
+    fn stmt_calls_blocking_task(&self, stmt: &Statement, scope: &str, depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let call_blocks = |raw: &str| -> bool {
+            let mut cands: Vec<String> = Vec::with_capacity(3);
+            if !scope.is_empty() {
+                cands.push(format!("{}.{}", scope, raw));
+            }
+            cands.push(raw.to_string());
+            if let Some((_, leaf)) = raw.rsplit_once('.') {
+                if !scope.is_empty() {
+                    cands.push(format!("{}.{}", scope, leaf));
+                }
+            }
+            for c in &cands {
+                if let Some(td) = self.module.tasks.get(c.as_str()) {
+                    return td.items.iter().any(|st| self.stmt_is_blocking(st))
+                        || td
+                            .items
+                            .iter()
+                            .any(|st| self.stmt_calls_blocking_task(st, scope, depth - 1));
+                }
+            }
+            false
+        };
+        match &stmt.kind {
+            StatementKind::Expr(e) => match &e.kind {
+                ExprKind::Call { func, .. } => match &func.kind {
+                    ExprKind::Ident(h) => {
+                        let raw: String = h
+                            .path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        call_blocks(&raw)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            },
+            StatementKind::TimingControl { stmt: inner, .. } => {
+                self.stmt_calls_blocking_task(inner, scope, depth)
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(|st| self.stmt_calls_blocking_task(st, scope, depth))
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.stmt_calls_blocking_task(then_stmt, scope, depth)
+                    || else_stmt
+                        .as_ref()
+                        .is_some_and(|e| self.stmt_calls_blocking_task(e, scope, depth))
+            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| self.stmt_calls_blocking_task(&it.stmt, scope, depth)),
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. } => {
+                self.stmt_calls_blocking_task(body, scope, depth)
+            }
+            _ => false,
+        }
+    }
+
     fn classify_one_always_block(&mut self, ab: AlwaysBlock) -> Option<AlwaysBlock> {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
@@ -15997,6 +16081,7 @@ impl Simulator {
                     && !has_named_event
                     && !self_ref
                     && !self.stmt_is_blocking(&body)
+                    && !self.stmt_calls_blocking_task(&body, &ab.scope, 3)
                     && (
                         // Index-dependent / select / concat sensitivity: the
                         // list does not name everything that may trigger the
@@ -16168,6 +16253,32 @@ impl Simulator {
                         terms.join(", ")
                     );
                 }
+                // A body that CALLS a blocking task must be a PROCESS: on
+                // the edge path the call executes synchronously and its
+                // first `#delay` advances global time with this slot's NBAs
+                // still queued — `q <= d;` scheduled before the call then
+                // commits picoseconds late (the cv8s BFM reset-release
+                // skew: rst_l_d1 stamped at t+6ps). As a process, the park
+                // machinery suspends the call properly, the slot's NBA
+                // region commits on time, and busy-body edges are missed
+                // per §9.2.2 exactly as the reference behaves.
+                if self.stmt_calls_blocking_task(&body, &ab.scope, 3) {
+                    let forever_stmt = Statement::new(
+                        StatementKind::Forever {
+                            body: Box::new(ab.stmt.clone()),
+                        },
+                        ab.stmt.span,
+                    );
+                    let pid = self.next_pid;
+                    self.next_pid += 1;
+                    if !ab.scope.is_empty() {
+                        self.process_scope_hint.insert(pid, ab.scope.clone());
+                    }
+                    self.process_origin
+                        .insert(pid, (ab.stmt.span, "always block"));
+                    self.event_queue.schedule(0, pid, vec![forever_stmt].into());
+                    return None;
+                }
                 Arc::make_mut(&mut self.edge_blocks).push(EdgeSensitiveBlock {
                     resolved_sensitivities: resolved,
                     stmt: body,
@@ -16257,7 +16368,9 @@ impl Simulator {
                 self.event_queue.schedule(0, pid, vec![forever_stmt].into());
                 return None;
             }
-            if self.stmt_is_blocking(&ab.stmt) {
+            if self.stmt_is_blocking(&ab.stmt)
+                || self.stmt_calls_blocking_task(&ab.stmt, &ab.scope, 3)
+            {
                 // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a blocking always
                 // body whose whole statement tree compiles fallback-free
                 // becomes a bytecode FSM — resumes re-enter at a saved pc
