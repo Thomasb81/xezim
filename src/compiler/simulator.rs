@@ -2429,6 +2429,16 @@ struct ProcFsm {
     /// Module-precision diff for delay quantization (§3.14.3), resolved on
     /// first activation when the process scope is installed.
     precision_diff: Option<i32>,
+    /// `always` bodies restart at pc 0 on completion; `initial` bodies are
+    /// done — the frame is dropped and the pid never reactivates.
+    is_always: bool,
+    /// Roadmap step 13: rustc-native form of the body (XEZIM_AOT=1). The
+    /// native fn loads/spills its registers from `native_frame` around each
+    /// suspension; bytecode execution is the fallback when absent.
+    #[cfg(feature = "jit")]
+    native: Option<super::aot::AotFsmFn>,
+    #[cfg(feature = "jit")]
+    native_frame: Vec<u64>,
 }
 
 /// What a Wait insn suspended on: (payload). Paired with the resume pc in
@@ -11861,6 +11871,8 @@ impl Simulator {
         self.build_comb_entries();
         #[cfg(feature = "jit")]
         self.jit_compile_comb_entries();
+        #[cfg(feature = "jit")]
+        self.aot_compile_proc_fsms();
         mark_compile_phase("build combinational entries", &mut compile_phase_start);
         if let Ok(w) = std::env::var("XEZIM_DUMP_ENTRY") {
             let probes: Vec<usize> = if w == "all" {
@@ -12260,6 +12272,32 @@ impl Simulator {
             if let Some(cg) = self.try_extract_initial_clock_gen(&stmts) {
                 self.clock_generators.push(cg);
                 continue;
+            }
+            // Roadmap 12 (opt-in XEZIM_PROC_FSM=1): a compilable initial body
+            // with waits becomes a process FSM. The cheap timing-control
+            // count runs first so memory-init megablocks skip without the
+            // SeqBlock rebuild.
+            {
+                use std::sync::OnceLock;
+                static FSM_ON: OnceLock<bool> = OnceLock::new();
+                let fsm_on = *FSM_ON.get_or_init(|| {
+                    std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1")
+                });
+                if fsm_on
+                    && stmts.iter().map(Self::count_timing_controls).sum::<usize>() >= 1
+                {
+                    let wrapped = Statement::new(
+                        StatementKind::SeqBlock {
+                            name: None,
+                            stmts: stmts.clone(),
+                        },
+                        span,
+                    );
+                    if self.try_register_proc_fsm(&wrapped, &scope, false, "initial block")
+                    {
+                        continue;
+                    }
+                }
             }
             let pid = self.next_pid;
             self.next_pid += 1;
@@ -15830,6 +15868,39 @@ impl Simulator {
         }
     }
 
+    /// Does the subtree contain a statement-level task-enable / void call?
+    /// (`pulse(x);` / `drv.step();`) — such a callee may hide waits that
+    /// `count_timing_controls` cannot see.
+    fn stmt_contains_call(stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::Expr(e) => matches!(e.kind, ExprKind::Call { .. }),
+            StatementKind::TimingControl { stmt: inner, .. } => {
+                Self::stmt_contains_call(inner)
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_contains_call)
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::stmt_contains_call(then_stmt)
+                    || else_stmt.as_ref().is_some_and(|e| Self::stmt_contains_call(e))
+            }
+            StatementKind::Case { items, .. } => {
+                items.iter().any(|it| Self::stmt_contains_call(&it.stmt))
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. } => Self::stmt_contains_call(body),
+            _ => false,
+        }
+    }
+
     fn classify_one_always_block(&mut self, ab: AlwaysBlock) -> Option<AlwaysBlock> {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
@@ -15845,9 +15916,10 @@ impl Simulator {
             let fsm_on = *FSM_ON.get_or_init(|| {
                 std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1")
             });
+            let tc = Self::count_timing_controls(&ab.stmt);
             if fsm_on
-                && Self::count_timing_controls(&ab.stmt) >= 2
-                && self.try_register_proc_fsm(&ab)
+                && (tc >= 2 || (tc >= 1 && Self::stmt_contains_call(&ab.stmt)))
+                && self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block")
             {
                 return None;
             }
@@ -16196,7 +16268,14 @@ impl Simulator {
                     let fsm_on = *ON.get_or_init(|| {
                         std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1")
                     });
-                    if fsm_on && self.try_register_proc_fsm(&ab) {
+                    if fsm_on
+                        && self.try_register_proc_fsm(
+                            &ab.stmt,
+                            &ab.scope,
+                            true,
+                            "always block",
+                        )
+                    {
                         return None;
                     }
                 }
@@ -16225,12 +16304,18 @@ impl Simulator {
     /// fallback and at least one wait point; the pid is scheduled with the
     /// empty payload marker that `run_process_payload` routes to
     /// `run_proc_fsm`.
-    fn try_register_proc_fsm(&mut self, ab: &xezim_core::elaborate::AlwaysBlock) -> bool {
+    fn try_register_proc_fsm(
+        &mut self,
+        stmt: &Statement,
+        scope: &str,
+        is_always: bool,
+        origin: &'static str,
+    ) -> bool {
         use super::bytecode::{BytecodeCompiler, Insn};
-        let scope_hint = if ab.scope.is_empty() {
+        let scope_hint = if scope.is_empty() {
             None
         } else {
-            Some(ab.scope.clone())
+            Some(scope.to_string())
         };
         let mut compiler = BytecodeCompiler::new(
             &self.signal_name_to_id,
@@ -16256,12 +16341,9 @@ impl Simulator {
         compiler.set_string_signals(&self.module.string_signals);
         compiler.set_signal_real(&self.signal_real);
         let dbg = std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some();
-        if !compiler.compile_stmt(&ab.stmt) {
+        if !compiler.compile_stmt(stmt) {
             if dbg {
-                eprintln!(
-                    "[PROC-FSM] scope '{}': body did not compile",
-                    ab.scope
-                );
+                eprintln!("[PROC-FSM] scope '{}': body did not compile", scope);
             }
             return false;
         }
@@ -16270,7 +16352,59 @@ impl Simulator {
                 .into_iter()
                 .map(|ev| (ev, None))
                 .collect();
-        let cb = compiler.finish();
+        let mut cb = compiler.finish();
+        // Constant-delay fold: an integer bare delay elaborates to
+        // `LoadConst(int) ; LoadConst(real scale) ; Mul ; WaitDelayReg`.
+        // Rewrite the window to `Nop ; Nop ; LoadConst(real ticks) ; Wait`
+        // (indices preserved) so the native generator's adjacency fold —
+        // and the bytecode VM identically — see one quantized tick literal.
+        {
+            use super::bytecode::Insn;
+            let n = cb.instructions.len();
+            for i in 0..n.saturating_sub(3) {
+                let hit = match (
+                    &cb.instructions[i],
+                    &cb.instructions[i + 1],
+                    &cb.instructions[i + 2],
+                    &cb.instructions[i + 3],
+                ) {
+                    (
+                        Insn::LoadConst(a, va),
+                        Insn::LoadConst(b, vb),
+                        Insn::Mul(c, ma, mb),
+                        Insn::WaitDelayReg(wr),
+                    ) if wr == c
+                        && ((ma == a && mb == b) || (ma == b && mb == a))
+                        && !va.is_real
+                        && vb.is_real =>
+                    {
+                        let iv = va.to_u64().unwrap_or(0) as f64;
+                        let ticks = iv * vb.to_f64();
+                        // The elaboration scale factor (unit/tick in f64)
+                        // can carry an ulp of error; the product is by
+                        // construction a whole tick count — snap it.
+                        let snapped = ticks.round();
+                        if ticks.is_finite()
+                            && snapped >= 0.0
+                            && snapped < 9.0e15
+                            && (ticks - snapped).abs() <= 1e-6 * snapped.max(1.0)
+                        {
+                            Some((*c, snapped))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some((c, ticks)) = hit {
+                    cb.instructions[i] = Insn::Nop;
+                    cb.instructions[i + 1] = Insn::Nop;
+                    cb.instructions[i + 2] =
+                        Insn::LoadConst(c, Box::new(Value::from_f64(ticks)));
+                }
+            }
+        }
+        let cb = cb;
         // Gate: fallback-free, at least one wait (else it belongs on the
         // comb/edge paths), and no process-local frame reads (the FSM has
         // no AST call frames).
@@ -16291,7 +16425,7 @@ impl Simulator {
                     .collect();
                 eprintln!(
                     "[PROC-FSM] scope '{}': gated out (fallback={} insns={} ops={:?})",
-                    ab.scope,
+                    scope,
                     cb.has_fallback,
                     cb.instructions.len(),
                     ops
@@ -16301,11 +16435,10 @@ impl Simulator {
         }
         let pid = self.next_pid;
         self.next_pid += 1;
-        if !ab.scope.is_empty() {
-            self.process_scope_hint.insert(pid, ab.scope.clone());
+        if !scope.is_empty() {
+            self.process_scope_hint.insert(pid, scope.to_string());
         }
-        self.process_origin
-            .insert(pid, (ab.stmt.span, "always block"));
+        self.process_origin.insert(pid, (stmt.span, origin));
         self.proc_fsm.insert(
             pid,
             ProcFsm {
@@ -16313,15 +16446,20 @@ impl Simulator {
                 waits,
                 pc: 0,
                 regs: Vec::new(),
-                scope: ab.scope.clone(),
+                scope: scope.to_string(),
                 precision_diff: None,
+                is_always,
+                #[cfg(feature = "jit")]
+                native: None,
+                #[cfg(feature = "jit")]
+                native_frame: Vec::new(),
             },
         );
         if dbg || sim_debug_enabled() {
             eprintln!(
                 "[PROC-FSM] registered pid {} scope '{}' ({} insns, {} waits)",
                 pid,
-                ab.scope,
+                scope,
                 self.proc_fsm[&pid].compiled.instructions.len(),
                 self.proc_fsm[&pid].waits.len()
             );
@@ -31760,6 +31898,78 @@ impl Simulator {
             prec_exp - Self::secs_to_exp(self.tick_s)
         });
         self.fsm_precision_diff = pd;
+        // Roadmap step 13: the native form suspends by RETURNING — no VM
+        // registers involved (its own live in `native_frame`).
+        #[cfg(feature = "jit")]
+        if let Some(nf) = f.native {
+            let mut out = [0u64; 4];
+            let mut passes = 0u32;
+            loop {
+                let sim_ptr = self as *mut Self as *mut u8;
+                let npc = unsafe {
+                    nf(sim_ptr, f.pc, f.native_frame.as_mut_ptr(), out.as_mut_ptr())
+                };
+                match out[0] {
+                    1 => {
+                        let v = Value::from_u64(out[2] & !out[3], 64);
+                        let t = self.fsm_delay_ticks(&v, pd);
+                        if t == 0 {
+                            self.inactive_queue.push((pid, ProcCont::empty()));
+                        } else {
+                            self.event_queue.schedule(
+                                self.time.saturating_add(t),
+                                pid,
+                                Vec::new().into(),
+                            );
+                        }
+                        f.pc = npc;
+                        break;
+                    }
+                    2 => {
+                        let ix = out[1] as usize;
+                        let sens = {
+                            let slot = &mut f.waits[ix];
+                            if slot.1.is_none() {
+                                slot.1 = Some(self.event_to_sens(&slot.0));
+                            }
+                            slot.1.clone().unwrap_or_default()
+                        };
+                        let w = self.make_event_waiter_kind(
+                            pid,
+                            sens,
+                            ProcCont::empty(),
+                            false,
+                        );
+                        self.event_waiters.push(w);
+                        f.pc = npc;
+                        break;
+                    }
+                    _ => {
+                        if self.finished {
+                            break;
+                        }
+                        if !f.is_always {
+                            *self.name_resolve_hint.borrow_mut() = saved_hint;
+                            self.settle_combinatorial();
+                            return;
+                        }
+                        f.pc = 0;
+                        passes += 1;
+                        if passes > 1000 {
+                            eprintln!(
+                                "[xezim][error] native process FSM (pid {}) looped {}                                  times without a wait — parking it",
+                                pid, passes
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            self.proc_fsm.insert(pid, f);
+            self.settle_combinatorial();
+            return;
+        }
         // An `always` body that completes without suspending restarts at
         // pc 0; the guard bounds a wait-free pass count so a body whose
         // waits are all branched around cannot livelock the scheduler.
@@ -31803,6 +32013,13 @@ impl Simulator {
             }
             if self.finished {
                 break;
+            }
+            if !f.is_always {
+                // An `initial` body ran to completion: done for good.
+                std::mem::swap(&mut self.vm_regs, &mut f.regs);
+                *self.name_resolve_hint.borrow_mut() = saved_hint;
+                self.settle_combinatorial();
+                return;
             }
             f.pc = 0;
             passes += 1;

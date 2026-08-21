@@ -1839,7 +1839,10 @@ impl<'a> BytecodeCompiler<'a> {
         {
             return false;
         }
-        if body.iter().any(Self::stmt_is_blocking) {
+        // Process-FSM mode inlines BLOCKING task bodies too — their waits
+        // compile to Wait insns like any other statement, and the register-
+        // backed formals live in the process frame across suspensions.
+        if !self.allow_waits && body.iter().any(Self::stmt_is_blocking) {
             return false;
         }
         let start = self.insns.len();
@@ -4759,6 +4762,19 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
                 return self.compile_stmt(inner);
+            }
+            // Process-FSM mode: `forever <body-with-waits>` is the FSM's
+            // native shape — body then an unconditional back-jump. The ≥1
+            // wait gate at registration guarantees each iteration suspends.
+            StatementKind::Forever { body }
+                if self.allow_waits && Self::stmt_is_blocking(body) =>
+            {
+                let top = self.insns.len() as u32;
+                if !self.compile_stmt(body) {
+                    return false;
+                }
+                self.emit(Insn::Jump(top));
+                return true;
             }
             // Process-FSM mode: `repeat (N) <body-with-waits>` compiles to a
             // counted loop (count evaluated ONCE, §12.7.2) so the classic
@@ -8673,7 +8689,9 @@ impl<'a> BytecodeCompiler<'a> {
     /// instructions report `true`. Used by the fuse peephole's liveness
     /// check — a wrong `false` here would fuse away a load whose register
     /// is still consumed later, so every variant must be enumerated.
-    fn insn_reads_reg(insn: &Insn, r: RegId) -> bool {
+    /// (pub(crate): the FSM native generator in `aot.rs` uses this to prove
+    /// a Real tick literal feeds only a delay wait.)
+    pub(crate) fn insn_reads_reg(insn: &Insn, r: RegId) -> bool {
         match insn {
             Insn::WaitDelayReg(d) => *d == r,
             Insn::WaitEdge(..) => false,
