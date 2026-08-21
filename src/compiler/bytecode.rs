@@ -458,6 +458,15 @@ pub enum Insn {
     /// character the unfused arms, so the 4-state, signedness and §5.7.1
     /// `is_fill` rules cannot drift.
     BinOpConst(RegId, RegId, Box<Value>, BinOpConstKind), // (dest, src, const, kind)
+
+    /// Roadmap steps 11-12 (compiled process FSMs): suspend the executing
+    /// PROCESS for the delay whose VALUE is in the register (converted to
+    /// ticks at runtime with the process's module-precision diff). Emitted
+    /// only for process bodies (`allow_waits`), never edge/comb blocks.
+    WaitDelayReg(RegId),
+    /// Suspend the process until the wait spec (index into the owning
+    /// FSM's `wait_specs` table) fires. Process bodies only.
+    WaitEdge(u32),
 }
 
 /// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
@@ -597,7 +606,7 @@ impl Insn {
             | StmtFallback(..) | EvalExprFallback(..) | NbaAssign(..)
             | NbaAssignConst(..) | NbaAssignRange(..) | NbaAssignRangeDyn(..)
             | NbaAssignBitDyn(..) | NbaAssignArray(..) | NbaAssignArrayRange(..)
-            | NbaAssignArrayRead(..) => return false,
+            | NbaAssignArrayRead(..) | WaitDelayReg(..) | WaitEdge(..) => return false,
         }
         true
     }
@@ -684,6 +693,8 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::NbaAssignArrayRange(..) => "NbaArrRng",
         Insn::NbaAssignArrayRead(..) => "NbaArrRd",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Add) => "AddC",
+        Insn::WaitDelayReg(..) => "WaitDly",
+        Insn::WaitEdge(..) => "WaitEdge",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Eq) => "EqC",
         Insn::BinOpConst(_, _, _, BinOpConstKind::CaseEq) => "CaseEqC",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Xor) => "XorC",
@@ -716,6 +727,12 @@ pub struct BytecodeCompiler<'a> {
     /// with a bare local name (`mem_valid`) is first tried verbatim, then
     /// with this prefix applied (`testbench.mem_valid`).
     pub scope_hint: Option<String>,
+    /// Process-FSM mode (roadmap 11-12): statement-level `#delay` and
+    /// `@(event)` compile to WaitDelayReg / WaitEdge instead of bailing.
+    /// Never set for edge or comb blocks.
+    pub allow_waits: bool,
+    /// Event-control specs referenced by WaitEdge, in emission order.
+    pub wait_specs: Vec<crate::ast::stmt::EventControl>,
     /// Per-for-loop leaf-name → signal_id override. Set by `compile_stmt`'s
     /// For arm before compiling condition/step expressions, cleared after.
     /// Re-routes bare-ident lookups for the loop variable so that the step
@@ -909,6 +926,8 @@ impl<'a> BytecodeCompiler<'a> {
             bail_reason: None,
             allow_ast_fallback: false,
             scope_hint: None,
+            allow_waits: false,
+            wait_specs: Vec::new(),
             for_loop_var_ids: std::collections::HashMap::default(),
             local_var_regs: std::collections::HashMap::default(),
             decl_local_regs: std::collections::HashSet::default(),
@@ -4713,6 +4732,66 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn compile_stmt_strict(&mut self, stmt: &Statement) -> bool {
         match &stmt.kind {
+            // Process-FSM mode: a statement-level timing control becomes a
+            // wait insn followed by its guarded statement. Star (`@*`) and
+            // intra-assignment forms never reach here (gated by the caller /
+            // canonicalized into marker calls that fail compile_expr).
+            StatementKind::TimingControl { control, stmt: inner }
+                if self.allow_waits =>
+            {
+                match control {
+                    crate::ast::stmt::TimingControl::Delay(d) => {
+                        let Some(r) = self.compile_expr(d, 0) else {
+                            return false;
+                        };
+                        self.emit(Insn::WaitDelayReg(r));
+                    }
+                    crate::ast::stmt::TimingControl::Event(ev) => {
+                        if matches!(
+                            ev,
+                            crate::ast::stmt::EventControl::Star
+                                | crate::ast::stmt::EventControl::ParenStar
+                        ) {
+                            return false;
+                        }
+                        self.wait_specs.push(ev.clone());
+                        self.emit(Insn::WaitEdge((self.wait_specs.len() - 1) as u32));
+                    }
+                }
+                return self.compile_stmt(inner);
+            }
+            // Process-FSM mode: `repeat (N) <body-with-waits>` compiles to a
+            // counted loop (count evaluated ONCE, §12.7.2) so the classic
+            // `repeat (n) @(posedge clk);` cycle-wait works. Wait-free
+            // repeats keep the existing unroll paths below.
+            StatementKind::Repeat { count, body }
+                if self.allow_waits && Self::stmt_is_blocking(body) =>
+            {
+                let Some(cnt) = self.compile_expr(count, 0) else {
+                    return false;
+                };
+                let ctr = self.alloc_reg();
+                self.emit(Insn::Move(ctr, cnt));
+                let top = self.insns.len() as u32;
+                let branch_idx = self.insns.len();
+                // Exits when the counter is no longer definitely non-zero
+                // (X/Z counts as zero, matching the interpreter's repeat).
+                self.emit(Insn::BranchIfFalse(ctr, 0));
+                if !self.compile_stmt(body) {
+                    return false;
+                }
+                let one = self.alloc_reg();
+                self.emit(Insn::LoadConst(
+                    one,
+                    Box::new(Value::from_u64(1, 32)),
+                ));
+                self.emit(Insn::Sub(ctr, ctr, one));
+                self.emit(Insn::Jump(top));
+                let end = self.insns.len() as u32;
+                self.insns[branch_idx] = Insn::BranchIfFalse(ctr, end);
+                return true;
+            }
+
             StatementKind::Null => true,
             // §13.4.1 early return inside an INLINED body: move the value
             // into the result register and jump to the body end (patched by
@@ -8596,6 +8675,8 @@ impl<'a> BytecodeCompiler<'a> {
     /// is still consumed later, so every variant must be enumerated.
     fn insn_reads_reg(insn: &Insn, r: RegId) -> bool {
         match insn {
+            Insn::WaitDelayReg(d) => *d == r,
+            Insn::WaitEdge(..) => false,
             Insn::CmpBranch(_, l, rr, _, _) => *l == r || *rr == r,
             Insn::MoveResize(_, s, _) => *s == r,
             Insn::CaseLut(_, src, _) => *src == r,
@@ -9905,7 +9986,9 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::Pow(d, _, _) => store(&mut rw, *d, None),
 
                 // No register destination.
-                Insn::BranchIfFalse(..)
+                Insn::WaitDelayReg(..)
+                | Insn::WaitEdge(..)
+                | Insn::BranchIfFalse(..)
                 | Insn::BranchUnlessZero(..)
                 | Insn::BranchIfSignalFalse(..)
                 | Insn::Jump(..)
