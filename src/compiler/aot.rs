@@ -280,6 +280,7 @@ pub fn gen_block_fn(
             Insn::BranchIfFalse(_, t)
             | Insn::Jump(t)
             | Insn::BranchIfSignalFalse(_, t, _)
+            | Insn::BranchUnlessZero(_, t)
             | Insn::CmpBranch(_, _, _, _, t) => targets.push(*t as usize),
             Insn::CaseJump(_, cj) => {
                 targets.extend(cj.table.iter().map(|&t| t as usize));
@@ -304,6 +305,7 @@ pub fn gen_block_fn(
             Insn::BranchIfFalse(..)
                 | Insn::Jump(..)
                 | Insn::BranchIfSignalFalse(..)
+                | Insn::BranchUnlessZero(..)
                 | Insn::CmpBranch(..)
                 | Insn::CaseJump(..)
         )
@@ -733,6 +735,16 @@ fn emit_insn_rust(
         BlockingAssignBitDyn(sig, idx_r, val) => {
             let _ = writeln!(w, "(br().blk_range)(sim, {sig}, r{idx_r}v, r{idx_r}v, r{val}v, r{val}x);");
         }
+        NbaAssignConst(sig, v, width) => {
+            if v.is_fill || v.is_real || v.width > 64 {
+                return None;
+            }
+            let (vb, xb) = v.raw_bits();
+            let _ = writeln!(
+                w,
+                "(br().nba4s)(sim, {sig}, {vb:#x}u64, {xb:#x}u64, {width});"
+            );
+        }
         NbaAssignRange(sig, hi, lo, val) => {
             let _ = writeln!(w, "(br().nba_range)(sim, {sig}, {hi}, {lo}, r{val}v, r{val}x);");
         }
@@ -766,9 +778,58 @@ fn emit_insn_rust(
                  }}"
             );
         }
+        NbaAssignArray(arr, idx_reg, val_reg, width) => {
+            let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
+                return None;
+            };
+            let _ = writeln!(
+                w,
+                "let eff = (r{idx_reg}v & !r{idx_reg}x) as i64;\n\
+                 if eff >= {lo} && eff <= {hi} {{\n\
+                   (br().nba4s)(sim, ({first_id} as i64 + (eff - {lo})) as u32, r{val_reg}v, r{val_reg}x, {width});\n\
+                 }}"
+            );
+        }
+        // Fused LoadSignal+LoadArrayElem+NbaAssign (RAM read port). The
+        // unresolved-element arm schedules the 1-bit X the interpreter's
+        // `Value::new(1).resize_for_assign(width)` produces (zero-extended).
+        NbaAssignArrayRead(dst_sig, arr, idx_sig, width) => {
+            let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
+                return None;
+            };
+            let _ = writeln!(
+                w,
+                "let t = ld(sim, {idx_sig});\n\
+                 let eff = (t.0 & !t.1) as i64;\n\
+                 if eff >= {lo} && eff <= {hi} {{\n\
+                   let e = ld(sim, ({first_id} as i64 + (eff - {lo})) as u32);\n\
+                   (br().nba4s)(sim, {dst_sig}, e.0, e.1, {width});\n\
+                 }} else {{ (br().nba4s)(sim, {dst_sig}, 0u64, 1u64, {width}); }}"
+            );
+        }
+        // Ranged NBA into a dense array element: the range bridge already
+        // takes a signal id, so the computed element id slots straight in.
+        NbaAssignArrayRange(arr, idx_reg, hi_reg, lo_reg, val_reg) => {
+            let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
+                return None;
+            };
+            let _ = writeln!(
+                w,
+                "let eff = (r{idx_reg}v & !r{idx_reg}x) as i64;\n\
+                 if eff >= {lo} && eff <= {hi} {{\n\
+                   (br().nba_range)(sim, ({first_id} as i64 + (eff - {lo})) as u32, r{hi_reg}v, r{lo_reg}v, r{val_reg}v, r{val_reg}x);\n\
+                 }}"
+            );
+        }
         BranchIfFalse(cond, target) => {
             let t = jump_pc(*target as usize, n);
             let _ = writeln!(w, "if (r{cond}v & !r{cond}x) == 0 {{ pc = {t}; continue 'sm; }}");
+        }
+        // Fused LogNot+BranchIfFalse: jump unless DEFINITE zero (X jumps),
+        // the exact composition the interpreter and cranelift implement.
+        BranchUnlessZero(cond, target) => {
+            let t = jump_pc(*target as usize, n);
+            let _ = writeln!(w, "if (r{cond}v | r{cond}x) != 0 {{ pc = {t}; continue 'sm; }}");
         }
         CmpBranch(kind, l, r, tmp, target) => {
             use crate::compiler::bytecode::CmpKind as CK;

@@ -161,3 +161,57 @@ endmodule
     assert_eq!(plain, "RES sum=46 slice=a5 bit=0", "interpreter values");
     assert_eq!(aot, plain, "AOT values must match the interpreter");
 }
+
+#[test]
+fn aot_edge_blocks_match_interpreter() {
+    // Roadmap step 10: edge (always_ff) blocks compile through the rustc-AOT
+    // path — branches (BranchIfFalse/BranchUnlessZero/Jump), const NBAs and
+    // dense-array NBA forms included. Values must match the interpreter.
+    let body = r#"
+module tb;
+  reg clk = 0;
+  reg [7:0] a, b;
+  reg [7:0] q1, q2, q3;
+  reg [7:0] mem [0:3];
+  reg [1:0] widx;
+  reg [7:0] rd;
+  always @(posedge clk) begin
+    if (a > b) q1 <= a - b;            // branch + NBA
+    else q1 <= b - a;
+    q2 <= 8'h5a;                        // const NBA
+    if (!a[0]) q3 <= q3 + 1;            // BranchUnlessZero shape
+    mem[widx] <= a ^ b;                 // dense array NBA
+    rd <= mem[widx];                    // fused array read NBA
+  end
+  always #5 clk = ~clk;
+  initial begin
+    a = 8'h30; b = 8'h11; widx = 2'd1; q3 = 0;
+    #12 a = 8'h05; widx = 2'd2;
+    #10 widx = 2'd1;
+    #10 $display("EDGE q1=%h q2=%h q3=%h rd=%h m1=%h m2=%h", q1, q2, q3, rd, mem[1], mem[2]);
+    $finish;
+  end
+endmodule
+"#;
+    let dir = std::env::temp_dir().join(format!("xezim_aot_edge_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let f = dir.join("t.sv");
+    std::fs::write(&f, body).unwrap();
+    let run = |aot: bool| -> String {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_xezim"));
+        c.args(["--no-cache", "-s", "tb", "--max-time", "1000"]).arg(&f);
+        if aot {
+            c.env("XEZIM_JIT", "1").env("XEZIM_AOT", "1");
+        }
+        let out = c.output().expect("run xezim");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.starts_with("EDGE "))
+            .unwrap_or("")
+            .to_string()
+    };
+    let plain = run(false);
+    let aot = run(true);
+    assert!(plain.starts_with("EDGE "), "interpreter run produced no result");
+    assert_eq!(aot, plain, "AOT edge-block values must match the interpreter");
+}
