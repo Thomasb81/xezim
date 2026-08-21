@@ -23254,6 +23254,24 @@ impl Simulator {
                         found = true;
                         break;
                     }
+                    if !found {
+                        // A TYPE name is not a signal and can never resolve.
+                        // Several cast lowerings leak the cast's type into the
+                        // read set (`ibex_mubi_t'(x)`, `cpu_ctrl_sts_part_t'(x)`
+                        // on Ibex), which pinned `has_unresolved_reads` and
+                        // re-evaluated the entry on every settle call forever.
+                        // Recognising type-ness here covers every AST shape a
+                        // cast can take, rather than special-casing one.
+                        // Reached only after every signal lookup failed, so a
+                        // name that is BOTH a type and a signal already
+                        // resolved as the signal above.
+                        let leaf = r.rsplit('.').next().unwrap_or(r.as_str());
+                        if self.module.typedef_types.contains_key(leaf)
+                            || self.module.typedefs.contains_key(leaf)
+                        {
+                            continue;
+                        }
+                    }
                     if !found && std::env::var("XEZIM_DUMP_UNRESOLVED").is_ok() {
                         let leaf = r.rsplit('.').next().unwrap_or(r.as_str());
                         let near: Vec<&str> = self
