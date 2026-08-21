@@ -35,8 +35,10 @@ Current capabilities include:
 * Sequential simulation infrastructure
 * Test execution framework
 * Waveform / trace dumps — VCD (`$dumpfile`/`$dumpvars`; IEEE 1800-2017 §21.7, and
-  matches Verilator/Icarus in GTKWave) and XTrace v1.0 (`--xtrace`, optional zstd
-  compression + scope filtering)
+  matches Verilator/Icarus in GTKWave), **FST** (`--fst`, GTKWave's binary format,
+  written on a dedicated writer thread with scope filtering), and XTrace v1.0
+  (`--xtrace`, optional zstd compression + scope filtering). All three are
+  cross-checked against each other by decoding them, not by file size.
 * **UVM run-phase execution** (Accellera **1800.2-2017 and 1800.2-2020.3.1**, with
   `-DUVM_NO_DPI`) — a real UVM testbench runs end-to-end: build → connect → topology →
   `run_phase` stimulus → sequencer↔driver TLM handshake → packet collection →
@@ -71,6 +73,17 @@ Current capabilities include:
 * **VPI loading** via `--vpi-lib <path>` (`-m`) — classic VPI modules run their
   `vlog_startup_routines`: system-task/function registration (`vpi_register_systf`)
   and design iteration (`vpi_iterate`/`vpi_scan`, handle/property access).
+* **cocotb** — Python testbenches run against xezim through a runner backend
+  (`contrib/cocotb/xezim_runner.py`) on top of the VPI layer, including timed and
+  synchronous callbacks.
+* **Native compilation** (`--features jit`) — hot bytecode compiles to machine
+  code, either through the in-process JIT (`XEZIM_JIT=1`) or the AOT backend
+  (`XEZIM_AOT=1`), which emits Rust for eligible combinational entries, edge
+  blocks, and process FSMs, builds it with `rustc`, and caches the resulting
+  library across runs. See [below](#native-compilation).
+* **`bind` by instance path** (§23.11) — `bind top.u_dut.u_sub target_tb u_tb();`
+  and the colon form bind only the named instances, with upward references from
+  the bound module resolving against the instance they were bound into.
 
 ### Non-standard extensions
 
@@ -87,6 +100,70 @@ and testbench flows. Portable code should not rely on them.
 * Gate-level-simulation CLI flags — `+nospecify`, `+notimingcheck`,
   `+delay_mode_zero`/`+delay_mode_unit`, `+mindelays`/`+typdelays`/`+maxdelays`,
   and the `-v`/`-y`/`+libext+` library flags — mirror the commercial spellings.
+
+---
+
+# What's new in 0.10
+
+### 0.10.1 – 0.10.2 — native compilation and process conformance (August 2026)
+
+* **AOT native backend** (`XEZIM_AOT=1`, needs a `--features jit` build) — the
+  compiler emits Rust for eligible combinational entries, edge blocks, and
+  process FSMs, builds it with `rustc`, and loads it through a single exported
+  API symbol. On the C910 CoreMark run 18,916 / 21,305 edge blocks and
+  108,248 / 215,494 combinational entries compile natively.
+* **Persistent native cache** — the generated library is keyed on the source,
+  optimization level, and xezim build, then stored under
+  `$XEZIM_CACHE_DIR` / `$XDG_CACHE_HOME/xezim/native` / `~/.cache/xezim/native`.
+  The first run pays the `rustc` cost; later runs load the cached `.so`
+  directly. `XEZIM_NO_NATIVE_CACHE=1` opts out.
+* **Compiled process FSMs** (`XEZIM_PROC_FSM=1`) — a blocking `always` body
+  compiles into a bytecode state machine with explicit wait instructions, so a
+  resume re-enters at the saved program counter with per-process registers
+  instead of re-walking the AST continuation chain. Blocking tasks and
+  `initial` blocks inline into the same FSM, and the FSMs themselves are
+  eligible for the native backend.
+* **Blocking task calls inside clocked blocks follow process semantics**
+  (§9.2.2) — an `always @(posedge clk)` body that calls a task which consumes
+  time is no longer executed on the fast edge path. Previously the callee's
+  delay advanced simulation time while that slot's non-blocking updates were
+  still queued, so a `q <= d;` scheduled before the call committed a few
+  picoseconds late; edges arriving mid-call were also mishandled. Such blocks
+  now run as processes: NBAs commit in their own slot, and edges that arrive
+  while the body is busy are missed, matching the reference simulator.
+* **Delays quantize at the declaring scope's precision** (§3.14.3) — a constant
+  fractional delay such as `#0.002` is folded and snapped to the precision grid
+  of the scope that declares it, at elaboration time, including delays inside
+  interface and class methods.
+* **`bind` by instance path** (§23.11) — `bind top.u_dut.u_sub tb u_tb();` and
+  the colon form specialize only the named instances; module-name binds are
+  applied before path binds, and upward references from the bound module
+  resolve against the instance it was bound into.
+* **Opt-in combinational region fusion** (`XEZIM_REGIONS=1`) — dependency-
+  connected compiled entries fuse into topologically ordered region blocks.
+  Measured net-negative on the current benchmark set (recompute cost outweighs
+  the dispatch saving), so it ships off by default and stays available for
+  experiments.
+
+### 0.10.0 — waveform integrity, cocotb, and class-storage fixes (August 2026)
+
+* **FST dumps are correct at scale** — a break-even compression case wrote the
+  time table raw while flagging it compressed, corrupting large dumps in
+  GTKWave; the writer now records what it actually wrote, dumps are finalized on
+  `Ctrl-C`, the final time slot is flushed, and values render on the writer
+  thread instead of the simulation thread. Cross-format agreement is checked by
+  decoding VCD, FST, and XTrace, not by comparing file sizes.
+* **cocotb backend** — Python testbenches run against xezim via
+  `contrib/cocotb/xezim_runner.py`, backed by VPI timed and synchronous
+  callbacks and a repaired VPI object model.
+* **Scheduling-region fixes** — the postponed region is serviced from the nested
+  event loop and on livelock recovery, and a delay closes out the slot it
+  resumed in, which removed a `$monitor`-vs-waveform timestamp skew.
+* **Class and scope storage** — class member arrays resolve through the runtime
+  class, `localparam` arrays inside classes elaborate, each instance gets its
+  own static task local under non-blocking assignment, packed-struct formals
+  read their members from the call frame, and `%m` no longer leaks the scope of
+  a suspended task.
 
 ---
 
@@ -219,6 +296,19 @@ golden expectations:
 | XuanTie C906 | cmark ×1 (INIT_ZERO=1) | 295294 cycles | 714s | **587s** (1.22×) |
 | riscv-dv (UVM 1.2) | `+num_of_tests=10` random RV32IMC | — | — | 10/10 assemble clean |
 
+Larger runs measured during the 0.10 campaign:
+
+| Design | Test | Result | wall |
+|---|---|---|---|
+| lowRISC Ibex (`simple_system`) | CoreMark ×10 | score 2.477304 CoreMark/MHz, 2,765,321 instret, halt at 41,454,505 ns — byte-identical | 447s |
+| XuanTie C906 | cmark ×2 | TEST PASSED, 286,469 cycles/iteration | 516s |
+| XuanTie C910 (dual-core) | cmark ×2 | TEST PASSED, CoreMark 6.327752, halt at 34,985,250 | 8,028s, including a cold native compile of the whole design |
+| mbits-mirafra AVIP suite (UVM) | apb / spi / i3c / axi4 / axi4Lite base tests | 5 of 5 reproduce the reference's `UVM_ERROR` counts and end times exactly; `ahb` runs in xezim but the reference fails to elaborate it, and `uart` is a known open stall | 33s for axi4Lite (28s with FSM + AOT), seconds for the rest |
+
+On these CPU workloads a commercial reference simulator is still roughly
+4–5× faster; the campaign narrowed the Ibex CoreMark gap from about 30× to
+4.3×. The remaining cost is evaluation, not scheduling.
+
 UVM run-phase (see [docs/uvm-guide.md](docs/uvm-guide.md)):
 
 | Testbench | Result |
@@ -257,7 +347,7 @@ reachable from the compiled design (transitively), which reclaimed ~1870
 
 # Test Suite
 
-~1,900 integration tests run in CI, each in **both** execution modes — the
+~2,200 integration tests run in CI, each in **both** execution modes — the
 bytecode interpreter (`cargo test`) and the JIT (`cargo test --features jit`).
 A large share are differential tests whose expected values were measured on a
 commercial reference simulator; their doc comments cite the LRM section and
@@ -379,6 +469,8 @@ Common options:
 | `+libext+<ext>+…` | Extension list for `-y` search (replaces the default `.v`/`.sv`/`.V`) |
 | `+nospecify` | Suppress specify-block path delays — zero-delay gate simulation (`-nospecify` also accepted) |
 | `+notimingcheck` | Accepted no-op: specify timing checks are not modeled (also `+notimingchecks`/`-notimingchecks`) |
+| `--fst <file>` | Emit an FST (GTKWave binary) waveform dump |
+| `--fst-scope <hier>` | Restrict the FST dump to signals under `<hier>` (repeatable) |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for vendor sources you cannot edit |
@@ -389,6 +481,13 @@ Selected env knobs (off by default unless noted):
 | Env var | Effect |
 |---|---|
 | `XEZIM_EVENT_EDGE=1` | Skip gateable clocked flop fires whose data is unchanged (1.13-1.30× wall on c910/c906) |
+| `XEZIM_JIT=1` | Compile bytecode blocks to machine code in-process (needs a `--features jit` build) |
+| `XEZIM_AOT=1` | Compile eligible blocks to native code via generated Rust + `rustc` (needs `--features jit`). See [below](#native-compilation) |
+| `XEZIM_AOT_OPT=0..3` | `rustc` optimization level for the generated crate (default 2) |
+| `XEZIM_PROC_FSM=1` | Compile blocking `always` bodies into bytecode state machines with wait instructions |
+| `XEZIM_NO_NATIVE_CACHE=1` | Disable the persistent native-library cache (`~/.cache/xezim/native`) |
+| `XEZIM_REGIONS=1` | Fuse dependency-connected compiled combinational entries into region blocks (experimental; currently net-negative on the benchmark set) |
+| `XEZIM_STUCK_CLOCK=1` | Flag a process parked on a clock/reset that never changes while the design keeps churning edges (`abort` variant for CI) |
 | `XEZIM_INIT_ZERO=1` | Coerce X-initialized signals/arrays to 0 (required for some C910/C906 workloads, e.g. cmark) |
 | `XEZIM_PROGRESS=N` | Emit a `[PROGRESS]` line every N wall-seconds (sim_time, iters, edges_fired, nba_q) |
 | `XEZIM_CACHE_DIR=<dir>` | Override the elaborated-design cache directory |
@@ -406,6 +505,36 @@ Example — run the picorv32 testbench against a gate-level netlist:
 ./target/release/xezim testbench.v synth.v \
     +firmware=firmware/firmware.hex --max-time 50000000
 ```
+
+## Native compilation
+
+Built with `--features jit`, xezim can turn hot bytecode into machine code.
+
+```bash
+cargo build --release --features jit
+
+# in-process JIT
+XEZIM_JIT=1 ./target/release/xezim <sources> -s <top>
+
+# AOT: generate Rust, build it with rustc, load the result
+XEZIM_AOT=1 ./target/release/xezim <sources> -s <top>
+
+# AOT plus compiled process state machines
+XEZIM_PROC_FSM=1 XEZIM_AOT=1 ./target/release/xezim <sources> -s <top>
+```
+
+The AOT backend covers combinational entries, edge-sensitive blocks, and — when
+`XEZIM_PROC_FSM=1` is also set — process FSMs. Blocks it cannot lower (values
+wider than 64 bits, unsupported opcodes, X/Z-carrying shapes) stay on the
+interpreter, so coverage is partial by design; `XEZIM_JIT_VERBOSE=1` prints the
+`[AOT] … compiled N/M` summary.
+
+Generating and compiling that Rust is the dominant cost on a first run — minutes
+on a large SoC — so the resulting library is cached under `$XEZIM_CACHE_DIR`,
+`$XDG_CACHE_HOME/xezim/native`, or `~/.cache/xezim/native`, keyed on the
+generated source, `XEZIM_AOT_OPT`, and the xezim build. Repeat runs load the
+cached `.so` directly. Set `XEZIM_NO_NATIVE_CACHE=1` to force a rebuild, and
+`XEZIM_AOT_OPT=0` to trade steady-state speed for a faster build.
 
 ## Warm design cache
 
