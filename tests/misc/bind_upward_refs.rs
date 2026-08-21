@@ -211,3 +211,158 @@ endmodule
         .unwrap_or_else(|| panic!("no WR line:\n{}", text));
     assert_eq!(line, "WR e1=23 e2=2c e3=2f", "reference values:\n{}", text);
 }
+
+#[test]
+fn bind_by_instance_path_targets_one_instance() {
+    // §23.11 bind_target_instance: `bind top.a.b.inst binder u ();` attaches
+    // to exactly that instance. Decoy instances of the same module — at top
+    // level and at other depths — must stay unbound: no monitor output, and
+    // the binder's signals must not exist under them.
+    let src = r#"
+module probe_dut (
+   input logic clk,
+   input logic rst_l
+);
+   logic rst_l_d1;
+   always_ff @(posedge clk) rst_l_d1 <= rst_l;
+endmodule
+
+module bfm_leaf (input logic clk, input logic rst_l);
+   probe_dut probe_dut (.clk(clk), .rst_l(rst_l));
+endmodule
+
+module bfm_wrap (input logic clk, input logic rst_l);
+   bfm_leaf bfm_clid00 (.clk(clk), .rst_l(rst_l));
+endmodule
+
+module decoy_two (input logic clk, input logic rst_l);
+   probe_dut probe_dut (.clk(clk), .rst_l(rst_l));
+endmodule
+
+module decoy_one (input logic clk, input logic rst_l);
+   probe_dut probe_dut (.clk(clk), .rst_l(rst_l));
+   decoy_two u_decoy_two (.clk(clk), .rst_l(rst_l));
+endmodule
+
+module tb_binder;
+   logic bind_active;
+   assign bind_active = 1'b1;
+   always @(posedge probe_dut.clk)
+      $display("%0d: MON %m rst_l=%b d1=%b", $time, probe_dut.rst_l, probe_dut.rst_l_d1);
+endmodule
+
+bind tb_top.u_bfm.bfm_clid00.probe_dut tb_binder u_tb_binder ();
+
+module tb_top;
+   int errors = 0;
+   logic clk, rst_l;
+   bfm_wrap u_bfm (.clk(clk), .rst_l(rst_l));
+   probe_dut probe_decoy0 (.clk(clk), .rst_l(rst_l));
+   decoy_one u_decoy_one (.clk(clk), .rst_l(rst_l));
+   always #5 clk = (clk === 1'b0) ? 1'b1 : 1'b0;
+   initial begin
+      clk = 0; rst_l = 0;
+      repeat(2) @(posedge clk);
+      rst_l = 1;
+      repeat(2) @(posedge clk);
+      if (tb_top.u_bfm.bfm_clid00.probe_dut.rst_l_d1 !== 1'b1) begin
+         $display("CHKFAIL pipeline"); errors++;
+      end
+      if (tb_top.u_bfm.bfm_clid00.probe_dut.u_tb_binder.bind_active !== 1'b1) begin
+         $display("CHKFAIL bind_active"); errors++;
+      end
+      if (errors == 0) $display("BINDPATH PASSED");
+      $finish;
+   end
+endmodule
+"#;
+    let text = run(src, "path");
+    assert!(text.contains("BINDPATH PASSED"), "checks failed:\n{}", text);
+    let mons: Vec<&str> = text.lines().filter(|l| l.contains(": MON ")).collect();
+    assert!(
+        mons.len() >= 4,
+        "bound monitor must fire on every posedge:\n{}",
+        text
+    );
+    for l in &mons {
+        assert!(
+            l.contains("tb_top.u_bfm.bfm_clid00.probe_dut.u_tb_binder"),
+            "monitor must fire ONLY under the bound instance: {}\n{}",
+            l,
+            text
+        );
+    }
+    assert_eq!(
+        mons.iter().filter(|l| l.starts_with("35:")).count(),
+        1,
+        "decoy instances must not be bound (one line per edge):\n{}",
+        text
+    );
+}
+
+#[test]
+fn bind_module_wide_covers_path_bound_instance_and_colon_form() {
+    // Two sibling shapes of the instance-path bind (reference-verified):
+    //  - a MODULE-name bind must reach the path-specialized instance too
+    //    (module binds apply before path binds clone the definition);
+    //  - the §23.11 colon form `bind <mod> : <path> <binder> <inst> ();`
+    //    selects exactly the listed instance.
+    let src = r#"
+module leaf_mod(input logic clk);
+  logic [3:0] v = 4'h5;
+endmodule
+module wrap_mod(input logic clk);
+  leaf_mod u_leaf(.clk(clk));
+endmodule
+module path_binder;
+  initial #1 $display("PATHB %m");
+endmodule
+module mod_binder;
+  initial #2 $display("MODB %m");
+endmodule
+module colon_binder;
+  initial #3 $display("COLB %m");
+endmodule
+bind tb_top.u_wrap.u_leaf path_binder u_pb ();
+bind leaf_mod mod_binder u_mb ();
+bind leaf_mod : tb_top.u_other colon_binder u_cb ();
+module tb_top;
+  logic clk = 0;
+  wrap_mod u_wrap(.clk(clk));
+  leaf_mod u_other(.clk(clk));
+  leaf_mod u_third(.clk(clk));
+  initial #5 $finish;
+endmodule
+"#;
+    let text = run(src, "modwide");
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("PATHB") || l.contains("MODB") || l.contains("COLB"))
+        .collect();
+    assert!(
+        lines.contains(&"PATHB tb_top.u_wrap.u_leaf.u_pb"),
+        "path bind:\n{}",
+        text
+    );
+    // Module-wide bind reaches ALL THREE leaf instances, including the
+    // path-specialized one.
+    for want in [
+        "MODB tb_top.u_wrap.u_leaf.u_mb",
+        "MODB tb_top.u_other.u_mb",
+        "MODB tb_top.u_third.u_mb",
+    ] {
+        assert!(lines.contains(&want), "missing {want}:\n{}", text);
+    }
+    // Colon form: only u_other.
+    assert!(
+        lines.contains(&"COLB tb_top.u_other.u_cb"),
+        "colon bind:\n{}",
+        text
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("COLB")).count(),
+        1,
+        "colon bind must select exactly one instance:\n{}",
+        text
+    );
+}
