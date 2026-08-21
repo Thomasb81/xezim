@@ -23211,6 +23211,64 @@ impl Simulator {
                     }
                 }
                 if !found {
+                    // A whole UNPACKED-ARRAY read (`assign y = '{a[0], a[1]}`
+                    // naming `a`, or a port carrying one) has no signal under
+                    // the BASE name — the array occupies a contiguous id range
+                    // recorded in `array_first_id`. Every lookup above works on
+                    // `signal_name_to_id`, so the base stayed unresolved, which
+                    // pins `has_unresolved_reads` and re-evaluates the entry on
+                    // EVERY settle call for the life of the run. Measured on
+                    // Ibex CoreMark: one such entry (ex_block's
+                    // `alu_imd_val_q` reading `imd_val_q_i`) was interpreted
+                    // 1.53M times for 6.2s — ~17% of all settle time.
+                    //
+                    // A cont-assign's RHS resolves in the SAME scope as its
+                    // LHS, so the LHS's own hierarchical prefix is the most
+                    // reliable qualifier; the inferred `scope_hint` can point
+                    // at a submodule that merely happens to share the port
+                    // name.
+                    let lhs_scope: Option<&str> = writes
+                        .iter()
+                        .next()
+                        .and_then(|w| w.rsplit_once('.').map(|(head, _)| head));
+                    let mut cands: Vec<String> = Vec::with_capacity(4);
+                    if let Some(ls) = lhs_scope {
+                        cands.push(format!("{}.{}", ls, r));
+                    }
+                    if let Some(scope) = &scope_hint {
+                        cands.push(format!("{}.{}", scope, r));
+                    }
+                    cands.push(r.clone());
+                    for cand in &cands {
+                        let Some(&(first_id, lo, hi)) = self.array_first_id.get(cand.as_str())
+                        else {
+                            continue;
+                        };
+                        let count = (hi - lo + 1).max(0) as usize;
+                        for k in 0..count {
+                            let id = first_id + k;
+                            if id < self.signal_table.len() && !rids.contains(&id) {
+                                rids.push(id);
+                            }
+                        }
+                        found = true;
+                        break;
+                    }
+                    if !found && std::env::var("XEZIM_DUMP_UNRESOLVED").is_ok() {
+                        let leaf = r.rsplit('.').next().unwrap_or(r.as_str());
+                        let near: Vec<&str> = self
+                            .array_first_id
+                            .keys()
+                            .filter(|k| k.rsplit('.').next() == Some(leaf))
+                            .map(|k| k.as_ref())
+                            .take(4)
+                            .collect();
+                        eprintln!(
+                            "[UNRES-ARR] read {r:?} not an array under {cands:?};                              array_first_id keys with leaf {leaf:?}: {near:?}"
+                        );
+                    }
+                }
+                if !found {
                     unresolved_count += 1;
                 }
             }
