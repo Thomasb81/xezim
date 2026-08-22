@@ -38,6 +38,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_CHAIN_CENSUS", "Phase 2: size the single-fanout chain clustering opportunity (count, lengths, dynamic coverage)"),
     ("XEZIM_CLKTREE_PROBE", "Clock tree: print the detected clock-tree roots and gating structure"),
     ("XEZIM_CLKTREE_STATS", "Clock tree: print dedup statistics for derived clock signals"),
+    ("XEZIM_COACT_CENSUS", "Phase 2: per-dep-edge same-slot co-activation stats; sizes convex-cluster fusion (wants profiling on)"),
     ("XEZIM_COMB_PATHS", "Profiling: count settle path (two-state/JIT/interp) per comb entry; ranked dump at end"),
     ("XEZIM_COMPILE_FAIL_STATS", "Bytecode: print why statements failed to compile (bail census)"),
     ("XEZIM_COMPILE_PHASES", "Print per-phase compilation timing breakdown"),
