@@ -17208,6 +17208,229 @@ impl Simulator {
         h.finish()
     }
 
+    /// Island phase-1 census (`XEZIM_ISLAND_CENSUS=1`): size the
+    /// synchronous-island opportunity per clock domain. Reports, for the
+    /// dominant clock: edge-block count, the comb cone reachable from the
+    /// domain's flop outputs (closure over the dep graph), boundary inputs
+    /// (read by the cone, written outside it), internal vs named signals
+    /// (named = observed under a waveform dump), and how much of the cone
+    /// the native emitter could compile today (width gate). Pure analysis;
+    /// the go/no-go for the island wrapper, exactly as the template census
+    /// gated dedup.
+    fn dump_island_census(&self) {
+        if std::env::var("XEZIM_ISLAND_CENSUS").is_err() {
+            return;
+        }
+        use std::collections::HashMap;
+        // 1. Group edge blocks by their first edge-sensitive signal (the
+        // clock). Multi-sensitivity blocks (async reset) count under their
+        // clock terminal.
+        let mut domains: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, eb) in self.edge_blocks.iter().enumerate() {
+            if let Some(s) = eb.resolved_sensitivities.first() {
+                domains.entry(s.signal_id as u32).or_default().push(i);
+            }
+        }
+        // Gated-clock conversion, census form: resolve every derived clock
+        // back to its ROOT by walking single-writer comb entries (buffers,
+        // ICG cells, clock muxes). The parent of a derived clock is the read
+        // that is itself a clock (used as an edge sensitivity or another
+        // step on the path); the rest of the reads are ENABLES — data, in
+        // the island's terms. This is what the reference's optimizer does
+        // implicitly: its merged process runs on the root clock. First
+        // census on c906 showed why this phase is REQUIRED: 760 raw
+        // domains, largest only 180 blocks — the ICG fabric fragments
+        // everything until clocks are rooted.
+        let is_clock: std::collections::HashSet<u32> = domains.keys().copied().collect();
+        let mut writer_of: HashMap<u32, usize> = HashMap::new();
+        for (e, ent) in self.comb_entries.iter().enumerate() {
+            for &w in &ent.cold.write_signal_ids {
+                writer_of.entry(w as u32).or_insert(e);
+            }
+        }
+        let resolve_root = |mut c: u32| -> u32 {
+            for _ in 0..64 {
+                let Some(&e) = writer_of.get(&c) else { return c };
+                let ent = &self.comb_entries[e];
+                // Parent = a read that is itself a clock; otherwise the sole
+                // read (pure buffer/inverter); otherwise stop (c is a root
+                // that happens to be comb-driven).
+                let mut parent = None;
+                for &r in &ent.cold.read_signal_ids {
+                    if is_clock.contains(&(r as u32)) && r as u32 != c {
+                        parent = Some(r as u32);
+                        break;
+                    }
+                }
+                if parent.is_none() && ent.cold.read_signal_ids.len() == 1 {
+                    parent = Some(ent.cold.read_signal_ids[0] as u32);
+                }
+                match parent {
+                    Some(p) if p != c => c = p,
+                    _ => return c,
+                }
+            }
+            c
+        };
+        let mut rooted: HashMap<u32, usize> = HashMap::new();
+        for (&clk, blocks) in &domains {
+            *rooted.entry(resolve_root(clk)).or_default() += blocks.len();
+        }
+        let mut rdom: Vec<(u32, usize)> = rooted.into_iter().collect();
+        rdom.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        eprintln!("[ISLAND] rooted domains: {} (from {} raw); top:", rdom.len(), domains.len());
+        for &(sig, n) in rdom.iter().take(5) {
+            eprintln!(
+                "[ISLAND]   root {} ({}): {} edge blocks",
+                sig,
+                self.id_to_name.get(sig as usize).map(|s| s.as_ref()).unwrap_or("?"),
+                n
+            );
+        }
+        let mut dom: Vec<(u32, usize)> = domains.iter().map(|(k, v)| (*k, v.len())).collect();
+        dom.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        eprintln!("[ISLAND] {} raw clock domain(s); top:", dom.len());
+        for &(sig, n) in dom.iter().take(4) {
+            eprintln!(
+                "[ISLAND]   clock {} ({}): {} edge blocks",
+                sig,
+                self.id_to_name.get(sig as usize).map(|s| s.as_ref()).unwrap_or("?"),
+                n
+            );
+        }
+        // Cone analysis at ROOTED scope: members = every edge block whose
+        // raw clock resolves to the dominant root. (The raw-domain cone was
+        // 1.9% on c906; the rooted domain covers 94% of edge blocks.)
+        let Some(&(top_root, _)) = rdom.first() else { return };
+        let members: Vec<usize> = domains
+            .iter()
+            .filter(|(clk, _)| resolve_root(**clk) == top_root)
+            .flat_map(|(_, v)| v.iter().copied())
+            .collect();
+        let members = &members;
+        // 2. Domain flop outputs: write targets of the domain's COMPILED
+        // edge blocks (scan insns; uncompiled blocks counted separately).
+        let num_signals = self.signal_table.len();
+        let mut flop_out: Vec<bool> = vec![false; num_signals];
+        let mut uncompiled = 0usize;
+        for &i in members {
+            let Some(Some(cb)) = self.compiled_edge_blocks.get(i) else {
+                uncompiled += 1;
+                continue;
+            };
+            use super::bytecode::Insn as I;
+            for insn in cb.instructions.iter() {
+                match insn {
+                    I::BlockingAssign(s, ..) | I::NbaAssign(s, ..)
+                    | I::NbaAssignConst(s, ..)
+                    | I::BlockingAssignRange(s, ..) | I::NbaAssignRange(s, ..)
+                    | I::BlockingAssignRangeDyn(s, ..) | I::NbaAssignRangeDyn(s, ..)
+                    | I::BlockingAssignBitDyn(s, ..) | I::NbaAssignBitDyn(s, ..) => {
+                        if (*s as usize) < num_signals {
+                            flop_out[*s as usize] = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // 3. Comb cone: closure of comb entries triggered (transitively) by
+        // domain flop outputs, via the dependency CSR.
+        let mut in_cone: Vec<bool> = vec![false; self.comb_entries.len()];
+        let mut frontier: Vec<usize> = Vec::new();
+        let dep_off = &self.comb_dep_offsets;
+        let dep_ent = &self.comb_dep_entries;
+        let mut push_readers = |sig: usize, frontier: &mut Vec<usize>, in_cone: &mut Vec<bool>| {
+            if sig + 1 < dep_off.len() {
+                for &e in &dep_ent[dep_off[sig] as usize..dep_off[sig + 1] as usize] {
+                    let e = e as usize;
+                    if !in_cone[e] {
+                        in_cone[e] = true;
+                        frontier.push(e);
+                    }
+                }
+            }
+        };
+        for sig in 0..num_signals {
+            if flop_out[sig] {
+                push_readers(sig, &mut frontier, &mut in_cone);
+            }
+        }
+        let mut cone_writes: Vec<bool> = vec![false; num_signals];
+        while let Some(e) = frontier.pop() {
+            for &w in &self.comb_entries[e].cold.write_signal_ids {
+                if w < num_signals && !cone_writes[w] {
+                    cone_writes[w] = true;
+                    push_readers(w, &mut frontier, &mut in_cone);
+                }
+            }
+        }
+        let cone_n = in_cone.iter().filter(|&&b| b).count();
+        // 4. Boundary inputs: read by cone entries, not written by cone or
+        // domain flops. Internal: written inside, and named vs unnamed
+        // (named = observed under a dump).
+        let mut reads_outside = 0usize;
+        let mut internal_named = 0usize;
+        let mut internal_unnamed = 0usize;
+        let mut width_excluded = 0usize;
+        let mut seen_read: Vec<bool> = vec![false; num_signals];
+        for (e, &inc) in in_cone.iter().enumerate() {
+            if !inc {
+                continue;
+            }
+            let ent = &self.comb_entries[e];
+            let mut wide = false;
+            for &r in &ent.cold.read_signal_ids {
+                if r < num_signals {
+                    if self.signal_widths[r] > 64 {
+                        wide = true;
+                    }
+                    if !seen_read[r] {
+                        seen_read[r] = true;
+                        if !cone_writes[r] && !flop_out[r] {
+                            reads_outside += 1;
+                        }
+                    }
+                }
+            }
+            for &w in &ent.cold.write_signal_ids {
+                if w < num_signals && self.signal_widths[w] > 64 {
+                    wide = true;
+                }
+            }
+            if wide {
+                width_excluded += 1;
+            }
+        }
+        for sig in 0..num_signals {
+            if cone_writes[sig] {
+                if self.id_to_name.get(sig).map(|n| !n.is_empty()).unwrap_or(false) {
+                    internal_named += 1;
+                } else {
+                    internal_unnamed += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[ISLAND] top domain: {} edge blocks ({} uncompiled/unanalyzed), {} flop-out signals",
+            members.len(),
+            uncompiled,
+            flop_out.iter().filter(|&&b| b).count()
+        );
+        eprintln!(
+            "[ISLAND] comb cone: {} of {} entries ({:.1}%); {} width-excluded (>64-bit) ({:.1}%)",
+            cone_n,
+            self.comb_entries.len(),
+            100.0 * cone_n as f64 / self.comb_entries.len().max(1) as f64,
+            width_excluded,
+            100.0 * width_excluded as f64 / cone_n.max(1) as f64
+        );
+        eprintln!(
+            "[ISLAND] boundary inputs: {}; cone-internal signals: {} named (dump-observed) + {} unnamed",
+            reads_outside, internal_named, internal_unnamed
+        );
+    }
+
     fn dump_template_census(&self) {
         if std::env::var("XEZIM_TEMPLATE_CENSUS").is_err() {
             return;
@@ -30538,6 +30761,7 @@ impl Simulator {
         }
         self.dump_comb_paths();
         self.dump_template_census();
+        self.dump_island_census();
         eprintln!("[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
             self.prof_edge_detect as f64/1e6, self.prof_edge_exec as f64/1e6, self.prof_edges_fired,
             self.prof_insns_executed,

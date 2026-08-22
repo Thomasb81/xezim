@@ -89,6 +89,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_INIT_ZERO_PATHS", "Init: comma-separated hierarchical prefixes to zero-initialize"),
     ("XEZIM_INLINE_BITS", "JIT: enable the inline-bits signal mirror for JIT'd blocks (0/1)"),
     ("XEZIM_INST_PROF", "Elab: profile per-instance elaboration cost"),
+    ("XEZIM_ISLAND_CENSUS", "Island phase 1: report per-clock-domain size, comb cone, boundary and observability"),
     ("XEZIM_JIT", "JIT: enable native compilation of bytecode blocks (needs --features jit build)"),
     ("XEZIM_JIT_BACKEND", "JIT: select backend (cranelift)"),
     ("XEZIM_JIT_BAIL_TRACE", "JIT: print pc+opcode when native codegen aborts a block mid-emit"),
