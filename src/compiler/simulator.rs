@@ -16646,6 +16646,21 @@ impl Simulator {
             .unwrap_or(false);
         self.comb_jit_fns = vec![None; self.comb_entries.len()];
         self.comb_jit_strikes = vec![0; self.comb_entries.len()];
+        if !enable_jit {
+            // `XEZIM_AOT` selects the native BACKEND (rustc-generated Rust
+            // instead of cranelift); it does not enable native compilation.
+            // Set alone it is a silent no-op — every native path below is
+            // gated on `XEZIM_JIT`, and the edge-block arm sits inside the
+            // same gate. That silence has already produced a profiling run
+            // that looked like "the native backend does not displace the
+            // interpreter" and a wrong README recipe, so say so out loud.
+            if std::env::var("XEZIM_AOT").map(|v| v == "1").unwrap_or(false) {
+                eprintln!(
+                    "[warn] XEZIM_AOT=1 has no effect without XEZIM_JIT=1 — no blocks \
+                     will be natively compiled. Use `XEZIM_JIT=1 XEZIM_AOT=1`."
+                );
+            }
+        }
         if !enable_jit || self.jit_module.is_none() {
             return;
         }
@@ -17086,6 +17101,18 @@ impl Simulator {
                 // their Debug form IS the canonical form.
                 other => format!("{:?}", other).hash(&mut h),
             }
+        }
+        // Per-signal WIDTH and SIGNEDNESS are baked into the generated code
+        // (mask constants, resize widths, sign scrubs), so two blocks with an
+        // identical opcode/ordinal shape still need DIFFERENT code when their
+        // mapped signals differ in width. Fold those in, or the census would
+        // over-report how many blocks a single generated template can serve.
+        let mut by_ord: Vec<(u32, u32)> = sig_map.iter().map(|(&id, &o)| (o, id)).collect();
+        by_ord.sort_unstable();
+        for (_, id) in by_ord {
+            let w = self.signal_widths.get(id as usize).copied().unwrap_or(0);
+            let sg = self.signal_signed.get(id as usize).copied().unwrap_or(false);
+            (w, sg).hash(&mut h);
         }
         h.finish()
     }
