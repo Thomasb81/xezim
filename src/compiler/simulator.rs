@@ -15703,12 +15703,42 @@ impl Simulator {
         let mut fired: Vec<(usize, u64)> = Vec::new();
         for cg in &mut self.clock_generators {
             if cg.next_toggle_time == self.time {
+                let w = self.signal_widths[cg.signal_id];
+                // `always #N clk = ~clk` must apply the real 4-state NOT
+                // (LRM §11.5.1): 0->1, 1->0, X->X, Z->X. The old shortcut
+                // treated any non-One (including X / Z on an uninitialized
+                // 4-state `logic`) as 0 and flipped it to 1, synthesising a
+                // clock out of a signal that per LRM stays X forever and so
+                // never produces an edge. Preserving X keeps the clockgen
+                // from inventing posedges where the reference idles. Keep the
+                // O(1) fast path for genuine 2-state 0/1 clocks.
                 let cur = self.signal_table[cg.signal_id].bits_first();
-                let new_val = if cur == LogicBit::One {
-                    Value::from_u64(0, self.signal_widths[cg.signal_id])
-                } else {
-                    Value::from_u64(1, self.signal_widths[cg.signal_id])
+                let new_val = match cur {
+                    LogicBit::Zero => Value::from_u64(1, w),
+                    LogicBit::One => Value::from_u64(0, w),
+                    _ => Value::all_x(w), // ~X = X ; ~Z = X
                 };
+                // Unknown clock: ~X == X is a no-op, but ~Z == X is a REAL
+                // value change (anyedge waiters, VCD), so write only when the
+                // value differs — and keep RE-ARMING rather than retiring:
+                // the extraction consumed the always block, so a retired
+                // generator could never run again, yet the standard
+                // start-the-clock-after-reset idiom seeds an X clock from the
+                // testbench later (`initial begin #20; clk = 0; end`) and
+                // must revive it. One bit compare per half-period is noise.
+                if !cur.is_known() {
+                    if self.signal_table[cg.signal_id] != new_val {
+                        write_sig!(self, cg.signal_id, new_val);
+                        if !self.dirty_signals[cg.signal_id] {
+                            self.dirty_signals[cg.signal_id] = true;
+                            self.dirty_list.push(cg.signal_id);
+                        }
+                        self.dirty_any = true;
+                        self.table_modified = true;
+                    }
+                    cg.next_toggle_time += cg.half_period;
+                    continue;
+                }
                 write_sig!(self, cg.signal_id, new_val);
                 if !self.dirty_signals[cg.signal_id] {
                     self.dirty_signals[cg.signal_id] = true;
