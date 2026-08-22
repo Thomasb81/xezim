@@ -4977,6 +4977,16 @@ pub struct Simulator {
     current_static_task: Option<String>,
     /// Best-effort hierarchical context for resolving ambiguous leaf identifiers.
     name_resolve_hint: RefCell<Option<String>>,
+    /// Memoized `signal_name_to_id` keys under an assoc-array prefix.
+    /// That map is populated only while the signal table is built and
+    /// during `collapse_identity_port_nets` — both elaboration-time —
+    /// so the set of its keys under a given prefix is FIXED for the
+    /// run. `assoc_top_level_keys` used to re-scan the whole map on
+    /// every call, `starts_with` per key; on the axi4 UVM AVIP that
+    /// single scan was 5.1% of the run (memcmp attributed to it by a
+    /// call-graph profile). The live half of the enumeration (elements
+    /// in `self.signals`) is NOT cached — that map mutates at runtime.
+    assoc_static_keys_cache: RefCell<HashMap<String, Arc<Vec<Arc<str>>>>>,
     /// §16.9.3 sampled-value function watches: per call site, a history of
     /// the operand sampled (preponed) at each matching clock edge. hist[0]
     /// is the sample at the most recent edge, hist[1] one edge earlier, …
@@ -7748,6 +7758,7 @@ impl Simulator {
             static_task_init: HashSet::default(),
             current_static_task: None,
             name_resolve_hint: RefCell::new(None),
+            assoc_static_keys_cache: RefCell::new(HashMap::default()),
             sampled_watches: Vec::new(),
             sampled_watch_site: HashMap::default(),
             sampled_site_clock: HashMap::default(),
@@ -70094,11 +70105,30 @@ impl Simulator {
         // §7.11) — take up to the LAST `]` so such brackets are not mistaken
         // for an index end.
         let idx_keys = self.signals.keys_with_elem_prefix(&prefix);
+        // The `signal_name_to_id` half of this enumeration is fixed for the
+        // run (see `assoc_static_keys_cache`), so scan it once per prefix
+        // instead of on every call.
+        let static_keys = {
+            let mut cache = self.assoc_static_keys_cache.borrow_mut();
+            if let Some(v) = cache.get(prefix.as_str()) {
+                Arc::clone(v)
+            } else {
+                let v: Arc<Vec<Arc<str>>> = Arc::new(
+                    self.signal_name_to_id
+                        .keys()
+                        .filter(|k| k.starts_with(prefix.as_str()))
+                        .cloned()
+                        .collect(),
+                );
+                cache.insert(prefix.clone(), Arc::clone(&v));
+                v
+            }
+        };
         let mut keys: Vec<String> = idx_keys
             .iter()
             .map(|k| k.as_str())
-            .chain(self.signal_name_to_id.keys().map(|k| &**k))
             .filter(|k| k.starts_with(&prefix))
+            .chain(static_keys.iter().map(|k| &**k))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
                 Self::assoc_first_key_seg(rest).map(|s| s.to_string())
