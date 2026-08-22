@@ -107,6 +107,9 @@ unsafe fn br() -> &'static AotBridge {
     }
     (b.store4s)(sim, id, v, x, w);
 }
+/// Template-mode signal lookup: `S` is the per-BLOCK mapping array, `k` the
+/// canonical first-use ordinal baked into the shared template body.
+#[inline(always)] unsafe fn sg(s: *const u32, k: usize) -> u32 { *s.add(k) }
 #[inline(always)] fn mask_w(w: u32) -> u64 { if w >= 64 { !0u64 } else { (1u64 << w) - 1 } }
 #[inline(always)] fn and4(av: u64, ax: u64, bv: u64, bx: u64) -> (u64, u64) {
     let one = (av & !ax) & (bv & !bx);
@@ -263,6 +266,21 @@ pub fn gen_block_fn(
     sig_w: &[u32],
     sig_signed: &[bool],
 ) -> Option<String> {
+    gen_block_fn_mapped(fn_name, insns, num_regs, sig_w, sig_signed, None)
+}
+
+/// `sigmap = None` bakes signal ids (one body per block). `Some(map)` emits
+/// mapping-array loads so a single body serves every block with the same
+/// canonical shape; the caller then emits a per-block trampoline supplying
+/// the array. See the template census (`XEZIM_TEMPLATE_CENSUS`).
+pub fn gen_block_fn_mapped(
+    fn_name: &str,
+    insns: &[Insn],
+    num_regs: u32,
+    sig_w: &[u32],
+    sig_signed: &[bool],
+    sigmap: Option<&std::collections::HashMap<u32, u32>>,
+) -> Option<String> {
     if super::jit::first_unsupported(insns).is_some() {
         return None;
     }
@@ -324,7 +342,7 @@ pub fn gen_block_fn(
             }
             let _ = writeln!(w, "{i} => {{");
         }
-        emit_insn_rust(w, &mut tables, &mut ntab, insn, i, n, &meta, sig_w, sig_signed)?;
+        emit_insn_rust(w, &mut tables, &mut ntab, insn, i, n, &meta, sig_w, sig_signed, sigmap)?;
         // Post-op width mask (mirror of the codegen masking pass).
         if let Some((d, mw)) = super::jit::insn_result_width(insn, &meta.w, sig_w) {
             let m = (1u64 << mw) - 1;
@@ -477,7 +495,7 @@ pub fn gen_fsm_fn(
             }
             _ => {}
         }
-        if emit_insn_rust(w, &mut tables, &mut ntab, insn, i, n, &meta, sig_w, sig_signed)
+        if emit_insn_rust(w, &mut tables, &mut ntab, insn, i, n, &meta, sig_w, sig_signed, None)
             .is_none()
         {
             if std::env::var_os("XEZIM_JIT_VERBOSE").is_some() {
@@ -547,10 +565,21 @@ fn emit_insn_rust(
     meta: &RegMeta,
     sig_w: &[u32],
     sig_signed: &[bool],
+    sigmap: Option<&std::collections::HashMap<u32, u32>>,
 ) -> Option<()> {
     use Insn::*;
     let rw = |r: u16| meta.w.get(r as usize).copied().unwrap_or(0);
     let rs = |r: u16| meta.s.get(r as usize).copied().unwrap_or(false);
+    // How a signal id reaches the generated code. `None` bakes the literal
+    // id (one body per block, the original behaviour, byte-identical).
+    // `Some(map)` emits a load from the block's mapping array instead, so
+    // ONE body can serve every block sharing this canonical shape.
+    let sref = |id: u32| -> String {
+        match sigmap {
+            None => id.to_string(),
+            Some(m) => format!("sg(S,{})", m.get(&id).copied().unwrap_or(0)),
+        }
+    };
     match insn {
         Nop | SetSigned(_) | ClearSigned(_) => {}
         LoadConst(d, v) => {
@@ -561,6 +590,7 @@ fn emit_insn_rust(
             let _ = writeln!(w, "r{d}v = {vb:#x}; r{d}x = {xb:#x};");
         }
         LoadSignal(d, sig) | LoadSignalSigned(d, sig) => {
+            let sig = sref(*sig);
             let _ = writeln!(w, "let t = ld(sim, {sig}); r{d}v = t.0; r{d}x = t.1;");
         }
         // §11.4.12.1 replication: n copies, high copy first — unrolled
@@ -825,6 +855,7 @@ fn emit_insn_rust(
         }
         LoadSignalBit(dest, sig, bit) => {
             let sw = sig_w.get(*sig as usize).copied().unwrap_or(0);
+            let sig = sref(*sig);
             if sw > 0 && *bit >= sw {
                 let _ = writeln!(w, "r{dest}v = 0; r{dest}x = 1;");
             } else if *bit >= 64 {
@@ -842,6 +873,8 @@ fn emit_insn_rust(
             }
         }
         LoadSignalRange(dest, sig, left, right) => {
+            let sig_sw = sig_w.get(*sig as usize).copied().unwrap_or(0);
+            let sig = sref(*sig);
             let lo = (*left).min(*right);
             let hi = (*left).max(*right);
             let wid = left.abs_diff(*right) + 1;
@@ -854,7 +887,7 @@ fn emit_insn_rust(
             // bridge, exactly like cranelift; out-of-declared-range bits
             // are X-marked with the same keep/oor masks as the narrow arm.
             if hi >= 64 {
-                let sw = sig_w.get(*sig as usize).copied().unwrap_or(0);
+                let sw = sig_sw;
                 let oor: u64 = if sw > 0 && lo >= sw {
                     (1u64 << wid) - 1
                 } else if sw > 0 && hi >= sw {
@@ -870,7 +903,7 @@ fn emit_insn_rust(
                 );
                 return Some(());
             }
-            let sw = sig_w.get(*sig as usize).copied().unwrap_or(0);
+            let sw = sig_sw;
             let oor: u64 = if sw > 0 && lo >= sw {
                 (1u64 << wid) - 1
             } else if sw > 0 && hi >= sw {
@@ -890,6 +923,7 @@ fn emit_insn_rust(
             // the signal's declared width (plane compare is exact then);
             // width 0 means "signal width" in the bridge, same condition.
             let sw = sig_w.get(*sig as usize).copied().unwrap_or(0);
+            let sig = sref(*sig);
             let effw = if *width == 0 { sw } else { *width };
             if effw == sw && (1..=64).contains(&effw) {
                 let mask = if effw >= 64 { u64::MAX } else { (1u64 << effw) - 1 };
@@ -902,18 +936,23 @@ fn emit_insn_rust(
             }
         }
         NbaAssign(sig, val, width) => {
+            let sig = sref(*sig);
             let _ = writeln!(w, "(br().nba4s)(sim, {sig}, r{val}v, r{val}x, {width});");
         }
         BlockingAssignRange(sig, hi, lo, val) => {
+            let sig = sref(*sig);
             let _ = writeln!(w, "(br().blk_range)(sim, {sig}, {hi}, {lo}, r{val}v, r{val}x);");
         }
         BlockingAssignRangeDyn(sig, hi_r, lo_r, val) => {
+            let sig = sref(*sig);
             let _ = writeln!(w, "(br().blk_range)(sim, {sig}, r{hi_r}v, r{lo_r}v, r{val}v, r{val}x);");
         }
         BlockingAssignBitDyn(sig, idx_r, val) => {
+            let sig = sref(*sig);
             let _ = writeln!(w, "(br().blk_range)(sim, {sig}, r{idx_r}v, r{idx_r}v, r{val}v, r{val}x);");
         }
         NbaAssignConst(sig, v, width) => {
+            let sig = sref(*sig);
             if v.is_fill || v.is_real || v.width > 64 {
                 return None;
             }
@@ -924,18 +963,25 @@ fn emit_insn_rust(
             );
         }
         NbaAssignRange(sig, hi, lo, val) => {
+            let sig = sref(*sig);
             let _ = writeln!(w, "(br().nba_range)(sim, {sig}, {hi}, {lo}, r{val}v, r{val}x);");
         }
         NbaAssignRangeDyn(sig, hi_r, lo_r, val) => {
+            let sig = sref(*sig);
             let _ = writeln!(w, "(br().nba_range)(sim, {sig}, r{hi_r}v, r{lo_r}v, r{val}v, r{val}x);");
         }
         NbaAssignBitDyn(sig, idx_r, val) => {
+            let sig = sref(*sig);
             let _ = writeln!(w, "(br().nba_bit)(sim, {sig}, r{idx_r}v, r{val}v, r{val}x);");
         }
         LoadArrayElem(d, arr, idx_reg) => {
             let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
                 return None;
             };
+            // A dense array's BASE id is mapped like any other signal id: the
+            // element address is base + (index - lo), so mapping the base
+            // relocates the whole array for this block's instance.
+            let first_id = sref(*first_id as u32);
             let _ = writeln!(
                 w,
                 "let eff = (r{idx_reg}v & !r{idx_reg}x) as i64;\n\
@@ -948,6 +994,10 @@ fn emit_insn_rust(
             let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
                 return None;
             };
+            // A dense array's BASE id is mapped like any other signal id: the
+            // element address is base + (index - lo), so mapping the base
+            // relocates the whole array for this block's instance.
+            let first_id = sref(*first_id as u32);
             let _ = writeln!(
                 w,
                 "let eff = (r{idx_reg}v & !r{idx_reg}x) as i64;\n\
@@ -960,6 +1010,10 @@ fn emit_insn_rust(
             let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
                 return None;
             };
+            // A dense array's BASE id is mapped like any other signal id: the
+            // element address is base + (index - lo), so mapping the base
+            // relocates the whole array for this block's instance.
+            let first_id = sref(*first_id as u32);
             let _ = writeln!(
                 w,
                 "let eff = (r{idx_reg}v & !r{idx_reg}x) as i64;\n\
@@ -972,9 +1026,18 @@ fn emit_insn_rust(
         // unresolved-element arm schedules the 1-bit X the interpreter's
         // `Value::new(1).resize_for_assign(width)` produces (zero-extended).
         NbaAssignArrayRead(dst_sig, arr, idx_sig, width) => {
+            let dst_sig = sref(*dst_sig);
+            // The INDEX is itself read from a signal — map it too. This one
+            // stays a plain u32 either way, so the type checker cannot flag
+            // it; only an audit of every id interpolation finds it.
+            let idx_sig = sref(*idx_sig);
             let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
                 return None;
             };
+            // A dense array's BASE id is mapped like any other signal id: the
+            // element address is base + (index - lo), so mapping the base
+            // relocates the whole array for this block's instance.
+            let first_id = sref(*first_id as u32);
             let _ = writeln!(
                 w,
                 "let t = ld(sim, {idx_sig});\n\
@@ -991,6 +1054,10 @@ fn emit_insn_rust(
             let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
                 return None;
             };
+            // A dense array's BASE id is mapped like any other signal id: the
+            // element address is base + (index - lo), so mapping the base
+            // relocates the whole array for this block's instance.
+            let first_id = sref(*first_id as u32);
             let _ = writeln!(
                 w,
                 "let eff = (r{idx_reg}v & !r{idx_reg}x) as i64;\n\
@@ -1045,6 +1112,7 @@ fn emit_insn_rust(
         }
         BranchIfSignalFalse(sig, target, bit) => {
             let t = jump_pc(*target as usize, n);
+            let sig = sref(*sig);
             if *bit == u32::MAX {
                 let _ = writeln!(
                     w,
