@@ -53,6 +53,8 @@ mod case_wait_in_task;
 mod clock_gate_fanout;
 #[path = "scheduling/clock_t0_variable_delay_phase.rs"]
 mod clock_t0_variable_delay_phase;
+#[path = "scheduling/clockgen_x_clock_stays_x.rs"]
+mod clockgen_x_clock_stays_x;
 #[path = "scheduling/clocking_event_cycle_delay.rs"]
 mod clocking_event_cycle_delay;
 #[path = "scheduling/comb_result_clobbered_by_process.rs"]
