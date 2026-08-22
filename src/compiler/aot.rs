@@ -1263,7 +1263,13 @@ pub fn compile_and_load(
             };
             feed(source.as_bytes());
             feed(opt_env.as_bytes());
-            feed(b"native");
+            // "nolto": ThinLTO was measured at 57s of the C910 comb
+            // crate's 213s compile — cross-function inlining analysis over
+            // bodies that are deliberately independent (template dedup
+            // REQUIRES them not to inline into each other). -C lto=off
+            // -C embed-bitcode=no: 213.1s -> 166.9s (-22%), .so 14 -> 13MB.
+            // The marker keeps ThinLTO-built cache entries from being reused.
+            feed(b"native-nolto");
             feed(
                 option_env!("XEZIM_GIT_HASH")
                     .unwrap_or(env!("CARGO_PKG_VERSION"))
@@ -1317,6 +1323,10 @@ pub fn compile_and_load(
             "panic=abort",
             "-C",
             "debuginfo=0",
+            "-C",
+            "lto=off",
+            "-C",
+            "embed-bitcode=no",
             "-o",
         ])
         .arg(&so)
