@@ -2951,6 +2951,9 @@ enum CombPlan {
     Ts(std::sync::Arc<super::bytecode::TwoStateBlock>),
     #[cfg(feature = "jit")]
     Jit(super::jit::JitFn),
+    /// Template-mode native fn plus the entry's mapping-blob window.
+    #[cfg(feature = "jit")]
+    Tpl(super::aot::AotTplFn, u32, u32),
     Interp,
 }
 
@@ -3898,6 +3901,14 @@ pub struct Simulator {
     /// cost +2.0% in the DEFAULT build from the hot-loop check alone.
     #[cfg(feature = "jit")]
     comb_jit_fns: Vec<Option<super::jit::JitFn>>,
+    /// Template-mode native comb fns: `(body, offset into comb_tpl_map_blob,
+    /// map len)` per entry. The mapping arrays are HOST-owned (one flat blob)
+    /// so the generated crate carries only the bodies — see
+    /// `gen_templated_blocks`.
+    #[cfg(feature = "jit")]
+    comb_tpl_fns: Vec<Option<(super::aot::AotTplFn, u32, u32)>>,
+    #[cfg(feature = "jit")]
+    comb_tpl_map_blob: Vec<u32>,
     /// Consecutive X/Z-bail strikes per entry (retires the fn past a limit).
     #[cfg(feature = "jit")]
     comb_jit_strikes: Vec<u8>,
@@ -7392,6 +7403,10 @@ impl Simulator {
             jit_fns: Vec::new(),
             #[cfg(feature = "jit")]
             comb_jit_fns: Vec::new(),
+            #[cfg(feature = "jit")]
+            comb_tpl_fns: Vec::new(),
+            #[cfg(feature = "jit")]
+            comb_tpl_map_blob: Vec::new(),
             #[cfg(feature = "jit")]
             comb_jit_strikes: Vec::new(),
             #[cfg(feature = "jit")]
@@ -16645,6 +16660,10 @@ impl Simulator {
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
         self.comb_jit_fns = vec![None; self.comb_entries.len()];
+        #[cfg(feature = "jit")]
+        {
+            self.comb_tpl_fns = vec![None; self.comb_entries.len()];
+        }
         self.comb_jit_strikes = vec![0; self.comb_entries.len()];
         if !enable_jit {
             // `XEZIM_AOT` selects the native BACKEND (rustc-generated Rust
@@ -16715,7 +16734,79 @@ impl Simulator {
             let verbose = std::env::var("XEZIM_JIT_VERBOSE").is_ok();
             let mut names: Vec<(usize, String)> = Vec::new();
             let mut fns: Vec<String> = Vec::new();
+            // XEZIM_AOT_TEMPLATE=1: emit ONE body per canonical block shape
+            // plus a per-block trampoline carrying that block's signal
+            // mapping, instead of one baked body per block. Same ABI, so the
+            // loader and dispatch are untouched. Census on C910: 148,106
+            // blocks -> 15,778 shapes.
+            let templated = std::env::var("XEZIM_AOT_TEMPLATE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if templated {
+                let items: Vec<(usize, Vec<super::bytecode::Insn>, u32)> = blocks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, b)| {
+                        let cb = b.as_ref()?;
+                        if !safe[idx] {
+                            return None;
+                        }
+                        Some((idx, cb.instructions.clone(), cb.num_regs))
+                    })
+                    .collect();
+                let built = super::aot::gen_templated_blocks(
+                    &items,
+                    &self.signal_widths,
+                    &self.signal_signed,
+                );
+                if verbose {
+                    eprintln!(
+                        "[AOT-TEMPLATE] comb blocks={} templates={} ({:.1}x fewer bodies)",
+                        built.n_blocks,
+                        built.n_templates,
+                        built.n_blocks as f64 / built.n_templates.max(1) as f64
+                    );
+                }
+                // The crate exports ONLY the template bodies (2-arg ABI); the
+                // per-block mapping arrays live host-side in one flat blob.
+                // This branch loads and installs everything itself — the
+                // shared JitFn path below stays untouched (`fns` is empty).
+                if !built.fns.is_empty() {
+                    let src = super::aot::module_source_named(&built.fns, &built.tpl_names);
+                    let planes = (
+                        self.signal_inline_bits.as_ptr() as u64,
+                        self.signal_inline_bits.len() as u32,
+                    );
+                    if let Some(lib) = super::aot::compile_and_load(&src, verbose, planes) {
+                        if let Some(api) = lib.api() {
+                            for (idx, tpl_pos, map) in &built.blocks {
+                                let p = api(*tpl_pos);
+                                if p.is_null() {
+                                    continue;
+                                }
+                                let f: super::aot::AotTplFn =
+                                    unsafe { std::mem::transmute(p) };
+                                let off = self.comb_tpl_map_blob.len() as u32;
+                                self.comb_tpl_map_blob.extend_from_slice(map);
+                                self.comb_tpl_fns[*idx] =
+                                    Some((f, off, map.len() as u32));
+                                n += 1;
+                            }
+                        }
+                        // Same retention discipline as the baked path: the
+                        // library must outlive the Simulator (fn pointers are
+                        // stored), so leak it rather than invent a new field.
+                        std::mem::forget(lib);
+                        if verbose {
+                            eprintln!("[AOT] comb entries compiled {}/{} (templated)", n, blocks.len());
+                        }
+                    }
+                }
+            }
             for (idx, b) in blocks.iter().enumerate() {
+                if templated {
+                    break;
+                }
                 let Some(cb) = b else { continue };
                 if !safe[idx] {
                     continue;
@@ -17251,6 +17342,10 @@ impl Simulator {
         if let Some(Some(f)) = self.comb_jit_fns.get(eidx).copied() {
             return CombPlan::Jit(f);
         }
+        #[cfg(feature = "jit")]
+        if let Some(Some((f, off, len))) = self.comb_tpl_fns.get(eidx).copied() {
+            return CombPlan::Tpl(f, off, len);
+        }
         CombPlan::Interp
     }
 
@@ -17288,7 +17383,7 @@ impl Simulator {
                 self.run_comb_jit_slot(eidx)
             }
             #[cfg(feature = "jit")]
-            CombPlan::Jit(_) => self.run_comb_jit_slot(eidx),
+            CombPlan::Jit(_) | CombPlan::Tpl(..) => self.run_comb_jit_slot(eidx),
             CombPlan::Interp | CombPlan::Unresolved => false,
         }
     }
@@ -17297,6 +17392,41 @@ impl Simulator {
     /// the strike protocol, and downgrade the plan when the slot dies.
     #[allow(unused_variables)]
     fn run_comb_jit_slot(&mut self, eidx: usize) -> bool {
+        #[cfg(feature = "jit")]
+        if let Some(Some((f, off, _len))) = self.comb_tpl_fns.get(eidx).copied() {
+            let map = unsafe { self.comb_tpl_map_blob.as_ptr().add(off as usize) };
+            let sp: *mut u8 = self as *mut Self as *mut u8;
+            match unsafe { f(sp, map) } {
+                0 => {
+                    self.comb_jit_strikes[eidx] = 0;
+                    if self.trace_comb_paths {
+                        self.note_comb_path(eidx, 1);
+                    }
+                    if self.profile_timing {
+                        self.prof_comb_jit[0] += 1;
+                    }
+                    return true;
+                }
+                1 => {
+                    if self.profile_timing {
+                        self.prof_comb_jit[1] += 1;
+                    }
+                    const XZ_STRIKE_LIMIT: u8 = 8;
+                    let st = &mut self.comb_jit_strikes[eidx];
+                    *st = st.saturating_add(1);
+                    if *st >= XZ_STRIKE_LIMIT {
+                        self.comb_tpl_fns[eidx] = None;
+                        self.downgrade_comb_plan(eidx);
+                    }
+                    return false;
+                }
+                _ => {
+                    self.comb_tpl_fns[eidx] = None;
+                    self.downgrade_comb_plan(eidx);
+                    return false;
+                }
+            }
+        }
         #[cfg(feature = "jit")]
         {
             if let Some(Some(f)) = self.comb_jit_fns.get(eidx).copied() {
@@ -17338,7 +17468,10 @@ impl Simulator {
     /// only a Jit plan decays to Interp).
     fn downgrade_comb_plan(&mut self, eidx: usize) {
         #[cfg(feature = "jit")]
-        if matches!(self.comb_plan.get(eidx), Some(CombPlan::Jit(_))) {
+        if matches!(
+            self.comb_plan.get(eidx),
+            Some(CombPlan::Jit(_)) | Some(CombPlan::Tpl(..))
+        ) {
             self.comb_plan[eidx] = CombPlan::Interp;
         }
     }

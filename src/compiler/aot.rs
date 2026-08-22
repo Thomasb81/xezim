@@ -355,10 +355,25 @@ pub fn gen_block_fn_mapped(
     }
 
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "#[no_mangle]\npub unsafe extern \"C\" fn {fn_name}(sim: *mut u8) -> u32 {{"
-    );
+    // Template body: internal, takes the per-block mapping pointer.
+    // `#[inline(never)]` is LOAD-BEARING — without it rustc inlines the body
+    // back into every trampoline and undoes the dedup entirely.
+    if sigmap.is_some() {
+        // Template bodies are exported directly — the host owns the per-block
+        // mapping arrays and calls `body(sim, map_ptr)` itself. No trampolines:
+        // on C910 the first trampoline-based build kept ~116k items and rustc
+        // time barely moved (3,870s -> 3,550s despite 13.2x fewer bodies) —
+        // rustc cost scales with ITEM COUNT, not body text.
+        let _ = writeln!(
+            out,
+            "#[no_mangle]\npub unsafe extern \"C\" fn {fn_name}(sim: *mut u8, S: *const u32) -> u32 {{"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "#[no_mangle]\npub unsafe extern \"C\" fn {fn_name}(sim: *mut u8) -> u32 {{"
+        );
+    }
     out.push_str(&tables);
     for r in 0..num_regs {
         let _ = writeln!(out, "let mut r{r}v = 0u64; let mut r{r}x = 0u64;");
@@ -1384,4 +1399,197 @@ pub fn module_source_named(block_fns: &[String], names: &[String]) -> String {
         s.push_str("_ => core::ptr::null_mut(),\n} }\n");
     }
     s
+}
+
+/// Canonical shape of a compiled block, for template dedup.
+///
+/// Walks the SAME id-bearing fields the emitter routes through `sref`, in the
+/// same order, assigning each distinct signal id a first-use ordinal. Returns
+/// the shape key plus the ordinal->id mapping, so the caller can emit ONE body
+/// per key and a per-block mapping array. The key MUST be computed from the
+/// same map the emitter uses, or two blocks sharing a body would resolve an
+/// ordinal to different signals.
+///
+/// The key folds in each mapped signal's declared width and signedness,
+/// because the emitter bakes those into masks, resize widths and sign scrubs —
+/// same-shaped blocks over differently-sized signals need different code.
+pub fn canon_shape(
+    insns: &[Insn],
+    sig_w: &[u32],
+    sig_signed: &[bool],
+) -> (u64, Vec<u32>, std::collections::HashMap<u32, u32>) {
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut map: HashMap<u32, u32> = HashMap::new();
+    let mut order: Vec<u32> = Vec::new();
+    let mut canon = |id: u32, h: &mut std::collections::hash_map::DefaultHasher| {
+        let next = order.len() as u32;
+        let ord = *map.entry(id).or_insert_with(|| {
+            order.push(id);
+            next
+        });
+        ord.hash(h);
+    };
+    for insn in insns {
+        super::bytecode::insn_opcode_name(insn).hash(&mut h);
+        match insn {
+            Insn::LoadSignal(d, s) | Insn::LoadSignalSigned(d, s) => {
+                d.hash(&mut h);
+                canon(*s, &mut h);
+            }
+            Insn::LoadSignalBit(d, s, b) => {
+                (d, b).hash(&mut h);
+                canon(*s, &mut h);
+            }
+            Insn::LoadSignalRange(d, s, l, r) => {
+                (d, l, r).hash(&mut h);
+                canon(*s, &mut h);
+            }
+            Insn::BranchIfSignalFalse(s, t, b) => {
+                (t, b).hash(&mut h);
+                canon(*s, &mut h);
+            }
+            Insn::BlockingAssign(s, r, w) | Insn::NbaAssign(s, r, w) => {
+                (r, w).hash(&mut h);
+                canon(*s, &mut h);
+            }
+            Insn::NbaAssignConst(s, v, w) => {
+                let (vb, xb) = v.raw_bits();
+                (w, vb, xb, v.width, v.is_signed).hash(&mut h);
+                canon(*s, &mut h);
+            }
+            Insn::BlockingAssignRange(s, hi, lo, r) | Insn::NbaAssignRange(s, hi, lo, r) => {
+                (hi, lo, r).hash(&mut h);
+                canon(*s, &mut h);
+            }
+            Insn::BlockingAssignRangeDyn(s, a, b, r) | Insn::NbaAssignRangeDyn(s, a, b, r) => {
+                (a, b, r).hash(&mut h);
+                canon(*s, &mut h);
+            }
+            Insn::BlockingAssignBitDyn(s, i, r) | Insn::NbaAssignBitDyn(s, i, r) => {
+                (i, r).hash(&mut h);
+                canon(*s, &mut h);
+            }
+            Insn::LoadArrayElem(d, arr, i) => {
+                d.hash(&mut h);
+                i.hash(&mut h);
+                match arr.as_ref() {
+                    ArrayOperand::Dense { first_id, lo, hi, .. } => {
+                        (lo, hi).hash(&mut h);
+                        canon(*first_id as u32, &mut h);
+                    }
+                    // Name-keyed arrays are not emitted natively; refuse.
+                    ArrayOperand::Named(_) => return (u64::MAX, Vec::new(), HashMap::new()),
+                }
+            }
+            Insn::BlockingAssignArray(arr, i, r, w) | Insn::NbaAssignArray(arr, i, r, w) => {
+                (i, r, w).hash(&mut h);
+                match arr.as_ref() {
+                    ArrayOperand::Dense { first_id, lo, hi, .. } => {
+                        (lo, hi).hash(&mut h);
+                        canon(*first_id as u32, &mut h);
+                    }
+                    ArrayOperand::Named(_) => return (u64::MAX, Vec::new(), HashMap::new()),
+                }
+            }
+            Insn::NbaAssignArrayRead(dst, arr, idx, w) => {
+                w.hash(&mut h);
+                canon(*dst, &mut h);
+                canon(*idx, &mut h);
+                match arr.as_ref() {
+                    ArrayOperand::Dense { first_id, lo, hi, .. } => {
+                        (lo, hi).hash(&mut h);
+                        canon(*first_id as u32, &mut h);
+                    }
+                    ArrayOperand::Named(_) => return (u64::MAX, Vec::new(), HashMap::new()),
+                }
+            }
+            // Everything else carries no signal identity: its Debug form IS
+            // its canonical form.
+            other => format!("{:?}", other).hash(&mut h),
+        }
+    }
+    for &id in &order {
+        let w = sig_w.get(id as usize).copied().unwrap_or(0);
+        let sg = sig_signed.get(id as usize).copied().unwrap_or(false);
+        (w, sg).hash(&mut h);
+    }
+    (h.finish(), order, map)
+}
+
+/// A template body's runtime signature: `(sim, map_ptr) -> rc`, where
+/// `map_ptr` is the calling block's ordinal->signal-id array (host-owned).
+pub type AotTplFn = unsafe extern "C" fn(*mut u8, *const u32) -> u32;
+
+/// Result of grouping blocks into shared templates.
+pub struct TemplateBuild {
+    /// Generated template bodies, in `tpl_names` order.
+    pub fns: Vec<String>,
+    /// Exported body names, in API-table order.
+    pub tpl_names: Vec<String>,
+    /// Per enrolled block: `(block index, position in tpl_names, mapping)`.
+    /// The mapping is the block's first-use-ordinal -> signal-id array; the
+    /// HOST stores it and passes a pointer at call time. Keeping the maps
+    /// host-side is the point: the generated crate contains ONLY the bodies
+    /// plus the api table, so its item count equals the template count.
+    pub blocks: Vec<(usize, u32, Vec<u32>)>,
+    pub n_templates: usize,
+    pub n_blocks: usize,
+}
+
+/// Group blocks by canonical shape and emit ONE exported body per shape.
+///
+/// Measured on C910: 108,248 comb blocks collapse to 8,172 shapes (13.2x).
+/// A shape whose representative fails to generate is dropped WHOLE — every
+/// block in it falls back to the interpreter — because the blocks in a shape
+/// share one body by construction.
+pub fn gen_templated_blocks(
+    items: &[(usize, Vec<Insn>, u32)],
+    sig_w: &[u32],
+    sig_signed: &[bool],
+) -> TemplateBuild {
+    use std::collections::HashMap;
+    let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut shapes: Vec<(u64, Vec<u32>, HashMap<u32, u32>)> = Vec::with_capacity(items.len());
+    for (i, (_, insns, _)) in items.iter().enumerate() {
+        let (key, order, map) = canon_shape(insns, sig_w, sig_signed);
+        if key == u64::MAX {
+            shapes.push((u64::MAX, Vec::new(), HashMap::new()));
+            continue;
+        }
+        groups.entry(key).or_default().push(i);
+        shapes.push((key, order, map));
+    }
+    let mut fns: Vec<String> = Vec::new();
+    let mut tpl_names: Vec<String> = Vec::new();
+    let mut blocks: Vec<(usize, u32, Vec<u32>)> = Vec::new();
+    // Deterministic order: generated source must not depend on hash iteration
+    // (the persistent native cache keys on the source text).
+    let mut keys: Vec<u64> = groups.keys().copied().collect();
+    keys.sort_unstable();
+    for key in keys {
+        let members = &groups[&key];
+        let rep = members[0];
+        let tpl = format!("xezim_aot_tpl_{key:016x}");
+        let (_, _, rep_map) = &shapes[rep];
+        let Some(body) = gen_block_fn_mapped(
+            &tpl,
+            &items[rep].1,
+            items[rep].2,
+            sig_w,
+            sig_signed,
+            Some(rep_map),
+        ) else {
+            continue; // whole shape unsupported; its blocks stay interpreted
+        };
+        let tpl_pos = tpl_names.len() as u32;
+        fns.push(body);
+        tpl_names.push(tpl);
+        for &m in members {
+            blocks.push((items[m].0, tpl_pos, shapes[m].1.clone()));
+        }
+    }
+    let (n_templates, n_blocks) = (tpl_names.len(), blocks.len());
+    TemplateBuild { fns, tpl_names, blocks, n_templates, n_blocks }
 }
