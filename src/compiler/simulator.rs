@@ -4446,6 +4446,17 @@ pub struct Simulator {
     /// settle call is vastly cheaper than iterating all num_entries bits
     /// (can be ~500K on designs like c910).
     comb_unresolved_idx: Vec<usize>,
+    /// Co-activation census (`XEZIM_COACT_CENSUS=1`): per-entry predecessor
+    /// CSR over the dep graph, a same-slot counter per (entry, pred) edge,
+    /// and the last simulated time each entry evaluated. Sizing data for
+    /// convex-cluster fusion: an entry whose evals are >=90% same-slot with
+    /// one predecessor can join that predecessor's cluster with bounded
+    /// waste — even across fanout. Empty unless the env is set.
+    coact_pred_off: Vec<u32>,
+    coact_pred_ent: Vec<u32>,
+    coact_edge_count: Vec<u64>,
+    coact_epoch: Vec<u64>,
+    coact_enabled: bool,
     /// Precomputed indices of comb_entries that should fire unconditionally
     /// at time=0: entries with empty read_signal_ids, or always_comb blocks.
     /// Avoids an O(num_entries) scan on every settle call while time=0.
@@ -7561,6 +7572,11 @@ impl Simulator {
                 .unwrap_or(256),
             bsp_shadow: std::env::var_os("XEZIM_BSP_SHADOW").is_some(),
             comb_unresolved_idx: Vec::new(),
+            coact_pred_off: Vec::new(),
+            coact_pred_ent: Vec::new(),
+            coact_edge_count: Vec::new(),
+            coact_epoch: Vec::new(),
+            coact_enabled: false,
             comb_time0_idx: Vec::new(),
             comb_time0_fired: false,
             comb_time0_deferred: Vec::new(),
@@ -17438,6 +17454,54 @@ impl Simulator {
     /// body has zero recompute waste at ANY activity factor (the defect
     /// that killed region fusion, twice). Weighted by dynamic eval counts
     /// when `XEZIM_COMB_PATHS`/profiling counters are populated.
+    /// Co-activation census report: per entry, the BEST predecessor edge's
+    /// same-slot ratio (co-evals / entry evals), weighted by dynamic evals.
+    /// The ">=0.9 coverage" number is the fraction of all evaluation work
+    /// that convex clustering can absorb with <=10% waste — the go/no-go
+    /// for fanout-inclusive supernode fusion.
+    fn dump_coact_census(&self) {
+        if !self.coact_enabled || self.prof_entry_counts.is_empty() {
+            return;
+        }
+        let n = self.comb_entries.len();
+        let mut buckets = [0u64; 6]; // <0.5, 0.5-0.7, 0.7-0.9, 0.9-0.99, >=0.99, no-pred
+        let mut bucket_evals = [0u64; 6];
+        let tot: u64 = self.prof_entry_counts.iter().sum();
+        for e in 0..n {
+            let evals = self.prof_entry_counts.get(e).copied().unwrap_or(0);
+            if evals == 0 {
+                continue;
+            }
+            let lo = self.coact_pred_off[e] as usize;
+            let hi = self.coact_pred_off[e + 1] as usize;
+            let best = self.coact_edge_count[lo..hi].iter().max().copied().unwrap_or(0);
+            let b = if hi == lo {
+                5
+            } else {
+                let r = best as f64 / evals as f64;
+                if r >= 0.99 { 4 } else if r >= 0.9 { 3 } else if r >= 0.7 { 2 }
+                else if r >= 0.5 { 1 } else { 0 }
+            };
+            buckets[b] += 1;
+            bucket_evals[b] += evals;
+        }
+        eprintln!(
+            "[COACT] best-pred same-slot ratio, entries: <0.5:{} 0.5-0.7:{} 0.7-0.9:{} 0.9-0.99:{} >=0.99:{} no-pred:{}",
+            buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5]
+        );
+        let pct = |x: u64| 100.0 * x as f64 / tot.max(1) as f64;
+        eprintln!(
+            "[COACT] dynamic-eval share: <0.5:{:.1}% 0.5-0.7:{:.1}% 0.7-0.9:{:.1}% 0.9-0.99:{:.1}% >=0.99:{:.1}% no-pred:{:.1}%",
+            pct(bucket_evals[0]), pct(bucket_evals[1]), pct(bucket_evals[2]),
+            pct(bucket_evals[3]), pct(bucket_evals[4]), pct(bucket_evals[5])
+        );
+        eprintln!(
+            "[COACT] clusterable (ratio>=0.9): {:.1}% of dynamic evals; with 0.7+: {:.1}%",
+            pct(bucket_evals[3] + bucket_evals[4]),
+            pct(bucket_evals[2] + bucket_evals[3] + bucket_evals[4])
+        );
+    }
+
     fn dump_chain_census(&self) {
         if std::env::var("XEZIM_CHAIN_CENSUS").is_err() {
             return;
@@ -25351,6 +25415,50 @@ impl Simulator {
         }
         self.comb_dep_offsets = dep_offsets;
         self.comb_dep_entries = dep_entries;
+        // Co-activation census setup: predecessor CSR (entry -> writer
+        // entries of its read signals, capped at 16 preds/entry). Built here
+        // so it reflects the FINAL entry order, learning from the topo-
+        // reorder dep-index bug.
+        self.coact_enabled = std::env::var("XEZIM_COACT_CENSUS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if self.coact_enabled {
+            let n = entries.len();
+            let mut writer_of: HashMap<usize, Vec<u32>> = HashMap::default();
+            for (e, ent) in entries.iter().enumerate() {
+                for &w in &ent.cold.write_signal_ids {
+                    let v = writer_of.entry(w).or_default();
+                    if v.len() < 4 {
+                        v.push(e as u32);
+                    }
+                }
+            }
+            let mut off: Vec<u32> = Vec::with_capacity(n + 1);
+            let mut ents: Vec<u32> = Vec::new();
+            off.push(0);
+            for (e, ent) in entries.iter().enumerate() {
+                let start = ents.len();
+                'reads: for &r in &ent.cold.read_signal_ids {
+                    if let Some(ws) = writer_of.get(&r) {
+                        for &w in ws {
+                            if w as usize != e
+                                && !ents[start..].contains(&w)
+                            {
+                                ents.push(w);
+                                if ents.len() - start >= 16 {
+                                    break 'reads;
+                                }
+                            }
+                        }
+                    }
+                }
+                off.push(ents.len() as u32);
+            }
+            self.coact_edge_count = vec![0; ents.len()];
+            self.coact_pred_off = off;
+            self.coact_pred_ent = ents;
+            self.coact_epoch = vec![u64::MAX; n];
+        }
         if std::env::var("XEZIM_DEP_STATS").is_ok() {
             let mut nonzero = 0usize;
             let mut max_fanout = 0usize;
@@ -30904,6 +31012,7 @@ impl Simulator {
         self.dump_template_census();
         self.dump_island_census();
         self.dump_chain_census();
+        self.dump_coact_census();
         eprintln!("[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
             self.prof_edge_detect as f64/1e6, self.prof_edge_exec as f64/1e6, self.prof_edges_fired,
             self.prof_insns_executed,
@@ -41712,6 +41821,21 @@ impl Simulator {
                 let dirty_before = self.dirty_list.len();
 
                 n_evals += 1;
+                // Co-activation stamp: count, per predecessor edge, how often
+                // this entry evaluates in the same TIME SLOT as that
+                // predecessor. Opt-in; ~4 loads per eval when enabled.
+                if self.coact_enabled {
+                    let now = self.time;
+                    let lo = self.coact_pred_off[eidx] as usize;
+                    let hi = self.coact_pred_off[eidx + 1] as usize;
+                    for k in lo..hi {
+                        let p = self.coact_pred_ent[k] as usize;
+                        if self.coact_epoch[p] == now {
+                            self.coact_edge_count[k] += 1;
+                        }
+                    }
+                    self.coact_epoch[eidx] = now;
+                }
                 // Which CombItem shapes actually dominate evaluation — the
                 // number that says whether to attack the interpreter or the
                 // worklist. Gated: `profile_timing` is already an opt-in slow
