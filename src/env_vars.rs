@@ -35,6 +35,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_CASEJUMP_OFF", "CaseJump: disable case jump-table dispatch (fall back to chained compares)"),
     ("XEZIM_CASEJUMP_TRACE", "CaseJump: trace which case statements lower to jump tables"),
     ("XEZIM_CAST_DBG", "Debug: trace $cast / type-cast evaluation"),
+    ("XEZIM_CHAIN_CENSUS", "Phase 2: size the single-fanout chain clustering opportunity (count, lengths, dynamic coverage)"),
     ("XEZIM_CLKTREE_PROBE", "Clock tree: print the detected clock-tree roots and gating structure"),
     ("XEZIM_CLKTREE_STATS", "Clock tree: print dedup statistics for derived clock signals"),
     ("XEZIM_COMB_PATHS", "Profiling: count settle path (two-state/JIT/interp) per comb entry; ranked dump at end"),
