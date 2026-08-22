@@ -76613,7 +76613,16 @@ impl Simulator {
         let inst = self.heap.get(handle)?.as_ref()?;
         // Class value parameters are instance properties (§8.25), so they can
         // size the range; fall back to module scope for everything else.
-        let mut params: HashMap<String, Value> = self.module.parameters.clone();
+        //
+        // Collect only the OVERRIDES here. Cloning `module.parameters` up
+        // front cost a full HashMap clone on every call — including on the
+        // several early-return paths below, which never look at a parameter
+        // at all. On the axi4 UVM AVIP this one clone was the largest named
+        // contributor to both the allocator and `memmove`. The map is now
+        // materialised only if a packed dimension actually needs
+        // const-evaluating, and is BORROWED outright when the class chain
+        // contributes no overrides (the common case).
+        let mut param_overrides: Vec<(String, Value)> = Vec::new();
         let mut cur = Some(inst.class_name.clone());
         let mut seen: HashSet<String> = HashSet::default();
         let mut decl: Option<&crate::ast::types::DataType> = None;
@@ -76639,7 +76648,7 @@ impl Simulator {
             }
             for (pname, _) in &cd.param_defaults {
                 if let Some(v) = inst.properties.get(pname) {
-                    params.insert(pname.clone(), v.clone());
+                    param_overrides.push((pname.clone(), v.clone()));
                 }
             }
             if let Some(dt) = cd.property_types.get(prop) {
@@ -76663,13 +76672,26 @@ impl Simulator {
         if dims.is_empty() {
             return None;
         }
+        // Only now is a parameter scope needed.
+        let params: std::borrow::Cow<'_, HashMap<String, Value>> = if param_overrides.is_empty() {
+            std::borrow::Cow::Borrowed(&self.module.parameters)
+        } else {
+            let mut m = self.module.parameters.clone();
+            // Leaf class first (§8.25): the walk pushed leaf overrides before
+            // ancestors, and the original merge let a LATER (ancestor) insert
+            // win, so replay in the same order.
+            for (k, v) in &param_overrides {
+                m.insert(k.clone(), v.clone());
+            }
+            std::borrow::Cow::Owned(m)
+        };
         let bounds = |d: &PackedDimension| -> Option<(i64, i64)> {
             let PackedDimension::Range { left, right, .. } = d else {
                 return None;
             };
             Some((
-                crate::elaborate::const_eval_i64_with_params(left, Some(&params))?,
-                crate::elaborate::const_eval_i64_with_params(right, Some(&params))?,
+                crate::elaborate::const_eval_i64_with_params(left, Some(&*params))?,
+                crate::elaborate::const_eval_i64_with_params(right, Some(&*params))?,
             ))
         };
         let (left, right) = bounds(&dims[0])?;
