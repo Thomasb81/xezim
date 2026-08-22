@@ -69355,13 +69355,8 @@ impl Simulator {
     /// the `name->id` index), so a nested assoc element (stored as
     /// `base[k1][k2]...`) is visible.
     fn signal_name_prefix_present(&self, prefix: &str) -> bool {
-        self.signals
-            .keys()
-            .any(|k| k.starts_with(prefix))
-            || self
-                .signal_name_to_id
-                .keys()
-                .any(|k| k.starts_with(prefix))
+        self.signals.keys().any(|k| k.starts_with(prefix))
+            || !self.assoc_static_keys(prefix).is_empty()
     }
 
     /// Resolve a `TypeName` (possibly a scoped/class-local typedef alias) to the
@@ -70088,6 +70083,35 @@ impl Simulator {
     /// (`arr[k1][k2]`). Returned sorted (numeric keys ascending by value,
     /// else lexicographic) to match the LRM's first/next/last/prev order and
     /// `num()`'s count of distinct keys.
+    /// `signal_name_to_id` keys under `prefix`, memoized.
+    ///
+    /// That map is written only while the signal table is built and during
+    /// `collapse_identity_port_nets` — both elaboration-time — so its keys
+    /// under a given prefix are FIXED for the run. Three hot paths used to
+    /// re-scan the WHOLE map (`starts_with` per key) on every call:
+    /// `assoc_top_level_keys`, assoc `size()`/`len()`, and
+    /// `signal_name_prefix_present`. On the axi4 UVM AVIP that scanning was
+    /// the single largest source of `memcmp` in the run.
+    ///
+    /// Callers that also need the LIVE half must still consult
+    /// `self.signals` (which mutates at runtime) separately.
+    fn assoc_static_keys(&self, prefix: &str) -> Arc<Vec<Arc<str>>> {
+        if let Some(v) = self.assoc_static_keys_cache.borrow().get(prefix) {
+            return Arc::clone(v);
+        }
+        let v: Arc<Vec<Arc<str>>> = Arc::new(
+            self.signal_name_to_id
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect(),
+        );
+        self.assoc_static_keys_cache
+            .borrow_mut()
+            .insert(prefix.to_string(), Arc::clone(&v));
+        v
+    }
+
     fn assoc_top_level_keys(&self, obj_name: &str) -> Vec<String> {
         let prefix = format!("{}[", obj_name);
         // A STRUCT element stores member-wise leaves (`sa[k].id`), which do
@@ -70108,22 +70132,7 @@ impl Simulator {
         // The `signal_name_to_id` half of this enumeration is fixed for the
         // run (see `assoc_static_keys_cache`), so scan it once per prefix
         // instead of on every call.
-        let static_keys = {
-            let mut cache = self.assoc_static_keys_cache.borrow_mut();
-            if let Some(v) = cache.get(prefix.as_str()) {
-                Arc::clone(v)
-            } else {
-                let v: Arc<Vec<Arc<str>>> = Arc::new(
-                    self.signal_name_to_id
-                        .keys()
-                        .filter(|k| k.starts_with(prefix.as_str()))
-                        .cloned()
-                        .collect(),
-                );
-                cache.insert(prefix.clone(), Arc::clone(&v));
-                v
-            }
-        };
+        let static_keys = self.assoc_static_keys(&prefix);
         let mut keys: Vec<String> = idx_keys
             .iter()
             .map(|k| k.as_str())
@@ -80385,11 +80394,7 @@ impl Simulator {
             if self.is_associative_array(obj_name) {
                 let prefix = format!("{}[", obj_name);
                 let c1 = self.signals.keys_with_elem_prefix(&prefix).len();
-                let c2 = self
-                    .signal_name_to_id
-                    .keys()
-                    .filter(|k| k.starts_with(&prefix))
-                    .count();
+                let c2 = self.assoc_static_keys(&prefix).len();
                 return Some(Value::from_u64((c1 + c2) as u64, 32));
             }
             if let Some(v) = self.signals.get(&format!("{}.size", obj_name)) {
