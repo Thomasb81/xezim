@@ -17431,6 +17431,147 @@ impl Simulator {
         );
     }
 
+    /// Phase-2 census (`XEZIM_CHAIN_CENSUS=1`): size the single-fanout
+    /// chain opportunity. A chain link is a comb entry ALL of whose written
+    /// signals are read by exactly one entry (the next link) — the whole
+    /// chain co-activates by construction, so fusing it into one compiled
+    /// body has zero recompute waste at ANY activity factor (the defect
+    /// that killed region fusion, twice). Weighted by dynamic eval counts
+    /// when `XEZIM_COMB_PATHS`/profiling counters are populated.
+    fn dump_chain_census(&self) {
+        if std::env::var("XEZIM_CHAIN_CENSUS").is_err() {
+            return;
+        }
+        let n = self.comb_entries.len();
+        let num_signals = self.signal_table.len();
+        // reader count per signal from the dep CSR; the unique reader when
+        // count == 1.
+        let dep_off = &self.comb_dep_offsets;
+        let dep_ent = &self.comb_dep_entries;
+        let reader_of = |sig: usize| -> Option<usize> {
+            if sig + 1 >= dep_off.len() {
+                return None;
+            }
+            let lo = dep_off[sig] as usize;
+            let hi = dep_off[sig + 1] as usize;
+            if hi - lo == 1 {
+                Some(dep_ent[lo] as usize)
+            } else {
+                None
+            }
+        };
+        // next[e] = the single successor entry when EVERY signal e writes is
+        // read by exactly that one entry (and nothing else). pred-count to
+        // find chain heads.
+        let mut next: Vec<u32> = vec![u32::MAX; n];
+        let mut npred: Vec<u32> = vec![0; n];
+        for (e, ent) in self.comb_entries.iter().enumerate() {
+            if ent.cold.write_signal_ids.is_empty() {
+                continue;
+            }
+            let mut succ: Option<usize> = None;
+            let mut ok = true;
+            for &w in &ent.cold.write_signal_ids {
+                if w >= num_signals {
+                    ok = false;
+                    break;
+                }
+                match (reader_of(w), succ) {
+                    (Some(r), None) if r != e => succ = Some(r),
+                    (Some(r), Some(p)) if r == p => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                if let Some(r) = succ {
+                    next[e] = r as u32;
+                    npred[r] += 1;
+                }
+            }
+        }
+        // Walk chains from heads (a linked entry whose predecessor count via
+        // `next` is 0 or ambiguous). Only single-pred nodes extend a chain.
+        let mut in_chain: Vec<bool> = vec![false; n];
+        let mut lens: Vec<usize> = Vec::new();
+        let mut linked = 0usize;
+        for e in 0..n {
+            if next[e] != u32::MAX {
+                linked += 1;
+            }
+        }
+        for e in 0..n {
+            if next[e] == u32::MAX || in_chain[e] {
+                continue;
+            }
+            // head: nobody chains INTO e, or the predecessor is shared
+            if npred[e] == 1 {
+                continue; // interior; will be covered from its head
+            }
+            let mut len = 0usize;
+            let mut cur = e;
+            while cur < n && next[cur] != u32::MAX && !in_chain[cur] {
+                in_chain[cur] = true;
+                len += 1;
+                let nx = next[cur] as usize;
+                if npred[nx] != 1 {
+                    break; // next node has other chain-predecessors
+                }
+                cur = nx;
+            }
+            if len >= 2 {
+                lens.push(len);
+            }
+        }
+        let covered: usize = lens.iter().sum();
+        let mut hist = [0usize; 6]; // 2-3, 4-7, 8-15, 16-31, 32-63, 64+
+        for &l in &lens {
+            let b = match l {
+                0..=3 => 0,
+                4..=7 => 1,
+                8..=15 => 2,
+                16..=31 => 3,
+                32..=63 => 4,
+                _ => 5,
+            };
+            hist[b] += 1;
+        }
+        // Dynamic coverage when eval counters exist.
+        let dyn_cov = if self.prof_entry_counts.len() == n {
+            let tot: u64 = self.prof_entry_counts.iter().sum();
+            let cov: u64 = (0..n)
+                .filter(|&e| in_chain[e])
+                .map(|e| self.prof_entry_counts[e])
+                .sum();
+            Some((cov, tot))
+        } else {
+            None
+        };
+        eprintln!(
+            "[CHAIN] entries={} single-successor-linked={} in-chains(len>=2)={} ({:.1}%) chains={}",
+            n,
+            linked,
+            covered,
+            100.0 * covered as f64 / n.max(1) as f64,
+            lens.len()
+        );
+        eprintln!(
+            "[CHAIN] length histogram 2-3:{} 4-7:{} 8-15:{} 16-31:{} 32-63:{} 64+:{} max={}",
+            hist[0], hist[1], hist[2], hist[3], hist[4], hist[5],
+            lens.iter().max().copied().unwrap_or(0)
+        );
+        if let Some((cov, tot)) = dyn_cov {
+            eprintln!(
+                "[CHAIN] dynamic eval coverage: {} of {} ({:.1}%)",
+                cov,
+                tot,
+                100.0 * cov as f64 / tot.max(1) as f64
+            );
+        }
+    }
+
     fn dump_template_census(&self) {
         if std::env::var("XEZIM_TEMPLATE_CENSUS").is_err() {
             return;
@@ -30762,6 +30903,7 @@ impl Simulator {
         self.dump_comb_paths();
         self.dump_template_census();
         self.dump_island_census();
+        self.dump_chain_census();
         eprintln!("[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
             self.prof_edge_detect as f64/1e6, self.prof_edge_exec as f64/1e6, self.prof_edges_fired,
             self.prof_insns_executed,
