@@ -289,6 +289,34 @@ pub fn gen_block_fn_mapped(
         s: vec![false; num_regs as usize],
     };
     let n = insns.len();
+    // `+:` part-select width recovery: the bytecode compiler lowers
+    // `base[l +: K]` to `BinOpConst(h, l, Add, K-1)` immediately followed by
+    // `RangeSelect(d, base, h, l)` — h == l + (K-1) always holds at runtime,
+    // so d's width is statically K even though both bounds are dynamic.
+    // Without this the select leaves width 0 and every downstream
+    // const-select on d bails the whole block out of AOT (the c906 GPR
+    // write decoders — ~20M interp evals — died exactly here).
+    let rsel_w: std::collections::HashMap<usize, (u16, u32)> = insns
+        .windows(2)
+        .enumerate()
+        .filter_map(|(j, pair)| {
+            let Insn::BinOpConst(h2, l2, k, super::bytecode::BinOpConstKind::Add) = &pair[0]
+            else {
+                return None;
+            };
+            let Insn::RangeSelect(d, _, h, l) = &pair[1] else {
+                return None;
+            };
+            if h2 != h || l2 != l || k.is_fill || k.is_real || k.width > 64 {
+                return None;
+            }
+            let (kv, kx) = k.raw_bits();
+            if kx != 0 || kv >= 64 {
+                return None;
+            }
+            Some((j + 1, (*d, kv as u32 + 1)))
+        })
+        .collect();
     // Leaders (same scan as the cranelift CFG construction).
     let mut is_leader = vec![false; n.max(1)];
     is_leader[0] = true;
@@ -342,13 +370,32 @@ pub fn gen_block_fn_mapped(
             }
             let _ = writeln!(w, "{i} => {{");
         }
-        emit_insn_rust(w, &mut tables, &mut ntab, insn, i, n, &meta, sig_w, sig_signed, sigmap)?;
+        if emit_insn_rust(w, &mut tables, &mut ntab, insn, i, n, &meta, sig_w, sig_signed, sigmap)
+            .is_none()
+        {
+            if std::env::var("XEZIM_JIT_VERBOSE").is_ok() {
+                eprintln!(
+                    "[AOT-GEN-BAIL] insn[{i}] {} :: {:?}",
+                    super::bytecode::insn_opcode_name(insn),
+                    insn
+                );
+                if std::env::var("XEZIM_JIT_VERBOSE").as_deref() == Ok("2") {
+                    for (k, ins) in insns.iter().enumerate() {
+                        eprintln!("[AOT-GEN-BAIL]   [{k}]{} {:?}", if k == i { "*" } else { " " }, ins);
+                    }
+                }
+            }
+            return None;
+        }
         // Post-op width mask (mirror of the codegen masking pass).
         if let Some((d, mw)) = super::jit::insn_result_width(insn, &meta.w, sig_w) {
             let m = (1u64 << mw) - 1;
             let _ = writeln!(w, "r{d}v &= {m:#x}; r{d}x &= {m:#x};");
         }
         super::jit::update_reg_meta(insn, &mut meta.w, &mut meta.s, sig_w, sig_signed);
+        if let Some(&(d, wid)) = rsel_w.get(&i) {
+            meta.w[d as usize] = wid;
+        }
     }
     if !single_block {
         let _ = writeln!(w, "return 0; }}");
@@ -851,10 +898,11 @@ fn emit_insn_rust(
             let lsb = (*l_imm).min(*r_imm);
             let msb = (*l_imm).max(*r_imm);
             let resw = msb - lsb + 1;
-            if resw >= 64 {
+            // resw == 64 fits a u64 exactly; only wider selects bail.
+            if resw > 64 {
                 return None;
             }
-            let resm: u64 = (1u64 << resw) - 1;
+            let resm: u64 = if resw >= 64 { u64::MAX } else { (1u64 << resw) - 1 };
             let oor: u64 = if lsb >= bw {
                 resm
             } else if msb >= bw {
@@ -893,7 +941,9 @@ fn emit_insn_rust(
             let lo = (*left).min(*right);
             let hi = (*left).max(*right);
             let wid = left.abs_diff(*right) + 1;
-            if wid >= 64 {
+            // wid == 64 fits a u64 exactly (a c906 [127:64] slice); only
+            // wider slices need multi-word moves the register file lacks.
+            if wid > 64 {
                 return None;
             }
             // A select reaching past bit 63 lives on a WIDE signal — the
@@ -903,15 +953,15 @@ fn emit_insn_rust(
             // are X-marked with the same keep/oor masks as the narrow arm.
             if hi >= 64 {
                 let sw = sig_sw;
+                let full: u64 = if wid >= 64 { u64::MAX } else { (1u64 << wid) - 1 };
                 let oor: u64 = if sw > 0 && lo >= sw {
-                    (1u64 << wid) - 1
+                    full
                 } else if sw > 0 && hi >= sw {
-                    let full = (1u64 << wid) - 1;
                     (full >> (sw - lo)) << (sw - lo)
                 } else {
                     0
                 };
-                let keep = ((1u64 << wid) - 1) & !oor;
+                let keep = full & !oor;
                 let _ = writeln!(
                     w,
                     "r{dest}v = (br().load_slice)(sim, {sig}, {lo}, {wid}) & {keep:#x}; r{dest}x = ((br().load_slice_xz)(sim, {sig}, {lo}, {wid}) & {keep:#x}) | {oor:#x};"
@@ -919,15 +969,15 @@ fn emit_insn_rust(
                 return Some(());
             }
             let sw = sig_sw;
+            let full: u64 = if wid >= 64 { u64::MAX } else { (1u64 << wid) - 1 };
             let oor: u64 = if sw > 0 && lo >= sw {
-                (1u64 << wid) - 1
+                full
             } else if sw > 0 && hi >= sw {
-                let full = (1u64 << wid) - 1;
                 (full >> (sw - lo)) << (sw - lo)
             } else {
                 0
             };
-            let keep = ((1u64 << wid) - 1) & !oor;
+            let keep = full & !oor;
             let _ = writeln!(
                 w,
                 "let t = ld(sim, {sig}); r{dest}v = (t.0 >> {lo}) & {keep:#x}; r{dest}x = ((t.1 >> {lo}) & {keep:#x}) | {oor:#x};"

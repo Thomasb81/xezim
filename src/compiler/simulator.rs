@@ -709,6 +709,15 @@ enum CombItem {
     FusedGate {
         op: FusedGate,
     },
+    /// A coact-clustered batch of fused gates executed in one worklist
+    /// dispatch, in topological member order, through the SAME per-gate
+    /// evaluator as `FusedGate` — zero semantic novelty, machinery amortized
+    /// over the batch. Formed by the region pass (class 3) from
+    /// profile-measured co-activation edges. c906: gates are 49.3% of all
+    /// comb evals and were untouched by bytecode fusion.
+    GateRegion {
+        gates: Box<[FusedGate]>,
+    },
     /// IEEE 1800-2017 §29 User-Defined Primitive instance. Evaluated by
     /// `eval_udp(idx)` against `self.udp_runtime[idx]` (truth table + per-
     /// instance sequential state). Always evaluated on the serial settle path.
@@ -3993,6 +4002,15 @@ pub struct Simulator {
     /// needs `name_resolve_hint` to be set for AST-exec). When false, the
     /// save/restore clone of the RefCell string can be skipped.
     edge_block_needs_hint: Vec<bool>,
+    /// Per edge block: no fallback, no `Format`, compiled — the block can
+    /// neither resolve a bare name nor print `%m`, so the per-firing scope
+    /// bookkeeping in `exec_bytecode` (a String clone into
+    /// `name_resolve_hint` + the `%m` buffer refresh) is skipped. At ~580
+    /// fired blocks/tick the clone alone was allocator-visible in perf.
+    edge_block_light: Vec<bool>,
+    /// Flat copy of each compiled edge block's instruction count so the hot
+    /// dispatch loop doesn't chase the `Option<CompiledBlock>` header.
+    edge_block_insn_len: Vec<u32>,
     /// VM register file (reusable across executions to avoid allocation).
     vm_regs: Vec<Value>,
     /// Built-in clock generators (optimized always #N clk = ~clk)
@@ -7441,6 +7459,8 @@ impl Simulator {
                 == Some("1"),
             edge_block_scope: Vec::new(),
             edge_block_needs_hint: Vec::new(),
+            edge_block_light: Vec::new(),
+            edge_block_insn_len: Vec::new(),
             vm_regs: Vec::new(),
             clock_generators: Vec::new(),
             fast_delay_always: HashMap::default(),
@@ -12584,7 +12604,10 @@ impl Simulator {
                 // AST entries always need &mut self.
                 CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {}
                 // §29 UDPs mutate per-instance state — never parallel-safe.
-                CombItem::Udp { .. } | CombItem::UdpBatch { .. } => {}
+                // GateRegion: serial-only in v1 (no isolated batch arm yet).
+                CombItem::Udp { .. }
+                | CombItem::UdpBatch { .. }
+                | CombItem::GateRegion { .. } => {}
             }
             if e.has_unresolved_reads {
                 unresolved += 1;
@@ -13232,6 +13255,8 @@ impl Simulator {
             // §29 UDPs are never evaluated on this isolated (parallel) path —
             // `has_udp` forces the serial settle. Present only for exhaustiveness.
             CombItem::Udp { .. } | CombItem::UdpBatch { .. } => true,
+            // Serial-only in v1: fall back to the full-simulator path.
+            CombItem::GateRegion { .. } => false,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 // LRM §9.3.1: skip if the destination is forced
                 if self.forced_signals.is_empty() || !self.forced_signals.contains_key(dst_id) {
@@ -13396,6 +13421,7 @@ impl Simulator {
             CombItem::Noop => true,
             // §29 UDPs never run on this isolated path (serial forced).
             CombItem::Udp { .. } | CombItem::UdpBatch { .. } => true,
+            CombItem::GateRegion { .. } => false,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 let (mut sv, mut sx) = view[*src_id].raw_bits();
                 // §6.11.1/§10.7: a 2-state destination drops X/Z (X/Z -> 0).
@@ -14431,6 +14457,8 @@ impl Simulator {
                 // §29 UDPs disable parallel settle (has_udp forces serial), so a
                 // UDP never reaches a worker; represent it inertly here.
                 CombItem::Udp { .. } | CombItem::UdpBatch { .. } => SendCombItem::Noop,
+                // Not par-safe (see extract ctx safety list); never partitioned.
+                CombItem::GateRegion { .. } => SendCombItem::Noop,
                 CombItem::FastDirectCopy { dst_id, src_id } => SendCombItem::FastDirectCopy {
                     dst_id: *dst_id,
                     src_id: *src_id,
@@ -17500,6 +17528,31 @@ impl Simulator {
             pct(bucket_evals[3] + bucket_evals[4]),
             pct(bucket_evals[2] + bucket_evals[3] + bucket_evals[4])
         );
+        // PGO handoff: dump per-edge ratios so a later run can drive region
+        // fusion from measured co-activation instead of blind adjacency.
+        if let Ok(path) = std::env::var("XEZIM_COACT_FILE") {
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            let _ = writeln!(out, "entries {n}");
+            for e in 0..n {
+                let evals = self.prof_entry_counts.get(e).copied().unwrap_or(0);
+                if evals == 0 {
+                    continue;
+                }
+                let lo = self.coact_pred_off[e] as usize;
+                let hi = self.coact_pred_off[e + 1] as usize;
+                for k in lo..hi {
+                    let r = self.coact_edge_count[k] as f64 / evals as f64;
+                    if r >= 0.5 {
+                        let _ = writeln!(out, "{e} {} {:.3}", self.coact_pred_ent[k], r);
+                    }
+                }
+            }
+            match std::fs::write(&path, out) {
+                Ok(()) => eprintln!("[COACT] edge file written: {path}"),
+                Err(e) => eprintln!("[COACT] edge file write FAILED ({path}): {e}"),
+            }
+        }
     }
 
     fn dump_chain_census(&self) {
@@ -17798,8 +17851,18 @@ impl Simulator {
         }
         match &self.comb_plan[eidx] {
             CombPlan::Ts(ts) => {
-                let ts = ts.clone();
-                if self.ts_guard_and_exec(&ts) {
+                // Raw-pointer borrow instead of an Arc clone: the clone's
+                // refcount atomics were 6.75% of settle self-time post-PGO
+                // (158.9M ts evals/run). SAFETY: the Arc lives in
+                // `self.comb_plan[eidx]`, which nothing in
+                // `ts_guard_and_exec` touches — the block executes TsInsn
+                // stores into signal planes and dirty bookkeeping only; plan
+                // slots mutate exclusively in `dispatch_comb_plan` /
+                // `run_comb_jit_slot`, which run strictly after this call
+                // returns. The pointee is heap-stable under any Vec resize.
+                let ts_ptr: *const super::bytecode::TwoStateBlock =
+                    std::sync::Arc::as_ptr(ts);
+                if self.ts_guard_and_exec(unsafe { &*ts_ptr }) {
                     if self.trace_comb_paths {
                         self.note_comb_path(eidx, 0);
                     }
@@ -18098,7 +18161,12 @@ impl Simulator {
             return false;
         }
         for &sig in ts.reads_whole.iter() {
-            let (_, x) = self.signal_table[sig as usize].raw_bits();
+            // Plane-direct xz word (fallback to raw_bits when the mirror is
+            // absent, i.e. non-JIT runs).
+            let x = match self.signal_inline_bits.get(sig as usize) {
+                Some(sl) => sl[1],
+                None => self.signal_table[sig as usize].raw_bits().1,
+            };
             if x != 0 {
                 self.prof_ts_bail_xread += 1;
                 return false;
@@ -18210,16 +18278,29 @@ impl Simulator {
         while pc < insns_len {
             match unsafe { &*insns_ptr.add(pc) } {
                 TsInsn::LoadSig { d, sig } => {
-                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    // Plane-direct: one flat load vs the Value discriminant
+                    // branch (raw_bits showed at 5% of settle post-PGO).
+                    // The mirror is authoritative in JIT runs and absent in
+                    // non-JIT runs (fall back).
+                    let v = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => sl[0],
+                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    };
                     regs[*d as usize] = v;
                 }
                 TsInsn::Const { d, v } => regs[*d as usize] = *v,
                 TsInsn::SigBit { d, sig, bit } => {
-                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    let v = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => sl[0],
+                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    };
                     regs[*d as usize] = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
-                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    let v = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => sl[0],
+                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    };
                     regs[*d as usize] = (v >> lo) & mask;
                 }
                 TsInsn::SigBitW { d, sig, bit } => {
@@ -18555,16 +18636,29 @@ impl Simulator {
         for insn in &ts.insns {
             match insn {
                 TsInsn::LoadSig { d, sig } => {
-                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    // Plane-direct: one flat load vs the Value discriminant
+                    // branch (raw_bits showed at 5% of settle post-PGO).
+                    // The mirror is authoritative in JIT runs and absent in
+                    // non-JIT runs (fall back).
+                    let v = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => sl[0],
+                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    };
                     regs[*d as usize] = v;
                 }
                 TsInsn::Const { d, v } => regs[*d as usize] = *v,
                 TsInsn::SigBit { d, sig, bit } => {
-                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    let v = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => sl[0],
+                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    };
                     regs[*d as usize] = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
-                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    let v = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => sl[0],
+                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    };
                     regs[*d as usize] = (v >> lo) & mask;
                 }
                 TsInsn::SigBitW { d, sig, bit } => {
@@ -18827,16 +18921,29 @@ impl Simulator {
         while pc < insns_len {
             match unsafe { &*insns_ptr.add(pc) } {
                 TsInsn::LoadSig { d, sig } => {
-                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    // Plane-direct: one flat load vs the Value discriminant
+                    // branch (raw_bits showed at 5% of settle post-PGO).
+                    // The mirror is authoritative in JIT runs and absent in
+                    // non-JIT runs (fall back).
+                    let v = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => sl[0],
+                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    };
                     regs[*d as usize] = v;
                 }
                 TsInsn::Const { d, v } => regs[*d as usize] = *v,
                 TsInsn::SigBit { d, sig, bit } => {
-                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    let v = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => sl[0],
+                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    };
                     regs[*d as usize] = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
-                    let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                    let v = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => sl[0],
+                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    };
                     regs[*d as usize] = (v >> lo) & mask;
                 }
                 TsInsn::SigBitW { d, sig, bit } => {
@@ -19677,6 +19784,8 @@ impl Simulator {
         self.edge_block_parallel.clear();
         self.edge_block_scope.clear();
         self.edge_block_needs_hint.clear();
+        self.edge_block_light.clear();
+        self.edge_block_insn_len.clear();
 
         // Single-writer NBA map: count how many edge blocks NBA-write each
         // signal. A static-range/bit NBA block (NbaAssignRange/NbaAssignBitDyn)
@@ -19799,6 +19908,15 @@ impl Simulator {
             // Non-compiled blocks (AST-only) always need hint.
             self.edge_block_needs_hint
                 .push(has_fallback || cb.is_none());
+            let has_format = cb.as_ref().is_some_and(|cb| {
+                cb.instructions
+                    .iter()
+                    .any(|insn| matches!(insn, super::bytecode::Insn::Format(..)))
+            });
+            self.edge_block_light
+                .push(!has_fallback && !has_format && cb.is_some());
+            self.edge_block_insn_len
+                .push(cb.as_ref().map(|cb| cb.instructions.len() as u32).unwrap_or(0));
             // Prefer the block's own inlining scope (see compile_edge_blocks).
             let scope = self.edge_blocks.get(idx).and_then(|b| {
                 if !b.scope.is_empty() {
@@ -21375,31 +21493,41 @@ impl Simulator {
         if self.trace_always.is_some() {
             self.exec_bytecode_trace(block_idx);
         }
-        // Record the firing block's instance scope for `%m`. This is the
-        // hottest path in an RTL run, so it is a short-string compare that
-        // usually falls through; only a genuine scope CHANGE touches the
-        // buffer, and then `take`/put-back reuses the existing allocation
-        // (the borrow checker needs the buffer out of `self` to copy into it).
-        let scope_id = self
-            .edge_block_scope_id
+        // Scope bookkeeping (`%m` buffer + `name_resolve_hint`) only matters
+        // to blocks that can print `%m` or resolve a bare name — fallbacks
+        // and `Format` insns. A "light" block (the overwhelming majority in
+        // an RTL run) skips both; the hint clone in particular was a String
+        // allocation on EVERY firing (~580 blocks/tick on c906).
+        let light = self
+            .edge_block_light
             .get(block_idx)
             .copied()
-            .unwrap_or(u32::MAX);
-        if self.m_block_scope_id != scope_id {
-            let mut mbs = std::mem::take(&mut self.m_block_scope);
-            mbs.clear();
-            mbs.push_str(&self.edge_blocks[block_idx].scope);
-            self.m_block_scope = mbs;
-            self.m_block_scope_id = scope_id;
-        }
-        // `name_resolve_hint` is a ratchet every resolution advances; without
-        // a reset here, a fallback stmt in THIS block resolves bare names
-        // under whatever scope the previous block or process left behind — a
-        // TOP-module `$display(d)` after a sub-instance block read the
-        // instance's same-named port copy. Install this block's own scope
-        // (None for a top block) so intra-block ratcheting still works but
-        // nothing leaks across blocks.
-        {
+            .unwrap_or(false);
+        if !light {
+            // Record the firing block's instance scope for `%m`. Short-string
+            // compare that usually falls through; only a genuine scope CHANGE
+            // touches the buffer, and then `take`/put-back reuses the existing
+            // allocation (the borrow checker needs the buffer out of `self`
+            // to copy into it).
+            let scope_id = self
+                .edge_block_scope_id
+                .get(block_idx)
+                .copied()
+                .unwrap_or(u32::MAX);
+            if self.m_block_scope_id != scope_id {
+                let mut mbs = std::mem::take(&mut self.m_block_scope);
+                mbs.clear();
+                mbs.push_str(&self.edge_blocks[block_idx].scope);
+                self.m_block_scope = mbs;
+                self.m_block_scope_id = scope_id;
+            }
+            // `name_resolve_hint` is a ratchet every resolution advances;
+            // without a reset here, a fallback stmt in THIS block resolves
+            // bare names under whatever scope the previous block or process
+            // left behind — a TOP-module `$display(d)` after a sub-instance
+            // block read the instance's same-named port copy. Install this
+            // block's own scope (None for a top block) so intra-block
+            // ratcheting still works but nothing leaks across blocks.
             let scope = &self.edge_blocks[block_idx].scope;
             *self.name_resolve_hint.borrow_mut() = if scope.is_empty() {
                 None
@@ -21416,10 +21544,11 @@ impl Simulator {
             match rc {
                 0 => {
                     // Success — JIT executed the entire block.
-                    self.prof_insns_executed += self.compiled_edge_blocks[block_idx]
-                        .as_ref()
-                        .map(|cb| cb.instructions.len() as u64)
-                        .unwrap_or(0);
+                    self.prof_insns_executed += self
+                        .edge_block_insn_len
+                        .get(block_idx)
+                        .copied()
+                        .unwrap_or(0) as u64;
                     return true;
                 }
                 1 => {
@@ -25124,17 +25253,60 @@ impl Simulator {
             // plain-always members keeps defer_at_time0 = true.
             let mut class: Vec<Option<u8>> = Vec::with_capacity(n);
             for e in entries.iter() {
+                // A member that is not individually width-safe would poison
+                // its WHOLE fused region out of native compilation (the
+                // fused block inherits every member's signals, and the
+                // width gate is all-or-nothing). Measured on c906: without
+                // this check, fusing 6,285 members DEMOTED 4,563 entries
+                // from native to interpreted and cost 24% wall. Keep such
+                // members unfused — they stay native individually.
+                // Members must ALSO two-state-lower individually: fusing a
+                // ts-lowered member into a non-lowerable block moves it off
+                // the cheapest execution tier. Measured on c906: ts evals
+                // collapsed 158.9M -> 71.6M under fusion without this check,
+                // cancelling the eval-count win.
+                let ts_ok = |cb: &super::bytecode::CompiledBlock| -> bool {
+                    super::bytecode::lower_two_state(
+                        cb,
+                        &self.signal_widths,
+                        &self.signal_signed,
+                        &self.signal_real,
+                        &self.array_first_id,
+                    )
+                    .is_some()
+                };
                 let c = match &e.item {
                     CombItem::CompiledContAssign { compiled }
-                        if !compiled.has_fallback && insn_ok(compiled) =>
+                        if !compiled.has_fallback
+                            && insn_ok(compiled)
+                            && self.block_signals_fit_u64(compiled)
+                            && ts_ok(compiled) =>
                     {
                         Some(0u8)
                     }
                     CombItem::CompiledAlwaysBlock {
                         compiled,
                         is_always_comb,
-                    } if !compiled.has_fallback && insn_ok(compiled) => {
+                    } if !compiled.has_fallback
+                        && insn_ok(compiled)
+                        && self.block_signals_fit_u64(compiled)
+                        && ts_ok(compiled) =>
+                    {
                         Some(if *is_always_comb { 1 } else { 2 })
+                    }
+                    // 3 = fused 1-bit gate primitive. Needs none of the
+                    // compiled-block gates (insn/width/ts) — a GateRegion
+                    // executes via fused_gate_eval, never via bytecode.
+                    // Opt-in: measured net-NEGATIVE on c906 (+4-9s settle).
+                    // Gate clusters there are clock/ICG trees whose mid-chain
+                    // outputs feed external consumers at every slot position,
+                    // so any single region slot delays some consumers by one
+                    // settle pass (iters +13-50%), outweighing the dispatch
+                    // saving (gate dispatch is already the cheapest arm).
+                    CombItem::FusedGate { .. }
+                        if std::env::var("XEZIM_REGION_GATES").is_ok_and(|v| v == "1") =>
+                    {
+                        Some(3u8)
                     }
                     _ => None,
                 };
@@ -25147,6 +25319,51 @@ impl Simulator {
                         .all(|w| writer_count.get(w).copied().unwrap_or(0) == 1);
                 class.push(if ok { c } else { None });
             }
+            // PGO: when XEZIM_COACT_FILE names an edge file from a census
+            // run of the SAME design/binary (entry count must match), only
+            // merge along edges whose measured same-slot co-activation ratio
+            // clears XEZIM_COACT_MIN (default 0.9). This bounds the fused
+            // region's recompute waste — the defect that made blind fusion
+            // net-negative twice.
+            let coact_min: f64 = std::env::var("XEZIM_COACT_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.9);
+            let coact_edges: Option<std::collections::HashSet<(u32, u32)>> =
+                std::env::var("XEZIM_COACT_FILE").ok().and_then(|path| {
+                    let text = std::fs::read_to_string(&path).ok()?;
+                    let mut lines = text.lines();
+                    let head = lines.next()?;
+                    let file_n: usize = head.strip_prefix("entries ")?.parse().ok()?;
+                    if file_n != n {
+                        eprintln!(
+                            "[REGIONS] coact file entry count {file_n} != {n}; ignoring file"
+                        );
+                        return None;
+                    }
+                    let mut set = std::collections::HashSet::new();
+                    for l in lines {
+                        let mut it = l.split_whitespace();
+                        let (Some(e), Some(p), Some(r)) = (it.next(), it.next(), it.next())
+                        else {
+                            continue;
+                        };
+                        let (Ok(e), Ok(p), Ok(r)) =
+                            (e.parse::<u32>(), p.parse::<u32>(), r.parse::<f64>())
+                        else {
+                            continue;
+                        };
+                        if r >= coact_min {
+                            set.insert((e, p));
+                        }
+                    }
+                    eprintln!(
+                        "[REGIONS] coact-gated fusion: {} qualifying edges (min ratio {})",
+                        set.len(),
+                        coact_min
+                    );
+                    Some(set)
+                });
             let mut producer: HashMap<usize, usize> = HashMap::default();
             for (i, e) in entries.iter().enumerate() {
                 if class[i].is_some() {
@@ -25174,6 +25391,12 @@ impl Simulator {
                     .iter()
                     .filter_map(|r| producer.get(r).copied())
                     .filter(|&p| p != i && class[p] == class[i])
+                    .filter(|&p| {
+                        coact_edges
+                            .as_ref()
+                            .map(|set| set.contains(&(i as u32, p as u32)))
+                            .unwrap_or(true)
+                    })
                     .collect();
                 for p in links {
                     let (a, b) = (rfind(&mut uf, i), rfind(&mut uf, p));
@@ -25264,6 +25487,9 @@ impl Simulator {
                     // scheduling position (same-pass cascade is idx-ordered)
                     // is never later than any member's was; the BODY executes
                     // members in topo order regardless of slot choice.
+                    // (Max-slot was tried: it delays every external consumer
+                    // sitting between min and max member by one settle pass —
+                    // measured settle 168.1s vs 165.0s on c906 it1.)
                     let head = chunk.iter().copied().min().unwrap();
                     // RegId is u16: renumbering offsets member registers by a
                     // running base, so the fused total must stay in range.
@@ -25315,6 +25541,35 @@ impl Simulator {
                                 region_writes.push(w);
                             }
                         }
+                    }
+                    if class[chunk[0]] == Some(3) {
+                        // Gate cluster: one worklist entry executing the
+                        // member gates in topo (chunk) order via the same
+                        // per-gate evaluator. Same head/Noop slot layout and
+                        // link-dropped sensitivity as compiled regions.
+                        let gates: Vec<FusedGate> = chunk
+                            .iter()
+                            .map(|&m| match &entries[m].item {
+                                CombItem::FusedGate { op } => *op,
+                                _ => unreachable!("class 3 admits only FusedGate"),
+                            })
+                            .collect();
+                        entries[head].item = CombItem::GateRegion {
+                            gates: gates.into_boxed_slice(),
+                        };
+                        entries[head].cold.read_signal_ids = region_reads;
+                        entries[head].cold.write_signal_ids = region_writes;
+                        for &m in chunk {
+                            if m == head {
+                                continue;
+                            }
+                            entries[m].item = CombItem::Noop;
+                            entries[m].cold.read_signal_ids.clear();
+                            entries[m].cold.write_signal_ids.clear();
+                        }
+                        fused_regions += 1;
+                        fused_members += chunk.len();
+                        continue;
                     }
                     let mut fused = super::bytecode::CompiledBlock {
                         instructions: Vec::new(),
@@ -31935,6 +32190,18 @@ impl Simulator {
                             continue;
                         };
                         self.name_for_id(dst_id)
+                    }
+                    CombItem::GateRegion { gates } => {
+                        let id = match gates.first() {
+                            Some(
+                                FusedGate::Buf1 { dst, .. }
+                                | FusedGate::Bin2 { dst, .. }
+                                | FusedGate::Mux2 { dst, .. }
+                                | FusedGate::UdpLut3 { dst, .. },
+                            ) => dst.sig_id as usize,
+                            None => 0,
+                        };
+                        self.name_for_id(id)
                     }
                     CombItem::FusedGate { op } => {
                         let id = match op {
@@ -39442,10 +39709,8 @@ impl Simulator {
             let mut parallel_insn_count = 0usize;
             for &bi in &triggered {
                 if bi < self.edge_block_parallel.len() && self.edge_block_parallel[bi] {
-                    parallel_insn_count += self.compiled_edge_blocks[bi]
-                        .as_ref()
-                        .map(|cb| cb.instructions.len())
-                        .unwrap_or(0);
+                    parallel_insn_count +=
+                        self.edge_block_insn_len.get(bi).copied().unwrap_or(0) as usize;
                     parallel_blocks.push(bi);
                 } else {
                     sequential_blocks.push(bi);
@@ -41508,6 +41773,11 @@ impl Simulator {
             CombItem::FusedGate { op } => {
                 self.exec_fused_gate(op);
             }
+            CombItem::GateRegion { gates } => {
+                for op in gates.iter() {
+                    self.exec_fused_gate(op);
+                }
+            }
             CombItem::FusedBufFanout { src, dsts, invert } => {
                 self.exec_fused_buf_fanout(*src, dsts, *invert);
             }
@@ -41787,6 +42057,23 @@ impl Simulator {
             while cur_pos < cur_list.len() {
                 let eidx = cur_list[cur_pos];
                 cur_pos += 1;
+                // The entry header load is the loop's dominant stall (~19%
+                // of settle self-time: 35k 64-byte entries visited in
+                // data-dependent order). The worklist tells us the next
+                // entry one iteration ahead — prefetch it while this one
+                // evaluates.
+                #[cfg(target_arch = "x86_64")]
+                if cur_pos < cur_list.len() {
+                    let nxt = cur_list[cur_pos];
+                    if nxt < entries.len() {
+                        unsafe {
+                            core::arch::x86_64::_mm_prefetch(
+                                entries.as_ptr().add(nxt) as *const i8,
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
+                    }
+                }
                 if !triggered[eidx] {
                     continue;
                 }
@@ -42163,6 +42450,25 @@ impl Simulator {
                     // its dependents through `trigger_deps!` directly, skipping
                     // the `mark_dirty_id` -> `dirty_list` -> post-entry rescan
                     // round trip. Same reads, same writes, same trigger set.
+                    CombItem::GateRegion { gates } => {
+                        // One worklist dispatch executes the whole coact
+                        // cluster in topo member order via the SAME per-gate
+                        // evaluator; internal links are dropped from the
+                        // region's read set at formation, so their writes
+                        // trigger nothing spurious.
+                        let sdf_any = !self.sdf_delays.is_empty();
+                        for op in gates.iter() {
+                            let (dst, new_bit) = self.fused_gate_eval(op);
+                            if self.fused_bit_commit(dst, new_bit, sdf_any) {
+                                let id = dst.sig_id as usize;
+                                if capture_churn {
+                                    churn.push((id, eidx));
+                                }
+                                note_toggle!(id);
+                                trigger_deps!(id, eidx);
+                            }
+                        }
+                    }
                     CombItem::FusedGate { op } => {
                         let (dst, new_bit) = self.fused_gate_eval(op);
                         let sdf_any = !self.sdf_delays.is_empty();
@@ -64628,7 +64934,9 @@ impl Simulator {
         if self.signal_table[id].set_bit_code(dst.bit as usize, new_bit) {
             self.sync_mirror(id);
             self.table_modified = true;
-            self.after_signal_write(id);
+            // sync_mirror just refreshed the mirror — skip the repack
+            // `after_signal_write` would redo (367M commits/run on c906).
+            self.after_signal_write_premirrored(id);
             true
         } else {
             false
@@ -65163,7 +65471,8 @@ impl Simulator {
                     }
                     CombItem::FusedGate { .. }
                     | CombItem::FusedBufFanout { .. }
-                    | CombItem::FusedAndFanout { .. } => "gate primitive",
+                    | CombItem::FusedAndFanout { .. }
+                    | CombItem::GateRegion { .. } => "gate primitive",
                     CombItem::Udp { .. } | CombItem::UdpBatch { .. } => "UDP",
                     CombItem::DirectCopy { .. }
                     | CombItem::FastDirectCopy { .. }
@@ -65387,6 +65696,17 @@ impl Simulator {
     }
 
     fn after_signal_write(&mut self, id: usize) {
+        self.after_signal_write_inner(id, false)
+    }
+
+    /// `after_signal_write` for callers that have ALREADY refreshed the
+    /// `signal_inline_bits` mirror for `id` — skips the raw_bits repack
+    /// (a 64-LogicBit walk on every wide signal).
+    fn after_signal_write_premirrored(&mut self, id: usize) {
+        self.after_signal_write_inner(id, true)
+    }
+
+    fn after_signal_write_inner(&mut self, id: usize, premirrored: bool) {
         // XEZIM_VALUE_TRACE: this hook covers the write paths that mutate
         // signal_table in place (bit/part-select, inline-bits, parallel-NBA
         // raw pointers) and so never expand write_sig!. The pre-write value
@@ -65429,7 +65749,9 @@ impl Simulator {
         // wide signal write and then threw the answer away. (LLVM cannot sink
         // it itself: the mirror's length is a runtime value.) Moving the call
         // inside the guard makes the disabled case a single load+compare.
-        if id < self.signal_inline_bits.len() {
+        // Callers that already refreshed the mirror themselves use
+        // `after_signal_write_premirrored` to skip this repack.
+        if !premirrored && id < self.signal_inline_bits.len() {
             let (new_v, new_x) = self.signal_table[id].raw_bits();
             self.signal_inline_bits[id] = [new_v, new_x];
         }
@@ -65812,7 +66134,6 @@ impl Simulator {
             let sig_id = match insn {
                 Insn::LoadSignal(_, id)
                 | Insn::LoadSignalSigned(_, id)
-                | Insn::LoadSignalBit(_, id, _)
                 | Insn::NbaAssign(id, ..)
                 | Insn::NbaAssignConst(id, ..)
                 | Insn::BranchIfSignalFalse(id, _, _)
@@ -65877,20 +66198,38 @@ impl Simulator {
             let sig_id = match insn {
                 Insn::LoadSignal(_, id)
                 | Insn::LoadSignalSigned(_, id)
-                | Insn::LoadSignalBit(_, id, _)
                 | Insn::NbaAssign(id, ..)
                 | Insn::NbaAssignConst(id, ..)
                 | Insn::BranchIfSignalFalse(id, _, _)
                 | Insn::NbaAssignRangeDyn(id, ..)
-                | Insn::NbaAssignBitDyn(id, ..)
                 | Insn::BlockingAssign(id, ..)
                 | Insn::BlockingAssignRangeDyn(id, ..)
-                | Insn::BlockingAssignBitDyn(id, ..)
                 // Only the destination is checked here; the index signal this
                 // variant also reads needs no separate check because
                 // `JitModule::is_supported` rejects `NbaAssignArrayRead`
                 // outright, so a block containing one never reaches codegen.
                 | Insn::NbaAssignArrayRead(id, ..) => Some(*id),
+                // Single-bit accesses tolerate a wide signal. Reads: bits
+                // < 64 come off the inline plane's low word (maintained for
+                // ALL ids, wide included), bits >= 64 go through the slice
+                // bridge. Writes: both BitDyn forms move exactly one bit
+                // through the range/bit bridges, whose per-bit fallback
+                // handles any width (dyn RANGE writes stay gated — a runtime
+                // span over 64 bits cannot ride a u64 register).
+                // Real-typed signals stay rejected (planes are ints).
+                Insn::NbaAssignBitDyn(id, ..)
+                | Insn::BlockingAssignBitDyn(id, ..)
+                | Insn::LoadSignalBit(_, id, _) => {
+                    if self
+                        .signal_table
+                        .get(*id as usize)
+                        .map(|v| v.is_real)
+                        .unwrap_or(false)
+                    {
+                        return false;
+                    }
+                    None
+                }
                 // Dense-array element access in the JIT computes the element
                 // id arithmetically; the first element's decl stands for all,
                 // so gating on it gates the whole span.
@@ -66421,6 +66760,47 @@ impl Simulator {
                 return;
             }
         }
+        // Single-bit write to a WIDE signal (the BitDyn bridges): patch the
+        // storage bit, the mirror's low word, and the has_xz hint
+        // incrementally — the general path below costs two full raw_bits
+        // repacks plus a whole-value has_xz walk per write, which dominated
+        // the profile once wide-signal blocks went native. The hint is only
+        // ever tightened via a scan when an xz bit was actually cleared
+        // (reset transitions), so the steady state never scans.
+        if w == 1 && sig_w > 64 {
+            if low >= sig_w {
+                return;
+            }
+            let src_bit = Value::from_inline(val_bits & 1, xz_bits & 1, 1).get_bit(0);
+            let old_bit = self.signal_table[id].get_bit(low as usize);
+            if old_bit == src_bit {
+                return;
+            }
+            self.signal_table[id].set_bit(low as usize, src_bit);
+            if let Some(slot) = self.signal_inline_bits.get_mut(id) {
+                if low < 64 {
+                    let m = 1u64 << low;
+                    slot[0] = (slot[0] & !m) | ((val_bits & 1) << low);
+                    slot[1] = (slot[1] & !m) | ((xz_bits & 1) << low);
+                }
+            }
+            if let Some(hx) = self.signal_has_xz.get_mut(id) {
+                if xz_bits & 1 != 0 {
+                    *hx = 1;
+                } else if *hx != 0 {
+                    // The written bit went xz -> valid; other bits may still
+                    // be xz. Scan only on this clearing transition — leaving
+                    // the hint stuck at 1 would permanently demote every
+                    // native block reading this signal.
+                    *hx = if self.signal_table[id].has_xz() { 1 } else { 0 };
+                }
+            }
+            self.signal_table[id].is_signed = self.signal_signed[id];
+            self.mark_dirty_id(id);
+            self.table_modified = true;
+            self.after_signal_write_premirrored(id);
+            return;
+        }
         let val = Value::from_inline(val_bits, xz_bits, w);
         let high_eff = high.min(sig_w.saturating_sub(1));
         let mut changed = false;
@@ -66428,15 +66808,19 @@ impl Simulator {
             let src_bit = val.get_bit((bit_pos - low) as usize);
             if self.signal_table[id].get_bit(bit_pos as usize) != src_bit {
                 self.signal_table[id].set_bit(bit_pos as usize, src_bit);
-                self.sync_mirror(id);
                 changed = true;
             }
         }
         if changed {
+            // ONE mirror sync for the whole span (raw_bits walks 64
+            // LogicBits and has_xz the full value — never per changed bit),
+            // and the premirrored hook skips the duplicate repack
+            // `after_signal_write` would otherwise redo.
+            self.sync_mirror(id);
             self.signal_table[id].is_signed = self.signal_signed[id];
             self.mark_dirty_id(id);
             self.table_modified = true;
-            self.after_signal_write(id);
+            self.after_signal_write_premirrored(id);
         }
     }
 
