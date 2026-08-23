@@ -18,6 +18,7 @@ use xezim_core::elaborate;
 // Re-export xezim-core surface so existing `xezim::...` paths keep working.
 pub use xezim_core::{
     adopted_lib_files, ast, diagnostics, lexer, log_eprintln, log_println, parse, parse_and_elaborate_multi,
+    preprocess_adopted_lib,
     parse_str, preprocessor, progress_clear, progress_status, read_compiled,
     set_compile_verbose, set_implicit_net_warn, set_library_cli,
     set_module_timescale_cli, sv_parser,
