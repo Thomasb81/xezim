@@ -118,6 +118,7 @@ fn print_usage() {
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
     eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
+    eprintln!("  --strict-top     Error out if -s names a module that does not exist");
     eprintln!("  --error-exit     Exit nonzero if any $error was reported ($fatal always does)
   --relax-implicit-static  Accept `int x = ...;` inside a static subroutine
                    (§6.21) with a warning instead of an error. Also enabled by
@@ -698,6 +699,9 @@ fn process_command_file(
                 "-xenowarn" => {
                     xezim::set_implicit_net_warn(false);
                 }
+                "--strict-top" => {
+                    xezim::set_strict_top(true);
+                }
                 _ if t.starts_with("+define+") => {
                     push_plus_define(t, defines);
                 }
@@ -1100,6 +1104,113 @@ fn merged_sv_files_for_top(top: &str, texts: &[String]) -> Option<Vec<usize>> {
     )
 }
 
+/// Record — and, for a repeat, STRIP — compilation-unit-scope (`$unit`)
+/// `task`/`function` definitions in `text`.
+///
+/// `--dump-merged-sv` concatenates whole adopted library files, but a `-v`/`-y`
+/// library only contributes the definitions an instantiation actually needed:
+/// two libraries can each carry their own copy of a `$unit` helper task and the
+/// original run never sees both. The merged file does, and §26.2 makes a repeat
+/// declaration in the same scope an error, so the dump would not re-compile.
+///
+/// Only DUPLICATES are removed and only at depth 0, so a misparse degrades to
+/// today's behaviour (text appended verbatim) rather than dropping code. The
+/// first definition wins, matching the elaborator's own resolution order.
+fn strip_duplicate_unit_subroutines(
+    text: &str,
+    seen: &mut std::collections::HashSet<String>,
+) -> (String, usize) {
+    // The identifier a `task`/`function` header declares: everything up to the
+    // first `(` or `;` minus qualifiers and the return type, i.e. the LAST
+    // identifier token ("automatic logic [7:0] foo" -> "foo").
+    fn header_name(rest: &str) -> Option<String> {
+        let head = rest
+            .split(['(', ';'])
+            .next()
+            .unwrap_or("");
+        head.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .filter(|t| !t.is_empty() && !t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .next_back()
+            .map(|t| t.to_string())
+    }
+    const OPENERS: [&str; 8] = [
+        "module", "macromodule", "interface", "package", "program", "class", "checker", "primitive",
+    ];
+    const CLOSERS: [&str; 8] = [
+        "endmodule",
+        "endinterface",
+        "endpackage",
+        "endprogram",
+        "endclass",
+        "endchecker",
+        "endprimitive",
+        "endconfig",
+    ];
+    // `endtask`/`endfunction` as a standalone TOKEN anywhere in the line: a
+    // one-line definition (`task automatic f(...); ...; endtask`) closes on the
+    // header line itself, and a scanner that only looked at the first token
+    // swallowed everything after it.
+    fn closes_here(line: &str, end_kw: &str) -> bool {
+        line.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .any(|t| t == end_kw)
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0i32;
+    let mut skipping: Option<&'static str> = None;
+    let mut stripped = 0usize;
+    for line in text.lines() {
+        let t = line.trim_start();
+        let toks: Vec<&str> = t.split_whitespace().collect();
+        if let Some(end_kw) = skipping {
+            if closes_here(t, end_kw) {
+                skipping = None;
+            }
+            continue;
+        }
+        let first = toks.first().copied().unwrap_or("");
+        // `typedef class c;` is a forward declaration with no `endclass`.
+        if first != "typedef" {
+            // `virtual class`, `static task`, … — look past one qualifier.
+            let kw = if OPENERS.contains(&first) {
+                Some(first)
+            } else {
+                toks.get(1).copied().filter(|w| OPENERS.contains(w))
+            };
+            if kw.is_some() {
+                depth += 1;
+            }
+            if CLOSERS.contains(&first) {
+                depth -= 1;
+            }
+            if depth == 0
+                && (first == "task" || first == "function")
+                // `extern`/`pure virtual` prototypes have no body to strip.
+                && !t.starts_with("extern")
+                && !t.starts_with("pure")
+            {
+                if let Some(name) = header_name(&t[first.len()..]) {
+                    if !seen.insert(name.clone()) {
+                        out.push_str(&format!(
+                            "// [xezim] duplicate $unit {first} '{name}' suppressed; first definition kept\n"
+                        ));
+                        let end_kw = if first == "task" { "endtask" } else { "endfunction" };
+                        // A one-liner closes on this very line; only a
+                        // multi-line body needs the skip state.
+                        if !closes_here(t, end_kw) {
+                            skipping = Some(end_kw);
+                        }
+                        stripped += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    (out, stripped)
+}
+
 /// `--dump-merged-sv` phase 2: after elaboration, append the `-v`/`-y`
 /// library files whose definitions were actually ADOPTED — with them inlined
 /// the merged file rebuilds standalone, with no -v/-y flags. Whole files are
@@ -1113,6 +1224,13 @@ fn append_adopted_libs_to_merged(merged_out: &str) {
     let mut extra = String::new();
     let mut nfiles = 0usize;
     let mut nmods = 0usize;
+    let mut nstripped = 0usize;
+    // Seed from the primary sources already in the file, so a library copy of
+    // a task the design itself defines is suppressed too.
+    let mut seen_subs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(primary) = std::fs::read_to_string(merged_out) {
+        let _ = strip_duplicate_unit_subroutines(&primary, &mut seen_subs);
+    }
     for (path, mods) in &adopted {
         // Preprocess with the SAME context the -v/-y indexing pass used
         // (fresh preprocessor, run include dirs, post-primary macro
@@ -1143,6 +1261,8 @@ fn append_adopted_libs_to_merged(merged_out: &str) {
         };
         nfiles += 1;
         nmods += mods.len();
+        let (text, nstrip) = strip_duplicate_unit_subroutines(&text, &mut seen_subs);
+        nstripped += nstrip;
         extra.push_str(&format!(
             "\n// ===== adopted library file: {} ({}; needed for: {}) =====\n",
             path.display(),
@@ -1166,8 +1286,15 @@ fn append_adopted_libs_to_merged(merged_out: &str) {
         return;
     }
     println!(
-        "Appended {} adopted library file(s) ({} definition(s)) to {}",
-        nfiles, nmods, merged_out
+        "Appended {} adopted library file(s) ({} definition(s)) to {}{}",
+        nfiles,
+        nmods,
+        merged_out,
+        if nstripped > 0 {
+            format!(" (suppressed {nstripped} duplicate $unit task/function definition(s))")
+        } else {
+            String::new()
+        }
     );
 }
 
@@ -1554,6 +1681,12 @@ fn run_main() -> i32 {
             // with unresolved vendor cells can emit thousands).
             "-xenowarn" => {
                 xezim::set_implicit_net_warn(false);
+            }
+            // §107: `-s <name>` naming no known module is an ERROR rather than
+            // a warning plus auto-detection, so a scripted flow that keys off
+            // the exit status catches a typo'd or stale top.
+            "--strict-top" => {
+                xezim::set_strict_top(true);
             }
             "-V" => {
                 print_version();

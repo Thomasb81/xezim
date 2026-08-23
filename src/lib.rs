@@ -20,7 +20,7 @@ pub use xezim_core::{
     adopted_lib_files, ast, diagnostics, lexer, log_eprintln, log_println, parse, parse_and_elaborate_multi,
     preprocess_adopted_lib,
     parse_str, preprocessor, progress_clear, progress_status, read_compiled,
-    set_compile_verbose, set_implicit_net_warn, set_library_cli,
+    set_compile_verbose, set_implicit_net_warn, set_library_cli, set_strict_top,
     set_module_timescale_cli, sv_parser,
     LibraryCli,
     tokenize_file, write_compiled, ModuleTimescaleCli, ParseResult, SourceDefinition,
