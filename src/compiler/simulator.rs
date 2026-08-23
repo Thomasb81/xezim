@@ -15918,6 +15918,47 @@ impl Simulator {
     /// Count the statement-level timing controls in a subtree (waits an FSM
     /// would own). Intra-assignment delays are canonicalized into marker
     /// CALLS by the elaborator and do not appear as TimingControl nodes.
+    /// Does the subtree contain a `#delay` STATEMENT control? Used to route
+    /// edge-sensitive always bodies to the process path: on the edge path a
+    /// body delay executes synchronously and advances global time while the
+    /// SIBLING blocks of the same edge have not run yet — an
+    /// `always @(posedge clk) begin #1; end` observer displaced every other
+    /// flop's `$time`/NBA commit on that edge by 1ps (same displacement class
+    /// as the cv8s blocking-task skew, which the task-call predicate below
+    /// already routes). Intra-assignment delays (`q <= #1 d;`) are transport
+    /// NBAs and stay on the edge path.
+    fn stmt_contains_delay_control(stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::TimingControl { control, stmt: inner } => {
+                matches!(control, TimingControl::Delay(_))
+                    || Self::stmt_contains_delay_control(inner)
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_contains_delay_control)
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::stmt_contains_delay_control(then_stmt)
+                    || else_stmt
+                        .as_ref()
+                        .is_some_and(|e| Self::stmt_contains_delay_control(e))
+            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| Self::stmt_contains_delay_control(&it.stmt)),
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. } => Self::stmt_contains_delay_control(body),
+            _ => false,
+        }
+    }
+
     fn count_timing_controls(stmt: &Statement) -> usize {
         match &stmt.kind {
             StatementKind::TimingControl { stmt: inner, .. } => {
@@ -16030,8 +16071,29 @@ impl Simulator {
                             .map(|s| s.name.name.as_str())
                             .collect::<Vec<_>>()
                             .join(".");
+                        // A dotted call (`obs.observe()`) can be a CLASS
+                        // METHOD on a handle — not in `module.tasks` at all.
+                        // Fall back to the leaf-name over-approximation that
+                        // resolves method bodies across classes (audit case
+                        // c: a delaying method kept its edge block on the
+                        // edge path and displaced sibling blocks by 1ps).
                         call_blocks(&raw)
+                            || (h.path.len() > 1
+                                && h.path
+                                    .last()
+                                    .is_some_and(|l| {
+                                        self.subroutine_name_blocks(l.name.name.as_str())
+                                    }))
                     }
+                    // Class-method receiver (`obs.observe()`): the leaf-name
+                    // over-approximation in `callee_transitively_blocks`
+                    // resolves method bodies across all classes. Without
+                    // this, an edge block calling a delaying class method
+                    // stayed on the edge path and its `#1` displaced every
+                    // sibling block's $time/NBA commit on that edge (the
+                    // class-method variant of the cv8s blocking-task skew;
+                    // audit case c).
+                    ExprKind::MemberAccess { .. } => self.callee_transitively_blocks(e),
                     _ => false,
                 },
                 _ => false,
@@ -16344,7 +16406,14 @@ impl Simulator {
                 // machinery suspends the call properly, the slot's NBA
                 // region commits on time, and busy-body edges are missed
                 // per §9.2.2 exactly as the reference behaves.
-                if self.stmt_calls_blocking_task(&body, &ab.scope, 3) {
+                if self.stmt_calls_blocking_task(&body, &ab.scope, 3)
+                    // Delay-routing applies to EDGE-triggered blocks only: a
+                    // level/`@(*)` block's star sensitivity resolves to an
+                    // empty list on the process path and would spin (the
+                    // star_sensitivity suite's defect #1). Level blocks keep
+                    // their established edge-path delay handling.
+                    || (!all_level && Self::stmt_contains_delay_control(&body))
+                {
                     let forever_stmt = Statement::new(
                         StatementKind::Forever {
                             body: Box::new(ab.stmt.clone()),
