@@ -25,6 +25,8 @@ mod bind_in_module;
 mod bind_path_through_library_module;
 #[path = "hierarchy/dump_merged_sv_library_dedup.rs"]
 mod dump_merged_sv_library_dedup;
+#[path = "hierarchy/port_net_driven_from_inside.rs"]
+mod port_net_driven_from_inside;
 #[path = "hierarchy/bind_upward_refs.rs"]
 mod bind_upward_refs;
 #[path = "hierarchy/c910_scoped_cont_assign.rs"]
