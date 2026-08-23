@@ -1114,27 +1114,44 @@ fn append_adopted_libs_to_merged(merged_out: &str) {
     let mut nfiles = 0usize;
     let mut nmods = 0usize;
     for (path, mods) in &adopted {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                nfiles += 1;
-                nmods += mods.len();
-                extra.push_str(&format!(
-                    "\n// ===== adopted library file: {} (needed for: {}) =====\n",
-                    path.display(),
-                    mods.join(", ")
-                ));
-                extra.push_str(&String::from_utf8_lossy(&bytes));
-                if !extra.ends_with('\n') {
-                    extra.push('\n');
+        // Preprocess with the SAME context the -v/-y indexing pass used
+        // (fresh preprocessor, run include dirs, post-primary macro
+        // snapshot) so the appended text has its includes inlined and
+        // macros expanded. Raw bytes broke the standalone re-compile the
+        // moment merged.sv left the original directory: the library's
+        // relative include paths no longer resolved and its macros came
+        // out undefined.
+        let (text, how) = match xezim::preprocess_adopted_lib(path) {
+            Some(t) => (t, "preprocessed"),
+            None => match std::fs::read(path) {
+                Ok(bytes) => {
+                    eprintln!(
+                        "Warning: --dump-merged-sv: preprocessing library '{}' failed; appending raw text (the merged file may not re-compile standalone)",
+                        path.display()
+                    );
+                    (String::from_utf8_lossy(&bytes).into_owned(), "raw")
                 }
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: --dump-merged-sv could not append library '{}': {}",
-                    path.display(),
-                    e
-                );
-            }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: --dump-merged-sv could not append library '{}': {}",
+                        path.display(),
+                        e
+                    );
+                    continue;
+                }
+            },
+        };
+        nfiles += 1;
+        nmods += mods.len();
+        extra.push_str(&format!(
+            "\n// ===== adopted library file: {} ({}; needed for: {}) =====\n",
+            path.display(),
+            how,
+            mods.join(", ")
+        ));
+        extra.push_str(&text);
+        if !extra.ends_with('\n') {
+            extra.push('\n');
         }
     }
     if nfiles == 0 {
