@@ -83795,6 +83795,19 @@ impl Simulator {
             return None;
         }
         let bound = self.vif_bound_for_root(&h.path[0].name.name)?;
+        // IDENTITY REWRITE GUARD. Both callers (`eval_expr_ctx`,
+        // `assign_value`) RE-ENTER on the rewrite, so a rewrite that
+        // reproduces its input recurses until the stack dies. That is not
+        // hypothetical: the universal UVM convention names the class property
+        // after the interface instance (`virtual foo_if vif;` bound to
+        // `foo_if vif()`), so `vif.x` rebases to `vif.x` — every
+        // `uvm_config_db#(virtual iface)` testbench aborted with a stack
+        // overflow at the first access. Declining is exactly equivalent: the
+        // rewrite was a no-op, so the caller resolves the same expression it
+        // already had, minus the recursion.
+        if bound == h.path[0].name.name {
+            return None;
+        }
         let mut segs: Vec<crate::ast::expr::HierPathSegment> = bound
             .split('.')
             .map(|part| crate::ast::expr::HierPathSegment {
@@ -83826,6 +83839,13 @@ impl Simulator {
             ExprKind::Ident(h) => {
                 if h.path.len() == 1 && h.path[0].selects.is_empty() {
                     let bound = self.vif_bound_for_root(&h.path[0].name.name)?;
+                    // Identity rewrite (property named after the instance —
+                    // the UVM `vif` convention): see the guard in
+                    // `vif_rebase_ident`. Rebasing `v` to `v` makes the
+                    // re-entering callers recurse forever.
+                    if bound == h.path[0].name.name {
+                        return None;
+                    }
                     let segs: Vec<crate::ast::expr::HierPathSegment> = bound
                         .split('.')
                         .map(|part| crate::ast::expr::HierPathSegment {
