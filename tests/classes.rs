@@ -198,6 +198,8 @@ mod randomize_obj_array_property;
 mod static_assoc_struct_pool;
 #[path = "classes/vif_static_roundtrip.rs"]
 mod vif_static_roundtrip;
+#[path = "classes/vif_property_named_like_instance.rs"]
+mod vif_property_named_like_instance;
 #[path = "classes/nopack_member_array.rs"]
 mod nopack_member_array;
 #[path = "classes/class_localparam_array.rs"]

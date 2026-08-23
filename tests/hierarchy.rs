@@ -13,6 +13,8 @@
 
 #[path = "hierarchy/typedef_array_ports_in_children.rs"]
 mod typedef_array_ports_in_children;
+#[path = "hierarchy/unpacked_struct_port.rs"]
+mod unpacked_struct_port;
 #[path = "hierarchy/array_of_module_instances.rs"]
 mod array_of_module_instances;
 #[path = "hierarchy/bind_directive_basic.rs"]
