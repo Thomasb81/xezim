@@ -70,3 +70,6 @@ Cargo.lock
 /.cargo/config.toml
 # A nested local xezim-core checkout used via use-local-core.sh
 /xezim-core/
+
+# Local PGO/experiment build dirs (cargo-local variants)
+target-*/
