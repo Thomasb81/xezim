@@ -13,6 +13,8 @@
 
 #[path = "types/packed_struct_formal_member.rs"]
 mod packed_struct_formal_member;
+#[path = "types/block_local_width_in_index_shift.rs"]
+mod block_local_width_in_index_shift;
 #[path = "types/ansi_port_name_with_unpacked_dim.rs"]
 mod ansi_port_name_with_unpacked_dim;
 #[path = "types/array_element_declared_signedness.rs"]
