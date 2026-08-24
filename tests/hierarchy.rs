@@ -91,6 +91,8 @@ mod null_ports_lib_defines_nowarn;
 mod package_scoped_vars_and_methods;
 #[path = "hierarchy/percent_m_scope.rs"]
 mod percent_m_scope;
+#[path = "hierarchy/percent_m_module_init_scope.rs"]
+mod percent_m_module_init_scope;
 #[path = "hierarchy/pkg_subroutines_and_unit_scope.rs"]
 mod pkg_subroutines_and_unit_scope;
 #[path = "hierarchy/repro_import.rs"]
