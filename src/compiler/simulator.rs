@@ -16631,6 +16631,7 @@ impl Simulator {
         compiler.set_packed_full_dims(&self.module.packed_full_dims);
         compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
         compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+        compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
         compiler.set_array_first_id(&self.array_first_id);
         compiler.set_string_signals(&self.module.string_signals);
         compiler.set_signal_real(&self.signal_real);
@@ -19444,6 +19445,7 @@ impl Simulator {
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+            compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
@@ -19526,6 +19528,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.set_string_signals(&self.module.string_signals);
                 compiler.set_signal_real(&self.signal_real);
@@ -19556,6 +19559,7 @@ impl Simulator {
                 delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
                 delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 delay_compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                delay_compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 delay_compiler.set_array_first_id(&self.array_first_id);
                 delay_compiler.set_string_signals(&self.module.string_signals);
                 delay_compiler.set_signal_real(&self.signal_real);
@@ -23701,6 +23705,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_array_first_id(&self.array_first_id);
                 // Without the function table, `compile_pure_call` cannot even
                 // LOOK UP a callee, so any RHS containing a function call
@@ -23769,6 +23774,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_array_first_id(&self.array_first_id);
                 // Same omission as the single-dest site above: without the
@@ -24461,6 +24467,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                     compiler.set_packed_full_dims(&self.module.packed_full_dims);
                     compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                    compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                     compiler.set_array_first_id(&self.array_first_id);
                     compiler.top_module_name = Some(self.module.name.clone());
                     // Enable AST fallback so partially-unsupported constructs
@@ -33851,6 +33858,7 @@ impl Simulator {
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+            compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
@@ -34071,6 +34079,7 @@ impl Simulator {
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+            compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
@@ -37193,6 +37202,28 @@ impl Simulator {
             ExprKind::Index { expr, index } => {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
+                    // A DYNAMIC array / QUEUE element carries a signal TWIN in
+                    // `signal_name_to_id`, so the lookup below used to resolve
+                    // it and the NBA took the fast path: `apply_nba_entry`
+                    // wrote that id and marked IT dirty, but a comb reader of
+                    // the COLLECTION does not depend on that id, so it was
+                    // never re-evaluated. The value landed (a direct read
+                    // returned it) while every reader silently served stale
+                    // data --- and a later BLOCKING write did notify, which is
+                    // what made it look intermittent.
+                    //
+                    // Returning None routes them through the queued-lvalue
+                    // path, which commits via `assign_value` --- the same
+                    // function blocking assignment uses, and the one
+                    // ASSOCIATIVE arrays already take (they are not in
+                    // `module.arrays`, which is why assoc was always correct).
+                    // Static arrays keep the fast path: their element ids ARE
+                    // what comb readers depend on.
+                    if self.module.dynamic_arrays.contains(&name)
+                        || self.module.queue_vars.contains(&name)
+                    {
+                        return None;
+                    }
                     if self.module.arrays.contains_key(&name) {
                         // `$` here is the collection's last index (§11.4.12);
                         // without the bound it evaluates to u64::MAX and the
