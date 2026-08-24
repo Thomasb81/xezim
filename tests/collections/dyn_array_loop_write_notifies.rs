@@ -129,9 +129,11 @@ module tb;
 endmodule
 "#;
 
-/// KNOWN OPEN GAP (audit round 4, 2026-08-24) — ignored, not deleted.
+/// A NON-BLOCKING write to a dynamic-array or queue ELEMENT must notify
+/// readers. (Audit rounds 4-6; FIXED.)
 ///
-/// A NON-BLOCKING write to a dynamic-array ELEMENT never notifies readers.
+/// It was a different path from the loop bug above: it reproduced with no loop
+/// at all.
 /// This is a DIFFERENT path from the loop bug fixed above: it reproduces with
 /// no loop at all, so the compile-gate guard does not reach it, and the
 /// interpreter's own NBA-to-collection commit is what fails to mark dirty.
@@ -144,13 +146,19 @@ endmodule
 /// C after NBA2: direct n1[0]=77 comb r1=55  <- stuck on the stale value
 /// ```
 ///
-/// Audit round 5 swept 32 combinations (4 collection kinds x blocking/NBA x
-/// direct/for/foreach/task) and the failure set is exactly the 8 NBA cases on
-/// a DYNAMIC ARRAY or a QUEUE — every context, no exceptions. NBA to an
-/// ASSOCIATIVE array or a STATIC array is correct, and all 16 blocking cases
-/// are correct, which is what scopes this. Both affected kinds are covered
-/// below. Remove the `#[ignore]` when the NBA commit path marks dynamic-array
-/// and queue elements dirty.
+/// A dynamic-array / queue element carries a signal TWIN, so the NBA fast
+/// path resolved it and `apply_nba_entry` wrote (and dirtied) THAT id — but a
+/// reader of the COLLECTION does not depend on it, so nothing re-evaluated.
+/// The value landed while readers served stale data, and a later BLOCKING
+/// write did notify, which made it look intermittent.
+///
+/// Fixed by returning None from `resolve_nba_target` for these two kinds, so
+/// they commit through the queued-lvalue path (`assign_value`) — the same
+/// route ASSOCIATIVE arrays already took, which is why assoc was always
+/// correct. Edge blocks needed the matching compiler-side gate
+/// (`collection_store_denied`), since they emit array-store insns directly.
+///
+/// Assoc and static are kept in the same case as positive controls.
 const NBA_TO_DYNAMIC_ELEMENT: &str = r#"
 module tb;
   logic [7:0] n1 [];
@@ -215,7 +223,6 @@ fn dynamic_array_sibling_shapes_and_non_comb_readers_notify() {
 }
 
 #[test]
-#[ignore = "open gap: NBA to a dynamic-array or queue element never marks it dirty (audit rounds 4-5)"]
 fn nba_to_dynamic_array_or_queue_element_notifies_readers() {
     assert_eq!(
         ok_flag(NBA_TO_DYNAMIC_ELEMENT),

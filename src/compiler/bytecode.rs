@@ -893,6 +893,11 @@ pub struct BytecodeCompiler<'a> {
     /// then only excludes 1D/packed bases as before. Set via
     /// `set_multi_dim_arrays`.
     multi_dim_arrays: Option<&'a HashSet<String>>,
+    /// Names the elaborator recorded as DYNAMIC arrays / QUEUES. Used only to
+    /// keep their element STORES off the dense array fast path (see
+    /// `collection_store_denied`); their READS are unaffected.
+    dynamic_arrays: Option<&'a HashSet<String>>,
+    queue_vars: Option<&'a HashSet<String>>,
     /// Packed-struct field layout: container name → ordered
     /// `(member, lsb_offset, width)`. Lets a member-write LHS like
     /// `s.m0` (parsed as a 2-segment `Ident(["<scope>.s", "m0"])` after
@@ -959,6 +964,8 @@ impl<'a> BytecodeCompiler<'a> {
             inline_ret: None,
             inline_ret_jumps: Vec::new(),
             multi_dim_arrays: None,
+            dynamic_arrays: None,
+            queue_vars: None,
             packed_struct_fields: None,
         }
     }
@@ -1225,6 +1232,40 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_multi_dim_arrays(&mut self, s: &'a HashSet<String>) {
         self.multi_dim_arrays = Some(s);
+    }
+
+    pub fn set_collection_denies(&mut self, dyn_arrays: &'a HashSet<String>, queues: &'a HashSet<String>) {
+        self.dynamic_arrays = Some(dyn_arrays);
+        self.queue_vars = Some(queues);
+    }
+
+    /// Must an element STORE to this name avoid the dense array fast path?
+    ///
+    /// A dynamic array / queue element carries a signal TWIN, so
+    /// `lookup_array_name` resolved it and the store wrote that id --- but a
+    /// reader of the COLLECTION does not depend on it, so nothing was ever
+    /// re-evaluated and readers silently served stale (or x) data. Bailing
+    /// sends the enclosing block to the interpreter, whose `assign_value` /
+    /// queued-lvalue NBA commit notify correctly --- the same route
+    /// ASSOCIATIVE arrays already take just above. Static arrays keep the fast
+    /// path: their element ids ARE what readers depend on.
+    fn collection_store_denied(&self, hier: &HierarchicalIdentifier) -> bool {
+        let (Some(d), Some(q)) = (self.dynamic_arrays, self.queue_vars) else {
+            return false;
+        };
+        let raw = Self::hier_raw_name(hier);
+        if d.contains(&raw) || q.contains(&raw) {
+            return true;
+        }
+        if let Some(scope) = &self.scope_hint {
+            let qual = format!("{}.{}", scope, raw);
+            if d.contains(&qual) || q.contains(&qual) {
+                return true;
+            }
+        }
+        hier.path
+            .last()
+            .is_some_and(|s| d.contains(&s.name.name) || q.contains(&s.name.name))
     }
 
     pub fn set_array_first_id(&mut self, arrays: &'a HashMap<Arc<str>, (usize, i64, i64)>) {
@@ -7091,6 +7132,10 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("nba_target_assoc");
                         return false;
                     }
+                    if self.collection_store_denied(hier) {
+                        self.bail("nba_target_collection");
+                        return false;
+                    }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
                             let array = self.array_operand(name);
@@ -7543,6 +7588,10 @@ impl<'a> BytecodeCompiler<'a> {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if self.is_assoc_target(hier) {
                         self.bail("blocking_target_assoc");
+                        return false;
+                    }
+                    if self.collection_store_denied(hier) {
+                        self.bail("blocking_target_collection");
                         return false;
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
