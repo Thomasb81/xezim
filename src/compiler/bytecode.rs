@@ -8463,6 +8463,16 @@ impl<'a> BytecodeCompiler<'a> {
                 // concatenation, `{(req.addr >> 5), lsbs}` resized the shift's
                 // operand to 1 bit and the whole term evaluated to 0.
                 .or_else(|| self.packed_struct_member_target(hier).map(|(_, _, mw)| mw))
+                // A BLOCK-LOCAL declaration — a `for (int i = ...)` header
+                // variable or a `begin`-block temp — is a REGISTER, not a
+                // signal, so both lookups above miss. The old fallback of 0
+                // then made every self-determined use of it 1 bit wide. In an
+                // array INDEX (compiled at ctx_width 0) that collapsed a
+                // shift's operand width to `max(0, 0).max(1)` = 1, so
+                // `arr[(i << 6) + off]` truncated `i` to one bit and the shift
+                // masked the result away: every iteration read `arr[off]`.
+                // `local_var_regs` already carries the declared width.
+                .or_else(|| self.local_var_reg_of(hier).map(|(_, w)| w))
                 .unwrap_or(0),
             ExprKind::Number(n) => self.eval_number_static(n).map(|v| v.width).unwrap_or(32),
             ExprKind::Binary { op, left, right } => {
