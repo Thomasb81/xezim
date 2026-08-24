@@ -293,6 +293,10 @@ fn test_sv_47_nettype_coercion() {
     run_positive_compliance_test("tests_advanced", "47_nettype_coercion.sv");
 }
 #[test]
+fn test_sv_48_nettype_inlined_real() {
+    run_positive_compliance_test("tests_advanced", "48_nettype_inlined_real.sv");
+}
+#[test]
 fn test_sv_41_genfor_localparam_idx() {
     run_positive_compliance_test("tests_advanced", "41_genfor_localparam_idx.sv");
 }
