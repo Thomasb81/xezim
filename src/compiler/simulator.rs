@@ -84288,6 +84288,7 @@ impl Simulator {
                 || cd.queue_properties.contains_key(name)
                 || cd.array_properties.contains_key(name)
                 || cd.array_nd_properties.contains_key(name)
+                || self.prop_bound_collection(handle, &cn, name)
             {
                 return Some(format!("{}#{}", handle, name));
             }
