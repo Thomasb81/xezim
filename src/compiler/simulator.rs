@@ -33907,7 +33907,25 @@ impl Simulator {
         let mut reads: HashSet<String> = HashSet::default();
         let mut writes: HashSet<String> = HashSet::default();
         Self::collect_stmt_reads(stmt, &self.module, &mut reads, &mut writes);
-        if writes.is_empty() || reads.is_empty() {
+        if writes.is_empty() {
+            return false;
+        }
+        // A DYNAMIC array is a collection, not a signal, so its name maps to
+        // no id below: the dependency walk found nothing, the loop compiled,
+        // and the compiled element store skipped the dirty-marking the AST
+        // interpreter store does. `always_comb` readers were then never
+        // re-evaluated and silently kept stale (or x) data --- `for (k) a[k] =
+        // v;` on `logic [7:0] a [];` left a reader at x while `a[0]` really
+        // held the written value. Treat any write to one as feedback so the
+        // loop stays interpreted, which notifies correctly. Static arrays and
+        // queues resolve through the walk normally and keep compiling.
+        if writes.iter().any(|w| {
+            let base = w.split('[').next().unwrap_or(w);
+            self.module.dynamic_arrays.contains(base)
+        }) {
+            return true;
+        }
+        if reads.is_empty() {
             return false;
         }
         let to_id = |n: &String| self.signal_name_to_id.get(n.as_str()).copied();
