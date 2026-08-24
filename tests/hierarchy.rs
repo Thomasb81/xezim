@@ -105,6 +105,8 @@ mod same_name_port_hop;
 mod submodule_net_array_shapes;
 #[path = "hierarchy/submodule_two_dim_array_element.rs"]
 mod submodule_two_dim_array_element;
+#[path = "hierarchy/t_bound_queue_member_storage.rs"]
+mod t_bound_queue_member_storage;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
 
