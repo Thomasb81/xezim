@@ -23,6 +23,8 @@ mod bind_directive_basic;
 mod bind_in_module;
 #[path = "hierarchy/bind_path_through_library_module.rs"]
 mod bind_path_through_library_module;
+#[path = "hierarchy/bind_through_nested_part_select.rs"]
+mod bind_through_nested_part_select;
 #[path = "hierarchy/dump_merged_sv_library_dedup.rs"]
 mod dump_merged_sv_library_dedup;
 #[path = "hierarchy/port_net_driven_from_inside.rs"]
