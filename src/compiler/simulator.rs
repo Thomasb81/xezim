@@ -3097,6 +3097,9 @@ impl std::ops::DerefMut for SignalMap {
     }
 }
 
+/// Mid-exec ts aborts tolerated per block before demotion.
+const TS_ABORT_DEMOTE: u16 = 8;
+
 #[derive(Clone)]
 enum CombPlan {
     Unresolved,
@@ -4681,6 +4684,21 @@ pub struct Simulator {
     prof_ts_bail_forced: u64,
     prof_ts_bail_xread: u64,
     prof_ts_bail_abort: u64,
+    /// Set by `ts_guard_and_exec`: the last `false` came from a MID-EXEC
+    /// abort (partial ts work + full 4-state replay), not a cheap guard
+    /// bail. Callers use it to DEMOTE chronically aborting blocks — the TS
+    /// NBA admission exposed blocks whose guards pass but whose bodies hit
+    /// an abortable op (blocking reads of X RAM data) on most evals: 67 M
+    /// aborts/run, each paying guard + partial exec + replay, a net LOSS vs
+    /// never admitting. Demotion returns such a block to exactly its
+    /// pre-admission engine; clean runners keep the fast path.
+    ts_exec_aborted: bool,
+    /// Per-slot mid-exec abort counts; at `TS_ABORT_DEMOTE` the slot flips
+    /// to No / Interp for the rest of the run. (Re-promotion after init
+    /// settles is future work.)
+    ts_edge_abortn: Vec<u16>,
+    ts_comb_abortn: Vec<u16>,
+    comb_plan_abortn: Vec<u16>,
     /// XEZIM_PROFILE_REPORT=1: reference-style ranked profile (by design
     /// unit / instance / construct). Implies per-entry and per-edge-block
     /// nanosecond attribution.
@@ -7841,6 +7859,10 @@ impl Simulator {
             prof_ts_bail_forced: 0,
             prof_ts_bail_xread: 0,
             prof_ts_bail_abort: 0,
+            ts_exec_aborted: false,
+            ts_edge_abortn: Vec::new(),
+            ts_comb_abortn: Vec::new(),
+            comb_plan_abortn: Vec::new(),
             profile_report: std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
             prof_entry_ns: Vec::new(),
             comb_dep_entries: Vec::new(),
@@ -18197,6 +18219,16 @@ impl Simulator {
                     }
                     return true;
                 }
+                if self.ts_exec_aborted {
+                    if eidx >= self.comb_plan_abortn.len() {
+                        self.comb_plan_abortn.resize(eidx + 1, 0);
+                    }
+                    self.comb_plan_abortn[eidx] =
+                        self.comb_plan_abortn[eidx].saturating_add(1);
+                    if self.comb_plan_abortn[eidx] >= TS_ABORT_DEMOTE {
+                        self.comb_plan[eidx] = CombPlan::Interp;
+                    }
+                }
                 // Dynamic guard bail (force on a target, X input): the
                 // unplanned chain tried the JIT next. Rare path — the full
                 // slot lookup is fine here.
@@ -18468,7 +18500,19 @@ impl Simulator {
             return false;
         };
         let ts = ts.clone();
-        self.ts_guard_and_exec(&ts)
+        let ok = self.ts_guard_and_exec(&ts);
+        if !ok && self.ts_exec_aborted {
+            let counts = if edge { &mut self.ts_edge_abortn } else { &mut self.ts_comb_abortn };
+            if eidx >= counts.len() {
+                counts.resize(eidx + 1, 0);
+            }
+            counts[eidx] = counts[eidx].saturating_add(1);
+            if counts[eidx] >= TS_ABORT_DEMOTE {
+                let slots = if edge { &mut self.ts_edge } else { &mut self.ts_comb };
+                slots[eidx] = TsSlot::No;
+            }
+        }
+        ok
     }
 
     /// Per-eval guards + execution: no forces (stores bypass force
@@ -18476,6 +18520,7 @@ impl Simulator {
     /// path), and every read X-free (width ≤ 64 was proven at lower time,
     /// so storage is Inline and raw_bits is exact).
     fn ts_guard_and_exec(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
+        self.ts_exec_aborted = false;
         if self.warn_x {
             self.prof_ts_bail_warnx += 1;
             return false;
@@ -18519,6 +18564,7 @@ impl Simulator {
         }
         if !self.exec_two_state(ts) {
             self.prof_ts_bail_abort += 1;
+            self.ts_exec_aborted = true;
             return false;
         }
         self.prof_ts_evals += 1;
@@ -18835,11 +18881,20 @@ impl Simulator {
                     }
                     let eid = op.first as usize + (i - op.lo) as usize;
                     let (ev, ex) = self.signal_table[eid].raw_bits();
-                    if ex != 0 {
-                        bail!();
-                    }
                     let m = if op.w >= 64 { u64::MAX } else { (1u64 << op.w) - 1 };
-                    self.ts_store_nba(op.dst as usize, ev & m, op.w);
+                    if ex != 0 {
+                        // X element data: the destination is an NBA QUEUE
+                        // entry, which holds a full 4-state Value — queue it
+                        // instead of aborting the whole block. On this
+                        // design 95% of cells carry X, so the abort was the
+                        // common case, and a mid-block abort is what forces
+                        // reads to precede every side effect.
+                        let mut v = Value::from_inline(ev & m, ex & m, op.w.max(1));
+                        v.is_signed = false;
+                        self.ts_store_nba_val(op.dst as usize, v);
+                    } else {
+                        self.ts_store_nba(op.dst as usize, ev & m, op.w);
+                    }
                 }
                 TsInsn::Store { sig, s, mask } => {
                     let v = regs[*s as usize] & mask;
@@ -18848,6 +18903,44 @@ impl Simulator {
                 TsInsn::StoreNba { sig, s, w, mask } => {
                     let v = regs[*s as usize] & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
+                }
+                TsInsn::ConstStoreNba { sig, v, w } => {
+                    self.ts_store_nba(*sig as usize, *v, *w);
+                }
+                TsInsn::RangeStoreNba { sig, hi, lo, s, mask } => {
+                    // Mirror of the 4-state `NbaAssignRange` fast arm: merge
+                    // into the pending entry when one exists, else seed from
+                    // the signal, with eval-time elision. Plane-based, so an
+                    // X base composes instead of aborting.
+                    let id = *sig as usize;
+                    let (src_v, src_x) = (regs[*s as usize] & mask, 0u64);
+                    if let Some(i) = self.nba_fast_index.get(id) {
+                        let target = &mut self.nba_fast[i].value;
+                        let (base_v, base_x) = target.raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        target.set_inline_bits(new_v, new_x);
+                        target.is_signed = self.signal_signed[id];
+                    } else {
+                        let (base_v, base_x) = self.signal_table[id].raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        if new_v == base_v && new_x == base_x {
+                            self.prof_nba_elided += 1;
+                        } else {
+                            let mut nv =
+                                Value::from_inline(new_v, new_x, self.signal_widths[id]);
+                            nv.is_signed = self.signal_signed[id];
+                            self.nba_fast_index.insert(id, self.nba_fast.len());
+                            self.nba_fast.push(NbaFast {
+                                block_index: 0,
+                                signal_id: id,
+                                value: nv,
+                            });
+                        }
+                    }
                 }
                 // ---- wide bank ----
                 TsInsn::WLoadSig { d, sig } => {
@@ -19163,6 +19256,44 @@ impl Simulator {
                     let v = regs[*s as usize] & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
                 }
+                TsInsn::ConstStoreNba { sig, v, w } => {
+                    self.ts_store_nba(*sig as usize, *v, *w);
+                }
+                TsInsn::RangeStoreNba { sig, hi, lo, s, mask } => {
+                    // Mirror of the 4-state `NbaAssignRange` fast arm: merge
+                    // into the pending entry when one exists, else seed from
+                    // the signal, with eval-time elision. Plane-based, so an
+                    // X base composes instead of aborting.
+                    let id = *sig as usize;
+                    let (src_v, src_x) = (regs[*s as usize] & mask, 0u64);
+                    if let Some(i) = self.nba_fast_index.get(id) {
+                        let target = &mut self.nba_fast[i].value;
+                        let (base_v, base_x) = target.raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        target.set_inline_bits(new_v, new_x);
+                        target.is_signed = self.signal_signed[id];
+                    } else {
+                        let (base_v, base_x) = self.signal_table[id].raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        if new_v == base_v && new_x == base_x {
+                            self.prof_nba_elided += 1;
+                        } else {
+                            let mut nv =
+                                Value::from_inline(new_v, new_x, self.signal_widths[id]);
+                            nv.is_signed = self.signal_signed[id];
+                            self.nba_fast_index.insert(id, self.nba_fast.len());
+                            self.nba_fast.push(NbaFast {
+                                block_index: 0,
+                                signal_id: id,
+                                value: nv,
+                            });
+                        }
+                    }
+                }
                 TsInsn::WLoadSig { .. }
                 | TsInsn::WConst { .. }
                 | TsInsn::WXor { .. }
@@ -19219,6 +19350,24 @@ impl Simulator {
     /// NBA writeback: exact mirror of the `NbaAssign` exec arm — §10.4.2
     /// last-write-wins via nba_fast_index, eval-time elision otherwise.
     #[inline]
+    /// `ts_store_nba` for an already-built (possibly 4-STATE) Value — the
+    /// NBA queue holds full Values, so an X element read by a two-state
+    /// block can be queued without the block aborting.
+    fn ts_store_nba_val(&mut self, id: usize, val: Value) {
+        if let Some(i) = self.nba_fast_index.get(id) {
+            self.nba_fast[i].value = val;
+        } else if self.signal_table[id] != val {
+            self.nba_fast_index.insert(id, self.nba_fast.len());
+            self.nba_fast.push(NbaFast {
+                block_index: 0,
+                signal_id: id,
+                value: val,
+            });
+        } else {
+            self.prof_nba_elided += 1;
+        }
+    }
+
     fn ts_store_nba(&mut self, id: usize, v: u64, w: u32) {
         let val = Value::from_u64(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
@@ -19481,6 +19630,44 @@ impl Simulator {
                 TsInsn::StoreNba { sig, s, w, mask } => {
                     let v = regs[*s as usize] & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
+                }
+                TsInsn::ConstStoreNba { sig, v, w } => {
+                    self.ts_store_nba(*sig as usize, *v, *w);
+                }
+                TsInsn::RangeStoreNba { sig, hi, lo, s, mask } => {
+                    // Mirror of the 4-state `NbaAssignRange` fast arm: merge
+                    // into the pending entry when one exists, else seed from
+                    // the signal, with eval-time elision. Plane-based, so an
+                    // X base composes instead of aborting.
+                    let id = *sig as usize;
+                    let (src_v, src_x) = (regs[*s as usize] & mask, 0u64);
+                    if let Some(i) = self.nba_fast_index.get(id) {
+                        let target = &mut self.nba_fast[i].value;
+                        let (base_v, base_x) = target.raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        target.set_inline_bits(new_v, new_x);
+                        target.is_signed = self.signal_signed[id];
+                    } else {
+                        let (base_v, base_x) = self.signal_table[id].raw_bits();
+                        let (new_v, new_x) = Self::compose_inline_range_bits(
+                            base_v, base_x, src_v, src_x, *lo, *hi,
+                        );
+                        if new_v == base_v && new_x == base_x {
+                            self.prof_nba_elided += 1;
+                        } else {
+                            let mut nv =
+                                Value::from_inline(new_v, new_x, self.signal_widths[id]);
+                            nv.is_signed = self.signal_signed[id];
+                            self.nba_fast_index.insert(id, self.nba_fast.len());
+                            self.nba_fast.push(NbaFast {
+                                block_index: 0,
+                                signal_id: id,
+                                value: nv,
+                            });
+                        }
+                    }
                 }
                 TsInsn::WLoadSig { .. }
                 | TsInsn::WConst { .. }
@@ -21952,6 +22139,16 @@ impl Simulator {
                 let ts = ts.clone();
                 if self.ts_guard_and_exec(&ts) {
                     return true;
+                }
+                if self.ts_exec_aborted {
+                    if block_idx >= self.ts_edge_abortn.len() {
+                        self.ts_edge_abortn.resize(block_idx + 1, 0);
+                    }
+                    self.ts_edge_abortn[block_idx] =
+                        self.ts_edge_abortn[block_idx].saturating_add(1);
+                    if self.ts_edge_abortn[block_idx] >= TS_ABORT_DEMOTE {
+                        self.ts_edge[block_idx] = TsSlot::No;
+                    }
                 }
             }
             _ => {
