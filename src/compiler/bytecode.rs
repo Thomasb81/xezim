@@ -10851,6 +10851,16 @@ pub enum TsInsn {
     /// Nonblocking write: queue `regs[s] & mask` (width `w`) with §10.4.2
     /// last-write-wins and the eval-time elision, exactly as `NbaAssign`.
     StoreNba { sig: u32, s: u16, w: u32, mask: u64 },
+    /// NBA of a compile-time CONSTANT (`q <= 8'h3f;`) — the single largest
+    /// two-state bail on c906 (1,189 edge blocks). Non-abortable: the value
+    /// was validated 2-state at lowering.
+    ConstStoreNba { sig: u32, v: u64, w: u32 },
+    /// Partial-bit NBA (`q[hi:lo] <= v`). Mirrors the 4-state executor's
+    /// `compose_inline_range_bits` merge against the pending-or-current
+    /// value — the composition works on raw bit PLANES, so an X base flows
+    /// through instead of aborting; only the SOURCE must be 2-state, and it
+    /// is (it lives in a ts register). Non-abortable.
+    RangeStoreNba { sig: u32, hi: u32, lo: u32, s: u16, mask: u64 },
     /// Dynamic array-element read: eid = first + (regs[idx] - lo). ABORTS
     /// the two-state run (caller re-runs 4-state) when the index is out of
     /// range or the element holds X — both produce X in 4-state. Lowering
@@ -11549,6 +11559,42 @@ pub fn lower_two_state(
                     out.push(TsInsn::Store { sig: sig as u32, s: *r as u16, mask: ts_mask(*w) });
                 }
             }
+            Insn::NbaAssignConst(sig, k, w) => {
+                let sig = *sig as usize;
+                if sig >= signal_widths.len() || signal_real[sig] || *w > 64 {
+                    return None;
+                }
+                let v = clean_const(k)?;
+                side_effects = true;
+                out.push(TsInsn::ConstStoreNba {
+                    sig: sig as u32,
+                    v: v & ts_mask(*w),
+                    w: *w,
+                });
+            }
+            Insn::NbaAssignRange(sig, hi, lo, r) => {
+                let sig = *sig as usize;
+                if sig >= signal_widths.len()
+                    || signal_real[sig]
+                    || signal_widths[sig] > 64
+                {
+                    return None;
+                }
+                let cw = rw[*r as usize]?;
+                let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                let w = high - low + 1;
+                if cw > 64 || high >= 64 {
+                    return None;
+                }
+                side_effects = true;
+                out.push(TsInsn::RangeStoreNba {
+                    sig: sig as u32,
+                    hi: high,
+                    lo: low,
+                    s: *r as u16,
+                    mask: ts_mask(w),
+                });
+            }
             Insn::NbaAssign(sig, r, w) => {
                 let sig = *sig as usize;
                 let cw = rw[*r as usize]?;
@@ -11659,11 +11705,6 @@ pub fn lower_two_state(
                 }
             }
             Insn::NbaAssignArrayRead(dst, array, idx_sig, w) => {
-                // Reads an element (abortable on X/out-of-range) AND queues —
-                // the read must still precede every side effect.
-                if side_effects {
-                    return None;
-                }
                 let (first, lo, hi) = array_span(array)?;
                 let isig = *idx_sig as usize;
                 let d = *dst as usize;
@@ -11672,6 +11713,26 @@ pub fn lower_two_state(
                     || d >= signal_widths.len()
                     || signal_real[d]
                 {
+                    return None;
+                }
+                // Historically the read was ABORTABLE (X index, X data,
+                // out-of-range), so it had to precede every side effect: a
+                // mid-block bail replays the block 4-state, and queued NBAs
+                // would double-apply. Two of the three abort sources are now
+                // gone — X element DATA is queued as a 4-state Value (the NBA
+                // queue holds Values; see the executor), and an X INDEX is
+                // impossible when the guard covers `isig`. When the array
+                // also spans the index's whole range (RAM with power-of-two
+                // depth: lo == 0, hi >= 2^idx_w - 1), out-of-range is
+                // statically impossible too — the read is then NON-abortable
+                // and may follow side effects. Anything else keeps the old
+                // ordering rule. c906: 536 edge blocks bailed here.
+                let idx_w = signal_widths[isig];
+                let statically_in_range = lo <= 0
+                    && idx_w < 63
+                    && hi >= (1i64 << idx_w) - 1
+                    && !stored.contains(&(isig as u32));
+                if side_effects && !statically_in_range {
                     return None;
                 }
                 note_read(isig, 0, signal_widths[isig], true, stored.contains(&(isig as u32)), &mut reads_whole, &mut reads_slice);
