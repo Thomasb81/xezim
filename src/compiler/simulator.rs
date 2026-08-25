@@ -24050,6 +24050,16 @@ impl Simulator {
             writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
             Self::collect_lhs_writes(&ca.lhs, &self.module, &mut writes);
+            // Substituted port actuals whose bare name collides with a child
+            // declaration arrive ROOT-marked (core rewrite_expr_impl, issue
+            // #128: `.v_node(out_val)` into a module with its own `out_val`).
+            // `collect_expr_reads` flattens the root away, so gather the
+            // rooted names separately: such a read resolves ABSOLUTELY, and
+            // the scope-candidate machinery below must not requalify it back
+            // into the child — that self-loop (dep AND eval on `b0.out_val`)
+            // silently severed the parent feedback path.
+            let mut rooted_reads: HashSet<String> = HashSet::default();
+            Self::collect_rooted_ident_names(&ca.rhs, &mut rooted_reads);
             // A bare LHS that IS a registered top-level signal resolves
             // absolutely — force no scope hint (both inferences would
             // otherwise scope a multi-driven net's folded
@@ -24452,7 +24462,11 @@ impl Simulator {
             let entry_is_bytecode = matches!(&item, CombItem::CompiledContAssign { .. });
             for r in &reads {
                 let mut found = false;
-                if entry_is_bytecode && !r.contains('.') {
+                // Root-marked read: the name is absolute by construction —
+                // never scope-qualify it (bytecode resolve_ident and the AST
+                // resolver both honor the root the same way).
+                let read_is_rooted = rooted_reads.contains(r.as_str());
+                if entry_is_bytecode && !r.contains('.') && !read_is_rooted {
                     if let Some(scope) = &scope_hint {
                         let q = format!("{}.{}", scope, r);
                         if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
@@ -24471,7 +24485,7 @@ impl Simulator {
                     // re-fired when the port copy actually arrived. Register the
                     // scoped id too; a superset sensitivity only costs an extra
                     // evaluation, while missing one loses the value entirely.
-                    if !entry_is_bytecode && !r.contains('.') {
+                    if !entry_is_bytecode && !r.contains('.') && !read_is_rooted {
                         for sc in [scope_hint.as_ref(), write_scope.as_ref()] {
                             if let Some(scope) = sc {
                                 if let Some(&sid) = self
@@ -24492,7 +24506,7 @@ impl Simulator {
                 // lockstep with the signal id the VM will read; otherwise a
                 // successfully compiled entry remains "unresolved" and is
                 // needlessly evaluated on every settle call.
-                if !entry_is_bytecode || r.contains('.') {
+                if (!entry_is_bytecode || r.contains('.')) && !read_is_rooted {
                     if let Some(scope) = &scope_hint {
                         let qualified = format!("{}.{}", scope, r);
                         if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
@@ -28133,6 +28147,93 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// Names of ROOT-marked identifiers (`root = Some("$root")`) in an
+    /// expression — substituted port actuals whose bare name collides with a
+    /// child declaration (core rewrite_expr_impl, issue #128). These resolve
+    /// absolutely; the CA dependency machinery uses this set to keep the
+    /// scope-candidate requalification off them.
+    fn collect_rooted_ident_names(e: &Expression, out: &mut HashSet<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some() {
+                    let name = h
+                        .path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    out.insert(name);
+                }
+                for seg in &h.path {
+                    for sel in &seg.selects {
+                        Self::collect_rooted_ident_names(sel, out);
+                    }
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::collect_rooted_ident_names(left, out);
+                Self::collect_rooted_ident_names(right, out);
+            }
+            ExprKind::Unary { operand, .. } => Self::collect_rooted_ident_names(operand, out),
+            ExprKind::Paren(inner) => Self::collect_rooted_ident_names(inner, out),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::collect_rooted_ident_names(condition, out);
+                Self::collect_rooted_ident_names(then_expr, out);
+                Self::collect_rooted_ident_names(else_expr, out);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    Self::collect_rooted_ident_names(p, out);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                Self::collect_rooted_ident_names(count, out);
+                for p in exprs {
+                    Self::collect_rooted_ident_names(p, out);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                Self::collect_rooted_ident_names(expr, out);
+                Self::collect_rooted_ident_names(index, out);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::collect_rooted_ident_names(expr, out);
+                Self::collect_rooted_ident_names(left, out);
+                Self::collect_rooted_ident_names(right, out);
+            }
+            ExprKind::MemberAccess { expr, .. } => Self::collect_rooted_ident_names(expr, out),
+            ExprKind::Call { func, args } => {
+                Self::collect_rooted_ident_names(func, out);
+                for a in args {
+                    Self::collect_rooted_ident_names(a, out);
+                }
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    Self::collect_rooted_ident_names(a, out);
+                }
+            }
+            ExprKind::AssignmentPattern(items) => {
+                for it in items {
+                    Self::collect_rooted_ident_names(it.expr(), out);
+                }
+            }
+            ExprKind::Inside { expr, ranges } => {
+                Self::collect_rooted_ident_names(expr, out);
+                for r in ranges {
+                    Self::collect_rooted_ident_names(r, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn collect_expr_reads(
