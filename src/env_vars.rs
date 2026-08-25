@@ -83,6 +83,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_FUSE_CHAINS", "Settle: opt-in (1) merge of single-reader comb chains into one entry; neutral on ibex, for chain-heavy designs"),
     ("XEZIM_FUSE_CONST", "Bytecode: enable constant-operand fusion (0/1)"),
     ("XEZIM_FUSE_MOVEFWD", "Bytecode: enable Move-into-assign forwarding (0/1)"),
+    ("XEZIM_FUSE_SCRUBS", "Bytecode: enable provably-unsigned sign-scrub elision (0/1)"),
     ("XEZIM_GIT_DATE", "Build metadata: git date baked into --version (build-time)"),
     ("XEZIM_GIT_HASH", "Build metadata: git hash baked into --version (build-time)"),
     ("XEZIM_HOT_STATS", "Print hottest comb entries / edge blocks at end of sim"),
