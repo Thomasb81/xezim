@@ -16240,6 +16240,48 @@ impl Simulator {
         }
     }
 
+    /// Does the subtree contain a statement-level `@(...)` EVENT control?
+    /// Same displacement class as `stmt_contains_delay_control`, nested-wait
+    /// flavor: on the edge path a body `@(posedge clk)` / `repeat (n)
+    /// @(posedge clk)` executes as if it were absent (the synchronous
+    /// executor cannot suspend), so a credit-paced response block streamed
+    /// its beats back-to-back and its `resp_vld` handshake alternated. Such
+    /// a body must be a PROCESS: the park machinery suspends at the inner
+    /// wait and §9.2.2 miss-edges-while-busy semantics match the reference.
+    /// The block's OWN head control was already stripped by
+    /// `extract_sensitivity`, so any event control seen here is nested.
+    fn stmt_contains_event_control(stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::TimingControl { control, stmt: inner } => {
+                matches!(control, TimingControl::Event(_))
+                    || Self::stmt_contains_event_control(inner)
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_contains_event_control)
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::stmt_contains_event_control(then_stmt)
+                    || else_stmt
+                        .as_ref()
+                        .is_some_and(|e| Self::stmt_contains_event_control(e))
+            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| Self::stmt_contains_event_control(&it.stmt)),
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. } => Self::stmt_contains_event_control(body),
+            _ => false,
+        }
+    }
+
     fn count_timing_controls(stmt: &Statement) -> usize {
         match &stmt.kind {
             StatementKind::TimingControl { stmt: inner, .. } => {
@@ -16694,6 +16736,11 @@ impl Simulator {
                     // star_sensitivity suite's defect #1). Level blocks keep
                     // their established edge-path delay handling.
                     || (!all_level && Self::stmt_contains_delay_control(&body))
+                    // A nested `@(...)` wait is the same class: the edge
+                    // path's synchronous executor cannot suspend, so it ran
+                    // the inner wait as a no-op (a `repeat (lat) @(posedge
+                    // clk)` paced response streamed with zero latency).
+                    || (!all_level && Self::stmt_contains_event_control(&body))
                 {
                     let forever_stmt = Statement::new(
                         StatementKind::Forever {
@@ -50655,15 +50702,62 @@ impl Simulator {
                 // `[msb:lsb]` form has two indices (LRM §7.4.1 / §11.5.1).
                 let mut li = self.eval_expr(left).to_i64().unwrap_or(0);
                 let mut ri = self.eval_expr(right).to_i64().unwrap_or(0);
-                if let ExprKind::Ident(h) = &expr.kind {
-                    let nm = self.resolve_hier_name(h);
-                    if let Some(dims) = self.module.packed_full_dims.get(&nm) {
-                        if let Some(&(dl, dr)) = dims.first() {
-                            let lo_b = dl.min(dr);
-                            if lo_b != 0 {
-                                li -= lo_b;
-                                if matches!(kind, RangeKind::Constant) {
-                                    ri -= lo_b;
+                {
+                    // Walk through Index layers so an ELEMENT of an unpacked
+                    // array/queue/assoc honours the declared bound too:
+                    // `logic [31:8] q[$]; q[0][31:8]` selects the whole
+                    // element (the mem_resp MWE read xxabcd — bits 23:8 plus
+                    // out-of-range x — instead of the element). Layers beyond
+                    // the collection's unpacked depth consume PACKED dims
+                    // (`logic [1:0][31:8] p; p[0][31:8]` → dims[1]).
+                    let mut base_e: &Expression = expr;
+                    let mut layers = 0usize;
+                    while let ExprKind::Index { expr: inner, .. } = &base_e.kind {
+                        base_e = inner;
+                        layers += 1;
+                    }
+                    if let ExprKind::Ident(h) = &base_e.kind {
+                        let nm = self.resolve_hier_name(h);
+                        if let Some(dims) = self.module.packed_full_dims.get(&nm) {
+                            let mut udepth = if let Some((sh, _)) = self.module.arrays_nd.get(&nm) {
+                                sh.len()
+                            } else if self.module.arrays_2d.contains_key(&nm) {
+                                2
+                            } else if self.module.arrays.contains_key(&nm)
+                                || self.module.dynamic_arrays.contains(&nm)
+                                || self.module.associative_arrays.contains_key(&nm)
+                            {
+                                1
+                            } else {
+                                0
+                            };
+                            // Element-is-collection (array of queues): the
+                            // flat element keys `nm[...]` add one more
+                            // unpacked layer.
+                            if udepth > 0 && layers > udepth {
+                                let elem_prefix = format!("{}[", nm);
+                                if self
+                                    .module
+                                    .dynamic_arrays
+                                    .iter()
+                                    .any(|k| k.starts_with(elem_prefix.as_str()))
+                                    || self
+                                        .module
+                                        .associative_arrays
+                                        .keys()
+                                        .any(|k| k.starts_with(elem_prefix.as_str()))
+                                {
+                                    udepth += 1;
+                                }
+                            }
+                            let consumed = layers.saturating_sub(udepth);
+                            if let Some(&(dl, dr)) = dims.get(consumed) {
+                                let lo_b = dl.min(dr);
+                                if lo_b != 0 {
+                                    li -= lo_b;
+                                    if matches!(kind, RangeKind::Constant) {
+                                        ri -= lo_b;
+                                    }
                                 }
                             }
                         }
