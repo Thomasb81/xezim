@@ -20532,6 +20532,10 @@ impl Simulator {
                 // the embedded constant, which the elided `LoadConst` would
                 // have cloned into `vm_regs[r]` verbatim — so the 4-state,
                 // signedness and §5.7.1 `is_fill` rules cannot drift.
+                Insn::BinOpConstAdd2(a) => {
+                    vm_regs[a.d1 as usize] = vm_regs[a.s1 as usize].add(&a.k1);
+                    vm_regs[a.d2 as usize] = vm_regs[a.s2 as usize].add(&a.k2);
+                }
                 Insn::BinOpConst(d, s, k, kind) => {
                     use super::bytecode::BinOpConstKind as K;
                     let (d, s) = (*d as usize, *s as usize);
@@ -21161,6 +21165,10 @@ impl Simulator {
                 // the embedded constant, which the elided `LoadConst` would
                 // have cloned into `vm_regs[r]` verbatim — so the 4-state,
                 // signedness and §5.7.1 `is_fill` rules cannot drift.
+                Insn::BinOpConstAdd2(a) => {
+                    vm_regs[a.d1 as usize] = vm_regs[a.s1 as usize].add(&a.k1);
+                    vm_regs[a.d2 as usize] = vm_regs[a.s2 as usize].add(&a.k2);
+                }
                 Insn::BinOpConst(d, s, k, kind) => {
                     use super::bytecode::BinOpConstKind as K;
                     let (d, s) = (*d as usize, *s as usize);
@@ -22272,6 +22280,29 @@ impl Simulator {
                 // verbatim (width/is_signed/is_real/is_fill included) — same
                 // `vm_*` fast helper, same `Value` fallback, so the 4-state,
                 // signedness and §5.7.1 `is_fill` rules cannot drift.
+                Insn::BinOpConstAdd2(a) => {
+                    // Each half runs EXACTLY the K::Add path below — same
+                    // vm_add_sub fast helper, same Value fallback — so the
+                    // superinstruction cannot drift from the pair it merged.
+                    match vm_add_sub(&self.vm_regs[a.s1 as usize], &a.k1, false) {
+                        Some((v, x, w, sg)) => {
+                            vm_store(&mut self.vm_regs[a.d1 as usize], v, x, w, sg)
+                        }
+                        None => {
+                            self.vm_regs[a.d1 as usize] =
+                                self.vm_regs[a.s1 as usize].add(&a.k1)
+                        }
+                    }
+                    match vm_add_sub(&self.vm_regs[a.s2 as usize], &a.k2, false) {
+                        Some((v, x, w, sg)) => {
+                            vm_store(&mut self.vm_regs[a.d2 as usize], v, x, w, sg)
+                        }
+                        None => {
+                            self.vm_regs[a.d2 as usize] =
+                                self.vm_regs[a.s2 as usize].add(&a.k2)
+                        }
+                    }
+                }
                 Insn::BinOpConst(d, s, k, kind) => {
                     use super::bytecode::BinOpConstKind as K;
                     let (d, s) = (*d as usize, *s as usize);
@@ -31767,6 +31798,10 @@ impl Simulator {
                 "[FUSE] provably-unsigned scrubs elided (static sites): {}",
                 super::bytecode::elided_scrub_count()
             );
+            eprintln!(
+                "[FUSE] AddC2 superinstructions (static sites): {}",
+                super::bytecode::addc2_count()
+            );
         }
         // XEZIM_OPCODE_CENSUS=1: dynamic opcode + adjacent-pair histogram for
         // fusion planning. Top-20 of each, with % of total executed insns.
@@ -32523,6 +32558,7 @@ impl Simulator {
             Insn::NbaAssignArrayRead(..) => "NbaAssignArrayRead",
             // Split by kind: the pair census is only useful if the three
             // fused ALU ops stay distinguishable.
+            Insn::BinOpConstAdd2(..) => "AddC2",
             Insn::BinOpConst(_, _, _, k) => match k {
                 super::bytecode::BinOpConstKind::Add => "BinOpConstAdd",
                 super::bytecode::BinOpConstKind::Eq => "BinOpConstEq",

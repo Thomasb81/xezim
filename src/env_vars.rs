@@ -79,6 +79,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_FORCE_PARALLEL", "Parallel: force parallel dispatch even below thresholds"),
     ("XEZIM_FOREACH_REPLAY_LIMIT", "Bytecode: max foreach unroll replay count"),
     ("XEZIM_FUSE", "Bytecode: enable/disable insn fusion peepholes (0/1)"),
+    ("XEZIM_FUSE_ADDC2", "Bytecode: opt-in AddC2 superinstruction formation (1 enables)"),
     ("XEZIM_FUSE_ARRNBA", "Bytecode: enable LoadSignal;LoadArrayElem;NbaAssign fusion (0/1)"),
     ("XEZIM_FUSE_CHAINS", "Settle: opt-in (1) merge of single-reader comb chains into one entry; neutral on ibex, for chain-heavy designs"),
     ("XEZIM_FUSE_CONST", "Bytecode: enable constant-operand fusion (0/1)"),

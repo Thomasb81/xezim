@@ -85,6 +85,14 @@ static FUSED_MOVE_FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// held an unsigned value already (see `elide_provably_unsigned_scrubs`).
 static ELIDED_SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Static count of `AddC ; AddC` pairs merged into one `BinOpConstAdd2`
+/// dispatch (see `fuse_addc2`).
+static FUSED_ADDC2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn addc2_count() -> u64 {
+    FUSED_ADDC2.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn elided_scrub_count() -> u64 {
     ELIDED_SCRUBS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -106,6 +114,16 @@ pub fn binop_const_fusions() -> [u64; BinOpConstKind::COUNT] {
 /// constant-fed ALU ops the census actually shows (`Add`, `Eq`, `CaseEq`)
 /// keeps the `Insn` enum — and the ~25 analysis sites that match on it — with
 /// a single new case to reason about instead of three.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AddC2 {
+    pub d1: RegId,
+    pub s1: RegId,
+    pub k1: Value,
+    pub d2: RegId,
+    pub s2: RegId,
+    pub k2: Value,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CmpKind {
     Eq,
@@ -474,6 +492,14 @@ pub enum Insn {
     /// character the unfused arms, so the 4-state, signedness and §5.7.1
     /// `is_fill` rules cannot drift.
     BinOpConst(RegId, RegId, Box<Value>, BinOpConstKind), // (dest, src, const, kind)
+    /// Superinstruction: TWO independent (or chained — executed in order)
+    /// constant adds in ONE dispatch. The c906 opcode census measured
+    /// `AddC -> AddC` as the hottest adjacent pair (415 M, 6.5% of the
+    /// stream) and they are NOT dataflow-foldable (different registers), so
+    /// the win is deleting one trip through the discriminant-load /
+    /// jump-table / indirect-jump dispatch chain per pair. Formed only under
+    /// `XEZIM_FUSE_ADDC2=1` (see `fuse_addc2`).
+    BinOpConstAdd2(Box<AddC2>),
 
     /// Roadmap steps 11-12 (compiled process FSMs): suspend the executing
     /// PROCESS for the delay whose VALUE is in the register (converted to
@@ -546,6 +572,12 @@ impl Insn {
         use Insn::*;
         match self {
             Nop => {}
+            BinOpConstAdd2(a) => {
+                a.d1 += rb;
+                a.s1 += rb;
+                a.d2 += rb;
+                a.s2 += rb;
+            }
             Jump(t) => *t += ib,
             BranchIfSignalFalse(_, t, _) => *t += ib,
             BranchIfFalse(a, t) | BranchUnlessZero(a, t) => {
@@ -709,6 +741,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::NbaAssignArrayRange(..) => "NbaArrRng",
         Insn::NbaAssignArrayRead(..) => "NbaArrRd",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Add) => "AddC",
+        Insn::BinOpConstAdd2(..) => "AddC2",
         Insn::WaitDelayReg(..) => "WaitDly",
         Insn::WaitEdge(..) => "WaitEdge",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Eq) => "EqC",
@@ -8728,6 +8761,7 @@ impl<'a> BytecodeCompiler<'a> {
         // Last, so it sees the final insn stream (fusions above both create
         // and absorb sign scrubs).
         Self::elide_provably_unsigned_scrubs(&mut self.insns, self.signal_signed);
+        Self::fuse_addc2(&mut self.insns);
         Self::compact_nops(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
@@ -8833,6 +8867,7 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::Replicate(_, s, _) => *s == r,
             // Its other operand is the embedded constant, not a register.
             Insn::BinOpConst(_, s, _, _) => *s == r,
+            Insn::BinOpConstAdd2(a) => a.s1 == r || a.s2 == r,
             Insn::BitSelect(_, b, i) => *b == r || *i == r,
             Insn::BitSelectConst(_, b, _) => *b == r,
             Insn::RangeSelect(_, b, l, rr) => *b == r || *l == r || *rr == r,
@@ -9859,6 +9894,11 @@ impl<'a> BytecodeCompiler<'a> {
 
                 // Result width varies per entry; drop tracking for the dest.
                 Insn::CaseLut(d, ..) => store(&mut rw, *d, None),
+                // Two dests; widths follow operand widths — drop tracking.
+                Insn::BinOpConstAdd2(a) => {
+                    store(&mut rw, a.d1, None);
+                    store(&mut rw, a.d2, None);
+                }
                 // Control only; defines nothing.
                 Insn::CaseJump(..) | Insn::CaseMaskJump(..) => {}
                 // Fused compare+branch: the embedded scratch gets the 1-bit
@@ -10378,6 +10418,70 @@ impl<'a> BytecodeCompiler<'a> {
                     clean.remove(&d);
                 }
             }
+        }
+    }
+
+    /// Merge two adjacent constant adds into one `BinOpConstAdd2` dispatch.
+    /// Pure dispatch amortization — both adds still execute, in order, so
+    /// chained (`s2 == d1`) and independent pairs are equally sound; the only
+    /// constraint is that control cannot enter between them. OPT-IN
+    /// (`XEZIM_FUSE_ADDC2=1`): the new variant must stay off until every
+    /// backend either handles it (interpreter, two-state lowering) or bails
+    /// per-block (JIT/AOT return None on unsupported insns) — forming it by
+    /// default would silently change which blocks those backends accept.
+    fn fuse_addc2(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| matches!(std::env::var("XEZIM_FUSE_ADDC2").as_deref(), Ok("1")))
+            || insns.len() < 2
+        {
+            return;
+        }
+        let is_target = Self::branch_target_map(insns);
+        let mut i = 0;
+        while i + 1 < insns.len() {
+            let Insn::BinOpConst(_, _, _, BinOpConstKind::Add) = insns[i] else {
+                i += 1;
+                continue;
+            };
+            let mut j = i + 1;
+            let mut blocked = false;
+            while j < insns.len() {
+                if is_target[j] {
+                    blocked = true;
+                    break;
+                }
+                if !matches!(insns[j], Insn::Nop) {
+                    break;
+                }
+                j += 1;
+            }
+            if blocked || j >= insns.len() {
+                i += 1;
+                continue;
+            }
+            let Insn::BinOpConst(_, _, _, BinOpConstKind::Add) = insns[j] else {
+                i = j;
+                continue;
+            };
+            let Insn::BinOpConst(d1, s1, k1, _) = std::mem::replace(&mut insns[i], Insn::Nop)
+            else {
+                unreachable!()
+            };
+            let Insn::BinOpConst(d2, s2, k2, _) = std::mem::replace(&mut insns[j], Insn::Nop)
+            else {
+                unreachable!()
+            };
+            insns[i] = Insn::BinOpConstAdd2(Box::new(AddC2 {
+                d1,
+                s1,
+                k1: *k1,
+                d2,
+                s2,
+                k2: *k2,
+            }));
+            FUSED_ADDC2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            i = j + 1;
         }
     }
 
@@ -11255,6 +11359,31 @@ pub fn lower_two_state(
                     TsInsn::LogAnd { d, a, b }
                 } else {
                     TsInsn::LogOr { d, a, b }
+                });
+            }
+            Insn::BinOpConstAdd2(a) => {
+                // Exactly the two `AddC` lowerings the pair had before
+                // merging — in order, so a chained `s2 == d1` sees d1's
+                // freshly defined width.
+                let w1 = rw[a.s1 as usize]?;
+                let v1 = clean_const(&a.k1)?;
+                let wr1 = w1.max(a.k1.width);
+                def!(rw, a.d1, wr1);
+                out.push(TsInsn::AddC {
+                    d: a.d1 as u16,
+                    s: a.s1 as u16,
+                    k: v1,
+                    mask: ts_mask(wr1),
+                });
+                let w2 = rw[a.s2 as usize]?;
+                let v2 = clean_const(&a.k2)?;
+                let wr2 = w2.max(a.k2.width);
+                def!(rw, a.d2, wr2);
+                out.push(TsInsn::AddC {
+                    d: a.d2 as u16,
+                    s: a.s2 as u16,
+                    k: v2,
+                    mask: ts_mask(wr2),
                 });
             }
             Insn::BinOpConst(d, s, k, kind) => {
