@@ -31759,6 +31759,10 @@ impl Simulator {
                 f[3],
                 f.iter().sum::<u64>()
             );
+            eprintln!(
+                "[FUSE] Move-into-assign forwards (static sites): {}",
+                super::bytecode::census_pair_fusions()
+            );
         }
         // XEZIM_OPCODE_CENSUS=1: dynamic opcode + adjacent-pair histogram for
         // fusion planning. Top-20 of each, with % of total executed insns.
