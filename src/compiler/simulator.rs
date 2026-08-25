@@ -31763,6 +31763,10 @@ impl Simulator {
                 "[FUSE] Move-into-assign forwards (static sites): {}",
                 super::bytecode::census_pair_fusions()
             );
+            eprintln!(
+                "[FUSE] provably-unsigned scrubs elided (static sites): {}",
+                super::bytecode::elided_scrub_count()
+            );
         }
         // XEZIM_OPCODE_CENSUS=1: dynamic opcode + adjacent-pair histogram for
         // fusion planning. Top-20 of each, with % of total executed insns.

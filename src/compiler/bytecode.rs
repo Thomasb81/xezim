@@ -81,6 +81,14 @@ static FUSED_BINOP_CONST: [std::sync::atomic::AtomicU64; BinOpConstKind::COUNT] 
 /// the assign's value operand (see `forward_move_into_assign`).
 static FUSED_MOVE_FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Static count of `ClearSigned` insns deleted because the register provably
+/// held an unsigned value already (see `elide_provably_unsigned_scrubs`).
+static ELIDED_SCRUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn elided_scrub_count() -> u64 {
+    ELIDED_SCRUBS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn census_pair_fusions() -> u64 {
     FUSED_MOVE_FWD.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -8717,6 +8725,9 @@ impl<'a> BytecodeCompiler<'a> {
         // Move;Resize pattern is disjoint from the Move;Assign one here.
         Self::forward_move_into_assign(&mut self.insns);
         Self::fuse_cmp_branch_move_resize(&mut self.insns);
+        // Last, so it sees the final insn stream (fusions above both create
+        // and absorb sign scrubs).
+        Self::elide_provably_unsigned_scrubs(&mut self.insns, self.signal_signed);
         Self::compact_nops(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
         // when it overflows, so a freshly compiled block can sit on
@@ -9675,6 +9686,12 @@ impl<'a> BytecodeCompiler<'a> {
             if j >= insns.len() {
                 continue;
             }
+            // NOTE (measured 2026-08-25): commutative `l == c` arms were
+            // tried here and are UNREACHABLE — operands compile left-first,
+            // so a LEFT constant's LoadConst is separated from the op by the
+            // right operand's load and never sits in this pass's window. The
+            // 76 M adjacent `LoadConst -> CaseEq` census pairs are therefore
+            // const-RIGHT shapes rejected by the width conditions below.
             let (d, l, kind) = match insns[j] {
                 Insn::Add(d, l, r) if r == c => (d, l, BinOpConstKind::Add),
                 Insn::Eq(d, l, r) if r == c => (d, l, BinOpConstKind::Eq),
@@ -10230,6 +10247,137 @@ impl<'a> BytecodeCompiler<'a> {
             }
             insns[i] = Insn::Nop;
             FUSED_MOVE_FWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Delete `ClearSigned(r)` when `r` provably already holds an UNSIGNED
+    /// value — the scrub is then a no-op and removing it cannot change
+    /// anything.
+    ///
+    /// The c906 opcode census measured ClearSigned at 8.0% of the executed
+    /// stream (506 M / run): sign scrubs are emitted defensively at §11.8.1
+    /// mixed-signedness sites, but most registers already carry unsigned
+    /// values. This is a single forward pass tracking a per-register
+    /// "provably unsigned" set, built only from rules VERIFIED against the
+    /// `Value` method each executor calls:
+    ///
+    /// * compares / case-compares / logical ops -> 1-bit unsigned
+    /// * `bitwise_and/or/xor`, `range_select`, `bit_select`, `concat_refs`
+    ///   -> `is_signed: false` unconditionally
+    /// * `add/sub/mul` -> signed only when BOTH operands signed
+    /// * `shift_left/right`, `bitwise_not`, replicate, `Move`/`MoveResize`
+    ///   -> preserve/propagate the source flag
+    /// * `Resize` extends by the value's own flag and keeps it — no change
+    ///
+    /// Every join point (branch target) wipes the set; any instruction not
+    /// understood wipes the set; `SetSigned` un-cleans its register. All
+    /// three fallbacks only FORGO deletions, never enable a wrong one.
+    fn elide_provably_unsigned_scrubs(insns: &mut [Insn], signal_signed: &[bool]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_FUSE").as_deref(), Ok("0"))
+                && !matches!(std::env::var("XEZIM_FUSE_SCRUBS").as_deref(), Ok("0"))
+        }) || insns.is_empty()
+        {
+            return;
+        }
+        let is_target = Self::branch_target_map(insns);
+        let mut clean: std::collections::HashSet<RegId> = std::collections::HashSet::new();
+        let sig_unsigned =
+            |sig: u32| -> bool { signal_signed.get(sig as usize).is_some_and(|s| !*s) };
+        for i in 0..insns.len() {
+            if is_target[i] {
+                clean.clear();
+            }
+            // set_to(d, c): record the DEST's new cleanliness. Computed before
+            // mutation so a dest that is also a source reads its OLD state.
+            let mut set_to: Option<(RegId, bool)> = None;
+            let mut elide = false;
+            match &insns[i] {
+                Insn::Nop => {}
+                // -- 1-bit unsigned results --
+                Insn::Eq(d, _, _)
+                | Insn::Neq(d, _, _)
+                | Insn::CaseEq(d, _, _)
+                | Insn::CasezEq(d, _, _)
+                | Insn::CasexEq(d, _, _)
+                | Insn::Lt(d, _, _)
+                | Insn::Leq(d, _, _)
+                | Insn::Gt(d, _, _)
+                | Insn::Geq(d, _, _)
+                | Insn::LogAnd(d, _, _)
+                | Insn::LogOr(d, _, _)
+                | Insn::LogNot(d, _) => set_to = Some((*d, true)),
+                // -- unconditionally unsigned constructors --
+                Insn::BitAnd(d, _, _)
+                | Insn::BitOr(d, _, _)
+                | Insn::BitXor(d, _, _)
+                | Insn::LoadSignalBit(d, _, _)
+                | Insn::LoadSignalRange(d, _, _, _)
+                | Insn::Concat(d, _) => set_to = Some((*d, true)),
+                // -- signed only when BOTH operands are --
+                Insn::Add(d, l, r) | Insn::Sub(d, l, r) | Insn::Mul(d, l, r) => {
+                    set_to = Some((*d, clean.contains(l) || clean.contains(r)))
+                }
+                // -- flag preserved / propagated from the source --
+                Insn::BitNot(d, sr)
+                | Insn::Shl(d, sr, _)
+                | Insn::Shr(d, sr, _)
+                | Insn::Replicate(d, sr, _)
+                | Insn::Move(d, sr)
+                | Insn::MoveResize(d, sr, _) => set_to = Some((*d, clean.contains(sr))),
+                Insn::Resize(_, _) => {}
+                Insn::LoadConst(d, v) => set_to = Some((*d, !v.is_signed && !v.is_real)),
+                Insn::LoadSignal(d, sig) => set_to = Some((*d, sig_unsigned(*sig))),
+                Insn::LoadSignalSigned(d, _) => set_to = Some((*d, false)),
+                Insn::BinOpConst(d, sr, k, kind) => {
+                    let c = match kind {
+                        BinOpConstKind::Eq | BinOpConstKind::CaseEq | BinOpConstKind::Xor => true,
+                        BinOpConstKind::Add => clean.contains(sr) || !k.is_signed,
+                    };
+                    set_to = Some((*d, c));
+                }
+                Insn::ClearSigned(r) => {
+                    if clean.contains(r) {
+                        elide = true;
+                    } else {
+                        set_to = Some((*r, true));
+                    }
+                }
+                Insn::SetSigned(r) => set_to = Some((*r, false)),
+                // -- no register writes: state flows through --
+                Insn::Jump(_)
+                | Insn::BranchIfFalse(_, _)
+                | Insn::BranchUnlessZero(_, _)
+                | Insn::BranchIfSignalFalse(_, _, _)
+                | Insn::CmpBranch(_, _, _, _, _)
+                | Insn::BlockingAssign(_, _, _)
+                | Insn::NbaAssign(_, _, _)
+                | Insn::BlockingAssignRange(_, _, _, _)
+                | Insn::NbaAssignRange(_, _, _, _)
+                | Insn::BlockingAssignBitDyn(_, _, _)
+                | Insn::NbaAssignBitDyn(_, _, _)
+                | Insn::BlockingAssignArray(_, _, _, _)
+                | Insn::NbaAssignArray(_, _, _, _)
+                | Insn::BlockingAssignArrayRange(_, _, _, _, _)
+                | Insn::NbaAssignArrayRange(_, _, _, _, _)
+                | Insn::NbaAssignArrayRead(_, _, _, _) => {}
+                // -- anything else: unknown effects, forget everything --
+                _ => clean.clear(),
+            }
+            if elide {
+                insns[i] = Insn::Nop;
+                ELIDED_SCRUBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            if let Some((d, c)) = set_to {
+                if c {
+                    clean.insert(d);
+                } else {
+                    clean.remove(&d);
+                }
+            }
         }
     }
 
