@@ -1,7 +1,7 @@
 //! Collection / class write gaps found by audit rounds 8 and 9 (2026-08-24).
-//! Both were PRE-EXISTING (the Aug-22 baseline behaves identically). Round 9 is
-//! now FIXED and runs live; round 8 is still open and stays `#[ignore]`d rather
-//! than deleted, so it starts passing loudly when fixed.
+//! All were PRE-EXISTING (the Aug-22 baseline behaves identically). Rounds 8
+//! and 9 are now FIXED and run live; one narrower case (a reduction METHOD
+//! read, e.g. `q.sum()`) is still open and stays `#[ignore]`d.
 
 use xezim::simulate;
 
@@ -14,26 +14,29 @@ use xezim::simulate;
 /// is what changes the binding. Blocking writes are correct either way, and a
 /// static array with a CA reader is correct, which is what scopes this.
 ///
-/// CORRECTED characterization (an earlier revision of this comment blamed the
-/// NBA and called the damage "permanent and array-wide" — that was wrong):
+/// ROOT CAUSE (measured, after three wrong guesses): the read-set builder gave
+/// a dynamic array ONLY the `<name>.size` proxy dependency, while a fixed array
+/// got per-ELEMENT dependencies:
 ///
-/// * The trigger is the PRESENCE of the continuous assign, not the NBA. With a
-///   CA on the array, every write AFTER the time-0 settle fails to reach any
-///   reader — the CA and a sibling `always_comb` alike, blocking writes
-///   included.
-/// * Writes issued BEFORE the time-0 settle appear to work (the settle just
-///   reads the new value), which is what made it look NBA-specific: an NBA
-///   commits after that settle.
-/// * WITHOUT the CA, a comb reader tracks later writes correctly — so the CA's
-///   presence is what breaks the comb reader too.
+/// ```text
+/// if dynamic_arrays.contains(name) { reads.insert("<name>.size") }
+/// else if arrays.get(name)         { reads.insert("<name>[i]")   }
+/// ```
 ///
-/// A collection element has no signal id, so the write is stored in
-/// `self.signals[<name>[i]]` and readers are woken via the `<name>.size` proxy
-/// (`touch_queue`). Two hypotheses have been tried and FALSIFIED: that the CA
-/// lacks the size-proxy dependency (a CA that demonstrably reads `.size` fails
-/// the same way), and that the element has a signal twin the write path misses
-/// (adding the twin write changed nothing). The next step is to MEASURE the
-/// CA's actual read-dependency set rather than guess again.
+/// But a dynamic array is registered in `module.arrays` too, so its elements
+/// own signal ids, and an element STORE marks those ids — the proxy is only
+/// touched on RESIZE. So a reader of `d[i]` depended solely on something
+/// element writes never mark, and stayed frozen on whatever it saw during the
+/// time-0 settle. A write issued BEFORE that settle appeared to work, which is
+/// what made this look NBA-specific for so long (an NBA commits after it).
+///
+/// Two registered toggles settled it: `XEZIM_DUMP_CA_READS` showed the read
+/// set was literally `{"d.size"}`, and a probe in `touch_queue` showed it is
+/// NEVER called for this shape. Depend on a proxy, never mark the proxy.
+///
+/// Fixed by recording the element dependency for dynamic arrays as well —
+/// constant index for one element, otherwise the declared span — mirroring the
+/// fixed-array arm. Reader-side, no hot-path cost.
 const CA_READER_ON_DYNAMIC: &str = r#"
 module tb;
   logic [7:0] c [], e [];
@@ -117,12 +120,40 @@ fn ok_flag(src: &str) -> u64 {
 }
 
 #[test]
-#[ignore = "open gap: a continuous-assign reader of a dynamic array never sees NBA writes (audit round 8)"]
-fn continuous_assign_reader_of_dynamic_array_sees_nba_writes() {
+fn continuous_assign_reader_of_dynamic_array_sees_element_writes() {
     assert_eq!(ok_flag(CA_READER_ON_DYNAMIC), 1);
 }
 
 #[test]
 fn nba_to_class_property_is_applied() {
     assert_eq!(ok_flag(NBA_TO_CLASS_MEMBER_ARRAY), 1);
+}
+
+/// STILL OPEN — a reduction METHOD read (`q.sum()`) of a collection does not
+/// re-fire on element writes.
+///
+/// Same class as the fixed cases above (the reader does not depend on the
+/// elements) but a different read-set path: a method call, not an index, so
+/// the element-dependency fix does not reach it. Pre-existing; found by audit
+/// round 8's reader cross, where it is now the only remaining failure.
+const REDUCTION_METHOD_READ: &str = r#"
+module tb;
+  logic [7:0] q [$];
+  int r_sum;
+  int ok;
+  always_comb r_sum = q.sum();
+  initial begin
+    q.delete();
+    for (int z = 0; z < 4; ++z) q.push_back(8'd0);
+    for (int k = 0; k < 4; ++k) q[k] <= 8'd1 + k[7:0];
+    #1;
+    ok = (r_sum == 10);                                  // 1+2+3+4
+  end
+endmodule
+"#;
+
+#[test]
+#[ignore = "open gap: a reduction method read (q.sum()) does not re-fire on element writes"]
+fn reduction_method_read_sees_element_writes() {
+    assert_eq!(ok_flag(REDUCTION_METHOD_READ), 1);
 }

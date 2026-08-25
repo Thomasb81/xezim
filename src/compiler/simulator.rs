@@ -27639,6 +27639,28 @@ impl Simulator {
                         // dependency and never re-fired. It now shares the
                         // `.size` proxy the dynamic/queue case uses.
                         reads.insert(format!("{}.size", name));
+                        // ...but the proxy is only touched when the collection
+                        // RESIZES. A dynamic array is registered in
+                        // `module.arrays` as well, so its elements own signal
+                        // ids, and an element STORE marks those ids -- never
+                        // the proxy. Depending on the proxy alone left a reader
+                        // of `d[i]` frozen on whatever it saw during the time-0
+                        // settle: every later write, blocking or NBA, marked an
+                        // id nothing depended on. (A write issued BEFORE that
+                        // settle appeared to work, which is what made this look
+                        // NBA-specific.) Record the element dependency too,
+                        // exactly as the fixed-array arm below does.
+                        if let Some((lo, hi, _)) = module.arrays.get(&name) {
+                            if let Some(i) = Self::constant_array_index(index, module) {
+                                if (*lo..=*hi).contains(&i) {
+                                    reads.insert(format!("{}[{}]", name, i));
+                                }
+                            } else {
+                                for i in *lo..=*hi {
+                                    reads.insert(format!("{}[{}]", name, i));
+                                }
+                            }
+                        }
                     } else if let Some((lo, hi, _)) = module.arrays.get(&name) {
                         if let Some(i) = Self::constant_array_index(index, module) {
                             if (*lo..=*hi).contains(&i) {
