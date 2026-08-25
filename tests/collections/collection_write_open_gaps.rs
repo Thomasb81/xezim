@@ -1,7 +1,6 @@
 //! Collection / class write gaps found by audit rounds 8 and 9 (2026-08-24).
-//! All were PRE-EXISTING (the Aug-22 baseline behaves identically). Rounds 8
-//! and 9 are now FIXED and run live; one narrower case (a reduction METHOD
-//! read, e.g. `q.sum()`) is still open and stays `#[ignore]`d.
+//! All were PRE-EXISTING (the Aug-22 baseline behaves identically) and all are
+//! now FIXED; every case here runs live.
 
 use xezim::simulate;
 
@@ -129,13 +128,15 @@ fn nba_to_class_property_is_applied() {
     assert_eq!(ok_flag(NBA_TO_CLASS_MEMBER_ARRAY), 1);
 }
 
-/// STILL OPEN — a reduction METHOD read (`q.sum()`) of a collection does not
-/// re-fire on element writes.
+/// A reduction METHOD read (`q.sum()`) must re-fire on element writes.
 ///
-/// Same class as the fixed cases above (the reader does not depend on the
-/// elements) but a different read-set path: a method call, not an index, so
-/// the element-dependency fix does not reach it. Pre-existing; found by audit
-/// round 8's reader cross, where it is now the only remaining failure.
+/// Same class as the cases above — the reader did not depend on the elements —
+/// but reached by a different path: `q.sum()` parses as a dotted hierarchical
+/// IDENT, not a member access or an index, so `q.sum` was recorded as the
+/// dependency and resolves to nothing. A continuous assign survived by
+/// accident (an unresolved read re-evaluates every settle) while an
+/// `always_comb` returned 0 forever. Fixed by recording the collection's
+/// elements plus its `.size` proxy for these method names.
 const REDUCTION_METHOD_READ: &str = r#"
 module tb;
   logic [7:0] q [$];
@@ -153,7 +154,6 @@ endmodule
 "#;
 
 #[test]
-#[ignore = "open gap: a reduction method read (q.sum()) does not re-fire on element writes"]
 fn reduction_method_read_sees_element_writes() {
     assert_eq!(ok_flag(REDUCTION_METHOD_READ), 1);
 }

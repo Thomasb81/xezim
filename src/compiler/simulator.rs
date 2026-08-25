@@ -27688,6 +27688,34 @@ impl Simulator {
                 // signal) so a whole-struct write (`bar = ...`) re-fires readers
                 // like `assign foo = bar.bar0`. Without it the dotted name never
                 // receives a change event and the reader stays X.
+                // A COLLECTION query/reduction (`q.sum()`, `d.size()`)
+                // parses as a dotted Ident but is NOT a member signal: the
+                // name `q.sum` resolves to nothing, so the entry depended on
+                // something that never exists. A continuous assign survived
+                // that by accident (an unresolved read re-evaluates on every
+                // settle); an `always_comb` reading `q.sum()` never re-fired
+                // on an element write and returned 0 forever. Depend on what
+                // element writes actually mark: the elements themselves, plus
+                // the `.size` proxy for resize.
+                if let Some(dot) = name.rfind('.') {
+                    let (base, meth) = (&name[..dot], &name[dot + 1..]);
+                    if matches!(
+                        meth,
+                        "sum" | "product" | "min" | "max" | "and" | "or" | "xor" | "size" | "num"
+                    ) && (module.dynamic_arrays.contains(base)
+                        || module.queue_vars.contains(base)
+                        || module.associative_arrays.contains_key(base))
+                    {
+                        let base = base.to_string();
+                        reads.insert(format!("{}.size", base));
+                        if let Some((lo, hi, _)) = module.arrays.get(&base) {
+                            for i in *lo..=*hi {
+                                reads.insert(format!("{}[{}]", base, i));
+                            }
+                        }
+                        return;
+                    }
+                }
                 if let Some(dot) = name.rfind('.') {
                     let parent = &name[..dot];
                     if !module.signals.contains_key(&name)
@@ -49199,6 +49227,22 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // §7.4.6 / §11.5.1: an x/z index reads x at the ELEMENT width,
+                // NOT element 0. `to_u64`/`to_i64` mask x bits to zero and
+                // never fail, so every `unwrap_or` below silently addressed
+                // element 0 and an unknown index returned real array data.
+                // Only for a side-effect-free index, so the extra evaluation
+                // cannot run a call twice.
+                if let ExprKind::Ident(h) = &expr.kind
+                    && Self::cond_expr_is_effect_free(index)
+                {
+                    let nm = self.resolve_hier_name(h);
+                    if let Some(&(_, _, ew)) = self.module.arrays.get(&nm) {
+                        if self.eval_expr(index).has_xz() {
+                            return Value::new(ew.max(1));
+                        }
+                    }
+                }
                 // §7.4.2: `arr[i]…[j].field[k]` over a PACKED array of packed
                 // structs. `arr[i]` is a bit slice of one backing vector, so
                 // there is no `arr[i]` signal to select from — resolve the
