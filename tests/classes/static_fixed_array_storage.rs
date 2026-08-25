@@ -157,3 +157,63 @@ fn test_static_fixed_array_declaration_forms() {
     // Class-scoped write with no instance involved.
     assert!(has("SCOPED_77"), "C::S[i] scoped write: {:?}", msgs);
 }
+
+// ── follow-ups landed with the merge ──────────────────────────────────
+// §6.8: a 4-STATE element type defaults to x, not 0 — the initial element
+// build used Value::zero unconditionally, so `static logic [7:0] L[2]`
+// read 00000000 where the LRM (and the reference simulator) give x.
+const STATIC_FIXED_ARRAY_XDEFAULT_SRC: &str = r#"
+module top;
+  class C;
+    static logic [7:0] L[2];
+    static int         I[2];
+  endclass
+  initial begin
+    C c = new();
+    $display("XD_%b_%0d", c.L[0], c.I[0]);
+  end
+endmodule
+"#;
+
+#[test]
+fn test_static_fixed_array_4state_defaults_x() {
+    let sim = simulate(STATIC_FIXED_ARRAY_XDEFAULT_SRC, 200).expect("simulate failed");
+    let msgs = messages(&sim);
+    assert!(
+        msgs.iter().any(|m| m == "XD_xxxxxxxx_0"),
+        "4-state static array element must default x (2-state stays 0): {:?}",
+        msgs
+    );
+}
+
+// DOCUMENTING test, not an endorsement: the store is keyed by the BARE
+// member name (the static_collections convention), so two classes declaring
+// the same static array name share one store — §8.9 wants one copy per
+// class. Until the key is class-qualified, elaboration warns loudly; this
+// test pins both the warning and the current (shared) behavior so a future
+// keying fix knows exactly what it is changing.
+const STATIC_FIXED_ARRAY_COLLISION_SRC: &str = r#"
+module top;
+  class A; static int S[2]; endclass
+  class B; static int S[2]; endclass
+  initial begin
+    A a = new(); B b = new();
+    a.S[0] = 11; b.S[0] = 99;
+    $display("COLL_%0d_%0d", a.S[0], b.S[0]);
+  end
+endmodule
+"#;
+
+#[test]
+fn test_static_fixed_array_cross_class_collision_warns() {
+    let sim = simulate(STATIC_FIXED_ARRAY_COLLISION_SRC, 200).expect("simulate failed");
+    let msgs = messages(&sim);
+    // Current behavior: shared store (last write wins through both handles).
+    assert!(
+        msgs.iter().any(|m| m == "COLL_99_99"),
+        "documented shared-store behavior changed — if this now prints \
+         COLL_11_99 the §8.9 keying fix landed; update this test to assert \
+         the correct isolation and drop the warning check: {:?}",
+        msgs
+    );
+}

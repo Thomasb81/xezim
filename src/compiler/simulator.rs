@@ -11881,18 +11881,62 @@ impl Simulator {
         // `<handle>#name`. Bounds are real (not the 0..63 queue buffer), and
         // every element is defaulted so an index read or `foreach` sees a
         // populated range instead of x.
-        let static_fixed: Vec<(String, i64, i64, u32)> = self
+        let static_fixed: Vec<(String, String, i64, i64, u32)> = self
             .module
             .classes
             .values()
-            .flat_map(|c| c.static_fixed_arrays.iter().cloned())
+            .flat_map(|c| {
+                c.static_fixed_arrays
+                    .iter()
+                    .map(|(n, lo, hi, w)| (c.name.clone(), n.clone(), *lo, *hi, *w))
+            })
             .collect();
-        for (name, lo, hi, width) in static_fixed {
+        // §8.9 gives one copy PER CLASS, but the store is keyed by the BARE
+        // member name (matching the static_collections convention) — two
+        // classes declaring the same static array name would silently share
+        // one store. Until the key is class-qualified, make that loud.
+        {
+            let mut owner: HashMap<&str, &str> = HashMap::default();
+            for (cls, name, ..) in &static_fixed {
+                match owner.entry(name.as_str()) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(cls.as_str());
+                    }
+                    std::collections::hash_map::Entry::Occupied(o) => {
+                        if *o.get() != cls.as_str() {
+                            eprintln!(
+ "[xezim][warning] static array '{}' is declared by both class '{}' and class '{}' — the flat store is shared, so writes through one class are visible through the other (IEEE 1800-2017 §8.9 wants one copy per class). Rename one of them to keep the stores separate.",
+                                name,
+                                o.get(),
+                                cls
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for (cls, name, lo, hi, width) in static_fixed {
             self.module.arrays.entry(name.clone()).or_insert((lo, hi, width));
+            // §6.8: a 4-STATE element type defaults to x, not 0 — only
+            // two-state elements (int/byte/bit...) start at zero. The
+            // declared type is on the owning class's property table.
+            let two_state = self
+                .module
+                .classes
+                .get(&cls)
+                .and_then(|c| c.property_types.get(&name))
+                .is_some_and(|dt| {
+                    super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
+                });
+            let default = if two_state {
+                Value::zero(width)
+            } else {
+                Value::all_x(width)
+            };
             for i in lo..=hi {
                 let elem = format!("{}[{}]", name, i);
                 self.widths.insert(elem.clone(), width);
-                self.signals.entry(elem).or_insert_with(|| Value::zero(width));
+                self.signals.entry(elem).or_insert_with(|| default.clone());
             }
         }
 
