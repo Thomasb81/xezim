@@ -45168,6 +45168,42 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                // §7.4.1 / §11.5.1: BIT write into an ELEMENT of an unpacked
+                // array/queue/assoc whose declared packed range needs label
+                // mapping (`logic [31:8] a[0:0]; a[0][8] = b` — storage bit
+                // 0, not 8; ascending mirrors). The arms below all treat the
+                // trailing index as a raw storage offset, so the write landed
+                // on the wrong bit. Width must match the dim exactly — a
+                // multi-packed element's trailing index selects a SLICE and
+                // belongs to the packed-element machinery below.
+                if let Some((dl, dr)) = self.select_base_elem_dim(expr) {
+                    if dl < dr || dl.min(dr) != 0 {
+                        let dim_w = (dl - dr).unsigned_abs() + 1;
+                        if let Some(en) = self.flat_member_name(expr) {
+                            if let Some(cur) = self.get_signal_value_by_name(&en) {
+                                if cur.width as u64 == dim_w {
+                                    let idx_v = self.eval_expr(index);
+                                    if idx_v.has_xz() {
+                                        return false; // §11.5.1: x/z index selects nothing
+                                    }
+                                    let l = idx_v.to_i64().unwrap_or(i64::MIN);
+                                    let phys = if dl >= dr { l - dr } else { dr - l };
+                                    if phys < 0 || phys >= cur.width as i64 {
+                                        return false; // out-of-range bit write discarded
+                                    }
+                                    let nb = val.get_bit(0);
+                                    let changed = cur.get_bit(phys as usize) != nb;
+                                    if changed {
+                                        let mut nv = cur;
+                                        nv.set_bit(phys as usize, nb);
+                                        self.set_signal_value_by_name(&en, nv);
+                                    }
+                                    return changed;
+                                }
+                            }
+                        }
+                    }
+                }
                 // §7.4.1: packed ELEMENT write on a plain packed-of-packed
                 // variable (`u8_vec16_t y; y[i] = v;`) — splice
                 // [i*ew +: ew], honoring the by-NAME storage of
@@ -46386,6 +46422,7 @@ impl Simulator {
                 // than bit — so each of those must keep the RAW indices and is
                 // excluded here. Bit-selects are already correct in both
                 // directions; this closes the part-select WRITE gap.
+                let mut elem_ascending_dim: Option<(i64, i64)> = None;
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
                     let is_multi_d = self
@@ -46414,6 +46451,22 @@ impl Simulator {
                                 }
                             }
                         }
+                    }
+                } else if let Some((dl, dr)) = self.select_base_elem_dim(expr) {
+                    // ELEMENT of an unpacked array/queue/assoc, same mapping
+                    // as the read side: descending offsets the labels here;
+                    // an ascending dim mirrors msb/lsb after they are formed
+                    // (the plain-Ident ascending block below stays untouched).
+                    if dl >= dr {
+                        let lo_b = dr;
+                        if lo_b != 0 {
+                            li -= lo_b;
+                            if matches!(kind, RangeKind::Constant) {
+                                ri -= lo_b;
+                            }
+                        }
+                    } else {
+                        elem_ascending_dim = Some((dl, dr));
                     }
                 }
                 let (msb_i, lsb_i): (i64, i64) = match kind {
@@ -46489,6 +46542,18 @@ impl Simulator {
                             msb = new_msb;
                             lsb = new_lsb;
                         }
+                    } else if let Some((dl, dr)) = elem_ascending_dim {
+                        // Ascending ELEMENT dim (`logic [0:23] a[0:0];
+                        // a[0][0:7] = v`): labels mirror against the right
+                        // bound — physical = right - label — so the formed
+                        // [msb:lsb] label pair swaps and shifts as one.
+                        let _ = dl;
+                        let (new_msb, new_lsb) = (
+                            (dr - lsb as i64).max(0) as usize,
+                            (dr - msb as i64).max(0) as usize,
+                        );
+                        msb = new_msb;
+                        lsb = new_lsb;
                     }
                 }
                 // Unpacked array slice assignment: copy element-by-element
@@ -47153,6 +47218,36 @@ impl Simulator {
                             }
                         }
                     }
+                    // Deeper chains (array-of-queues element:
+                    // `qa[0][0][31:24] = v`): the arm above resolves only ONE
+                    // Index layer — build the flat element name for the whole
+                    // chain and apply the same read-modify-write.
+                    if let Some(ename) = self.flat_member_name(expr) {
+                        if let Some(cur) = self.get_signal_value_by_name(&ename) {
+                            let w = cur.width as usize;
+                            let mut nv = cur.clone();
+                            let mut changed = false;
+                            let hi2 = msb.min(w.saturating_sub(1));
+                            let base = if src_base < 0 { src_base } else { lsb as i64 };
+                            if msb_i >= 0 && hi2 >= lsb {
+                                for i in lsb..=hi2 {
+                                    let src = i as i64 - base;
+                                    if src < 0 {
+                                        continue;
+                                    }
+                                    let nb = val.get_bit(src as usize);
+                                    if nv.get_bit(i) != nb {
+                                        nv.set_bit(i, nb);
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            if changed {
+                                self.set_signal_value_by_name(&ename, nv);
+                            }
+                            return changed;
+                        }
+                    }
                 }
                 false
             }
@@ -47777,6 +47872,68 @@ impl Simulator {
 
     /// §7.4.1: bit offset of ELEMENT `idx` of the packed multi-D signal
     /// `name`, normalized against the declared outer dimension — a descending
+    /// Declared packed dimension a trailing bit/part select on `base` indexes
+    /// into, when `base` is a chain of Index layers over an identifier —
+    /// an ELEMENT of an unpacked array/queue/assoc (`logic [31:8] q[$];
+    /// q[0][31:8]`), or a packed element (`logic [1:0][31:8] p; p[0][...]`).
+    /// Index layers up to the collection's unpacked depth consume no packed
+    /// dims; each further layer consumes one. Returns the ORIENTED (left,
+    /// right) pair so callers can map labels for both a non-zero lower bound
+    /// and an ascending range: physical = label - right (descending) /
+    /// right - label (ascending). None for a plain Ident base (layers = 0 —
+    /// the existing plain-signal paths own that) or when nothing is recorded.
+    fn select_base_elem_dim(&self, base: &Expression) -> Option<(i64, i64)> {
+        let mut cur = base;
+        let mut layers = 0usize;
+        while let ExprKind::Index { expr: inner, .. } = &cur.kind {
+            cur = inner;
+            layers += 1;
+        }
+        if layers == 0 {
+            return None;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        let nm = self.resolve_hier_name(h);
+        let dims = self.module.packed_full_dims.get(&nm)?;
+        let mut udepth = if let Some((sh, _)) = self.module.arrays_nd.get(&nm) {
+            sh.len()
+        } else if self.module.arrays_2d.contains_key(&nm) {
+            2
+        } else if self.module.arrays.contains_key(&nm)
+            || self.module.dynamic_arrays.contains(&nm)
+            || self.module.associative_arrays.contains_key(&nm)
+        {
+            1
+        } else {
+            0
+        };
+        // Element-is-collection (array of queues): the flat element keys
+        // `nm[...]` add one more unpacked layer.
+        if udepth > 0 && layers > udepth {
+            let elem_prefix = format!("{}[", nm);
+            if self
+                .module
+                .dynamic_arrays
+                .iter()
+                .any(|k| k.starts_with(elem_prefix.as_str()))
+                || self
+                    .module
+                    .associative_arrays
+                    .keys()
+                    .any(|k| k.starts_with(elem_prefix.as_str()))
+            {
+                udepth += 1;
+            }
+        }
+        if layers < udepth {
+            // An unpacked SLICE (a row of a 2-D array), not a packed element.
+            return None;
+        }
+        dims.get(layers - udepth).copied()
+    }
+
     /// `[N-1:0]` maps idx→(idx-lo)·w, an ASCENDING `[0:N-1]` mirrors the slot
     /// order (element 0 is the TOP slot). The raw `idx*elem_w` computation is
     /// only right for the normalized descending case.
@@ -50702,64 +50859,64 @@ impl Simulator {
                 // `[msb:lsb]` form has two indices (LRM §7.4.1 / §11.5.1).
                 let mut li = self.eval_expr(left).to_i64().unwrap_or(0);
                 let mut ri = self.eval_expr(right).to_i64().unwrap_or(0);
-                {
-                    // Walk through Index layers so an ELEMENT of an unpacked
-                    // array/queue/assoc honours the declared bound too:
-                    // `logic [31:8] q[$]; q[0][31:8]` selects the whole
-                    // element (the mem_resp MWE read xxabcd — bits 23:8 plus
-                    // out-of-range x — instead of the element). Layers beyond
-                    // the collection's unpacked depth consume PACKED dims
-                    // (`logic [1:0][31:8] p; p[0][31:8]` → dims[1]).
-                    let mut base_e: &Expression = expr;
-                    let mut layers = 0usize;
-                    while let ExprKind::Index { expr: inner, .. } = &base_e.kind {
-                        base_e = inner;
-                        layers += 1;
-                    }
-                    if let ExprKind::Ident(h) = &base_e.kind {
+                // Plain packed vector: the declared lower bound offsets the
+                // labels (`logic [7:4] v; v[6:5]` → storage bits [2:1]),
+                // mirroring the WRITE path. Ascending plain vectors were
+                // intercepted by the ascending arm above.
+                let plain_dim: Option<(i64, i64)> = match &expr.kind {
+                    ExprKind::Ident(h) => {
                         let nm = self.resolve_hier_name(h);
-                        if let Some(dims) = self.module.packed_full_dims.get(&nm) {
-                            let mut udepth = if let Some((sh, _)) = self.module.arrays_nd.get(&nm) {
-                                sh.len()
-                            } else if self.module.arrays_2d.contains_key(&nm) {
-                                2
-                            } else if self.module.arrays.contains_key(&nm)
-                                || self.module.dynamic_arrays.contains(&nm)
-                                || self.module.associative_arrays.contains_key(&nm)
-                            {
-                                1
-                            } else {
-                                0
-                            };
-                            // Element-is-collection (array of queues): the
-                            // flat element keys `nm[...]` add one more
-                            // unpacked layer.
-                            if udepth > 0 && layers > udepth {
-                                let elem_prefix = format!("{}[", nm);
-                                if self
-                                    .module
-                                    .dynamic_arrays
-                                    .iter()
-                                    .any(|k| k.starts_with(elem_prefix.as_str()))
-                                    || self
-                                        .module
-                                        .associative_arrays
-                                        .keys()
-                                        .any(|k| k.starts_with(elem_prefix.as_str()))
-                                {
-                                    udepth += 1;
-                                }
+                        self.module
+                            .packed_full_dims
+                            .get(&nm)
+                            .and_then(|d| d.first())
+                            .copied()
+                    }
+                    _ => None,
+                };
+                if let Some((dl, dr)) = plain_dim.filter(|&(l, r)| l >= r) {
+                    let _ = dl;
+                    if dr != 0 {
+                        li -= dr;
+                        if matches!(kind, RangeKind::Constant) {
+                            ri -= dr;
+                        }
+                    }
+                } else if let Some((dl, dr)) = self.select_base_elem_dim(expr) {
+                    // ELEMENT of an unpacked array/queue/assoc (or a packed
+                    // element): `logic [31:8] q[$]; q[0][31:8]` selects the
+                    // whole element (this read xxabcd — bits 23:8 plus
+                    // out-of-range x — before). Descending offsets the labels
+                    // by the low bound; an ASCENDING dim mirrors them
+                    // (physical = right - label), handled by a direct select
+                    // since the shared tail below is descending-only.
+                    if dl < dr {
+                        let phys_hi: i64;
+                        let phys_lo: i64;
+                        match kind {
+                            RangeKind::Constant => {
+                                phys_hi = dr - li.min(ri);
+                                phys_lo = dr - li.max(ri);
                             }
-                            let consumed = layers.saturating_sub(udepth);
-                            if let Some(&(dl, dr)) = dims.get(consumed) {
-                                let lo_b = dl.min(dr);
-                                if lo_b != 0 {
-                                    li -= lo_b;
-                                    if matches!(kind, RangeKind::Constant) {
-                                        ri -= lo_b;
-                                    }
-                                }
+                            RangeKind::IndexedUp => {
+                                phys_hi = dr - li;
+                                phys_lo = dr - li - (ri - 1);
                             }
+                            RangeKind::IndexedDown => {
+                                phys_hi = dr - li + (ri - 1);
+                                phys_lo = dr - li;
+                            }
+                        }
+                        if phys_lo >= 0 && phys_hi >= phys_lo {
+                            return base.range_select(phys_hi as usize, phys_lo as usize);
+                        }
+                        return base.range_select_signed(phys_hi, phys_lo);
+                    }
+                    let lo_b = dr.min(dl);
+                    if lo_b != 0 {
+                        li -= lo_b;
+                        if matches!(kind, RangeKind::Constant) {
+                            ri -= lo_b;
                         }
                     }
                 }

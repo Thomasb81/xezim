@@ -4401,6 +4401,71 @@ impl<'a> BytecodeCompiler<'a> {
             .unwrap_or(0)
     }
 
+    /// ASCENDING declared range (`logic [0:23]`): bit/part labels mirror
+    /// against the right bound — the low-bound rebase the emitted insns use
+    /// cannot express that, so such selects must run on the AST interpreter.
+    fn dim_is_ascending(d: Option<(i64, i64)>) -> bool {
+        matches!(d, Some((l, r)) if l < r)
+    }
+
+    /// Trailing bit/part select whose base is an Index CHAIN over a signal
+    /// whose packed dims need label mapping — an ELEMENT of an unpacked
+    /// collection declared `logic [31:8]`/`logic [0:23]` style, or a packed
+    /// element under such an inner dim. The emitted select/store insns index
+    /// raw physical bits, so these shapes must bail to the AST interpreter
+    /// (which maps labels via `select_base_elem_dim`).
+    fn elem_chain_needs_ast(&self, base: &Expression) -> bool {
+        let mut cur = base;
+        let mut layers = 0usize;
+        while let ExprKind::Index { expr: inner, .. } = &cur.kind {
+            cur = inner;
+            layers += 1;
+        }
+        if layers == 0 {
+            return false;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return false;
+        };
+        let raw = Self::hier_raw_name(h);
+        let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+        let Some(dims) = self.packed_full_dims.and_then(|m| {
+            m.get(raw.as_str()).or_else(|| m.get(leaf))
+        }) else {
+            return false;
+        };
+        let is_coll = |n: &str| -> bool {
+            self.array_first_id.is_some_and(|m| m.contains_key(n))
+                || self.multi_dim_arrays.is_some_and(|s| s.contains(n))
+                || self.dynamic_arrays.is_some_and(|s| s.contains(n))
+                || self.queue_vars.is_some_and(|s| s.contains(n))
+                || self.assoc_arrays.is_some_and(|m| m.contains_key(n))
+        };
+        let needs = |d: &(i64, i64)| d.0 < d.1 || d.0.min(d.1) != 0;
+        if is_coll(raw.as_str()) || is_coll(leaf) {
+            // The exact unpacked depth is not knowable here — be
+            // conservative: any mapping dim forces the AST path.
+            dims.iter().any(needs)
+        } else {
+            dims.get(layers).is_some_and(needs)
+        }
+    }
+
+    /// Combined guard for the plain bit/range select and store arms: bail
+    /// when the base needs a label mapping those arms do not emit. A packed
+    /// multi-D Ident base is excluded — its element machinery normalizes
+    /// slots itself (including ascending outer dims).
+    fn sel_base_needs_ast(&self, base: &Expression) -> bool {
+        match &base.kind {
+            ExprKind::Ident(h) => {
+                self.packed_elem_width_of(h).filter(|&w| w > 1).is_none()
+                    && Self::dim_is_ascending(self.packed_outer_dim(h))
+            }
+            ExprKind::Index { .. } => self.elem_chain_needs_ast(base),
+            _ => false,
+        }
+    }
+
     fn flattened_const_range_target(
         &self,
         expr: &Expression,
@@ -6572,6 +6637,13 @@ impl<'a> BytecodeCompiler<'a> {
                 // correct throughout because it goes through the AST
                 // interpreter, which rebases — so the bug only showed in
                 // assign / always_comb / always_ff, which compile to bytecode.
+                //
+                // §7.4.1/§11.5.1: ascending or element-of-collection bases
+                // need label mapping the rebase cannot express — AST only.
+                if self.sel_base_needs_ast(expr) {
+                    self.bail("bit_sel_base_maps");
+                    return None;
+                }
                 let base = self.compile_expr(expr, 0)?;
                 let base_lo = match &expr.kind {
                     ExprKind::Ident(h) => self.declared_low_bound(h),
@@ -6607,6 +6679,12 @@ impl<'a> BytecodeCompiler<'a> {
                 ..
             } => match kind {
                 RangeKind::Constant => {
+                    // §7.4.1/§11.5.1: ascending or element-of-collection
+                    // bases need label mapping — AST path only.
+                    if self.sel_base_needs_ast(expr) {
+                        self.bail("range_sel_base_maps");
+                        return None;
+                    }
                     let base = self.compile_expr(expr, 0)?;
                     if let (Some(l), Some(r)) =
                         (self.eval_const_expr(left), self.eval_const_expr(right))
@@ -6656,6 +6734,12 @@ impl<'a> BytecodeCompiler<'a> {
                     Some(dest)
                 }
                 RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                    // §7.4.1/§11.5.1: ascending or element-of-collection
+                    // bases need label mapping — AST path only.
+                    if self.sel_base_needs_ast(expr) {
+                        self.bail("range_sel_base_maps");
+                        return None;
+                    }
                     // `sig[idx +: W]` / `sig[idx -: W]` — W must be constant.
                     // Emit idx register, then compute hi/lo via Add/Sub with a
                     // const (W-1), and reuse existing RangeSelect insn.
@@ -7172,6 +7256,12 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
             ExprKind::Index { expr, index } => {
+                // §7.4.1/§11.5.1: ascending or element-of-collection bases
+                // need label mapping the stores below do not emit — AST only.
+                if self.sel_base_needs_ast(expr) {
+                    self.bail("nba_sel_base_maps");
+                    return false;
+                }
                 if let Some(id) = self.const_multi_dim_array_elem_signal_id(lhs) {
                     self.emit(Insn::NbaAssign(as_sig_id(id), val_reg, width));
                     return true;
@@ -7253,6 +7343,12 @@ impl<'a> BytecodeCompiler<'a> {
                 right,
                 kind,
             } => {
+                // §7.4.1/§11.5.1: ascending or element-of-collection bases
+                // need label mapping the stores below do not emit — AST only.
+                if self.sel_base_needs_ast(expr) {
+                    self.bail("nba_range_base_maps");
+                    return false;
+                }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(id) = self.lookup_signal_id(hier) {
                         // §7.4.1: rebase declared indices to physical offsets
@@ -7496,6 +7592,14 @@ impl<'a> BytecodeCompiler<'a> {
         // width and the write becomes a no-op. Assumes [N-1:0] outer bounds
         // (the packed-of-packed typedef shape); other locals have no elem
         // entry and keep the bail-to-AST behavior.
+        // §7.4.1/§11.5.1: ascending or element-of-collection select bases
+        // need label mapping the stores below do not emit — AST only.
+        if let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &lhs.kind {
+            if self.sel_base_needs_ast(expr) {
+                self.bail("blocking_sel_base_maps");
+                return false;
+            }
+        }
         if let ExprKind::Index { expr, index } = &lhs.kind {
             if let ExprKind::Ident(h) = &expr.kind {
                 let raw = Self::hier_raw_name(h);
