@@ -77,6 +77,14 @@ static FUSED_BINOP_CONST: [std::sync::atomic::AtomicU64; BinOpConstKind::COUNT] 
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Static count of `Move ; <assign>` pairs where the Move was forwarded into
+/// the assign's value operand (see `forward_move_into_assign`).
+static FUSED_MOVE_FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn census_pair_fusions() -> u64 {
+    FUSED_MOVE_FWD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Static count of constant-operand ALU fusions performed, per
 /// [`BinOpConstKind`] (same index order as the enum).
 pub fn binop_const_fusions() -> [u64; BinOpConstKind::COUNT] {
@@ -8705,6 +8713,9 @@ impl<'a> BytecodeCompiler<'a> {
         // pattern is disjoint from `fuse_array_read_nba`'s, so the order
         // between the two does not matter.
         Self::fuse_binop_const(&mut self.insns);
+        // After fuse_binop_const, before fuse_cmp_branch_move_resize: its
+        // Move;Resize pattern is disjoint from the Move;Assign one here.
+        Self::forward_move_into_assign(&mut self.insns);
         Self::fuse_cmp_branch_move_resize(&mut self.insns);
         Self::compact_nops(&mut self.insns);
         // Trim unused capacity. `Vec::push` doubles the backing buffer
@@ -10107,6 +10118,121 @@ impl<'a> BytecodeCompiler<'a> {
     /// A target that pointed AT a removed `Nop` moves to the next surviving
     /// instruction, which is exactly where control would have arrived anyway;
     /// `len` (one past the end, used by loop exits) maps to the new length.
+    /// Is any instruction after `j` reading `r`? Conservative liveness for
+    /// the census-pair peepholes below: any later read — even one past a
+    /// redefinition — counts as live, which can only forgo an optimization,
+    /// never miscompile one.
+    fn reg_read_after(insns: &[Insn], j: usize, r: RegId) -> bool {
+        insns[j + 1..].iter().any(|x| Self::insn_reads_reg(x, r))
+    }
+
+    /// Branch-target map shared by the census-pair peepholes: rewriting or
+    /// deleting an instruction is only sound when control cannot enter the
+    /// pattern's interior from elsewhere.
+    fn branch_target_map(insns: &[Insn]) -> Vec<bool> {
+        let mut is_target = vec![false; insns.len() + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::CaseJump(_, cj) => {
+                    for &t in cj.table.iter().chain(std::iter::once(&cj.default)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::CaseMaskJump(_, mj) => {
+                    for &t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::CmpBranch(_, _, _, _, t)
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() =>
+                {
+                    is_target[*t as usize] = true;
+                }
+                _ => {}
+            }
+        }
+        is_target
+    }
+
+    /// `Move(d, s) ; <assign whose VALUE reg is d>` → assign reads `s`
+    /// directly, Move deleted.
+    ///
+    /// `propagate_copies` above folds the PRODUCER side (`producer ; Move`
+    /// retargets the producer), but the c906 opcode census showed the
+    /// CONSUMER side alive at scale: `Move -> BlockingAssignRange` was 5.3%
+    /// of all executed instructions (337 M dynamic pairs on cmark it1) —
+    /// the Move's source is produced far earlier, so the producer-side pass
+    /// never sees it. Sound when nothing can jump into the pair's interior
+    /// and `d` has no later reader.
+    fn forward_move_into_assign(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_FUSE").as_deref(), Ok("0"))
+                && !matches!(std::env::var("XEZIM_FUSE_MOVEFWD").as_deref(), Ok("0"))
+        }) || insns.len() < 2
+            || Self::has_backward_branch(insns)
+        {
+            return;
+        }
+        let is_target = Self::branch_target_map(insns);
+        for i in 0..insns.len() - 1 {
+            let Insn::Move(d, s) = insns[i] else {
+                continue;
+            };
+            if d == s {
+                continue;
+            }
+            // Next surviving instruction; only Nops may sit between, and no
+            // branch may land inside (i, j].
+            let mut j = i + 1;
+            let mut blocked = false;
+            while j < insns.len() {
+                if is_target[j] {
+                    blocked = true;
+                    break;
+                }
+                if !matches!(insns[j], Insn::Nop) {
+                    break;
+                }
+                j += 1;
+            }
+            if blocked || j >= insns.len() {
+                continue;
+            }
+            let vref = match &mut insns[j] {
+                Insn::BlockingAssign(_, v, _)
+                | Insn::NbaAssign(_, v, _)
+                | Insn::BlockingAssignRange(_, _, _, v)
+                | Insn::NbaAssignRange(_, _, _, v) => v,
+                _ => continue,
+            };
+            if *vref != d {
+                continue;
+            }
+            if Self::reg_read_after(insns, j, d) {
+                continue;
+            }
+            match &mut insns[j] {
+                Insn::BlockingAssign(_, v, _)
+                | Insn::NbaAssign(_, v, _)
+                | Insn::BlockingAssignRange(_, _, _, v)
+                | Insn::NbaAssignRange(_, _, _, v) => *v = s,
+                _ => unreachable!(),
+            }
+            insns[i] = Insn::Nop;
+            FUSED_MOVE_FWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn compact_nops(insns: &mut Vec<Insn>) {
         if !insns.iter().any(|i| matches!(i, Insn::Nop)) {
             return;
