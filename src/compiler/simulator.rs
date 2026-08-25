@@ -5577,6 +5577,7 @@ impl Simulator {
                     || cd.array_properties.contains_key(pname)
                     || cd.array_nd_properties.contains_key(pname)
                     || cd.static_collections.iter().any(|(n, ..)| n == pname)
+                    || cd.static_fixed_arrays.iter().any(|(n, ..)| n == pname)
                 {
                     continue;
                 }
@@ -5608,6 +5609,27 @@ impl Simulator {
                         }
                         Some(UD::Queue { .. }) | Some(UD::Unsized(_)) => {
                             cd.static_collections.push((pname, false, w));
+                        }
+                        // Fixed-size static array reached through a typedef
+                        // (`typedef int arr_t[3]; static arr_t S;`) — same
+                        // shared-store treatment as the direct declaration
+                        // (see `static_fixed_arrays` in elaborate.rs).
+                        Some(UD::Expression { expr, .. }) => {
+                            if let Some(n) =
+                                super::elaborate::const_eval_i64_with_params(expr, Some(&params))
+                            {
+                                if n > 0 {
+                                    cd.static_fixed_arrays.push((pname, 0, n - 1, w));
+                                }
+                            }
+                        }
+                        Some(UD::Range { left, right, .. }) => {
+                            if let (Some(l), Some(r)) = (
+                                super::elaborate::const_eval_i64_with_params(left, Some(&params)),
+                                super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                            ) {
+                                cd.static_fixed_arrays.push((pname, l.min(r), l.max(r), w));
+                            }
                         }
                         _ => {}
                     }
@@ -11850,6 +11872,27 @@ impl Simulator {
                     .entry(name.clone())
                     .or_insert((0, 63, width));
                 self.set_queue_size(&name, 0);
+            }
+        }
+
+        // Fixed-size static array members (`static int S[3]`) share ONE store
+        // per class (§8.9), so — like the collections above — they register
+        // globally under the bare name rather than per-instance as
+        // `<handle>#name`. Bounds are real (not the 0..63 queue buffer), and
+        // every element is defaulted so an index read or `foreach` sees a
+        // populated range instead of x.
+        let static_fixed: Vec<(String, i64, i64, u32)> = self
+            .module
+            .classes
+            .values()
+            .flat_map(|c| c.static_fixed_arrays.iter().cloned())
+            .collect();
+        for (name, lo, hi, width) in static_fixed {
+            self.module.arrays.entry(name.clone()).or_insert((lo, hi, width));
+            for i in lo..=hi {
+                let elem = format!("{}[{}]", name, i);
+                self.widths.insert(elem.clone(), width);
+                self.signals.entry(elem).or_insert_with(|| Value::zero(width));
             }
         }
 
@@ -78087,6 +78130,12 @@ impl Simulator {
                 {
                     return None;
                 }
+                // A fixed-size STATIC array stores globally under its bare
+                // name, so its `[i]` element leaves are NOT reachable through
+                // the per-instance struct machinery either.
+                if cd.static_fixed_arrays.iter().any(|(n, ..)| n == prop) {
+                    return None;
+                }
                 if let Some(DataType::Struct(su)) = cd.property_types.get(prop) {
                     return Some(su.clone());
                 }
@@ -78904,6 +78953,9 @@ impl Simulator {
                 // too (§7.4.2) — route them to the collection paths, not
                 // the packed-select machinery.
                 || cd.static_collections.iter().any(|(n, _, _)| n == prop)
+                // A fixed-size static array indexes its unpacked dimension
+                // first as well — it is an array, just a globally-stored one.
+                || cd.static_fixed_arrays.iter().any(|(n, ..)| n == prop)
             {
                 return None;
             }
