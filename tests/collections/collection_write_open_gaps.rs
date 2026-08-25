@@ -14,30 +14,26 @@ use xezim::simulate;
 /// is what changes the binding. Blocking writes are correct either way, and a
 /// static array with a CA reader is correct, which is what scopes this.
 ///
-/// Sharpened by probing (audit round 8, continued):
+/// CORRECTED characterization (an earlier revision of this comment blamed the
+/// NBA and called the damage "permanent and array-wide" — that was wrong):
 ///
-/// * The NBA takes the INTENDED path — `resolve_nba_target` returns None for
-///   dynamic arrays and the drain calls `assign_value` with an Index lvalue,
-///   both confirmed with temporary probes. The commit path is identical to the
-///   blocking one that works.
-/// * The damage is PERMANENT and ARRAY-WIDE, not a missed notify. Once ANY
-///   element of the array takes an NBA, EVERY continuous-assign reader of that
-///   array stops updating for good — a later BLOCKING write to the very
-///   element being read does NOT revive it:
+/// * The trigger is the PRESENCE of the continuous assign, not the NBA. With a
+///   CA on the array, every write AFTER the time-0 settle fails to reach any
+///   reader — the CA and a sibling `always_comb` alike, blocking writes
+///   included.
+/// * Writes issued BEFORE the time-0 settle appear to work (the settle just
+///   reads the new value), which is what made it look NBA-specific: an NBA
+///   commits after that settle.
+/// * WITHOUT the CA, a comb reader tracks later writes correctly — so the CA's
+///   presence is what breaks the comb reader too.
 ///
-/// ```text
-/// 1 blocking first : rc=11 direct=11   <- CA working
-/// 2 then NBA       : rc=11 direct=22   <- CA frozen
-/// 3 blocking again : rc=11 direct=33   <- still frozen
-/// ```
-///
-/// * Array-wide: an NBA to `c[1]` freezes a CA reading `c[0]`.
-///
-/// That shape (permanent + array-wide + survives later blocking writes) points
-/// at the array's STORAGE being rebound by the NBA-region write, orphaning the
-/// binding the continuous assign resolved against — not at a dirty-marking
-/// omission. Whoever picks this up should start there rather than in the
-/// notify path.
+/// A collection element has no signal id, so the write is stored in
+/// `self.signals[<name>[i]]` and readers are woken via the `<name>.size` proxy
+/// (`touch_queue`). Two hypotheses have been tried and FALSIFIED: that the CA
+/// lacks the size-proxy dependency (a CA that demonstrably reads `.size` fails
+/// the same way), and that the element has a signal twin the write path misses
+/// (adding the twin write changed nothing). The next step is to MEASURE the
+/// CA's actual read-dependency set rather than guess again.
 const CA_READER_ON_DYNAMIC: &str = r#"
 module tb;
   logic [7:0] c [], e [];
