@@ -984,6 +984,17 @@ struct NbaEntry {
     /// all while the other advanced at double rate, so its `forever` divider
     /// never reached its threshold and the clock it drove never toggled.
     static_key: Option<String>,
+    /// §8.3 + §4.9.4: the `this` handle in scope when the NBA was SCHEDULED.
+    ///
+    /// The slow path commits through `assign_value` in the NBA region, AFTER
+    /// the process context has been restored to the event-loop caller — so
+    /// `this_stack` is empty there and a CLASS PROPERTY target resolved to
+    /// nothing. Every `prop <= val` inside a class method was silently
+    /// DROPPED: scalars, vectors, static arrays, queues and dynamic arrays
+    /// alike, while a blocking write in the same method worked. Captured here
+    /// and re-pushed for the apply, exactly as `static_key` pins the declaring
+    /// frame.
+    this_handle: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -37597,7 +37608,15 @@ impl Simulator {
                 continue;
             }
             if let Some(lhs) = entry.lhs {
-                self.assign_value(&lhs, &entry.value);
+                // Re-establish the scheduling context so a class-property
+                // target resolves (see NbaEntry::this_handle).
+                if let Some(h) = entry.this_handle {
+                    self.this_stack.push(Some(h));
+                    self.assign_value(&lhs, &entry.value);
+                    self.this_stack.pop();
+                } else {
+                    self.assign_value(&lhs, &entry.value);
+                }
             }
         }
         // §15.5.2 deferred `->>` triggers fire with the NBA flush.
@@ -56592,6 +56611,8 @@ impl Simulator {
                             value: val.resize_for_assign(w),
                             resolved_id: None,
                             static_key: Some(key),
+                            // No `lhs` to re-resolve, so no context needed.
+                            this_handle: None,
                         });
                         return;
                     }
@@ -56633,11 +56654,13 @@ impl Simulator {
                             val.resize_for_assign(w)
                         };
                         let static_key = self.nba_static_key_for_lvalue(lvalue);
+                        let this_handle = self.this_stack.last().copied().flatten();
                         self.nba_queue.push(NbaEntry {
                             lhs: Some(frozen),
                             value: qval,
                             resolved_id: None,
                             static_key,
+                            this_handle,
                         });
                     }
                 } else if let Some(id) = self.resolve_nba_target(lvalue) {
@@ -56656,11 +56679,13 @@ impl Simulator {
                         val.resize_for_assign(w)
                     };
                     let static_key = self.nba_static_key_for_lvalue(lvalue);
+                    let this_handle = self.this_stack.last().copied().flatten();
                     self.nba_queue.push(NbaEntry {
                         lhs: Some(frozen),
                         value: qval,
                         resolved_id: None,
                         static_key,
+                        this_handle,
                     });
                 }
             }
