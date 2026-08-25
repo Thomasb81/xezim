@@ -2653,6 +2653,28 @@ fn resolve_array_elem_id(
 }
 
 #[inline(always)]
+/// Element width of a bytecode array operand, so an out-of-range or x/z-index
+/// READ can yield x at the ELEMENT width. A 1-bit x zero-extends into a wider
+/// element (`0000000x`), which silently turns "unknown" into "almost all
+/// zero" — an AES S-box indexed by an uninitialized input must stay all-x.
+fn bytecode_array_elem_width(
+    array: &super::bytecode::ArrayOperand,
+    array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
+    signal_table: &[Value],
+) -> u32 {
+    let first = match array {
+        super::bytecode::ArrayOperand::Dense { first_id, .. } => Some(*first_id),
+        super::bytecode::ArrayOperand::Named(name) => {
+            array_first_id.get(name.as_str()).map(|&(f, _, _)| f)
+        }
+    };
+    first
+        .and_then(|f| signal_table.get(f))
+        .map(|v| v.width)
+        .unwrap_or(1)
+        .max(1)
+}
+
 fn resolve_bytecode_array_elem(
     array: &super::bytecode::ArrayOperand,
     idx: i64,
@@ -20663,7 +20685,22 @@ impl Simulator {
                     // Direct compute via array_first_id — no format!() / no
                     // HashMap miss on cell access. Parallel-path equivalent
                     // of the sequential array_elem_ids cache.
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §7.4.6 / §11.5.1: an UNKNOWN index reads x, NOT element 0.
+                    // `to_u64()` returns None for an x/z value, and the old
+                    // `unwrap_or(0)` silently read arr[0] — an AES S-box
+                    // indexed by an uninitialized input returned real table
+                    // data, so downstream logic resolved to a definite WRONG
+                    // value instead of propagating x. A sentinel below `lo`
+                    // makes the element resolve MISS, taking the existing
+                    // out-of-range arm that already yields x.
+                    let idx = {
+                        let ir = &vm_regs[*idx_reg as usize];
+                        // x/z index: force a resolve MISS so the existing
+                        // out-of-range arm yields x. `to_u64()` masks x bits to
+                        // ZERO and never returns None, so it cannot be used to
+                        // detect this -- the old code silently read arr[0].
+                        if ir.has_xz() { i64::MIN } else { ir.to_u64().unwrap_or(0) as i64 }
+                    };
                     let id = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -20673,7 +20710,9 @@ impl Simulator {
                     if let Some(eid) = id {
                         vm_regs[*dest as usize] = signal_table[eid].clone();
                     } else {
-                        vm_regs[*dest as usize] = Value::new(1);
+                        vm_regs[*dest as usize] = Value::new(
+                            bytecode_array_elem_width(array_name, array_first_id, signal_table),
+                        );
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
@@ -21210,7 +21249,22 @@ impl Simulator {
                         vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
                 Insn::LoadArrayElem(dest, array_name, idx_reg) => {
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §7.4.6 / §11.5.1: an UNKNOWN index reads x, NOT element 0.
+                    // `to_u64()` returns None for an x/z value, and the old
+                    // `unwrap_or(0)` silently read arr[0] — an AES S-box
+                    // indexed by an uninitialized input returned real table
+                    // data, so downstream logic resolved to a definite WRONG
+                    // value instead of propagating x. A sentinel below `lo`
+                    // makes the element resolve MISS, taking the existing
+                    // out-of-range arm that already yields x.
+                    let idx = {
+                        let ir = &vm_regs[*idx_reg as usize];
+                        // x/z index: force a resolve MISS so the existing
+                        // out-of-range arm yields x. `to_u64()` masks x bits to
+                        // ZERO and never returns None, so it cannot be used to
+                        // detect this -- the old code silently read arr[0].
+                        if ir.has_xz() { i64::MIN } else { ir.to_u64().unwrap_or(0) as i64 }
+                    };
                     let id = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -21220,7 +21274,9 @@ impl Simulator {
                     if let Some(eid) = id {
                         vm_regs[*dest as usize] = view[eid].clone();
                     } else {
-                        vm_regs[*dest as usize] = Value::new(1);
+                        vm_regs[*dest as usize] = Value::new(
+                            bytecode_array_elem_width(array_name, array_first_id, view),
+                        );
                     }
                 }
                 // ── Immediate (blocking) writes — comb semantics ──
@@ -22936,7 +22992,22 @@ impl Simulator {
                     // (thousands of array reads per clock). The cache is
                     // populated lazily by `get_array_elem_id` on first
                     // miss; subsequent calls are a Vec index away.
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §7.4.6 / §11.5.1: an UNKNOWN index reads x, NOT element 0.
+                    // `to_u64()` returns None for an x/z value, and the old
+                    // `unwrap_or(0)` silently read arr[0] — an AES S-box
+                    // indexed by an uninitialized input returned real table
+                    // data, so downstream logic resolved to a definite WRONG
+                    // value instead of propagating x. A sentinel below `lo`
+                    // makes the element resolve MISS, taking the existing
+                    // out-of-range arm that already yields x.
+                    let idx = {
+                        let ir = &self.vm_regs[*idx_reg as usize];
+                        // x/z index: force a resolve MISS so the existing
+                        // out-of-range arm yields x. `to_u64()` masks x bits to
+                        // ZERO and never returns None, so it cannot be used to
+                        // detect this -- the old code silently read arr[0].
+                        if ir.has_xz() { i64::MIN } else { ir.to_u64().unwrap_or(0) as i64 }
+                    };
                     if let Some(eid) = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -22964,8 +23035,14 @@ impl Simulator {
                             self.vm_regs[*dest as usize].copy_from(&self.signal_table[eid]);
                         }
                     } else {
-                        // `Value::new(1)` — a 1-bit X.
-                        vm_store(&mut self.vm_regs[*dest as usize], 0, 1, 1, false);
+                        // x/z or out-of-range index: x at the ELEMENT width.
+                        let w = bytecode_array_elem_width(
+                            array_name,
+                            &self.array_first_id,
+                            &self.signal_table,
+                        );
+                        let xm = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                        vm_store(&mut self.vm_regs[*dest as usize], 0, xm, w, false);
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
