@@ -99,6 +99,8 @@ mod pkg_subroutines_and_unit_scope;
 mod repro_import;
 #[path = "hierarchy/resource_pool_scope_lookup.rs"]
 mod resource_pool_scope_lookup;
+#[path = "hierarchy/colliding_actual_child_body.rs"]
+mod colliding_actual_child_body;
 #[path = "hierarchy/same_name_port_hop.rs"]
 mod same_name_port_hop;
 #[path = "hierarchy/submodule_net_array_shapes.rs"]
