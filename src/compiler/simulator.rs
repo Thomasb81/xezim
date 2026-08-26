@@ -84706,6 +84706,71 @@ impl Simulator {
         None
     }
 
+    /// §8.25: derive the per-specialization signature of an ANCESTOR class
+    /// reached through a CONCRETE subclass — e.g. `ext1::ID()` where
+    /// `ext1 extends uvm_tlm_extension#(ext1)`. A static call like
+    /// `ext1::ID()` carries no `#(spec)` and has no instance, so `current_spec`
+    /// is None and inherited statics key the shared `Class::member` cell,
+    /// colliding across sibling specializations (`ext1::ID()` and
+    /// `ext2::ID()` returned the same singleton). Walk the receiver's extends
+    /// chain rebinding each parent's type params from `extends_type_args` until
+    /// `ancestor` is bound, and return its `(base, sig)` so the caller can seed
+    /// `current_spec`. Mirrors the assoc-key carry loop.
+    fn static_receiver_spec(&self, receiver: &str, ancestor: &str) -> Option<(String, String)> {
+        let mut carried: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut cur = Some(receiver.to_string());
+        let mut level = 0;
+        while let Some(cn) = cur {
+            level += 1;
+            if level > 64 {
+                return None;
+            }
+            let cd = self.module.classes.get(&cn)?;
+            if cn == ancestor {
+                let sig = self.rebind_class_sig(&cd, &carried);
+                return Some((cn, sig));
+            }
+            // Move to the parent, rebinding its type params from this class's
+            // extends type args.
+            let parent = cd.extends.clone()?;
+            if let Some(pcd) = self.module.classes.get(&parent) {
+                let order: Vec<String> = if pcd.param_order.is_empty() {
+                    pcd.type_param_names.clone()
+                } else {
+                    pcd.param_order.clone()
+                };
+                let mut next: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                for (i, pname) in order.iter().enumerate() {
+                    if let Some(arg) = cd.extends_type_args.get(i) {
+                        let a = arg.trim();
+                        let resolved = carried.get(a).cloned().unwrap_or_else(|| a.to_string());
+                        next.insert(pname.clone(), resolved);
+                    }
+                }
+                carried = next;
+            }
+            cur = Some(parent);
+        }
+        None
+    }
+
+    /// Rebuild a class's specialization signature string from a binding map of
+    /// its type/value parameter names to concrete leaves (declaration order).
+    fn rebind_class_sig(&self, cd: &crate::compiler::elaborate::ElaboratedClass, carried: &std::collections::HashMap<String, String>) -> String {
+        let order: Vec<String> = if cd.param_order.is_empty() {
+            cd.type_param_names.clone()
+        } else {
+            cd.param_order.clone()
+        };
+        order
+            .iter()
+            .map(|p| carried.get(p).cloned().unwrap_or_else(|| p.clone()))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     /// Resolve a CLASS-SCOPED constant `ClassName::member` — an enum literal
     /// of a `typedef enum` declared in `ClassName` or an ancestor, or a static
     /// property. SystemVerilog scopes enum literals to their declaring class,
@@ -87524,7 +87589,22 @@ impl Simulator {
                 break;
             };
             if has_method {
-                return Some(self.exec_method_in_class_hierarchy(0, &cname, method_name, args));
+                // §8.25: a static inherited from a PARAMETERIZED base reached
+                // through a concrete subclass (`ext1::ID()` where `ext1 extends
+                // base#(ext1)`) has no `#(spec)` and no instance, so seed
+                // current_spec from the receiver's extends type args so
+                // per-specialization statics stay distinct.
+                let saved = self.current_spec.clone();
+                if !self.class_is_parameterized(class_name)
+                    && self.class_is_parameterized(&cname)
+                {
+                    if let Some(spec) = self.static_receiver_spec(class_name, &cname) {
+                        self.current_spec = Some(spec);
+                    }
+                }
+                let v = self.exec_method_in_class_hierarchy(0, &cname, method_name, args);
+                self.current_spec = saved;
+                return Some(v);
             }
             cur = parent;
         }
@@ -87552,7 +87632,19 @@ impl Simulator {
                 break;
             };
             if has_method {
-                return Some(self.exec_method_in_class_hierarchy(0, &cname, method_name, args));
+                // §8.25: see exec_static_method — seed current_spec for
+                // per-specialization inherited statics.
+                let saved = self.current_spec.clone();
+                if !self.class_is_parameterized(class_name)
+                    && self.class_is_parameterized(&cname)
+                {
+                    if let Some(spec) = self.static_receiver_spec(class_name, &cname) {
+                        self.current_spec = Some(spec);
+                    }
+                }
+                let v = self.exec_method_in_class_hierarchy(0, &cname, method_name, args);
+                self.current_spec = saved;
+                return Some(v);
             }
             cur = parent;
         }
@@ -103151,6 +103243,27 @@ impl Simulator {
                                     self.current_spec = Some((cn.clone(), sig_frags.join(",")));
                                 }
                             }
+                        }
+                    }
+                }
+                // §8.25 instance-method analogue of the static-receiver seeding
+                // above: a CONCRETE instance (e.g. `ext3x`) whose method is
+                // declared in a PARAMETERIZED base (`get_type_handle` in
+                // `uvm_tlm_extension`) reaches it through `extends #(ext3)`.
+                // The instance seeding above leaves current_spec unset for a
+                // concrete (unparameterized) class, so the method body's inner
+                // static call (`ID()`) resolves against the generic base and
+                // mints a WRONG singleton. Derive the declaring class's
+                // specialization from the receiver's extends type args.
+                if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
+                    if self.current_spec.is_none()
+                        && !self.class_is_parameterized(&inst.class_name)
+                        && self.class_is_parameterized(&cname)
+                    {
+                        if let Some(spec) =
+                            self.static_receiver_spec(&inst.class_name, &cname)
+                        {
+                            self.current_spec = Some(spec);
                         }
                     }
                 }
