@@ -7957,11 +7957,17 @@ impl Simulator {
             in_edge_rescan: false,
             edge_rescan_block_hits: HashMap::default(),
             stall_edge_block_hits: HashMap::default(),
+            // ON by default since the shadow validator (XEZIM_DIRTY_EDGE_SHADOW,
+            // which drives the sim by full scan and asserts every firing edge
+            // was captured) reported zero misses across the C906 CoreMark run,
+            // ibex simple_system, the C910 SoC, three UVM testbenches and the
+            // whole regression suite. `XEZIM_DIRTY_EDGE=0` restores the full
+            // per-tick scan.
             // Documented as (0/1): `is_some()` made `XEZIM_DIRTY_EDGE=0`
             // ENABLE the mode, the opposite of what the value says.
             dirty_edge: std::env::var("XEZIM_DIRTY_EDGE")
                 .map(|v| v != "0" && !v.is_empty())
-                .unwrap_or(false),
+                .unwrap_or(true),
             dirty_edge_shadow: std::env::var("XEZIM_DIRTY_EDGE_SHADOW")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false),
