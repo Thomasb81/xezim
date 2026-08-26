@@ -186,12 +186,10 @@ fn test_static_fixed_array_4state_defaults_x() {
     );
 }
 
-// DOCUMENTING test, not an endorsement: the store is keyed by the BARE
-// member name (the static_collections convention), so two classes declaring
-// the same static array name share one store — §8.9 wants one copy per
-// class. Until the key is class-qualified, elaboration warns loudly; this
-// test pins both the warning and the current (shared) behavior so a future
-// keying fix knows exactly what it is changing.
+// §8.9 cross-class isolation (issue #135): the store is keyed
+// `{DeclaringClass}::{member}`, so two classes declaring the same static
+// array name get SEPARATE stores — and an inherited static resolves through
+// the chain to the declaring class's one shared copy.
 const STATIC_FIXED_ARRAY_COLLISION_SRC: &str = r#"
 module top;
   class A; static int S[2]; endclass
@@ -205,15 +203,13 @@ endmodule
 "#;
 
 #[test]
-fn test_static_fixed_array_cross_class_collision_warns() {
+fn test_static_fixed_array_cross_class_isolated() {
     let sim = simulate(STATIC_FIXED_ARRAY_COLLISION_SRC, 200).expect("simulate failed");
     let msgs = messages(&sim);
-    // Current behavior: shared store (last write wins through both handles).
     assert!(
-        msgs.iter().any(|m| m == "COLL_99_99"),
-        "documented shared-store behavior changed — if this now prints \
-         COLL_11_99 the §8.9 keying fix landed; update this test to assert \
-         the correct isolation and drop the warning check: {:?}",
+        msgs.iter().any(|m| m == "COLL_11_99"),
+        "§8.9: same-named statics of different classes must not share a \
+         store: {:?}",
         msgs
     );
 }

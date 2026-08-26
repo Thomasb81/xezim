@@ -11929,32 +11929,14 @@ impl Simulator {
                     .map(|(n, lo, hi, w)| (c.name.clone(), n.clone(), *lo, *hi, *w))
             })
             .collect();
-        // §8.9 gives one copy PER CLASS, but the store is keyed by the BARE
-        // member name (matching the static_collections convention) — two
-        // classes declaring the same static array name would silently share
-        // one store. Until the key is class-qualified, make that loud.
-        {
-            let mut owner: HashMap<&str, &str> = HashMap::default();
-            for (cls, name, ..) in &static_fixed {
-                match owner.entry(name.as_str()) {
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(cls.as_str());
-                    }
-                    std::collections::hash_map::Entry::Occupied(o) => {
-                        if *o.get() != cls.as_str() {
-                            eprintln!(
- "[xezim][warning] static array '{}' is declared by both class '{}' and class '{}' — the flat store is shared, so writes through one class are visible through the other (IEEE 1800-2017 §8.9 wants one copy per class). Rename one of them to keep the stores separate.",
-                                name,
-                                o.get(),
-                                cls
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        // §8.9: ONE copy per DECLARING class — the store is keyed
+        // `{Class}::{member}` (each class's static_fixed_arrays lists only
+        // its OWN declarations, so the key is by construction the declarer;
+        // inherited access walks the chain via `static_fixed_key_in`). Two
+        // classes declaring the same member name get separate stores.
         for (cls, name, lo, hi, width) in static_fixed {
-            self.module.arrays.entry(name.clone()).or_insert((lo, hi, width));
+            let key = format!("{}::{}", cls, name);
+            self.module.arrays.entry(key.clone()).or_insert((lo, hi, width));
             // §6.8: a 4-STATE element type defaults to x, not 0 — only
             // two-state elements (int/byte/bit...) start at zero. The
             // declared type is on the owning class's property table.
@@ -11972,7 +11954,7 @@ impl Simulator {
                 Value::all_x(width)
             };
             for i in lo..=hi {
-                let elem = format!("{}[{}]", name, i);
+                let elem = format!("{}[{}]", key, i);
                 self.widths.insert(elem.clone(), width);
                 self.signals.entry(elem).or_insert_with(|| default.clone());
             }
@@ -46267,6 +46249,16 @@ impl Simulator {
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
                     }
+                    // §8.9: `Cls::S[i] = v` reaches here with the resolver's
+                    // bare-leaf collapse of the 2-segment form; the original
+                    // segments name the qualified store.
+                    if !self.module.arrays.contains_key(&name) {
+                        if let Some(h) = hier_opt {
+                            if let Some(k) = self.static_fixed_key_from_hier(h) {
+                                name = k;
+                            }
+                        }
+                    }
                     // A bare name inside a SUBMODULE process resolves under
                     // the process's instance scope (name_resolve_hint), like
                     // scalar reads/writes already do.
@@ -52894,6 +52886,14 @@ impl Simulator {
                             if let Some(scoped) = self.instance_assoc_member(&aname) {
                                 if self.module.arrays.contains_key(&scoped) {
                                     aname = scoped;
+                                }
+                            }
+                            // §8.9: `$size(Cls::S)` — the resolver collapses
+                            // the 2-segment form to the bare leaf; map from
+                            // the original segments to the qualified store.
+                            if !self.module.arrays.contains_key(&aname) {
+                                if let Some(k) = self.static_fixed_key_from_hier(hier) {
+                                    aname = k;
                                 }
                             }
                             // Every unpacked dimension, outermost first. Only the
@@ -85708,14 +85708,78 @@ impl Simulator {
         Some(name)
     }
 
+    /// §8.9: the store key of a fixed-size STATIC array member reachable
+    /// from `class_name`'s inheritance chain — `{DeclaringClass}::{member}`,
+    /// nearest declarer first (a subclass redeclaring the name hides the
+    /// base's copy; an inherited-only member resolves to the base's key, so
+    /// every subclass shares the ONE store §8.9 prescribes).
+    fn static_fixed_key_in(&self, class_name: &str, member: &str) -> Option<String> {
+        let mut cur = Some(class_name.to_string());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if cd.static_fixed_arrays.iter().any(|(n, ..)| n == member) {
+                return Some(format!("{}::{}", cn, member));
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// §8.9: a source-spelled `Cls::member` (or the flattened `Cls.member`
+    /// an inlined path can produce) naming a fixed-size static array,
+    /// resolved through Cls's chain to the DECLARING class's store key —
+    /// `C::B` inherited from `Base` maps to `Base::B`.
+    /// §8.9: hier-shape-aware variant — `Cls::member` may reach resolution
+    /// as a TWO-SEGMENT Ident whose leaf the generic resolver collapses to
+    /// (`resolve_hier_name([C, R])` yields bare "R"), losing the class. Map
+    /// from the ORIGINAL segments instead.
+    fn static_fixed_key_from_hier(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<String> {
+        match hier.path.len() {
+            1 => self.static_fixed_key_for_name(&hier.path[0].name.name),
+            2 if hier.path[0].selects.is_empty() => {
+                let cls = &hier.path[0].name.name;
+                if !self.module.classes.contains_key(cls) {
+                    return None;
+                }
+                self.static_fixed_key_in(cls, &hier.path[1].name.name)
+            }
+            _ => None,
+        }
+    }
+
+    fn static_fixed_key_for_name(&self, name: &str) -> Option<String> {
+        let (cls, member) = name
+            .split_once("::")
+            .or_else(|| name.split_once('.'))?;
+        if member.is_empty() || member.contains(':') || member.contains('.') {
+            return None;
+        }
+        if !self.module.classes.contains_key(cls) {
+            return None;
+        }
+        self.static_fixed_key_in(cls, member)
+    }
+
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
+        // §8.9: `Cls::member` / flattened `Cls.member` spellings of a static
+        // fixed array resolve to the declaring class's store BEFORE the
+        // dotted-name guard below can reject them.
+        if let Some(k) = self.static_fixed_key_for_name(name) {
+            return Some(k);
+        }
         if name.contains('#') || name.contains('.') || name.contains('[') {
             return None;
         }
-        let handle = self.this_stack.last().copied().flatten()?;
-        if handle == 0 {
-            return None;
-        }
+        // §8.9: inside a STATIC method there is no `this`; the lexical class
+        // context still resolves a bare static-array member to its store.
+        let Some(handle) = self.this_stack.last().copied().flatten().filter(|&h| h != 0)
+        else {
+            let ctx = self.class_context_stack.last().cloned().flatten()?;
+            return self.static_fixed_key_in(&ctx, name);
+        };
         // Use the runtime class of `this` (from the heap) rather than the
         // lexical class_context_stack.  When a bare method call (e.g. `body()`)
         // is inlined without updating class_context_stack, the stack still
@@ -85737,6 +85801,11 @@ impl Simulator {
                 || self.prop_bound_collection(handle, &cn, name)
             {
                 return Some(format!("{}#{}", handle, name));
+            }
+            // §8.9: a fixed-size STATIC array resolves to its class-qualified
+            // shared store, not a per-instance name.
+            if cd.static_fixed_arrays.iter().any(|(n, ..)| n == name) {
+                return Some(format!("{}::{}", cn, name));
             }
             cur = cd.extends.clone();
         }
@@ -85841,7 +85910,9 @@ impl Simulator {
         {
             Some(format!("{}#{}", handle, member))
         } else {
-            None
+            // §8.9: a fixed-size static array member of the receiver's class
+            // chain names the class-qualified shared store.
+            self.static_fixed_key_in(&cn, member)
         }
     }
 
@@ -85877,7 +85948,9 @@ impl Simulator {
                 // array/queue typedef — a per-spec collection property.
                 Some(format!("{}#{}", handle, member))
             } else {
-                None
+                // §8.9: a fixed-size static array member names the
+                // class-qualified shared store.
+                sim.static_fixed_key_in(&cn, member)
             }
         };
         match &expr.kind {
@@ -85894,10 +85967,19 @@ impl Simulator {
                     // globally by bare name). Without this, obj_member treats
                     // the class name as an object handle (0 → None), and the
                     // assoc-array first()/next() iteration silently fails.
-                    if self.module.classes.contains_key(&bh.path[0].name.name)
-                        && self.is_associative_array(&member.name)
-                    {
-                        return Some(member.name.clone());
+                    if self.module.classes.contains_key(&bh.path[0].name.name) {
+                        if self.is_associative_array(&member.name) {
+                            return Some(member.name.clone());
+                        }
+                        // §8.9: `ClassName::S[i]` — the class-qualified
+                        // shared store of a fixed-size static array,
+                        // resolved through the chain (a subclass scope may
+                        // name an inherited static).
+                        if let Some(k) =
+                            self.static_fixed_key_in(&bh.path[0].name.name, &member.name)
+                        {
+                            return Some(k);
+                        }
                     }
                     obj_member(self, &bh.path[0].name.name, &member.name)
                 }
