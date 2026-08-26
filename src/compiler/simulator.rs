@@ -18988,6 +18988,27 @@ impl Simulator {
                 TsInsn::LogNot { d, s } => {
                     regs[*d as usize] = (regs[*s as usize] == 0) as u64;
                 }
+                TsInsn::RedOr { d, s } => {
+                    regs[*d as usize] = (regs[*s as usize] != 0) as u64;
+                }
+                TsInsn::RedAnd { d, s, mask } => {
+                    regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
+                }
+                TsInsn::BitStoreDyn { sig, i, s, w } => {
+                    // §11.5.1: an out-of-range dynamic bit-select target
+                    // drops the write (`Value::set_bit` is a no-op there).
+                    let idx = regs[*i as usize];
+                    if idx < *w as u64 {
+                        let b = regs[*s as usize] & 1;
+                        self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
+                    }
+                }
+                TsInsn::ConstStoreX { sig, v, x } => {
+                    self.ts_store_xz(*sig as usize, *v, *x);
+                }
+                TsInsn::RangeStoreX { sig, hi, lo, v, x } => {
+                    self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
+                }
                 TsInsn::LogAnd { d, a, b } => {
                     regs[*d as usize] =
                         (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
@@ -19069,6 +19090,24 @@ impl Simulator {
                 }
                 TsInsn::Jmp { t } => {
                     pc = *t as usize;
+                    continue;
+                }
+                TsInsn::CaseJmp { s, cj } => {
+                    // Two-state selector is X-free, so the 4-state x/z ->
+                    // default branch is unreachable; out-of-table indices and
+                    // holes still take `default`.
+                    pc = cj
+                        .table
+                        .get(regs[*s as usize] as usize)
+                        .copied()
+                        .unwrap_or(cj.default) as usize;
+                    continue;
+                }
+                TsInsn::CaseMaskJmp { s, mask, lo, wmask, mj } => {
+                    // The window is fully defined on an X-free selector, so
+                    // `xz_path` (the wildcard compare chain) cannot be taken.
+                    let v = regs[*s as usize] & *mask;
+                    pc = mj.table[(((v >> *lo) & *wmask) as usize)] as usize;
                     continue;
                 }
                 TsInsn::ElemLoad(op) => {
@@ -19414,6 +19453,27 @@ impl Simulator {
                 TsInsn::LogNot { d, s } => {
                     regs[*d as usize] = (regs[*s as usize] == 0) as u64;
                 }
+                TsInsn::RedOr { d, s } => {
+                    regs[*d as usize] = (regs[*s as usize] != 0) as u64;
+                }
+                TsInsn::RedAnd { d, s, mask } => {
+                    regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
+                }
+                TsInsn::BitStoreDyn { sig, i, s, w } => {
+                    // §11.5.1: an out-of-range dynamic bit-select target
+                    // drops the write (`Value::set_bit` is a no-op there).
+                    let idx = regs[*i as usize];
+                    if idx < *w as u64 {
+                        let b = regs[*s as usize] & 1;
+                        self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
+                    }
+                }
+                TsInsn::ConstStoreX { sig, v, x } => {
+                    self.ts_store_xz(*sig as usize, *v, *x);
+                }
+                TsInsn::RangeStoreX { sig, hi, lo, v, x } => {
+                    self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
+                }
                 TsInsn::LogAnd { d, a, b } => {
                     regs[*d as usize] =
                         (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
@@ -19577,7 +19637,9 @@ impl Simulator {
                 TsInsn::BrSigFalse { .. }
                 | TsInsn::BrFalse { .. }
                 | TsInsn::BrNz { .. }
-                | TsInsn::Jmp { .. } => unreachable!("ctrl insn in straight-line block"),
+                | TsInsn::Jmp { .. }
+                | TsInsn::CaseJmp { .. }
+                | TsInsn::CaseMaskJmp { .. } => unreachable!("ctrl insn in straight-line block"),
             }
         }
         self.ts_regs = regs;
@@ -19592,14 +19654,43 @@ impl Simulator {
     /// `signal[hi:lo]`, leaving every other bit (value AND x/z planes)
     /// untouched, then run the ordinary change/dirty/post-write bookkeeping.
     fn ts_range_store(&mut self, id: usize, v: u64, lo: u32, hi: u32) {
+        self.ts_range_store_xz(id, v, 0, lo, hi)
+    }
+
+    /// `ts_range_store` with an explicit x/z plane, for a folded 4-state
+    /// constant source (`y[hi:lo] = 'x;`).
+    fn ts_range_store_xz(&mut self, id: usize, v: u64, x: u64, lo: u32, hi: u32) {
         let (base_v, base_x) = self.signal_table[id].raw_bits();
         let (new_v, new_x) =
-            Self::compose_inline_range_bits(base_v, base_x, v, 0, lo, hi);
+            Self::compose_inline_range_bits(base_v, base_x, v, x, lo, hi);
         if new_v == base_v && new_x == base_x {
             return;
         }
         if !self.signal_table[id].set_inline_bits(new_v, new_x) {
             let mut val = Value::from_inline(new_v, new_x, self.signal_widths[id]);
+            val.is_signed = self.signal_signed[id];
+            self.signal_table[id] = val;
+        }
+        self.sync_mirror(id);
+        self.signal_table[id].is_signed = self.signal_signed[id];
+        if !self.dirty_signals[id] {
+            self.dirty_signals[id] = true;
+            self.dirty_list.push(id);
+        }
+        self.dirty_any = true;
+        self.table_modified = true;
+        self.after_signal_write(id);
+    }
+
+    /// Whole-signal blocking store of a folded 4-state constant. Mirrors
+    /// `ts_store`'s bookkeeping but carries an x/z plane.
+    fn ts_store_xz(&mut self, id: usize, v: u64, x: u64) {
+        let (dv, dx) = self.signal_table[id].raw_bits();
+        if v == dv && x == dx {
+            return;
+        }
+        if !self.signal_table[id].set_inline_bits(v, x) {
+            let mut val = Value::from_inline(v, x, self.signal_widths[id]);
             val.is_signed = self.signal_signed[id];
             self.signal_table[id] = val;
         }
@@ -19802,6 +19893,27 @@ impl Simulator {
                 TsInsn::LogNot { d, s } => {
                     regs[*d as usize] = (regs[*s as usize] == 0) as u64;
                 }
+                TsInsn::RedOr { d, s } => {
+                    regs[*d as usize] = (regs[*s as usize] != 0) as u64;
+                }
+                TsInsn::RedAnd { d, s, mask } => {
+                    regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
+                }
+                TsInsn::BitStoreDyn { sig, i, s, w } => {
+                    // §11.5.1: an out-of-range dynamic bit-select target
+                    // drops the write (`Value::set_bit` is a no-op there).
+                    let idx = regs[*i as usize];
+                    if idx < *w as u64 {
+                        let b = regs[*s as usize] & 1;
+                        self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
+                    }
+                }
+                TsInsn::ConstStoreX { sig, v, x } => {
+                    self.ts_store_xz(*sig as usize, *v, *x);
+                }
+                TsInsn::RangeStoreX { sig, hi, lo, v, x } => {
+                    self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
+                }
                 TsInsn::LogAnd { d, a, b } => {
                     regs[*d as usize] =
                         (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
@@ -19870,6 +19982,24 @@ impl Simulator {
                 }
                 TsInsn::Jmp { t } => {
                     pc = *t as usize;
+                    continue;
+                }
+                TsInsn::CaseJmp { s, cj } => {
+                    // Two-state selector is X-free, so the 4-state x/z ->
+                    // default branch is unreachable; out-of-table indices and
+                    // holes still take `default`.
+                    pc = cj
+                        .table
+                        .get(regs[*s as usize] as usize)
+                        .copied()
+                        .unwrap_or(cj.default) as usize;
+                    continue;
+                }
+                TsInsn::CaseMaskJmp { s, mask, lo, wmask, mj } => {
+                    // The window is fully defined on an X-free selector, so
+                    // `xz_path` (the wildcard compare chain) cannot be taken.
+                    let v = regs[*s as usize] & *mask;
+                    pc = mj.table[(((v >> *lo) & *wmask) as usize)] as usize;
                     continue;
                 }
                 TsInsn::ElemLoad(op) => {

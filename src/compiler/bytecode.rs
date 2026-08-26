@@ -11489,6 +11489,31 @@ pub enum TsInsn {
     /// Jump to `t` when regs[s] != 0 (4-state `BranchUnlessZero`).
     BrNz { s: u16, t: u32 },
     Jmp { t: u32 },
+    /// Jump-table dispatch (§12.5 `case`). Two-state registers are X-free by
+    /// the eval-site prefilter, so the 4-state arm's "any x/z bit matches no
+    /// pattern -> default" branch cannot arise and this reduces to a bounds-
+    /// checked table index. Targets are LOWERED indices (remapped in the same
+    /// fixup pass as the other branches).
+    CaseJmp { s: u16, cj: Box<CaseJumpData> },
+    /// Bucket-window jump table (§12.5 `case` with wildcard-free windows).
+    /// X-free registers make the 4-state `xz_path` (wildcard selector can
+    /// match several buckets) unreachable, leaving a plain window index.
+    CaseMaskJmp { s: u16, mask: u64, lo: u32, wmask: u64, mj: Box<CaseMaskJumpData> },
+    /// regs[d] = (regs[s] != 0) — §11.4.9 reduction OR on an X-free operand.
+    RedOr { d: u16, s: u16 },
+    /// regs[d] = (regs[s] == mask) — §11.4.9 reduction AND; `mask` is the
+    /// source width, so "all ones" is an equality against it.
+    RedAnd { d: u16, s: u16, mask: u64 },
+    /// `sig[regs[i]] = regs[s] & 1` (§11.5.1 dynamic bit-select target).
+    /// Out-of-range indices are dropped, matching `Value::set_bit`. Splices
+    /// through the same plane-level merge as `RangeStore`, so X elsewhere in
+    /// the destination survives.
+    BitStoreDyn { sig: u32, i: u16, s: u16, w: u32 },
+    /// Blocking store of a folded 4-state constant (`y = 'x;`). `v`/`x` are
+    /// the raw value/xz planes, already masked to the assigned width.
+    ConstStoreX { sig: u32, v: u64, x: u64 },
+    /// Partial-range counterpart (`y[hi:lo] = 'x;`).
+    RangeStoreX { sig: u32, hi: u32, lo: u32, v: u64, x: u64 },
     /// Write back `regs[s] & mask` to `sig` with change-detect + dirty
     /// marking (the eval site mirrors the 4-state fast-path bookkeeping).
     Store { sig: u32, s: u16, mask: u64 },
@@ -11754,15 +11779,82 @@ pub fn lower_two_state(
         }
         Some(v)
     };
+    // Stream-order width tracking is EXACT wherever a register's read is
+    // reached by exactly ONE of its definitions. Bailing on every
+    // differing-width redefinition threw away the `case` shape, where each
+    // arm reuses the same temp slot at its own width and every use stays
+    // inside its own arm: on the C906 SoC that single rule was the first
+    // blocker for 58% of the remaining interpreter-bound evaluations.
+    // Instead, allow the redefinition and reject only a read that a BRANCH
+    // TARGET separates from its stream-order definition -- the one place a
+    // second definition could reach it. `tcount[i]` counts branch targets at
+    // indices <= i, so "no target in between" is one integer compare.
+    let n_ins = cb.instructions.len();
+    let mut tgts: Vec<u32> = Vec::new();
+    for insn in cb.instructions.iter() {
+        match insn {
+            Insn::BranchIfFalse(_, t)
+            | Insn::BranchUnlessZero(_, t)
+            | Insn::BranchIfSignalFalse(_, t, _)
+            | Insn::CmpBranch(_, _, _, _, t)
+            | Insn::Jump(t) => tgts.push(*t),
+            Insn::CaseJump(_, cj) => {
+                tgts.extend(cj.table.iter().copied());
+                tgts.push(cj.default);
+            }
+            Insn::CaseMaskJump(_, mj) => {
+                tgts.extend(mj.table.iter().copied());
+                tgts.push(mj.xz_path);
+            }
+            _ => {}
+        }
+    }
+    let mut is_tgt = vec![false; n_ins + 1];
+    for t in tgts {
+        if (t as usize) <= n_ins {
+            is_tgt[t as usize] = true;
+        }
+    }
+    let mut tcount = vec![0u32; n_ins + 1];
+    let mut tc_run = 0u32;
+    for i in 0..=n_ins {
+        if is_tgt[i] {
+            tc_run += 1;
+        }
+        tcount[i] = tc_run;
+    }
+    // A back edge can re-enter an earlier read from a LATER definition, which
+    // the forward-only reasoning above does not model.
+    let back_branch = BytecodeCompiler::has_backward_branch(&cb.instructions);
+    let mut wconf: Vec<bool> = vec![false; cb.num_regs as usize];
+    let mut wconf_list: Vec<RegId> = Vec::new();
+    let mut def_tc: Vec<u32> = vec![0; cb.num_regs as usize];
+    // Mirror of the loop index, readable from `def!` (a `for` pattern binding
+    // is not, due to macro hygiene).
+    let mut cur_i: usize = 0;
+    // Registers holding a folded 4-state constant: (value plane, xz plane).
+    // These registers are NEVER materialized in the u64 file, so any reader
+    // outside the fold set would see an unwritten slot -- the guard at the
+    // top of the loop rejects the block instead.
+    let mut xc: Vec<Option<(u64, u64)>> = vec![None; cb.num_regs as usize];
+    let mut xc_live: Vec<RegId> = Vec::new();
     macro_rules! def {
         ($rw:ident, $r:expr, $w:expr) => {{
             let r = $r as usize;
             let w = $w;
             match $rw[r] {
-                Some(prev) if prev != w => return None,
+                Some(prev) if prev != w => {
+                    if !wconf[r] {
+                        wconf[r] = true;
+                        wconf_list.push(r as RegId);
+                    }
+                    $rw[r] = Some(w);
+                }
                 _ => $rw[r] = Some(w),
             }
+            def_tc[r] = tcount[cur_i];
             rc[r] = None;
+            xc[r] = None;
         }};
     }
     // Tracking costs one thread-local store per instruction, so it is armed
@@ -11783,6 +11875,34 @@ pub fn lower_two_state(
         if track {
             TS_BAIL_AT.with(|c| c.set((ins_i, insn_opcode_name(insn))));
             TS_GATE_WHY.with(|c| c.set("-"));
+        }
+        cur_i = ins_i;
+        if !wconf_list.is_empty() {
+            if back_branch {
+                gate!("reg width phi (back edge)");
+            }
+            let tc = tcount[cur_i];
+            if wconf_list
+                .iter()
+                .any(|&r| tc != def_tc[r as usize]
+                    && BytecodeCompiler::insn_reads_reg(insn, r))
+            {
+                gate!("reg width phi");
+            }
+        }
+        if !xc_live.is_empty()
+            && !matches!(
+                insn,
+                Insn::Replicate(..)
+                    | Insn::Move(..)
+                    | Insn::BlockingAssign(..)
+                    | Insn::BlockingAssignRange(..)
+            )
+            && xc_live
+                .iter()
+                .any(|&r| xc[r as usize].is_some() && BytecodeCompiler::insn_reads_reg(insn, r))
+        {
+            gate!("x-const consumed");
         }
         idx_map.push(out.len() as u32);
         match insn {
@@ -11824,6 +11944,19 @@ pub fn lower_two_state(
                     }
                     def!(rw, *d, k.width);
                     out.push(TsInsn::WConst { d: *d as u16, v: Box::new(w2) });
+                } else if k.has_xz() {
+                    // Fold rather than reject: admitted only while it stays
+                    // a constant all the way to a store (see the loop guard).
+                    if k.is_signed || k.is_real || k.is_fill {
+                        gate!("x-const signed/real");
+                    }
+                    let Some((v, x)) = k.inline_bits() else {
+                        gate!("x-const not inline");
+                    };
+                    def!(rw, *d, k.width);
+                    let m = ts_mask(k.width);
+                    xc[*d as usize] = Some((v & m, x & m));
+                    xc_live.push(*d);
                 } else {
                     let v = clean_const(k)?;
                     def!(rw, *d, k.width);
@@ -11943,6 +12076,12 @@ pub fn lower_two_state(
             // had no lowering.
             Insn::Move(d, s) => {
                 let w = rw[*s as usize]?;
+                if let Some(k) = xc[*s as usize] {
+                    def!(rw, *d, w);
+                    xc[*d as usize] = Some(k);
+                    xc_live.push(*d);
+                    continue;
+                }
                 def!(rw, *d, w);
                 let (d, s) = (*d as u16, *s as u16);
                 out.push(if w > 64 {
@@ -12040,10 +12179,13 @@ pub fn lower_two_state(
                 });
             }
             // 4-state table semantics (x/z selector -> default) cannot lower
-            // to the 2-state pipeline.
+            // to the 2-state pipeline. `CaseJump` is the exception and is
+            // handled below, as is `CaseMaskJump`: the eval-site prefilter
+            // proves every signal the block reads is X-free, so their selectors
+            // cannot carry x/z and the "no pattern matches -> default" /
+            // wildcard-chain branches are unreachable, leaving a plain
+            // bounds-checked table index.
             Insn::CaseLut(..) => return None,
-            Insn::CaseJump(..) => return None,
-            Insn::CaseMaskJump(..) => return None,
             Insn::Format(..) => return None,
             Insn::StrOp(..) => return None,
             Insn::BlockingAssignString(..) => return None,
@@ -12184,12 +12326,14 @@ pub fn lower_two_state(
                         out.push(TsInsn::WMask { d: *r as u16, mask_hi: wmask_hi(*w) });
                     }
                     rw[*r as usize] = Some(*w);
+                    def_tc[*r as usize] = tcount[cur_i];
                     rc[*r as usize] = None;
                     continue;
                 }
                 if cur > 64 {
                     out.push(TsInsn::NFromW { r: *r as u16, mask: ts_mask(*w) });
                     rw[*r as usize] = Some(*w);
+                    def_tc[*r as usize] = tcount[cur_i];
                     rc[*r as usize] = None;
                     continue;
                 }
@@ -12199,7 +12343,11 @@ pub fn lower_two_state(
                 // Widening zero-extends — free for an unsigned register.
                 // Redefinition width-conflict does not apply: Resize is a
                 // width CHANGE of the same value, not a second definition.
+                // It IS the point the width now dates from, though, so the
+                // phi guard measures from here (without marking a conflict,
+                // which would newly reject blocks that lower correctly today).
                 rw[*r as usize] = Some(*w);
+                def_tc[*r as usize] = tcount[cur_i];
                 // Keep const knowledge in sync with the (possible) truncation.
                 if let Some(k) = rc[*r as usize] {
                     rc[*r as usize] = Some(k & ts_mask(*w));
@@ -12253,9 +12401,88 @@ pub fn lower_two_state(
             Insn::Jump(t) => {
                 out.push(TsInsn::Jmp { t: *t });
             }
+            Insn::CaseJump(src, cj) => {
+                // The selector must live in the u64 register file: a wider
+                // one is kept in the wide plane file, where `regs[s]` is not
+                // its value at all.
+                let sw = rw[*src as usize]?;
+                if sw > 64 {
+                    gate!("casejump sel >64b");
+                }
+                out.push(TsInsn::CaseJmp { s: *src as u16, cj: cj.clone() });
+            }
+            Insn::CaseMaskJump(src, mj) => {
+                let sw = rw[*src as usize]?;
+                if sw > 64 {
+                    gate!("casemaskjump sel >64b");
+                }
+                if mj.lo + mj.width > 64 {
+                    gate!("casemaskjump window >=64");
+                }
+                out.push(TsInsn::CaseMaskJmp {
+                    s: *src as u16,
+                    mask: ts_mask(sw),
+                    lo: mj.lo,
+                    wmask: ts_mask(mj.width),
+                    mj: mj.clone(),
+                });
+            }
+            Insn::ReduceOr(d, src) => {
+                rw[*src as usize]?;
+                def!(rw, *d, 1);
+                out.push(TsInsn::RedOr { d: *d as u16, s: *src as u16 });
+            }
+            Insn::ReduceAnd(d, src) => {
+                let sw = rw[*src as usize]?;
+                if sw > 64 {
+                    gate!("redand src >64b");
+                }
+                def!(rw, *d, 1);
+                out.push(TsInsn::RedAnd {
+                    d: *d as u16,
+                    s: *src as u16,
+                    mask: ts_mask(sw),
+                });
+            }
+            Insn::BlockingAssignBitDyn(sig, idx, r) => {
+                let sig = *sig as usize;
+                if sig >= signal_widths.len() || signal_real[sig] {
+                    gate!("dest oob/real");
+                }
+                if signal_widths[sig] > 64 {
+                    gate!("dest >64b");
+                }
+                rw[*idx as usize]?;
+                rw[*r as usize]?;
+                side_effects = true;
+                stored.push(sig as u32);
+                out.push(TsInsn::BitStoreDyn {
+                    sig: sig as u32,
+                    i: *idx as u16,
+                    s: *r as u16,
+                    w: signal_widths[sig],
+                });
+            }
             Insn::BlockingAssign(sig, r, w) => {
                 let sig = *sig as usize;
                 let cw = rw[*r as usize]?;
+                if let Some((v, x)) = xc[*r as usize] {
+                    // §10.4.1 with a folded constant source. Every lowered
+                    // register is unsigned, so a narrow source zero-extends:
+                    // masking to the narrower of the two widths IS the resize.
+                    if sig >= signal_widths.len()
+                        || signal_widths[sig] != *w
+                        || signal_real[sig]
+                        || *w > 64
+                    {
+                        gate!("x-const dest shape");
+                    }
+                    let m = ts_mask(cw.min(*w));
+                    side_effects = true;
+                    stored.push(sig as u32);
+                    out.push(TsInsn::ConstStoreX { sig: sig as u32, v: v & m, x: x & m });
+                    continue;
+                }
                 // Same-width, non-real destination only: the 4-state slow
                 // path's fit/resize semantics are not reproduced here.
                 if sig >= signal_widths.len() || signal_widths[sig] != *w || signal_real[sig] {
@@ -12296,6 +12523,26 @@ pub fn lower_two_state(
                 let sig = *sig as usize;
                 if sig >= signal_widths.len() || signal_real[sig] {
                     gate!("dest oob/real");
+                }
+                if let Some((v, x)) = xc[*r as usize] {
+                    if signal_widths[sig] > 64 {
+                        gate!("dest >64b");
+                    }
+                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                    if high >= 64 {
+                        gate!("range top >=64");
+                    }
+                    let m = ts_mask(high - low + 1);
+                    side_effects = true;
+                    stored.push(sig as u32);
+                    out.push(TsInsn::RangeStoreX {
+                        sig: sig as u32,
+                        hi: high,
+                        lo: low,
+                        v: v & m,
+                        x: x & m,
+                    });
+                    continue;
                 }
                 if signal_widths[sig] > 64 {
                     gate!("dest >64b");
@@ -12524,6 +12771,20 @@ pub fn lower_two_state(
                     return None;
                 }
                 let total = sw.saturating_mul(n);
+                if let Some((v, x)) = xc[*src as usize] {
+                    if total > 64 {
+                        gate!("x-const repl >64b");
+                    }
+                    let (mut rv, mut rx) = (0u64, 0u64);
+                    for i in 0..n {
+                        rv |= v << (i * sw);
+                        rx |= x << (i * sw);
+                    }
+                    def!(rw, *d, total);
+                    xc[*d as usize] = Some((rv, rx));
+                    xc_live.push(*d);
+                    continue;
+                }
                 if total == 0 || total > 128 {
                     return None;
                 }
@@ -12561,6 +12822,27 @@ pub fn lower_two_state(
                 }
                 *t = idx_map[old];
             }
+            TsInsn::CaseMaskJmp { mj, .. } => {
+                // `xz_path` is unreachable on X-free registers but is still
+                // remapped: leaving a 4-state index in a lowered stream would
+                // be a live landmine if the invariant ever weakened.
+                for t in mj.table.iter_mut().chain(std::iter::once(&mut mj.xz_path)) {
+                    let old = *t as usize;
+                    if old >= idx_map.len() {
+                        return None;
+                    }
+                    *t = idx_map[old];
+                }
+            }
+            TsInsn::CaseJmp { cj, .. } => {
+                for t in cj.table.iter_mut().chain(std::iter::once(&mut cj.default)) {
+                    let old = *t as usize;
+                    if old >= idx_map.len() {
+                        return None;
+                    }
+                    *t = idx_map[old];
+                }
+            }
             _ => {}
         }
     }
@@ -12586,6 +12868,9 @@ pub fn lower_two_state(
                     | TsInsn::ConstStoreNba { .. }
                     | TsInsn::RangeStore { .. }
                     | TsInsn::RangeStoreNba { .. }
+                    | TsInsn::BitStoreDyn { .. }
+                    | TsInsn::ConstStoreX { .. }
+                    | TsInsn::RangeStoreX { .. }
                     | TsInsn::ElemStore { .. }
                     | TsInsn::ElemStoreNba { .. }
                     | TsInsn::NbaFromElem { .. }
@@ -12625,6 +12910,8 @@ pub fn lower_two_state(
                 | TsInsn::BrFalse { .. }
                 | TsInsn::BrNz { .. }
                 | TsInsn::Jmp { .. }
+                | TsInsn::CaseJmp { .. }
+                | TsInsn::CaseMaskJmp { .. }
         )
     });
     let apply_skip = !has_ctrl;
