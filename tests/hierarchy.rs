@@ -93,6 +93,8 @@ mod null_ports_lib_defines_nowarn;
 mod package_scoped_vars_and_methods;
 #[path = "hierarchy/percent_m_scope.rs"]
 mod percent_m_scope;
+#[path = "hierarchy/percent_m_module_init_scope.rs"]
+mod percent_m_module_init_scope;
 #[path = "hierarchy/pkg_subroutines_and_unit_scope.rs"]
 mod pkg_subroutines_and_unit_scope;
 #[path = "hierarchy/repro_import.rs"]
@@ -107,6 +109,18 @@ mod same_name_port_hop;
 mod submodule_net_array_shapes;
 #[path = "hierarchy/submodule_two_dim_array_element.rs"]
 mod submodule_two_dim_array_element;
+#[path = "hierarchy/t_bound_queue_member_storage.rs"]
+mod t_bound_queue_member_storage;
+#[path = "hierarchy/t_bound_generic_value_param_argument.rs"]
+mod t_bound_generic_value_param_argument;
+#[path = "hierarchy/t_bound_member_collection_registration.rs"]
+mod t_bound_member_collection_registration;
+#[path = "hierarchy/t_bound_queue_value_param_chain.rs"]
+mod t_bound_queue_value_param_chain;
+#[path = "hierarchy/t_no_parens_static_method.rs"]
+mod t_no_parens_static_method;
+#[path = "hierarchy/t_nested_value_param_in_type_arg.rs"]
+mod t_nested_value_param_in_type_arg;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
 
