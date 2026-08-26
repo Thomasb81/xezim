@@ -18599,6 +18599,28 @@ impl Simulator {
             for insn in compiled.instructions.iter() {
                 *op_hist.entry(super::bytecode::insn_opcode_name(insn)).or_insert(0) += c[2];
             }
+            // Per-block opcode SET. Two-state lowering is all-or-nothing per
+            // block, so the first-bail histogram above names only the first
+            // blocker and clearing it just exposes the next one in the SAME
+            // block (measured: adding a `Select` arm made the `AssignRng`
+            // count RISE). Sizing "which set of arms would actually flip
+            // blocks" needs the whole opcode closure per block, which this
+            // line emits for offline analysis.
+            if std::env::var_os("XEZIM_COMB_OPS").is_some() {
+                let mut ops: Vec<&'static str> = compiled
+                    .instructions
+                    .iter()
+                    .map(super::bytecode::insn_opcode_name)
+                    .collect();
+                ops.sort_unstable();
+                ops.dedup();
+                eprintln!(
+                    "[COMBOPS] eidx={eidx} interp={} n={} ops={}",
+                    c[2],
+                    compiled.instructions.len(),
+                    ops.join(",")
+                );
+            }
             let scope = entry.cold.scope_hint.as_deref().unwrap_or("?");
             eprintln!(
                 "[COMBPATH] #{rank} eidx={eidx} interp={} ts={} jit={} insns={} bail={} scope={}",
