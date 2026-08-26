@@ -4,6 +4,11 @@
 # instructions, -1.6% cycles, -1.8% simulation loop vs the same build
 # un-bolted (interleaved A/B, PMU-judged); output gate-verified bit-exact.
 #
+# DO NOT stack on a PGO build: measured NET NEGATIVE there (+1.4% cycles,
+# +1.2% simulation loop — BOLT's re-layout fights PGO's own profile-driven
+# placement). PGO alone (scripts/build-pgo.sh, -17.7%) is the perf build;
+# use BOLT only when PGO is not in the pipeline.
+#
 # Usage:
 #   ./scripts/build-bolt.sh <training-command...>
 # e.g.
