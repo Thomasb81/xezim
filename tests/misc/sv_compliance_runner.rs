@@ -380,3 +380,7 @@ fn test_sv_neg10_duplicate_enum_literal() {
 fn test_sv_neg11_missing_named_port() {
     run_negative_compliance_test("neg11_missing_named_port.sv");
 }
+#[test]
+fn test_sv_neg13_wreal_packed_range() {
+    run_negative_compliance_test("neg13_wreal_packed_range.sv");
+}
