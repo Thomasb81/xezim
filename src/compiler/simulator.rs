@@ -17431,6 +17431,25 @@ impl Simulator {
                 if !safe[idx] {
                     continue;
                 }
+                // Bisection aid, mirroring XEZIM_JIT_ONLY on the edge-block
+                // side: `XEZIM_JIT_COMB_RANGE=lo-hi` natively compiles only
+                // comb entries in [lo, hi). Halving the range is how a
+                // miscompiled entry gets located in ~log2(N) runs.
+                {
+                    static R: std::sync::OnceLock<Option<(usize, usize)>> =
+                        std::sync::OnceLock::new();
+                    let r = *R.get_or_init(|| {
+                        std::env::var("XEZIM_JIT_COMB_RANGE").ok().and_then(|v| {
+                            let (a, b) = v.split_once('-')?;
+                            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+                        })
+                    });
+                    if let Some((lo, hi)) = r {
+                        if idx < lo || idx >= hi {
+                            continue;
+                        }
+                    }
+                }
                 let compiled_fn = jm.try_compile_with_xz_hint(
                     &cb.instructions,
                     cb.num_regs,
@@ -43006,6 +43025,17 @@ impl Simulator {
         // advance while `settling` is set — so re-reading them from `self` on
         // each of the ~679 entry evaluations per settle call is pure overhead.
         let prof_on = self.profile_timing;
+        // Settle-worklist prefetch distance (entries ahead of the cursor).
+        // Latched once per settle: it is a process-wide env knob.
+        let prefetch_dist: usize = {
+            static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *D.get_or_init(|| {
+                std::env::var("XEZIM_PREFETCH_DIST")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(8)
+            })
+        };
         let mon_on = self.activity_mon;
         let trace_on = self.trace_always.is_some();
         let warn_x_on = self.warn_x && self.time > 0;
@@ -43090,18 +43120,48 @@ impl Simulator {
                 cur_pos += 1;
                 // The entry header load is the loop's dominant stall (~19%
                 // of settle self-time: 35k 64-byte entries visited in
-                // data-dependent order). The worklist tells us the next
-                // entry one iteration ahead — prefetch it while this one
-                // evaluates.
+                // data-dependent order). The worklist names the upcoming
+                // entries, so prefetch AHEAD of the cursor while this one
+                // evaluates. One-ahead only hides the latency of a
+                // dependent L1/L2 hit; the entry array is ~2 MB on the C906
+                // SoC, so the misses that matter are L3 (and the 64-byte
+                // entry is one line). `XEZIM_PREFETCH_DIST` tunes the
+                // distance; 8 measured best, 0 disables.
+                //
+                // An earlier revision of this prefetch was reverted after a
+                // C910 run hung with it enabled "despite the prefetch being
+                // a semantic no-op". A prefetch instruction is indeed inert
+                // — but the ADDRESS computation was not: it indexed
+                // `cur_list[cur_pos + D]` without checking the worklist
+                // length, so past the end it read a garbage index and formed
+                // `entries.as_ptr().add(garbage)`, which is out-of-bounds
+                // pointer arithmetic (UB) that LLVM is free to miscompile
+                // around. BOTH indices are bounds-checked here, which keeps
+                // the address inside the allocation on every path.
                 #[cfg(target_arch = "x86_64")]
-                if cur_pos < cur_list.len() {
-                    let nxt = cur_list[cur_pos];
-                    if nxt < entries.len() {
-                        unsafe {
-                            core::arch::x86_64::_mm_prefetch(
-                                entries.as_ptr().add(nxt) as *const i8,
-                                core::arch::x86_64::_MM_HINT_T0,
-                            );
+                {
+                    let d = cur_pos + prefetch_dist;
+                    if d < cur_list.len() {
+                        let nxt = cur_list[d];
+                        if nxt < entries.len() {
+                            unsafe {
+                                core::arch::x86_64::_mm_prefetch(
+                                    entries.as_ptr().add(nxt) as *const i8,
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
+                        }
+                    } else if cur_pos < cur_list.len() {
+                        // Tail of a short worklist: fall back to one-ahead so
+                        // small settle passes keep the original behaviour.
+                        let nxt = cur_list[cur_pos];
+                        if nxt < entries.len() {
+                            unsafe {
+                                core::arch::x86_64::_mm_prefetch(
+                                    entries.as_ptr().add(nxt) as *const i8,
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
                         }
                     }
                 }
@@ -67626,6 +67686,34 @@ impl Simulator {
 
     fn block_signals_fit_u64(&self, cb: &super::bytecode::CompiledBlock) -> bool {
         use super::bytecode::Insn;
+        // §PACKED_MEM pre-pass: cells of a PACKED array live in the arena
+        // above `PACKED_BASE` and have no `signal_table` slot at all, while
+        // the JIT addresses array elements relative to `signal_table`. The
+        // per-signal width test below narrows ids with `as u32`, which
+        // TRUNCATES a packed id (`1<<48 + off` -> `off`) and so silently
+        // aliases a whole RAM onto an unrelated signal — the opposite of the
+        // loud out-of-bounds failure `PACKED_BASE` was chosen to give. Under
+        // `XEZIM_PACKED_MEM=1` that miscompiled every JIT'd SRAM block on the
+        // C906 SoC (a 524288x128 macro among them), so reject such blocks up
+        // front, on EVERY array-bearing opcode.
+        for insn in &cb.instructions {
+            let arr = match insn {
+                Insn::LoadArrayElem(_, a, _)
+                | Insn::NbaAssignArray(a, ..)
+                | Insn::BlockingAssignArray(a, ..)
+                | Insn::NbaAssignArrayRange(a, ..)
+                | Insn::BlockingAssignArrayRange(a, ..)
+                | Insn::NbaAssignArrayRead(_, a, ..) => Some(a),
+                _ => None,
+            };
+            if let Some(a) = arr {
+                if let super::bytecode::ArrayOperand::Dense { first_id, .. } = a.as_ref() {
+                    if is_packed_id(*first_id as usize) {
+                        return false;
+                    }
+                }
+            }
+        }
         for insn in &cb.instructions {
             let sig_id = match insn {
                 Insn::LoadSignal(_, id)
