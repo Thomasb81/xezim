@@ -31268,7 +31268,9 @@ impl Simulator {
             non_clock_change = true;
         }
 
-        self.fire_clock_generators();
+        // Clock generators fire AFTER the first wheel drain below — see the
+        // de facto interleave note at the call site.
+        let mut clocks_fired = false;
 
         let _t = profile_timing.then(std::time::Instant::now);
         let has_active = self.event_queue.next_time() == Some(self.time);
@@ -31315,6 +31317,21 @@ impl Simulator {
                 if !self.is_pid_suspended(pid) {
                     self.child_finished(pid);
                 }
+            }
+            // De facto §4.5 interleave (verified against the major
+            // implementations): a process whose `#delay` expires exactly at
+            // a clock-toggle time resumes and runs to its NEXT timing
+            // control BEFORE the clock toggles — so a `@(posedge clk)` it
+            // reaches catches THIS slot's edge, and a `clk` read sees the
+            // pre-toggle value. Firing the generators before the wheel
+            // drain made xezim skip that edge: LRM-legal (§4.7 leaves the
+            // interleave open) but against the run-to-next-time-control
+            // model everyone else implements — a task ending in `#N` that
+            // lands on a posedge shifted the caller's whole
+            // `repeat(M) @(posedge clk)` sequence by one period.
+            if !clocks_fired {
+                clocks_fired = true;
+                self.fire_clock_generators();
             }
             if self.finished || self.zero_delay_defer_pending {
                 // Pending same-time activations remain in the timing wheel.
@@ -54367,6 +54384,12 @@ impl Simulator {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
+                // §5.7 (issue #31): a PROCEDURAL-only literal never passes
+                // through elaboration const-eval, so the wrap warning has to
+                // fire here too. Slow path only (the cached-value fast path
+                // above returns first), and the shared dedupe means a literal
+                // already reported at elaboration stays quiet.
+                super::elaborate::warn_unsized_decimal_wrap(*size, base, value);
                 let mut v = Value::from_str_radix(value, r, w);
                 // Cache inline values (width <= 64)
                 if w <= 64 {
@@ -81743,14 +81766,9 @@ impl Simulator {
     ) -> Option<Value> {
         let ln = self.dyn_cmp_operand_name(left)?;
         let rn = self.dyn_cmp_operand_name(right)?;
-        if ln == rn {
-            // Self-comparison is always true regardless of contents — but only
-            // when both resolve to the SAME storage; a member and an unrelated
-            // bare name (e.g. `this.val` vs an outer value-param `val`) compare
-            // by value instead.
-            let res = if want_eq { 1 } else { 0 };
-            return Some(Value::from_u64(res, 1));
-        }
+        // NO same-storage shortcut: a queue holding an x element makes BOTH
+        // `q == q` and `q != q` come out 0 on the reference simulator, so
+        // self-comparison must run the element walk like any other pair.
         let ls = self.get_queue_size(&ln);
         let rs = self.get_queue_size(&rn);
         if ls != rs {
@@ -81773,7 +81791,11 @@ impl Simulator {
                 .get_signal_value_by_name(&format!("{}[{}]", rn, i))
                 .unwrap_or_else(|| Value::zero(w));
             if lv.has_unknown() || rv.has_unknown() {
-                return Some(Value::new(1)); // X propagates
+                // Reference behavior: an x/z element makes the comparison
+                // neither equal NOR unequal — both `==` and `!=` yield 0
+                // (verified: `q1 == q1` and `q1 != q1` with an 8'hxx element
+                // both print 0 there; returning x instead rendered `%b` as x).
+                return Some(Value::from_u64(0, 1));
             }
             if lv != rv {
                 equal = false;
