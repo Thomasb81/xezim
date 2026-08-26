@@ -55,7 +55,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_DEBUG_NAMED_ARRAYS", "Debug: trace named-array signal-table binding"),
     ("XEZIM_DEP_STATS", "Settle: print comb dependency-graph statistics"),
     ("XEZIM_DIAG_LIMIT", "Diagnostics: per-kind cap for elaboration warnings (0 = unlimited)"),
-    ("XEZIM_DIRTY_EDGE", "Edge engine: force dirty-driven edge scan mode (0/1)"),
+    ("XEZIM_DIRTY_EDGE", "Edge engine: dirty-driven edge scan instead of the full per-tick scan (0/1). Measured -5.9% host instructions on the C906 CoreMark benchmark; shadow-validated with zero missed edges on that design and on ibex simple_system (see XEZIM_DIRTY_EDGE_SHADOW). Still opt-in: a write path that is not hooked would silently miss an edge, so shadow-validate a new design before relying on it"),
     ("XEZIM_DIRTY_EDGE_SHADOW", "Edge engine: shadow-compare dirty-driven scan vs full scan"),
     ("XEZIM_DISPATCHER", "Select process dispatcher implementation (debug)"),
     ("XEZIM_DUMP_CA_READS", "Dump continuous-assign read sets after elaboration"),
