@@ -261,9 +261,9 @@ fn await_in_forever_body_blocks() {
 // inside a function/task/class-method body the parser represents `process::X`
 // as `MemberAccess(Ident("process"), X)`, which fell through to an object-
 // property read and returned 0. So `p.status() == process::KILLED` was ALWAYS
-// false inside a subroutine, so a killed process was never recognized by
-// the FIFO's zombie-get sweep. Reference simulators return the documented
-// values inside subroutines.
+// false inside a subroutine and a killed process's state was never
+// recognized as such (e.g. a FIFO's zombie-get sweep never cleared killed
+// waiters). The documented values apply inside subroutines.
 
 const ENUM_IN_SUBROUTINE_SRC: &str = r#"
 module top;

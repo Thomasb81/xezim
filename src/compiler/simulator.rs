@@ -53737,6 +53737,20 @@ impl Simulator {
                             if let Some(v) = self.module.parameters.get(&member.name) {
                                 return v.clone();
                             }
+                            // §26.3: a package DATA declaration — a `const` or
+                            // a plain variable — reached through `pkg::X`.
+                            // These are registered under their BARE name as a
+                            // signal (the flat-Ident path at module/initial
+                            // scope resolves them that way), so neither the
+                            // enum nor the parameter route above has an entry
+                            // and the reference fell through to read 0 inside
+                            // a subroutine body. Read the bare signal; because
+                            // the base is a real package (not a caller local),
+                            // the lookup honors the package qualification
+                            // rather than a same-named subroutine local.
+                            if let Some(v) = self.get_signal(&member.name) {
+                                return v.clone();
+                            }
                         }
                     }
                 }

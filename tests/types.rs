@@ -308,5 +308,7 @@ mod packed_member_self_determined_width;
 mod zero_width_select_confidence;
 #[path = "types/typedef_chain_local_namespace.rs"]
 mod typedef_chain_local_namespace;
+#[path = "types/package_data_members_in_subroutine.rs"]
+mod package_data_members_in_subroutine;
 #[path = "types/signed_unsigned_compare_extension.rs"]
 mod signed_unsigned_compare_extension;
