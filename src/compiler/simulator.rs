@@ -6999,11 +6999,23 @@ impl Simulator {
                     }
                 }
             });
-            if elem_dt.is_some_and(|dt| {
-                super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
-            }) {
-                for id in first_id..signal_table.len() {
-                    signal_signed_vec[id] = true;
+            if let Some(dt) = elem_dt {
+                if super::elaborate::is_type_signed_resolved(dt, &module.typedef_types) {
+                    for id in first_id..signal_table.len() {
+                        signal_signed_vec[id] = true;
+                    }
+                }
+                // Element REALNESS inheritance (`real T[4]`): the push
+                // helpers default every element to integral, so the
+                // two-state lowering admitted real arrays and read/wrote
+                // their elements as raw f64 BITS (a compiled `T[k] + x`
+                // returned 4.6e18-looking garbage while the AST path was
+                // right). Everything keying on per-element `signal_real`
+                // needs this — same shape as the §6.11.1 signedness loop.
+                if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
+                    for id in first_id..signal_table.len() {
+                        signal_real_vec[id] = true;
+                    }
                 }
             }
         }
@@ -7107,6 +7119,14 @@ impl Simulator {
                     signal_signed_vec[id] = true;
                 }
             }
+            // Element REALNESS inheritance — see the 1-D loop.
+            if module.var_decl_types.get(base).is_some_and(|dt| {
+                super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
+            }) {
+                for id in first_id..signal_table.len() {
+                    signal_real_vec[id] = true;
+                }
+            }
         }
         let mut arrays_nd_sorted: Vec<(&String, &(Vec<(i64, i64)>, u32))> =
             module.arrays_nd.iter().collect();
@@ -7144,6 +7164,14 @@ impl Simulator {
             }) {
                 for id in first_id..signal_table.len() {
                     signal_signed_vec[id] = true;
+                }
+            }
+            // Element REALNESS inheritance — see the 1-D loop.
+            if module.var_decl_types.get(base).is_some_and(|dt| {
+                super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
+            }) {
+                for id in first_id..signal_table.len() {
+                    signal_real_vec[id] = true;
                 }
             }
         }
@@ -17016,6 +17044,7 @@ impl Simulator {
         compiler.set_packed_full_dims(&self.module.packed_full_dims);
         compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
         compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
         compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
         compiler.set_array_first_id(&self.array_first_id);
         compiler.set_string_signals(&self.module.string_signals);
@@ -19995,6 +20024,7 @@ impl Simulator {
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
             compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
@@ -20078,6 +20108,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
                 compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.set_string_signals(&self.module.string_signals);
@@ -20109,6 +20140,7 @@ impl Simulator {
                 delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
                 delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 delay_compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                delay_compiler.set_arrays_2d(&self.module.arrays_2d);
                 delay_compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 delay_compiler.set_array_first_id(&self.array_first_id);
                 delay_compiler.set_string_signals(&self.module.string_signals);
@@ -24378,6 +24410,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
                 compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_array_first_id(&self.array_first_id);
                 // Without the function table, `compile_pure_call` cannot even
@@ -24447,6 +24480,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
                 compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_array_first_id(&self.array_first_id);
@@ -25144,6 +25178,7 @@ impl Simulator {
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                     compiler.set_packed_full_dims(&self.module.packed_full_dims);
                     compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
                     compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
                     compiler.set_array_first_id(&self.array_first_id);
                     compiler.top_module_name = Some(self.module.name.clone());
@@ -34687,6 +34722,7 @@ impl Simulator {
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
             compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
@@ -34908,6 +34944,7 @@ impl Simulator {
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+                compiler.set_arrays_2d(&self.module.arrays_2d);
             compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
