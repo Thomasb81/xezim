@@ -18886,6 +18886,13 @@ impl Simulator {
                 TsInsn::Or { d, a, b } => {
                     regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
                 }
+                TsInsn::Sel { d, c, a, b } => {
+                    regs[*d as usize] = if regs[*c as usize] != 0 {
+                        regs[*a as usize]
+                    } else {
+                        regs[*b as usize]
+                    };
+                }
                 TsInsn::Not { d, s, mask } => {
                     regs[*d as usize] = !regs[*s as usize] & mask;
                 }
@@ -19082,6 +19089,20 @@ impl Simulator {
                 TsInsn::Store { sig, s, mask } => {
                     let v = regs[*s as usize] & mask;
                     self.ts_store(*sig as usize, v, *mask);
+                }
+                TsInsn::RangeStore { sig, hi, lo, s, mask } => {
+                    // §10.4.1 blocking splice: replace only [hi:lo] and keep
+                    // the surrounding bits, including any X they already
+                    // carry (the eval-site prefilter proves the block's READS
+                    // are X-free, not the untouched remainder of a partially
+                    // written destination). `compose_inline_range_bits` is
+                    // the same merge the NBA arm below uses.
+                    self.ts_range_store(
+                        *sig as usize,
+                        regs[*s as usize] & mask,
+                        *lo,
+                        *hi,
+                    );
                 }
                 TsInsn::StoreNba { sig, s, w, mask } => {
                     let v = regs[*s as usize] & mask;
@@ -19291,6 +19312,13 @@ impl Simulator {
                 TsInsn::Or { d, a, b } => {
                     regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
                 }
+                TsInsn::Sel { d, c, a, b } => {
+                    regs[*d as usize] = if regs[*c as usize] != 0 {
+                        regs[*a as usize]
+                    } else {
+                        regs[*b as usize]
+                    };
+                }
                 TsInsn::Not { d, s, mask } => {
                     regs[*d as usize] = !regs[*s as usize] & mask;
                 }
@@ -19435,6 +19463,20 @@ impl Simulator {
                     let v = regs[*s as usize] & mask;
                     self.ts_store(*sig as usize, v, *mask);
                 }
+                TsInsn::RangeStore { sig, hi, lo, s, mask } => {
+                    // §10.4.1 blocking splice: replace only [hi:lo] and keep
+                    // the surrounding bits, including any X they already
+                    // carry (the eval-site prefilter proves the block's READS
+                    // are X-free, not the untouched remainder of a partially
+                    // written destination). `compose_inline_range_bits` is
+                    // the same merge the NBA arm below uses.
+                    self.ts_range_store(
+                        *sig as usize,
+                        regs[*s as usize] & mask,
+                        *lo,
+                        *hi,
+                    );
+                }
                 TsInsn::StoreNba { sig, s, w, mask } => {
                     let v = regs[*s as usize] & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
@@ -19508,6 +19550,32 @@ impl Simulator {
     /// BlockingAssign fast path's bookkeeping exactly (dirty +
     /// after_signal_write, which also records §9.2 edge-exec writes).
     #[inline]
+    /// Blocking partial-range store for two-state blocks: splice `v` into
+    /// `signal[hi:lo]`, leaving every other bit (value AND x/z planes)
+    /// untouched, then run the ordinary change/dirty/post-write bookkeeping.
+    fn ts_range_store(&mut self, id: usize, v: u64, lo: u32, hi: u32) {
+        let (base_v, base_x) = self.signal_table[id].raw_bits();
+        let (new_v, new_x) =
+            Self::compose_inline_range_bits(base_v, base_x, v, 0, lo, hi);
+        if new_v == base_v && new_x == base_x {
+            return;
+        }
+        if !self.signal_table[id].set_inline_bits(new_v, new_x) {
+            let mut val = Value::from_inline(new_v, new_x, self.signal_widths[id]);
+            val.is_signed = self.signal_signed[id];
+            self.signal_table[id] = val;
+        }
+        self.sync_mirror(id);
+        self.signal_table[id].is_signed = self.signal_signed[id];
+        if !self.dirty_signals[id] {
+            self.dirty_signals[id] = true;
+            self.dirty_list.push(id);
+        }
+        self.dirty_any = true;
+        self.table_modified = true;
+        self.after_signal_write(id);
+    }
+
     fn ts_store(&mut self, id: usize, v: u64, mask: u64) {
         let (dv, dx) = self.signal_table[id].raw_bits();
         if v != (dv & mask) || (dx & mask) != 0 {
@@ -19631,6 +19699,13 @@ impl Simulator {
                 }
                 TsInsn::Or { d, a, b } => {
                     regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
+                }
+                TsInsn::Sel { d, c, a, b } => {
+                    regs[*d as usize] = if regs[*c as usize] != 0 {
+                        regs[*a as usize]
+                    } else {
+                        regs[*b as usize]
+                    };
                 }
                 TsInsn::Not { d, s, mask } => {
                     regs[*d as usize] = !regs[*s as usize] & mask;
@@ -19809,6 +19884,20 @@ impl Simulator {
                 TsInsn::Store { sig, s, mask } => {
                     let v = regs[*s as usize] & mask;
                     self.ts_store(*sig as usize, v, *mask);
+                }
+                TsInsn::RangeStore { sig, hi, lo, s, mask } => {
+                    // §10.4.1 blocking splice: replace only [hi:lo] and keep
+                    // the surrounding bits, including any X they already
+                    // carry (the eval-site prefilter proves the block's READS
+                    // are X-free, not the untouched remainder of a partially
+                    // written destination). `compose_inline_range_bits` is
+                    // the same merge the NBA arm below uses.
+                    self.ts_range_store(
+                        *sig as usize,
+                        regs[*s as usize] & mask,
+                        *lo,
+                        *hi,
+                    );
                 }
                 TsInsn::StoreNba { sig, s, w, mask } => {
                     let v = regs[*s as usize] & mask;
