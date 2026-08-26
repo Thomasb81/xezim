@@ -365,6 +365,10 @@ fn test_sv_neg09_duplicate_port_name() {
     run_negative_compliance_test("neg09_duplicate_port_name.sv");
 }
 #[test]
+fn test_sv_neg10_duplicate_enum_literal() {
+    run_negative_compliance_test("neg10_duplicate_enum_literal.sv");
+}
+#[test]
 fn test_sv_neg11_missing_named_port() {
     run_negative_compliance_test("neg11_missing_named_port.sv");
 }
