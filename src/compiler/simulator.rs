@@ -53669,6 +53669,34 @@ impl Simulator {
                 // BEFORE the object-property paths below — a class name has no
                 // runtime instance, so without this `Base::STARTED` reads 0.
                 if let ExprKind::Ident(h) = &expr.kind {
+                    // §9.7: the built-in `process` class's state enum
+                    // (`process::RUNNING` … `process::KILLED`). `process` is
+                    // not a USER-declared class (it is without a body, so no
+                    // `module.classes` entry exists), so the flattened
+                    // hier-Ident form `process::KILLED` (used at module/initial
+                    // scope) resolves it through the `process` special-case in
+                    // the Ident arm, but inside a function/task/method body the
+                    // parser represents the reference as
+                    // `MemberAccess(Ident("process"), X)` and it fell through to
+                    // an object-property read that returned 0 — so
+                    // `p.status() == process::KILLED` was ALWAYS false and
+                    // killed (zombie) processes were never cleared. Mirror the
+                    // flat-Ident handling here.
+                    if h.path.len() == 1
+                        && h.path[0].name.name == "process"
+                        && h.path[0].selects.is_empty()
+                    {
+                        if let Some(v) = match member.name.as_str() {
+                            "FINISHED" => Some(0u64),
+                            "RUNNING" => Some(1u64),
+                            "WAITING" => Some(2u64),
+                            "SUSPENDED" => Some(3u64),
+                            "KILLED" => Some(4u64),
+                            _ => None,
+                        } {
+                            return Value::from_u64(v, 32);
+                        }
+                    }
                     if h.path.len() == 1 && h.path[0].selects.is_empty()
                         && self.module.classes.contains_key(&h.path[0].name.name)
                     {
