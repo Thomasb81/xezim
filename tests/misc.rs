@@ -321,3 +321,5 @@ mod hier_port_drive_and_collision;
 mod recursive_function_in_continuous_assign;
 #[path = "misc/env_var_registry.rs"]
 mod env_var_registry;
+#[path = "misc/two_state_lowering_shapes.rs"]
+mod two_state_lowering_shapes;
