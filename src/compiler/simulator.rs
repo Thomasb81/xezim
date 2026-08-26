@@ -18539,7 +18539,16 @@ impl Simulator {
         let mut bail_hist: HashMap<&'static str, u64> = HashMap::default();
         let mut jit_bail_hist: HashMap<&'static str, u64> = HashMap::default();
         let mut op_hist: HashMap<&'static str, u64> = HashMap::default();
-        for (rank, (eidx, c)) in ranked.iter().take(40).enumerate() {
+        // Depth of the ranked walk. The bail/opcode histograms below are
+        // accumulated over exactly this set, so sizing a whole-population
+        // opportunity (rather than just the head) needs it raised —
+        // `XEZIM_COMB_PATHS_TOP=0` means "every interp-bound entry".
+        let top_n: usize = std::env::var("XEZIM_COMB_PATHS_TOP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|n: usize| if n == 0 { usize::MAX } else { n })
+            .unwrap_or(40);
+        for (rank, (eidx, c)) in ranked.iter().take(top_n).enumerate() {
             let Some(entry) = self.comb_entries.get(*eidx) else { continue };
             let compiled = match &entry.item {
                 CombItem::CompiledContAssign { compiled, .. }
