@@ -310,5 +310,7 @@ mod zero_width_select_confidence;
 mod typedef_chain_local_namespace;
 #[path = "types/package_data_members_in_subroutine.rs"]
 mod package_data_members_in_subroutine;
+#[path = "types/per_spec_static_singletons.rs"]
+mod per_spec_static_singletons;
 #[path = "types/signed_unsigned_compare_extension.rs"]
 mod signed_unsigned_compare_extension;
