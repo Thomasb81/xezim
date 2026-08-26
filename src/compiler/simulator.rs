@@ -3632,6 +3632,15 @@ pub struct Simulator {
     /// declared in `base_class` (so unrelated/inherited statics stay shared),
     /// giving each specialization its own cell (§8.25). None = shared cell.
     current_spec: Option<(String, String)>,
+    /// Active specialization scope CHAIN (innermost last): a parameterized
+    /// `C#(params)::method()` call (`eval_call`) sets `current_spec` to the
+    /// callee for the body, so a value-parameter reference in an ACTUAL
+    /// argument that belongs to an ENCLOSING specialization (e.g. `string
+    /// FIELD` of `uvm_utils` passed into `uvm_config_db#(uvm_object)::get`)
+    /// can no longer resolve through `current_spec` alone. This stack keeps
+    /// the CALLER specializations alive so value-param resolution can walk up
+    /// to them (§13.5.1: args evaluate in the caller's scope).
+    spec_scope_stack: Vec<(String, String)>,
     /// §28.11 gate FALL delays by signal id, from
     /// `ElaboratedModule::gate_fall_delays`. Empty unless some gate used the
     /// two-delay `#(rise, fall)` form with differing values.
@@ -7618,6 +7627,7 @@ impl Simulator {
             class_statics: HashMap::default(),
             local_type_stack: Vec::new(),
             current_spec: None,
+            spec_scope_stack: Vec::new(),
             gate_fall_delay_by_id: HashMap::default(),
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
@@ -48956,6 +48966,24 @@ impl Simulator {
                                 .signal_name_to_id
                                 .contains_key(self.resolve_hier_name(hier).as_str())
                         {
+                            // `Class::method` with NO parens invokes a
+                            // parameterless STATIC function (LRM §13.4.1: a
+                            // no-arg function may be called by name alone).
+                            // e.g. UVM's `TYPE::type_name` in `uvm_misc`
+                            // where `type_name` is `static function string
+                            // type_name();`. Previously the flat 2-segment
+                            // ident fell through `class_static_get` (which
+                            // only reads static PROPERTIES), so the call
+                            // returned garbage instead of invoking
+                            // `comp_b::type_name()`. If it's a parameterless
+                            // static function, invoke it and return its result.
+                            if self.is_static_method(cls, prop)
+                                && self.class_parameterless_function(cls, prop)
+                            {
+                                if let Some(v) = self.exec_static_method(cls, prop, &[]) {
+                                    return v;
+                                }
+                            }
                             if let Some(v) = self.class_static_get(cls, prop) {
                                 return v;
                             }
@@ -49550,6 +49578,17 @@ impl Simulator {
                             !equal
                         };
                         return Value::from_u64(if r { 1 } else { 0 }, 1);
+                    }
+                }
+                // IEEE 1800-2017 §11.8.1: `==`/`!=` on two dynamic arrays /
+                // queues compares element-by-element (after a length check),
+                // not the container's packed scalar. UVM's
+                // `uvm_resource#(T)::do_write` guards on `val == t` for a
+                // `T`-typed queue, so a wrong scalar compare (X/garbage)
+                // made the update early-return or was otherwise unreliable.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
+                    if let Some(res) = self.compare_dyn_arrays(left, right, matches!(op, BinaryOp::Eq)) {
+                        return res;
                     }
                 }
                 let is_arith_or_bitwise = matches!(
@@ -53738,6 +53777,24 @@ impl Simulator {
                             && !self.signal_name_to_id.contains_key(cls.as_str())
                             && !self.signals.contains_key(cls)
                         {
+                            // `Class::method` with NO parens invokes a
+                            // parameterless STATIC function (LRM §13.4.1) —
+                            // the MemberAccess twin of the flat-2-segment
+                            // `Class::method` handling in the Ident arm. UVM's
+                            // `TYPE::type_name` (in `uvm_misc`) parses as
+                            // MemberAccess{`TYPE`, type_name}; the previous
+                            // `class_static_get` only read static PROPERTIES,
+                            // so the call came back empty instead of invoking
+                            // `comp_b::type_name()`.
+                            if self.is_static_method(cls, &member.name)
+                                && self.class_parameterless_function(cls, &member.name)
+                            {
+                                if let Some(v) =
+                                    self.exec_static_method(cls, &member.name, &[])
+                                {
+                                    return v;
+                                }
+                            }
                             if let Some(v) = self.class_static_get(cls, &member.name) {
                                 return v;
                             }
@@ -57008,7 +57065,20 @@ impl Simulator {
                 let resolve_coll = |sim: &mut Self, e: &Expression| -> Option<(String, bool)> {
                     if let ExprKind::Ident(h) = &e.kind {
                         let n = Self::resolve_hier_name_static(h, &sim.module);
+                        // A bare identifier naming a COLLECTION MEMBER of
+                        // `this` must resolve to its `<handle>#member` storage
+                        // even when a same-named value-param / dyn-array is
+                        // registered from an enclosing frame. Prefer the
+                        // `this`-scoped member; a true local (instance_assoc_member
+                        // returns None) falls through to the bare name below.
+                        // Without this, a deep `Store::do_write` whose `val = t`
+                        // ran while an outer `make(T val)` value-param `val` was
+                        // still live in `module.dynamic_arrays` resolved the LHS
+                        // to bare `"val"` and the queue copy was dropped (§13.5.2).
                         if sim.module.dynamic_arrays.contains(&n) {
+                            if let Some(m) = sim.instance_assoc_member(&n) {
+                                return Some((m, true));
+                            }
                             return Some((n, false));
                         }
                     }
@@ -71982,8 +72052,28 @@ impl Simulator {
                 if let Some(v) = self.read_value_param_literal(nm) {
                     return Some(v);
                 }
-                // Otherwise keep the name verbatim (a type-parameter name
-                // like `T`, or an enum member, resolved downstream).
+                // Resolve an ENCLOSING TYPE PARAMETER (e.g. `W#(T)` where
+                // `T` is the surrounding class's type param, bound to a
+                // concrete type) to its current binding. The specialization
+                // sig must carry the CONCRETE type here — leaving the bare
+                // param name lets `canonicalize_spec_sig` mistake it for
+                // THIS class's own same-named parameter and clobber it with
+                // that parameter's declared default, so a nested generic
+                // member (`S#(T) s;` inside `W#(T)`) recorded `W#(int)`
+                // instead of `W#(int_arr)` and every downstream type-param
+                // resolution of `T` came back as the default, dropping a
+                // `T`-typed queue formal. (A genuine class/typedef name
+                // never reaches here — it resolved above — so this only
+                // fires for type-parameter references.)
+                if let Some(resolved) = self.resolve_type_param_binding(nm) {
+                    if self.module.classes.contains_key(&resolved)
+                        || self.module.typedef_types.contains_key(&resolved)
+                    {
+                        return Some(resolved);
+                    }
+                }
+                // Otherwise keep the name verbatim (an enum member, resolved
+                // downstream).
                 Some(nm.clone())
             }
             _ => None,
@@ -73204,11 +73294,18 @@ impl Simulator {
                 }
             }
         }
-        // Module-level fixed array (bare Ident).
+        // Module-level fixed array (bare Ident). A DYNAMIC array / queue is
+        // registered in `module.arrays` with the (0,-1) queue SENTINEL range
+        // (and in `dynamic_arrays`) — it is NOT a fixed array and must not be
+        // compared element-wise as the empty 0:-1 range: UVM's `val == t` on
+        // two `T`-typed queues would otherwise both resolve to (0,-1) and the
+        // guard falsely reported them equal (skipping the update).
         if let ExprKind::Ident(h) = &expr.kind {
             let name = self.resolve_hier_name(h);
             if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
-                return Some((name, lo, hi));
+                if !self.module.dynamic_arrays.contains(&name) && !(hi < lo) {
+                    return Some((name, lo, hi));
+                }
             }
         }
         None
@@ -81632,6 +81729,85 @@ impl Simulator {
         Self::spreads_member_wise(&su).then_some(su)
     }
 
+    /// IEEE 1800-2017 §7.2 / §11.8.1: `==`/`!=` on two dynamic-array / queue
+    /// operands compares element-by-element (after a length check). Each
+    /// operand is resolved to its storage name — a bare dyn-array formal /
+    /// local, or a `<handle>#member` collection property — and every element
+    /// is compared. Returns `None` when neither operand is a dynamic
+    /// array / queue (caller falls through to the packed-scalar path).
+    fn compare_dyn_arrays(
+        &mut self,
+        left: &Expression,
+        right: &Expression,
+        want_eq: bool,
+    ) -> Option<Value> {
+        let ln = self.dyn_cmp_operand_name(left)?;
+        let rn = self.dyn_cmp_operand_name(right)?;
+        if ln == rn {
+            // Self-comparison is always true regardless of contents — but only
+            // when both resolve to the SAME storage; a member and an unrelated
+            // bare name (e.g. `this.val` vs an outer value-param `val`) compare
+            // by value instead.
+            let res = if want_eq { 1 } else { 0 };
+            return Some(Value::from_u64(res, 1));
+        }
+        let ls = self.get_queue_size(&ln);
+        let rs = self.get_queue_size(&rn);
+        if ls != rs {
+            return Some(Value::from_u64(if want_eq { 0 } else { 1 }, 1));
+        }
+        // Width for default values when an element is unset.
+        let w = self
+            .module
+            .arrays
+            .get(&ln)
+            .map(|t| t.2)
+            .or_else(|| self.module.arrays.get(&rn).map(|t| t.2))
+            .unwrap_or(32);
+        let mut equal = true;
+        for i in 0..ls {
+            let lv = self
+                .get_signal_value_by_name(&format!("{}[{}]", ln, i))
+                .unwrap_or_else(|| Value::zero(w));
+            let rv = self
+                .get_signal_value_by_name(&format!("{}[{}]", rn, i))
+                .unwrap_or_else(|| Value::zero(w));
+            if lv.has_unknown() || rv.has_unknown() {
+                return Some(Value::new(1)); // X propagates
+            }
+            if lv != rv {
+                equal = false;
+            }
+        }
+        let res = if want_eq { equal } else { !equal };
+        Some(Value::from_u64(if res { 1 } else { 0 }, 1))
+    }
+
+    /// Resolve an expression to a dynamic-array / queue storage name, or None
+    /// if it does not name a dynamic array / queue. Handles bare formals /
+    /// locals (`q` registered in `dynamic_arrays`), and `<handle>#member`
+    /// collection properties (via [`Self::expr_assoc_name`]).
+    fn dyn_cmp_operand_name(&mut self, e: &Expression) -> Option<String> {
+        if let ExprKind::Ident(h) = &e.kind {
+            // A bare-identifier dyn array / queue formal or local registered
+            // in `dynamic_arrays`. Consult `this`-scoped members first so a
+            // member name hidden by an unrelated outer bare registration
+            // still resolves to its own `<handle>#member` storage.
+            let n = Self::resolve_hier_name_static(h, &self.module);
+            if self.module.dynamic_arrays.contains(&n) {
+                if let Some(m) = self.instance_assoc_member(&n) {
+                    return Some(m);
+                }
+                return Some(n);
+            }
+        }
+        let an = self.expr_assoc_name(e)?;
+        if self.is_associative_array(&an) {
+            return None;
+        }
+        Some(an)
+    }
+
     /// IEEE 1800-2017 §11.4.5 / §7.2: `==` and `!=` on unpacked structs compare
     /// them member by member. Their leaves live in separate signals, so the
     /// packed-value path compared two container signals that do not exist and
@@ -83438,14 +83614,34 @@ impl Simulator {
 
     /// Parse a string like `ClassName#(arg1,arg2)` into `(ClassName, "arg1,arg2")`.
     fn extract_spec_from_string(&self, s: &str) -> Option<(String, String)> {
-        if let Some(hash_idx) = s.find("#(") {
-            if s.ends_with(')') {
-                let base = s[..hash_idx].to_string();
-                let sig = s[hash_idx + 2..s.len() - 1].to_string();
-                if self.get_class_def(&base).is_some() {
-                    return Some((base, sig));
-                }
-            }
+        // Whitespace-tolerant scan for `Base#(args)`. The parser reconstructs
+        // parameterized type text with spaces around the `#`/parens
+        // (`special_comp # ( N )`). Previously the code only matched the
+        // compact `#(` form, so a SYMBOLIC value-param nested type argument
+        // (e.g. `uvm_typeid#(special_comp#(N))` from inside
+        // `special_comp#(N)`) was never parsed here — the value param `N`
+        // stayed unresolved and fell back to its default, producing a
+        // wrong-per-spec typeid/assoc key. Match `#` optionally followed by
+        // spaces then `(`. `normalize_spec_ws` later canonically strips
+        // remaining whitespace inside `sig`. Returns `(base, raw_sig)` where
+        // base is the (possibly still symbolic) class name; callers that
+        // need to re-extract nested specs keep whitespace handling here so
+        // the raw sig is unchanged for further resolution.
+        let bs = s.trim();
+        let hash_idx = bs.find('#')?;
+        let rest = &bs[hash_idx + 1..];
+        let lparen = rest.find('(')?;
+        let base = bs[..hash_idx].trim().to_string();
+        if !bs.ends_with(')') {
+            return None;
+        }
+        // `sig` is everything between `(` and the final `)`, preserving any
+        // inner whitespace verbatim (the caller canonicalizes via
+        // `normalize_spec_ws`).
+        let open_paren = hash_idx + 1 + lparen;
+        let sig = bs[open_paren + 1..bs.len() - 1].to_string();
+        if self.get_class_def(&base).is_some() {
+            return Some((base, sig));
         }
         None
     }
@@ -85516,6 +85712,7 @@ impl Simulator {
                 || cd.queue_properties.contains_key(name)
                 || cd.array_properties.contains_key(name)
                 || cd.array_nd_properties.contains_key(name)
+                || self.prop_bound_collection(handle, &cn, name)
             {
                 return Some(format!("{}#{}", handle, name));
             }
@@ -86874,9 +87071,21 @@ impl Simulator {
         if let Some((ref base, ref sig)) = extracted {
             self.ensure_spec_statics(base, sig);
         }
-        self.current_spec = extracted.or(saved.clone());
+        // Execute the callee with `current_spec` = the CALLER'S spec so an
+        // actual arg that is an enclosing specialization's value parameter
+        // resolves in the caller's scope; the call's own specialization stays
+        // on the scope stack for the body/method-dispatch to key per-spec.
+        // (Innermost caller last — value-param resolution walks inward.)
+        if let Some(cs) = &saved {
+            self.spec_scope_stack.push(cs.clone());
+        }
+        let pushed = saved.is_some();
+        self.current_spec = extracted.clone().or(saved.clone());
         let r = self.eval_call_inner(func, args);
         self.current_spec = saved;
+        if pushed {
+            self.spec_scope_stack.pop();
+        }
         r
     }
 
@@ -87068,9 +87277,16 @@ impl Simulator {
                             {
                                 self.ensure_spec_statics(&base, &sig);
                                 let saved = self.current_spec.take();
+                                if let Some(cs) = &saved {
+                                    self.spec_scope_stack.push(cs.clone());
+                                }
                                 self.current_spec = Some((base.clone(), sig));
                                 let res = self.exec_static_method(&base, mname, args);
+                                let had_saved = saved.is_some();
                                 self.current_spec = saved;
+                                if had_saved {
+                                    self.spec_scope_stack.pop();
+                                }
                                 if let Some(v) = res {
                                     return v;
                                 }
@@ -87811,9 +88027,16 @@ impl Simulator {
                         if let Some((base, sig)) = self.extract_spec_from_string(&resolved) {
                             self.ensure_spec_statics(&base, &sig);
                             let saved = self.current_spec.take();
+                            if let Some(cs) = &saved {
+                                self.spec_scope_stack.push(cs.clone());
+                            }
                             self.current_spec = Some((base.clone(), sig));
                             let res = self.exec_static_method(&base, mname, args);
+                            let had_saved = saved.is_some();
                             self.current_spec = saved;
+                            if had_saved {
+                                self.spec_scope_stack.pop();
+                            }
                             if let Some(v) = res {
                                 return v;
                             }
@@ -87826,9 +88049,16 @@ impl Simulator {
                     if let Some((base, sig)) = self.extract_spec_from_string(&name) {
                         self.ensure_spec_statics(&base, &sig);
                         let saved = self.current_spec.take();
+                        if let Some(cs) = &saved {
+                            self.spec_scope_stack.push(cs.clone());
+                        }
                         self.current_spec = Some((base.clone(), sig));
                         let res = self.exec_static_method(&base, mname, args);
+                        let had_saved = saved.is_some();
                         self.current_spec = saved;
+                        if had_saved {
+                            self.spec_scope_stack.pop();
+                        }
                         if let Some(v) = res {
                             return v;
                         }
@@ -87848,9 +88078,16 @@ impl Simulator {
                     if let Some((base, sig)) = self.resolve_typedef_spec(&name) {
                         self.ensure_spec_statics(&base, &sig);
                         let saved = self.current_spec.take();
+                        if let Some(cs) = &saved {
+                            self.spec_scope_stack.push(cs.clone());
+                        }
                         self.current_spec = Some((base.clone(), sig));
                         let res = self.exec_static_method(&base, mname, args);
+                        let had_saved = saved.is_some();
                         self.current_spec = saved;
+                        if had_saved {
+                            self.spec_scope_stack.pop();
+                        }
                         if let Some(v) = res {
                             return v;
                         }
@@ -89045,10 +89282,17 @@ impl Simulator {
                         if let Some((base, sig)) = self.extract_spec_from_string(&resolved) {
                             self.ensure_spec_statics(&base, &sig);
                             let saved = self.current_spec.take();
+                            if let Some(cs) = &saved {
+                                self.spec_scope_stack.push(cs.clone());
+                            }
                             self.current_spec = Some((base.clone(), sig));
                             let m = method_name.clone();
                             let res = self.exec_static_method(&base, &m, args);
+                            let had_saved = saved.is_some();
                             self.current_spec = saved;
+                            if had_saved {
+                                self.spec_scope_stack.pop();
+                            }
                             if let Some(v) = res {
                                 return v;
                             }
@@ -89063,10 +89307,17 @@ impl Simulator {
                     if let Some((base, sig)) = self.extract_spec_from_string(obj_name) {
                         self.ensure_spec_statics(&base, &sig);
                         let saved = self.current_spec.take();
+                        if let Some(cs) = &saved {
+                            self.spec_scope_stack.push(cs.clone());
+                        }
                         self.current_spec = Some((base.clone(), sig));
                         let m = method_name.clone();
                         let res = self.exec_static_method(&base, &m, args);
+                        let had_saved = saved.is_some();
                         self.current_spec = saved;
+                        if had_saved {
+                            self.spec_scope_stack.pop();
+                        }
                         if let Some(v) = res {
                             return v;
                         }
@@ -89095,9 +89346,16 @@ impl Simulator {
                         let m = method_name.clone();
                         self.ensure_spec_statics(&base, &sig);
                         let saved = self.current_spec.take();
+                        if let Some(cs) = &saved {
+                            self.spec_scope_stack.push(cs.clone());
+                        }
                         self.current_spec = Some((base.clone(), sig));
                         let res = self.exec_static_method(&base, &m, args);
+                        let had_saved = saved.is_some();
                         self.current_spec = saved;
+                        if had_saved {
+                            self.spec_scope_stack.pop();
+                        }
                         if let Some(v) = res {
                             return v;
                         }
@@ -89205,9 +89463,16 @@ impl Simulator {
                         {
                             self.ensure_spec_statics(&base, &sig);
                             let saved = self.current_spec.take();
+                            if let Some(cs) = &saved {
+                                self.spec_scope_stack.push(cs.clone());
+                            }
                             self.current_spec = Some((base.clone(), sig));
                             let res = self.exec_static_method(&base, &mname3, args);
+                            let had_saved = saved.is_some();
                             self.current_spec = saved;
+                            if had_saved {
+                                self.spec_scope_stack.pop();
+                            }
                             if let Some(v) = res {
                                 return v;
                             }
@@ -93233,7 +93498,35 @@ impl Simulator {
         Some(m)
     }
 
+    /// Resolve a value parameter `name` against the ACTIVE specialization,
+    /// and if it is not declared there, against each ENCLOSING caller
+    /// specialization on `spec_scope_stack` (`eval_call` pushes the caller's
+    /// spec when it enters a parameterized `C#(params)::method`). §13.5.1: an
+    /// actual argument is evaluated in the CALLER's scope, so a value
+    /// parameter of an enclosing specialization (e.g. `string FIELD` of
+    /// `uvm_utils` passed into `uvm_config_db#(uvm_object)::get`) must
+    /// resolve to its bound value even though `current_spec` is the callee
+    /// while the args are bound.
     fn resolve_value_param_from_spec(&mut self, name: &str) -> Option<Value> {
+        if let Some(v) = self.resolve_value_param_in_current(name) {
+            return Some(v);
+        }
+        // Not declared by the leaf/callee spec — walk the caller chain,
+        // innermost first (nearest caller wins).
+        let chain: Vec<(String, String)> = self.spec_scope_stack.clone();
+        for cs in chain.iter().rev() {
+            let saved = self.current_spec.clone();
+            self.current_spec = Some(cs.clone());
+            let v = self.resolve_value_param_in_current(name);
+            self.current_spec = saved;
+            if v.is_some() {
+                return v;
+            }
+        }
+        None
+    }
+
+    fn resolve_value_param_in_current(&mut self, name: &str) -> Option<Value> {
         // Cycle guard: a value param's specialization argument can itself
         // be a bare name that resolves back into value-param resolution for
         // the same class/specialization (e.g. class factories, where a
@@ -94389,6 +94682,48 @@ impl Simulator {
             }
         }
         self.heap.push(Some(instance));
+        // Per-instance TYPE-PARAM-BOUND collection members
+        // (`#(type T=int) data;` instantiated with T bound to a queue/array
+        // typedef such as `typedef int a_i[];`). These live only in
+        // `cd.properties` generically and never reach `queue_properties` /
+        // `array_properties`, so whole-assignment / size / index / `%p` paths
+        // had no array table entry and treated `data` as a scalar. Register
+        // `<handle>#member` as a dynamic array once this instance's type
+        // bindings (set above) resolve the parameter to a concrete collection
+        // type.
+        for cdef in &classes_to_init {
+            for (prop, sig) in &cdef.properties {
+                if cdef.queue_properties.contains_key(prop)
+                    || cdef.assoc_properties.contains_key(prop)
+                    || cdef.array_properties.contains_key(prop)
+                    || cdef.array_nd_properties.contains_key(prop)
+                    || cdef.static_collections.iter().any(|(n, ..)| n == prop)
+                {
+                    continue;
+                }
+                if !self.prop_bound_collection(handle, &cdef.name, prop) {
+                    continue;
+                }
+                let raw = sig.type_name.as_deref().unwrap_or(prop);
+                let concrete = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.type_bindings.get(raw).cloned())
+                    .unwrap_or_else(|| raw.to_string());
+                let w = self
+                    .module
+                    .typedef_elem_widths
+                    .get(&concrete)
+                    .copied()
+                    .unwrap_or(sig.width)
+                    .max(1);
+                let scoped = format!("{}#{}", handle, prop);
+                self.module.dynamic_arrays.insert(scoped.clone());
+                self.module.arrays.insert(scoped.clone(), (0, 63, w));
+                self.set_queue_size(&scoped, 0);
+            }
+        }
         // Re-evaluate scalar property initializers against the live parameter
         // table and instance context, before the constructor runs (SV applies
         // member initializers prior to `new`'s body). `elaborate_class`
