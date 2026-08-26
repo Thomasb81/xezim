@@ -11619,6 +11619,23 @@ pub fn ts_last_bail() -> (usize, &'static str) {
     TS_BAIL_AT.with(|c| c.get())
 }
 
+thread_local! {
+    /// Fine-grained reason for the last bail, for arms that carry several
+    /// distinct gates. The opcode alone was not enough: the gate census
+    /// showed `BlockingAssignRange` accounting for 58% of all interpreter
+    /// evaluations on the C906 SoC while its DESTINATION passed every
+    /// signal-level check, so the deciding condition had to be named from
+    /// inside the arm.
+    static TS_GATE_WHY: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("-") };
+}
+
+/// Fine-grained gate label for the last `lower_two_state` bail ("-" when the
+/// arm does not carry one).
+pub fn ts_last_gate() -> &'static str {
+    TS_GATE_WHY.with(|c| c.get())
+}
+
 pub fn lower_two_state(
     cb: &CompiledBlock,
     signal_widths: &[u32],
@@ -11752,9 +11769,20 @@ pub fn lower_two_state(
     // only when the dump is requested.
     static TRACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let track = *TRACK.get_or_init(|| std::env::var("XEZIM_TS_DBG").is_ok());
+    // Names the exact condition that rejected an instruction, for arms with
+    // more than one gate. Costs nothing unless the dump is armed.
+    macro_rules! gate {
+        ($why:expr) => {{
+            if track {
+                TS_GATE_WHY.with(|c| c.set($why));
+            }
+            return None;
+        }};
+    }
     for (ins_i, insn) in cb.instructions.iter().enumerate() {
         if track {
             TS_BAIL_AT.with(|c| c.set((ins_i, insn_opcode_name(insn))));
+            TS_GATE_WHY.with(|c| c.set("-"));
         }
         idx_map.push(out.len() as u32);
         match insn {
@@ -12266,17 +12294,22 @@ pub fn lower_two_state(
             }
             Insn::BlockingAssignRange(sig, hi, lo, r) => {
                 let sig = *sig as usize;
-                if sig >= signal_widths.len()
-                    || signal_real[sig]
-                    || signal_widths[sig] > 64
-                {
-                    return None;
+                if sig >= signal_widths.len() || signal_real[sig] {
+                    gate!("dest oob/real");
                 }
-                let cw = rw[*r as usize]?;
+                if signal_widths[sig] > 64 {
+                    gate!("dest >64b");
+                }
+                let Some(cw) = rw[*r as usize] else {
+                    gate!("src reg width unknown");
+                };
                 let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                 let w = high - low + 1;
-                if cw > 64 || high >= 64 {
-                    return None;
+                if cw > 64 {
+                    gate!("src reg >64b");
+                }
+                if high >= 64 {
+                    gate!("range top >=64");
                 }
                 side_effects = true;
                 stored.push(sig as u32);
@@ -12532,6 +12565,17 @@ pub fn lower_two_state(
         }
     }
     // A block that stores nothing is useless to run in 2-state.
+    //
+    // This list must name EVERY store opcode. It did not: the partial-range
+    // and constant NBA stores were absent, so a block whose only side effect
+    // was a range store lowered perfectly and was then discarded here as
+    // "stores nothing". On the C906 SoC that silently rejected 176.4M
+    // interpreter evaluations — 58.4% of all of them — in blocks of exactly
+    // the shape `LoadSignalRange(r, wide, 127, 64); BlockingAssignRange(dst,
+    // 63, 0, r)` (wide-bus word shuffles). Found by labelling the arm's own
+    // gates and seeing that NONE of them fired: the bail was here, after the
+    // instruction loop, with the stamp merely naming the last instruction
+    // entered.
     if !out
         .iter()
         .any(|i| {
@@ -12539,6 +12583,9 @@ pub fn lower_two_state(
                 i,
                 TsInsn::Store { .. }
                     | TsInsn::StoreNba { .. }
+                    | TsInsn::ConstStoreNba { .. }
+                    | TsInsn::RangeStore { .. }
+                    | TsInsn::RangeStoreNba { .. }
                     | TsInsn::ElemStore { .. }
                     | TsInsn::ElemStoreNba { .. }
                     | TsInsn::NbaFromElem { .. }

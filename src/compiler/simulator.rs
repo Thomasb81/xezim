@@ -18614,6 +18614,7 @@ impl Simulator {
                     .collect();
                 ops.sort_unstable();
                 ops.dedup();
+                let why = super::bytecode::ts_last_gate();
                 let gate = if bail_i != usize::MAX {
                     compiled
                         .instructions
@@ -18624,7 +18625,7 @@ impl Simulator {
                     "(lowers; xz-guard)"
                 };
                 eprintln!(
-                    "[COMBOPS] eidx={eidx} interp={} n={} gate={gate} bail={bail} ops={}",
+                    "[COMBOPS] eidx={eidx} interp={} n={} gate={gate} why={why} bail={bail} ops={}",
                     c[2],
                     compiled.instructions.len(),
                     ops.join(",")
