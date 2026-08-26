@@ -18614,8 +18614,17 @@ impl Simulator {
                     .collect();
                 ops.sort_unstable();
                 ops.dedup();
+                let gate = if bail_i != usize::MAX {
+                    compiled
+                        .instructions
+                        .get(bail_i)
+                        .map(|i| self.ts_gate_reason(i))
+                        .unwrap_or("?")
+                } else {
+                    "(lowers; xz-guard)"
+                };
                 eprintln!(
-                    "[COMBOPS] eidx={eidx} interp={} n={} ops={}",
+                    "[COMBOPS] eidx={eidx} interp={} n={} gate={gate} bail={bail} ops={}",
                     c[2],
                     compiled.instructions.len(),
                     ops.join(",")
@@ -67802,6 +67811,85 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// Why two-state lowering gave up AT this instruction, when the opcode
+    /// itself is one the lowering handles. The closure census showed 76.4% of
+    /// interpreter-bound evaluations sit in blocks whose opcodes are ALL
+    /// supported — they fail on a GATE inside the arm — so naming the gate is
+    /// what decides where the next mechanism goes. Pure diagnostics: reads the
+    /// same signal tables the gates consult and never affects lowering.
+    fn ts_gate_reason(&self, insn: &super::bytecode::Insn) -> &'static str {
+        use super::bytecode::Insn;
+        // §5.7.1: any x/z bit in a literal is a hard stop — a two-state block
+        // cannot represent it at all, so these blocks are permanently out of
+        // reach rather than waiting on a mechanism.
+        if let Insn::LoadConst(_, v) = insn {
+            if v.has_xz() {
+                return "x-const (unreachable)";
+            }
+            if v.is_real {
+                return "real-const";
+            }
+        }
+        let mut sigs: Vec<usize> = Vec::new();
+        let mut push = |id: u32, out: &mut Vec<usize>| out.push(id as usize);
+        match insn {
+            Insn::LoadSignal(_, id)
+            | Insn::LoadSignalSigned(_, id)
+            | Insn::LoadSignalBit(_, id, _)
+            | Insn::LoadSignalRange(_, id, _, _)
+            | Insn::BranchIfSignalFalse(id, _, _)
+            | Insn::NbaAssign(id, ..)
+            | Insn::NbaAssignConst(id, ..)
+            | Insn::NbaAssignRange(id, ..)
+            | Insn::NbaAssignRangeDyn(id, ..)
+            | Insn::NbaAssignBitDyn(id, ..)
+            | Insn::BlockingAssign(id, ..)
+            | Insn::BlockingAssignRange(id, ..)
+            | Insn::BlockingAssignRangeDyn(id, ..)
+            | Insn::BlockingAssignBitDyn(id, ..) => push(*id, &mut sigs),
+            Insn::NbaAssignArrayRead(dst, arr, idx, _) => {
+                push(*dst, &mut sigs);
+                push(*idx, &mut sigs);
+                if let super::bytecode::ArrayOperand::Dense { first_id, .. } = arr.as_ref() {
+                    sigs.push(*first_id);
+                }
+            }
+            Insn::LoadArrayElem(_, arr, _)
+            | Insn::NbaAssignArray(arr, ..)
+            | Insn::BlockingAssignArray(arr, ..) => {
+                if let super::bytecode::ArrayOperand::Dense { first_id, .. } = arr.as_ref() {
+                    sigs.push(*first_id);
+                }
+            }
+            _ => {}
+        }
+        if sigs.is_empty() {
+            return "register-only gate";
+        }
+        for &id in &sigs {
+            if self.signal_real.get(id).copied().unwrap_or(false) {
+                return "real-signal";
+            }
+        }
+        for &id in &sigs {
+            if self.signal_widths.get(id).copied().unwrap_or(0) > 128 {
+                return "signal >128b";
+            }
+        }
+        for &id in &sigs {
+            let w = self.signal_widths.get(id).copied().unwrap_or(0);
+            if w > 64 {
+                return "signal 65..128b";
+            }
+        }
+        for &id in &sigs {
+            if self.signal_signed.get(id).copied().unwrap_or(false) {
+                return "signed-signal";
+            }
+        }
+        "other (reg width/shape)"
     }
 
     fn block_signals_fit_u64(&self, cb: &super::bytecode::CompiledBlock) -> bool {
