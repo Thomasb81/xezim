@@ -7957,8 +7957,14 @@ impl Simulator {
             in_edge_rescan: false,
             edge_rescan_block_hits: HashMap::default(),
             stall_edge_block_hits: HashMap::default(),
-            dirty_edge: std::env::var_os("XEZIM_DIRTY_EDGE").is_some(),
-            dirty_edge_shadow: std::env::var_os("XEZIM_DIRTY_EDGE_SHADOW").is_some(),
+            // Documented as (0/1): `is_some()` made `XEZIM_DIRTY_EDGE=0`
+            // ENABLE the mode, the opposite of what the value says.
+            dirty_edge: std::env::var("XEZIM_DIRTY_EDGE")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
+            dirty_edge_shadow: std::env::var("XEZIM_DIRTY_EDGE_SHADOW")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
             prof_clocks_only_detect: 0,
             is_edge_signal_non_clock: Vec::new(),
             nba_touched_edge_non_clock: false,
