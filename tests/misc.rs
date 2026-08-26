@@ -25,6 +25,8 @@ mod bind_upward_refs;
 mod interconnect_and_var_ports;
 #[path = "misc/real_call_bytecode.rs"]
 mod real_call_bytecode;
+#[path = "misc/unsized_decimal_wrap_warning.rs"]
+mod unsized_decimal_wrap_warning;
 #[path = "misc/blocking_task_call.rs"]
 mod blocking_task_call;
 #[path = "misc/c910_create_en_cont_assign.rs"]

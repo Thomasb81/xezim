@@ -8925,6 +8925,9 @@ impl<'a> BytecodeCompiler<'a> {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
+                // §5.7 (issue #31): compiled-path literals warn here — once
+                // per literal string, deduped with the elaboration/AST sites.
+                crate::compiler::elaborate::warn_unsized_decimal_wrap(*size, base, value);
                 let mut v = Value::from_str_radix(value, r, w);
                 v.is_signed = *signed;
                 v.is_fill = xz_fill;
