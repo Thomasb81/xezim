@@ -35869,6 +35869,30 @@ impl Simulator {
                         _ => None,
                     };
                     if let Some((cls, mn)) = scoped {
+                        // A `C#(params)::task` receiver dispatches on the
+                        // bare class but must ALSO establish the receiver
+                        // specialization as `current_spec`, or a bare type
+                        // argument `T` in the task body (e.g.
+                        // `tester#(uvm_object)::do_it()` constructing
+                        // `my_cb#(T)` / `uvm_event#(T)`) resolves to the
+                        // literal `T` instead of `uvm_object`. The static
+                        // METHOD path seeds `current_spec` from the
+                        // specialization (§8.25); this static-task path was
+                        // missing it, so the body bound its parameterized
+                        // locals with `type_bindings={T:"T"}`, casting to
+                        // `uvm_callback` failed, and every `$cast` inside the
+                        // callback `get_all` saw a plain `uvm_callback` with
+                        // no callbacks.
+                        let mut recv_spec: Option<(String, String)> = None;
+                        if let ExprKind::MemberAccess { expr: mrecv, .. } = &func.kind {
+                            if let ExprKind::Specialization { .. } = &mrecv.kind {
+                                recv_spec = self
+                                    .resolve_call_spec_params(
+                                        Self::extract_call_spec(&func.clone()),
+                                        &self.current_spec.clone(),
+                                    );
+                            }
+                        }
                         if let Some((td, mclass)) = self.resolve_class_task(&cls, &mn) {
                             if self.stmts_have_blocking(&td.items) {
                                 let mut cleanup = self.bind_task_frame(&td, args);
@@ -35877,12 +35901,21 @@ impl Simulator {
                                 self.this_stack.push(None);
                                 self.class_context_stack.push(Some(mclass));
                                 cleanup.pushed_method_this = true;
+                                let saved_spec = self.current_spec.clone();
+                                if let Some((sb, ss)) = recv_spec {
+                                    self.ensure_spec_statics(&sb, &ss);
+                                    self.current_spec = Some((sb, ss));
+                                }
                                 self.task_cleanup.push(cleanup);
                                 let mut cont: Vec<Statement> = td.items.clone();
                                 cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
                                 // Chain the caller's tail instead of copying it onto the end of
                                 // the spliced body (ProcCont::pushed).
-                                self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                self.run_process_stmts(
+                                    pid,
+                                    &pc.pushed(cont, pc.start + i + 1),
+                                );
+                                self.current_spec = saved_spec;
                                 return;
                             }
                         }
@@ -69331,43 +69364,62 @@ impl Simulator {
     fn class_method_return_width(&self, func: &Expression) -> Option<u32> {
         use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::DataType;
-        // Extract (receiver head name, method name) as BORROWED slices.
-        // `infer_width` probes every arithmetic/bitwise operand on each
-        // evaluation, so the two `String` allocations this used to do ran in
-        // every loop iteration; borrowing from `func` avoids them.
-        let (recv_head, mname): (&str, &str) = match &func.kind {
-            ExprKind::MemberAccess { expr, member } => {
-                let head = match &expr.kind {
-                    ExprKind::Ident(h) if h.path.len() == 1 => h.path[0].name.name.as_str(),
-                    _ => return None,
-                };
-                (head, member.name.as_str())
-            }
+        // Extract the receiver expression + method name. `infer_width` probes
+        // every arithmetic/bitwise operand each evaluation, so keep this free
+        // of allocations.
+        let (recv_expr, mname): (&Expression, &str) = match &func.kind {
+            ExprKind::MemberAccess { expr, member } => (expr, member.name.as_str()),
             ExprKind::Ident(h) if h.path.len() == 2 => {
-                (h.path[0].name.name.as_str(), h.path[1].name.name.as_str())
+                // `recv.m(...)` flattened to Ident([recv, m]). Reconstruct a
+                // borrowable Identifier for the receiver segment (no
+                // allocation).
+                let seg = h.path[0].name.name.clone();
+                if let Some(cn) = self.var_class_types.get(&seg) {
+                    return self.method_ret_width(cn, h.path[1].name.name.as_str());
+                } else if let Some(&id) = self.signal_name_to_id.get(seg.as_str()) {
+                    if let Some(cn) = self.signal_type_names.get(&id) {
+                        return self.method_ret_width(cn, h.path[1].name.name.as_str());
+                    }
+                } else if let Some(th) = self.this_stack.last().copied().flatten() {
+                    if let Some(cn) = self.prop_class_type(th, &seg) {
+                        return self.method_ret_width(&cn, h.path[1].name.name.as_str());
+                    }
+                }
+                return None;
             }
             _ => return None,
         };
-        // Resolve the receiver's class type. Common cases only — a bare
-        // local of class type, or a class-typed signal. Subtler resolutions
-        // (properties of `this`, typedef locals, …) return None and keep the
-        // prior fallback.
-        //
-        // NOTE: `var_class_types` is a FLAT accumulator never cleared on
-        // scope/method exit (see the note at `class_prop_type`), so this
-        // binding can be stale across method calls — the result is therefore
-        // NOT memoisable by AST node. That is pre-existing behaviour.
-        let class_name: String = if let Some(cn) = self.var_class_types.get(recv_head) {
-            cn.clone()
-        } else {
-            let id = *self.signal_name_to_id.get(recv_head)?;
-            self.signal_type_names.get(&id)?.clone()
+        let class_name: Option<String> = match &recv_expr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let rn = h.path[0].name.name.clone();
+                if let Some(cn) = self.var_class_types.get(&rn) {
+                    Some(cn.clone())
+                } else if let Some(&id) = self.signal_name_to_id.get(rn.as_str()) {
+                    self.signal_type_names.get(&id).cloned()
+                } else if let Some(th) = self.this_stack.last().copied().flatten() {
+                    self.prop_class_type(th, &rn)
+                } else {
+                    None
+                }
+            }
+            ExprKind::Index { expr, .. } => Self::collection_element_class(self, expr),
+            _ => None,
         };
+        let class_name = class_name?;
+        self.method_ret_width(&class_name, mname)
+    }
+
+    /// Width of a class method's declared return type, resolved through the
+    /// inheritance chain from `class_name` (read-only; never executes the
+    /// method). `None` for a task / void / unresolvable.
+    fn method_ret_width(&self, class_name: &str, mname: &str) -> Option<u32> {
+        use crate::ast::decl::ClassMethodKind;
+        use crate::ast::types::DataType;
         // Walk the inheritance chain read-only to the method's return type.
         // `extends` must be cloned per level: the borrow of a `classes` entry
         // can't be carried across loop iterations (the entry is dropped at
         // each iteration end).
-        let mut cur = class_name;
+        let mut cur = class_name.to_string();
         while let Some(cd) = self.module.classes.get(&cur) {
             if let Some(m) = cd.methods.get(mname) {
                 if let ClassMethodKind::Function(f) = &m.kind {
@@ -69389,6 +69441,96 @@ impl Simulator {
             cur = cd.extends.clone()?;
         }
         None
+    }
+
+    /// Class type of the element of a collection-index receiver `q[i]` — the
+    /// dynamic-array / queue variable `q`'s element type (a class name when
+    /// the elements are class handles). Mirrors how a queue element member
+    /// call `cb_q[i].pre(...)` resolves its receiver class statically.
+    fn collection_element_class(
+        &self,
+        arr_expr: &Expression,
+    ) -> Option<String> {
+        let ExprKind::Ident(h) = &arr_expr.kind else {
+            return None;
+        };
+        if h.path.len() != 1 {
+            return None;
+        }
+        let name = &h.path[0].name.name;
+        if let Some(cls) = self.module.array_elem_class.get(name.as_str()) {
+            return Some(cls.clone());
+        }
+        if let Some(cls) = self.declared_collection_elem_class(name) {
+            return Some(cls);
+        }
+        // A queue/dyn-array of a TYPEDEF'd class (`cb_type cb_q[$]` where
+        // `typedef uvm_event_callback#(T) cb_type;`) has an element type that
+        // names the typedef, not a registered class — `array_elem_class` and
+        // `declared_collection_elem_class` miss it. Some queue declarations
+        // also record an EMPTY unpacked-dimensions list on `var_decl_types`
+        // (`cb_type cb_q[$]`), so resolve the (possibly typedef'd) element
+        // name to its base class regardless of recorded dimensions.
+        if let Some(dt) = self.module.var_decl_types.get(name).cloned() {
+            if let Some(elem) = Self::collection_elem_typename(&dt) {
+                if let Some(cls) = self.resolve_typeref_class_name(&elem) {
+                    return Some(cls);
+                }
+            }
+        }
+        // A COLLECTION FIELD of the enclosing class (`base_cb q[$];` as a
+        // member of `this`) is not registered in the module-scope tables; its
+        // element class comes from the property's declared type. Walk the
+        // class-context chain (leaf first) for the property, like the field
+        // element-class resolution at a collection assignment, and resolve the
+        // declared element type to a class.
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            let mut cur = Some(ctx);
+            let mut seen: HashSet<String> = HashSet::default();
+            while let Some(cn) = cur {
+                if !seen.insert(cn.clone()) {
+                    break;
+                }
+                let Some(cd) = self.module.classes.get(&cn) else {
+                    break;
+                };
+                if let Some(tn) = cd.properties.get(name).and_then(|s| s.type_name.clone()) {
+                    let tn = tn.trim();
+                    if let Some(cls) = self.resolve_typeref_class_name_str(tn) {
+                        return Some(cls);
+                    }
+                }
+                cur = cd.extends.clone();
+            }
+        }
+        None
+    }
+
+    /// Resolve a class name / typedef / specialization string to a class name.
+    fn resolve_typeref_class_name_str(&self, s: &str) -> Option<String> {
+        let tnname = crate::ast::types::TypeName {
+            scope: None,
+            name: crate::ast::Identifier {
+                name: s.to_string(),
+                span: crate::ast::Span::dummy(),
+            },
+            span: crate::ast::Span::dummy(),
+        };
+        self.resolve_typeref_class_name(&tnname)
+    }
+
+    /// Element type of an unpacked-collection DataType, or None for a scalar /
+    /// non-collection type.
+    fn collection_elem_typename(dt: &crate::ast::types::DataType) -> Option<crate::ast::types::TypeName> {
+        match dt {
+            crate::ast::types::DataType::TypeReference { name, dimensions, .. }
+                if !dimensions.is_empty() =>
+            {
+                Some(name.clone())
+            }
+            crate::ast::types::DataType::TypeReference { name, .. } => Some(name.clone()),
+            _ => None,
+        }
     }
 
     fn infer_lhs_width(&mut self, expr: &Expression) -> u32 {
@@ -72875,6 +73017,26 @@ impl Simulator {
                             if nm == "this_type" || nm == "this" {
                                 if let Some((b, s)) = &self.current_spec {
                                     return Some(format!("{}#({})", b, s));
+                                }
+                            }
+                            // A type arg that is a TYPEDEF of a parameterized
+                            // class (`cb_type cb_q[$]` where `typedef
+                            // uvm_event_callback#(T) cb_type;`): expand it via
+                            // `resolve_typedef_spec` so the base's own type
+                            // args are carried (and their bare params resolved
+                            // through `current_spec`). `expr_to_spec_fragment`
+                            // on the raw typedef ident otherwise returns ONLY
+                            // the base class name — dropping the `#(T)`, so
+                            // the missing param is afterwards filled with its
+                            // DECLARED DEFAULT (`uvm_object`) instead of the
+                            // enclosing `T` (`string`). That made the string /
+                            // `uvm_object` event callbacks key differently and
+                            // the string event's `get_all` missed its callback.
+                            if self.module.typedef_types.contains_key(nm.as_str())
+                                || self.lookup_typedef_target(nm.as_str()).is_some()
+                            {
+                                if let Some((tb, ts)) = self.resolve_typedef_spec(&nm) {
+                                    return Some(format!("{}#({})", tb, ts));
                                 }
                             }
                         }
