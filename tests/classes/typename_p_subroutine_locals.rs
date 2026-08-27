@@ -40,6 +40,15 @@ const SRC: &str = r#"class res #(parameter type T = int);
   function void write(T t);
     do_write(t);
   endfunction
+  // `%0d`/`%p` on a TYPE-PARAMETER local/formal must adopt the bound type's
+  // SIGNEDNESS (`T`→`int` is signed): pre-fix a `T=int` local read back as
+  // an unsigned `3735928559`, not the reference's `-559038737`.
+  virtual function T probe();
+    T _t;
+    _t = 32'hDEAD_BEEF;
+    $display("INT-P=%p INT-D=%0d", _t, _t);
+    return _t;
+  endfunction
 endclass
 
 class my_res #(parameter type T = string) extends res#(T);
@@ -67,6 +76,12 @@ module top;
     r = new;
     r.write("Hello, world!");
     $display("RES=%s", r.read());
+    // signedness of a T=int local (%0d/%p: must be -559038737)
+    begin
+      res#(int) p;
+      p = new;
+      p.probe();
+    end
     $finish;
   end
 endmodule
@@ -84,5 +99,10 @@ fn typename_p_formats_subroutine_locals() {
         out.contains("READ-P=\"Hello, world!\"") && out.contains("RES=Hello, world!"),
         "a `string` through `T` (generic virtual method) must not be \
          truncated; expected the full `Hello, world!`, got:\n{out}"
+    );
+    assert!(
+        out.contains("INT-P=-559038737") && out.contains("INT-D=-559038737"),
+        "a `T=int` local must render SIGNED (%p and %0d); expected \
+         `INT-P=-559038737 INT-D=-559038737`, got:\n{out}"
     );
 }
