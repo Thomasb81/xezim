@@ -53493,6 +53493,23 @@ impl Simulator {
                                 }
                             }
                         }
+                        // A bare `data_type` argument that names a TYPEDEF
+                        // (`$typename(my_bits_t)`): per §20.6.1a the typedef
+                        // resolves back to its built-in base, so "logic
+                        // signed [15:0]" rather than the typedef name or a
+                        // bare "logic".
+                        if let ExprKind::Ident(hier_td) = &arg.kind {
+                            if hier_td.path.len() == 1 && hier_td.path[0].selects.is_empty() {
+                                let tdn = &hier_td.path[0].name.name;
+                                if self.module.typedef_types.contains_key(tdn)
+                                    || self.lookup_typedef_target(tdn).is_some()
+                                {
+                                    if let Some(target) = self.lookup_typedef_target(tdn) {
+                                        return Value::from_string(&self.typename_of_dt(&target));
+                                    }
+                                }
+                            }
+                        }
                         // A bare class/covergroup type name, or a scalar signal.
                         if let ExprKind::Ident(hier) = &arg.kind {
                             if hier.path.len() == 1 {
@@ -53501,6 +53518,25 @@ impl Simulator {
                                     || self.module.covergroups.contains_key(n.as_str())
                                 {
                                     return Value::from_string(&format!("class {}", n));
+                                }
+                            }
+                            let leaf = hier
+                                .path
+                                .last()
+                                .map(|s| s.name.name.as_str())
+                                .unwrap_or("");
+                            // A signal or block-local var with a declared
+                            // type: render it, so `logic [15:0] v` reports
+                            // "logic [15:0]" (§20.6.1g preserves the range)
+                            // instead of a bare "logic".
+                            if let Some(dt) = self.module.var_decl_types.get(leaf).cloned() {
+                                return Value::from_string(&self.typename_of_dt(&dt));
+                            }
+                            // A var declared with a TYPEDEF'd type
+                            // (`my_bits_t v1;`): render the typedef's base.
+                            if let Some(tn) = self.var_typedef_types.get(leaf).cloned() {
+                                if let Some(target) = self.lookup_typedef_target(&tn) {
+                                    return Value::from_string(&self.typename_of_dt(&target));
                                 }
                             }
                             let name = self.resolve_hier_name(hier);
@@ -78905,6 +78941,115 @@ impl Simulator {
             break;
         }
         cur
+    }
+
+    /// IEEE 1800-2017 §20.6.1 `$typename` string for a resolved (builtin)
+    /// `DataType`: the built-in keyword, then non-default signing, then the
+    /// packed-vector range (bounds as unsized decimals). A typedef /
+    /// `TypeReference` is resolved back to its built-in base type (§20.6.1a),
+    /// the default signing is removed (§20.6.1b), and vector/array ranges are
+    /// preserved (§20.6.1g).
+    fn typename_of_dt(&self, dt: &DataType) -> String {
+        use crate::ast::types::{
+            DataType, IntegerAtomType, IntegerVectorType, PackedDimension, RealType, Signing, SimpleType,
+        };
+        let cur = self.resolve_dt(dt);
+        match &cur {
+            DataType::IntegerVector { kind, signing, dimensions, .. } => {
+                let kw = match kind {
+                    IntegerVectorType::Bit => "bit",
+                    IntegerVectorType::Logic => "logic",
+                    IntegerVectorType::Reg => "reg",
+                };
+                // Vector types default to UNsigned, so only the explicit
+                // `signed` survives default-signing removal.
+                let sign = matches!(signing, Some(Signing::Signed)).then_some(" signed").unwrap_or("");
+                let mut s = format!("{}{}", kw, sign);
+                for d in dimensions {
+                    match d {
+                        PackedDimension::Range { left, right, .. } => {
+                            let l = crate::elaborate::const_eval_i64_with_params(left, None);
+                            let r = crate::elaborate::const_eval_i64_with_params(right, None);
+                            match (l, r) {
+                                (Some(l), Some(r)) => s.push_str(&format!(" [{}:{}]", l, r)),
+                                // Unresolvable bound: drop the range but keep
+                                // the base keyword.
+                                _ => return kw.to_string(),
+                            }
+                        }
+                        PackedDimension::Unsized(_) => {}
+                    }
+                }
+                s
+            }
+            DataType::IntegerAtom { kind, signing, .. } => {
+                let kw = match kind {
+                    IntegerAtomType::Byte => "byte",
+                    IntegerAtomType::ShortInt => "shortint",
+                    IntegerAtomType::Int => "int",
+                    IntegerAtomType::LongInt => "longint",
+                    IntegerAtomType::Integer => "integer",
+                    IntegerAtomType::Time => "time",
+                };
+                // Integer atoms default to signed; drop it, keep explicit
+                // `unsigned`.
+                if matches!(signing, Some(Signing::Unsigned)) {
+                    format!("{} unsigned", kw)
+                } else {
+                    kw.to_string()
+                }
+            }
+            DataType::Real { kind, .. } => match kind {
+                RealType::Real => "real".to_string(),
+                RealType::ShortReal => "shortreal".to_string(),
+                RealType::RealTime => "realtime".to_string(),
+            },
+            DataType::Simple { kind, .. } => match kind {
+                SimpleType::String => "string".to_string(),
+                SimpleType::Chandle => "chandle".to_string(),
+                SimpleType::Event => "event".to_string(),
+            },
+            DataType::Implicit { .. } => "logic".to_string(),
+            // Aggregates / classes are out of the scalar path's scope.
+            _ => "logic".to_string(),
+        }
+    }
+
+    /// `$typename` of a resolved CONCRETE type string (a type parameter's
+    /// binding, from `resolve_type_param_binding`): `class <n>` for a class /
+    /// covergroup (or a class specialization), or the base keyword with the
+    /// packed range for a built-in / typedef'd vector.
+    fn typename_of_concrete(&self, concrete: &str) -> String {
+        // A class (or a specialization `foo#(...)` whose base is a class).
+        if self.module.classes.contains_key(concrete)
+            || self.module.covergroups.contains_key(concrete)
+        {
+            return format!("class {}", concrete);
+        }
+        if let Some(n) = concrete.split('#').next() {
+            if self.module.classes.contains_key(n)
+                || self.module.covergroups.contains_key(n)
+            {
+                return format!("class {}", concrete);
+            }
+        }
+        // A typedef of a built-in / vector, e.g. `uvm_bitstream_t` ->
+        // `logic signed [4095:0]`. Resolve the target and render it.
+        if self.module.typedef_types.contains_key(concrete)
+            || self.lookup_typedef_target(concrete).is_some()
+        {
+            let target = self
+                .lookup_typedef_target(concrete)
+                .unwrap_or_else(|| crate::ast::types::DataType::Implicit {
+                    signing: None,
+                    dimensions: Vec::new(),
+                    span: crate::ast::Span::dummy(),
+                });
+            return self.typename_of_dt(&target);
+        }
+        // Otherwise a bare built-in keyword (`string`, `int`, ...) or the
+        // type name itself.
+        concrete.to_string()
     }
 
     /// Constant indices of a member's (single) unpacked dimension.
@@ -104581,56 +104726,6 @@ impl Simulator {
             }
         }
         None
-    }
-
-    /// `$typename` rendering of a resolved CONCRETE type string: `class <n>`
-    /// for a class / covergroup, the base keyword for a typedef chain
-    /// (`uvm_bitstream_t` -> `logic`), or the type name itself otherwise.
-    /// Used when `$typename` receives a bare TYPE PARAMETER whose binding was
-    /// resolved through the active specialization.
-    fn typename_of_concrete(&self, concrete: &str) -> String {
-        // A class (or a specialization `foo#(...)` whose base is a class).
-        if self.module.classes.contains_key(concrete)
-            || self.module.covergroups.contains_key(concrete)
-        {
-            return format!("class {}", concrete);
-        }
-        if let Some(n) = concrete.split('#').next() {
-            if self.module.classes.contains_key(n)
-                || self.module.covergroups.contains_key(n)
-            {
-                return format!("class {}", concrete);
-            }
-        }
-        // Resolve a typedef chain (`uvm_bitstream_t` -> `logic`) to its base
-        // keyword per IEEE 1800-2017 §20.6.1 ($typename of a built-in type is
-        // that built-in's own name).
-        let mut cur = concrete.to_string();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        while let Some(dt) = self.lookup_typedef_target(&cur) {
-            if !seen.insert(cur.clone()) {
-                break;
-            }
-            match dt {
-                crate::ast::types::DataType::TypeReference { name, .. }
-                    if name.name.name.as_str() != cur =>
-                {
-                    cur = name.name.name.clone();
-                }
-                // A typedef of a base virtual type (`logic signed [63:0]`):
-                // return the base keyword.
-                crate::ast::types::DataType::IntegerVector { kind, .. } => {
-                    cur = match kind {
-                        crate::ast::types::IntegerVectorType::Bit => "bit".to_string(),
-                        crate::ast::types::IntegerVectorType::Reg => "reg".to_string(),
-                        _ => "logic".to_string(),
-                    };
-                    break;
-                }
-                _ => break,
-            }
-        }
-        cur
     }
 
     /// Format the `$typename` string for a class type (IEEE 1800-2017 §21.7):
