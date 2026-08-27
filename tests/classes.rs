@@ -31,6 +31,8 @@ mod wait_level_sensitive_inactive_delta;
 mod nested_same_named_ref_assoc_formal;
 #[path = "classes/class_time_field_neg_one.rs"]
 mod class_time_field_neg_one;
+#[path = "classes/param_type_binding_resolves_enclosing_value_param.rs"]
+mod param_type_binding_resolves_enclosing_value_param;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
 #[path = "classes/class_field_named_event.rs"]
