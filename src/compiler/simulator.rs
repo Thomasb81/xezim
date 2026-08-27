@@ -19011,6 +19011,15 @@ impl Simulator {
                 TsInsn::RedAnd { d, s, mask } => {
                     regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
                 }
+                TsInsn::WRedOr { d, s } => {
+                    let w = wregs[*s as usize];
+                    regs[*d as usize] = ((w[0] | w[1]) != 0) as u64;
+                }
+                TsInsn::WRedAnd { d, s, mask_hi } => {
+                    let w = wregs[*s as usize];
+                    regs[*d as usize] =
+                        (w[0] == u64::MAX && w[1] == *mask_hi) as u64;
+                }
                 TsInsn::BitStoreDyn { sig, i, s, w } => {
                     // §11.5.1: an out-of-range dynamic bit-select target
                     // drops the write (`Value::set_bit` is a no-op there).
@@ -19476,6 +19485,9 @@ impl Simulator {
                 TsInsn::RedAnd { d, s, mask } => {
                     regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
                 }
+                TsInsn::WRedOr { .. } | TsInsn::WRedAnd { .. } => {
+                    unreachable!("wide insn outside the wide executor")
+                }
                 TsInsn::BitStoreDyn { sig, i, s, w } => {
                     // §11.5.1: an out-of-range dynamic bit-select target
                     // drops the write (`Value::set_bit` is a no-op there).
@@ -19915,6 +19927,9 @@ impl Simulator {
                 }
                 TsInsn::RedAnd { d, s, mask } => {
                     regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
+                }
+                TsInsn::WRedOr { .. } | TsInsn::WRedAnd { .. } => {
+                    unreachable!("wide insn outside the wide executor")
                 }
                 TsInsn::BitStoreDyn { sig, i, s, w } => {
                     // §11.5.1: an out-of-range dynamic bit-select target
