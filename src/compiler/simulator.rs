@@ -84666,11 +84666,20 @@ impl Simulator {
                     // is active, each specialization gets its own static cell.
                     // This applies to statics declared in the spec's base class
                     // AND inherited from parameterized ancestors (per IEEE 1800-2023 §8.25).
-                    let active_spec = spec_override.or(self.current_spec.as_ref());
+                    // Fall back to synthesizing a spec from a CONCRETE receiver
+                    // (e.g. `ext1::ID()` where `ext1 extends base#(ext1)`) so any
+                    // static reachable through such a subclass is keyed per
+                    // specialization too — this is the generic home of the
+                    // concrete-receiver path, so it applies uniformly to static
+                    // calls, instance-inherited statics, and property reads.
+                    let active_spec = spec_override
+                        .or(self.current_spec.as_ref())
+                        .cloned()
+                        .or_else(|| self.derive_static_spec(start_class, &cname));
                     let key = match active_spec {
                         Some((base, sig))
-                            if (base == &cname
-                                || self.class_extends(base.as_str(), &cname))
+                            if (base == cname
+                                || self.class_extends(&base, &cname))
                                 && self.class_is_parameterized(&cname) =>
                         {
                             // For inherited statics (cname != base), derive
@@ -84680,7 +84689,7 @@ impl Simulator {
                             // `callbacks#(T,base_callback)` — which both
                             // extend `typed_callbacks#(T)` — share the
                             // same `m_tw_cb_q` static cell.
-                            if base == &cname {
+                            if base == cname {
                                 format!("{}#{}::{}", cname, self.canonicalize_spec_sig(&cname, sig.as_str()), prop)
                             } else if let Some(ancestor_sig) =
                                 self.ancestor_spec(base.as_str(), sig.as_str(), &cname)
@@ -84769,6 +84778,24 @@ impl Simulator {
             .map(|p| carried.get(p).cloned().unwrap_or_else(|| p.clone()))
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    /// §8.25 generic spec derivation for a member accessed from subclass
+    /// `start_class` whose declaring class is `cname`. When no specialization is
+    /// already active (`current_spec`/`spec_override`) and `start_class` is a
+    /// CONCRETE subclass of a PARAMETERIZED `cname`, synthesize the declaring
+    /// class's specialization from the receiver's `extends_type_args`. This is
+    /// called from `static_prop_key_inner` so every static-member key — whether
+    /// reached by a static call, an instance-inherited static, or a bare
+    /// property read — is keyed per specialization regardless of the caller.
+    fn derive_static_spec(&self, start_class: &str, cname: &str) -> Option<(String, String)> {
+        if self.class_is_parameterized(start_class) || !self.class_is_parameterized(cname) {
+            return None;
+        }
+        if !self.class_extends(start_class, cname) {
+            return None;
+        }
+        self.static_receiver_spec(start_class, cname)
     }
 
     /// Resolve a CLASS-SCOPED constant `ClassName::member` — an enum literal
@@ -87589,21 +87616,22 @@ impl Simulator {
                 break;
             };
             if has_method {
-                // §8.25: a static inherited from a PARAMETERIZED base reached
-                // through a concrete subclass (`ext1::ID()` where `ext1 extends
-                // base#(ext1)`) has no `#(spec)` and no instance, so seed
-                // current_spec from the receiver's extends type args so
-                // per-specialization statics stay distinct.
-                let saved = self.current_spec.clone();
-                if !self.class_is_parameterized(class_name)
-                    && self.class_is_parameterized(&cname)
-                {
-                    if let Some(spec) = self.static_receiver_spec(class_name, &cname) {
-                        self.current_spec = Some(spec);
-                    }
+                // §8.25: a static reached through a CONCRETE receiver but
+                // declared in a PARAMETERIZED ancestor (`ext1::ID()` where
+                // `ext1 extends base#(ext1)`) has no `#(spec)` on the call and
+                // no instance; seed current_spec from the receiver's extends
+                // chain so the body's BARE static member keys per-
+                // specialization. Generic: applies to any concrete receiver of
+                // a parameterized method (`derive_static_spec` is the shared
+                // path; this is its method-dispatch home).
+                if let Some(spec) = self.derive_static_spec(class_name, &cname) {
+                    let saved = self.current_spec.clone();
+                    self.current_spec = Some(spec);
+                    let v = self.exec_method_in_class_hierarchy(0, &cname, method_name, args);
+                    self.current_spec = saved;
+                    return Some(v);
                 }
                 let v = self.exec_method_in_class_hierarchy(0, &cname, method_name, args);
-                self.current_spec = saved;
                 return Some(v);
             }
             cur = parent;
@@ -87632,18 +87660,16 @@ impl Simulator {
                 break;
             };
             if has_method {
-                // §8.25: see exec_static_method — seed current_spec for
-                // per-specialization inherited statics.
-                let saved = self.current_spec.clone();
-                if !self.class_is_parameterized(class_name)
-                    && self.class_is_parameterized(&cname)
-                {
-                    if let Some(spec) = self.static_receiver_spec(class_name, &cname) {
-                        self.current_spec = Some(spec);
-                    }
+                // §8.25: same generic receiver-specialization seeding as
+                // exec_static_method (see above).
+                if let Some(spec) = self.derive_static_spec(class_name, &cname) {
+                    let saved = self.current_spec.clone();
+                    self.current_spec = Some(spec);
+                    let v = self.exec_method_in_class_hierarchy(0, &cname, method_name, args);
+                    self.current_spec = saved;
+                    return Some(v);
                 }
                 let v = self.exec_method_in_class_hierarchy(0, &cname, method_name, args);
-                self.current_spec = saved;
                 return Some(v);
             }
             cur = parent;
@@ -103246,19 +103272,18 @@ impl Simulator {
                         }
                     }
                 }
-                // §8.25 instance-method analogue of the static-receiver seeding
-                // above: a CONCRETE instance (e.g. `ext3x`) whose method is
-                // declared in a PARAMETERIZED base (`get_type_handle` in
-                // `uvm_tlm_extension`) reaches it through `extends #(ext3)`.
-                // The instance seeding above leaves current_spec unset for a
-                // concrete (unparameterized) class, so the method body's inner
-                // static call (`ID()`) resolves against the generic base and
-                // mints a WRONG singleton. Derive the declaring class's
-                // specialization from the receiver's extends type args.
+                // §8.25 (generic receiver specialization): when a method is
+                // reached on a CONCRETE receiver (static, `ext1::ID()`; or
+                // instance, `x3.get_type_handle()`) but is DECLARED in a
+                // PARAMETERIZED ancestor (`uvm_tlm_extension#(ext1)`), the
+                // receiver's `#(...)` specialization is not captured anywhere
+                // once the body runs a BARE static member like `m_singleton`.
+                // Seed current_spec from the concrete receiver's extends chain
+                // so the body's inner static access keys per specialization.
                 if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
-                    if self.current_spec.is_none()
-                        && !self.class_is_parameterized(&inst.class_name)
+                    if !self.class_is_parameterized(&inst.class_name)
                         && self.class_is_parameterized(&cname)
+                        && self.class_extends(&inst.class_name, &cname)
                     {
                         if let Some(spec) =
                             self.static_receiver_spec(&inst.class_name, &cname)
