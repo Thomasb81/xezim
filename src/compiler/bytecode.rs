@@ -11550,6 +11550,13 @@ pub enum TsInsn {
     CaseMaskJmp { s: u16, mask: u64, lo: u32, wmask: u64, mj: Box<CaseMaskJumpData> },
     /// regs[d] = (regs[s] != 0) — §11.4.9 reduction OR on an X-free operand.
     RedOr { d: u16, s: u16 },
+    /// Wide (65..128-bit) reduction OR: reads the WIDE register file. The
+    /// narrow `RedOr` on a wide source read `regs[s]` — a slot the wide load
+    /// never wrote, i.e. whatever the PREVIOUS block's evaluation left there.
+    WRedOr { d: u16, s: u16 },
+    /// Wide reduction AND: value == all-ones over its width
+    /// (`mask_hi` masks the high word).
+    WRedAnd { d: u16, s: u16, mask_hi: u64 },
     /// regs[d] = (regs[s] == mask) — §11.4.9 reduction AND; `mask` is the
     /// source width, so "all ones" is an equality against it.
     RedAnd { d: u16, s: u16, mask: u64 },
@@ -11910,8 +11917,29 @@ pub fn lower_two_state(
     // only when the dump is requested.
     static TRACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let track = *TRACK.get_or_init(|| std::env::var("XEZIM_TS_DBG").is_ok());
+    // Runtime opcode bisection: XEZIM_TS_DENY=CaseJump,RedOr,... makes any
+    // block containing a listed 4-state opcode bail back to the interpreter,
+    // so a suspected two-state miscompile can be isolated without rebuilding.
+    static DENY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let deny = DENY.get_or_init(|| {
+        std::env::var("XEZIM_TS_DENY")
+            .map(|v| v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default()
+    });
     // Names the exact condition that rejected an instruction, for arms with
     // more than one gate. Costs nothing unless the dump is armed.
+    // A register wider than 64 bits lives in the WIDE plane file, so any
+    // TsInsn that reads `regs[r]` must prove the register is narrow first —
+    // otherwise it reads whatever the previous evaluation left in the slot.
+    macro_rules! narrow_reg {
+        ($rw:ident, $r:expr, $why:expr) => {{
+            let w = $rw[$r as usize]?;
+            if w > 64 {
+                gate!($why);
+            }
+            w
+        }};
+    }
     macro_rules! gate {
         ($why:expr) => {{
             if track {
@@ -11924,6 +11952,9 @@ pub fn lower_two_state(
         if track {
             TS_BAIL_AT.with(|c| c.set((ins_i, insn_opcode_name(insn))));
             TS_GATE_WHY.with(|c| c.set("-"));
+        }
+        if !deny.is_empty() && deny.iter().any(|d| d == insn_opcode_name(insn)) {
+            return None;
         }
         cur_i = ins_i;
         if !wconf_list.is_empty() {
@@ -12203,7 +12234,10 @@ pub fn lower_two_state(
             // Wrapping at max operand width; zero-extension is the correct
             // §11.8.1 widening because both registers are unsigned.
             Insn::Add(d, a, b) | Insn::Sub(d, a, b) => {
-                let (wa, wb) = (rw[*a as usize]?, rw[*b as usize]?);
+                let (wa, wb) = (
+                    narrow_reg!(rw, *a, "wide operand (add/sub)"),
+                    narrow_reg!(rw, *b, "wide operand (add/sub)"),
+                );
                 let w = wa.max(wb);
                 def!(rw, *d, w);
                 let (d, a, b) = (*d as u16, *a as u16, *b as u16);
@@ -12217,8 +12251,8 @@ pub fn lower_two_state(
             // AShr is excluded: every lowered register is unsigned, so an
             // arithmetic shift would need sign tracking the bank lacks.
             Insn::Shl(d, a, b) | Insn::Shr(d, a, b) => {
-                let wa = rw[*a as usize]?;
-                rw[*b as usize]?;
+                let wa = narrow_reg!(rw, *a, "wide operand (shift)");
+                narrow_reg!(rw, *b, "wide shift amount");
                 def!(rw, *d, wa);
                 let (d, a, b) = (*d as u16, *a as u16, *b as u16);
                 out.push(if matches!(insn, Insn::Shl(..)) {
@@ -12240,14 +12274,14 @@ pub fn lower_two_state(
             Insn::BlockingAssignString(..) => return None,
             // 1-bit results. CaseEq/CaseNeq equal Eq/Neq on X-free values.
             Insn::Eq(d, a, b) | Insn::CaseEq(d, a, b) => {
-                rw[*a as usize]?;
-                rw[*b as usize]?;
+                narrow_reg!(rw, *a, "wide operand (eq)");
+                narrow_reg!(rw, *b, "wide operand (eq)");
                 def!(rw, *d, 1);
                 out.push(TsInsn::Eq { d: *d as u16, a: *a as u16, b: *b as u16 });
             }
             Insn::Neq(d, a, b) => {
-                rw[*a as usize]?;
-                rw[*b as usize]?;
+                narrow_reg!(rw, *a, "wide operand (neq)");
+                narrow_reg!(rw, *b, "wide operand (neq)");
                 def!(rw, *d, 1);
                 out.push(TsInsn::Neq { d: *d as u16, a: *a as u16, b: *b as u16 });
             }
@@ -12255,8 +12289,8 @@ pub fn lower_two_state(
             // always here, since every lowered register is unsigned.
             Insn::Lt(d, a, b) | Insn::Leq(d, a, b) | Insn::Gt(d, a, b)
             | Insn::Geq(d, a, b) => {
-                rw[*a as usize]?;
-                rw[*b as usize]?;
+                narrow_reg!(rw, *a, "wide operand (cmp)");
+                narrow_reg!(rw, *b, "wide operand (cmp)");
                 def!(rw, *d, 1);
                 let (d, a, b) = (*d as u16, *a as u16, *b as u16);
                 out.push(match insn {
@@ -12267,13 +12301,13 @@ pub fn lower_two_state(
                 });
             }
             Insn::LogNot(d, s) => {
-                rw[*s as usize]?;
+                narrow_reg!(rw, *s, "wide operand (lognot)");
                 def!(rw, *d, 1);
                 out.push(TsInsn::LogNot { d: *d as u16, s: *s as u16 });
             }
             Insn::LogAnd(d, a, b) | Insn::LogOr(d, a, b) => {
-                rw[*a as usize]?;
-                rw[*b as usize]?;
+                narrow_reg!(rw, *a, "wide operand (logic)");
+                narrow_reg!(rw, *b, "wide operand (logic)");
                 def!(rw, *d, 1);
                 let (d, a, b) = (*d as u16, *a as u16, *b as u16);
                 out.push(if matches!(insn, Insn::LogAnd(..)) {
@@ -12286,7 +12320,7 @@ pub fn lower_two_state(
                 // Exactly the two `AddC` lowerings the pair had before
                 // merging — in order, so a chained `s2 == d1` sees d1's
                 // freshly defined width.
-                let w1 = rw[a.s1 as usize]?;
+                let w1 = narrow_reg!(rw, a.s1, "wide operand (addc2)");
                 let v1 = clean_const(&a.k1)?;
                 let wr1 = w1.max(a.k1.width);
                 def!(rw, a.d1, wr1);
@@ -12296,7 +12330,7 @@ pub fn lower_two_state(
                     k: v1,
                     mask: ts_mask(wr1),
                 });
-                let w2 = rw[a.s2 as usize]?;
+                let w2 = narrow_reg!(rw, a.s2, "wide operand (addc2)");
                 let v2 = clean_const(&a.k2)?;
                 let wr2 = w2.max(a.k2.width);
                 def!(rw, a.d2, wr2);
@@ -12308,7 +12342,7 @@ pub fn lower_two_state(
                 });
             }
             Insn::BinOpConst(d, s, k, kind) => {
-                let w = rw[*s as usize]?;
+                let w = narrow_reg!(rw, *s, "wide operand (binop-const)");
                 let v = clean_const(k)?;
                 match kind {
                     BinOpConstKind::Xor => {
@@ -12423,14 +12457,14 @@ pub fn lower_two_state(
                 out.push(TsInsn::BrSigFalse { sig: sig as u32, bit: *bit, t: *t });
             }
             Insn::BranchIfFalse(c, t) => {
-                rw[*c as usize]?;
+                narrow_reg!(rw, *c, "wide branch condition");
                 out.push(TsInsn::BrFalse { s: *c as u16, t: *t });
             }
             // Fused compare+branch: decompose to the exact unfused lowering,
             // reusing the embedded dead register as the compare scratch.
             Insn::CmpBranch(kind, a, b, tmp, t) => {
-                rw[*a as usize]?;
-                rw[*b as usize]?;
+                narrow_reg!(rw, *a, "wide operand (cmpbranch)");
+                narrow_reg!(rw, *b, "wide operand (cmpbranch)");
                 def!(rw, *tmp, 1);
                 let (d, a, b) = (*tmp as u16, *a as u16, *b as u16);
                 out.push(match kind {
@@ -12444,7 +12478,7 @@ pub fn lower_two_state(
                 out.push(TsInsn::BrFalse { s: d, t: *t });
             }
             Insn::BranchUnlessZero(s, t) => {
-                rw[*s as usize]?;
+                narrow_reg!(rw, *s, "wide branch condition");
                 out.push(TsInsn::BrNz { s: *s as u16, t: *t });
             }
             Insn::Jump(t) => {
@@ -12477,20 +12511,36 @@ pub fn lower_two_state(
                 });
             }
             Insn::ReduceOr(d, src) => {
-                rw[*src as usize]?;
+                // Registers wider than 64 bits live in the WIDE plane file;
+                // `regs[s]` for such a register is whatever the previous
+                // block's evaluation left in that slot. Emitting the narrow
+                // form regardless of width made `|wide_bus` evaluate from
+                // stale garbage — on the C910 SoC that wedged the LSU after
+                // exactly 250 retired instructions (the first `|128-bit`
+                // control reduction on the store path).
+                let sw = rw[*src as usize]?;
                 def!(rw, *d, 1);
-                out.push(TsInsn::RedOr { d: *d as u16, s: *src as u16 });
+                out.push(if sw > 64 {
+                    TsInsn::WRedOr { d: *d as u16, s: *src as u16 }
+                } else {
+                    TsInsn::RedOr { d: *d as u16, s: *src as u16 }
+                });
             }
             Insn::ReduceAnd(d, src) => {
                 let sw = rw[*src as usize]?;
-                if sw > 64 {
-                    gate!("redand src >64b");
-                }
                 def!(rw, *d, 1);
-                out.push(TsInsn::RedAnd {
-                    d: *d as u16,
-                    s: *src as u16,
-                    mask: ts_mask(sw),
+                out.push(if sw > 64 {
+                    TsInsn::WRedAnd {
+                        d: *d as u16,
+                        s: *src as u16,
+                        mask_hi: wmask_hi(sw),
+                    }
+                } else {
+                    TsInsn::RedAnd {
+                        d: *d as u16,
+                        s: *src as u16,
+                        mask: ts_mask(sw),
+                    }
                 });
             }
             Insn::BlockingAssignBitDyn(sig, idx, r) => {
@@ -12501,8 +12551,8 @@ pub fn lower_two_state(
                 if signal_widths[sig] > 64 {
                     gate!("dest >64b");
                 }
-                rw[*idx as usize]?;
-                rw[*r as usize]?;
+                narrow_reg!(rw, *idx, "wide bit index");
+                narrow_reg!(rw, *r, "wide store source");
                 side_effects = true;
                 stored.push(sig as u32);
                 out.push(TsInsn::BitStoreDyn {
@@ -12672,7 +12722,7 @@ pub fn lower_two_state(
                     return None;
                 }
                 let (first, lo, hi) = array_span(array)?;
-                rw[*idx_reg as usize]?;
+                narrow_reg!(rw, *idx_reg, "wide array index");
                 let w = signal_widths[first];
                 def!(rw, *d, w);
                 out.push(TsInsn::ElemLoad(Box::new(TsElemOp {
@@ -12687,7 +12737,7 @@ pub fn lower_two_state(
             }
             Insn::NbaAssignArray(array, idx_reg, val_reg, w) => {
                 let (first, lo, hi) = array_span(array)?;
-                rw[*val_reg as usize]?;
+                narrow_reg!(rw, *val_reg, "wide store source");
                 if *w > 64 || signal_widths[first] != *w {
                     return None;
                 }
@@ -12707,7 +12757,7 @@ pub fn lower_two_state(
                         });
                     }
                 } else {
-                    rw[*idx_reg as usize]?;
+                    narrow_reg!(rw, *idx_reg, "wide array index");
                     out.push(TsInsn::ElemStoreNba(Box::new(TsElemOp {
                         first: first as u32,
                         lo,
@@ -12721,7 +12771,7 @@ pub fn lower_two_state(
             }
             Insn::BlockingAssignArray(array, idx_reg, val_reg, w) => {
                 let (first, lo, hi) = array_span(array)?;
-                rw[*val_reg as usize]?;
+                narrow_reg!(rw, *val_reg, "wide store source");
                 if *w > 64 || signal_widths[first] != *w {
                     return None;
                 }
@@ -12737,7 +12787,7 @@ pub fn lower_two_state(
                         });
                     }
                 } else {
-                    rw[*idx_reg as usize]?;
+                    narrow_reg!(rw, *idx_reg, "wide array index");
                     out.push(TsInsn::ElemStore(Box::new(TsElemOp {
                         first: first as u32,
                         lo,
@@ -12934,6 +12984,8 @@ pub fn lower_two_state(
         matches!(
             i,
             TsInsn::WLoadSig { .. }
+                | TsInsn::WRedOr { .. }
+                | TsInsn::WRedAnd { .. }
                 | TsInsn::WConst { .. }
                 | TsInsn::WXor { .. }
                 | TsInsn::WAnd { .. }

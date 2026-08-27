@@ -190,6 +190,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_TRACE_SPIN", "Diagnose time-0 livelocks: drain-guard + empty-sensitivity reports"),
     ("XEZIM_TRACE_TYPE", "Elab: trace typedef-width table for matching names"),
     ("XEZIM_TS_DBG", "Two-state: print lowering bail opcode per block"),
+    ("XEZIM_TS_DENY", "Two-state: comma-separated 4-state opcode names whose blocks bail back to the interpreter (miscompile bisection)"),
     ("XEZIM_TWO_STATE", "Two-state u64 fast path: 0 disables (default on)"),
     ("XEZIM_UNRESOLVED_DUMP", "Comb settle: name the entries that re-evaluate on every settle call"),
     ("XEZIM_UVM_DIR", "Path to a UVM source tree auto-added for UVM designs"),

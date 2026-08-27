@@ -325,3 +325,5 @@ mod env_var_registry;
 mod two_state_lowering_shapes;
 #[path = "misc/array_elem_indexed_part_select_target.rs"]
 mod array_elem_indexed_part_select_target;
+#[path = "misc/two_state_wide_reduction.rs"]
+mod two_state_wide_reduction;
