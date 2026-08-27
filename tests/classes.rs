@@ -37,6 +37,8 @@ mod param_type_binding_resolves_enclosing_value_param;
 mod virtual_method_in_binary_is_evaluated_once;
 #[path = "classes/typename_type_param_resolves_concrete.rs"]
 mod typename_type_param_resolves_concrete;
+#[path = "classes/static_param_class_collection_reuse.rs"]
+mod static_param_class_collection_reuse;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
 #[path = "classes/class_field_named_event.rs"]
