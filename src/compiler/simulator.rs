@@ -91356,7 +91356,7 @@ impl Simulator {
         &mut self,
         port: &crate::ast::decl::FunctionPort,
         arg: &Expression,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, Option<bool>)> {
         if !self.port_is_assoc_array(port) {
             return None;
         }
@@ -91381,6 +91381,7 @@ impl Simulator {
             self.signals.insert(k, v);
         }
         let is_string_key = self.is_string_keyed_array(&caller);
+        let prior = self.module.associative_arrays.get(&param).copied();
         self.module
             .associative_arrays
             .insert(param.clone(), is_string_key);
@@ -91389,17 +91390,35 @@ impl Simulator {
         if let Some(frame) = self.local_dyn.last_mut() {
             frame.insert(param.clone(), param.clone());
         }
-        Some((param, caller))
+        Some((param, caller, prior))
     }
 
-    /// Drop a formal associative array's entries and registration.
-    fn purge_assoc_param(&mut self, param: &str) {
+    /// Drop a formal associative array's entries and registration. Restores
+    /// any PRIOR registration an enclosing call had for the same name (see
+    /// `bind_assoc_param`'s captured `prior`): a nested call must not leave
+    /// the array unregistered after it returns just because its own formal
+    /// happens to share the name — the flat `module.associative_arrays` table
+    /// is shared across nesting depths.
+    fn purge_assoc_param(&mut self, param: &str, prior: Option<bool>) {
         let prefix = format!("{}[", param);
         let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
         for k in keys {
             self.signals.remove(&k);
         }
-        self.module.associative_arrays.remove(param);
+        match prior {
+            // An entry predated THIS call (it belongs to an enclosing frame
+            // whose bindings are still live) — put it back.
+            Some(is_string_key) => {
+                self.module
+                    .associative_arrays
+                    .insert(param.to_string(), is_string_key);
+            }
+            // This call created the registration; no enclosing frame wanted
+            // it — drop it.
+            None => {
+                self.module.associative_arrays.remove(param);
+            }
+        }
     }
 
     /// Copy a `ref`/`output`/`inout` associative formal back onto the caller's
@@ -92033,7 +92052,7 @@ impl Simulator {
             }
         }
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
-        let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
+        let mut assoc_params: Vec<(String, String, bool, Option<bool>)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
         // `output`/`inout`/`ref` STRUCT formals are bound member-wise (locals
         // `o.a`, `o.b`), so they bypass the whole-value `output_bindings`
@@ -92048,8 +92067,8 @@ impl Simulator {
             // An ASSOCIATIVE-array formal: functions bound nothing at all, so
             // `arr.size()` inside the body read 0.
             if i < args.len() {
-                if let Some((param, caller)) = self.bind_assoc_param(port, &args[i]) {
-                    assoc_params.push((param, caller, is_out));
+                if let Some((param, caller, prior)) = self.bind_assoc_param(port, &args[i]) {
+                    assoc_params.push((param, caller, is_out, prior));
                     continue;
                 }
                 // §13.5.2: bind member-wise, and for an output/inout/ref struct
@@ -92462,17 +92481,23 @@ impl Simulator {
             result.is_signed = super::elaborate::is_type_signed(&fd.return_type);
         }
         // Array formals copy element-wise; scalars go through `output_bindings`.
-        for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+        for (param, caller, is_out, prior) in std::mem::take(&mut assoc_params) {
             if param == caller {
                 // Formal aliases the caller's namespace; the body's writes
                 // already live there. Copying back would duplicate, and
-                // purging would delete the caller's data. Leave as-is.
+                // purging would delete the caller's data. Restore the prior
+                // registration (a nested same-name formal must not leave the
+                // flat `module.associative_arrays` entry wrong).
+                match prior {
+                    Some(v) => { self.module.associative_arrays.insert(param.clone(), v); }
+                    None => { self.module.associative_arrays.remove(&param); }
+                }
                 continue;
             }
             if is_out {
                 self.writeback_assoc_param(&param, &caller);
             }
-            self.purge_assoc_param(&param);
+            self.purge_assoc_param(&param, prior);
         }
         // Capture the callee's queue formals now; the caller's shadowed
         // storage is restored below, and only then is the writeback
@@ -92922,7 +92947,7 @@ impl Simulator {
                 }
             }
         }
-        let mut assoc_params: Vec<(String, String, bool)> = Vec::new(); // (param_name, caller_array_name)
+        let mut assoc_params: Vec<(String, String, bool)> = Vec::new(); // (param_name, caller_array_name, is_out)
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
         self.push_queue_frame();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
@@ -102839,7 +102864,7 @@ impl Simulator {
                 }
                 let mut queue_writebacks: Vec<(String, String)> = Vec::new();
                 let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
-                let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
+                let mut assoc_params: Vec<(String, String, bool, Option<bool>)> = Vec::new();
                 // Member-wise struct `output`/`inout`/`ref` formals bypass the
                 // whole-value `output_bindings` path (see exec_function_call).
                 let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
@@ -102865,14 +102890,14 @@ impl Simulator {
                         output_bindings.push((port.name.name.clone(), args[i].clone()));
                     }
                     if i < args.len() {
-                        if let Some((param, caller)) = self.bind_assoc_param(port, &args[i]) {
+                        if let Some((param, caller, prior)) = self.bind_assoc_param(port, &args[i]) {
                             let is_out = matches!(
                                 port.direction,
                                 PortDirection::Output
                                     | PortDirection::Inout
                                     | PortDirection::Ref
                             );
-                            assoc_params.push((param, caller, is_out));
+                            assoc_params.push((param, caller, is_out, prior));
                             continue;
                         }
                         // §13.5.2: a formal with an unpacked QUEUE / array
@@ -103611,14 +103636,23 @@ impl Simulator {
                 // §13.5.2: copy `output`/`inout`/`ref` associative-array
                 // formals back onto the caller's AA (signal-namespace
                 // merge), then drop the formal's temporary copy.
-                for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+                for (param, caller, is_out, prior) in std::mem::take(&mut assoc_params) {
                     if param == caller {
+                        // Identity binding — the body's writes landed directly
+                        // in the caller's namespace; just restore the prior
+                        // registration (a nested same-name formal must not
+                        // leave the flat `module.associative_arrays` entry
+                        // clobbered).
+                        match prior {
+                            Some(v) => { self.module.associative_arrays.insert(param.clone(), v); }
+                            None => { self.module.associative_arrays.remove(&param); }
+                        }
                         continue;
                     }
                     if is_out {
                         self.writeback_assoc_param(&param, &caller);
                     }
-                    self.purge_assoc_param(&param);
+                    self.purge_assoc_param(&param, prior);
                 }
                 for saved in formal_metadata.into_iter().rev() {
                     self.restore_formal_metadata(saved);

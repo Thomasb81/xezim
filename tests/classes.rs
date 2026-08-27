@@ -27,6 +27,8 @@ mod bit_class_property_signedness;
 mod type_param_formal_stale_local;
 #[path = "classes/wait_level_sensitive_inactive_delta.rs"]
 mod wait_level_sensitive_inactive_delta;
+#[path = "classes/nested_same_named_ref_assoc_formal.rs"]
+mod nested_same_named_ref_assoc_formal;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
 #[path = "classes/class_field_named_event.rs"]
