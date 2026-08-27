@@ -107630,11 +107630,16 @@ fn vm_is_equal(a: &Value, b: &Value) -> Option<bool> {
     if ax != 0 || bx != 0 {
         return None;
     }
-    // §11.4.4: if either operand is signed, both are extended to max width.
-    if (asg || bsg) && aw != bw {
+    // §11.6.1/§11.8.2: the comparison is SIGNED only when BOTH operands are
+    // signed; if either is unsigned the propagated type is unsigned and the
+    // narrower operand is ZERO-extended. Mirrors `Value::is_equal` — this fast
+    // path is asserted equal to it by `binary_ops_match_value_methods`, which
+    // is what caught the two implementations drifting apart.
+    if aw != bw {
         let w = aw.max(bw);
-        let (ra, rax) = vm_resize_bits(av, ax, aw, asg, w)?;
-        let (rb, rbx) = vm_resize_bits(bv, bx, bw, bsg, w)?;
+        let both_signed = asg && bsg;
+        let (ra, rax) = vm_resize_bits(av, ax, aw, both_signed, w)?;
+        let (rb, rbx) = vm_resize_bits(bv, bx, bw, both_signed, w)?;
         Some(vm_to_u64(ra, rax) == vm_to_u64(rb, rbx))
     } else {
         Some(vm_to_u64(av, ax) == vm_to_u64(bv, bx))

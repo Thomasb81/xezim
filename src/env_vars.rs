@@ -89,6 +89,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_FUSE_SCRUBS", "Bytecode: enable provably-unsigned sign-scrub elision (0/1)"),
     ("XEZIM_GIT_DATE", "Build metadata: git date baked into --version (build-time)"),
     ("XEZIM_GIT_HASH", "Build metadata: git hash baked into --version (build-time)"),
+    ("XEZIM_GIT_TAG", "Build metadata: nearest release tag baked into -V (build-time)"),
     ("XEZIM_HOT_STATS", "Print hottest comb entries / edge blocks at end of sim"),
     ("XEZIM_HUGEPAGE", "Memory: back the signal table with huge pages (0/1)"),
     ("XEZIM_HUGEPAGE_STATS", "Memory: print huge-page allocation statistics"),

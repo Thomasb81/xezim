@@ -222,7 +222,12 @@ fn print_usage() {
 }
 
 fn print_version() {
+    // Crate version first and alone on its line: `-V` output is commonly
+    // parsed by scripts. The build provenance follows in the same shape the
+    // run banner uses, so a log and a `-V` can be matched by eye.
     println!("xezim version {}", env!("CARGO_PKG_VERSION"));
+    println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
+    println!("tag {}", env!("XEZIM_GIT_TAG"));
 }
 
 /// Parse a SystemVerilog time literal (`1ns`, `10ns`, `100ps`) to a power-of-

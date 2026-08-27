@@ -44,10 +44,25 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=XEZIM_GIT_DATE={}", git_date);
+    // Nearest release tag reachable from HEAD, so `-V` can name the release a
+    // build came from and not just its commit. `--abbrev=0` yields the bare
+    // tag name (`0.10.3`) rather than the `tag-N-gHASH` long form — the hash
+    // is printed alongside it already. Best-effort: an untagged history or a
+    // missing git gives "unknown".
+    let git_tag = Command::new("git")
+        .args(["describe", "--tags", "--abbrev=0"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=XEZIM_GIT_TAG={}", git_tag);
     // HEAD ref + index changes should retrigger the build script so the hash
     // does not go stale between commits.
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
 
     // UVM checkout for the UVM integration tests
     // (tests/classes/uvm_integration_tests.rs): a single
