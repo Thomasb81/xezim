@@ -297,6 +297,10 @@ fn test_sv_48_nettype_inlined_real() {
     run_positive_compliance_test("tests_advanced", "48_nettype_inlined_real.sv");
 }
 #[test]
+fn test_sv_49_specparam_hierarchical() {
+    run_positive_compliance_test("tests_advanced", "49_specparam_hierarchical.sv");
+}
+#[test]
 fn test_sv_41_genfor_localparam_idx() {
     run_positive_compliance_test("tests_advanced", "41_genfor_localparam_idx.sv");
 }
