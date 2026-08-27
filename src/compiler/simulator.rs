@@ -86774,6 +86774,23 @@ impl Simulator {
         self.static_fixed_key_in(cls, member)
     }
 
+    /// Is `member` a STATIC queue/assoc/dynamic-array collection property of
+    /// `start_class` or an ancestor (i.e. it is in `static_collections`)?
+    fn member_is_static_coll(&self, start_class: &str, member: &str) -> bool {
+        let mut cur = Some(start_class.to_string());
+        while let Some(cn) = cur {
+            if let Some(cd) = self.module.classes.get(&cn) {
+                if cd.static_collections.iter().any(|(n, _, _)| n == member) {
+                    return true;
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
     /// Does `start_class` or an ancestor declare `name` as a STATIC
     /// queue/assoc/dynamic-array collection (i.e. it is in
     /// `static_collections`)?
@@ -87009,6 +87026,30 @@ impl Simulator {
                     // the class name as an object handle (0 → None), and the
                     // assoc-array first()/next() iteration silently fails.
                     if self.module.classes.contains_key(&bh.path[0].name.name) {
+                        // §8.25: an EXPLICITLY parameterized access
+                        // `config_db#(int)::m_rsc.exists(c)`/`.num()` arrives
+                        // here as a bare `Ident(config_db)` receiver (the outer
+                        // value-context eval strips the `Specialization`
+                        // wrapper before the builtin method dispatches). The
+                        // active `current_spec` still carries `(config_db,
+                        // int)`, so resolve the per-spec static-collection key
+                        // the same way the `Specialization` arm below does;
+                        // otherwise the read lands on bare `m_rsc` while the
+                        // matching write went to `config_db#(int)::m_rsc`, and
+                        // `exists()`/`num()` report empty.
+                        if let Some((cb, cs)) = &self.current_spec {
+                            if cb == &bh.path[0].name.name
+                                && self.member_is_static_coll(cb, &member.name)
+                            {
+                                let sb = cb.clone();
+                                let ss = cs.clone();
+                                let saved = self.current_spec.take();
+                                self.current_spec = Some((sb.clone(), ss));
+                                let key = self.static_prop_key(&sb, &member.name);
+                                self.current_spec = saved;
+                                return key;
+                            }
+                        }
                         if self.is_associative_array(&member.name) {
                             return Some(member.name.clone());
                         }
@@ -87084,31 +87125,12 @@ impl Simulator {
                     ) else {
                         return None;
                     };
-                    let mut cur = Some(b.clone());
-                    while let Some(cn) = cur {
-                        let is_static_coll = self
-                            .module
-                            .classes
-                            .get(&cn)
-                            .map(|cd| {
-                                cd.static_properties.contains(&member.name)
-                                    && cd.static_collections
-                                        .iter()
-                                        .any(|(n, _, _)| n == &member.name)
-                            })
-                            .unwrap_or(false);
-                        if is_static_coll {
-                            let saved = self.current_spec.take();
-                            self.current_spec = Some((b.clone(), s.clone()));
-                            let key = self.static_prop_key(&b, &member.name);
-                            self.current_spec = saved;
-                            return key;
-                        }
-                        cur = self
-                            .module
-                            .classes
-                            .get(&cn)
-                            .and_then(|cd| cd.extends.clone());
+                    if self.member_is_static_coll(&b, &member.name) {
+                        let saved = self.current_spec.take();
+                        self.current_spec = Some((b.clone(), s.clone()));
+                        let key = self.static_prop_key(&b, &member.name);
+                        self.current_spec = saved;
+                        return key;
                     }
                     None
                 }
