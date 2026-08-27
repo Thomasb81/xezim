@@ -95455,6 +95455,24 @@ impl Simulator {
                     // parameterized context (`uvm_resource#(T)` where `T` is
                     // config_db's own param) — resolve it to the concrete type so
                     // the instance's binding is `T -> int`, not `T -> T`.
+                    //
+                    // A type arg that is a SPECIALIZATION of the ENCLOSING class's
+                    // own parameter (`uvm_callback_iter#(special_comp#(N),...)` on
+                    // a special_comp#(N) instance) carries a bare value-parameter
+                    // name `N` in its `#(...)`. leaf_ident_name returns the raw
+                    // `special_comp#(N)` string, so binding `T -> "special_comp#(N)"`
+                    // captures N as literal text and every later `T`-param
+                    // resolution inside the iterator's methods (`first()` calling
+                    // `uvm_callbacks#(T,CB)::get_first`) ends up at the un-
+                    // specialized `special_comp` cell — empty typewide queue,
+                    // so `get_first`/`first()` returned null. Resolve the
+                    // `#(N)` args through the ACTIVE specialization here, so the
+                    // binding is the concrete `special_comp#(1)`.
+                    let concrete = if concrete.contains('(') && matches!(ta.kind, ExprKind::Specialization { .. }) {
+                        self.expr_to_spec_fragment(ta).unwrap_or(concrete)
+                    } else {
+                        concrete
+                    };
                     bound = Some(
                         self.resolve_type_param_binding(&concrete)
                             .unwrap_or(concrete),
