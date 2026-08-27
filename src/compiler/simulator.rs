@@ -53473,6 +53473,26 @@ impl Simulator {
                                 &self.format_class_typename(&base, &ta),
                             );
                         }
+                        // §8.25: a bare TYPE PARAMETER of the active
+                        // specialization (`$typename(T)` inside
+                        // `ger#(type T)::do_it()`), resolved through the
+                        // current spec to its CONCRETE bound type — not the
+                        // literal param name. Pre-fix this fell through to the
+                        // scalar-signal fallback and reported `logic` for a
+                        // class type (`T=uvm_object`), hiding what the body
+                        // actually specialized.
+                        if let ExprKind::Ident(hier2) = &arg.kind {
+                            if hier2.path.len() == 1 {
+                                let tnp = &hier2.path[0].name.name;
+                                if let Some(concrete) = self.resolve_type_param_binding(tnp) {
+                                    if concrete != *tnp {
+                                        return Value::from_string(
+                                            &self.typename_of_concrete(&concrete),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         // A bare class/covergroup type name, or a scalar signal.
                         if let ExprKind::Ident(hier) = &arg.kind {
                             if hier.path.len() == 1 {
@@ -104561,6 +104581,56 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// `$typename` rendering of a resolved CONCRETE type string: `class <n>`
+    /// for a class / covergroup, the base keyword for a typedef chain
+    /// (`uvm_bitstream_t` -> `logic`), or the type name itself otherwise.
+    /// Used when `$typename` receives a bare TYPE PARAMETER whose binding was
+    /// resolved through the active specialization.
+    fn typename_of_concrete(&self, concrete: &str) -> String {
+        // A class (or a specialization `foo#(...)` whose base is a class).
+        if self.module.classes.contains_key(concrete)
+            || self.module.covergroups.contains_key(concrete)
+        {
+            return format!("class {}", concrete);
+        }
+        if let Some(n) = concrete.split('#').next() {
+            if self.module.classes.contains_key(n)
+                || self.module.covergroups.contains_key(n)
+            {
+                return format!("class {}", concrete);
+            }
+        }
+        // Resolve a typedef chain (`uvm_bitstream_t` -> `logic`) to its base
+        // keyword per IEEE 1800-2017 §20.6.1 ($typename of a built-in type is
+        // that built-in's own name).
+        let mut cur = concrete.to_string();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(dt) = self.lookup_typedef_target(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            match dt {
+                crate::ast::types::DataType::TypeReference { name, .. }
+                    if name.name.name.as_str() != cur =>
+                {
+                    cur = name.name.name.clone();
+                }
+                // A typedef of a base virtual type (`logic signed [63:0]`):
+                // return the base keyword.
+                crate::ast::types::DataType::IntegerVector { kind, .. } => {
+                    cur = match kind {
+                        crate::ast::types::IntegerVectorType::Bit => "bit".to_string(),
+                        crate::ast::types::IntegerVectorType::Reg => "reg".to_string(),
+                        _ => "logic".to_string(),
+                    };
+                    break;
+                }
+                _ => break,
+            }
+        }
+        cur
     }
 
     /// Format the `$typename` string for a class type (IEEE 1800-2017 §21.7):
