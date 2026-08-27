@@ -23,6 +23,8 @@ mod class_formal_typedef_widen;
 mod assoc_typedef_element_class;
 #[path = "classes/bit_class_property_signedness.rs"]
 mod bit_class_property_signedness;
+#[path = "classes/type_param_formal_stale_local.rs"]
+mod type_param_formal_stale_local;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
 #[path = "classes/class_field_named_event.rs"]

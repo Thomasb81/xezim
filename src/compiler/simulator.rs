@@ -92165,6 +92165,31 @@ impl Simulator {
                 } else if self.module.classes.contains_key(&type_name) {
                     self.record_local_class_type(&port.name.name, &type_name);
                     self.var_class_types.insert(port.name.name.clone(), type_name);
+                } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
+                    // The formal is typed with a class TYPE PARAMETER
+                    // (`IMP imp` inside a parameterized class, e.g. the
+                    // uvm_tlm_*_socket `new(name, parent, IMP imp=null)`).
+                    // `type_name` is not a real class name, so the branches
+                    // above silently skip it and `class_of_var` falls back to
+                    // a STALE same-named entry left in the flat
+                    // `var_class_types` by an unrelated scope (UVM's
+                    // config_db methods declare a local `imp` of concrete type
+                    // `uvm_config_db_implementation_t`). The local's record is
+                    // not scrubbed like a formal's, so `$cast(imp, parent)`
+                    // resolved `imp` to that WRONG class and failed it
+                    // (UVM/TLM2/NOIMP on a valid initiator socket). Record the
+                    // resolved concrete class so `$cast`/`new` see the right
+                    // type. Mirrors the local-VarDecl path (§8.25).
+                    let cn_is_class = self.module.classes.contains_key(&concrete)
+                        || (concrete.contains('#')
+                            && self
+                                .module
+                                .classes
+                                .contains_key(concrete.split('#').next().unwrap_or(&concrete)));
+                    if cn_is_class {
+                        self.record_local_class_type(&port.name.name, &concrete);
+                        self.var_class_types.insert(port.name.name.clone(), concrete);
+                    }
                 }
             }
             // Same §13.3 metadata registration as the task path.
@@ -103026,6 +103051,30 @@ impl Simulator {
                         } else if self.module.classes.contains_key(&type_name) {
                             self.record_local_class_type(&port.name.name, &type_name);
                             self.var_class_types.insert(port.name.name.clone(), type_name.clone());
+                        } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
+                            // See the identical branch in exec_function_call's
+                            // port loop: the formal is typed with a class TYPE
+                            // PARAMETER (`IMP imp`), not a real class name. It
+                            // used to be skipped, so `class_of_var` fell back
+                            // to a STALE same-named `var_class_types` entry from
+                            // an unrelated scope (UVM's config_db methods)
+                            // and `$cast(imp, parent)` resolved `imp` to the
+                            // WRONG class — failing a valid TLM initiator
+                            // socket with UVM/TLM2/NOIMP. Record the resolved
+                            // concrete class so the cast/new sees the right
+                            // type (mirrors the local-VarDecl path, §8.25).
+                            let cn_is_class = self.module.classes.contains_key(&concrete)
+                                || (concrete.contains('#')
+                                    && self
+                                        .module
+                                        .classes
+                                        .contains_key(
+                                            concrete.split('#').next().unwrap_or(&concrete),
+                                        ));
+                            if cn_is_class {
+                                self.record_local_class_type(&port.name.name, &concrete);
+                                self.var_class_types.insert(port.name.name.clone(), concrete);
+                            }
                         }
                     }
                     locals.insert(port.name.name.clone(), val);
