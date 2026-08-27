@@ -31517,6 +31517,75 @@ impl Simulator {
         }
     }
 
+    /// Resume level-sensitive `wait(expr)` waiters parked in
+    /// `condition_waiters` whose condition has just become true. IEEE
+    /// 1800-2023 §9.7.4: `wait(cond)` is level-sensitive — the process
+    /// resumes as soon as the condition is true, INCLUDING in the same
+    /// timestep via a delta-cycle (#0) write from another process.
+    ///
+    /// Because `wait` on non-signal state (class members / locals) cannot use
+    /// the edge-triggered event_waiter path, waiters park here and are
+    /// re-checked as a bounded fixpoint: reschedule each, run the ones whose
+    /// condition now holds (its continuation may free another waiter), apply
+    /// any NBA work those runs produced, and iterate until a round advances
+    /// no waiter (the remainder are blocked on a genuinely future-time
+    /// change).
+    ///
+    /// The caller invokes this BOTH (a) inside `run_one_tick`'s active loop,
+    /// immediately before the INACTIVE (`#0`) region is promoted — so a
+    /// waiter is resumed in the SAME delta as the write that satisfied it,
+    /// before a `#0`-parked peer's continuation overwrites the value — and
+    /// (b) at the end of the tick, after the NBA region has settled, to
+    /// catch waiters satisfied by non-blocking/edge-propagated state.
+    fn drain_condition_waiters(&mut self) {
+        let mut guard = 0u32;
+        while !self.condition_waiters.is_empty()
+            && !self.finished
+            && !self.zero_delay_defer_pending
+        {
+            guard += 1;
+            if guard > 10000 {
+                break;
+            }
+            let prog_before = self.cond_progress;
+            let parked = std::mem::take(&mut self.condition_waiters);
+            for (cpid, cont) in parked {
+                self.event_queue.schedule(self.time, cpid, cont);
+            }
+            while self.event_queue.next_time() == Some(self.time)
+                && !self.finished
+                && !self.zero_delay_defer_pending
+            {
+                let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
+                    break;
+                };
+                self.run_scheduled_process(bpid, &stmts);
+                if !self.is_pid_suspended(bpid) {
+                    self.child_finished(bpid);
+                }
+            }
+            if !self.nba_fast.is_empty()
+                || !self.nba_queue.is_empty()
+                // §15.5.2: a bare `->>` (deferred trigger) must flush with the
+                // NBA region even when no NBA DATA is queued.
+                || !self.pending_nba_triggers.is_empty()
+                || !self.pending_nba_instance_triggers.is_empty()
+                || self.delayed_nba_due()
+            {
+                self.apply_nba();
+            }
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            // No waiter proceeded this round → the remainder are genuinely
+            // blocked (future-time change); stop re-checking until the next
+            // tick.
+            if self.cond_progress == prog_before {
+                break;
+            }
+        }
+    }
+
     fn run_one_tick(
         &mut self,
         accum: &mut PerTickAccum,
@@ -31641,6 +31710,19 @@ impl Simulator {
             // the NBA region — a `#0`-resumed read must see pre-NBA values
             // (reference-simulator verified; the previous NBA-first order
             // followed a differing commercial camp).
+            //
+            // Before handing control to the INACTIVE (`#0`) continuations,
+            // let any `wait(expr)` whose condition this ACTIVE batch just made
+            // true resume FIRST. Level-sensitive `wait` is a same-delta, same-
+            // timestep handoff (IEEE 1800-2023 §9.7.4); a `#0`-parked peer's
+            // continuation runs in the NEXT delta and may overwrite the value
+            // the waiter latches on — e.g. `x = 1; #0; x = 0;` with a peer
+            // `wait(x==1)` must observe the 1 and proceed, not skip straight
+            // to the 0 (the passthrough-socket AT handshake stalls when the
+            // slave's `wait(state!=BEGIN_RESP)` wakes on the clobbered value).
+            // The end-of-tick fixpoint alone is too late: the `#0` resume has
+            // already committed the overwrite by then.
+            self.drain_condition_waiters();
             if self.promote_inactive_to_active()
                 && self.event_queue.next_time() == Some(self.time)
             {
@@ -31766,56 +31848,8 @@ impl Simulator {
         }
         self.dump_write_changes();
 
-        // Condition-waiter fixpoint. A `wait(expr)` on non-signal state (class
-        // members / locals) parked in condition_waiters during the batch above
-        // instead of falsely proceeding. Now that the active + NBA regions have
-        // settled, re-check each: a waiter whose condition flipped runs its
-        // continuation (and may flip another's), so iterate to a fixpoint. Stop
-        // when a full round advances no waiter (the rest are waiting on a
-        // future-time change).
-        let mut guard = 0u32;
-        while !self.condition_waiters.is_empty() && !self.finished && !self.zero_delay_defer_pending
-        {
-            guard += 1;
-            if guard > 10000 {
-                break;
-            }
-            let prog_before = self.cond_progress;
-            let parked = std::mem::take(&mut self.condition_waiters);
-            for (cpid, cont) in parked {
-                self.event_queue.schedule(self.time, cpid, cont);
-            }
-            while self.event_queue.next_time() == Some(self.time)
-                && !self.finished
-                && !self.zero_delay_defer_pending
-            {
-                let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
-                    break;
-                };
-                self.run_scheduled_process(bpid, &stmts);
-                if !self.is_pid_suspended(bpid) {
-                    self.child_finished(bpid);
-                }
-            }
-            if !self.nba_fast.is_empty()
-            || !self.nba_queue.is_empty()
-            // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
-            // region even when no NBA DATA is queued.
-            || !self.pending_nba_triggers.is_empty()
-            || !self.pending_nba_instance_triggers.is_empty()
-            || self.delayed_nba_due()
-        {
-                self.apply_nba();
-            }
-            if self.dirty_any {
-                self.settle_combinatorial();
-            }
-            // No waiter proceeded this round → the remainder are genuinely
-            // blocked (future-time change); stop re-checking until the next tick.
-            if self.cond_progress == prog_before {
-                break;
-            }
-        }
+        // Condition-waiter fixpoint (level-sensitive `wait(expr)` resume).
+        self.drain_condition_waiters();
 
         // `#0` continuations parked during the POST-active stages of this
         // tick (edge cascades, reactive work) resume in the next same-time

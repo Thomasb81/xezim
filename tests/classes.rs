@@ -25,6 +25,8 @@ mod assoc_typedef_element_class;
 mod bit_class_property_signedness;
 #[path = "classes/type_param_formal_stale_local.rs"]
 mod type_param_formal_stale_local;
+#[path = "classes/wait_level_sensitive_inactive_delta.rs"]
+mod wait_level_sensitive_inactive_delta;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
 #[path = "classes/class_field_named_event.rs"]
