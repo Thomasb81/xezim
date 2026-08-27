@@ -39,6 +39,8 @@ mod virtual_method_in_binary_is_evaluated_once;
 mod typename_type_param_resolves_concrete;
 #[path = "classes/static_param_class_collection_reuse.rs"]
 mod static_param_class_collection_reuse;
+#[path = "classes/explicit_param_static_coll_read.rs"]
+mod explicit_param_static_coll_read;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
 #[path = "classes/class_field_named_event.rs"]
