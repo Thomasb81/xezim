@@ -41,6 +41,8 @@ mod typename_type_param_resolves_concrete;
 mod static_param_class_collection_reuse;
 #[path = "classes/explicit_param_static_coll_read.rs"]
 mod explicit_param_static_coll_read;
+#[path = "classes/typename_p_subroutine_locals.rs"]
+mod typename_p_subroutine_locals;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
 #[path = "classes/class_field_named_event.rs"]

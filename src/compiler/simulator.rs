@@ -45346,7 +45346,10 @@ impl Simulator {
                             let is_str = hier
                                 .path
                                 .last()
-                                .is_some_and(|s| self.string_signals.contains(&s.name.name));
+                                .is_some_and(|s| {
+                                    self.string_signals.contains(&s.name.name)
+                                        || self.p_local_is_string(&s.name.name)
+                                });
                             let fitted = if !val.is_real && !is_str {
                                 if let Some(&target_w) = self.widths.get(&joined) {
                                     if val.width != target_w {
@@ -45388,7 +45391,8 @@ impl Simulator {
                             // $urandom` keeps only the low 8 bits). STRING
                             // locals are exempt (1024-bit internal packed
                             // text).
-                            let is_str = self.string_signals.contains(name.as_str());
+                            let is_str = self.string_signals.contains(name.as_str())
+                                || self.p_local_is_string(name);
                             let fitted = if !val.is_real && !is_str {
                                 if let Some(&target_w) = self.widths.get(name) {
                                     let mut f = if val.width != target_w {
@@ -64514,6 +64518,39 @@ impl Simulator {
                             if ai < args.len() {
                                 let arg = &args[ai];
                                 ai += 1;
+                                // §21.2.1.7: a SUBROUTINE-local scalar variable
+                                // (`int x; string s; T _t;` inside a task/
+                                // function) does not live in the module `signals`
+                                // map, so the name-based `render_p_var` path below
+                                // reads nothing and prints `x`/empty. Its runtime
+                                // value sits in the current `local_stack` frame,
+                                // reachable through `eval_expr` (the same read the
+                                // `%0d`/`%0h` arms use, which work). For a bare
+                                // scalar local, evaluate it and render directly —
+                                // quoting WHEN the declared type is `string`
+                                // (resolving a type parameter `T` to its concrete
+                                // bound, so `T=string` prints a quoted string and
+                                // `T=int` prints a number).
+                                if let ExprKind::Ident(h) = &arg.kind {
+                                    if h.path.len() == 1 && h.path[0].selects.is_empty()
+                                        && !self.local_stack.is_empty()
+                                    {
+                                        let nm = &h.path[0].name.name;
+                                        let is_local = self
+                                            .local_stack
+                                            .last()
+                                            .is_some_and(|f| f.contains_key(nm));
+                                        if is_local && !self.local_ident_is_collection(nm) {
+                                            let is_str = self
+                                                .p_local_is_string(nm);
+                                            let v = self.eval_expr(arg);
+                                            let core =
+                                                Self::render_p_value(&v, is_str);
+                                            result.push_str(&core);
+                                            continue;
+                                        }
+                                    }
+                                }
                                 // §7.12.1: an array LOCATOR call (`q.unique()`,
                                 // `q.find with (…)`, `q.min()`) RETURNS a queue.
                                 // Only the ASSIGNMENT path materialized that, so
@@ -81957,6 +81994,58 @@ impl Simulator {
         format!("'{{{}}}", parts.join(", "))
     }
 
+    /// Is a SUBROUTINE-LOCAL variable `name` a QUEUE/assoc/dynamic/fixed
+    /// array (as opposed to a plain scalar)? Local collections are handled by
+    /// `render_p_var`'s name-based element path; a scalar local is rendered by
+    /// evaluating it directly (its value is not a module signal).
+    fn local_ident_is_collection(&self, name: &str) -> bool {
+        self.module.dynamic_arrays.contains(name)
+            || self.module.associative_arrays.contains_key(name)
+            || self.module.arrays.contains_key(name)
+            || self.module.arrays_2d.contains_key(name)
+            || self.module.arrays_nd.contains_key(name)
+    }
+
+    /// Does a SUBROUTINE-LOCAL variable `name` of declared type
+    /// `var_decl_types[name]` hold a `string`? Resolves a TYPE PARAMETER (e.g.
+    /// `T _t;` where `T`→`string`) through the active specialization so the
+    /// `%p` argument quoting matches the concrete bound type.
+    fn p_local_is_string(&self, name: &str) -> bool {
+        use crate::ast::types::{DataType, SimpleType};
+        let Some(dt0) = self.module.var_decl_types.get(name).cloned() else {
+            return self.string_signals.contains(name);
+        };
+        let mut dt = dt0;
+        'walk: loop {
+            if matches!(dt, DataType::Simple { kind: SimpleType::String, .. }) {
+                return true;
+            }
+            match &dt {
+                DataType::TypeReference { name: tn, .. } => {
+                    let n = tn.name.name.as_str();
+                    // Type parameter -> concrete bound type name.
+                    if let Some(bound) = self.resolve_type_param_binding(n) {
+                        if let Some(bdt) = self.module.typedef_types.get(&bound).cloned() {
+                            dt = bdt;
+                            continue 'walk;
+                        }
+                        // `T` bound to a BUILT-IN (e.g. `T`→`int`/`string`):
+                        // only `string` is a quoted `%p` scalar.
+                        return bound == "string";
+                    }
+                    // Named typedef -> its base.
+                    if let Some(bdt) = self.module.typedef_types.get(n).cloned() {
+                        dt = bdt;
+                        continue 'walk;
+                    }
+                    // A class handle is not a string scalar.
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+    }
+
     /// LRM §21.2.1.7 `%p` on the variable `name`: recursively render nested
     /// structs, unpacked arrays, enums, strings and reals in assignment-pattern
     /// form. `None` if neither the variable nor its base has a declared type.
@@ -91173,9 +91262,71 @@ impl Simulator {
         out
     }
 
-    /// Execute a module-level function call with arguments.
-    /// Is `dt` the `string` data type? Used to mark function return variables
-    /// and params so `var[i]` does byte (character) indexing, not bit-select.
+    /// Is a method's DECLARED return type a `string` AFTER resolving a TYPE
+    /// PARAMETER to its concrete bound (e.g. `virtual function T do_read();`
+    /// in `res#(T)`, specialized to `T=string`)? `is_string_data_type`
+    /// cannot answer that — the AST holds `TypeReference("T")`, and without
+    /// resolving it xezim treats the return as an integral width and
+    /// truncates an N-char string to 4 chars when the method returns. Only a
+    /// plainly-`string` verdict short-circuits that resize.
+    fn method_return_is_string(&self, rt: &crate::ast::types::DataType) -> bool {
+        use crate::ast::types::DataType;
+        if Self::is_string_data_type(rt) {
+            return true;
+        }
+        let DataType::TypeReference { name: tn, .. } = rt else {
+            return false;
+        };
+        // Follow a typedef chain, then a type-parameter binding, then its
+        // typedef, back to the base kind.
+        let mut n = tn.name.name.to_string();
+        loop {
+            // A type parameter in the ACTIVE specialization binds to a
+            // concrete type name (`T` -> `string` / `int` / ...).
+            let bound = self
+                .resolve_type_param_binding(&n)
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    // `current_spec` is cleared for a BASE/inherited method
+                    // reached via `super` (e.g. `super.do_read()` executes
+                    // `res#(string)::do_read` with no active specialization),
+                    // so fall back to the RECEIVER object's type bindings.
+                    let h = self.this_stack.last().copied().flatten()?;
+                    let inst = self.heap.get(h)?.as_ref()?;
+                    inst.type_bindings.get(&n).cloned()
+                });
+            if let Some(bound) = bound {
+                if bound == "string" {
+                    return true;
+                }
+                let bdt = self.module.typedef_types.get(&bound).cloned();
+                if let Some(bd) = bdt {
+                    if Self::is_string_data_type(&bd) {
+                        return true;
+                    }
+                    if let DataType::TypeReference { name: bn, .. } = &bd {
+                        n = bn.name.name.to_string();
+                        continue;
+                    }
+                }
+                return false;
+            }
+            let bdt = self.module.typedef_types.get(&n).cloned();
+            if let Some(bd) = bdt {
+                if Self::is_string_data_type(&bd) {
+                    return true;
+                }
+                if let DataType::TypeReference { name: bn, .. } = &bd {
+                    n = bn.name.name.to_string();
+                    continue;
+                }
+                return false;
+            }
+            return false;
+        }
+    }
+
+    /// Is `dt` directly the `string` data type (no typedef/param resolution)?
     fn is_string_data_type(dt: &crate::ast::types::DataType) -> bool {
         matches!(
             dt,
@@ -103314,7 +103465,7 @@ impl Simulator {
                     .map(|name| self.snapshot_formal_metadata(name))
                     .collect();
                 let ret_is_string = matches!(&method.kind,
-                    ClassMethodKind::Function(f) if Self::is_string_data_type(&f.return_type));
+                    ClassMethodKind::Function(f) if self.method_return_is_string(&f.return_type));
                 // A packed return type whose range references a CLASS
                 // parameter (`function bit [W-1:0] mk();`) can only be
                 // sized per instance — capture it for the clamp at the
