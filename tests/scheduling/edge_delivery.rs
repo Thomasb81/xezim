@@ -267,9 +267,14 @@ fn settle_limit_warning_names_the_oscillating_signals() {
     .expect("write sv");
     let out = Command::new(xezim_bin()).arg(&sv).output().expect("run xezim");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // The established first line must survive verbatim (scripts grep it).
+    // The established first line must survive (scripts grep it). The
+    // iteration count is the CONFIGURED limit, not part of the contract —
+    // pinning it to a literal made this test fail when the default was raised
+    // from 100 to 1000 for the C910 PLIC's 128-stage ripple chain, even
+    // though the warning still fired and still named both ring signals.
     assert!(
-        stderr.contains("settle limit hit (100 iters) at time 0 — signals may not have converged"),
+        stderr.contains("settle limit hit (")
+            && stderr.contains(" iters) at time 0 — signals may not have converged"),
         "settle-limit warning missing or first line changed:\n{}",
         stderr
     );
