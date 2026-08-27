@@ -8517,9 +8517,58 @@ impl<'a> BytecodeCompiler<'a> {
                     if let ExprKind::Ident(hier) = &arr_expr.kind {
                         if let Some(name) = self.lookup_array_name(hier) {
                             if let Some(idx_reg) = self.compile_expr(index, 0) {
-                                if let (Some(hi_reg), Some(lo_reg)) =
-                                    (self.compile_expr(left, 0), self.compile_expr(right, 0))
-                                {
+                                // §11.5.1: in `[base +: w]` / `[base -: w]` the
+                                // RIGHT operand is a WIDTH, not an index. This
+                                // arm emitted it as `lo` regardless of `kind`,
+                                // so `arr[n][64 +: 32]` became the 33-bit window
+                                // `[64:32]`: the payload landed 32 bits low and
+                                // the top bit was clipped. The flat-signal arm
+                                // above and the NBA array arm both convert —
+                                // only this one did not, which wedged the C910
+                                // PLIC's prefix-OR chain (plic_hreg_busif.v
+                                // builds `mie_lst_read_tmp[n][32*(m+1)+:32]`
+                                // from the previous slice, so every stage read
+                                // back x/z and the settle never converged).
+                                let regs = if *kind == RangeKind::Constant {
+                                    match (
+                                        self.compile_expr(left, 0),
+                                        self.compile_expr(right, 0),
+                                    ) {
+                                        (Some(h), Some(l)) => Some((h, l)),
+                                        _ => None,
+                                    }
+                                } else {
+                                    match self.eval_const_expr(right) {
+                                        Some(width) if width > 0 => {
+                                            match self.compile_expr(left, 0) {
+                                                Some(base) if width == 1 => Some((base, base)),
+                                                Some(base) => {
+                                                    let delta = self.alloc_reg();
+                                                    self.emit(Insn::LoadConst(
+                                                        delta,
+                                                        Box::new(Value::from_u64(
+                                                            (width - 1) as u64,
+                                                            32,
+                                                        )),
+                                                    ));
+                                                    let other = self.alloc_reg();
+                                                    if *kind == RangeKind::IndexedUp {
+                                                        // lo = base, hi = base + w - 1
+                                                        self.emit(Insn::Add(other, base, delta));
+                                                        Some((other, base))
+                                                    } else {
+                                                        // hi = base, lo = base - w + 1
+                                                        self.emit(Insn::Sub(other, base, delta));
+                                                        Some((base, other))
+                                                    }
+                                                }
+                                                None => None,
+                                            }
+                                        }
+                                        _ => None,
+                                    }
+                                };
+                                if let Some((hi_reg, lo_reg)) = regs {
                                     let array = self.array_operand(name);
                                     self.emit(Insn::BlockingAssignArrayRange(
                                         array, idx_reg, hi_reg, lo_reg, val_reg,
