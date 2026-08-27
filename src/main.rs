@@ -1813,7 +1813,7 @@ fn run_main() -> i32 {
             "--settle-limit" => {
                 i += 1;
                 if i < args.len() {
-                    settle_limit = Some(args[i].parse().unwrap_or(100));
+                    settle_limit = Some(args[i].parse().unwrap_or(1000));
                 }
             }
             "--activity-mon" => {

@@ -7591,7 +7591,18 @@ impl Simulator {
             max_time,
             tick_s,
             time_format: None,
-            settle_limit: 100,
+            // Zero-delay settle iteration cap. 100 was too low for real
+            // RTL: a RIPPLE chain of continuous assigns needs one iteration
+            // per stage, and the C910 SoC's PLIC builds a 128-stage prefix-OR
+            // (`plic_kid_busif.v`: each stage ORs the previous slice), so the
+            // design genuinely reports `max_iters=129`. Capping at 100 left
+            // the chain at x, the interrupt priorities never resolved and
+            // CoreMark died on the testbench's "no instructions retired"
+            // watchdog. The cap only bounds a TRUE zero-delay loop, and the
+            // deep case is rare — that same run averaged 1.007 iterations per
+            // settle call — so a higher cap costs nothing in practice.
+            // The real fix is levelized evaluation, which needs one pass.
+            settle_limit: 1000,
             settle_limit_hits: 0,
             settle_limit_last_time: 0,
             proc_settle_defer: false,
