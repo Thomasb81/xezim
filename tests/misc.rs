@@ -327,3 +327,5 @@ mod two_state_lowering_shapes;
 mod array_elem_indexed_part_select_target;
 #[path = "misc/two_state_wide_reduction.rs"]
 mod two_state_wide_reduction;
+#[path = "misc/udn_resolver_compiled.rs"]
+mod udn_resolver_compiled;
