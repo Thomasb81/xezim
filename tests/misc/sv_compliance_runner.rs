@@ -81,10 +81,21 @@ fn run_negative_compliance_test(filename: &str) {
         filename,
         combined
     );
+    // A parse diagnostic carries a source prefix (`[file] 2:15: error: ...`);
+    // elaboration reports either `Simulation error: ...` or, for a check that
+    // runs before a scope is established, a BARE `error: ...` with no prefix
+    // at all. The bare form was not accepted here, so a test whose construct
+    // xezim correctly rejects still failed the harness -- which is why
+    // neg11_missing_named_port could not be registered. Matched at a line
+    // start so the "0 errors" summary line cannot satisfy it.
+    let has_diagnostic = combined.contains(": error:")
+        || combined.contains("Parse errors")
+        || combined.contains("Simulation error")
+        || combined
+            .lines()
+            .any(|l| l.trim_start().starts_with("error:"));
     assert!(
-        combined.contains(": error:")
-            || combined.contains("Parse errors")
-            || combined.contains("Simulation error"),
+        has_diagnostic,
         "Negative test {} failed without an error diagnostic. Output:\n{}",
         filename,
         combined
@@ -352,4 +363,16 @@ fn test_sv_neg07_bad_clocking_direction() {
 #[test]
 fn test_sv_neg08_bad_constraint_reference() {
     run_negative_compliance_test("neg08_bad_constraint_reference.sv");
+}
+#[test]
+fn test_sv_neg09_duplicate_port_name() {
+    run_negative_compliance_test("neg09_duplicate_port_name.sv");
+}
+#[test]
+fn test_sv_neg10_duplicate_enum_literal() {
+    run_negative_compliance_test("neg10_duplicate_enum_literal.sv");
+}
+#[test]
+fn test_sv_neg11_missing_named_port() {
+    run_negative_compliance_test("neg11_missing_named_port.sv");
 }
