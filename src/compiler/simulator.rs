@@ -48256,6 +48256,30 @@ impl Simulator {
                         }
                     }
                 }
+                // `ClassName#(params)::static_prop = ...` — a STATIC scalar /
+                // handle property write through a class SPECIALIZATION
+                // receiver (the READ path resolves it per-spec via
+                // class_static_get; the write must land in the SAME per-spec
+                // cell). Without this `C#(int)::n = 5` fell through to a
+                // bare-name store the later read never consulted.
+                if let ExprKind::Specialization { .. } = &expr.kind {
+                    if let Some((base, sig)) = self.resolve_call_spec_params(
+                        Self::extract_call_spec(expr),
+                        &self.current_spec.clone(),
+                    ) {
+                        if self.module.classes.contains_key(&base)
+                            && !self.signal_name_to_id.contains_key(base.as_str())
+                        {
+                            let saved = self.current_spec.take();
+                            self.current_spec = Some((base.clone(), sig));
+                            let ok = self.class_static_set(&base, &member.name, val.clone());
+                            self.current_spec = saved;
+                            if ok {
+                                return true;
+                            }
+                        }
+                    }
+                }
                 // `ClassName::static_prop = ...` — explicit static write.
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if hier.path.len() == 1 {
@@ -86750,6 +86774,24 @@ impl Simulator {
         self.static_fixed_key_in(cls, member)
     }
 
+    /// Does `start_class` or an ancestor declare `name` as a STATIC
+    /// queue/assoc/dynamic-array collection (i.e. it is in
+    /// `static_collections`)?
+    fn collection_is_static_in(&self, start_class: &str, name: &str) -> bool {
+        let mut cur = Some(start_class.to_string());
+        while let Some(cn) = cur {
+            if let Some(cd) = self.module.classes.get(&cn) {
+                if cd.static_collections.iter().any(|(n, _, _)| n == name) {
+                    return true;
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
         // §8.9: `Cls::member` / flattened `Cls.member` spellings of a static
         // fixed array resolve to the declaring class's store BEFORE the
@@ -86765,6 +86807,18 @@ impl Simulator {
         let Some(handle) = self.this_stack.last().copied().flatten().filter(|&h| h != 0)
         else {
             let ctx = self.class_context_stack.last().cloned().flatten()?;
+            // A static QUEUE/ASSOC/dynamic-ARRAY property of a (possibly
+            // parameterized) class, accessed BARE inside a static method
+            // (e.g. uvm_config_db's `static pool m_rsc[comp]`): route to its
+            // per-specialization store (`spec_static_coll_key` folds the
+            // active spec), so an ELEMENT read/write `m[k]` and the builtin
+            // ops (size/exists/...) agree on ONE store. Without this the
+            // element path resolved to the bare name ─ a DIFFERENT store from
+            // the per-spec key builtins use ─ so `m[k]=v` stored its value
+            // where the later `m[k]`/`exists` never looked (and vice-versa).
+            if self.collection_is_static_in(&ctx, name) {
+                return Some(self.spec_static_coll_key(name));
+            }
             return self.static_fixed_key_in(&ctx, name);
         };
         // Use the runtime class of `this` (from the heap) rather than the
@@ -87012,6 +87066,51 @@ impl Simulator {
                     } else {
                         None
                     }
+                }
+                // `ClassName#(params)::static_coll` — a parameterized-class
+                // static collection (queue/assoc/array) reached through a
+                // class SPECIALIZATION receiver rather than `this`/an object.
+                // Resolve the per-spec storage key exactly like
+                // `spec_static_coll_key` does, so the assoc/queue store name
+                // matches the one builtin ops (push_back/size/...) use and is
+                // isolated per specialization. Without this the index/assoc
+                // read AND write both resolved to None, so `C#(int)::m["a"]=v`
+                // (and uvm_config_db's static per-component pool) was silently
+                // dropped on write and read back empty.
+                ExprKind::Specialization { .. } => {
+                    let Some((b, s)) = self.resolve_call_spec_params(
+                        Self::extract_call_spec(base),
+                        &self.current_spec.clone(),
+                    ) else {
+                        return None;
+                    };
+                    let mut cur = Some(b.clone());
+                    while let Some(cn) = cur {
+                        let is_static_coll = self
+                            .module
+                            .classes
+                            .get(&cn)
+                            .map(|cd| {
+                                cd.static_properties.contains(&member.name)
+                                    && cd.static_collections
+                                        .iter()
+                                        .any(|(n, _, _)| n == &member.name)
+                            })
+                            .unwrap_or(false);
+                        if is_static_coll {
+                            let saved = self.current_spec.take();
+                            self.current_spec = Some((b.clone(), s.clone()));
+                            let key = self.static_prop_key(&b, &member.name);
+                            self.current_spec = saved;
+                            return key;
+                        }
+                        cur = self
+                            .module
+                            .classes
+                            .get(&cn)
+                            .and_then(|cd| cd.extends.clone());
+                    }
+                    None
                 }
                 _ => None,
             },
