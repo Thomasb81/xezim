@@ -46,7 +46,7 @@ fn env_var_registry_matches_sources() {
         collect_vars(&core_src, &mut used);
     }
     // Build-time-only variables read via env! in build scripts, not runtime.
-    for buildtime in ["XEZIM_GIT_DATE", "XEZIM_GIT_HASH"] {
+    for buildtime in ["XEZIM_GIT_DATE", "XEZIM_GIT_HASH", "XEZIM_GIT_TAG"] {
         used.insert(buildtime.to_string());
     }
 
