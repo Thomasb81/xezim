@@ -60809,6 +60809,18 @@ impl Simulator {
                                 };
                                 self.module.arrays.insert(name.clone(), (0, -1, w));
                                 self.module.dynamic_arrays.insert(name.clone());
+                                // A QUEUE-typed local (`int a[$];`, possibly with
+                                // a bound `[$:N]`) keeps the queue semantics -
+                                // index-at-size appends, size tracking on
+                                // `q[i] = v` back-fill - not the discard-out-of-
+                                // range rule of an unallocated dynamic array.
+                                // Mirror the module-scope classification.
+                                if matches!(
+                                    first,
+                                    UnpackedDimension::Queue { .. }
+                                ) {
+                                    self.module.queue_vars.insert(name.clone());
+                                }
                                 self.widths.insert(name.clone(), w);
                                 self.set_queue_size(&name, 0);
                                 // §7.4.5: a LOCAL `T a[][16]` / `a[$][16]` —
