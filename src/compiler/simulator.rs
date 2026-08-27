@@ -69080,7 +69080,22 @@ impl Simulator {
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);
-                self.lookup_signal_width(&n)
+                if let Some(w) = self.lookup_signal_width(&n) {
+                    return Some(w);
+                }
+                // A CLASS-FIELD operand (e.g. a `time` / `longint` member of
+                // a `uvm_transaction`) isn't a module-scope signal, so the
+                // width tables above miss it. Falling back to the live
+                // receiver lets a comparison against a literal size the
+                // operand correctly: `begin_time != -1` on a 64-bit `time`
+                // field otherwise sized `-1` as 32-bit and compared
+                // 64-bit-all-ones against 32'hFFFFFFFF as NOT equal.
+                if let Some((handle, prop)) = self.class_prop_receiver(expr) {
+                    if let Some(w) = self.class_prop_width_of(handle, &prop) {
+                        return Some(w);
+                    }
+                }
+                None
             }
             ExprKind::Unary { op, operand } => match op {
                 UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => self.lrm_self_width(operand),
