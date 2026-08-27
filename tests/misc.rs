@@ -323,3 +323,5 @@ mod recursive_function_in_continuous_assign;
 mod env_var_registry;
 #[path = "misc/two_state_lowering_shapes.rs"]
 mod two_state_lowering_shapes;
+#[path = "misc/array_elem_indexed_part_select_target.rs"]
+mod array_elem_indexed_part_select_target;
