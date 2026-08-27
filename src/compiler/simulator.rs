@@ -61536,7 +61536,7 @@ impl Simulator {
                         // (needed for signed division/modulo, comparison, and
                         // `%0d` display). A fresh decl also clears a stale
                         // same-named signed flag from another frame.
-                        if super::elaborate::is_type_signed(data_type) {
+                        if self.type_is_signed_concrete(data_type) {
                             self.signed_signals.insert(d.name.name.clone());
                         } else {
                             self.signed_signals.remove(&d.name.name);
@@ -82046,6 +82046,57 @@ impl Simulator {
         }
     }
 
+    /// Is a declared type SIGNED after resolving a TYPE PARAMETER to its
+    /// concrete bound (e.g. `T`→`int`) and following typedef aliases?
+    /// `is_type_signed(_resolved)` alone cannot bind `TypeReference("T")`, so a
+    /// scalar local `T _t` (in a `res#(int)` method) was never stamped signed
+    /// and `%0d`/`%p` rendered it unsigned (`3735928559`) where the reference
+    /// prints `-559038737`. Resolves the type param via the active
+    /// specialization (with the receiver-instance fallback a `super` call
+    /// needs) and judges the base kind like `is_type_signed`.
+    fn type_is_signed_concrete(&self, dt: &crate::ast::types::DataType) -> bool {
+        use crate::ast::types::DataType;
+        // Fast path: resolvable without a type parameter (typedefs only).
+        if super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types) {
+            return true;
+        }
+        let DataType::TypeReference { name: tn, .. } = dt else {
+            return super::elaborate::is_type_signed(dt);
+        };
+        let mut n = tn.name.name.to_string();
+        for _ in 0..64 {
+            // Is `n` a type parameter bound by the active specialization?
+            if let Some(bound) = self.resolve_type_param_binding(&n) {
+                // Binding to a concrete atom: judge like `is_type_signed`.
+                match bound.as_str() {
+                    "int" | "integer" | "longint" | "shortint" | "byte" => return true,
+                    _ => {
+                        let bdt = self.module.typedef_types.get(&bound).cloned();
+                        match bdt {
+                            Some(bt) if super::elaborate::is_type_signed(&bt) => return true,
+                            Some(DataType::TypeReference { name: bn, .. }) => {
+                                n = bn.name.name.to_string();
+                                continue;
+                            }
+                            _ => return false,
+                        }
+                    }
+                }
+            }
+            // Named typedef -> its base.
+            let bdt = self.module.typedef_types.get(&n).cloned();
+            match bdt {
+                Some(bt) if super::elaborate::is_type_signed(&bt) => return true,
+                Some(DataType::TypeReference { name: bn, .. }) => {
+                    n = bn.name.name.to_string();
+                    continue;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// LRM §21.2.1.7 `%p` on the variable `name`: recursively render nested
     /// structs, unpacked arrays, enums, strings and reals in assignment-pattern
     /// form. `None` if neither the variable nor its base has a declared type.
@@ -93786,7 +93837,7 @@ impl Simulator {
                             &port.data_type,
                             &self.module.typedef_types,
                         );
-                    } else if super::elaborate::is_type_signed(&port.data_type) {
+                    } else if self.type_is_signed_concrete(&port.data_type) {
                         val.is_signed = true;
                     }
                     locals.insert(port.name.name.clone(), val);
@@ -103740,6 +103791,13 @@ impl Simulator {
                                 val
                             };
                             val.is_signed = signed;
+                        } else if self.type_is_signed_concrete(&port.data_type) {
+                            // A TYPE-PARAMETER formal (`T t` with `T`->`int`)
+                            // isn't a resolvable integral typedef, so
+                            // `scalar_formal_integral` falls through; still
+                            // stamp the resolved signedness so `%p`/`%0d` on a
+                            // `T=int` formal renders signed like the reference.
+                            val.is_signed = true;
                         }
                     } else if super::elaborate::is_type_signed(&port.data_type) {
                         val.is_signed = true;
