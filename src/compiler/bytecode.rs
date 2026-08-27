@@ -946,6 +946,11 @@ pub struct BytecodeCompiler<'a> {
     /// stay real — no bit packing). A dynamic index compiles to a
     /// compare/branch chain over the elements.
     local_var_array: HashMap<String, LocalArrayBind>,
+    /// Loop variables currently bound to a compile-time CONSTANT (an
+    /// unrolled `foreach` iteration). Consulted by `eval_const_expr`, so an
+    /// index like `drivers[i]` folds to a direct element register instead of
+    /// a compare/branch chain.
+    const_var_binds: HashMap<String, u64>,
     /// Active inline return context: (result register — None for a void
     /// function or task —, resize width; 0 = none, e.g. strings). `return`
     /// compiles to result-move + jump; the jump indexes collect in
@@ -1034,6 +1039,7 @@ impl<'a> BytecodeCompiler<'a> {
             local_var_is_string: HashSet::default(),
             local_var_is_real: HashSet::default(),
             local_var_array: HashMap::default(),
+            const_var_binds: HashMap::default(),
             purity_depth: std::cell::Cell::new(0),
             inline_ret: None,
             inline_ret_jumps: Vec::new(),
@@ -1615,19 +1621,47 @@ impl<'a> BytecodeCompiler<'a> {
             self.bail("Expr_Call");
             return None;
         };
+        // §6.6.7 resolver dispatch: a DYNAMIC-ARRAY formal (`input real
+        // drivers[]`) whose actual is a FIXED assignment pattern is
+        // monomorphic at this call site — the nettype resolution machinery
+        // synthesizes one Ordered element per driver — so it binds as a
+        // fixed local array of per-element registers (the #129 machinery).
+        // This was the single largest RNM cost: every node re-ran the
+        // resolver on the AST path each settle (issue #137, ~25µs/eval for
+        // a 4-term multiply-accumulate).
+        let dyn_array_formal = |p: &_, a: &Expression| -> bool {
+            matches!(p, &crate::ast::decl::FunctionPort { .. })
+                && matches!(
+                    &a.kind,
+                    ExprKind::AssignmentPattern(items)
+                        if (1..=32).contains(&items.len())
+                            && items.iter().all(|it| matches!(
+                                it,
+                                crate::ast::expr::AssignmentPatternItem::Ordered(_)
+                            ))
+                )
+        };
+        let is_unsized_dim = |p: &crate::ast::decl::FunctionPort| {
+            matches!(
+                p.dimensions.as_slice(),
+                [crate::ast::types::UnpackedDimension::Unsized(_)]
+            ) && matches!(p.direction, PortDirection::Input)
+        };
         if fd.ports.len() != args.len()
             || fd
                 .ports
                 .iter()
-                .any(|p| {
+                .zip(args)
+                .any(|(p, a)| {
                     // §13.5.2 output formals ride the existing ref-writeback
                     // machinery: the body sees a register, the caller's actual
                     // is written on return. AES-style helpers
                     // (`mix_column(c0.., r0..)`) are exactly this shape.
-                    !matches!(
+                    (!matches!(
                         p.direction,
                         PortDirection::Input | PortDirection::Ref | PortDirection::Output
-                    ) || !p.dimensions.is_empty()
+                    ) || !p.dimensions.is_empty())
+                        && !(is_unsized_dim(p) && dyn_array_formal(p, a))
                 })
         {
             self.bail("Expr_Call_ports");
@@ -1720,7 +1754,50 @@ impl<'a> BytecodeCompiler<'a> {
         let mut ref_writes: Vec<(Expression, RegId, u32)> = Vec::new();
         let mut string_formal_names: Vec<String> = Vec::new();
         let mut real_formal_names: Vec<String> = Vec::new();
+        let mut array_binds: Vec<(String, LocalArrayBind)> = Vec::new();
         for (i, (p, a)) in fd.ports.iter().zip(args).enumerate() {
+            if is_unsized_dim(p) {
+                // Dynamic-array formal from a fixed assignment pattern: one
+                // register per element, evaluated in the CALLER's scope. The
+                // gate above already proved the shape.
+                let ExprKind::AssignmentPattern(items) = &a.kind else {
+                    self.bail("Expr_Call_ports");
+                    return None;
+                };
+                let is_real = dt_is_real(&p.data_type);
+                let elem_w = if is_real {
+                    64
+                } else {
+                    self.decl_width_in(&p.data_type, Some(&name))
+                };
+                if elem_w == 0 || elem_w > 64 {
+                    self.bail("Expr_Call_ports");
+                    return None;
+                }
+                let mut regs = Vec::with_capacity(items.len());
+                for it in items {
+                    let crate::ast::expr::AssignmentPatternItem::Ordered(e) = it else {
+                        self.bail("Expr_Call_ports");
+                        return None;
+                    };
+                    let slot = self.alloc_reg();
+                    let v = self.compile_expr(e, if is_real { 0 } else { elem_w })?;
+                    self.emit(Insn::Move(slot, v));
+                    if is_real {
+                        // §13.3.1: each element CONVERTS to the real
+                        // element type, exactly like a scalar real formal.
+                        self.emit_to_real(slot);
+                    } else {
+                        self.emit(Insn::Resize(slot, elem_w));
+                    }
+                    regs.push(slot);
+                }
+                array_binds.push((
+                    p.name.name.clone(),
+                    LocalArrayBind { regs, lo: 0, elem_w, is_real },
+                ));
+                continue;
+            }
             if matches!(p.direction, PortDirection::Ref)
                 && (matches!(&a.kind, ExprKind::Ident(h) if self.local_var_reg_of(h).is_some())
                     || self.expr_to_signal_id(a).is_none())
@@ -1785,6 +1862,12 @@ impl<'a> BytecodeCompiler<'a> {
         let saved_local_reals = std::mem::take(&mut self.local_var_is_real);
         let saved_local_arrays = std::mem::take(&mut self.local_var_array);
         let saved_local_elems = std::mem::take(&mut self.local_var_elem);
+        for (n, ab) in array_binds {
+            if let Some(pfx) = &qpfx {
+                self.local_var_array.insert(format!("{pfx}.{n}"), ab.clone());
+            }
+            self.local_var_array.insert(n, ab);
+        }
         for (n, b) in binds {
             if let Some(pfx) = &qpfx {
                 self.local_var_regs.insert(format!("{pfx}.{n}"), b);
@@ -2976,6 +3059,21 @@ impl<'a> BytecodeCompiler<'a> {
                     expr_ok(lvalue, bound, me, false) && expr_ok(rvalue, bound, me, ext)
                 }
                 StatementKind::Return(e) => e.as_ref().is_none_or(|e| expr_ok(e, bound, me, ext)),
+                StatementKind::Foreach { array, vars, body } => {
+                    // §12.7.3: the loop variables are implicitly DECLARED by
+                    // the foreach for its body — without this arm they read
+                    // as free module names and every resolver body using
+                    // `foreach (drivers[i])` was branded impure (the
+                    // Expr_Call_impure half of issue #137).
+                    if !expr_ok(array, bound, me, ext) {
+                        return false;
+                    }
+                    let mut inner = bound.clone();
+                    for v in vars.iter().flatten() {
+                        inner.insert(v.name.clone());
+                    }
+                    stmt_ok(body, &mut inner, me, ext)
+                }
                 StatementKind::SeqBlock { stmts, .. } => {
                     // A block's declarations are visible to the statements that
                     // FOLLOW them, so thread one scope through the sequence.
@@ -6248,6 +6346,87 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit_fallback(stmt)
                 }
             }
+            StatementKind::Foreach { array, vars, body } => {
+                // §12.7.3 foreach over a register-bound local array — an
+                // inlined resolver's dynamic-array formal or a #129 local
+                // buffer. The element count is a compile-time constant, so
+                // the loop UNROLLS with the loop variable bound both as a
+                // register (value uses) and as a constant (index uses fold
+                // to a direct element register via const_var_binds).
+                let arr_name = match &array.kind {
+                    ExprKind::Ident(h)
+                        if h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                    {
+                        h.path[0].name.name.clone()
+                    }
+                    _ => {
+                        self.bail("Stmt_Foreach");
+                        return false;
+                    }
+                };
+                let Some(ab) = self.local_var_array.get(&arr_name).cloned() else {
+                    self.bail("Stmt_Foreach");
+                    return false;
+                };
+                let var = match vars.as_slice() {
+                    [Some(v)] => v.name.clone(),
+                    _ => {
+                        self.bail("Stmt_Foreach_vars");
+                        return false;
+                    }
+                };
+                if ab.lo < 0 || Self::stmt_has_break_or_continue(body) {
+                    // §12.7 break/continue jump-patch lists belong to REAL
+                    // compiled loops; an unrolled iteration has no loop to
+                    // exit. Rolls back to one AST-interpreted unit instead.
+                    self.bail("Stmt_Foreach_break");
+                    return false;
+                }
+                let var_reg = self.alloc_reg();
+                let saved_local = self.local_var_regs.insert(var.clone(), (var_reg, 32));
+                let saved_const = self.const_var_binds.get(&var).copied();
+                let saved_fallback = self.allow_ast_fallback;
+                // A per-statement AST fallback inside the unrolled body
+                // would read the loop var as a (non-existent) SIGNAL — same
+                // hazard as the register-var for-loop guard. Fail the body
+                // instead, so the WHOLE foreach rolls back as one unit.
+                self.allow_ast_fallback = false;
+                let mut ok = true;
+                for k in 0..ab.regs.len() {
+                    let idx = (ab.lo + k as i64) as u64;
+                    self.emit(Insn::LoadConst(
+                        var_reg,
+                        Box::new(Value::from_u64(idx, 32)),
+                    ));
+                    self.const_var_binds.insert(var.clone(), idx);
+                    if !self.compile_stmt(body) {
+                        ok = false;
+                        break;
+                    }
+                }
+                self.allow_ast_fallback = saved_fallback;
+                match saved_const {
+                    Some(v) => {
+                        self.const_var_binds.insert(var.clone(), v);
+                    }
+                    None => {
+                        self.const_var_binds.remove(&var);
+                    }
+                }
+                match saved_local {
+                    Some(b) => {
+                        self.local_var_regs.insert(var, b);
+                    }
+                    None => {
+                        self.local_var_regs.remove(&var);
+                    }
+                }
+                if !ok {
+                    self.bail("Stmt_Foreach_body");
+                    return false;
+                }
+                true
+            }
             other => {
                 let name: &'static str = match other {
                     StatementKind::Expr(_) => "Expr",
@@ -8760,7 +8939,14 @@ impl<'a> BytecodeCompiler<'a> {
         match &e.kind {
             ExprKind::Number(n) => self.eval_number_static(n)?.to_u64().map(|v| v as u32),
             ExprKind::Paren(inner) => self.eval_const_expr(inner),
-            ExprKind::Ident(hier) => self.lookup_param_value(hier)?.to_u64().map(|u| u as u32),
+            ExprKind::Ident(hier) => {
+                if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                    if let Some(&v) = self.const_var_binds.get(hier.path[0].name.name.as_str()) {
+                        return Some(v as u32);
+                    }
+                }
+                self.lookup_param_value(hier)?.to_u64().map(|u| u as u32)
+            }
             // Fold simple parameter arithmetic so slice bounds like
             // `[ENTRY_NUM-1:0]` resolve. Without this, expr_max_width on a
             // sliced range returned 1 (unwrap_or(0)), which then clobbered
