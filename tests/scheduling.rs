@@ -199,3 +199,5 @@ mod nested_delay_slot_servicing;
 mod finish_with_live_fork_child;
 #[path = "scheduling/nba_array_elem_last_write_wins.rs"]
 mod nba_array_elem_last_write_wins;
+#[path = "scheduling/delayed_write_pending_semantics.rs"]
+mod delayed_write_pending_semantics;
