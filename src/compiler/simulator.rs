@@ -27949,10 +27949,24 @@ impl Simulator {
         // initial one at t=0 (a reference simulator leaves the output at x until the delay
         // elapses — unlike SDF back-annotation, which does not act at t=0).
         if delay > 0 {
-            if self.signal_table[id].get_bit_code(bit) != new_code {
-                let mut v = self.signal_table[id].clone();
-                v.set_bit_code(bit, new_code);
-                self.schedule_delayed_with_delay(id, v, delay);
+            // §29.7 instance delays are INERTIAL, and the compare must run
+            // against the PENDING delayed value when one exists: gating on
+            // the CURRENT value elided the cancelling transition of a pulse
+            // narrower than the delay — the rise stayed scheduled, the fall
+            // was dropped, and the output stuck high where the reference
+            // swallows the glitch (issue #144). `schedule_delayed_slice`
+            // composes into pending-or-current and cancels outright when the
+            // revert leaves nothing to change.
+            let base_code = self
+                .delayed_updates
+                .iter()
+                .find(|(_, sid, _)| *sid == id)
+                .map(|(_, _, v)| v.get_bit_code(bit))
+                .unwrap_or_else(|| self.signal_table[id].get_bit_code(bit));
+            if base_code != new_code {
+                let mut sel = Value::new(1);
+                sel.set_bit_code(0, new_code);
+                self.schedule_delayed_slice(id, bit as u32, 1, &sel, delay);
             }
         } else if is_seq {
             // A SEQUENTIAL UDP is a flip-flop/latch: its output must update with
@@ -39163,6 +39177,42 @@ impl Simulator {
         self.delayed_updates.push((target_time, id, val));
     }
 
+    /// Schedule a delayed update to a SLICE of `id`, composing against the
+    /// PENDING delayed value when one exists (else the current value).
+    ///
+    /// `schedule_delayed_with_delay` is whole-signal inertial — it replaces
+    /// any pending entry for the id — so two slice drivers on one base
+    /// clobbered each other's bits, and the callers' "did anything change"
+    /// compares ran against `signal_table` while a pending entry held the
+    /// truth: the #142 elision class, in the delayed dimension. Composing
+    /// into pending-or-current keeps every slice's contribution, and a slice
+    /// that reverts to the CURRENT value reduces the pending entry (cancelling
+    /// it outright when nothing is left to change — the inertial glitch
+    /// swallow, issues #143/#144).
+    fn schedule_delayed_slice(
+        &mut self,
+        id: usize,
+        lo: u32,
+        sel_w: u32,
+        sel_val: &Value,
+        delay: u64,
+    ) {
+        let mut merged = self
+            .delayed_updates
+            .iter()
+            .find(|(_, sid, _)| *sid == id)
+            .map(|(_, _, v)| v.clone())
+            .unwrap_or_else(|| self.signal_table[id].clone());
+        for i in 0..sel_w as usize {
+            merged.set_bit_code(lo as usize + i, sel_val.get_bit_code(i));
+        }
+        if merged == self.signal_table[id] {
+            self.cancel_delayed(id);
+        } else {
+            self.schedule_delayed_with_delay(id, merged, delay);
+        }
+    }
+
     /// Base signal id + (physical lo bit, width) for a CONSTANT select LHS —
     /// `sig[hi:lo]` or `sig[bit]` on a plain vector. Zero-based declared
     /// ranges only (a non-zero-based base would need rebasing; returning None
@@ -39174,11 +39224,31 @@ impl Simulator {
                 expr,
                 left,
                 right,
-                kind: RangeKind::Constant,
+                kind,
             } => {
+                // §11.5.1: for the indexed forms the RIGHT operand is a
+                // WIDTH, not a second index. Only `Constant` was accepted
+                // here, so `assign #1 d[64 +: 32] = ...` fell through to the
+                // caller's silent-drop path and the slice stayed z forever —
+                // the same drop this helper was created to close for
+                // constant ranges (issue #143).
                 let l = self.eval_expr(left).to_u64()?;
                 let r = self.eval_expr(right).to_u64()?;
-                (expr, l.max(r) as u32, l.min(r) as u32)
+                match kind {
+                    RangeKind::Constant => (expr, l.max(r) as u32, l.min(r) as u32),
+                    RangeKind::IndexedUp => {
+                        if r == 0 {
+                            return None;
+                        }
+                        (expr, (l + r - 1) as u32, l as u32)
+                    }
+                    RangeKind::IndexedDown => {
+                        if r == 0 || l + 1 < r {
+                            return None;
+                        }
+                        (expr, l as u32, (l + 1 - r) as u32)
+                    }
+                }
             }
             ExprKind::Index { expr, index } => {
                 let i = self.eval_expr(index).to_u64()? as u32;
@@ -42132,21 +42202,11 @@ impl Simulator {
                     // the bridge's state register read z forever, its rvalid
                     // X-poisoned the SoC read arbiter, and the first
                     // speculative fetch into the error region deadlocked the
-                    // whole read path. Splice the slice into the current
-                    // value and schedule the merged whole-signal update — the
-                    // full-range spelling (the common case) is exact.
+                    // whole read path. The splice composes against the
+                    // PENDING delayed value so several slice drivers on one
+                    // base keep each other's bits (issue #143).
                     let sel_val = val.resize(sel_w);
-                    let cur_slice = self.signal_table[base_id]
-                        .range_select((lo + sel_w - 1) as usize, lo as usize);
-                    if cur_slice != sel_val {
-                        let mut merged = self.signal_table[base_id].clone();
-                        for i in 0..sel_w as usize {
-                            merged.set_bit(lo as usize + i, sel_val.get_bit(i));
-                        }
-                        self.schedule_delayed_with_delay(base_id, merged, delay);
-                    } else {
-                        self.cancel_delayed(base_id);
-                    }
+                    self.schedule_delayed_slice(base_id, lo, sel_w, &sel_val, delay);
                 }
             } else if let Some(id) = lhs_id {
                 let width = self.signal_widths[id];
@@ -43125,19 +43185,10 @@ impl Simulator {
                     {
                         // Select-LHS delayed assign — same fix as the other
                         // ContAssign eval site (see delayed_lhs_select_range):
-                        // this used to DROP the write silently.
+                        // this used to DROP the write silently. Composes
+                        // against the PENDING delayed value (issue #143).
                         let sel_val = val.resize(sel_w);
-                        let cur_slice = self.signal_table[base_id]
-                            .range_select((lo + sel_w - 1) as usize, lo as usize);
-                        if cur_slice != sel_val {
-                            let mut merged = self.signal_table[base_id].clone();
-                            for i in 0..sel_w as usize {
-                                merged.set_bit(lo as usize + i, sel_val.get_bit(i));
-                            }
-                            self.schedule_delayed_with_delay(base_id, merged, delay);
-                        } else {
-                            self.cancel_delayed(base_id);
-                        }
+                        self.schedule_delayed_slice(base_id, lo, sel_w, &sel_val, delay);
                     }
                 } else if let Some(id) = lhs_id {
                     let width = self.signal_widths[id];
@@ -58451,8 +58502,25 @@ impl Simulator {
                     // §4.9.4: matures in the target slot's NBA REGION — the
                     // separate queue commits inside apply_nba, so Active
                     // reads at the same time still see the old value.
-                    self.delayed_nba
-                        .push((self.time + d, id, val.resize_for_assign(w)));
+                    //
+                    // Reference-parity (#145): a delayed NBA whose captured
+                    // value equals the CURRENT value is elided at SCHEDULE
+                    // time (`q = 0; q <= #5 0; #1 q = 1;` leaves q at 1 —
+                    // the reference never lands the update). Elide only when
+                    // no delayed NBA is already pending for the id: a
+                    // pending entry, not the register, is the truth then
+                    // (the #142 rule).
+                    let mut v = val.resize_for_assign(w);
+                    // Normalize signedness to the TARGET before comparing —
+                    // the apply site does the same at maturity, and without
+                    // it the elision compare saw identical bits as unequal
+                    // Values and always pushed.
+                    v.is_signed = self.signal_signed[id];
+                    let pending_here =
+                        self.delayed_nba.iter().any(|(_, sid, _)| *sid == id);
+                    if pending_here || self.signal_table[id] != v {
+                        self.delayed_nba.push((self.time + d, id, v));
+                    }
                 } else {
                     let frozen = self.freeze_lvalue_indices(lvalue);
                     let qval = if self.nba_target_is_assoc_elem(lvalue) {
