@@ -12387,6 +12387,95 @@ impl Simulator {
             }
             self.current_spec = saved;
         }
+
+        // The base loop resolves each class's `type_id` registry spec with the
+        // class's OWN parameters at their DEFAULTS (e.g. `base_class#(0)` from
+        // `typedef uvm_object_registry#(base_class#(P)) type_id;`) — correct
+        // when a parameterized class is only ever used at its default impl, but
+        // the factory/registry tests instantiate NON-default specializations
+        // (`typedef base_class#(9) BaseType;`) and assert their registry is
+        // registered BEFORE any `create()`. Register the concrete specializations
+        // referenced by typedefs too: every module/class-scoped typedef that
+        // names a parameterized class (or a registry) yields its concrete spec,
+        // and we run the statics of the associated registry specialization
+        // (via the class's `type_id` or directly for a registry typedef).
+        let mut extra_specs: Vec<(String, String)> = Vec::new();
+        {
+            use crate::ast::types::DataType;
+            // Snapshot typedef targets (module + all classes) so the param-
+            // resolving processing below can borrow `self` mutably without
+            // aliasing the iteration borrows.
+            let mut targets: Vec<DataType> = Vec::new();
+            for dt in self.module.typedef_types.values() {
+                targets.push(dt.clone());
+            }
+            for cd in self.module.classes.values() {
+                for dt in cd.typedef_targets.values() {
+                    targets.push(dt.clone());
+                }
+            }
+            for target in targets {
+                let DataType::TypeReference { name, type_args, .. } = &target else {
+                    continue;
+                };
+                if type_args.is_empty() {
+                    continue;
+                }
+                let base = name.name.name.clone();
+                if !self.module.classes.contains_key(&base) {
+                    continue;
+                }
+                // Resolve concrete args (a type arg may itself be a typedef,
+                // e.g. `uvm_object_registry#(BaseType)`).
+                let frags: Vec<String> = type_args
+                    .iter()
+                    .filter_map(|e| self.expr_to_spec_fragment(e))
+                    .collect();
+                if frags.len() != type_args.len() {
+                    continue;
+                }
+                let cls = base.split('#').next().unwrap_or(&base).to_string();
+                let sig = self.canonicalize_spec_sig(&cls, &frags.join(","));
+                if sig.is_empty() {
+                    continue;
+                }
+                // Registry typedef itself → register this specialization.
+                if base.contains("registry") {
+                    extra_specs.push((base.clone(), sig.clone()));
+                    continue;
+                }
+                // Parameterized user class → register ITS `type_id` registry
+                // with this class's params bound to the concrete args.
+                let tid = self
+                    .module
+                    .classes
+                    .get(&cls)
+                    .and_then(|c| c.typedef_targets.get("type_id").cloned());
+                if tid.is_some() {
+                    let saved = self.current_spec.take();
+                    self.current_spec = Some((cls.clone(), sig.clone()));
+                    if let Some((rb, rsig)) =
+                        self.resolve_class_member_typedef_spec(&cls, "type_id")
+                    {
+                        extra_specs.push((rb, rsig));
+                    }
+                    self.current_spec = saved;
+                }
+            }
+        }
+        for (base, sig) in extra_specs {
+            if reg_dbg {
+                eprintln!("[REG2] ensure {}#({})", base, sig);
+            }
+            self.ensure_spec_statics(&base, &sig);
+            let saved = self.current_spec.clone();
+            self.current_spec = Some((base.clone(), sig.clone()));
+            let common = self.resolve_class_member_typedef_spec(&base, "common_type");
+            if let Some((b2, s2)) = common {
+                self.ensure_spec_statics(&b2, &s2);
+            }
+            self.current_spec = saved;
+        }
         mark_compile_phase("registry spec static init", &mut compile_phase_start);
 
         // Evaluate parameter expressions whose initializers contained function
@@ -74848,7 +74937,34 @@ impl Simulator {
                     },
                     span: crate::ast::Span::dummy(),
                 };
+                // Resolve a typedef alias to a PARAMETERIZED class with its
+                // specialization args intact (`BaseType` → `base_class#(9)`),
+                // not just the bare base (`resolve_typeref_class_name` drops
+                // the `#(...)`). A `$cast` destination typed via such an
+                // alias recorded the alias name in `var_type_args`; without
+                // the args the type-param comparison compared `base_class`
+                // against the instance's `base_class#(9)` binding and wrongly
+                // rejected a cast to one's own registry specialization
+                // (factory/registry parameterized-object tests).
                 if let Some(cls) = self.resolve_typeref_class_name(&synth) {
+                    if let Some((base, Some(ta))) =
+                        self.resolve_typeref_class_with_type_args(&synth)
+                    {
+                        // Rebuild the class with its args if the rich
+                        // resolution has them (canonicalize the sig).
+                        if !ta.is_empty() {
+                            let frags: Vec<String> = ta
+                                .iter()
+                                .filter_map(|e| self.expr_to_spec_fragment(e))
+                                .collect();
+                            if frags.len() == ta.len() {
+                                let sig = self.canonicalize_spec_sig(&base, &frags.join(","));
+                                if !sig.is_empty() {
+                                    return Some(format!("{}#({})", base, sig));
+                                }
+                            }
+                        }
+                    }
                     return Some(cls);
                 }
                 // Resolve a value parameter (e.g. `Tname`) to its literal
@@ -90903,6 +91019,74 @@ impl Simulator {
                                 }
                                 if let Some(v) = res {
                                     return v;
+                                }
+                            }
+                        }
+                        // §6.18/§8.23: `Alias::typedef::method(args)` where the
+                        // FIRST segment `pkg` is a MODULE-LEVEL TYPEDEF ALIAS to a
+                        // parameterized class (`typedef base_class#(9) BaseType;`),
+                        // and `cls` is a member typedef of that class
+                        // (`BaseType::type_id::get()` where `base_class` declares
+                        // `typedef uvm_object_registry#(base_class#(P)) type_id;`).
+                        // The existing branches only handle `pkg` being a package or
+                        // a real class name, so this 3-segment path never reached
+                        // the registry's `get()` and returned null (factory/registry
+                        // parameterized-object tests: type_id identity and factory
+                        // registration checks). Resolve `pkg` to its class spec, set
+                        // the active specialization so the member typedef's type args
+                        // bind their params, resolve the member typedef, and dispatch.
+                        else if !self
+                            .local_stack
+                            .last()
+                            .is_some_and(|m| m.contains_key(pkg.as_str()))
+                            && !self.signal_name_to_id.contains_key(pkg.as_str())
+                        {
+                            if let Some((alias_base, alias_sig)) =
+                                self.resolve_typedef_spec(pkg) && self.module.classes.contains_key(&alias_base)
+                            {
+                                // Resolve the member typedef within the alias's
+                                // specialization. Set current_spec so type args that
+                                // reference the class's own params resolve to the
+                                // alias's concrete values.
+                                let saved = self.current_spec.take();
+                                self.current_spec = Some((alias_base.clone(), alias_sig.clone()));
+                                let member = self.resolve_class_member_typedef_spec(&alias_base, &cls);
+                                let mem_class_only =
+                                    self.resolve_class_member_typedef_class(&alias_base, &cls);
+                                self.current_spec = saved;
+                                let target: Option<(String, String)> = match member {
+                                    Some(m) => Some(m),
+                                    None => mem_class_only.map(|c| (c, String::new())),
+                                };
+                                if let Some((target_base, target_sig)) = target {
+                                    if !target_sig.is_empty() {
+                                        self.ensure_spec_statics(&target_base, &target_sig);
+                                    }
+                                    let saved_spec = self.current_spec.take();
+                                    if !target_sig.is_empty() {
+                                        if let Some(cs) = &saved_spec {
+                                            self.spec_scope_stack.push(cs.clone());
+                                        }
+                                        self.current_spec =
+                                            Some((target_base.clone(), target_sig.clone()));
+                                    }
+                                    let res = self
+                                        .exec_static_method(&target_base, mname, args);
+                                    let had_spec = saved_spec.is_some() && !target_sig.is_empty();
+                                    self.current_spec = saved_spec;
+                                    if had_spec {
+                                        self.spec_scope_stack.pop();
+                                    }
+                                    if let Some(v) = res {
+                                        return v;
+                                    }
+                                    if mname == "new" && target_sig.is_empty() {
+                                        if let Some(cd) =
+                                            self.module.classes.get(&target_base).cloned()
+                                        {
+                                            return self.instantiate_class(&cd, args);
+                                        }
+                                    }
                                 }
                             }
                         }

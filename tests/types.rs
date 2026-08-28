@@ -77,6 +77,8 @@ mod enum_typeparam_wrapper_from_name;
 mod enum_xz_and_package_shapes;
 #[path = "types/package_base_constraint_inherited.rs"]
 mod package_base_constraint_inherited;
+#[path = "types/param_registry_typeid_identity.rs"]
+mod param_registry_typeid_identity;
 #[path = "types/formal_type_metadata_and_typedef_packed_array.rs"]
 mod formal_type_metadata_and_typedef_packed_array;
 #[path = "types/forward_referenced_parameter.rs"]
