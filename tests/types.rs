@@ -324,3 +324,5 @@ mod per_spec_static_singletons;
 mod signed_unsigned_compare_extension;
 #[path = "types/field_init_call_singletons.rs"]
 mod field_init_call_singletons;
+#[path = "types/data_decl_param_spec_type_arg.rs"]
+mod data_decl_param_spec_type_arg;

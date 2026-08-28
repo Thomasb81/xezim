@@ -57991,15 +57991,6 @@ impl Simulator {
                                 }
                                 found
                             };
-                            if std::env::var("XEZIM_EC_DBG").is_ok() && bname == "pool" {
-                                eprintln!("[ECDBG] bname={} recv={:?} aec={:?} vct={:?} member={:?} decl={:?} ctx={:?}",
-                                    bname, recv_elem_cls,
-                                    self.module.array_elem_class.get(&bname).cloned(),
-                                    self.var_class_types.get(&bname).cloned(),
-                                    member_elem_cls,
-                                    self.declared_collection_elem_class(&bname),
-                                    self.class_context_stack.last().cloned().flatten());
-                            }
                             // §8.10 precedence: a true frame-LOCAL shadows a
                             // class member, which in turn shadows any
                             // global-by-bare-name map. `var_class_types` and
@@ -58193,9 +58184,6 @@ impl Simulator {
                                         }),
                                     None => None,
                                 };
-                            if std::env::var("XEZIM_EC_DBG").is_ok() && bname == "pool" {
-                                eprintln!("[ECDBG] final elem_cls={:?}", elem_cls);
-                            }
                             if let Some((cn, spec)) = elem_cls {
                                 let ctor_args: &[Expression] = match &rvalue.kind {
                                     ExprKind::Call { args, .. } => args,
@@ -58236,16 +58224,66 @@ impl Simulator {
                                     }
                                 }
                                 if let Some(cd) = self.module.classes.get(&cn).cloned() {
-                                    let v = if let Some((b, s)) = spec {
+                                    // The collection's element may be a
+                                    // DIRECTLY parameterized class
+                                    // (`param_obj #(int) m_aa[string]`). The
+                                    // base-class maps above record only
+                                    // `param_obj`; recover the `#(int)` args
+                                    // from the collection's declared element
+                                    // type and bind them so the instance
+                                    // records the correct specialization
+                                    // (its `type_name`/`get_object_type`),
+                                    // mirroring the plain `lvalue = new()`
+                                    // path via `instantiate_class_with_type_args`.
+                                    let mut ta: Option<Vec<Expression>> = None;
+                                    if let Some(dt) = self
+                                        .module
+                                        .var_decl_types
+                                        .get(&bname)
+                                        .or_else(|| {
+                                            self.module.var_decl_types.get(
+                                                &self
+                                                    .dyn_name_lookup(&bname)
+                                                    .map(str::to_string)
+                                                    .unwrap_or_default(),
+                                            )
+                                        })
+                                    {
+                                        if let crate::ast::types::DataType::TypeReference {
+                                            type_args, ..
+                                        } = dt
+                                        {
+                                            if !type_args.is_empty() {
+                                                ta = Some(type_args.clone());
+                                            }
+                                        }
+                                    }
+                                    if ta.is_none() {
+                                        ta = self
+                                            .module
+                                            .class_type_args
+                                            .get(&bname)
+                                            .cloned()
+                                            .or_else(|| {
+                                                self.this_property_type_args(&bname)
+                                            })
+                                            .or_else(|| self.var_type_args.get(&bname).cloned());
+                                    }
+                                    let mut v = None;
+                                    if let Some(ta_args) = ta {
+                                        v = Some(self.instantiate_class_with_type_args(
+                                            &cd, ctor_args, Some(ta_args.as_slice()),
+                                        ));
+                                    } else if let Some((b, s)) = spec {
                                         let saved = self.current_spec.take();
                                         self.current_spec = Some((b, s));
                                         let r = self.instantiate_class(&cd, ctor_args);
                                         self.current_spec = saved;
-                                        r
+                                        v = Some(r);
                                     } else {
-                                        self.instantiate_class(&cd, ctor_args)
-                                    };
-                                    self.assign_value(lvalue, &v);
+                                        v = Some(self.instantiate_class(&cd, ctor_args));
+                                    }
+                                    self.assign_value(lvalue, &v.unwrap());
                                     return;
                                 }
                             }
@@ -63001,6 +63039,50 @@ impl Simulator {
                                     if self.module.classes.contains_key(&ecn) {
                                         self.module.array_elem_class.insert(name.clone(), ecn);
                                     }
+                                }
+                                // A local ASSOCIATIVE array's declaration
+                                // initializer (`uvm_object_wrapper m[string] =
+                                // '{"a": w, default: d};` inside a method) was
+                                // silently dropped — the branch registered the
+                                // array then `continue`d, so every element read
+                                // back null/X even for EXPLICIT keys. Route it
+                                // through a BlockingAssign (as the queue and
+                                // fixed-array branches do) so the pattern-
+                                // aggregate spread applies write the keyed
+                                // elements and record the default fallback.
+                                if let Some(init) = &d.init {
+                                    let lvalue =
+                                        crate::ast::expr::Expression::new(
+                                            crate::ast::expr::ExprKind::Ident(
+                                                crate::ast::expr::HierarchicalIdentifier {
+                                                    root: None,
+                                                    path: vec![
+                                                        crate::ast::expr::HierPathSegment {
+                                                            name: crate::ast::Identifier {
+                                                                name: bare,
+                                                                span: d.name.span,
+                                                            },
+                                                            selects: Vec::new(),
+                                                        },
+                                                    ],
+                                                    span: d.name.span,
+                                                    cached_signal_id: std::cell::Cell::new(
+                                                        None,
+                                                    ),
+                                                    cached_resolved_name:
+                                                        std::cell::OnceCell::new(),
+                                                },
+                                            ),
+                                            d.name.span,
+                                        );
+                                    let assign = crate::ast::stmt::Statement::new(
+                                        crate::ast::stmt::StatementKind::BlockingAssign {
+                                            lvalue,
+                                            rvalue: init.clone(),
+                                        },
+                                        d.name.span,
+                                    );
+                                    self.exec_statement(&assign);
                                 }
                                 continue;
                             }
@@ -83893,8 +83975,10 @@ impl Simulator {
             return false;
         };
 
-        // Associative array: `'{key:value, ...}`. `default:` is recorded at
-        // elaboration (`assoc_defaults`) and needs no element write.
+        // Associative array: `'{key:value, ...}`. A `default:` value is the
+        // fallback for any key not explicitly listed (§7.8), so record it
+        // for absent-key reads (elaboration records declaration defaults via
+        // `assoc_defaults`; a RUN-TIME `m = '{...}` must record it here).
         if self.module.associative_arrays.contains_key(base) {
             let mut wrote = false;
             for item in items {
@@ -83902,6 +83986,9 @@ impl Simulator {
                     let kv = self.eval_expr(k);
                     let key = self.assoc_key_str(base, &kv);
                     self.assign_pattern_or_leaf(&format!("{}[{}]", base, key), &dt, v);
+                    wrote = true;
+                } else if let AssignmentPatternItem::Default(e) = item {
+                    self.module.assoc_defaults.insert(base.to_string(), e.clone());
                     wrote = true;
                 }
             }
