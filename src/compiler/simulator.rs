@@ -21587,7 +21587,14 @@ impl Simulator {
                     );
                     if let Some(eid) = id {
                         let val = vm_regs[*val_reg as usize].resize(*width);
-                        if signal_table[eid] != val {
+                        // §10.4.2 last-write-wins: see the NbaAssign arm.
+                        if let Some(i) = if nba_dup {
+                            nba_out.iter().rposition(|n| n.signal_id == eid)
+                        } else {
+                            None
+                        } {
+                            nba_out[i].value = val;
+                        } else if signal_table[eid] != val {
                             nba_out.push(NbaFast {
                                 signal_id: eid,
                                 value: val,
@@ -22391,7 +22398,14 @@ impl Simulator {
                     );
                     if let Some(eid) = id {
                         let val = vm_regs[*val_reg as usize].resize(*width);
-                        if view[eid] != val {
+                        // §10.4.2 last-write-wins: see the NbaAssign arm.
+                        if let Some(i) = if nba_dup {
+                            nba_out.iter().rposition(|n| n.signal_id == eid)
+                        } else {
+                            None
+                        } {
+                            nba_out[i].value = val;
+                        } else if view[eid] != val {
                             nba_out.push(NbaFast {
                                 signal_id: eid,
                                 value: val,
@@ -23960,13 +23974,22 @@ impl Simulator {
                         &self.signal_name_to_id,
                     ) {
                         let val = self.vm_regs[*val_reg as usize].resize(*width);
-                        // Eval-time elision — array element write that
-                        // matches current storage is dropped before queue.
+                        // §10.4.2 last-write-wins, THEN eval-time elision: an
+                        // earlier NBA in this evaluation must be OVERWRITTEN,
+                        // and the elision may only compare against the
+                        // register when nothing is pending. Eliding on the
+                        // register alone dropped a conditional override whose
+                        // value happened to equal the CURRENT value while the
+                        // unconditional default sat in the queue — a taken
+                        // branch-to-self on the 4004 committed pc+2 (issue
+                        // #142; every sibling arm already had this guard).
                         if is_packed_id(eid) {
                             let (bv, bx) = val.raw_bits();
                             if self.packed.set_raw(eid, bv, bx) {
                                 self.table_modified = true;
                             }
+                        } else if let Some(i) = self.nba_fast_index.get(eid) {
+                            self.nba_fast[i].value = val;
                         } else if self.signal_table[eid] != val {
                             self.nba_fast_index.insert(eid, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
@@ -24022,10 +24045,17 @@ impl Simulator {
                         let high_eff = high.min(sig_w.saturating_sub(1));
 
                         if low == 0 && high_eff + 1 >= sig_w {
-                            // Whole-element write — elide if same.
+                            // Whole-element write — §10.4.2 last-write-wins
+                            // against a pending entry FIRST, then elide if
+                            // same as the register. Same defect class as the
+                            // NbaAssignArray arm (issue #142): eliding on the
+                            // register alone dropped an override equal to the
+                            // current value while an earlier NBA sat queued.
                             let mut v = val.resize_for_assign(sig_w);
                             v.is_signed = self.signal_signed[eid];
-                            if self.signal_table[eid] != v {
+                            if let Some(i) = self.nba_fast_index.get(eid) {
+                                self.nba_fast[i].value = v;
+                            } else if self.signal_table[eid] != v {
                                 self.nba_fast_index.insert(eid, self.nba_fast.len());
                                 self.nba_fast.push(NbaFast {
                                     block_index: 0,
@@ -27932,9 +27962,19 @@ impl Simulator {
             // through in one edge — a shift register would collapse. Verified
             // against a commercial simulator and a reference simulator: a `q0->q1` chain must
             // shift one stage per clock. Route through the NBA queue like a flop.
-            if self.signal_table[id].get_bit_code(bit) != new_code {
+            // §10.4.2 against the PENDING value: a second fire in the same
+            // delta must update the queued value (a fire back to the current
+            // code was dropped while the first fire's entry survived), and
+            // two UDPs driving different BITS of one output word must merge
+            // rather than the second clone losing the first's bit. Keeping
+            // the entry indexed also lets the RTL NBA paths find it.
+            if let Some(i) = self.nba_fast_index.get(id) {
+                let tv = &mut self.nba_fast[i].value;
+                tv.set_bit_code(bit, new_code);
+            } else if self.signal_table[id].get_bit_code(bit) != new_code {
                 let mut v = self.signal_table[id].clone();
                 v.set_bit_code(bit, new_code);
+                self.nba_fast_index.insert(id, self.nba_fast.len());
                 self.nba_fast.push(NbaFast {
                     signal_id: id,
                     value: v,
