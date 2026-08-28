@@ -3674,6 +3674,12 @@ pub struct Simulator {
     /// before `resolve_hier_name`, whose per-node cache would freeze the first
     /// element's binding for the whole sort.
     item_alias: Option<String>,
+    /// Custom iterator name bound inside a locator/`with` filter (e.g. `i` in
+    /// `q.find(i) with (i.field)`). `item_alias` resolves `item.field`; with a
+    /// custom name the struct-member lambda reads `i.field`, which must also
+    /// dereference through the aliased element path. Defaults to `item` when
+    /// the user wrote no explicit iterator.
+    locator_iter: String,
     /// LRM §18.5.4 dist-pick-once tracking (per-randomize scope). Records
     /// `(handle, prop_name)` pairs for which a weighted `dist` constraint
     /// has already drawn one sample in the current randomize call. The
@@ -3763,6 +3769,9 @@ pub struct Simulator {
     pending_spec_inits: Vec<(String, String)>,
     /// Recursion guard for `ensure_spec_statics`.
     spec_init_depth: u32,
+    /// Recursion guard for evaluating call-bearing instance-property
+    /// initializers at construction (see `evaluate_call_init_at_construct`).
+    construct_init_depth: u32,
     /// Class-typed procedural locals — variable name -> class type name.
     /// Lets a later `name = new();` know which class to construct.
     var_class_types: HashMap<String, String>,
@@ -7736,6 +7745,7 @@ impl Simulator {
             viface_var_aliases: HashMap::default(),
             last_vif_return: None,
             item_alias: None,
+            locator_iter: "item".to_string(),
             dist_picked_once: HashSet::default(),
             rand_ranges: HashMap::default(),
             class_statics: HashMap::default(),
@@ -7752,6 +7762,7 @@ impl Simulator {
             reported_null_derefs: std::collections::HashSet::default(),
             pending_spec_inits: Vec::new(),
             spec_init_depth: 0,
+            construct_init_depth: 0,
             var_class_types: HashMap::default(),
             var_type_args: HashMap::default(),
             var_container_types: HashMap::default(),
@@ -50821,10 +50832,14 @@ impl Simulator {
                         }
                     }
                 }
-                // `item.field` inside a `with` filter over a struct queue.
+                // `item.field` / `i.field` inside a `with` filter over a struct
+                // queue. `item_alias` aliases the current element's flat name;
+                // the head may be the literal `item` or a custom iterator name.
                 if hier.path.len() >= 2 {
                     if let Some(alias) = self.item_alias.clone() {
-                        if hier.path[0].name.name == "item" {
+                        if hier.path[0].name.name == "item"
+                            || hier.path[0].name.name == self.locator_iter
+                        {
                             let rest = hier.path[1..]
                                 .iter()
                                 .map(|s| s.name.name.as_str())
@@ -55750,13 +55765,15 @@ impl Simulator {
                         }
                     }
                 }
-                // `item.field` / `item.inner.field` inside a `with` filter over a
-                // struct queue. Fold the whole receiver chain, then swap the
-                // `item` prefix for the element's flat name.
+                // `item.field` / `i.field` / `item.inner.field` inside a `with`
+                // filter over a struct queue. Fold the whole receiver chain,
+                // then swap the `item` (or custom iterator) prefix for the
+                // element's flat name.
                 if let Some(alias) = self.item_alias.clone() {
                     if let Some(base_flat) = self.flat_member_name(expr) {
-                        if base_flat == "item" || base_flat.starts_with("item.") {
-                            let rest = &base_flat["item".len()..];
+                        let head = self.locator_iter.as_str();
+                        if base_flat == head || base_flat.starts_with(&format!("{}.", head)) {
+                            let rest = &base_flat[head.len()..];
                             let name = format!("{}{}.{}", alias, rest, member.name);
                             if let Some(v) = self.get_signal_value_by_name(&name) {
                                 return v;
@@ -83553,9 +83570,8 @@ impl Simulator {
                 return;
             }
         }
-        if let Some(dt) = self.p_elem_type(obj_name) {
-            if let DataType::Struct(su) = self.resolve_dt(&dt) {
-                if Self::spreads_member_wise(&su) {
+        if let Some(su) = self.queue_elem_struct(obj_name) {
+            if Self::spreads_member_wise(&su) {
                     if let ExprKind::AssignmentPattern(items) = &arg.kind {
                         if !items.is_empty() {
                             self.assign_pattern_into_struct(elem, &su, items);
@@ -83566,7 +83582,6 @@ impl Simulator {
                         self.copy_unpacked_struct(elem, &src, &su.clone());
                         return;
                     }
-                }
             }
         }
         let val = self.queue_eval_arg(obj_name, arg);
@@ -85404,6 +85419,8 @@ impl Simulator {
         };
         let saved_item = self.local_stack.last().and_then(|f| f.get("item").cloned());
         let saved_alias = self.item_alias.take();
+        let saved_iter = self.locator_iter.clone();
+        self.locator_iter = iter_name.unwrap_or("item").to_string();
 
         let mut keys: Vec<i64> = Vec::with_capacity(size);
         let mut truth: Vec<bool> = Vec::with_capacity(size);
@@ -85437,6 +85454,7 @@ impl Simulator {
         }
 
         self.item_alias = saved_alias;
+        self.locator_iter = saved_iter;
         if let Some(f) = self.local_stack.last_mut() {
             match saved_item {
                 Some(v) => {
@@ -85508,6 +85526,8 @@ impl Simulator {
         };
         let saved_item = self.local_stack.last().and_then(|f| f.get("item").cloned());
         let saved_alias = self.item_alias.take();
+        let saved_iter = self.locator_iter.clone();
+        self.locator_iter = iter.unwrap_or("item").to_string();
 
         let mut keys: Vec<i64> = Vec::with_capacity(size);
         for i in 0..size {
@@ -85528,6 +85548,7 @@ impl Simulator {
         }
 
         self.item_alias = saved_alias;
+        self.locator_iter = saved_iter;
         if let Some(f) = self.local_stack.last_mut() {
             if let Some(nm) = iter {
                 f.remove(nm);
@@ -97992,6 +98013,40 @@ impl Simulator {
         out
     }
 
+    /// Evaluate an instance-property initializer that contains a function call
+    /// (`uvm_root r = uvm_root::get()`, `uvm_factory f = cs.get_factory()`,
+    /// etc.) at CONSTRUCTION time and store the result on the instance.
+    ///
+    /// Field initializers legally run at every construction (as if the first
+    /// statements of `new()`), but the main property-init loop skips
+    /// call-bearing initializers to avoid recursion. Singleton getter
+    /// initializers like these MUST run here: their elaborate-time value is
+    /// always null (the singletons don't exist during elaboration), so
+    /// skipping left every UVM test that caches `uvm_root::get()` /
+    /// `uvm_coreservice_t::get()` / `cs.get_factory()` as a field null, and
+    /// the factory-based tests (type/instance aliases + overrides) silently
+    /// registered nothing.
+    fn evaluate_call_init_at_construct(
+        &mut self,
+        handle: usize,
+        pname: &str,
+        init: &Expression,
+    ) -> bool {
+        // Guard: evaluating a field initializer may itself construct objects.
+        // Cap the depth so a pathological self-referential field init can't
+        // recurse without bound. 64 is far beyond any legitimate chain.
+        if self.construct_init_depth >= 64 {
+            return false;
+        }
+        self.construct_init_depth += 1;
+        let v = self.eval_expr(init);
+        self.construct_init_depth -= 1;
+        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+            inst.properties.insert(pname.to_string(), v);
+        }
+        true
+    }
+
     fn instantiate_class(
         &mut self,
         class_def: &crate::compiler::elaborate::ElaboratedClass,
@@ -98707,6 +98762,7 @@ impl Simulator {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+            let mut deferred_call_inits: Vec<(String, Expression)> = Vec::new();
             for (pname, init) in inits {
                 // A STATIC member is shared across all instances (it lives in
                 // `class_statics`, not per-instance), so it must NOT be
@@ -98807,6 +98863,12 @@ impl Simulator {
                 // mutate state and are the constructor's job; leave their
                 // elaborate-time value in place.
                 if Self::expr_contains_call(&init) {
+                    // Scalar (non-collection) call-bearing initializers are
+                    // re-evaluated at construction in a fixed point below so
+                    // field-order dependencies resolve (a later-declared field
+                    // can read an earlier one). Collected here and run after
+                    // the non-call initializers so singletons are up.
+                    deferred_call_inits.push((pname.clone(), init.clone()));
                     continue;
                 }
                 // Queue / dynamic-array member initializer (`int q[$] =
@@ -98864,6 +98926,38 @@ impl Simulator {
                 }
                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
                     inst.properties.insert(pname, val);
+                }
+            }
+            // Fixed point over the deferred call-bearing instance property
+            // initializers. Field initializers legally run in DECLARATION order
+            // at construction; a later field may read an earlier one (e.g.
+            // `uvm_coreservice_t cs = uvm_coreservice_t::get();` then
+            // `uvm_factory factory = cs.get_factory();`). `property_inits` is an
+            // unordered map, so repeat the pass until a full round changes
+            // nothing — dependency chains settle regardless of iteration order.
+            if !deferred_call_inits.is_empty() {
+                for _ in 0..=deferred_call_inits.len() {
+                    let mut changed = false;
+                    for (pname, init) in deferred_call_inits.clone() {
+                        let before = self
+                            .heap
+                            .get(handle)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|i| i.properties.get(&pname).cloned());
+                        if self.evaluate_call_init_at_construct(handle, &pname, &init) {
+                            let after = self
+                                .heap
+                                .get(handle)
+                                .and_then(|o| o.as_ref())
+                                .and_then(|i| i.properties.get(&pname).cloned());
+                            if before.as_ref() != after.as_ref() {
+                                changed = true;
+                            }
+                        }
+                    }
+                    if !changed {
+                        break;
+                    }
                 }
             }
             self.class_context_stack.pop();

@@ -322,3 +322,5 @@ mod package_data_members_in_subroutine;
 mod per_spec_static_singletons;
 #[path = "types/signed_unsigned_compare_extension.rs"]
 mod signed_unsigned_compare_extension;
+#[path = "types/field_init_call_singletons.rs"]
+mod field_init_call_singletons;
