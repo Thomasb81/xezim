@@ -12128,15 +12128,32 @@ impl Simulator {
         // m[KEY]`) as a single shared global store under their bare name, so
         // queue/assoc ops and `inside {m}` resolve. riscv-dv's instruction
         // tables (instr_names, instr_template, ...) live here.
-        let static_cols: Vec<(String, bool, u32)> = self
+        // The `associative_arrays` bool is ``is the key `string`'' — seed it
+        // from each declaring class's `static_assoc_key_types` so a
+        // `static T map[string]` gets string storage (hashing the bare name
+        // as NUMERIC would corrupt foreach()/first()/next()).
+        let static_cols: Vec<(String, bool, u32, bool)> = self
             .module
             .classes
             .values()
-            .flat_map(|c| c.static_collections.iter().cloned())
+            .flat_map(|cd| {
+                cd.static_collections
+                    .iter()
+                    .map(move |(name, is_assoc, width)| {
+                        let is_str = cd
+                            .static_assoc_key_types
+                            .get(name)
+                            .map(|kt| kt == "string")
+                            .unwrap_or(false);
+                        (name.clone(), *is_assoc, *width, is_str)
+                    })
+            })
             .collect();
-        for (name, is_assoc, width) in static_cols {
+        for (name, is_assoc, width, is_str) in static_cols {
             if is_assoc {
-                self.module.associative_arrays.entry(name).or_insert(false);
+                self.module.associative_arrays
+                    .entry(name.clone())
+                    .or_insert(is_str);
             } else {
                 self.module.dynamic_arrays.insert(name.clone());
                 self.module
@@ -60566,7 +60583,6 @@ impl Simulator {
                 {
                     if let Some(an) = self.expr_assoc_name(array) {
                         // §12.7.3 `foreach (m[i, j])` over a DYNAMIC ARRAY OF
-                        // DYNAMIC ARRAYS member: the inner bound is per-row
                         // (`<h>#m[i].size`), so the two dimensions cannot be
                         // iterated as a rectangle.
                         if vars.len() >= 2
@@ -60728,7 +60744,8 @@ impl Simulator {
                                     .associative_arrays
                                     .get(&an)
                                     .copied()
-                                    .unwrap_or(false);
+                                    .unwrap_or(false)
+                                    || self.is_string_keyed_array(&an);
                                 // Integer-keyed members iterate in NUMERIC order;
                                 // lexicographic sort would visit "10" before "2".
                                 // Use i64 so negative (signed) keys keep order.
@@ -61127,7 +61144,8 @@ impl Simulator {
                                 .associative_arrays
                                 .get(&name)
                                 .copied()
-                                .unwrap_or(false);
+                                .unwrap_or(false)
+                                || self.is_string_keyed_array(&name);
                             // Numeric key order for integer-keyed arrays (see
                             // note above); lexicographic would scramble order.
                             if is_str {
@@ -63436,6 +63454,21 @@ impl Simulator {
                         // name from a TypeReference data_type.
                         if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
                             let tn = name.name.name.clone();
+                            // A local declared with a class TYPE PARAMETER
+                            // (`T e;` in a parameterized class) isn't in the
+                            // flat typedef/enum tables under `T`. Resolve the
+                            // active specialization's binding (T -> e_t) so
+                            // `e.first()/.next()/.last()/.prev()/.num()/`
+                            // names find the CONCRETE enum-member list
+                            // (else they fall through to a generic 0).
+                            let tn = if self.module.enum_members.contains_key(&tn)
+                                || self.module.typedefs.contains_key(&tn)
+                                || self.module.typedef_types.contains_key(&tn)
+                            {
+                                tn
+                            } else {
+                                self.resolve_type_param_binding(&tn).unwrap_or_else(|| tn)
+                            };
                             if self.module.enum_members.contains_key(&tn)
                                 || self.module.typedefs.contains_key(&tn)
                                 || self.module.typedef_types.contains_key(&tn)
@@ -68461,6 +68494,29 @@ impl Simulator {
                     let parent = parent_of(k).to_string();
                     *self.name_resolve_hint.borrow_mut() = Some(parent);
                     return k.to_string();
+                }
+            }
+        }
+        // §8.25.1: a 2-segment path `[alias, member]` where the leading
+        // segment is a TYPE-DEF specialization alias for a PARAMETERIZED
+        // class (`w_t = wrapper#(e_t)`) and the member is a STATIC
+        // associative-array collection. Element access (`w_t::map[k]`,
+        // `size()`, `foreach`) must read/store under the SAME per-spec key
+        // (`wrapper#e_t::map`) that an in-method bare access uses
+        // (`spec_static_coll_key`); otherwise the suffix scan below collapses
+        // this to bare `map`, so an in-method write (per-spec) is never seen
+        // by a module-scope read (bare). Only STATIC COLLECTIONS are
+        // intercepted — scalar statics keep their own resolution path.
+        if hier.path.len() == 2 {
+            if let Some((base, sig)) = self.resolve_typedef_spec(&hier.path[0].name.name) {
+                let member = &hier.path[1].name.name;
+                if self.member_is_static_coll(&base, member) {
+                    return format!(
+                        "{}#{}::{}",
+                        base,
+                        self.canonicalize_spec_sig(&base, &sig),
+                        member
+                    );
                 }
             }
         }
@@ -74430,6 +74486,24 @@ impl Simulator {
         if self.module.associative_arrays.contains_key(name) {
             return true;
         }
+        // A per-specialization static-collection storage key
+        // (`Class#spec::member`, e.g. `wrapper#e_t::map`) rewritten by
+        // `spec_static_coll_key` / `obj_member` for a parameterized-class
+        // STATIC associative array. `module.associative_arrays` registers
+        // such arrays only under the BARE member name, so `Class#spec::map`
+        // never matched and `size()/num()/exists()` on a static
+        // parameterized assoc array read 0 / garbage (`first()` dropped the
+        // whole store). Confirm the member after the last `::` is a
+        // registered static assoc array of the class before the `#`.
+        // NB: this is distinct from an INSTANCE member store `handle#member`
+        // (numeric handle, no `::`), handled by the `#` branch above.
+        if let Some((head, member)) = name.split_once('#')
+            && let Some((_, member2)) = member.rsplit_once("::")
+            && self.member_is_static_coll(head, member2)
+            && self.module.associative_arrays.contains_key(member2)
+        {
+            return true;
+        }
         // Per-instance class member: `<handle>#<member>`.
         if let Some(pos) = name.find('#') {
             if let Ok(handle) = name[..pos].parse::<usize>() {
@@ -75092,6 +75166,26 @@ impl Simulator {
         {
             return true;
         }
+
+        // A per-specialization STATIC collection storage key
+        // (`Class#spec::member`, e.g. `wrapper#e_t::map`) rewritten by
+        // `spec_static_coll_key` / `obj_member` for a static assoc array whose
+        // KEY is `string` (or a type parameter bound to `string`). The bare
+        // `map` is registered above (string-keyed after startup seeds the
+        // flag), but the per-spec name `Class#spec::map` has no
+        // `module.associative_arrays` entry — and its `parse::<usize>()` fails
+        // the instance `##` branch below — so without this it fell into the
+        // NUMERIC branch of `assoc_key_str` and stored string keys as hashed
+        // integers (consistent for /set/get but corrupting foreach()).
+        if let Some((head, member)) = name.split_once('#')
+            && let Some((_, member2)) = member.rsplit_once("::")
+            && let Some(cls) = head.split_once('#').map(|(c, _)| c).or(Some(head))
+        {
+            if self.static_member_is_string_keyed(cls, member2) {
+                return true;
+            }
+        }
+
         // Per-instance class member `<handle>#<member>`: the declared key may
         // be a TYPE PARAMETER the instance binds to `string` (`uvm_pool
         // #(string, T)` — the elaboration-time flag is false because KEY is
@@ -75227,6 +75321,51 @@ impl Simulator {
     fn assoc_index_width_for(&self, name: &str) -> Option<(u32, bool)> {
         if let Some(&iw) = self.module.assoc_index_widths.get(name) {
             return Some(iw);
+        }
+        // A BARE STATIC collection name (`imap`, no `#`) of the CURRENT class
+        // context (non-parameterized class, so `spec_static_coll_key` leaves
+        // the bare name). Resolve the class via `class_context_stack` and read
+        // its `static_assoc_index_props`.
+        if !name.contains('#') && !name.contains("::") {
+            if let Some(Some(ctx)) = self.class_context_stack.last() {
+                let mut cur = Some(ctx.clone());
+                while let Some(c) = cur {
+                    if let Some(cd) = self.module.classes.get(&c) {
+                        if cd.static_collections.iter().any(|(n, is_a, _)| n == name && *is_a) {
+                            if let Some(&iw) = cd.static_assoc_index_props.get(name) {
+                                return Some(iw);
+                            }
+                        }
+                        cur = cd.extends.clone();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        // A per-specialization STATIC collection storage key
+        // (`Class#spec::member`, e.g. `wrapper#e_t::imap`): the class-declared
+        // INDEX width+signedness lives in `static_assoc_index_props` (see
+        // `ElaboratedClass`). WITHOUT this branch the instance `##` lookup
+        // below would bail (its `#[..].parse()` sees `wrapper#e_t`, not a
+        // numeric handle), so a signed `int` key like `-3` fell back to the
+        // default unsigned (32,false) — `foreach` bound the index as
+        // `4294967293` and `imap[that]` missed the stored `imap[-3]`.
+        if let Some((head, member)) = name.split_once('#')
+            && let Some((_, member2)) = member.rsplit_once("::")
+            && let Some(cls) = head.split_once('#').map(|(c, _)| c).or(Some(head))
+        {
+            let mut cur = Some(cls.to_string());
+            while let Some(c) = cur {
+                if let Some(cd) = self.module.classes.get(&c) {
+                    if let Some(&iw) = cd.static_assoc_index_props.get(member2) {
+                        return Some(iw);
+                    }
+                    cur = cd.extends.clone();
+                } else {
+                    break;
+                }
+            }
         }
         // Per-instance class member: `<handle>#<member>`.
         if let Some(pos) = name.find('#') {
@@ -76428,7 +76567,8 @@ impl Simulator {
             .associative_arrays
             .get(name)
             .copied()
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self.is_string_keyed_array(name);
         if is_str {
             ks.sort();
         } else {
@@ -85855,6 +85995,22 @@ impl Simulator {
             if self.bare_receiver_is_class_handle(obj_name) {
                 return None;
             }
+            // A bare CLASS-NAME receiver (`uvm_config_db#(T)` flattened to
+            // `uvm_config_db`) is a STATIC-method call, not a collection.
+            // Without this, `uvm_config_db::exists(...)` (and any other
+            // class static whose name collides with a collection builtin)
+            // fell through to the assoc-array `exists` handler and answered
+            // 0 without ever running the class method body. Resolve the
+            // specialization base (or bare name) against the class table
+            // and bail so the class-static dispatch owns the call.
+            if self.module.classes.contains_key(obj_name)
+                || obj_name
+                    .split('#')
+                    .next()
+                    .is_some_and(|b| self.module.classes.contains_key(b))
+            {
+                return None;
+            }
             if self.dyn_name_lookup(obj_name).is_none() {
                 match self.instance_assoc_member(obj_name) {
                     Some(scoped) => {
@@ -85950,7 +86106,7 @@ impl Simulator {
                                 .get_local_or_signal(obj_name)
                                 .or_else(|| self.get_signal_value_by_name(obj_name));
                             let cur_xz = cur_v.as_ref().is_some_and(|v| v.has_xz());
-                            let cur = cur_v.map(|v| v.to_u64().unwrap_or(0)).unwrap_or(0);
+                            let cur = cur_v.as_ref().map(|v| v.to_u64().unwrap_or(0)).unwrap_or(0);
                             // Compare at the enum's WIDTH: the member table and
                             // the variable can hold the same value at different
                             // widths (a signed enum sign-extends on read), so a
@@ -88890,6 +89046,36 @@ impl Simulator {
                     return true;
                 }
                 cur = cd.extends.as_deref();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Is a STATIC assoc collection member string-keyed? Walks `start_class`
+    /// up its extends chain consulting `static_assoc_key_types`. A key type
+    /// recorded as a plain TYPE PARAMETER (e.g. `static T map[K];` where the
+    /// active specialization binds `K` to `string`) is resolved through the
+    /// active specialization [1] before judging; statics have no instance so
+    /// `current_spec` is the only binding source.
+    fn static_member_is_string_keyed(&self, start_class: &str, member: &str) -> bool {
+        let mut cur = Some(start_class.to_string());
+        while let Some(cn) = cur {
+            if let Some(cd) = self.module.classes.get(&cn) {
+                if cd.static_collections.iter().any(|(n, is_a, _)| n == member && *is_a) {
+                    if let Some(kt) = cd.static_assoc_key_types.get(member) {
+                        let mut concrete =
+                            self.resolve_type_param_binding(kt).unwrap_or_else(|| kt.clone());
+                        if let Some(c2) = self.resolve_type_param_binding(&concrete) {
+                            concrete = c2;
+                        }
+                        if concrete == "string" {
+                            return true;
+                        }
+                    }
+                }
+                cur = cd.extends.clone();
             } else {
                 break;
             }
