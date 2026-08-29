@@ -53,6 +53,8 @@ mod ref_arg_assoc_writeback;
 mod ref_arg_collection_writeback;
 #[path = "strings/string_eq_relational_2state.rs"]
 mod string_eq_relational_2state;
+#[path = "strings/string_flag_not_clobbered_by_samed_name_local.rs"]
+mod string_flag_not_clobbered_by_samed_name_local;
 #[path = "strings/string_index_ref_queue.rs"]
 mod string_index_ref_queue;
 #[path = "strings/string_is_dynamic.rs"]
