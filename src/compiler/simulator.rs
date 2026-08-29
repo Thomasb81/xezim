@@ -4041,6 +4041,16 @@ pub struct Simulator {
     static_local_syncs: Vec<(String, Vec<(String, String)>)>,
     /// Return value from last function call.
     return_value: Option<Value>,
+    /// "string_typed-name" flag snapshots for each active subroutine frame
+    /// (free function / method / task). `string_signals` is a flat global set
+    /// keyed by bare name; a nested frame's NON-STRING local (e.g. `int m`)
+    /// runs `string_signals.remove("m")` (the block-local decl clears stale
+    /// string flags), which would permanently clobber an ENCLOSING scope's
+    /// `string m` — so a later `m = <long string>` there is no longer treated
+    /// as a string and gets resized to the 1024-bit placeholder (128 chars).
+    /// Snapshot at frame entry, restore at frame exit, so a
+    /// frame can never leak an add OR a remove to its caller.
+    string_signals_saves: Vec<HashSet<String>>,
     /// Default random number generator — the stream used by any object or
     /// process that has not been given a private one (§18.14).
     rng: SvRng,
@@ -7847,6 +7857,7 @@ impl Simulator {
             static_local_syncs: Vec::new(),
             in_const_param_eval: false,
             return_value: None,
+            string_signals_saves: Vec::new(),
             rng: SvRng::from_seed(SvRng::DEFAULT_SEED),
             proc_rng: HashMap::default(),
             obj_rng: HashMap::default(),
@@ -95799,6 +95810,12 @@ impl Simulator {
         // when the name is already present from an active caller frame, so
         // recursion/nesting is handled) and remove exactly those on exit.
         let mut frame_string_signals: Vec<String> = Vec::new();
+        // §6.21/§23.8: make the string-flag registry frame-scoped. A nested
+        // frame's non-string local removes its bare name from `string_signals`
+        // (the block-local decl clears stale flags), which would otherwise
+        // permanently clobber an enclosing scope's `string m`; snapshot here
+        // and restore below so a frame leaks neither an add nor a remove.
+        self.string_signals_saves.push(self.string_signals.clone());
         if Self::is_string_data_type(&fd.return_type) {
             if self.string_signals.insert(ret_name.clone()) {
                 frame_string_signals.push(ret_name.clone());
@@ -95868,8 +95885,14 @@ impl Simulator {
         }
         // §23.8: stop leaking this frame's string formal names into the
         // global set now that the body is done (see frame_string_signals).
-        for n in &frame_string_signals {
-            self.string_signals.remove(n);
+        // §6.21/§23.8: also restore the frame-scoped snapshot (see the push
+        // at entry), so this frame's non-string locals can't leak a `remove`.
+        if let Some(snap) = self.string_signals_saves.pop() {
+            self.string_signals = snap;
+        } else {
+            for n in &frame_string_signals {
+                self.string_signals.remove(n);
+            }
         }
         self.sync_static_locals();
         self.local_iface_aliases.pop();
@@ -106858,6 +106881,11 @@ impl Simulator {
                 // on exit; HashSet::insert returning false (name already
                 // present from an active caller) is left untouched.
                 let mut frame_string_signals: Vec<String> = Vec::new();
+                // §6.21/§23.8: frame-scope the string-flag registry (see the
+                // free-function path) so this method's non-string locals can't
+                // leak a `string_signals.remove` that clobbers an enclosing
+                // scope's `string <name>`.
+                self.string_signals_saves.push(self.string_signals.clone());
                 if let ClassMethodKind::Function(f) = &method.kind {
                     if Self::is_string_data_type(&f.return_type) {
                         if self.string_signals.insert(f.name.name.name.clone()) {
@@ -107097,8 +107125,16 @@ impl Simulator {
                 // §23.8: stop leaking this frame's string formal names into
                 // the global set now that the body is done (see
                 // frame_string_signals).
-                for n in &frame_string_signals {
-                    self.string_signals.remove(n);
+                // §6.21/§23.8: also restore the frame-scoped snapshot so this
+                // method's non-string locals can't leak a `remove` (parking
+                // mirrors the free-function path: the frame is torn down and
+                // re-entered on resume, re-pushing the snapshot).
+                if let Some(snap) = self.string_signals_saves.pop() {
+                    self.string_signals = snap;
+                } else {
+                    for n in &frame_string_signals {
+                        self.string_signals.remove(n);
+                    }
                 }
                 self.current_spec = saved_spec;
                 if let Some(prev) = saved_resolve_hint {
