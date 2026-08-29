@@ -330,3 +330,5 @@ mod data_decl_param_spec_type_arg;
 mod type_id_create_applies_override;
 #[path = "types/queue_literal_function_return.rs"]
 mod queue_literal_function_return;
+#[path = "types/class_handle_nonclass_assign_compile_err.rs"]
+mod class_handle_nonclass_assign_compile_err;

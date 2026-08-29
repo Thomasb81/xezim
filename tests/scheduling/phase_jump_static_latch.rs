@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// UVM 40phasing/06started_ended: the `main_phase` carries a
+/// UVM phase-start/end sequencing: the `main_phase` carries a
 /// `static bit first=1` guard that, on the FIRST run, raises the objection,
 /// `#10`, then sets `first=0` and `phase.jump(uvm_reset_phase::get())`. The
 /// jump re-enters the reset -> ... -> main chain, so `main_phase` runs a
