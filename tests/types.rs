@@ -35,6 +35,8 @@ mod bits_of_signal_in_const_expr;
 mod bits_package_scoped_type_width;
 #[path = "types/callback_typedef_static.rs"]
 mod callback_typedef_static;
+#[path = "types/cast_class_member_enum_range.rs"]
+mod cast_class_member_enum_range;
 #[path = "types/cast_typeparam.rs"]
 mod cast_typeparam;
 #[path = "types/cast_valparam_typeparam_static.rs"]
