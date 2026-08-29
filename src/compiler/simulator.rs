@@ -66143,6 +66143,15 @@ impl Simulator {
                 }) || self
                     .get_expr_type_name(base)
                     .is_some_and(|t| t == "string")
+                // An ELEMENT of a class-member STRING collection
+                // (`h.q[idx]`, `this.q[i]`) is a string too. The base is a
+                // `MemberAccess` or two-segment ident (`h.q`), which is not
+                // an `Ident` and has no composed signal name in
+                // `string_signals`; only the class registration knows it is
+                // a string collection. Without this, UVM's visitor
+                // queues-of-strings (`node.get_name()` accumulated into `q[$]`)
+                // printed as garbage packed integers instead of text.
+                || self.class_member_is_string(base)
             }
             ExprKind::MemberAccess { expr: base, member } => {
                 // A `this.<prop>` / `obj.<prop>` access where the property is
@@ -66313,6 +66322,17 @@ impl Simulator {
                 }
                 (self.this_stack.last().copied().flatten(), name.clone())
             }
+            // `obj.prop` parsed as a two-segment dotted id (§4c). Same
+            // resolution as the MemberAccess arm above, but the parser
+            // collapses `h.q` into one HierarchicalIdentifier (`[h, q]`)
+            // when there are no selects. Without this, a STRING member
+            // (including a string collection, for `%s` diagnostics, and the
+            // element-index case in expr_is_string_valued) reached from
+            // module scope via `h.q` was invisible to string_classification.
+            ExprKind::Ident(hier) if hier.path.len() == 2 => {
+                let h = self.peek_local_handle(&hier.path[0].name.name);
+                (h, hier.path[1].name.name.clone())
+            }
             _ => return false,
         };
         let handle = match handle_opt {
@@ -66348,6 +66368,14 @@ impl Simulator {
             if let Some(v) = m.get(name) {
                 return v.to_u64().map(|h| h as usize);
             }
+        }
+        // A module-scope class-handle declaration (`holder h;` in a `module`,
+        // assigned `h = new()` inside an initial block) lives in the signal
+        // TABLE, not the legacy `signals` map — mirror `eval_ident_handle`'s
+        // fallback so `h.q[idx]` string-classification can resolve the handle
+        // from program scope too, not just inside a method.
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return self.signal_table[id].to_u64().map(|h| h as usize);
         }
         // Fallback to the signal map (initial/always-block locals).
         self.signals.get(name).and_then(|v| v.to_u64().map(|h| h as usize))
