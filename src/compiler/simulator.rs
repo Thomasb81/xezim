@@ -20304,6 +20304,111 @@ impl Simulator {
         if collapsed > 0 && std::env::var("XEZIM_DEBUG").is_ok() {
             eprintln!("[NET-COLLAPSE] {} identity port nets collapsed", collapsed);
         }
+        // XEZIM_BUF_COLLAPSE=1 (opt-in): collapse GENERAL whole-net identity
+        // continuous assigns (`assign y = x;` — the std-cell BUF fabric on
+        // gate-level SoCs; 5,939 of 25,850 CAs on the C906). Same mechanism
+        // as the port collapse above: re-point the lhs NAME at the rhs id
+        // before anything bakes ids, and the connect drops as a self-copy in
+        // build_comb_entries. Beyond deleting the entry evals, clock-buffer
+        // chains merge onto their root, shrinking edge sensitivity fan-out.
+        // Opt-in because it removes the one-delta propagation step the
+        // buffer otherwise adds (the same transform the reference's
+        // optimizer applies), and a runtime force on the buffered name now
+        // reaches the shared net. Skipped entirely under SDF (a collapsed
+        // net would lose its annotated delay).
+        if std::env::var("XEZIM_BUF_COLLAPSE").map(|v| v == "1").unwrap_or(false)
+            && self.sdf_delays.is_empty()
+        {
+            let mut buf_collapsed = 0usize;
+            for _ in 0..8 {
+                let mut changed = false;
+                for ca in &self.module.continuous_assigns {
+                    if ca.delay != 0 {
+                        continue;
+                    }
+                    let (ExprKind::Ident(lh), ExprKind::Ident(rh)) =
+                        (&ca.lhs.kind, &ca.rhs.kind)
+                    else {
+                        continue;
+                    };
+                    if !lh.path.iter().all(|s| s.selects.is_empty())
+                        || !rh.path.iter().all(|s| s.selects.is_empty())
+                    {
+                        continue;
+                    }
+                    let ln = Self::resolve_hier_name_static(lh, &self.module);
+                    let rn = Self::resolve_hier_name_static(rh, &self.module);
+                    let (Some(&lid), Some(&rid)) = (
+                        self.signal_name_to_id.get(ln.as_str()),
+                        self.signal_name_to_id.get(rn.as_str()),
+                    ) else {
+                        continue;
+                    };
+                    if lid == rid
+                        || self.signal_widths[lid] != self.signal_widths[rid]
+                        || self.signal_real[lid] != self.signal_real[rid]
+                        || self.module.events.contains(ln.as_str())
+                        || self.module.events.contains(rn.as_str())
+                        || ca_driver_counts.get(ln.as_str()).copied().unwrap_or(0) != 1
+                    {
+                        continue;
+                    }
+                    self.signal_name_to_id.insert(ln.as_str().into(), rid);
+                    self.collapsed_port_children.insert(ln);
+                    buf_collapsed += 1;
+                    changed = true;
+                }
+                if !changed {
+                    break;
+                }
+            }
+            if buf_collapsed > 0 {
+                eprintln!("[BUF-COLLAPSE] {} identity buffer nets collapsed", buf_collapsed);
+            }
+        }
+        // Census for the buffer-net collapse experiment: how many WHOLE-NET
+        // identity continuous assigns (`assign y = x;`, equal widths, single
+        // driver) remain after the port collapse above — the std-cell BUF
+        // fabric class on gate-level SoCs.
+        if std::env::var("XEZIM_BUF_CENSUS").is_ok() {
+            let mut total_ca = 0usize;
+            let mut identity = 0usize;
+            let mut identity_single = 0usize;
+            for ca in &self.module.continuous_assigns {
+                total_ca += 1;
+                if ca.delay != 0 {
+                    continue;
+                }
+                let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&ca.lhs.kind, &ca.rhs.kind)
+                else {
+                    continue;
+                };
+                if !lh.path.iter().all(|s| s.selects.is_empty())
+                    || !rh.path.iter().all(|s| s.selects.is_empty())
+                {
+                    continue;
+                }
+                let ln = Self::resolve_hier_name_static(lh, &self.module);
+                let rn = Self::resolve_hier_name_static(rh, &self.module);
+                let (Some(&lid), Some(&rid)) = (
+                    self.signal_name_to_id.get(ln.as_str()),
+                    self.signal_name_to_id.get(rn.as_str()),
+                ) else {
+                    continue;
+                };
+                if lid == rid || self.signal_widths[lid] != self.signal_widths[rid] {
+                    continue;
+                }
+                identity += 1;
+                if ca_driver_counts.get(ln.as_str()).copied().unwrap_or(0) == 1 {
+                    identity_single += 1;
+                }
+            }
+            eprintln!(
+                "[BUF-CENSUS] cont_assigns={} identity={} identity_single_driver={}",
+                total_ca, identity, identity_single
+            );
+        }
     }
 
     fn compile_edge_blocks(&mut self) {
