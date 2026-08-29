@@ -100,7 +100,7 @@ What's left for the user:
   dominate short runs; `--cache` (experimental warm-start design cache) and
   `--artifact-compression` help repeated runs of an unchanged design.
 - `--report-stats[=json]` prints an end-of-run footer for dashboards.
-- `--threads` defaults to 1; the engine parallelizes internally where safe.
+- There is no user-facing thread knob; the engine parallelizes internally where safe.
 
 ## Debugging a misbehaving simulation
 

@@ -61,7 +61,6 @@ fn run_in_process(src: &str) -> Option<String> {
         None,
         &[],
         &[],
-        1,
         None,
         &[],
         0,

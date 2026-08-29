@@ -163,8 +163,6 @@ fn print_usage() {
     eprintln!("  -timescale <unit>/<prec>     spelled as other simulators spell it. Same rule:");
     eprintln!("                     it is a DEFAULT for design elements with no timescale");
     eprintln!("                     directive, and never overrides an explicit one.");
-    eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
-    eprintln!("                   n>=2 offloads stdout writes to a background thread.");
     eprintln!("  --report-stats[=json]  Print an end-of-run statistics footer on stderr");
     eprintln!("                   (human text; '=json' emits one JSON line instead). Off by");
     eprintln!("                   default. XEZIM_REPORT_STATS=1|json enables it too; the");
@@ -1456,7 +1454,6 @@ fn run_main() -> i32 {
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
-    let mut threads: usize = 1;
     let mut emit_hypergraph: Option<String> = None;
     let mut load_partition: Option<String> = None;
     let mut write_profile: Option<String> = None;
@@ -1956,13 +1953,9 @@ fn run_main() -> i32 {
                 dump_merged_sv = Some(arg["--dump-merged-sv=".len()..].to_string());
             }
             "--threads" => {
+                // Removed. Consume the count so it isn't taken for a source file.
                 i += 1;
-                if i < args.len() {
-                    threads = args[i].parse().unwrap_or(1).max(1);
-                }
-            }
-            _ if arg.starts_with("--threads=") => {
-                threads = arg["--threads=".len()..].parse().unwrap_or(1).max(1);
+                eprintln!("Warning: --threads has been removed (ignored)");
             }
             "--report-stats" => {
                 report_stats_cli = Some(report::ReportMode::Human);
@@ -2364,7 +2357,6 @@ suppressed but the explicit SDF annotation still applies."
                         sim.fst_file = fst_file.clone();
                         sim.fst_scopes = fst_scopes.clone();
                         sim.set_plusargs(&plusargs);
-                        sim.set_threads(threads);
                         // Pass the full CLI invocation (binary name +
                         // all args + plusargs) so vpi_get_vlog_info
                         // can hand the same argv back to UVM.
@@ -2801,7 +2793,6 @@ suppressed but the explicit SDF annotation still applies."
         sdf_select,
         &defines,
         &plusargs,
-        threads,
         xtrace_file.as_deref(),
         &xtrace_scopes,
         xtrace_from_ns,
