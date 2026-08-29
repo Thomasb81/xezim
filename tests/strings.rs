@@ -15,6 +15,8 @@
 mod assoc_in_always_ff_and_string_element_methods;
 #[path = "strings/call_time_defaults_and_string_queries.rs"]
 mod call_time_defaults_and_string_queries;
+#[path = "strings/class_member_string_queue_element_via_path.rs"]
+mod class_member_string_queue_element_via_path;
 #[path = "strings/display_only_always.rs"]
 mod display_only_always;
 #[path = "strings/dpi_integration_tests.rs"]
