@@ -3539,6 +3539,14 @@ pub struct Simulator {
     /// maturity): these commit in the target slot's NBA region, after that
     /// slot's Active reads.
     delayed_nba: Vec<(u64, usize, Value)>,
+    /// NBA writes into PACKED-ARENA cells (issue #147). A packed cell has no
+    /// `signal_table` slot, so it cannot ride `nba_fast` (apply indexes the
+    /// per-signal tables) — and committing immediately gave NBAs into big
+    /// RAMs blocking semantics: a same-timestep reader in another edge block
+    /// saw the new value a delta early. (eid, value plane, xz plane); tiny —
+    /// entries exist only between an edge exec and the same tick's NBA
+    /// region. Last-write-wins by linear scan.
+    packed_nba: Vec<(usize, u64, u64)>,
     /// §29 per-instance UDP runtime state, indexed by `CombItem::Udp{idx}`.
     udp_runtime: Vec<UdpRuntime>,
     /// True when the design contains any UDP instance — forces the serial
@@ -7619,6 +7627,7 @@ impl Simulator {
             sdf_delays: Vec::new(),
             delayed_updates: Vec::new(),
             delayed_nba: Vec::new(),
+            packed_nba: Vec::new(),
             udp_runtime: Vec::new(),
             has_udp: false,
             module,
@@ -23984,10 +23993,12 @@ impl Simulator {
                         // branch-to-self on the 4004 committed pc+2 (issue
                         // #142; every sibling arm already had this guard).
                         if is_packed_id(eid) {
+                            // Issue #147: queue, do not commit — an NBA into
+                            // a packed RAM must mature in the NBA region like
+                            // any other, or a same-timestep reader in another
+                            // edge block sees it a delta early.
                             let (bv, bx) = val.raw_bits();
-                            if self.packed.set_raw(eid, bv, bx) {
-                                self.table_modified = true;
-                            }
+                            self.queue_packed_nba(eid, bv, bx);
                         } else if let Some(i) = self.nba_fast_index.get(eid) {
                             self.nba_fast[i].value = val;
                         } else if self.signal_table[eid] != val {
@@ -24041,6 +24052,34 @@ impl Simulator {
                         let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
                         let w = high - low + 1;
                         let val = self.vm_regs[*val_reg as usize].resize(w);
+                        if is_packed_id(eid) {
+                            // Issue #147: no signal_widths/table slot for an
+                            // arena id (the indexing below would panic).
+                            // Compose the range into the PENDING queued value
+                            // when one exists, else the cell, then queue.
+                            let (mut cv, mut cx) = match self
+                                .packed_nba
+                                .iter()
+                                .find(|(i, _, _)| *i == eid)
+                            {
+                                Some(&(_, v, x)) => (v, x),
+                                None => {
+                                    let (v, x, _) = self.packed.raw(eid);
+                                    (v, x)
+                                }
+                            };
+                            let cell_w = self.packed.width(eid);
+                            let high_eff = high.min(cell_w.saturating_sub(1));
+                            let (sv, sx) = val.raw_bits();
+                            for bit in low..=high_eff {
+                                let sbit = bit - low;
+                                let m = 1u64 << bit;
+                                if (sv >> sbit) & 1 != 0 { cv |= m } else { cv &= !m }
+                                if (sx >> sbit) & 1 != 0 { cx |= m } else { cx &= !m }
+                            }
+                            self.queue_packed_nba(eid, cv, cx);
+                            continue;
+                        }
                         let sig_w = self.signal_widths[eid];
                         let high_eff = high.min(sig_w.saturating_sub(1));
 
@@ -24122,6 +24161,25 @@ impl Simulator {
                         let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
                         let w = high - low + 1;
                         let val = self.vm_regs[*val_reg as usize].resize(w);
+                        if is_packed_id(eid) {
+                            // Blocking splice into a packed cell — immediate,
+                            // like assign_value's packed path; the per-signal
+                            // indexing below would panic on the arena id.
+                            let (mut cv, mut cx, _) = self.packed.raw(eid);
+                            let cell_w = self.packed.width(eid);
+                            let high_eff = high.min(cell_w.saturating_sub(1));
+                            let (sv, sx) = val.raw_bits();
+                            for bit in low..=high_eff {
+                                let sbit = bit - low;
+                                let m = 1u64 << bit;
+                                if (sv >> sbit) & 1 != 0 { cv |= m } else { cv &= !m }
+                                if (sx >> sbit) & 1 != 0 { cx |= m } else { cx &= !m }
+                            }
+                            if self.packed.set_raw(eid, cv, cx) {
+                                self.table_modified = true;
+                            }
+                            continue;
+                        }
                         let sig_w = self.signal_widths[eid];
                         let high_eff = high.min(sig_w.saturating_sub(1));
 
@@ -31623,6 +31681,7 @@ impl Simulator {
                 // §15.5.2: a bare `->>` (deferred trigger) must flush with the
                 // NBA region even when no NBA DATA is queued.
                 || !self.pending_nba_triggers.is_empty()
+                || !self.packed_nba.is_empty()
                 || !self.pending_nba_instance_triggers.is_empty()
                 || self.delayed_nba_due()
             {
@@ -31831,6 +31890,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+                || !self.packed_nba.is_empty()
             || !self.pending_nba_instance_triggers.is_empty()
             || self.delayed_nba_due()
         {
@@ -34040,6 +34100,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+                || !self.packed_nba.is_empty()
             || !self.pending_nba_instance_triggers.is_empty()
             || self.delayed_nba_due()
         {
@@ -38745,6 +38806,22 @@ impl Simulator {
 
     fn apply_nba_inner(&mut self) {
 
+        // Packed-arena NBAs (issue #147): commit queued cell writes in the
+        // NBA region. Mirrors the old immediate write's observable effects
+        // (set_raw + table_modified) — packed cells have no signal slot, so
+        // no dirty/edge bookkeeping applies.
+        if !self.packed_nba.is_empty() {
+            let entries = std::mem::take(&mut self.packed_nba);
+            for (eid, v, x) in &entries {
+                if self.packed.set_raw(*eid, *v, *x) {
+                    self.table_modified = true;
+                }
+            }
+            let mut reuse = entries;
+            reuse.clear();
+            self.packed_nba = reuse;
+        }
+
         // §4.9.4: commit matured future-time NBAs first — they were scheduled
         // in an earlier slot, so they precede this slot's freshly queued NBAs.
         if !self.delayed_nba.is_empty() {
@@ -38985,7 +39062,32 @@ impl Simulator {
     }
 
     #[inline]
+    /// Queue an NBA into a packed-arena cell: §10.4.2 last-write-wins against
+    /// the pending entry first, then eval-time elision against the cell.
+    fn queue_packed_nba(&mut self, eid: usize, v: u64, x: u64) {
+        if let Some(e) = self.packed_nba.iter_mut().find(|(i, _, _)| *i == eid) {
+            e.1 = v;
+            e.2 = x;
+        } else {
+            let (cv, cx, _) = self.packed.raw(eid);
+            if cv != v || cx != x {
+                self.packed_nba.push((eid, v, x));
+            } else {
+                self.prof_nba_elided += 1;
+            }
+        }
+    }
+
     fn apply_nba_entry(&mut self, entry: NbaFast) {
+        // Defensive landing for a packed-arena id: the per-signal table
+        // indexing below cannot take one (it would index far out of bounds).
+        if is_packed_id(entry.signal_id) {
+            let (v, x) = entry.value.raw_bits();
+            if self.packed.set_raw(entry.signal_id, v, x) {
+                self.table_modified = true;
+            }
+            return;
+        }
         let id = entry.signal_id;
         let signed = self.signal_signed[id];
         // §10.7: fit the queued value to the destination type (real / 2-state /
@@ -51191,6 +51293,13 @@ impl Simulator {
                                 let idx = idx_val.to_i64().unwrap_or(0);
                                 if idx >= lo && idx <= hi {
                                     let eid = first_id + (idx - lo) as usize;
+                                    // Packed-arena cell: no signal_table slot
+                                    // (found by the #147 race test's AST-path
+                                    // `$display("%h", mem[5])` — the clone
+                                    // below panicked on the arena id).
+                                    if is_packed_id(eid) {
+                                        return self.packed.read(eid);
+                                    }
                                     let mut v = self.signal_table[eid].clone();
                                     if self.signal_signed[eid] {
                                         v.is_signed = true;
@@ -59946,6 +60055,7 @@ impl Simulator {
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
             // region even when no NBA DATA is queued.
             || !self.pending_nba_triggers.is_empty()
+                || !self.packed_nba.is_empty()
             || !self.pending_nba_instance_triggers.is_empty()
         {
                             self.apply_nba();
@@ -69110,6 +69220,18 @@ impl Simulator {
     /// compare, `write_sig!` (which respects `forced_signals`), dirty mark.
     #[inline]
     fn fast_signal_write_id(&mut self, id: usize, val: &Value) -> bool {
+        // Packed-arena cell: no per-signal table slots (the indexing below
+        // panics on the arena id — found by the issue #147 write/read-race
+        // test's plain `mem[5] = v` init). A whole-element blocking write
+        // commits immediately, like assign_value's packed range splice.
+        if is_packed_id(id) {
+            let w = self.packed.width(id);
+            let (v, x) = val.resize(w).raw_bits();
+            if self.packed.set_raw(id, v, x) {
+                self.table_modified = true;
+            }
+            return true;
+        }
         let width = self.signal_widths[id];
         let mut resized = val.resize(width);
         // §6.11.1/§10.7: a 2-state destination drops X/Z on every write.
