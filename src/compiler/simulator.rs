@@ -12170,23 +12170,53 @@ impl Simulator {
         // from each declaring class's `static_assoc_key_types` so a
         // `static T map[string]` gets string storage (hashing the bare name
         // as NUMERIC would corrupt foreach()/first()/next()).
-        let static_cols: Vec<(String, bool, u32, bool)> = self
-            .module
-            .classes
-            .values()
-            .flat_map(|cd| {
-                cd.static_collections
-                    .iter()
-                    .map(move |(name, is_assoc, width)| {
-                        let is_str = cd
-                            .static_assoc_key_types
-                            .get(name)
-                            .map(|kt| kt == "string")
-                            .unwrap_or(false);
-                        (name.clone(), *is_assoc, *width, is_str)
-                    })
-            })
-            .collect();
+        // A static-collection bare name declared by MORE THAN ONE class must be
+        // stored per DECLARING class (§8.9) — compute that set up front.
+        let mut colliding_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut name_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for cd in self.module.classes.values() {
+            let mut seen: Vec<&str> = Vec::new();
+            for (nm, _, _) in &cd.static_collections {
+                if !seen.contains(&nm.as_str()) {
+                    *name_counts.entry(nm.as_str()).or_insert(0) += 1;
+                    seen.push(nm.as_str());
+                }
+            }
+        }
+        for (nm, c) in name_counts {
+            if c >= 2 {
+                colliding_names.insert(nm.to_string());
+            }
+        }
+        let mut static_cols: Vec<(String, bool, u32, bool)> = Vec::new();
+        for cd in self.module.classes.values() {
+            for (name, is_assoc, width) in &cd.static_collections {
+                let is_str = cd
+                    .static_assoc_key_types
+                    .get(name)
+                    .map(|kt| kt == "string")
+                    .unwrap_or(false);
+                // A static collection name declared by MORE THAN ONE class
+                // (e.g. the four sibling `uvm_cmdline_*` classes each
+                // declaring `static … settings[$]`) must be stored per
+                // DECLARING class so the classes don't share one cell (§8.9).
+                // A uniquely-declared name keeps the bare store the rest of
+                // the runtime relies on.
+                let keyed = colliding_names.contains(name.as_str());
+                static_cols.push((
+                    if keyed {
+                        format!("{}::{}", cd.name, name)
+                    } else {
+                        name.clone()
+                    },
+                    *is_assoc,
+                    *width,
+                    is_str,
+                ));
+            }
+        }
         for (name, is_assoc, width, is_str) in static_cols {
             if is_assoc {
                 self.module.associative_arrays
@@ -68801,6 +68831,27 @@ impl Simulator {
                     );
                 }
             }
+            // §8.9: a 2-segment path `[Class, member]` where the leading
+            // segment is a PLAIN (non-typedef) CLASS name and the member is a
+            // STATIC collection whose bare name COLLIDES across classes.
+            // Such collisions are stored per DECLARING class
+            // (`{DeclClass}::{member}`), so a module-scope read like
+            // `A.settings.size()` / `A.settings[k]` must resolve to that
+            // per-class key, not collapse to the bare `settings` (which would
+            // hit whichever sibling stored under the bare name).
+            if hier.path[0].selects.is_empty()
+                && self.module.classes.contains_key(&hier.path[0].name.name)
+            {
+                let cls = hier.path[0].name.name.clone();
+                let member = &hier.path[1].name.name;
+                if self.member_is_static_coll(&cls, member) {
+                    if let Some(key) = self.static_prop_key(&cls, member) {
+                        if key.contains('#') || self.static_coll_name_collides(member) {
+                            return key;
+                        }
+                    }
+                }
+            }
         }
 
         // Multi-segment suffix fallback: for paths like "uut.picorv32_core.cpu_state",
@@ -87769,13 +87820,14 @@ impl Simulator {
                     && cd.static_collections.iter().any(|(n, _, _)| n == name)
                 {
                     if let Some(key) = self.static_prop_key(&ctx, name) {
-                        // ONLY rewrite for a parameterized class with an
-                        // active specialization (key carries `#spec`). For a
-                        // non-parameterized class the key is just
-                        // `Class::prop` — identical storage to the bare name
-                        // used by the many access paths we do NOT touch here,
-                        // so rewriting would split storage and break them.
-                        if key.contains('#') {
+                        // Rewrite storage to the per-DECLARING-class key ONLY
+                        // when the bare name collides across classes (§8.9) or
+                        // the class is parameterized (`#spec`). A statically
+                        // unique collection name keeps the bare store the rest
+                        // of the runtime uses; rewriting it would split
+                        // storage and break the many bare-name accessors
+                        // (including the UVM phase machinery).
+                        if key.contains('#') || self.static_coll_name_collides(name) {
                             return key;
                         }
                     }
@@ -89552,6 +89604,26 @@ impl Simulator {
                 cur = cd.extends.as_deref();
             } else {
                 break;
+            }
+        }
+        false
+    }
+
+    /// Does MORE THAN ONE class declare a static collection with the bare
+    /// name `member`? When two sibling/unrelated classes declare a same-named
+    /// static queue/assoc member (§8.9), the materialisation and every bare
+    /// accessor would otherwise share ONE cell and collide. Such collisions
+    /// must be keyed per DECLARING class (`{Class}::{member}`); a static
+    /// collection name declared by EXACTLY ONE class keeps the bare-name
+    /// storage that the rest of the runtime relies on.
+    fn static_coll_name_collides(&self, member: &str) -> bool {
+        let mut n = 0usize;
+        for cd in self.module.classes.values() {
+            if cd.static_collections.iter().any(|(nm, _, _)| nm == member) {
+                n += 1;
+                if n >= 2 {
+                    return true;
+                }
             }
         }
         false
