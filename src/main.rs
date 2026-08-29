@@ -1225,7 +1225,12 @@ fn strip_duplicate_unit_subroutines(
 /// the merged file rebuilds standalone, with no -v/-y flags. Whole files are
 /// appended (a cell library groups related primitives); if one also defines a
 /// name the primary sources already define, the re-compile will say so.
-fn append_adopted_libs_to_merged(merged_out: &str) {
+fn append_adopted_libs_to_merged(
+    merged_out: &str,
+    primary_texts: &[String],
+    primary_labels: &[String],
+    kept: Option<&[usize]>,
+) {
     let adopted = xezim::adopted_lib_files();
     if adopted.is_empty() {
         return;
@@ -1234,6 +1239,13 @@ fn append_adopted_libs_to_merged(merged_out: &str) {
     let mut nfiles = 0usize;
     let mut nmods = 0usize;
     let mut nstripped = 0usize;
+    // References made INSIDE the adopted library texts. The `-s <top>` file
+    // closure is lexical over the PRIMARY sources only, so a primary file
+    // whose module is instantiated solely from a library file was dropped
+    // from the merged output — the dump then contained the instantiation but
+    // not the definition and did not re-run standalone. Collect the library
+    // refs here and re-add such primaries below.
+    let mut lib_refs: Vec<String> = Vec::new();
     // Seed from the primary sources already in the file, so a library copy of
     // a task the design itself defines is suppressed too.
     let mut seen_subs: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1270,6 +1282,10 @@ fn append_adopted_libs_to_merged(merged_out: &str) {
         };
         nfiles += 1;
         nmods += mods.len();
+        {
+            let (_decl, refs, _bind) = scan_units_and_refs(&text);
+            lib_refs.extend(refs);
+        }
         let (text, nstrip) = strip_duplicate_unit_subroutines(&text, &mut seen_subs);
         nstripped += nstrip;
         extra.push_str(&format!(
@@ -1285,6 +1301,58 @@ fn append_adopted_libs_to_merged(merged_out: &str) {
     }
     if nfiles == 0 {
         return;
+    }
+    // Re-add primary files the `-s` closure dropped but the adopted library
+    // text references (transitively: a re-added primary may itself pull in
+    // further dropped primaries). Mirrors elaboration order — a name declared
+    // by a primary resolves there before any library fallback.
+    if let Some(kept) = kept {
+        let scanned: Vec<_> = primary_texts.iter().map(|t| scan_units_and_refs(t)).collect();
+        let mut owner: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (fi, (declared, _, _)) in scanned.iter().enumerate() {
+            for name in declared {
+                owner.entry(name.as_str()).or_insert(fi);
+            }
+        }
+        let mut included = vec![false; primary_texts.len()];
+        for &fi in kept {
+            if fi < included.len() {
+                included[fi] = true;
+            }
+        }
+        let mut queue = lib_refs;
+        let mut added: Vec<usize> = Vec::new();
+        while let Some(name) = queue.pop() {
+            if let Some(&fi) = owner.get(name.as_str()) {
+                if !included[fi] {
+                    included[fi] = true;
+                    added.push(fi);
+                    queue.extend(scanned[fi].1.iter().cloned());
+                }
+            }
+        }
+        added.sort_unstable();
+        for fi in &added {
+            let (text, nstrip) =
+                strip_duplicate_unit_subroutines(&primary_texts[*fi], &mut seen_subs);
+            nstripped += nstrip;
+            extra.push_str(&format!(
+                "
+// ===== primary file re-added: {} (referenced only from an adopted library) =====
+",
+                primary_labels[*fi]
+            ));
+            extra.push_str(&text);
+            if !extra.ends_with('\n') {
+                extra.push('\n');
+            }
+        }
+        if !added.is_empty() {
+            println!(
+                "Re-added {} primary file(s) referenced only from adopted libraries",
+                added.len()
+            );
+        }
     }
     if let Err(e) = std::fs::OpenOptions::new()
         .append(true)
@@ -2474,6 +2542,7 @@ suppressed but the explicit SDF annotation still applies."
     // re-runnable repro for parse/elaboration debugging. Blank lines left by
     // the preprocessor are kept so line numbers inside each section still
     // match the per-file diagnostics.
+    let mut merged_kept: Option<Vec<usize>> = None;
     if let Some(ref merged_out) = dump_merged_sv {
         // With `-s <top>`, keep only the files needed to elaborate that top —
         // the whole point of the flag is cutting a 125-file build down to a
@@ -2494,6 +2563,9 @@ suppressed but the explicit SDF annotation still applies."
             None => (0..preprocessed_sources.len()).collect(),
         };
         let pruned = keep.len() < preprocessed_sources.len();
+        if pruned {
+            merged_kept = Some(keep.clone());
+        }
         let mut out = String::new();
         out.push_str(&format!(
             "// Merged preprocessed sources — xezim {} ({} file(s))\n\
@@ -2716,7 +2788,12 @@ suppressed but the explicit SDF annotation still applies."
                     xezim::compiler::elaborate::iprof_dump();
                 }
                 if let Some(ref mo) = dump_merged_sv {
-                    append_adopted_libs_to_merged(mo);
+                    append_adopted_libs_to_merged(
+                        mo,
+                        &preprocessed_sources,
+                        &file_labels,
+                        merged_kept.as_deref(),
+                    );
                 }
                 print_design_summary(&_defs, &elab);
                 print_resource_usage(compile_wall_start);
@@ -2809,7 +2886,12 @@ suppressed but the explicit SDF annotation still applies."
         Ok(sim) => {
             println!("------------------------------");
             if let Some(ref mo) = dump_merged_sv {
-                append_adopted_libs_to_merged(mo);
+                append_adopted_libs_to_merged(
+                    mo,
+                    &preprocessed_sources,
+                    &file_labels,
+                    merged_kept.as_deref(),
+                );
             }
             println!("Simulation finished at time {}", sim.time);
             {

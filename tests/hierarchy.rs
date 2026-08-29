@@ -25,6 +25,8 @@ mod bind_in_module;
 mod bind_path_through_library_module;
 #[path = "hierarchy/bind_through_nested_part_select.rs"]
 mod bind_through_nested_part_select;
+#[path = "hierarchy/dump_merged_sv_adopted_primary.rs"]
+mod dump_merged_sv_adopted_primary;
 #[path = "hierarchy/dump_merged_sv_library_dedup.rs"]
 mod dump_merged_sv_library_dedup;
 #[path = "hierarchy/port_net_driven_from_inside.rs"]
