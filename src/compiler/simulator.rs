@@ -2498,7 +2498,7 @@ struct ProcessContext {
     // + the `resolve_hier_name` early return), each invocation's data lives
     // under a distinct key. Stack of frames pushed/popped in sync with
     // `push_queue_frame`/`pop_and_restore_queue_frame`.
-    local_dyn: Vec<HashMap<String, String>>,
+    local_dyn: Vec<Vec<(String, String)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3125,10 +3125,16 @@ pub struct Simulator {
     /// AVIP run). Class/typedef tables are elaboration-static, and per-handle
     /// type bindings are applied AFTER the cached raw lookup, so both maps
     /// are sound to memoize for the life of the run.
-    prop_raw_ty_cache: std::cell::RefCell<HashMap<(String, String), Option<String>>>,
-    typedef_target_cache:
-        std::cell::RefCell<HashMap<(String, String), Option<crate::ast::types::DataType>>>,
+    prop_raw_ty_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
+    typedef_target_cache: std::cell::RefCell<
+        HashMap<String, HashMap<String, Option<crate::ast::types::DataType>>>,
+    >,
     collection_dim_cache: std::cell::RefCell<HashMap<String, bool>>,
+    /// Sticky: set the first time a `<base>.` frame marker is created (an
+    /// unpacked-struct formal binding, or a struct-return variable via
+    /// `unpacked_struct_leaf_keys`); gates `frame_leaf_key_of`'s per-eval
+    /// probe.
+    any_struct_formal_markers: bool,
     /// Flattened names currently under an active `force` (§10.6) or
     /// procedural continuous `assign` (§10.6.1) whose storage lives only
     /// in the runtime `signals` map (no compact signal-table id). Mirrors
@@ -3739,7 +3745,7 @@ pub struct Simulator {
     /// Per-call-frame rename map for local dynamic arrays/queues/assoc
     /// locals (bare name -> process-unique storage key). See
     /// `ProcessContext::local_dyn`.
-    local_dyn: Vec<HashMap<String, String>>,
+    local_dyn: Vec<Vec<(String, String)>>,
     /// Monotonic counter backing the process-unique keys in `local_dyn`.
     next_dyn_id: u64,
     /// Built-in mailboxes (handle -> queue of values)
@@ -4098,6 +4104,12 @@ pub struct Simulator {
     comb_tpl_fns: Vec<Option<(super::aot::AotTplFn, u32, u32)>>,
     #[cfg(feature = "jit")]
     comb_tpl_map_blob: Vec<u32>,
+    /// Template-mode native EDGE-block fns, same layout as `comb_tpl_fns`.
+    /// Checked before `jit_fns` in the edge fast path.
+    #[cfg(feature = "jit")]
+    edge_tpl_fns: Vec<Option<(super::aot::AotTplFn, u32, u32)>>,
+    #[cfg(feature = "jit")]
+    edge_tpl_map_blob: Vec<u32>,
     /// Consecutive X/Z-bail strikes per entry (retires the fn past a limit).
     #[cfg(feature = "jit")]
     comb_jit_strikes: Vec<u8>,
@@ -7532,6 +7544,7 @@ impl Simulator {
             prop_raw_ty_cache: std::cell::RefCell::new(HashMap::default()),
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
+            any_struct_formal_markers: false,
             forced_names: HashSet::default(),
             static_fn_ret: HashMap::default(),
             active_force_exprs: Vec::new(),
@@ -7771,6 +7784,10 @@ impl Simulator {
             comb_jit_fns: Vec::new(),
             #[cfg(feature = "jit")]
             comb_tpl_fns: Vec::new(),
+            #[cfg(feature = "jit")]
+            edge_tpl_fns: Vec::new(),
+            #[cfg(feature = "jit")]
+            edge_tpl_map_blob: Vec::new(),
             #[cfg(feature = "jit")]
             comb_tpl_map_blob: Vec::new(),
             #[cfg(feature = "jit")]
@@ -20649,9 +20666,86 @@ impl Simulator {
                         #[cfg(feature = "jit")]
                         if std::env::var("XEZIM_AOT").map(|v| v == "1").unwrap_or(false) {
                             let verbose = std::env::var("XEZIM_JIT_VERBOSE").is_ok();
+                            let templated = std::env::var("XEZIM_AOT_TEMPLATE")
+                                .map(|v| v == "1")
+                                .unwrap_or(false);
+                            self.edge_tpl_fns = vec![None; self.compiled_edge_blocks.len()];
+                            if templated {
+                                // Mirror of the comb templated branch: one
+                                // body per canonical shape, per-block signal
+                                // maps host-side. Edge blocks were the last
+                                // per-block-baked crate (37MB / ~308s rustc
+                                // on the C910 SoC).
+                                let items: Vec<(usize, Vec<super::bytecode::Insn>, u32)> = self
+                                    .compiled_edge_blocks
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(idx, b)| {
+                                        let cb = b.as_ref()?;
+                                        if !block_jit_safe[idx] {
+                                            return None;
+                                        }
+                                        Some((idx, cb.instructions.clone(), cb.num_regs))
+                                    })
+                                    .collect();
+                                let built = super::aot::gen_templated_blocks(
+                                    &items,
+                                    &self.signal_widths,
+                                    &self.signal_signed,
+                                );
+                                if verbose {
+                                    eprintln!(
+                                        "[AOT-TEMPLATE] edge blocks={} templates={} ({:.1}x fewer bodies)",
+                                        built.n_blocks,
+                                        built.n_templates,
+                                        built.n_blocks as f64 / built.n_templates.max(1) as f64
+                                    );
+                                }
+                                if !built.fns.is_empty() {
+                                    let src = super::aot::module_source_named(
+                                        &built.fns,
+                                        &built.tpl_names,
+                                    );
+                                    let planes = (
+                                        self.signal_inline_bits.as_ptr() as u64,
+                                        self.signal_inline_bits.len() as u32,
+                                    );
+                                    if let Some(lib) =
+                                        super::aot::compile_and_load(&src, verbose, planes)
+                                    {
+                                        let mut n = 0usize;
+                                        if let Some(api) = lib.api() {
+                                            for (idx, tpl_pos, map) in &built.blocks {
+                                                let ptr = api(*tpl_pos);
+                                                if ptr.is_null() {
+                                                    continue;
+                                                }
+                                                let f: super::aot::AotTplFn =
+                                                    unsafe { std::mem::transmute(ptr) };
+                                                let off = self.edge_tpl_map_blob.len() as u32;
+                                                self.edge_tpl_map_blob.extend_from_slice(map);
+                                                self.edge_tpl_fns[*idx] =
+                                                    Some((f, off, map.len() as u32));
+                                                n += 1;
+                                            }
+                                        }
+                                        std::mem::forget(lib);
+                                        if verbose {
+                                            eprintln!(
+                                                "[AOT] edge blocks compiled {}/{} (templated)",
+                                                n,
+                                                self.compiled_edge_blocks.len()
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             let mut names: Vec<(usize, String)> = Vec::new();
                             let mut fns_src: Vec<String> = Vec::new();
                             for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
+                                if templated {
+                                    break;
+                                }
                                 let Some(cb) = cb_opt else { continue };
                                 if !block_jit_safe[idx] {
                                     continue;
@@ -20724,7 +20818,12 @@ impl Simulator {
                                     continue;
                                 }
                                 // Slot already filled by the AOT branch above.
-                                if self.jit_fns[idx].is_some() {
+                                #[cfg(feature = "jit")]
+                                let tpl_filled =
+                                    self.edge_tpl_fns.get(idx).is_some_and(|t| t.is_some());
+                                #[cfg(not(feature = "jit"))]
+                                let tpl_filled = false;
+                                if self.jit_fns[idx].is_some() || tpl_filled {
                                     jit_count += 1;
                                     continue;
                                 }
@@ -22595,6 +22694,28 @@ impl Simulator {
             } else {
                 Some(scope.clone())
             };
+        }
+        // Templated AOT slot first (same rc protocol as the JitFn path:
+        // 0 = done, 1 = transient X/Z bail — interpreter runs this firing,
+        // slot stays armed — >=2 = permanent, disarm).
+        #[cfg(feature = "jit")]
+        if let Some(Some((tf, toff, _tlen))) = self.edge_tpl_fns.get(block_idx).copied() {
+            let map = unsafe { self.edge_tpl_map_blob.as_ptr().add(toff as usize) };
+            let self_ptr: *mut u8 = self as *mut Self as *mut u8;
+            match unsafe { tf(self_ptr, map) } {
+                0 => {
+                    self.prof_insns_executed += self
+                        .edge_block_insn_len
+                        .get(block_idx)
+                        .copied()
+                        .unwrap_or(0) as u64;
+                    return true;
+                }
+                1 => {}
+                _ => {
+                    self.edge_tpl_fns[block_idx] = None;
+                }
+            }
         }
         // Fast path: if we JIT-compiled this block, call the native fn
         // directly. Zero-cost when the jit feature is off (jit_fns stays
@@ -73060,21 +73181,24 @@ impl Simulator {
         // Class/typedef tables are elaboration-static and the result depends
         // only on the lexical class context + name — memoize. The miss case
         // otherwise linear-scans every class's typedefs on EVERY call.
-        let ctx_key = match self.class_context_stack.last() {
-            Some(Some(c)) => c.clone(),
-            _ => String::new(),
+        let ctx_key: &str = match self.class_context_stack.last() {
+            Some(Some(c)) => c.as_str(),
+            _ => "",
         };
         if let Some(hit) = self
             .typedef_target_cache
             .borrow()
-            .get(&(ctx_key.clone(), nm.to_string()))
+            .get(ctx_key)
+            .and_then(|m| m.get(nm))
         {
             return hit.clone();
         }
         let out = self.lookup_typedef_target_uncached(nm);
         self.typedef_target_cache
             .borrow_mut()
-            .insert((ctx_key, nm.to_string()), out.clone());
+            .entry(ctx_key.to_string())
+            .or_default()
+            .insert(nm.to_string(), out.clone());
         out
     }
     fn lookup_typedef_target_uncached(&self, nm: &str) -> Option<crate::ast::types::DataType> {
@@ -74914,7 +75038,7 @@ impl Simulator {
     /// Push a fresh queue-local save frame on entry to a subroutine.
     fn push_queue_frame(&mut self) {
         self.queue_frame_saves.push(HashMap::default());
-        self.local_dyn.push(HashMap::default());
+        self.local_dyn.push(Vec::new());
     }
 
     /// Look up the process-unique storage key for a local dynamic-array /
@@ -74930,13 +75054,13 @@ impl Simulator {
         // FORMAL records an identity mapping (see `bind_queue_param`) so it
         // shadows a caller's same-named renamed local.
         for frame in self.local_dyn.iter().rev() {
-            // Most frames declare no local dyn arrays — skip them before
-            // hashing `bare` (this probe runs for every bare-name resolve).
-            if frame.is_empty() {
-                continue;
-            }
-            if let Some(uq) = frame.get(bare) {
-                return Some(uq.as_str());
+            // Frames hold at most a handful of entries — a reverse linear
+            // scan (later declaration shadows earlier) beats hashing `bare`
+            // once per frame (this probe runs for every bare-name resolve).
+            for (k, uq) in frame.iter().rev() {
+                if k == bare {
+                    return Some(uq.as_str());
+                }
             }
         }
         None
@@ -74963,16 +75087,23 @@ impl Simulator {
             return bare.to_string();
         }
         // Clean up a prior same-frame declaration so the new one starts fresh.
-        if let Some(old) = self.local_dyn.last().and_then(|f| f.get(bare)).cloned() {
+        if let Some(old) = self
+            .local_dyn
+            .last()
+            .and_then(|f| f.iter().find(|(k, _)| k == bare))
+            .map(|(_, v)| v.clone())
+        {
             self.cleanup_dyn_storage(&old);
         }
         let id = self.next_dyn_id;
         self.next_dyn_id += 1;
         let key = format!("@{}#{}", bare, id);
-        self.local_dyn
-            .last_mut()
-            .unwrap()
-            .insert(bare.to_string(), key.clone());
+        let frame = self.local_dyn.last_mut().unwrap();
+        if let Some(slot) = frame.iter_mut().find(|(k, _)| k == bare) {
+            slot.1 = key.clone();
+        } else {
+            frame.push((bare.to_string(), key.clone()));
+        }
         key
     }
 
@@ -83946,7 +84077,11 @@ impl Simulator {
         // (`cleanup_dyn_storage` skips bare names, so this is never torn down
         // here — the existing writeback/snapshot machinery owns the formal.)
         if let Some(frame) = self.local_dyn.last_mut() {
-            frame.insert(pname.to_string(), pname.to_string());
+            if let Some(slot) = frame.iter_mut().find(|(k, _)| k == pname) {
+                slot.1 = pname.to_string();
+            } else {
+                frame.push((pname.to_string(), pname.to_string()));
+            }
         }
         Some(cname)
     }
@@ -85823,6 +85958,20 @@ impl Simulator {
         // untouched (return false → the normal value assign still runs).
         if let ExprKind::Ident(h) = &lvalue.kind {
             if h.path.len() == 1 {
+                // Cheap RHS shape gate FIRST: the strict resolver only ever
+                // accepts Ident/MemberAccess/Index (or Null clearing a
+                // binding). Everything else — literals, arithmetic, calls —
+                // can skip the class-hierarchy classification walk below,
+                // which otherwise ran for EVERY plain-name assignment.
+                if !matches!(
+                    &rvalue.kind,
+                    ExprKind::Null
+                        | ExprKind::Ident(_)
+                        | ExprKind::MemberAccess { .. }
+                        | ExprKind::Index { .. }
+                ) {
+                    return false;
+                }
                 let lname = h.path[0].name.name.clone();
                 // A bare name that is a PROPERTY of `this` stores per-instance
                 // (each uvm_resource's `val` must keep its own interface);
@@ -86602,19 +86751,18 @@ impl Simulator {
             return None;
         }
         let this_h = self.this_stack.last().copied().flatten()?;
-        let cn = self
+        let cn: &str = self
             .heap
             .get(this_h)
             .and_then(|o| o.as_ref())
-            .map(|i| i.class_name.clone())?;
+            .map(|i| i.class_name.as_str())?;
         // An ELEMENT key (`va[0]`) checks the BASE property name but binds
         // per element (§25.10).
         let prop_base = root.split('[').next().unwrap_or(root);
-        let has = self
-            .module
-            .classes
-            .get(&cn)
-            .is_some_and(|c| c.virtual_iface_properties.contains_key(prop_base));
+        let has = self.module.classes.get(cn).is_some_and(|c| {
+            !c.virtual_iface_properties.is_empty()
+                && c.virtual_iface_properties.contains_key(prop_base)
+        });
         if !has {
             return None;
         }
@@ -86856,6 +87004,7 @@ impl Simulator {
         if let Some(b) = self
             .local_iface_aliases
             .last()
+            .filter(|frame| !frame.is_empty())
             .and_then(|frame| frame.get(name))
         {
             return Some(b.clone());
@@ -87290,9 +87439,14 @@ impl Simulator {
     /// a typedef carrying a dynamic/queue unpacked dimension (§6.20.3)?
     fn prop_bound_collection(&self, handle: usize, class_name: &str, member: &str) -> bool {
         let raw_ty: Option<String> = {
-            let key = (class_name.to_string(), member.to_string());
-            if let Some(hit) = self.prop_raw_ty_cache.borrow().get(&key) {
-                hit.clone()
+            let hit = self
+                .prop_raw_ty_cache
+                .borrow()
+                .get(class_name)
+                .and_then(|m| m.get(member))
+                .cloned();
+            if let Some(hit) = hit {
+                hit
             } else {
                 let mut cur = Some(class_name.to_string());
                 let computed: Option<String> = loop {
@@ -87309,7 +87463,9 @@ impl Simulator {
                 };
                 self.prop_raw_ty_cache
                     .borrow_mut()
-                    .insert(key, computed.clone());
+                    .entry(class_name.to_string())
+                    .or_default()
+                    .insert(member.to_string(), computed.clone());
                 computed
             }
         };
@@ -91910,6 +92066,7 @@ impl Simulator {
         // The `<base>.` marker (no real leaf can be named that) lets the read
         // and write paths reject an unrelated expression with one hash lookup,
         // before flattening a name.
+        self.any_struct_formal_markers = true;
         let mut keys: Vec<(String, u32, bool)> = vec![(format!("{}.", base_name), 0, false)];
         keys.extend(out.into_iter().map(|(k, _, w, r)| (k, w, r)));
         keys
@@ -92068,6 +92225,7 @@ impl Simulator {
         // top level left `p.inner.x` and `p.arr[i]` unbound in the callee.
         let mut leaves = Vec::new();
         self.unpacked_struct_leaves(port_name, arg, &su, 0, &mut leaves);
+        self.any_struct_formal_markers = true;
         locals.insert(format!("{}.", port_name), Value::zero(1));
         // A positional STRUCT pattern literal actual (`'{a, b}`) can't be read
         // member-by-member (`.a` on a pattern returns x), so bind its evaluated
@@ -92124,6 +92282,14 @@ impl Simulator {
     /// nested or indexed member is not a single `base.member` pair: matching
     /// only that shape left every deeper leaf reading module scope.
     fn frame_leaf_key_of(&mut self, e: &Expression) -> Option<String> {
+        // Sticky gate: `<base>.` markers are created in exactly two places —
+        // `bind_unpacked_struct_formal` and `unpacked_struct_leaf_keys` (the
+        // struct-return path) — and both set this flag. A design that never
+        // touches unpacked-struct formals/returns (all of UVM) skips the
+        // root walk and marker-string allocation on every member/index eval.
+        if !self.any_struct_formal_markers {
+            return None;
+        }
         if !matches!(
             e.kind,
             ExprKind::MemberAccess { .. } | ExprKind::Index { .. }
@@ -92355,7 +92521,11 @@ impl Simulator {
         // Identity mapping so the formal shadows any enclosing renamed local
         // of the same name (see `bind_queue_param`).
         if let Some(frame) = self.local_dyn.last_mut() {
-            frame.insert(param.clone(), param.clone());
+            if let Some(slot) = frame.iter_mut().find(|(k, _)| *k == param) {
+                slot.1 = param.clone();
+            } else {
+                frame.push((param.clone(), param.clone()));
+            }
         }
         Some((param, caller, prior))
     }
@@ -103939,7 +104109,11 @@ impl Simulator {
                         // §6.18/§6.20.3: typedef'd / type-param-bound
                         // formal — dims live on the type (see the same
                         // resolution in exec_function_call).
-                        if std::env::var("XEZIM_BD_DBG").is_ok() {
+                        // getenv is NOT free: this probe ran once per
+                        // typedef'd formal of every method call (0.85% of an
+                        // AVIP run). Latch it once.
+                        static BD_DBG: OnceLock<bool> = OnceLock::new();
+                        if *BD_DBG.get_or_init(|| std::env::var("XEZIM_BD_DBG").is_ok()) {
                             if let crate::ast::types::DataType::TypeReference { name, .. } =
                                 &port.data_type
                             {
