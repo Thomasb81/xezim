@@ -49,8 +49,11 @@ Facts worth knowing before the first run:
   Prefer `--timescale 1ns/1ps` (a default, never an override) or the named
   `--module-timescale mod=unit/prec` form; `--dump-timescales` prints every
   module's resolution.
-- **Exit codes**: `$fatal` is always nonzero; add `--error-exit` to make any
-  `$error` fail the run — essential in scripts and CI.
+- **Exit codes**: parse errors, elaboration errors, `$fatal`, and a `-s`
+  naming a nonexistent top all exit nonzero; add `--error-exit` to make any
+  `$error` fail the run too — essential in scripts and CI. A generated
+  corpus with known-stale top names can restore auto-detection with
+  `--no-strict-top`.
 - **Reserved-word caveat**: `cell` and `wreal` are keywords in this lexer
   even where IEEE 1800 would allow them as identifiers.
 - `-l/--log file` redirects *everything*, including DPI/VPI C-side prints.

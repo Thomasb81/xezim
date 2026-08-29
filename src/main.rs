@@ -118,7 +118,10 @@ fn print_usage() {
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
     eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
-    eprintln!("  --strict-top     Error out if -s names a module that does not exist");
+    eprintln!("  --strict-top     Error out if -s names a module that does not exist (default)");
+    eprintln!("  --no-strict-top  Warn and auto-detect the design root instead when -s names");
+    eprintln!("                   a module that does not exist (for generated corpora whose");
+    eprintln!("                   recorded top names are known-stale)");
     eprintln!("  --error-exit     Exit nonzero if any $error was reported ($fatal always does)
   --relax-implicit-static  Accept `int x = ...;` inside a static subroutine
                    (§6.21) with a warning instead of an error. Also enabled by
@@ -706,6 +709,9 @@ fn process_command_file(
                 }
                 "--strict-top" => {
                     xezim::set_strict_top(true);
+                }
+                "--no-strict-top" => {
+                    xezim::set_strict_top(false);
                 }
                 _ if t.starts_with("+define+") => {
                     push_plus_define(t, defines);
@@ -1692,6 +1698,9 @@ fn run_main() -> i32 {
             // the exit status catches a typo'd or stale top.
             "--strict-top" => {
                 xezim::set_strict_top(true);
+            }
+            "--no-strict-top" => {
+                xezim::set_strict_top(false);
             }
             "-V" => {
                 print_version();

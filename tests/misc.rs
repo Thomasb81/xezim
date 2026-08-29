@@ -333,3 +333,5 @@ mod udn_resolver_compiled;
 mod pure_fn_loops_compiled;
 #[path = "misc/packed_mem_nba_region.rs"]
 mod packed_mem_nba_region;
+#[path = "misc/exit_codes.rs"]
+mod exit_codes;
