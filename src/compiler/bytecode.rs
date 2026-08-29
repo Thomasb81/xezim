@@ -3059,6 +3059,23 @@ impl<'a> BytecodeCompiler<'a> {
                     expr_ok(lvalue, bound, me, false) && expr_ok(rvalue, bound, me, ext)
                 }
                 StatementKind::Return(e) => e.as_ref().is_none_or(|e| expr_ok(e, bound, me, ext)),
+                StatementKind::While { condition, body } => {
+                    // Same gap as the Foreach arm (issue #146): no arm meant
+                    // `_ => false`, branding a pure while-loop helper
+                    // (popcnt-style) impure.
+                    expr_ok(condition, bound, me, ext)
+                        && stmt_ok(body, &mut bound.clone(), me, ext)
+                }
+                StatementKind::DoWhile { body, condition } => {
+                    expr_ok(condition, bound, me, ext)
+                        && stmt_ok(body, &mut bound.clone(), me, ext)
+                }
+                StatementKind::Repeat { count, body } => {
+                    expr_ok(count, bound, me, ext)
+                        && stmt_ok(body, &mut bound.clone(), me, ext)
+                }
+                // §12.7: control flow only; reads nothing, writes nothing.
+                StatementKind::Break | StatementKind::Continue => true,
                 StatementKind::Foreach { array, vars, body } => {
                     // §12.7.3: the loop variables are implicitly DECLARED by
                     // the foreach for its body — without this arm they read
@@ -5044,19 +5061,36 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         let raw = Self::hier_raw_name(hier);
+        let dense = |name: &str| -> bool {
+            // An ARRAY OF COLLECTIONS registers its outer shape in `arrays`
+            // but each element is its own queue/dynamic/associative container
+            // (`int a[2][u8_t]`), living OUTSIDE the dense cells this name
+            // resolves to — a compiled LoadArrayElem read the fake backing
+            // and `mem[h][addr]` compared against garbage the moment the
+            // enclosing loop compiled (found when the new do-while arm
+            // compiled a block the old bail had kept on the AST path). The
+            // element registrations are keyed `name[lo]`, so probe that.
+            let Some((lo, _, _)) = self.arrays.get(name) else {
+                return false;
+            };
+            let elem = format!("{}[{}]", name, lo);
+            !(self.assoc_arrays.is_some_and(|m| m.contains_key(&elem))
+                || self.queue_vars.is_some_and(|m| m.contains(&elem))
+                || self.dynamic_arrays.is_some_and(|m| m.contains(&elem)))
+        };
         if self.arrays.contains_key(&raw) {
-            return Some(raw);
+            return dense(&raw).then_some(raw);
         }
         if let Some(scope) = &self.scope_hint {
             let qualified = format!("{}.{}", scope, raw);
             if self.arrays.contains_key(&qualified) {
-                return Some(qualified);
+                return dense(&qualified).then_some(qualified);
             }
         }
         if hier.path.len() == 1 {
             let leaf = &hier.path[0].name.name;
             if self.arrays.contains_key(leaf) {
-                return Some(leaf.clone());
+                return dense(leaf).then_some(leaf.clone());
             }
         }
         None
@@ -6345,6 +6379,78 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("Continue_outside_loop");
                     self.emit_fallback(stmt)
                 }
+            }
+            StatementKind::While { condition, body } => {
+                // §12.7.2: a while is a For with no init and no step. The
+                // condition is re-evaluated at the loop head each iteration;
+                // `continue` jumps back to the head, `break` to the end.
+                // Compiling it (rather than bailing "Stmt_While") is what
+                // lets a pure while-loop helper inline (issue #146) — the
+                // purity arm alone would only have moved the bail here.
+                self.loop_break_patches.push(Vec::new());
+                self.loop_continue_patches.push(Vec::new());
+                let top = self.insns.len() as u32;
+                let Some(c) = self.compile_expr(condition, 0) else {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    self.bail("While_cond");
+                    return false;
+                };
+                let br = self.insns.len();
+                self.emit(Insn::BranchIfFalse(c, 0));
+                if !self.compile_stmt(body) {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    return false;
+                }
+                self.emit(Insn::Jump(top));
+                let end = self.insns.len() as u32;
+                if let Insn::BranchIfFalse(reg, _) = self.insns[br] {
+                    self.insns[br] = Insn::BranchIfFalse(reg, end);
+                }
+                if let Some(patches) = self.loop_continue_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(top);
+                    }
+                }
+                if let Some(patches) = self.loop_break_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(end);
+                    }
+                }
+                true
+            }
+            StatementKind::DoWhile { body, condition } => {
+                // Body first, then the condition; `continue` re-tests the
+                // condition (§12.7.4), `break` exits.
+                self.loop_break_patches.push(Vec::new());
+                self.loop_continue_patches.push(Vec::new());
+                let top = self.insns.len() as u32;
+                if !self.compile_stmt(body) {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    return false;
+                }
+                let cond_at = self.insns.len() as u32;
+                let Some(c) = self.compile_expr(condition, 0) else {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    self.bail("DoWhile_cond");
+                    return false;
+                };
+                self.emit(Insn::BranchUnlessZero(c, top));
+                let end = self.insns.len() as u32;
+                if let Some(patches) = self.loop_continue_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(cond_at);
+                    }
+                }
+                if let Some(patches) = self.loop_break_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(end);
+                    }
+                }
+                true
             }
             StatementKind::Foreach { array, vars, body } => {
                 // §12.7.3 foreach over a register-bound local array — an
