@@ -42593,6 +42593,18 @@ impl Simulator {
         } else {
             self.settle_combinatorial_inner();
         }
+        // §10.6.2 again, AFTER the settle body: a tracked operand that is
+        // itself comb-driven (a bound module forcing from `host.wire`, where
+        // the wire copies a child port) only bumps its epoch DURING the
+        // settle above — the entry refresh at the top of this call ran too
+        // early to see it, and if no later settle comes the override went
+        // stale. The forced targets are override-registered, so this write
+        // cannot re-trigger the very entries that fed it (no oscillation);
+        // a target with comb readers marks them dirty and the caller's
+        // next settle picks that up as usual.
+        if !self.active_force_exprs.is_empty() {
+            self.refresh_active_forces();
+        }
     }
 
     /// Level-BSP combinational settle (XEZIM_BSP_SETTLE=1). Reaches the SAME
