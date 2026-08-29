@@ -328,3 +328,5 @@ mod field_init_call_singletons;
 mod data_decl_param_spec_type_arg;
 #[path = "types/type_id_create_applies_override.rs"]
 mod type_id_create_applies_override;
+#[path = "types/queue_literal_function_return.rs"]
+mod queue_literal_function_return;

@@ -3932,6 +3932,16 @@ pub struct Simulator {
     /// return arrays/queues). The caller's assign-from-call consumes it with
     /// a whole-collection copy; a plain value return leaves it None.
     pending_ret_collection: Option<String>,
+    /// Innermost-first stack of whether each currently-active function returns
+    /// a collECTION (queue / unsized dynamic array). The `Return` statement
+    /// reads the top to decide whether a LITERAL return value (`return '{...}`,
+    /// which is not an Ident, so the bare-name snapshot path can't fire) must be
+    /// materialised into a whole-collection snapshot and handed to the caller
+    /// through `pending_ret_collection`. Without it a function whose `return`
+    /// expression is a queue literal collapsed to a single-element scalar
+    /// value when the caller assigned it to a queue variable — an EMPTY `'{}`
+    /// returned size 1 (one phantom element), and `'{a,b}` kept only `a`.
+    fn_ret_collection_stack: Vec<bool>,
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,
@@ -7815,6 +7825,7 @@ impl Simulator {
             }),
             timescale_scope_override: None,
             pending_ret_collection: None,
+            fn_ret_collection_stack: Vec::new(),
             current_scope: String::new(),
             m_block_scope: String::new(),
             edge_block_scope_id: Vec::new(),
@@ -61895,6 +61906,29 @@ impl Simulator {
                             }
                         }
                     }
+                    // §13.4: `return '{}`/`return '{...}` — a whole-collECTION
+                    // LITERAL returned directly (queue / unsized dynamic array).
+                    // The Ident path above cannot fire (there is no storage
+                    // name), and `eval_expr` alone collapses a queue to a
+                    // single packed scalar, so the caller's `q = f()` lost
+                    // elements — an empty `'{}` came back as size 1 (one
+                    // phantom element), and `'{a,b}` kept only `a`. When the
+                    // CURRENT function returns a collection, snapshot the
+                    // literal's elements into the reserved ret name and hand
+                    // it through `pending_ret_collection` exactly as the
+                    // Ident-return path does.
+                    if self.pending_ret_collection.is_none()
+                        && self.fn_ret_collection_stack.last().copied().unwrap_or(false)
+                    {
+                        if matches!(
+                            e.kind,
+                            ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
+                        ) {
+                            const RET_SNAP: &str = "__xz_ret_coll__";
+                            self.populate_queue_from_init(RET_SNAP, e);
+                            self.pending_ret_collection = Some(RET_SNAP.to_string());
+                        }
+                    }
                     self.return_value = Some(self.eval_expr(e));
                     // §25.9: a returned VIRTUAL INTERFACE carries only a
                     // sentinel value; record the instance it is bound to so
@@ -95664,6 +95698,12 @@ impl Simulator {
         // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
         // body; recursion keeps the stack ordered.
         self.func_call_stack.push(fd.name.name.name.clone());
+        // §13.4: record whether THIS function returns a collection (queue /
+        // unsized dynamic array) so a later `return '{...}` literal can be
+        // snapshotted as a whole collection (same snapshot the Ident-return
+        // path uses). Popped with `func_call_stack` below; nesting stays
+        // ordered.
+        self.fn_ret_collection_stack.push(self.fn_returns_collection(&fd.return_type));
         self.pkg_scope_stack.push(pkg_scope);
         let m_fn_leaf = fd.name.name.name.rsplit('.').next().unwrap_or(&fd.name.name.name).to_string();
         let saved_m_scope_fn = std::mem::replace(&mut self.m_scope_stack, vec![m_fn_leaf]);
@@ -95685,6 +95725,7 @@ impl Simulator {
         self.sync_static_locals();
         self.local_iface_aliases.pop();
         self.func_call_stack.pop();
+        self.fn_ret_collection_stack.pop();
         self.pkg_scope_stack.pop();
         self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
@@ -95994,6 +96035,42 @@ impl Simulator {
             }
         }
         dt.clone()
+    }
+
+    /// §13.4: does a function's DECLARED return type denote a collECTION
+    /// (queue, or unsized dynamic array)? A queue-typed typedef (e.g.
+    /// `typedef chandle data_q[$];` for the uvm_regex_cache's
+    /// `optional_data` = `DATA_T[$]`) is a `TypeReference` whose queue-ness
+    /// lives in `typedef_unpacked_dims`, not the return `DataType` itself.
+    /// Used by the `Return` handler to route a queue-LITERAL return value
+    /// (`return '{a,b}` / `return '{}`) through the whole-collection snapshot
+    /// so the caller's `q = f()` copies the full queue (an empty `'{}` must
+    /// yield size 0, and `'{a,b}` must keep both elements).
+    fn fn_returns_collection(&self, dt: &DataType) -> bool {
+        use crate::ast::types::{DataType, UnpackedDimension};
+        let mut cur = dt.clone();
+        for _ in 0..8 {
+            match &cur {
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } if dimensions.is_empty() => {
+                    let tn = &name.name.name;
+                    if let Some(dims) = self.module.typedef_unpacked_dims.get(tn) {
+                        return matches!(
+                            dims.first(),
+                            Some(UnpackedDimension::Queue { .. })
+                                | Some(UnpackedDimension::Unsized(_))
+                        );
+                    }
+                    match self.module.typedef_types.get(tn) {
+                        Some(inner) => cur = inner.clone(),
+                        _ => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// Does some `name.<rest>` key exist in `packed_signal_elem_widths`?
@@ -106837,6 +106914,18 @@ impl Simulator {
                     self.ctor_class_stack.push((handle, cname.clone()));
                 }
                 self.local_iface_aliases.push(iface_alias_frame);
+                // §13.4: a FUNCTION method may return a collection (queue /
+                // unsized dynamic array) via a LITERAL (`return '{}` /
+                // `return '{...}`). The free-function `Return` handler routes
+                // those through `fn_ret_collection_stack`, so push the flag
+                // here too — otherwise the shared `StatementKind::Return`
+                // lost the whole collection (an empty `'{}` came back as a
+                // one-element queue when assigned to a queue variable).
+                let method_ret_collection = match &method.kind {
+                    ClassMethodKind::Function(f) => self.fn_returns_collection(&f.return_type),
+                    _ => false,
+                };
+                self.fn_ret_collection_stack.push(method_ret_collection);
                 // §6.21: open a static-local sync frame so a `static`
                 // local declared in the method body persists across calls.
                 // (Class methods previously never opened one — only free
@@ -106855,6 +106944,7 @@ impl Simulator {
                 // Write back any static locals declared in this body before
                 // the locals frame is dropped.
                 self.sync_static_locals();
+                self.fn_ret_collection_stack.pop();
                 // §23.8: stop leaking this frame's string formal names into
                 // the global set now that the body is done (see
                 // frame_string_signals).
