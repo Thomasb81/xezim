@@ -4447,9 +4447,6 @@ pub struct Simulator {
     vcd_limit: Option<u64>,
     vcd_bytes: u64,
     vcd_limit_hit: bool,
-    /// Worker-thread count. >=2 routes VCD dumps through a
-    /// background writer thread (see vcd_sink::VcdSink).
-    threads: usize,
     /// Persistent workers for XEZIM_DISPATCHER=pdes parallel edge dispatch.
     pdes_worker_pool: Option<ParallelWorkerPool>,
     /// LP-A (core0) scope prefix captured when the multikernel-scope
@@ -4479,7 +4476,7 @@ pub struct Simulator {
     /// only once signals are defined.
     perlp_after: u64,
     /// Buffered stdout sink for $display/$write. Lazily initialized on first
-    /// write so threaded mode can be enabled by `set_threads` beforehand.
+    /// write; runs its own background writer unless XEZIM_DUMP_INLINE=1.
     stdout_sink: Option<super::stdout_sink::StdoutSink>,
     /// XTrace dump state. Independent from VCD — can run alongside.
     /// Set `xtrace_file` to enable. Emits the XTrace v1.0 "minimal" profile:
@@ -7862,7 +7859,6 @@ impl Simulator {
             vcd_limit: None,
             vcd_bytes: 0,
             vcd_limit_hit: false,
-            threads: 1,
             pdes_worker_pool: None,
             perlp_settle_prefix: None,
             perlp_settle: None,
@@ -8221,13 +8217,6 @@ impl Simulator {
                 }
             }
         }
-    }
-
-    /// Configure the worker-thread count. `n >= 2` enables the background
-    /// VCD writer thread; `n == 1` keeps the dump path inline.
-    pub fn set_threads(&mut self, n: usize) {
-        self.threads = n.max(1);
-        self.pdes_worker_pool = None;
     }
 
     /// Reuse the runtime-neutral combinational worklist associated with an
@@ -9321,7 +9310,7 @@ impl Simulator {
 
     /// Whether `$display`/`$write` output is handed to a background writer.
     ///
-    /// Default ON, and deliberately decoupled from `--threads`: writing the log
+    /// Default ON regardless of host parallelism settings: writing the log
     /// is pure I/O, so even a single-threaded simulation benefits from moving
     /// the `write`/`flush` syscalls off the thread that is running the design.
     /// `XEZIM_DUMP_INLINE=1` (the same switch the waveform sinks honour) keeps
@@ -70154,7 +70143,7 @@ impl Simulator {
     }
 
     /// Whether dump writers (VCD / XTrace) offload formatting and I/O
-    /// to a background thread. Decoupled from `--threads`: dump writing is pure
+    /// to a background thread. Always considered: dump writing is pure
     /// I/O and benefits even a single-threaded sim by moving ASCII formatting
     /// and file writes off the simulation thread. Set `XEZIM_DUMP_INLINE=1` to
     /// force inline writing (deterministic debugging, or to avoid the thread).
