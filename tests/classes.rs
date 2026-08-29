@@ -129,6 +129,8 @@ mod ivtest_class_struct_cluster;
 mod localparam_class_not_parameterized;
 #[path = "classes/nonvirtual_dispatch_fscanf_process.rs"]
 mod nonvirtual_dispatch_fscanf_process;
+#[path = "classes/static_member_method_collision.rs"]
+mod static_member_method_collision;
 #[path = "classes/out_of_class_method_shadow.rs"]
 mod out_of_class_method_shadow;
 #[path = "classes/param_typedef_ctor_resolution.rs"]

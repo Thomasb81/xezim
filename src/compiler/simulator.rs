@@ -92760,7 +92760,28 @@ impl Simulator {
                                     .get(handle)
                                     .and_then(|o| o.as_ref())
                                     .map(|i| i.class_name.clone());
-                                if runtime.as_deref() != Some(target.as_str()) {
+                                // §8.9: a STATIC-member receiver (`m_modified`
+                                // of `uvm_report_catcher`) makes `class_of_var`
+                                // resolve the DECLARING class of the static,
+                                // not the member's own VALUE type. Binding a
+                                // NON-virtual method to that declaring class
+                                // (e.g. `uvm_report_catcher::get_severity` — a
+                                // real, non-virtual method that collides with
+                                // `uvm_report_message::get_severity`) dispatches
+                                // the wrong method onto a live object of an
+                                // unrelated type, reading zeroed fields. Only
+                                // honor the declared target when it is the
+                                // runtime object's class or an ANCESTOR of it;
+                                // otherwise the static-type info is bogus and
+                                // the runtime (virtual) dispatch through the
+                                // live handle's class is correct.
+                                let target_on_chain = runtime.as_deref().is_some_and(|rt| {
+                                    target == rt.to_string()
+                                        || self.class_is_a(rt, &target)
+                                });
+                                if target_on_chain
+                                    && runtime.as_deref() != Some(target.as_str())
+                                {
                                     return self.exec_method_in_class_hierarchy(
                                         handle,
                                         &target,
