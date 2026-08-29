@@ -3419,6 +3419,10 @@ pub struct Simulator {
     pub fatal_finish_number: Option<i32>,
     /// Count of `$error` occurrences (see `--error-exit`).
     pub error_count: u64,
+    /// Compile-time diagnostics that must prevent simulation (e.g. an illegal
+    /// §6.18 assignment of a non-class value to a class handle). The CLI and
+    /// library `simulate()` report these and stop; simulation never runs.
+    pub compile_errors: Vec<String>,
     /// Set when the dead-clock watchdog aborted the run (XEZIM_STUCK_CLOCK=abort).
     /// The CLI reports a non-zero exit so CI/regressions fail fast.
     pub stuck_clock_aborted: bool,
@@ -7676,6 +7680,7 @@ impl Simulator {
             saw_fatal: false,
             fatal_finish_number: None,
             error_count: 0,
+            compile_errors: Vec::new(),
             stuck_clock_aborted: false,
             compiled: false,
             monitor: None,
@@ -12999,6 +13004,18 @@ impl Simulator {
         // blocks are consumed into scheduled processes, so clock-edge
         // history accumulates from the first edge.
         self.register_sampled_watches();
+        // §6.18: reject assigning a non-class value (an enum member or integer
+        // literal) to a class-handle variable. The reference elaborator flags
+        // this at compile time; surface a compile error so simulation never
+        // runs. Deliberately conservative and side-effect free (it only reads
+        // declared types and enum-member tables — it must NOT call
+        // resolve_hier_name, which would pre-populate the shared per-AST-node
+        // name cache with process-scope-free resolutions that later corrupt
+        // name resolution at simulation time).
+        self.check_class_handle_assignment_type();
+        if !self.compile_errors.is_empty() {
+            return;
+        }
         let pending_initial = std::mem::take(&mut self.module.pending_initial);
         let initial_blocks = std::mem::take(&mut self.module.initial_blocks);
         // Static/package-global initializers must run before any `initial`
@@ -16073,6 +16090,10 @@ impl Simulator {
     pub fn simulate(&mut self) {
         if !self.compiled {
             self.compile();
+        }
+        // A compile-time failure means simulation must not run at all.
+        if !self.compile_errors.is_empty() {
+            return;
         }
         // Back the big, stable, randomly-accessed arrays with 2 MiB transparent
         // huge pages. On c910 the per-signal arrays span ~1.3 GiB / ~340k 4 KiB
@@ -74947,6 +74968,134 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// §6.18 compile-time assignment type-check: assigning a non-class value
+    /// (an enum member or integer literal) to a class-handle variable is
+    /// illegal — only a class handle, `null`, `this` or `super` may be
+    /// assigned. The reference elaborator rejects this at compile time;
+    /// xezim runs the procedural body at time 0, so without
+    /// this check a `// UVM TEST COMPILE-TIME FAILURE` test would silently
+    /// compile. Record a compile error and stop before simulation.
+    ///
+    /// Deliberately conservative and side-effect free, so it can never alter
+    /// normal simulation:
+    ///   * only fires when the LHS is a bare identifier naming a class-handle
+    ///     variable (a module signal whose declared type is a class, or a block
+    ///     local declared with a class type) AND the RHS is a bare identifier
+    ///     that is a user-declared enum member, or an integer literal;
+    ///   * it reads only declared types and the enum-member tables, and uses
+    ///     the RAW identifier leaf name — it must never call resolve_hier_name,
+    ///     because prepopulating that shared per-AST-node cache with a
+    ///     process-scope-free resolution poisons name resolution later at
+    ///     simulation time (regression: struct-with-class-handle copy).
+    fn check_class_handle_assignment_type(&mut self) {
+        use crate::ast::stmt::StatementKind as SK;
+        use crate::ast::expr::ExprKind as EK;
+
+        // Every declared enum member (all enum typedefs + all package enums).
+        let mut enum_lits: std::collections::HashSet<String> = std::collections::HashSet::default();
+        for members in self.module.enum_members.values() {
+            for (nm, _) in members { enum_lits.insert(nm.clone()); }
+        }
+        for members in self.module.package_enum_members.values() {
+            for nm in members.keys() { enum_lits.insert(nm.clone()); }
+        }
+
+        fn is_class_data_type(dt: &crate::ast::types::DataType, sim: &Simulator) -> bool {
+            let mut cur = dt; let mut depth = 0;
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::default();
+            while let crate::ast::types::DataType::TypeReference { name, .. } = cur {
+                let nm = name.name.name.as_str();
+                if !seen.insert(nm.to_string()) { return false; }
+                if sim.module.classes.contains_key(nm) { return true; }
+                match sim.module.typedef_types.get(nm) {
+                    Some(nxt) => cur = nxt,
+                    None => return sim.module.interfaces.contains(nm),
+                }
+                depth += 1; if depth > 8 { return false; }
+            }
+            false
+        }
+        fn rhs_is_non_class(rv: &crate::ast::expr::Expression, el: &std::collections::HashSet<String>) -> bool {
+            match &rv.kind {
+                EK::Ident(rh) if rh.path.len() == 1 => {
+                    let leaf = rh.path[0].name.name.as_str();
+                    !matches!(leaf, "null" | "this" | "super") && el.contains(leaf)
+                }
+                EK::Number(_) => true,
+                _ => false,
+            }
+        }
+        fn walk(
+            stmt: &crate::ast::stmt::Statement,
+            sim: &Simulator,
+            el: &std::collections::HashSet<String>,
+            locals: &mut std::collections::HashSet<String>,
+            errs: &mut Vec<String>,
+        ) {
+            match &stmt.kind {
+                SK::VarDecl { data_type, declarators, .. } => {
+                    if is_class_data_type(data_type, sim) {
+                        for d in declarators { locals.insert(d.name.name.clone()); }
+                    }
+                }
+                SK::BlockingAssign { lvalue, rvalue }
+                | SK::NonblockingAssign { lvalue, rvalue, .. } => {
+                    let EK::Ident(lhier) = &lvalue.kind else { return; };
+                    // Raw leaf name only — see the method doc: resolve_hier_name
+                    // must not run here. Block-locals and module signals are both
+                    // keyed by their declared (leaf) name.
+                    let name = lhier.path[0].name.name.clone();
+                    let is_class = lhier.path.len() == 1 && lhier.path[0].selects.is_empty()
+                        && (locals.contains(&name)
+                            || sim.module.signals.get(&name).filter(|s|
+                                s.type_name.as_ref().map(|t| sim.module.classes.contains_key(t)).unwrap_or(false)).is_some());
+                    if is_class && rhs_is_non_class(rvalue, el) {
+                        let loc = sim.span_file_line_in(rvalue.span, sim.module.src_file_of_module.get(&sim.module.name).copied())
+                            .unwrap_or_else(|| "<source>".to_string());
+                        errs.push(format!(
+                            "{}: illegal assignment of a non-class value to class handle '{}' (only a class handle or null is allowed)",
+                            loc, name
+                        ));
+                    }
+                }
+                SK::If { then_stmt, else_stmt, .. } => {
+                    let mut in_ = locals.clone(); walk(then_stmt, sim, el, &mut in_, errs);
+                    if let Some(e) = else_stmt { walk(e, sim, el, &mut in_, errs); }
+                }
+                SK::Case { items, .. } => { for it in items { let mut in_ = locals.clone(); walk(&it.stmt, sim, el, &mut in_, errs); } }
+                SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                    let mut in_ = locals.clone(); for st in stmts { walk(st, sim, el, &mut in_, errs); }
+                }
+                SK::For { init, body, .. } => {
+                    let mut in_ = locals.clone();
+                    for i in init {
+                        if let crate::ast::stmt::ForInit::VarDecl { data_type, name, .. } = i {
+                            if is_class_data_type(data_type, sim) { in_.insert(name.name.clone()); }
+                        }
+                    }
+                    walk(body, sim, el, &mut in_, errs);
+                }
+                SK::Foreach { body, .. } | SK::While { body, .. } | SK::DoWhile { body, .. }
+                | SK::Repeat { body, .. } | SK::Forever { body, .. }
+                | SK::TimingControl { stmt: body, .. } | SK::Wait { stmt: body, .. } => {
+                    let mut in_ = locals.clone(); walk(body, sim, el, &mut in_, errs);
+                }
+                _ => {}
+            }
+        }
+
+        let mut errs: Vec<String> = Vec::new();
+        let mut locals: std::collections::HashSet<String> = std::collections::HashSet::default();
+        for ib in &self.module.initial_blocks { walk(&ib.stmt, self, &enum_lits, &mut locals, &mut errs); }
+        for ib in &self.module.static_init_blocks { walk(&ib.stmt, self, &enum_lits, &mut locals, &mut errs); }
+        for ib in &self.module.program_initial_blocks { walk(&ib.stmt, self, &enum_lits, &mut locals, &mut errs); }
+        for ab in &self.module.always_blocks { walk(&ab.stmt, self, &enum_lits, &mut locals, &mut errs); }
+        for fb in &self.module.final_blocks { walk(&fb.stmt, self, &enum_lits, &mut locals, &mut errs); }
+        if !errs.is_empty() {
+            std::mem::swap(&mut self.compile_errors, &mut errs);
+        }
     }
 
     /// True if a TypeReference data type names a class handle (directly, via a

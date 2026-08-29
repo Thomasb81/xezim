@@ -2,7 +2,7 @@
 //! initializes to 0, and enum methods (`first`/`last`/`next`/`prev`/`num`/
 //! `name`) resolve correctly on a local typed with a CLASS TYPE PARAMETER.
 //!
-//! Regression for `10resources/90Mantis/3693setting_enum_by_nameA`:
+//! Regression for a UVM enum-name/from_name test:
 //! `uvm_enum_wrapper#(e_t)::from_name()` builds a `protected static
 //! T map[string]` of `<name, value>` by walking `T e = e.first()`. Two bugs
 //! made every `from_name` / `w_t::map` lookup fail:
