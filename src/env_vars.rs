@@ -26,6 +26,8 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_BSP_SETTLE", "Parallel settle: enable levelized BSP settle algorithm (0/1)"),
     ("XEZIM_BSP_SHADOW", "Parallel settle: shadow-compare BSP settle against the canonical loop"),
     ("XEZIM_BSP_WIDTHS", "Parallel settle: print per-level width/occupancy statistics"),
+    ("XEZIM_BUF_CENSUS", "Census: count whole-net identity continuous assigns (buffer-net collapse experiment)"),
+    ("XEZIM_BUF_COLLAPSE", "Opt-in: collapse whole-net identity continuous assigns (assign y = x) onto their source net; drops one delta step per buffer"),
     ("XEZIM_CACHE_COMPRESSION_LEVEL", "Elab cache: zstd compression level (default 3)"),
     ("XEZIM_CACHE_DIR", "Elab cache: override cache directory (default XDG cache)"),
     ("XEZIM_CACHE_FIT", "Elab cache: print cache-fit decisions per design"),
