@@ -329,3 +329,7 @@ mod array_elem_indexed_part_select_target;
 mod two_state_wide_reduction;
 #[path = "misc/udn_resolver_compiled.rs"]
 mod udn_resolver_compiled;
+#[path = "misc/pure_fn_loops_compiled.rs"]
+mod pure_fn_loops_compiled;
+#[path = "misc/packed_mem_nba_region.rs"]
+mod packed_mem_nba_region;
