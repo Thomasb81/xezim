@@ -3119,6 +3119,16 @@ pub struct Simulator {
     pub signals: SignalMap,
     /// Signals currently under force/release control (LRM §9.3.1).
     forced_signals: HashMap<usize, Value>,
+    /// Memoization for `prop_bound_collection`: (class, member) → resolved
+    /// raw type name (hierarchy walk), and type name → is-collection verdict
+    /// (which otherwise LINEAR-SCANS every class's local typedefs — 5% of an
+    /// AVIP run). Class/typedef tables are elaboration-static, and per-handle
+    /// type bindings are applied AFTER the cached raw lookup, so both maps
+    /// are sound to memoize for the life of the run.
+    prop_raw_ty_cache: std::cell::RefCell<HashMap<(String, String), Option<String>>>,
+    typedef_target_cache:
+        std::cell::RefCell<HashMap<(String, String), Option<crate::ast::types::DataType>>>,
+    collection_dim_cache: std::cell::RefCell<HashMap<String, bool>>,
     /// Flattened names currently under an active `force` (§10.6) or
     /// procedural continuous `assign` (§10.6.1) whose storage lives only
     /// in the runtime `signals` map (no compact signal-table id). Mirrors
@@ -7519,6 +7529,9 @@ impl Simulator {
             real_signals,
             multi_dim_array_names,
             forced_signals: HashMap::default(),
+            prop_raw_ty_cache: std::cell::RefCell::new(HashMap::default()),
+            typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
+            collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
             forced_names: HashSet::default(),
             static_fn_ret: HashMap::default(),
             active_force_exprs: Vec::new(),
@@ -73044,6 +73057,27 @@ impl Simulator {
     /// leak into the module table where the last-elaborated class wins), then
     /// the module-level table, then any class-local typedef table.
     fn lookup_typedef_target(&self, nm: &str) -> Option<crate::ast::types::DataType> {
+        // Class/typedef tables are elaboration-static and the result depends
+        // only on the lexical class context + name — memoize. The miss case
+        // otherwise linear-scans every class's typedefs on EVERY call.
+        let ctx_key = match self.class_context_stack.last() {
+            Some(Some(c)) => c.clone(),
+            _ => String::new(),
+        };
+        if let Some(hit) = self
+            .typedef_target_cache
+            .borrow()
+            .get(&(ctx_key.clone(), nm.to_string()))
+        {
+            return hit.clone();
+        }
+        let out = self.lookup_typedef_target_uncached(nm);
+        self.typedef_target_cache
+            .borrow_mut()
+            .insert((ctx_key, nm.to_string()), out.clone());
+        out
+    }
+    fn lookup_typedef_target_uncached(&self, nm: &str) -> Option<crate::ast::types::DataType> {
 
         if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
             let mut cur = Some(ctx);
@@ -74896,6 +74930,11 @@ impl Simulator {
         // FORMAL records an identity mapping (see `bind_queue_param`) so it
         // shadows a caller's same-named renamed local.
         for frame in self.local_dyn.iter().rev() {
+            // Most frames declare no local dyn arrays — skip them before
+            // hashing `bare` (this probe runs for every bare-name resolve).
+            if frame.is_empty() {
+                continue;
+            }
             if let Some(uq) = frame.get(bare) {
                 return Some(uq.as_str());
             }
@@ -87187,7 +87226,10 @@ impl Simulator {
         if let Some(k) = self.static_fixed_key_for_name(name) {
             return Some(k);
         }
-        if name.contains('#') || name.contains('.') || name.contains('[') {
+        if name
+            .bytes()
+            .any(|b| matches!(b, b'#' | b'.' | b'['))
+        {
             return None;
         }
         // §8.9: inside a STATIC method there is no `this`; the lexical class
@@ -87247,30 +87289,43 @@ impl Simulator {
     /// a property declared with a type parameter that this instance binds to
     /// a typedef carrying a dynamic/queue unpacked dimension (§6.20.3)?
     fn prop_bound_collection(&self, handle: usize, class_name: &str, member: &str) -> bool {
-        let mut cur = Some(class_name.to_string());
-        let raw_ty: Option<String> = loop {
-            let Some(cn) = cur else { break None };
-            match self.module.classes.get(&cn) {
-                Some(cd) => {
-                    if let Some(sig) = cd.properties.get(member) {
-                        break sig.type_name.clone();
+        let raw_ty: Option<String> = {
+            let key = (class_name.to_string(), member.to_string());
+            if let Some(hit) = self.prop_raw_ty_cache.borrow().get(&key) {
+                hit.clone()
+            } else {
+                let mut cur = Some(class_name.to_string());
+                let computed: Option<String> = loop {
+                    let Some(cn) = cur else { break None };
+                    match self.module.classes.get(&cn) {
+                        Some(cd) => {
+                            if let Some(sig) = cd.properties.get(member) {
+                                break sig.type_name.clone();
+                            }
+                            cur = cd.extends.clone();
+                        }
+                        None => break None,
                     }
-                    cur = cd.extends.clone();
-                }
-                None => break None,
+                };
+                self.prop_raw_ty_cache
+                    .borrow_mut()
+                    .insert(key, computed.clone());
+                computed
             }
         };
         let Some(raw) = raw_ty else { return false };
         // A type-param binding resolves first; otherwise the raw name may
         // itself be an array/queue typedef (`my_array_t data;` — the class
         // property elaboration is dim-blind for typedef'd types).
-        let _raw_dbg = raw.clone();
         let concrete = self
             .heap
             .get(handle)
             .and_then(|o| o.as_ref())
             .and_then(|i| i.type_bindings.get(&raw).cloned())
             .unwrap_or(raw);
+        if let Some(&hit) = self.collection_dim_cache.borrow().get(&concrete) {
+            return hit;
+        }
         // A typedef name may itself be a class-LOCAL typedef, which
         // lives in the declaring class's `typedef_unpacked_dims`, NOT the
         // module-level map. Search BOTH: module-level first (package
@@ -87285,15 +87340,19 @@ impl Simulator {
                 )
             })
         };
-        if let Some(dims) = self.module.typedef_unpacked_dims.get(&concrete) {
-            return is_collection_dim(dims);
-        }
-        for cd in self.module.classes.values() {
-            if let Some(dims) = cd.typedef_unpacked_dims.get(&concrete) {
-                return is_collection_dim(dims);
-            }
-        }
-        false
+        let verdict = if let Some(dims) = self.module.typedef_unpacked_dims.get(&concrete) {
+            is_collection_dim(dims)
+        } else {
+            self.module
+                .classes
+                .values()
+                .find_map(|cd| cd.typedef_unpacked_dims.get(&concrete))
+                .is_some_and(|dims| is_collection_dim(dims))
+        };
+        self.collection_dim_cache
+            .borrow_mut()
+            .insert(concrete, verdict);
+        verdict
     }
 
     fn class_assoc_member(&self, class_name: &str, member: &str) -> bool {
