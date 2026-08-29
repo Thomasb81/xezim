@@ -326,3 +326,5 @@ mod signed_unsigned_compare_extension;
 mod field_init_call_singletons;
 #[path = "types/data_decl_param_spec_type_arg.rs"]
 mod data_decl_param_spec_type_arg;
+#[path = "types/type_id_create_applies_override.rs"]
+mod type_id_create_applies_override;
