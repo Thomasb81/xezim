@@ -92916,11 +92916,17 @@ impl Simulator {
                 && path[len - 2].name.name == "type_id"
             {
                 let class_name = path[len - 3].name.name.clone();
-                if let Some(target) = self.resolve_type_id_target_class(&class_name) {
-                    if let Some(class_def) = self.module.classes.get(&target).cloned() {
-                        return self.instantiate_class(&class_def, args);
-                    }
-                }
+                // NOTE: the plain (non-parameterized, non-typedef-alias) form
+                // `C::type_id::create(...)` is deliberately NOT intercepted
+                // here so it falls through to the real UVM factory
+                // (`common_type::create` -> `create_*_by_type`), which applies
+                // type/instance overrides and bumps each override's `used`
+                // counter. A direct `instantiate_class` (the old shortcut)
+                // bypassed the factory entirely, so an override on `C` was
+                // silently ignored and `factory.print()` reported `used 0`.
+                // The MemberAccess-form shortcut above keeps the
+                // parameterized `C#(P)::type_id::create` and type-parameter
+                // receiver (`T::type_id::create`) direct paths.
                 if let Some(DataType::TypeReference { name, type_args, .. }) =
                     self.module.typedef_types.get(&class_name).cloned()
                 {
@@ -93569,7 +93575,31 @@ impl Simulator {
                                         .get(handle)
                                         .and_then(|o| o.as_ref())
                                         .map(|i| i.class_name.clone());
-                                    if runtime.as_deref() != Some(target.as_str()) {
+                                    // §8.20: a non-virtual method binds to the
+                                    // DECLARED type of the receiver. `decl_cls`
+                                    // here can be a STALE value from the flat
+                                    // `var_class_types` map when a same-named
+                                    // local in another scope (e.g. a UVM
+                                    // method's `uvm_factory f`) overwrote the
+                                    // user variable's recorded type (here
+                                    // `uvm_factory` polluted to
+                                    // `uvm_default_report_server`). Binding
+                                    // then dispatches `f.print()` to an
+                                    // unrelated class's `print` (e.g.
+                                    // `uvm_object`), not the object's real
+                                    // method. Only honor the resolved target
+                                    // when it is the runtime object's class or
+                                    // an ANCESTOR of it; otherwise the declared
+                                    // type is bogus and the runtime (virtual)
+                                    // dispatch through the live class is
+                                    // correct.
+                                    let target_on_chain = runtime.as_deref().is_some_and(|rt| {
+                                        target == rt.to_string()
+                                            || self.class_is_a(rt, &target)
+                                    });
+                                    if target_on_chain
+                                        && runtime.as_deref() != Some(target.as_str())
+                                    {
                                         return self.exec_method_in_class_hierarchy(
                                             handle,
                                             &target,
