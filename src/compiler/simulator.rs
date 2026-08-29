@@ -3135,6 +3135,16 @@ pub struct Simulator {
     /// `unpacked_struct_leaf_keys`); gates `frame_leaf_key_of`'s per-eval
     /// probe.
     any_struct_formal_markers: bool,
+    /// Recycled subroutine-frame maps: every call built a fresh
+    /// `HashMap<String, Value>` and dropped it on return — at UVM call rates
+    /// the table alloc/free was pure allocator churn. `clear()` keeps the
+    /// table's capacity, so a pooled frame re-binds formals with zero
+    /// rehashing growth.
+    frame_pool: Vec<HashMap<String, Value>>,
+    /// Lazily-built leaf index over `module.parameters` for the bytecode
+    /// compiler's suffix-match fallback (see `lookup_param_value`). Built
+    /// once — parameters are final before any bytecode compilation runs.
+    param_leaf_index_cell: std::cell::OnceCell<HashMap<String, Vec<String>>>,
     /// Flattened names currently under an active `force` (§10.6) or
     /// procedural continuous `assign` (§10.6.1) whose storage lives only
     /// in the runtime `signals` map (no compact signal-table id). Mirrors
@@ -7545,6 +7555,8 @@ impl Simulator {
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
             any_struct_formal_markers: false,
+            frame_pool: Vec::new(),
+            param_leaf_index_cell: std::cell::OnceCell::new(),
             forced_names: HashSet::default(),
             static_fn_ret: HashMap::default(),
             active_force_exprs: Vec::new(),
@@ -17079,6 +17091,7 @@ impl Simulator {
         compiler.set_tasks(&self.module.tasks);
         compiler.set_functions(&self.module.functions);
         compiler.set_params(&self.module.parameters);
+        compiler.set_param_leaf_idx(self.param_leaf_index());
         compiler.set_cast_widths(&self.cast_widths);
         compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
         compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
@@ -20352,6 +20365,7 @@ impl Simulator {
             compiler.set_tasks(&self.module.tasks);
                 compiler.set_functions(&self.module.functions);
             compiler.set_params(&self.module.parameters);
+            compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
@@ -20437,6 +20451,7 @@ impl Simulator {
                 compiler.set_tasks(&self.module.tasks);
                 compiler.set_functions(&self.module.functions);
                 compiler.set_params(&self.module.parameters);
+                compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
@@ -20469,6 +20484,7 @@ impl Simulator {
                 delay_compiler.set_tasks(&self.module.tasks);
                 delay_compiler.set_functions(&self.module.functions);
                 delay_compiler.set_params(&self.module.parameters);
+                delay_compiler.set_param_leaf_idx(self.param_leaf_index());
                 delay_compiler.set_cast_widths(&self.cast_widths);
                 delay_compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
@@ -24922,6 +24938,7 @@ impl Simulator {
                 );
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
+                compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
@@ -24992,6 +25009,7 @@ impl Simulator {
                 );
                 compiler.set_scope_hint(scope_hint.clone());
                 compiler.set_params(&self.module.parameters);
+                compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
@@ -25690,6 +25708,7 @@ impl Simulator {
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_functions(&self.module.functions);
                     compiler.set_params(&self.module.parameters);
+                    compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
@@ -35311,6 +35330,7 @@ impl Simulator {
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
             compiler.set_params(&self.module.parameters);
+            compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
                 compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
@@ -35534,6 +35554,7 @@ impl Simulator {
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
             compiler.set_params(&self.module.parameters);
+            compiler.set_param_leaf_idx(self.param_leaf_index());
             compiler.set_cast_widths(&self.cast_widths);
             compiler.set_packed_struct_fields(&self.module.packed_struct_fields);
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
@@ -57361,7 +57382,7 @@ impl Simulator {
                                             "{}[{}]",
                                             arr_name, i
                                         )) {
-                                            let mut locals = HashMap::default();
+                                            let mut locals = self.take_pooled_frame();
                                             locals.insert(iter_name.clone(), v.clone());
                                             if let Some(fields) = &struct_fields {
                                                 for (fname, off, w) in fields {
@@ -79283,10 +79304,40 @@ impl Simulator {
             .push((HashMap::default(), HashMap::default()));
     }
 
-    /// Pop a local frame, keeping the type overlay in lockstep.
-    fn pop_local_frame(&mut self) -> Option<HashMap<String, Value>> {
+    /// Pop a local frame, keeping the type overlay in lockstep. The frame
+    /// map is recycled into `frame_pool` (capacity kept, contents cleared);
+    /// use `pop_local_frame_take` when the caller needs the contents.
+    fn pop_local_frame(&mut self) {
+        self.local_type_stack.pop();
+        if let Some(mut f) = self.local_stack.pop() {
+            if self.frame_pool.len() < 64 {
+                f.clear();
+                self.frame_pool.push(f);
+            }
+        }
+    }
+
+    /// Pop a local frame and hand the map to the caller (writeback reads).
+    fn pop_local_frame_take(&mut self) -> Option<HashMap<String, Value>> {
         self.local_type_stack.pop();
         self.local_stack.pop()
+    }
+
+    /// A frame map from the pool (capacity retained) or a fresh one.
+    fn take_pooled_frame(&mut self) -> HashMap<String, Value> {
+        self.frame_pool.pop().unwrap_or_default()
+    }
+
+    /// Leaf-segment index over `module.parameters` (built once).
+    fn param_leaf_index(&self) -> &HashMap<String, Vec<String>> {
+        self.param_leaf_index_cell.get_or_init(|| {
+            let mut idx: HashMap<String, Vec<String>> = HashMap::default();
+            for name in self.module.parameters.keys() {
+                let leaf = name.rsplit('.').next().unwrap_or(name.as_str());
+                idx.entry(leaf.to_string()).or_default().push(name.clone());
+            }
+            idx
+        })
     }
 
     fn class_of_var(&self, vname: &str) -> Option<String> {
@@ -91726,7 +91777,7 @@ impl Simulator {
 
     fn exec_let_call(&mut self, ld: &LetDeclaration, args: &[Expression]) -> Value {
         use crate::ast::module::PortList;
-        let mut locals = HashMap::default();
+        let mut locals = self.take_pooled_frame();
         let mut arg_idx = 0usize;
         match &ld.ports {
             PortList::Ansi(ports) => {
@@ -93169,7 +93220,7 @@ impl Simulator {
 
 
         // Set up local scope with parameters
-        let mut locals = HashMap::default();
+        let mut locals = self.take_pooled_frame();
         self.push_queue_frame();
         // `output`/`inout`/`ref` formals copy back to the caller's actual on
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
@@ -93788,7 +93839,7 @@ impl Simulator {
         self.local_iface_aliases.pop();
         self.continue_flag = c.saved_continue;
         self.sync_static_locals();
-        let locals = self.pop_local_frame().unwrap_or_default();
+        let locals = self.pop_local_frame_take().unwrap_or_default();
         for (port_name, caller_expr) in &c.output_bindings {
             if let Some(val) = locals.get(port_name) {
                 self.assign_value(caller_expr, val);
@@ -94068,7 +94119,7 @@ impl Simulator {
             .map(|name| self.snapshot_formal_metadata(name))
             .collect();
         // Evaluate input args and collect output/ref arg expressions
-        let mut locals = HashMap::default();
+        let mut locals = self.take_pooled_frame();
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
         // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
         // records its interface under the formal's name (cleared otherwise so
@@ -103954,7 +104005,7 @@ impl Simulator {
                     ClassMethodKind::Task(t) => (&t.ports, &t.items),
                     _ => unreachable!("non-Function/Task methods filtered out above"),
                 };
-                let mut locals: HashMap<String, Value> = HashMap::default();
+                let mut locals: HashMap<String, Value> = self.take_pooled_frame();
                 // §13.5.3: reorder named args into formal order and fill any
                 // omitted (`.name()` / positional `,,`) slot from the formal's
                 // default before positional binding below.

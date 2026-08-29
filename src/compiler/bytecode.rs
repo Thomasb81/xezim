@@ -849,6 +849,11 @@ pub struct BytecodeCompiler<'a> {
     /// bytecode compilation can fold module params (e.g. `CARRY_CHAIN`) into
     /// the compile-time widths of `+:` / `-:` range selects.
     params: Option<&'a HashMap<String, Value>>,
+    /// Leaf-segment index over `params` (last dotted segment -> full keys).
+    /// The suffix-match fallback in `lookup_param_value` otherwise scans the
+    /// WHOLE param map with memcmp per entry on every miss — 94% of the
+    /// C910 SoC's 410s compile phase.
+    param_leaf_idx: Option<&'a HashMap<String, Vec<String>>>,
     /// Typedef name -> total width (module + package scope), for local
     /// declarations of typedef'd packed types inside inlined functions.
     typedefs: Option<&'a HashMap<String, u32>>,
@@ -1021,6 +1026,7 @@ impl<'a> BytecodeCompiler<'a> {
             inlining_stack: Vec::new(),
             tasks_inlined: 0,
             params: None,
+            param_leaf_idx: None,
             typedefs: None,
             typedef_elems: None,
             local_var_elem: std::collections::HashMap::new(),
@@ -1375,6 +1381,10 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
         self.params = Some(params);
+    }
+
+    pub fn set_param_leaf_idx(&mut self, idx: &'a HashMap<String, Vec<String>>) {
+        self.param_leaf_idx = Some(idx);
     }
 
     pub fn set_packed_elem_widths(&mut self, w: &'a HashMap<String, u32>) {
@@ -4502,19 +4512,37 @@ impl<'a> BytecodeCompiler<'a> {
         // Suffix-match: bare `CARRY_CHAIN` may be stored as
         // `top.uut.picorv32_core.pcpi_mul.CARRY_CHAIN`. Only accept if a
         // single param key matches — multiple matches are ambiguous.
-        let mut found: Option<&Value> = None;
-        for (name, value) in params {
+        //
+        // Any match in either direction shares the LAST dotted segment with
+        // `raw`, so the leaf index narrows the scan to same-leaf keys.
+        let is_match = |name: &str| -> bool {
             let raw_has_key_suffix = raw.len() >= name.len()
-                && raw.ends_with(name.as_str())
+                && raw.ends_with(name)
                 && (raw.len() == name.len() || raw.as_bytes()[raw.len() - name.len() - 1] == b'.');
             let key_has_raw_suffix = name.len() >= raw.len()
                 && name.ends_with(raw.as_str())
                 && (name.len() == raw.len() || name.as_bytes()[name.len() - raw.len() - 1] == b'.');
-            if raw_has_key_suffix || key_has_raw_suffix {
-                if found.is_some() {
-                    return None;
+            raw_has_key_suffix || key_has_raw_suffix
+        };
+        let mut found: Option<&Value> = None;
+        if let Some(idx) = self.param_leaf_idx {
+            let leaf = raw.rsplit('.').next().unwrap_or(raw.as_str());
+            for name in idx.get(leaf).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if is_match(name) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = params.get(name);
                 }
-                found = Some(value);
+            }
+        } else {
+            for (name, value) in params {
+                if is_match(name) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(value);
+                }
             }
         }
         found.cloned()
