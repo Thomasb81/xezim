@@ -8222,6 +8222,86 @@ impl Simulator {
                 named_count
             );
         }
+        // Per-signal memory accounting (XEZIM_MEM_CENSUS=1). The array cells
+        // are already handled by the packed arena; this measures what is left,
+        // which the reverse-engineering notes rank as the single biggest gap
+        // (memory 59x vs speed 2.6x).
+        //
+        // READ THE NUMBERS AS CAPACITY, NOT RESIDENT MEMORY. The signal-side
+        // vectors are reserved for the FULL pre-arena signal count (35,114,425
+        // on the C906 SoC) but only ~1.56 M entries are ever pushed, so the
+        // tail is untouched pages that never enter RSS: this census totals
+        // 1.5 GB where the process actually resides in ~0.98 GB. Reclaiming
+        // the excess with shrink_to_fit was MEASURED AND REVERTED — it copies
+        // the live prefix, transiently doubling the touched set, and took peak
+        // RSS 981 -> 1021 MB with wall 15.1 -> 16.6 s. Right-sizing the
+        // reservation up front would avoid the address space but buys little
+        // resident memory.
+        if std::env::var("XEZIM_MEM_CENSUS").is_ok() {
+            let n = sim.signal_table.len();
+            let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+            let name_bytes: usize = sim.id_to_name.iter().map(|s| s.len()).sum();
+            let leaf_vec_bytes: usize = sim
+                .leaf_name_to_ids
+                .values()
+                .map(|v| v.capacity() * std::mem::size_of::<usize>() + 24)
+                .sum();
+            let scope_vec_bytes: usize = sim
+                .scope_parents_by_leaf
+                .values()
+                .map(|v| v.capacity() * std::mem::size_of::<Arc<str>>() + 24)
+                .sum();
+            let hm_entry = |entries: usize, k: usize, v: usize| -> usize {
+                // hashbrown: (K,V) plus one control byte, at ~87.5% max load.
+                ((k + v + 1) as f64 * entries as f64 / 0.875) as usize
+            };
+            let rows: Vec<(&str, usize)> = vec![
+                ("signal_table (Value)", sim.signal_table.capacity() * std::mem::size_of::<Value>()),
+                ("id_to_name ptrs", sim.id_to_name.capacity() * std::mem::size_of::<Arc<str>>()),
+                ("id_to_name STRING BYTES", name_bytes),
+                ("signal_name_to_id map", hm_entry(sim.signal_name_to_id.len(), 16, 8)),
+                ("leaf_name_to_ids map+vecs", hm_entry(sim.leaf_name_to_ids.len(), 16, 24) + leaf_vec_bytes),
+                ("scope_parents_by_leaf", hm_entry(sim.scope_parents_by_leaf.len(), 16, 24) + scope_vec_bytes),
+                ("signal_inline_bits", sim.signal_inline_bits.capacity() * 16),
+                ("prev_val + prev_xz", (sim.prev_val.capacity() + sim.prev_xz.capacity()) * 8),
+                ("active_force_signal_epochs", sim.active_force_signal_epochs.capacity() * 8),
+                ("signal_widths", sim.signal_widths.capacity() * 4),
+                ("signal flag vecs (5x bool)", sim.signal_signed.capacity()
+                    + sim.signal_real.capacity()
+                    + sim.signal_two_state.capacity()
+                    + sim.signal_gate_driven.capacity()
+                    + sim.signal_is_string.capacity()),
+                ("dirty_signals", sim.dirty_signals.capacity()),
+            ];
+            let total: usize = rows.iter().map(|(_, b)| *b).sum();
+            eprintln!("[MEM-CENSUS] === per-signal structures, {} signals ===", n);
+            let mut sorted = rows.clone();
+            sorted.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+            for (name, bytes) in sorted {
+                eprintln!(
+                    "[MEM-CENSUS] {:>9.1} MB {:>5.1}%  {:>6.0} B/sig  {}",
+                    mb(bytes),
+                    100.0 * bytes as f64 / total.max(1) as f64,
+                    bytes as f64 / n.max(1) as f64,
+                    name
+                );
+            }
+            eprintln!(
+                "[MEM-CENSUS] len vs CAPACITY: signal_table {}/{} | widths {}/{} | signed {}/{} | inline_bits {}/{} | prev_val {}/{} | dirty {}/{}",
+                sim.signal_table.len(), sim.signal_table.capacity(),
+                sim.signal_widths.len(), sim.signal_widths.capacity(),
+                sim.signal_signed.len(), sim.signal_signed.capacity(),
+                sim.signal_inline_bits.len(), sim.signal_inline_bits.capacity(),
+                sim.prev_val.len(), sim.prev_val.capacity(),
+                sim.dirty_signals.len(), sim.dirty_signals.capacity(),
+            );
+            eprintln!(
+                "[MEM-CENSUS] TOTAL accounted {:.1} MB ({:.0} B/signal); mean name length {:.1} chars",
+                mb(total),
+                total as f64 / n.max(1) as f64,
+                name_bytes as f64 / n.max(1) as f64
+            );
+        }
         // Collapse identity port nets before anything resolves names to ids:
         // per-node id caches make later re-pointing unreliable.
         sim.collapse_identity_port_nets();
