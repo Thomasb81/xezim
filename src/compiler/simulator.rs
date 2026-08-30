@@ -71333,6 +71333,18 @@ impl Simulator {
                         return w;
                     }
                 }
+                // §7.2.1: a PACKED-STRUCT MEMBER (`s.field`) is a bit slice of
+                // `s`, not a signal of its own, so every lookup above misses and
+                // the 32-bit default below silently truncated the assignment —
+                // a 40-bit field lost its top 8 bits on every NBA. Checked
+                // BEFORE the bare-leaf fallback, which would otherwise take the
+                // width from an unrelated module-scope signal of the same leaf
+                // name.
+                if let Some((_, _, pw)) = self.packed_leaf_of_hier(&name) {
+                    if pw > 0 {
+                        return pw;
+                    }
+                }
                 let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                 if let Some(&id) = self.signal_name_to_id.get(leaf) {
                     h.cached_signal_id.set(Some(id));
