@@ -5515,15 +5515,15 @@ impl Simulator {
     ) -> Option<Vec<crate::ast::types::UnpackedDimension>> {
         let mut tn = tn0.to_string();
         for _ in 0..8 {
-            let mut cur = Some(start_class.to_string());
+            let mut cur: Option<&str> = Some(start_class);
             while let Some(cn) = cur {
-                let Some(cd) = module.classes.get(&cn) else {
+                let Some(cd) = module.classes.get(cn) else {
                     break;
                 };
                 if let Some(d) = cd.typedef_unpacked_dims.get(&tn) {
                     return Some(d.clone());
                 }
-                cur = cd.extends.clone();
+                cur = cd.extends.as_deref();
             }
             if let Some(d) = module.typedef_unpacked_dims.get(&tn) {
                 return Some(d.clone());
@@ -80040,13 +80040,13 @@ impl Simulator {
         // first so a derived class's parameter shadows an ancestor's.
         let mut params: HashMap<String, Value> = HashMap::default();
         let mut fingerprint = String::new();
-        let mut cur = Some(decl_class.to_string());
+        let mut cur: Option<&str> = Some(decl_class);
         let mut seen: HashSet<String> = HashSet::default();
         while let Some(cn) = cur {
-            if !seen.insert(cn.clone()) {
+            if !seen.insert(cn.to_string()) {
                 break;
             }
-            let Some(c) = self.module.classes.get(&cn) else {
+            let Some(c) = self.module.classes.get(cn) else {
                 break;
             };
             for (pname, _) in &c.param_defaults {
@@ -80061,7 +80061,7 @@ impl Simulator {
                     params.insert(pname.clone(), v.clone());
                 }
             }
-            cur = c.extends.clone();
+            cur = c.extends.as_deref();
         }
         if params.is_empty() {
             return None;
@@ -80107,9 +80107,9 @@ impl Simulator {
         handle: Option<usize>,
         prop: &str,
     ) -> Option<u32> {
-        let mut cur = Some(class_name.to_string());
+        let mut cur: Option<&str> = Some(class_name);
         while let Some(cn) = cur {
-            let cd = self.module.classes.get(&cn)?;
+            let cd = self.module.classes.get(cn)?;
             if let Some(sig) = cd.properties.get(prop) {
                 if sig.is_real
                     || sig
@@ -80149,7 +80149,7 @@ impl Simulator {
                 }
                 return Some(sig.width).filter(|w| *w > 0);
             }
-            cur = cd.extends.clone();
+            cur = cd.extends.as_deref();
         }
         None
     }
@@ -86772,22 +86772,22 @@ impl Simulator {
     fn static_receiver_spec(&self, receiver: &str, ancestor: &str) -> Option<(String, String)> {
         let mut carried: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        let mut cur = Some(receiver.to_string());
+        let mut cur: Option<&str> = Some(receiver);
         let mut level = 0;
         while let Some(cn) = cur {
             level += 1;
             if level > 64 {
                 return None;
             }
-            let cd = self.module.classes.get(&cn)?;
+            let cd = self.module.classes.get(cn)?;
             if cn == ancestor {
                 let sig = self.rebind_class_sig(&cd, &carried);
-                return Some((cn, sig));
+                return Some((cn.to_string(), sig));
             }
             // Move to the parent, rebinding its type params from this class's
             // extends type args.
-            let parent = cd.extends.clone()?;
-            if let Some(pcd) = self.module.classes.get(&parent) {
+            let parent: &str = cd.extends.as_deref()?;
+            if let Some(pcd) = self.module.classes.get(parent) {
                 let order: Vec<String> = if pcd.param_order.is_empty() {
                     pcd.type_param_names.clone()
                 } else {
@@ -86859,13 +86859,13 @@ impl Simulator {
     /// reference inside a class body can consult its own scope before the
     /// flat design-wide map (§6.19).
     fn class_enum_member(&self, start_class: &str, member: &str) -> Option<Value> {
-        let mut cur = Some(start_class.to_string());
+        let mut cur: Option<&str> = Some(start_class);
         let mut seen: HashSet<String> = HashSet::default();
         while let Some(cn) = cur {
-            if !seen.insert(cn.clone()) {
+            if !seen.insert(cn.to_string()) {
                 break;
             }
-            let cd = self.module.classes.get(&cn)?;
+            let cd = self.module.classes.get(cn)?;
             for (td_name, dt) in &cd.typedef_targets {
                 if !matches!(dt, DataType::Enum(_)) {
                     continue;
@@ -86877,7 +86877,7 @@ impl Simulator {
                     }
                 }
             }
-            cur = cd.extends.clone();
+            cur = cd.extends.as_deref();
         }
         None
     }
@@ -86905,10 +86905,10 @@ impl Simulator {
         let mut chain_classes: Vec<String> = Vec::new();
         let mut enum_tds: Vec<(String, u32)> = Vec::new();
         {
-            let mut cur = Some(start_class.to_string());
+            let mut cur: Option<&str> = Some(start_class);
             while let Some(cn) = cur {
-                chain_classes.push(cn.clone());
-                match self.module.classes.get(&cn) {
+                chain_classes.push(cn.to_string());
+                match self.module.classes.get(cn) {
                     Some(cd) => {
                         for (td_name, dt) in &cd.typedef_targets {
                             if matches!(dt, DataType::Enum(_)) {
@@ -86922,7 +86922,7 @@ impl Simulator {
                                 enum_tds.push((td_name.clone(), w));
                             }
                         }
-                        cur = cd.extends.clone();
+                        cur = cd.extends.as_deref();
                     }
                     None => break,
                 }
@@ -88371,13 +88371,13 @@ impl Simulator {
     /// base's copy; an inherited-only member resolves to the base's key, so
     /// every subclass shares the ONE store §8.9 prescribes).
     fn static_fixed_key_in(&self, class_name: &str, member: &str) -> Option<String> {
-        let mut cur = Some(class_name.to_string());
+        let mut cur: Option<&str> = Some(class_name);
         while let Some(cn) = cur {
-            let cd = self.module.classes.get(&cn)?;
+            let cd = self.module.classes.get(cn)?;
             if cd.static_fixed_arrays.iter().any(|(n, ..)| n == member) {
                 return Some(format!("{}::{}", cn, member));
             }
-            cur = cd.extends.clone();
+            cur = cd.extends.as_deref();
         }
         None
     }
@@ -88423,13 +88423,13 @@ impl Simulator {
     /// Is `member` a STATIC queue/assoc/dynamic-array collection property of
     /// `start_class` or an ancestor (i.e. it is in `static_collections`)?
     fn member_is_static_coll(&self, start_class: &str, member: &str) -> bool {
-        let mut cur = Some(start_class.to_string());
+        let mut cur: Option<&str> = Some(start_class);
         while let Some(cn) = cur {
-            if let Some(cd) = self.module.classes.get(&cn) {
+            if let Some(cd) = self.module.classes.get(cn) {
                 if cd.static_collections.iter().any(|(n, _, _)| n == member) {
                     return true;
                 }
-                cur = cd.extends.clone();
+                cur = cd.extends.as_deref();
             } else {
                 break;
             }
@@ -88441,13 +88441,13 @@ impl Simulator {
     /// queue/assoc/dynamic-array collection (i.e. it is in
     /// `static_collections`)?
     fn collection_is_static_in(&self, start_class: &str, name: &str) -> bool {
-        let mut cur = Some(start_class.to_string());
+        let mut cur: Option<&str> = Some(start_class);
         while let Some(cn) = cur {
-            if let Some(cd) = self.module.classes.get(&cn) {
+            if let Some(cd) = self.module.classes.get(cn) {
                 if cd.static_collections.iter().any(|(n, _, _)| n == name) {
                     return true;
                 }
-                cur = cd.extends.clone();
+                cur = cd.extends.as_deref();
             } else {
                 break;
             }
@@ -88494,19 +88494,22 @@ impl Simulator {
         // holds the CALLER's class (e.g. "uvm_sequence_base"), so a foreach
         // over a member array declared in the concrete subclass ("my_seq")
         // would fail to resolve.  The heap always knows the actual type.
-        let ctx = self
+        // Borrowed walk: the owned form allocated the start class name and
+        // one String per ancestor level, on a path that runs 22.3M times on
+        // an axi4Lite UVM run.
+        let ctx: &str = self
             .heap
             .get(handle)
             .and_then(|x| x.as_ref())
-            .map(|i| i.class_name.clone())?;
-        let mut cur = Some(ctx);
+            .map(|i| i.class_name.as_str())?;
+        let mut cur: Option<&str> = Some(ctx);
         while let Some(cn) = cur {
-            let cd = self.module.classes.get(&cn)?;
+            let cd = self.module.classes.get(cn)?;
             if cd.assoc_properties.contains_key(name)
                 || cd.queue_properties.contains_key(name)
                 || cd.array_properties.contains_key(name)
                 || cd.array_nd_properties.contains_key(name)
-                || self.prop_bound_collection(handle, &cn, name)
+                || self.prop_bound_collection(handle, cn, name)
             {
                 return Some(format!("{}#{}", handle, name));
             }
@@ -88515,7 +88518,7 @@ impl Simulator {
             if cd.static_fixed_arrays.iter().any(|(n, ..)| n == name) {
                 return Some(format!("{}::{}", cn, name));
             }
-            cur = cd.extends.clone();
+            cur = cd.extends.as_deref();
         }
         None
     }
@@ -88536,15 +88539,15 @@ impl Simulator {
             if let Some(hit) = hit {
                 hit
             } else {
-                let mut cur = Some(class_name.to_string());
+                let mut cur: Option<&str> = Some(class_name);
                 let computed: Option<String> = loop {
                     let Some(cn) = cur else { break None };
-                    match self.module.classes.get(&cn) {
+                    match self.module.classes.get(cn) {
                         Some(cd) => {
                             if let Some(sig) = cd.properties.get(member) {
                                 break sig.type_name.clone();
                             }
-                            cur = cd.extends.clone();
+                            cur = cd.extends.as_deref();
                         }
                         None => break None,
                     }
@@ -88600,9 +88603,13 @@ impl Simulator {
     }
 
     fn class_assoc_member(&self, class_name: &str, member: &str) -> bool {
-        let mut cur = Some(class_name.to_string());
+        // Walk the ancestry by BORROW. The owned form allocated a String for
+        // the start class and another per level (`extends.clone()`); this
+        // helper sits under `instance_assoc_member`, which runs 22.3M times
+        // on an axi4Lite UVM run.
+        let mut cur: Option<&str> = Some(class_name);
         while let Some(cn) = cur {
-            match self.module.classes.get(&cn) {
+            match self.module.classes.get(cn) {
                 Some(cd) => {
                     if cd.assoc_properties.contains_key(member)
                         || cd.queue_properties.contains_key(member)
@@ -88610,7 +88617,7 @@ impl Simulator {
                     {
                         return true;
                     }
-                    cur = cd.extends.clone();
+                    cur = cd.extends.as_deref();
                 }
                 None => return false,
             }
@@ -89663,16 +89670,16 @@ impl Simulator {
         method: &str,
     ) -> Option<(crate::ast::decl::TaskDeclaration, String)> {
         use crate::ast::decl::ClassMethodKind;
-        let mut cur = Some(start_class.to_string());
+        let mut cur: Option<&str> = Some(start_class);
         while let Some(cn) = cur {
-            let cd = self.module.classes.get(&cn)?;
+            let cd = self.module.classes.get(cn)?;
             if let Some(m) = cd.methods.get(method) {
                 if let ClassMethodKind::Task(t) = &m.kind {
-                    return Some((t.clone(), cn));
+                    return Some((t.clone(), cn.to_string()));
                 }
                 return None;
             }
-            cur = cd.extends.clone();
+            cur = cd.extends.as_deref();
         }
         None
     }
@@ -98536,9 +98543,9 @@ impl Simulator {
         prop: &str,
         owner: Option<usize>,
     ) -> Option<String> {
-        let mut cur = Some(cls.to_string());
+        let mut cur: Option<&str> = Some(cls);
         while let Some(cn) = cur {
-            let cd = self.module.classes.get(&cn)?;
+            let cd = self.module.classes.get(cn)?;
             if let Some(sig) = cd.properties.get(prop) {
                 let mut tn = sig.type_name.clone();
                 if let Some(raw) = &tn {
@@ -98551,7 +98558,7 @@ impl Simulator {
                 }
                 return tn.filter(|t| self.module.classes.contains_key(t));
             }
-            cur = cd.extends.clone();
+            cur = cd.extends.as_deref();
         }
         None
     }
