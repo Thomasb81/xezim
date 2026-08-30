@@ -3148,9 +3148,11 @@ pub struct Simulator {
     force_epoch_gen: u64,
     force_refresh_done_gen: u64,
     /// XEZIM_NAME_STATS counters for the string-keyed read path (the UVM
-    /// "runtime IDs" investigation): which lookup site actually dominates.
-    /// 0=get_signal_value_by_name 1=resolve_hier_name 2=dyn_name_lookup
-    /// 3=instance_assoc_member 4=class-hierarchy method dispatch.
+    /// "runtime IDs" investigation). 0=get_signal_value_by_name,
+    /// 1=resolve_hier_name, 2=subroutine frames pushed, 3=total locals in
+    /// them — the last pair sizes the frame maps, which measured a mean of
+    /// 1.8 entries and so would be better served by a linear-scan Vec than
+    /// by hashing a String key.
     /// Flattened per-class collection-property lookup for
     /// `instance_assoc_member`: class -> (member -> kind), built once by
     /// walking the ancestry, so the 22.3M-call hot path costs two hash
@@ -3159,7 +3161,7 @@ pub struct Simulator {
     /// `Some(class)` = static fixed array owned by that class.
     #[allow(clippy::type_complexity)]
     class_coll_index: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
-    name_stats: [std::cell::Cell<u64>; 5],
+    name_stats: [std::cell::Cell<u64>; 4],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
     /// Lazily-built leaf index over `module.parameters` for the bytecode
@@ -34338,8 +34340,9 @@ impl Simulator {
         if std::env::var("XEZIM_NAME_STATS").is_ok() {
             let n = &self.name_stats;
             eprintln!(
-                "[NAME-STATS] get_signal_by_name={} resolve_hier_name={} dyn_name_lookup={} instance_assoc_member={} (of which key-allocating {})",
-                n[0].get(), n[1].get(), n[2].get(), n[3].get(), n[4].get()
+                "[NAME-STATS] get_signal_by_name={} resolve_hier_name={} frames_pushed={} frame_locals={} (mean {:.1} entries/frame)",
+                n[0].get(), n[1].get(), n[2].get(), n[3].get(),
+                n[3].get() as f64 / n[2].get().max(1) as f64
             );
 
         }
@@ -76125,7 +76128,6 @@ impl Simulator {
     /// class property, or not a collection at all) — in which case callers
     /// should use `bare` as-is.
     fn dyn_name_lookup(&self, bare: &str) -> Option<&str> {
-        if self.name_stats_on { self.name_stats[2].set(self.name_stats[2].get() + 1); }
         // Walk frames innermost-first: a local dyn array declared in an
         // enclosing call frame is visible in nested scopes (matches how
         // inlined blocking calls share the caller's scope). A queue/assoc
@@ -80356,6 +80358,10 @@ impl Simulator {
 
     /// Push a local frame, keeping the type overlay in lockstep.
     fn push_local_frame(&mut self, f: HashMap<String, Value>) {
+        if self.name_stats_on {
+            self.name_stats[2].set(self.name_stats[2].get() + 1);
+            self.name_stats[3].set(self.name_stats[3].get() + f.len() as u64);
+        }
         self.local_stack.push(f);
         self.local_type_stack
             .push((HashMap::default(), HashMap::default()));
@@ -88485,7 +88491,6 @@ impl Simulator {
     }
 
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
-        if self.name_stats_on { self.name_stats[3].set(self.name_stats[3].get() + 1); }
         // §8.9: `Cls::member` / flattened `Cls.member` spellings of a static
         // fixed array resolve to the declaring class's store BEFORE the
         // dotted-name guard below can reject them.
