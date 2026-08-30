@@ -650,11 +650,38 @@ impl Insn {
                     *r += rb;
                 }
             }
+            // NBA stores carry registers but never branch targets, so they
+            // rebase like any other operand. (Comb-region fusion refuses NBA
+            // members through its own `insn_ok` gate, so admitting them here
+            // does not loosen that pass; edge-block merging needs them —
+            // a flop body is NBAs and nothing else.)
+            NbaAssign(_, a, _) => *a += rb,
+            NbaAssignConst(..) => {}
+            NbaAssignRange(_, _, _, a) => *a += rb,
+            NbaAssignRangeDyn(_, a, b, c) => {
+                *a += rb;
+                *b += rb;
+                *c += rb;
+            }
+            NbaAssignBitDyn(_, a, b) => {
+                *a += rb;
+                *b += rb;
+            }
+            NbaAssignArray(_, a, b, _) => {
+                *a += rb;
+                *b += rb;
+            }
+            NbaAssignArrayRange(_, a, b, c, d) => {
+                *a += rb;
+                *b += rb;
+                *c += rb;
+                *d += rb;
+            }
+            // Signal-to-signal fused array read: no registers at all.
+            NbaAssignArrayRead(..) => {}
             LoadProcessLocal(..) | Format(..) | CaseJump(..) | CaseMaskJump(..)
-            | StmtFallback(..) | EvalExprFallback(..) | NbaAssign(..)
-            | NbaAssignConst(..) | NbaAssignRange(..) | NbaAssignRangeDyn(..)
-            | NbaAssignBitDyn(..) | NbaAssignArray(..) | NbaAssignArrayRange(..)
-            | NbaAssignArrayRead(..) | WaitDelayReg(..) | WaitEdge(..) => return false,
+            | StmtFallback(..) | EvalExprFallback(..)
+            | WaitDelayReg(..) | WaitEdge(..) => return false,
         }
         true
     }
