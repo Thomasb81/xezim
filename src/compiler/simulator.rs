@@ -3848,8 +3848,8 @@ pub struct Simulator {
     /// Immutable method bodies cached after their first dispatch. Runtime
     /// execution mutates object state, never declarations, so sharing the
     /// parsed body avoids rebuilding a deep AST on every call.
-    class_method_cache:
-        HashMap<String, HashMap<String, Option<Arc<crate::ast::decl::ClassMethod>>>>,
+    class_method_cache: std::cell::RefCell<
+        HashMap<String, HashMap<String, Option<Arc<crate::ast::decl::ClassMethod>>>>>,
     /// Current covergroup instance if in sampling context.
     cg_this: Option<usize>,
     /// Processes waiting for join
@@ -7749,7 +7749,7 @@ impl Simulator {
             local_stack: vec![],
             class_context_stack: vec![],
             method_local_base: vec![],
-            class_method_cache: HashMap::default(),
+            class_method_cache: std::cell::RefCell::new(HashMap::default()),
             cg_this: None,
             join_waiters: Vec::new(),
             process_parents: HashMap::default(),
@@ -105052,12 +105052,13 @@ impl Simulator {
     }
 
     fn cached_class_method(
-        &mut self,
+        &self,
         class_name: &str,
         method_name: &str,
     ) -> Option<Arc<crate::ast::decl::ClassMethod>> {
         if let Some(cached) = self
             .class_method_cache
+            .borrow()
             .get(class_name)
             .and_then(|methods| methods.get(method_name))
         {
@@ -105078,6 +105079,7 @@ impl Simulator {
             .cloned()
             .map(Arc::new);
         self.class_method_cache
+            .borrow_mut()
             .entry(class_name.to_string())
             .or_default()
             .insert(method_name.to_string(), method.clone());
@@ -105113,15 +105115,31 @@ impl Simulator {
                 return Value::zero(32);
             }
         }
-        let mut cur_class = Some(start_class.to_string());
+        // Find the DEFINING class by borrow before doing any work: the old
+        // form allocated `start_class.to_string()` plus one `extends.clone()`
+        // per ancestor level on every method call, and UVM dispatch is the
+        // hottest path in a testbench run (4.5% of the run's memcmp sat under
+        // this function). The search is pure lookup, so it can hold a borrow;
+        // only the class that actually defines the method is materialized.
+        let mut cur_class: Option<String> = {
+            let mut found: Option<String> = None;
+            let mut probe: Option<&str> = Some(start_class);
+            while let Some(cn) = probe {
+                if self.cached_class_method(cn, method_name).is_some() {
+                    found = Some(cn.to_string());
+                    break;
+                }
+                probe = self
+                    .module
+                    .classes
+                    .get(cn)
+                    .and_then(|class_def| class_def.extends.as_deref());
+            }
+            found
+        };
         while let Some(cname) = cur_class {
-            let parent = self
-                .module
-                .classes
-                .get(&cname)
-                .and_then(|class_def| class_def.extends.clone());
             let method_opt = self.cached_class_method(&cname, method_name);
-            cur_class = parent;
+            cur_class = None;
             if let Some(method) = method_opt {
                 let (ports, body) = match &method.kind {
                     ClassMethodKind::Function(f) => (&f.ports, &f.items),
