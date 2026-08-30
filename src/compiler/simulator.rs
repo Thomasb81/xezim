@@ -3151,6 +3151,14 @@ pub struct Simulator {
     /// "runtime IDs" investigation): which lookup site actually dominates.
     /// 0=get_signal_value_by_name 1=resolve_hier_name 2=dyn_name_lookup
     /// 3=instance_assoc_member 4=class-hierarchy method dispatch.
+    /// Flattened per-class collection-property lookup for
+    /// `instance_assoc_member`: class -> (member -> kind), built once by
+    /// walking the ancestry, so the 22.3M-call hot path costs two hash
+    /// lookups instead of four map probes plus a linear scan PER ANCESTOR
+    /// LEVEL. `true` = per-instance collection (`<handle>#<member>`);
+    /// `Some(class)` = static fixed array owned by that class.
+    #[allow(clippy::type_complexity)]
+    class_coll_index: std::cell::RefCell<HashMap<String, Arc<HashMap<String, Option<String>>>>>,
     name_stats: [std::cell::Cell<u64>; 5],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
@@ -7570,6 +7578,7 @@ impl Simulator {
             any_struct_formal_markers: false,
             force_epoch_gen: 0,
             force_refresh_done_gen: 0,
+            class_coll_index: std::cell::RefCell::new(HashMap::default()),
             name_stats: Default::default(),
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
@@ -88408,6 +88417,14 @@ impl Simulator {
     }
 
     fn static_fixed_key_for_name(&self, name: &str) -> Option<String> {
+        // Fast reject before building any pattern searcher: both shapes below
+        // need a `::` or `.` separator, and the overwhelming majority of calls
+        // pass a bare identifier. This runs under `instance_assoc_member`
+        // (22.3M calls on an axi4Lite UVM run) where the two `split_once`
+        // searchers cost ~3% of the whole run.
+        if !name.as_bytes().iter().any(|&b| b == b':' || b == b'.') {
+            return None;
+        }
         let (cls, member) = name
             .split_once("::")
             .or_else(|| name.split_once('.'))?;
@@ -88502,25 +88519,64 @@ impl Simulator {
             .get(handle)
             .and_then(|x| x.as_ref())
             .map(|i| i.class_name.as_str())?;
+        // Flattened index first: it answers the class-only part of the
+        // decision (the four property maps and the static-fixed-array list,
+        // in ancestry order) in one lookup. A property is declared once, so a
+        // name can never be BOTH a static fixed array and a type-parameter-
+        // bound collection in the same class — which is what lets the
+        // handle-dependent `prop_bound_collection` probe move to the miss
+        // path below instead of running at every level.
+        let idx = self.class_coll_index_for(ctx);
+        if let Some(kind) = idx.get(name) {
+            return Some(match kind {
+                None => format!("{}#{}", handle, name),
+                Some(owner) => format!("{}::{}", owner, name),
+            });
+        }
+        // Miss: only the per-instance type-binding case can still match.
         let mut cur: Option<&str> = Some(ctx);
         while let Some(cn) = cur {
             let cd = self.module.classes.get(cn)?;
-            if cd.assoc_properties.contains_key(name)
-                || cd.queue_properties.contains_key(name)
-                || cd.array_properties.contains_key(name)
-                || cd.array_nd_properties.contains_key(name)
-                || self.prop_bound_collection(handle, cn, name)
-            {
+            if self.prop_bound_collection(handle, cn, name) {
                 return Some(format!("{}#{}", handle, name));
-            }
-            // §8.9: a fixed-size STATIC array resolves to its class-qualified
-            // shared store, not a per-instance name.
-            if cd.static_fixed_arrays.iter().any(|(n, ..)| n == name) {
-                return Some(format!("{}::{}", cn, name));
             }
             cur = cd.extends.as_deref();
         }
         None
+    }
+
+    /// Build (once per class) the flattened member -> kind map described on
+    /// `class_coll_index`. Walks derived -> base inserting only absent names,
+    /// so the first level that declares a name wins, and within a level the
+    /// per-instance collections take precedence over static fixed arrays —
+    /// exactly the order the original level-by-level walk used.
+    fn class_coll_index_for(&self, class_name: &str) -> Arc<HashMap<String, Option<String>>> {
+        if let Some(hit) = self.class_coll_index.borrow().get(class_name) {
+            return hit.clone();
+        }
+        let mut map: HashMap<String, Option<String>> = HashMap::default();
+        let mut cur: Option<&str> = Some(class_name);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else { break };
+            for k in cd
+                .assoc_properties
+                .keys()
+                .chain(cd.queue_properties.keys())
+                .chain(cd.array_properties.keys())
+                .chain(cd.array_nd_properties.keys())
+            {
+                map.entry(k.clone()).or_insert(None);
+            }
+            for (n, ..) in cd.static_fixed_arrays.iter() {
+                map.entry(n.clone()).or_insert_with(|| Some(cn.to_string()));
+            }
+            cur = cd.extends.as_deref();
+        }
+        let arc = Arc::new(map);
+        self.class_coll_index
+            .borrow_mut()
+            .insert(class_name.to_string(), arc.clone());
+        arc
     }
 
     /// Does `class_name` or an ancestor declare `member` as an associative
