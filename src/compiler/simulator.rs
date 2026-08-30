@@ -20540,6 +20540,279 @@ impl Simulator {
         self.compiled_edge_blocks = compiled;
         self.ts_edge.clear();
 
+        // R6 (the reference ships `merge`/`mergeEnh` by DEFAULT; opt-in here):
+        // merge edge blocks with IDENTICAL plain sensitivities into one
+        // compiled block. Same-signature members always fire together (100%
+        // co-activation BY CONSTRUCTION — the recompute-waste defect that
+        // sank comb-region fusion cannot occur here), and concatenation in
+        // block-index order preserves relative order among the members.
+        //
+        // Guards, each paid for by an earlier measurement:
+        //  * members must be individually native-admissible (fit_u64 AND
+        //    two-state-lowerable) and the MERGED block must be too — comb
+        //    fusion without this demoted 4,563 c906 entries from native to
+        //    interpreted and cost 24% wall;
+        //  * NBA-only bodies (no blocking stores): merging changes a member's
+        //    position relative to NON-member blocks sharing the same trigger
+        //    signal, which is observable for blocking writes but not for
+        //    queued NBAs;
+        //  * no `iff` / non-trivial event terms; no fallback insns.
+        // `XEZIM_EDGE_MERGE=census` sizes the population; `=N` merges with at
+        // most N members per merged block.
+        if let Ok(em) = std::env::var("XEZIM_EDGE_MERGE") {
+            use super::bytecode::Insn as EI;
+            let census_only = em == "census";
+            let cap: usize = if census_only {
+                usize::MAX
+            } else {
+                em.parse().unwrap_or(0)
+            };
+            if census_only || cap >= 2 {
+                let native_ok = |this: &Self, cb: &super::bytecode::CompiledBlock| -> bool {
+                    this.block_signals_fit_u64(cb)
+                        && super::bytecode::lower_two_state(
+                            cb,
+                            &this.signal_widths,
+                            &this.signal_signed,
+                            &this.signal_real,
+                            &this.array_first_id,
+                        )
+                        .is_some()
+                };
+                let nba_only = |cb: &super::bytecode::CompiledBlock| -> bool {
+                    !cb.instructions.iter().any(|ins| {
+                        matches!(
+                            ins,
+                            EI::BlockingAssign(..)
+                                | EI::BlockingAssignRange(..)
+                                | EI::BlockingAssignRangeDyn(..)
+                                | EI::BlockingAssignBitDyn(..)
+                                | EI::BlockingAssignArray(..)
+                                | EI::BlockingAssignArrayRange(..)
+                                | EI::BlockingAssignString(..)
+                        )
+                    })
+                };
+                // §10.4.2 last-write-wins hazard: merging moves a member's
+                // NBA pushes relative to NON-member blocks that share a
+                // trigger signal, so if two edge blocks drive the SAME target
+                // on one edge, the surviving value could flip. Admit only
+                // single-driver targets — the same discipline the identity-net
+                // collapse uses. (Conservative: two members of one chunk
+                // driving one target keep their order by construction, but
+                // proving that per-chunk is not worth the complexity.)
+                let mut nba_target_writers: HashMap<u64, u32> = HashMap::default();
+                let block_nba_targets = |cb: &super::bytecode::CompiledBlock| -> Vec<u64> {
+                    let mut out: Vec<u64> = Vec::new();
+                    for ins in cb.instructions.iter() {
+                        match ins {
+                            EI::NbaAssign(sig, ..)
+                            | EI::NbaAssignConst(sig, ..)
+                            | EI::NbaAssignRange(sig, ..)
+                            | EI::NbaAssignRangeDyn(sig, ..)
+                            | EI::NbaAssignBitDyn(sig, ..)
+                            | EI::NbaAssignArrayRead(sig, ..) => out.push(*sig as u64),
+                            EI::NbaAssignArray(arr, ..) | EI::NbaAssignArrayRange(arr, ..) => {
+                                // Array targets: key on the dense base id (or
+                                // a name hash for Named arrays), tagged above
+                                // the signal-id space.
+                                let key = match arr.as_ref() {
+                                    super::bytecode::ArrayOperand::Dense { first_id, .. } => {
+                                        *first_id as u64
+                                    }
+                                    super::bytecode::ArrayOperand::Named(n) => {
+                                        let mut h: u64 = 1469598103934665603;
+                                        for b in n.as_bytes() {
+                                            h = (h ^ *b as u64).wrapping_mul(1099511628211);
+                                        }
+                                        h
+                                    }
+                                };
+                                out.push(key | (1u64 << 63));
+                            }
+                            _ => {}
+                        }
+                    }
+                    out.sort_unstable();
+                    out.dedup();
+                    out
+                };
+                for cb in self.compiled_edge_blocks.iter().flatten() {
+                    for t in block_nba_targets(cb) {
+                        *nba_target_writers.entry(t).or_insert(0) += 1;
+                    }
+                }
+                let mut groups: HashMap<Vec<(usize, u8)>, Vec<usize>> = HashMap::default();
+                let mut n_eligible = 0usize;
+                let mut r_multidrv = 0usize;
+                let (mut r_nocb, mut r_fallback, mut r_blocking, mut r_offset, mut r_native, mut r_sens) =
+                    (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+                for (i, b) in self.edge_blocks.iter().enumerate() {
+                    let Some(cb) = self.compiled_edge_blocks[i].as_ref() else {
+                        r_nocb += 1;
+                        continue;
+                    };
+                    if cb.has_fallback {
+                        r_fallback += 1;
+                        continue;
+                    }
+                    if !nba_only(cb) {
+                        r_blocking += 1;
+                        continue;
+                    }
+                    if !cb.instructions.iter().all(|ins| {
+                        let mut probe = ins.clone();
+                        probe.offset_regs_and_targets(0, 0)
+                    }) {
+                        r_offset += 1;
+                        continue;
+                    }
+                    if !native_ok(self, cb) {
+                        r_native += 1;
+                        continue;
+                    }
+                    if block_nba_targets(cb)
+                        .iter()
+                        .any(|t| nba_target_writers.get(t).copied().unwrap_or(0) != 1)
+                    {
+                        r_multidrv += 1;
+                        continue;
+                    }
+                    let mut sig: Vec<(usize, u8)> = Vec::new();
+                    let mut ok = true;
+                    for t in &b.resolved_sensitivities {
+                        if t.iff.is_some() || t.value_of.is_some() {
+                            ok = false;
+                            break;
+                        }
+                        let tag = match t.edge {
+                            EdgeKind::Posedge => 0u8,
+                            EdgeKind::Negedge => 1u8,
+                            EdgeKind::AnyEdge => 2u8,
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        sig.push((t.signal_id, tag));
+                    }
+                    if !ok || sig.is_empty() {
+                        r_sens += 1;
+                        continue;
+                    }
+                    sig.sort_unstable();
+                    sig.dedup();
+                    n_eligible += 1;
+                    groups.entry(sig).or_default().push(i);
+                }
+                if census_only {
+                    let mergeable: usize =
+                        groups.values().filter(|v| v.len() >= 2).map(|v| v.len()).sum();
+                    let ngroups = groups.values().filter(|v| v.len() >= 2).count();
+                    let mut sizes: Vec<usize> =
+                        groups.values().map(|v| v.len()).filter(|&n| n >= 2).collect();
+                    sizes.sort_unstable_by(|a, b| b.cmp(a));
+                    eprintln!(
+                        "[EDGE-MERGE] reject: no_cb={} fallback={} blocking={} offset={} native={} multidrv={} sens={}",
+                        r_nocb, r_fallback, r_blocking, r_offset, r_native, r_multidrv, r_sens
+                    );
+                    eprintln!(
+                        "[EDGE-MERGE] census: eligible={} of {} blocks; mergeable={} in {} groups; top sizes {:?}",
+                        n_eligible,
+                        self.edge_blocks.len(),
+                        mergeable,
+                        ngroups,
+                        &sizes[..sizes.len().min(10)]
+                    );
+                } else {
+                    let mut merged_blocks = 0usize;
+                    let mut merged_members = 0usize;
+                    let mut retired: Vec<usize> = Vec::new();
+                    let mut group_list: Vec<Vec<usize>> =
+                        groups.into_values().filter(|v| v.len() >= 2).collect();
+                    // Deterministic order (HashMap iteration is not).
+                    group_list.sort_unstable();
+                    for mut idxs in group_list {
+                        idxs.sort_unstable();
+                        for chunk in idxs.chunks(cap) {
+                            if chunk.len() < 2 {
+                                continue;
+                            }
+                            let total_regs: u64 = chunk
+                                .iter()
+                                .map(|&m| {
+                                    self.compiled_edge_blocks[m]
+                                        .as_ref()
+                                        .map(|c| c.num_regs as u64)
+                                        .unwrap_or(0)
+                                })
+                                .sum();
+                            if total_regs > u16::MAX as u64 {
+                                continue;
+                            }
+                            let mut merged = super::bytecode::CompiledBlock {
+                                instructions: Vec::new(),
+                                num_regs: 0,
+                                has_fallback: false,
+                                // Two members may NBA the same target; the
+                                // pending-queue path must keep §10.4.2
+                                // last-write-wins across the merged body.
+                                nba_dup_targets: true,
+                            };
+                            let mut ok = true;
+                            for &m in chunk {
+                                let mb = self.compiled_edge_blocks[m].as_ref().unwrap();
+                                let off = merged.instructions.len() as u32;
+                                let reg_base = merged.num_regs as u16;
+                                for ins in mb.instructions.iter() {
+                                    let mut i2 = ins.clone();
+                                    if !i2.offset_regs_and_targets(reg_base, off) {
+                                        ok = false;
+                                        break;
+                                    }
+                                    merged.instructions.push(i2);
+                                }
+                                if !ok {
+                                    break;
+                                }
+                                merged.num_regs += mb.num_regs;
+                            }
+                            // The merged block must keep the native tier its
+                            // members individually had, or the merge is a
+                            // demotion (see the guard note above).
+                            if !ok || !native_ok(self, &merged) {
+                                continue;
+                            }
+                            let head = chunk[0];
+                            self.compiled_edge_blocks[head] = Some(merged);
+                            for &m in &chunk[1..] {
+                                self.compiled_edge_blocks[m] = None;
+                                retired.push(m);
+                            }
+                            merged_blocks += 1;
+                            merged_members += chunk.len();
+                        }
+                    }
+                    if !retired.is_empty() {
+                        // Clearing the sensitivity list takes a retired member
+                        // out of every trigger path: the edge fanout index and
+                        // the scan structures are built from these lists AFTER
+                        // this function returns.
+                        let blocks = Arc::make_mut(&mut self.edge_blocks);
+                        for m in retired {
+                            blocks[m].resolved_sensitivities.clear();
+                        }
+                    }
+                    if merged_members > 0 {
+                        eprintln!(
+                            "[EDGE-MERGE] merged {} blocks into {} (cap {})",
+                            merged_members, merged_blocks, cap
+                        );
+                    }
+                }
+            }
+        }
+
         // Retained dynamic-delay processes are also hot procedural code. In
         // PLL models this is commonly `always #(period/2) clk = ...`, which
         // runs millions of times. Resolve that assignment once instead of
