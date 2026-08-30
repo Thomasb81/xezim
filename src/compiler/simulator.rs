@@ -551,6 +551,7 @@ macro_rules! write_sig {
             {
                 $self.active_force_signal_epochs[__wsig_id] =
                     $self.active_force_signal_epochs[__wsig_id].wrapping_add(1);
+                $self.force_epoch_gen = $self.force_epoch_gen.wrapping_add(1);
             }
             // Incremental VCD: mark this write dirty (no-op when the dump is off
             // or the full scan is forced). Superset-safe — the flush re-checks
@@ -3140,6 +3141,12 @@ pub struct Simulator {
     /// the table alloc/free was pure allocator churn. `clear()` keeps the
     /// table's capacity, so a pooled frame re-binds formals with zero
     /// rehashing growth.
+    /// Bumped whenever any `active_force_signal_epochs` entry advances;
+    /// `refresh_active_forces` early-exits when nothing bumped since its
+    /// last completed pass (the post-settle refresh otherwise re-scanned
+    /// every armed force per settle — 1.6% of an axi4Lite run).
+    force_epoch_gen: u64,
+    force_refresh_done_gen: u64,
     frame_pool: Vec<HashMap<String, Value>>,
     /// Lazily-built leaf index over `module.parameters` for the bytecode
     /// compiler's suffix-match fallback (see `lookup_param_value`). Built
@@ -7555,6 +7562,8 @@ impl Simulator {
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
             any_struct_formal_markers: false,
+            force_epoch_gen: 0,
+            force_refresh_done_gen: 0,
             frame_pool: Vec::new(),
             param_leaf_index_cell: std::cell::OnceCell::new(),
             forced_names: HashSet::default(),
@@ -44835,6 +44844,19 @@ impl Simulator {
         if self.active_force_exprs.is_empty() {
             return;
         }
+        // Nothing an armed force reads has changed since the last completed
+        // pass, and no entry needs the conservative once-per-refresh re-eval
+        // — skip the whole scan. Arming a new force (arm_force_expr) always
+        // evaluates the expression at arm time, so a freshly armed override
+        // is already current.
+        if self.force_epoch_gen == self.force_refresh_done_gen
+            && !self
+                .active_force_exprs
+                .iter()
+                .any(|e| e.has_unresolved_reads)
+        {
+            return;
+        }
         let entry_count = self.active_force_exprs.len();
         let mut conservative_done = vec![false; entry_count];
         let mut evaluated = vec![false; entry_count];
@@ -44915,6 +44937,7 @@ impl Simulator {
                 .collect();
         }
 
+        self.force_refresh_done_gen = self.force_epoch_gen;
         self.active_force_skips += self
             .active_force_exprs
             .iter()
@@ -68203,6 +68226,7 @@ impl Simulator {
         if !self.active_force_exprs.is_empty() && id < self.active_force_signal_epochs.len() {
             self.active_force_signal_epochs[id] =
                 self.active_force_signal_epochs[id].wrapping_add(1);
+            self.force_epoch_gen = self.force_epoch_gen.wrapping_add(1);
         }
         // `raw_bits()` is NOT free: its `Wide` arm (any signal over 64 bits)
         // re-packs up to 64 `LogicBit` bytes one at a time. Its ONLY consumer
