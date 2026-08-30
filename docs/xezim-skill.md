@@ -93,9 +93,25 @@ What's left for the user:
   carries megabyte memories. (Known gap: NBAs into packed arrays commit
   immediately; designs whose RAM read ports read back the same element in
   the same timestep would see the new value a delta early.)
+- **`XEZIM_BUF_COLLAPSE=1`** — folds whole-net identity continuous assigns
+  (`assign y = x;`) onto their source net, the transform commercial
+  optimizers apply by default to clock and buffer trees. Measured −10%
+  instructions on a gate-level SoC, −47% of the simulation phase on a
+  larger one, −8.6% on behavioral RTL. It removes the one-delta
+  propagation step a buffer adds, so leave it off if your testbench
+  deliberately observes a buffer's input and output at different deltas.
+- **`XEZIM_EDGE_MERGE=<N>`** — merges edge blocks with identical
+  sensitivities into one compiled block, at most `N` per block (8 measures
+  best; large values lose more to coarser gating than they save in
+  dispatch). −4% instructions on a gate-level SoC. Use it with the default
+  engine: it measured net-negative under `XEZIM_AOT`, where wider blocks
+  shrink native coverage and defeat template deduplication.
 - **PGO build** (above) for long runs; the build cost amortizes quickly.
-- **`XEZIM_JIT=1`** exists but is currently *not* a win (bridge overhead
-  eats the gain on real SoCs) — leave it off unless you're measuring it.
+- **`XEZIM_JIT=1 XEZIM_AOT=1`** with a warm native cache is now the fastest
+  configuration on gate-level SoCs (c906: 44.2 s against 45.7 s for the
+  default engine). The first run after any design or binary change pays a
+  one-time rustc compile, so it pays off for repeated runs, not one-shots.
+  `XEZIM_AOT_TEMPLATE=1` cuts that compile by ~16× and is runtime-neutral.
 - Elaboration of huge SoCs (hundreds of files, millions of signals) can
   dominate short runs; `--cache` (experimental warm-start design cache) and
   `--artifact-compression` help repeated runs of an unchanged design.
