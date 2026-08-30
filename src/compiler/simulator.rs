@@ -27588,6 +27588,56 @@ impl Simulator {
                     producer.insert(w, i);
                 }
             }
+            // Optional co-activation gate: when XEZIM_COACT_FILE names an edge
+            // file from a census run of the SAME design, grow only along edges
+            // whose measured same-slot ratio clears XEZIM_COACT_MIN. Gating is
+            // required for the real transform anyway — ungated merging brings
+            // back the recompute waste that made bytecode fusion negative — so
+            // the interior share has to be measured under it, not without it.
+            let coact_min: f64 = std::env::var("XEZIM_COACT_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.9);
+            let coact: Option<std::collections::HashSet<(u32, u32)>> =
+                std::env::var("XEZIM_COACT_FILE").ok().and_then(|path| {
+                    let text = std::fs::read_to_string(&path).ok()?;
+                    let mut lines = text.lines();
+                    let file_n: usize =
+                        lines.next()?.strip_prefix("entries ")?.parse().ok()?;
+                    if file_n != n {
+                        eprintln!(
+                            "[CLUSTER-CENSUS] coact file has {file_n} entries, this run has {n}; ignoring"
+                        );
+                        return None;
+                    }
+                    let mut set = std::collections::HashSet::new();
+                    for l in lines {
+                        let mut it = l.split_whitespace();
+                        let (Some(a), Some(b), Some(r)) = (it.next(), it.next(), it.next())
+                        else {
+                            continue;
+                        };
+                        if let (Ok(a), Ok(b), Ok(r)) =
+                            (a.parse::<u32>(), b.parse::<u32>(), r.parse::<f64>())
+                        {
+                            if r >= coact_min {
+                                set.insert((a, b));
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[CLUSTER-CENSUS] coact-gated growth: {} edges at ratio >= {}",
+                        set.len(),
+                        coact_min
+                    );
+                    Some(set)
+                });
+            let edge_ok = |consumer: usize, producer: usize| -> bool {
+                match &coact {
+                    None => true,
+                    Some(set) => set.contains(&(consumer as u32, producer as u32)),
+                }
+            };
             // Consumers of each entry, so growth can follow dataflow in both
             // directions.
             let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -27648,13 +27698,13 @@ impl Simulator {
                     members += 1;
                     for &r in &entries[m].cold.read_signal_ids {
                         if let Some(&p) = producer.get(&r) {
-                            if !cluster_of.contains_key(&p) {
+                            if !cluster_of.contains_key(&p) && edge_ok(m, p) {
                                 queue.push_back(p);
                             }
                         }
                     }
                     for &c in &consumers[m] {
-                        if !cluster_of.contains_key(&c) {
+                        if !cluster_of.contains_key(&c) && edge_ok(c, m) {
                             queue.push_back(c);
                         }
                     }
