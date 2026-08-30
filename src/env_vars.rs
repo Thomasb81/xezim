@@ -200,6 +200,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_VALUE_TRACE_LIMIT", "Max Value-trace reports"),
     ("XEZIM_VCD_FULL", "VCD/FST: dump all scopes regardless of $dumpvars args"),
     ("XEZIM_VCD_PARAM_AS_WIRE", "VCD/FST: emit parameters as wires for viewer compatibility"),
+    ("XEZIM_VEC_CENSUS", "Census: size the per-bit comb-entry population coalescable into vector ops (R1)"),
     ("XEZIM_VERIFY_INLINE_BITS", "JIT: shadow-verify the inline-bits mirror against Values"),
     ("XEZIM_WAITERS_FIRST", "Scheduling: run event waiters before edge blocks (0/1)"),
     ("XEZIM_XZ_STATS", "Print X/Z-bit population statistics for the signal table"),
