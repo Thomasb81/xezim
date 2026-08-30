@@ -3147,6 +3147,12 @@ pub struct Simulator {
     /// every armed force per settle — 1.6% of an axi4Lite run).
     force_epoch_gen: u64,
     force_refresh_done_gen: u64,
+    /// XEZIM_NAME_STATS counters for the string-keyed read path (the UVM
+    /// "runtime IDs" investigation): which lookup site actually dominates.
+    /// 0=get_signal_value_by_name 1=resolve_hier_name 2=dyn_name_lookup
+    /// 3=instance_assoc_member 4=class-hierarchy method dispatch.
+    name_stats: [std::cell::Cell<u64>; 5],
+    name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
     /// Lazily-built leaf index over `module.parameters` for the bytecode
     /// compiler's suffix-match fallback (see `lookup_param_value`). Built
@@ -7564,6 +7570,8 @@ impl Simulator {
             any_struct_formal_markers: false,
             force_epoch_gen: 0,
             force_refresh_done_gen: 0,
+            name_stats: Default::default(),
+            name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
             param_leaf_index_cell: std::cell::OnceCell::new(),
             forced_names: HashSet::default(),
@@ -34312,6 +34320,14 @@ impl Simulator {
                 100.0 * (s - c) as f64 / s.max(1) as f64
             );
         }
+        if std::env::var("XEZIM_NAME_STATS").is_ok() {
+            let n = &self.name_stats;
+            eprintln!(
+                "[NAME-STATS] get_signal_by_name={} resolve_hier_name={} dyn_name_lookup={} instance_assoc_member={}",
+                n[0].get(), n[1].get(), n[2].get(), n[3].get()
+            );
+
+        }
         // Assertion + coverage summary (always when any data was recorded;
         // dump the JSON database iff XEZIM_COV_DB=<path> is set, else default
         // path xezim_cov.json when at least one stat exists).
@@ -51987,6 +52003,17 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // Every shape probe below used to re-resolve this same base
+                // identifier from scratch — up to ten resolutions, each with
+                // its own allocation, per indexed read. On an axi4Lite UVM run
+                // that was ~24M of the 52.8M total resolutions. Resolve once.
+                // Sound: for one AST node the result is idempotent — the
+                // memoized path deliberately skips the scope-hint ratchet, so
+                // the repeats were pure overhead, not a second decision.
+                let base_nm: Option<String> = match &expr.kind {
+                    ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                    _ => None,
+                };
                 // §7.4.6 / §11.5.1: an x/z index reads x at the ELEMENT width,
                 // NOT element 0. `to_u64`/`to_i64` mask x bits to zero and
                 // never fail, so every `unwrap_or` below silently addressed
@@ -51996,8 +52023,8 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &expr.kind
                     && Self::cond_expr_is_effect_free(index)
                 {
-                    let nm = self.resolve_hier_name(h);
-                    if let Some(&(_, _, ew)) = self.module.arrays.get(&nm) {
+                    let nm = base_nm.as_deref().unwrap_or("");
+                    if let Some(&(_, _, ew)) = self.module.arrays.get(nm) {
                         if self.eval_expr(index).has_xz() {
                             return Value::new(ew.max(1));
                         }
@@ -52065,11 +52092,11 @@ impl Simulator {
                 // `wire [1:0][7:0] w [0:1]`, `w[0]` indexes the UNPACKED
                 // dimension first and must stay on the existing path.
                 if let ExprKind::Ident(h) = &expr.kind {
-                    let nm = self.resolve_hier_name(h);
-                    if !self.module.arrays.contains_key(&nm)
-                        && self.signal_name_to_id.contains_key(nm.as_str())
+                    let nm = base_nm.as_deref().unwrap_or("");
+                    if !self.module.arrays.contains_key(nm)
+                        && self.signal_name_to_id.contains_key(nm)
                     {
-                        if let Some(&ew) = self.module.packed_signal_elem_widths.get(&nm) {
+                        if let Some(&ew) = self.module.packed_signal_elem_widths.get(nm) {
                             // `ew == 1` is a real element width when the inner
                             // packed dimension collapses (`[N-1:0][0:0]`, which
                             // a parameterized design produces when
@@ -52078,7 +52105,7 @@ impl Simulator {
                             let multi_packed = self
                                 .module
                                 .packed_full_dims
-                                .get(&nm)
+                                .get(nm)
                                 .is_some_and(|d| d.len() > 1);
                             if ew > 1 || multi_packed {
                                 // Extract here rather than delegating to
@@ -52089,7 +52116,7 @@ impl Simulator {
                                     let base_v = self.eval_expr(expr);
                                     if base_v.width as usize > ew as usize {
                                         if let Some(lo) =
-                                            self.packed_elem_lsb(&nm, i as i64, ew)
+                                            self.packed_elem_lsb(nm, i as i64, ew)
                                         {
                                             let hi = lo + ew as usize - 1;
                                             if hi < base_v.width as usize {
@@ -52259,8 +52286,8 @@ impl Simulator {
                 // label i is the MSB end, so it reads internal bit (W-1)-i
                 // (LRM §7.4.1, §11.5.1). Whole-value storage is normal.
                 if let ExprKind::Ident(h) = &expr.kind {
-                    let nm = self.resolve_hier_name(h);
-                    if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
+                    let nm = base_nm.as_deref().unwrap_or("");
+                    if let Some(w) = self.module.ascending_packed.get(nm).copied() {
                         let i = self.eval_expr(index).to_u64().unwrap_or(0) as u32;
                         let sig = self.eval_expr(expr);
                         if i < w {
@@ -52529,8 +52556,8 @@ impl Simulator {
                 // container size, not the string length — indexing that read
                 // the empty leading bytes and always returned 0.
                 if let ExprKind::Ident(hier) = &expr.kind {
-                    let nm = self.resolve_hier_name(hier);
-                    if self.string_signals.contains(&nm) {
+                    let nm = base_nm.as_deref().unwrap_or("");
+                    if self.string_signals.contains(nm) {
                         let content = self.eval_expr(expr).to_sv_string();
                         let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                         let byte = content.as_bytes().get(i).copied().unwrap_or(0);
@@ -67609,6 +67636,9 @@ impl Simulator {
     }
 
     fn resolve_hier_name(&self, hier: &HierarchicalIdentifier) -> String {
+        if self.name_stats_on {
+            self.name_stats[1].set(self.name_stats[1].get() + 1);
+        }
         // Per-process local dynamic arrays: resolve the bare name through the
         // current process's per-frame rename map and BYPASS the AST-node cache.
         // The cache is shared across concurrent processes (they share AST
@@ -75213,6 +75243,8 @@ impl Simulator {
     }
 
     fn get_signal_value_by_name(&self, name: &str) -> Option<Value> {
+        if self.name_stats_on { self.name_stats[0].set(self.name_stats[0].get() + 1); }
+
         // Mirror of the write path: a dotted name the innermost frame owns is a
         // member of a subroutine-local / formal unpacked struct and is read from
         // the frame, never from the module signal table.
@@ -76072,6 +76104,7 @@ impl Simulator {
     /// class property, or not a collection at all) — in which case callers
     /// should use `bare` as-is.
     fn dyn_name_lookup(&self, bare: &str) -> Option<&str> {
+        if self.name_stats_on { self.name_stats[2].set(self.name_stats[2].get() + 1); }
         // Walk frames innermost-first: a local dyn array declared in an
         // enclosing call frame is visible in nested scopes (matches how
         // inlined blocking calls share the caller's scope). A queue/assoc
@@ -88423,6 +88456,7 @@ impl Simulator {
     }
 
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
+        if self.name_stats_on { self.name_stats[3].set(self.name_stats[3].get() + 1); }
         // §8.9: `Cls::member` / flattened `Cls.member` spellings of a static
         // fixed array resolve to the declaring class's store BEFORE the
         // dotted-name guard below can reject them.
