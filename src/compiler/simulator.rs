@@ -27024,6 +27024,106 @@ impl Simulator {
                 opaque
             );
         }
+        // splitAlways census (XEZIM_SPLIT_CENSUS=1, analysis-only). Their
+        // `splitAlways` ("split combinatorial always blocks into single
+        // statement blocks") is Default Production, and it is the one gap
+        // that survives the per-firing filter: a block whose statements read
+        // disjoint inputs currently re-runs ALL of them whenever ANY input
+        // changes. Splitting narrows each piece's sensitivity.
+        //
+        // Payoff proxy: for a block with read set R and top-level statements
+        // s_i with read sets R_i, an input change today costs the whole
+        // block; after splitting it costs only the statements that read it.
+        // `work_ratio` = sum|R_i| / (n * |R|) approximates the post-split
+        // cost as a fraction of today's, under uniform input activity.
+        if std::env::var("XEZIM_SPLIT_CENSUS").is_ok() {
+            let mut comb_always = 0usize;
+            let mut multi_stmt = 0usize;
+            let mut splittable = 0usize;   // >=2 stmts AND some disjointness
+            let mut legal_split = 0usize;  // ... AND legal to split (see below)
+            let mut stmts_total = 0usize;
+            let mut ratio_sum = 0.0f64;
+            let mut ratio_n = 0usize;
+            let mut best: Vec<(f64, usize, usize)> = Vec::new(); // ratio, stmts, |R|
+            for ab in self.module.always_blocks.iter() {
+                let is_comb = matches!(
+                    ab.kind,
+                    crate::ast::decl::AlwaysKind::AlwaysComb
+                        | crate::ast::decl::AlwaysKind::AlwaysLatch
+                        | crate::ast::decl::AlwaysKind::Always
+                );
+                if !is_comb {
+                    continue;
+                }
+                comb_always += 1;
+                let StatementKind::SeqBlock { stmts, .. } = &ab.stmt.kind else {
+                    continue;
+                };
+                if stmts.len() < 2 {
+                    continue;
+                }
+                multi_stmt += 1;
+                stmts_total += stmts.len();
+                let mut whole: HashSet<String> = HashSet::default();
+                let mut w = HashSet::default();
+                Self::collect_stmt_reads(&ab.stmt, &self.module, &mut whole, &mut w);
+                if whole.is_empty() {
+                    continue;
+                }
+                let mut per_sum = 0usize;
+                let mut disjoint = false;
+                let mut prev: Vec<HashSet<String>> = Vec::new();
+                let mut prev_w: Vec<HashSet<String>> = Vec::new();
+                // A split is only LEGAL when the statements are independent:
+                // no two write the same signal (else the split creates a
+                // multi-driver — the `y = '0; if (c) y = a;` default-
+                // assignment idiom is exactly this), and no statement reads
+                // what another writes (intra-block dataflow).
+                let mut legal = true;
+                for st in stmts.iter() {
+                    let mut r: HashSet<String> = HashSet::default();
+                    let mut w2: HashSet<String> = HashSet::default();
+                    Self::collect_stmt_reads(st, &self.module, &mut r, &mut w2);
+                    per_sum += r.len();
+                    if prev.iter().any(|p| p.is_disjoint(&r)) {
+                        disjoint = true;
+                    }
+                    for pw in prev_w.iter() {
+                        if !pw.is_disjoint(&w2) || !pw.is_disjoint(&r) {
+                            legal = false;
+                        }
+                    }
+                    for pr in prev.iter() {
+                        if !pr.is_disjoint(&w2) {
+                            legal = false;
+                        }
+                    }
+                    prev.push(r);
+                    prev_w.push(w2);
+                }
+                if legal {
+                    legal_split += 1;
+                }
+                let ratio = per_sum as f64 / (stmts.len() as f64 * whole.len() as f64);
+                ratio_sum += ratio;
+                ratio_n += 1;
+                if disjoint {
+                    splittable += 1;
+                }
+                best.push((ratio, stmts.len(), whole.len()));
+            }
+            best.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!(
+                "[SPLIT-CENSUS] comb always blocks={} | multi-statement={} | disjoint reads={} | LEGALLY splittable={} | total top-level stmts={}",
+                comb_always, multi_stmt, splittable, legal_split, stmts_total
+            );
+            eprintln!(
+                "[SPLIT-CENSUS] mean work_ratio after split = {:.3} (1.0 = no gain, lower is better) over {} blocks; best 5: {:?}",
+                if ratio_n > 0 { ratio_sum / ratio_n as f64 } else { 1.0 },
+                ratio_n,
+                &best[..best.len().min(5)]
+            );
+        }
         // Constant-propagation census (XEZIM_CONST_CENSUS=1, analysis-only).
         // Their `replaceCA`/`backReplaceCA`/`replaceReg` family is Default
         // Production and their c906 log reports "Propagated 8429 values
