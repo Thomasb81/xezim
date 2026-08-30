@@ -26933,6 +26933,246 @@ impl Simulator {
             }
         }
 
+        // Dead-cone census (XEZIM_DEAD_CENSUS=1, analysis-only). Their
+        // `removeUnref` ("Hanging Logic Optimization") is Default Production
+        // and xezim has no equivalent. Count comb entries whose outputs
+        // nothing observable reads, closed transitively.
+        //
+        // CAVEAT, stated in the output: reads from PROCESS/AST code (initial
+        // blocks, delayed always, tasks, $display args) and from dump/VPI are
+        // not modelled here, so this is an UPPER BOUND. It exists to decide
+        // whether a precise implementation is worth building.
+        if std::env::var("XEZIM_DEAD_CENSUS").is_ok() {
+            use super::bytecode::Insn as DI;
+            let mut observed: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            let mut opaque = 0usize;
+            for (bi, cb) in self.compiled_edge_blocks.iter().enumerate() {
+                if let Some(b) = self.edge_blocks.get(bi) {
+                    for t in &b.resolved_sensitivities {
+                        observed.insert(t.signal_id);
+                    }
+                }
+                match cb {
+                    None => opaque += 1,
+                    Some(cb) if cb.has_fallback => opaque += 1,
+                    Some(cb) => {
+                        for ins in cb.instructions.iter() {
+                            match ins {
+                                DI::LoadSignal(_, sig)
+                                | DI::LoadSignalSigned(_, sig)
+                                | DI::LoadSignalBit(_, sig, _)
+                                | DI::LoadSignalRange(_, sig, _, _)
+                                | DI::BranchIfSignalFalse(sig, _, _) => {
+                                    observed.insert(*sig as usize);
+                                }
+                                DI::NbaAssignArrayRead(_, _, idx, _) => {
+                                    observed.insert(*idx as usize);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            let mut alive: Vec<bool> = vec![true; entries.len()];
+            let mut dead_rounds = 0usize;
+            for _round in 0..32 {
+                let mut reads: std::collections::HashSet<usize> = observed.clone();
+                for (i, e) in entries.iter().enumerate() {
+                    if !alive[i] {
+                        continue;
+                    }
+                    for &r in &e.cold.read_signal_ids {
+                        reads.insert(r);
+                    }
+                }
+                let mut changed = false;
+                for (i, e) in entries.iter().enumerate() {
+                    if !alive[i] || e.cold.write_signal_ids.is_empty() {
+                        continue;
+                    }
+                    if e.cold.write_signal_ids.iter().all(|w| !reads.contains(w)) {
+                        alive[i] = false;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+                dead_rounds += 1;
+            }
+            let dead = alive.iter().filter(|a| !**a).count();
+            eprintln!(
+                "[DEAD-CENSUS] reader-visibility probe: initial_blocks={} always_blocks={} pending_initial={} pending_always={} tasks={} fns={} | dumps vcd={} fst={} xtrace={}",
+                self.module.initial_blocks.len(),
+                self.module.always_blocks.len(),
+                self.module.pending_initial.len(),
+                self.module.pending_always.len(),
+                self.module.tasks.len(),
+                self.module.functions.len(),
+                self.vcd_file.is_some(),
+                self.fst_file.is_some(),
+                self.xtrace_file.is_some(),
+            );
+            eprintln!(
+                "[DEAD-CENSUS] UPPER BOUND (process/AST/dump reads NOT modelled): dead={} of {} comb entries ({:.1}%), {} rounds, opaque_edge={}",
+                dead,
+                entries.len(),
+                100.0 * dead as f64 / entries.len().max(1) as f64,
+                dead_rounds,
+                opaque
+            );
+        }
+        // Constant-propagation census (XEZIM_CONST_CENSUS=1, analysis-only).
+        // Their `replaceCA`/`backReplaceCA`/`replaceReg` family is Default
+        // Production and their c906 log reports "Propagated 8429 values
+        // through CAs". Size the same population here: nets whose driving
+        // comb entry reads NOTHING (so its output never changes after t0),
+        // transitively closed, then count the reader LOAD sites those
+        // constants would turn into immediates.
+        if std::env::var("XEZIM_CONST_CENSUS").is_ok() {
+            use super::bytecode::Insn as CI;
+            // Signals any EDGE block writes are not constant. An edge block
+            // without a compiled body could write anything, so treat the
+            // whole census as unreliable if one exists (report it).
+            let mut edge_written: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            let mut opaque_edge = 0usize;
+            for cb in self.compiled_edge_blocks.iter() {
+                match cb {
+                    None => opaque_edge += 1,
+                    Some(cb) if cb.has_fallback => opaque_edge += 1,
+                    Some(cb) => {
+                        for ins in cb.instructions.iter() {
+                            match ins {
+                                CI::NbaAssign(sig, ..)
+                                | CI::NbaAssignConst(sig, ..)
+                                | CI::NbaAssignRange(sig, ..)
+                                | CI::NbaAssignRangeDyn(sig, ..)
+                                | CI::NbaAssignBitDyn(sig, ..)
+                                | CI::NbaAssignArrayRead(sig, ..)
+                                | CI::BlockingAssign(sig, ..)
+                                | CI::BlockingAssignRange(sig, ..)
+                                | CI::BlockingAssignRangeDyn(sig, ..)
+                                | CI::BlockingAssignBitDyn(sig, ..)
+                                | CI::BlockingAssignString(sig, ..) => {
+                                    edge_written.insert(*sig as usize);
+                                }
+                                CI::NbaAssignArray(arr, ..)
+                                | CI::NbaAssignArrayRange(arr, ..)
+                                | CI::BlockingAssignArray(arr, ..)
+                                | CI::BlockingAssignArrayRange(arr, ..) => {
+                                    if let super::bytecode::ArrayOperand::Dense {
+                                        first_id,
+                                        lo,
+                                        hi,
+                                        ..
+                                    } = arr.as_ref()
+                                    {
+                                        let n = (hi - lo).unsigned_abs() as usize + 1;
+                                        for k in 0..n {
+                                            edge_written.insert(first_id + k);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            let mut comb_writers: HashMap<usize, u32> = HashMap::default();
+            for e in entries.iter() {
+                for &w in &e.cold.write_signal_ids {
+                    *comb_writers.entry(w).or_insert(0) += 1;
+                }
+            }
+            let single_and_free = |w: usize| -> bool {
+                comb_writers.get(&w).copied().unwrap_or(0) == 1 && !edge_written.contains(&w)
+            };
+            let mut constant: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            let mut const_entries = 0usize;
+            let mut seeds = 0usize;
+            for _round in 0..16 {
+                let mut changed = false;
+                for e in entries.iter() {
+                    if e.has_unresolved_reads || e.cold.write_signal_ids.is_empty() {
+                        continue;
+                    }
+                    if !e.cold.write_signal_ids.iter().all(|&w| single_and_free(w)) {
+                        continue;
+                    }
+                    if e.cold.write_signal_ids.iter().all(|w| constant.contains(w)) {
+                        continue;
+                    }
+                    let all_const_reads =
+                        e.cold.read_signal_ids.iter().all(|r| constant.contains(r));
+                    if !all_const_reads {
+                        continue;
+                    }
+                    if e.cold.read_signal_ids.is_empty() {
+                        seeds += 1;
+                    }
+                    for &w in &e.cold.write_signal_ids {
+                        constant.insert(w);
+                    }
+                    const_entries += 1;
+                    changed = true;
+                }
+                if !changed {
+                    break;
+                }
+            }
+            // Reader payoff: load sites that would become immediates.
+            let mut load_sites = 0usize;
+            let mut blocks_touched = 0usize;
+            let mut count_loads = |cb: &super::bytecode::CompiledBlock| {
+                let mut hit = 0usize;
+                for ins in cb.instructions.iter() {
+                    let sig = match ins {
+                        CI::LoadSignal(_, sig)
+                        | CI::LoadSignalSigned(_, sig)
+                        | CI::LoadSignalBit(_, sig, _)
+                        | CI::LoadSignalRange(_, sig, _, _) => Some(*sig as usize),
+                        _ => None,
+                    };
+                    if let Some(sig) = sig {
+                        if constant.contains(&sig) {
+                            hit += 1;
+                        }
+                    }
+                }
+                if hit > 0 {
+                    blocks_touched += 1;
+                    load_sites += hit;
+                }
+            };
+            for e in entries.iter() {
+                match &e.item {
+                    CombItem::CompiledContAssign { compiled }
+                    | CombItem::CompiledAlwaysBlock { compiled, .. } => count_loads(compiled),
+                    _ => {}
+                }
+            }
+            for cb in self.compiled_edge_blocks.iter().flatten() {
+                count_loads(cb);
+            }
+            eprintln!(
+                "[CONST-CENSUS] const_nets={} from {} entries ({} seed, no-read) | opaque_edge_blocks={}",
+                constant.len(),
+                const_entries,
+                seeds,
+                opaque_edge
+            );
+            eprintln!(
+                "[CONST-CENSUS] reader payoff: {} load sites in {} blocks would fold to immediates (of {} comb entries)",
+                load_sites,
+                blocks_touched,
+                entries.len()
+            );
+        }
         // R1 census (XEZIM_VEC_CENSUS=1, analysis-only): size the population
         // of per-bit comb entries that could re-coalesce into vector ops —
         // groups doing the SAME operation on same-offset bit slices of the
