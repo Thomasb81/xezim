@@ -3161,7 +3161,7 @@ pub struct Simulator {
     /// `Some(class)` = static fixed array owned by that class.
     #[allow(clippy::type_complexity)]
     class_coll_index: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
-    name_stats: [std::cell::Cell<u64>; 4],
+    name_stats: [std::cell::Cell<u64>; 5],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
     /// Lazily-built leaf index over `module.parameters` for the bytecode
@@ -34342,9 +34342,10 @@ impl Simulator {
         if std::env::var("XEZIM_NAME_STATS").is_ok() {
             let n = &self.name_stats;
             eprintln!(
-                "[NAME-STATS] get_signal_by_name={} resolve_hier_name={} frames_pushed={} frame_locals={} (mean {:.1} entries/frame)",
+                "[NAME-STATS] get_signal_by_name={} resolve_hier_name={} frames_pushed={} class_prop_reads={} (mean {:.2}/resolve) frame_gets={}",
                 n[0].get(), n[1].get(), n[2].get(), n[3].get(),
-                n[3].get() as f64 / n[2].get().max(1) as f64
+                n[3].get() as f64 / n[1].get().max(1) as f64,
+                n[4].get()
             );
 
         }
@@ -46653,7 +46654,7 @@ impl Simulator {
         // and the matching read returned an outer scope's value.
         if !self.local_stack.is_empty() {
             if let Some(key) = self.frame_leaf_key_of(lhs) {
-                let prev = self.local_stack.last().and_then(|l| l.get(&key)).cloned();
+                let prev = self.frame_get(&key).cloned();
                 let fitted = match prev.as_ref() {
                     Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
                     Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
@@ -50200,7 +50201,7 @@ impl Simulator {
         }
         if !self.local_stack.is_empty() {
             if let Some(key) = self.frame_leaf_key_of(expr) {
-                if let Some(v) = self.local_stack.last().and_then(|l| l.get(&key)) {
+                if let Some(v) = self.frame_get(&key) {
                     return v.clone();
                 }
             }
@@ -50690,6 +50691,9 @@ impl Simulator {
                                 self.read_whole_struct_class_prop(handle, key)
                             {
                                 return v;
+                            }
+                            if self.name_stats_on {
+                                self.name_stats[3].set(self.name_stats[3].get() + 1);
                             }
                             if let Some(Some(instance)) = self.heap.get(handle) {
                                 if let Some(val) = instance.properties.get(key) {
@@ -75275,7 +75279,7 @@ impl Simulator {
         // member of a subroutine-local / formal unpacked struct and is read from
         // the frame, never from the module signal table.
         if name.contains('.') {
-            if let Some(v) = self.local_stack.last().and_then(|l| l.get(name)) {
+            if let Some(v) = self.frame_get(name) {
                 return Some(v.clone());
             }
             // §23.7/§4c: `<top>.<sig>` names the TOP MODULE's own variable —
@@ -75397,7 +75401,7 @@ impl Simulator {
                 .last()
                 .is_some_and(|l| l.contains_key(name))
             {
-                let fitted = match self.local_stack.last().and_then(|l| l.get(name)) {
+                let fitted = match self.frame_get(name) {
                     Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
                     Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
                     _ => val,
@@ -80362,7 +80366,6 @@ impl Simulator {
     fn push_local_frame(&mut self, f: HashMap<String, Value>) {
         if self.name_stats_on {
             self.name_stats[2].set(self.name_stats[2].get() + 1);
-            self.name_stats[3].set(self.name_stats[3].get() + f.len() as u64);
         }
         self.local_stack.push(f);
         self.local_type_stack
@@ -80386,6 +80389,18 @@ impl Simulator {
     fn pop_local_frame_take(&mut self) -> Option<HashMap<String, Value>> {
         self.local_type_stack.pop();
         self.local_stack.pop()
+    }
+
+    /// Read a name from the innermost subroutine frame. Routing the frame
+    /// reads through one place makes their cost measurable (XEZIM_NAME_STATS
+    /// slot 4) — frames hold a mean of 1.8 entries, so whether hashing a
+    /// String key is worth it at all is an empirical question.
+    #[inline]
+    fn frame_get(&self, name: &str) -> Option<&Value> {
+        if self.name_stats_on {
+            self.name_stats[4].set(self.name_stats[4].get() + 1);
+        }
+        self.local_stack.last().and_then(|l| l.get(name))
     }
 
     /// A frame map from the pool (capacity retained) or a fresh one.
@@ -94006,7 +94021,7 @@ impl Simulator {
                 if self.static_local_names.contains(&local_name) {
                     continue;
                 }
-                if let Some(v) = self.local_stack.last().and_then(|l| l.get(&local_name)) {
+                if let Some(v) = self.frame_get(&local_name) {
                     self.static_local_vars.insert(key, v.clone());
                 }
             }
