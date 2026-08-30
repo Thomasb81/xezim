@@ -40,6 +40,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_CHAIN_CENSUS", "Phase 2: size the single-fanout chain clustering opportunity (count, lengths, dynamic coverage)"),
     ("XEZIM_CLKTREE_PROBE", "Clock tree: print the detected clock-tree roots and gating structure"),
     ("XEZIM_CLKTREE_STATS", "Clock tree: print dedup statistics for derived clock signals"),
+    ("XEZIM_CLUSTER_CENSUS", "Census: form comb clusters and report how many written nets could stay local (native-clustering gate)"),
     ("XEZIM_COACT_CENSUS", "Phase 2: per-dep-edge same-slot co-activation stats; sizes convex-cluster fusion (wants profiling on)"),
     ("XEZIM_COACT_FILE", "Phase 2: coact census writes per-edge ratios here; region fusion reads it to gate merging"),
     ("XEZIM_COACT_MIN", "Phase 2: minimum same-slot ratio for a fusion edge (default 0.9)"),
