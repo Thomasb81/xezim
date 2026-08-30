@@ -3,10 +3,10 @@
 //!
 //! * `XEZIM_BUF_COLLAPSE` — folds whole-net identity continuous assigns
 //!   (`assign y = x;`) onto their source net, the analogue of the reference
-//!   optimizer's Default-Production `mergeClk`;
+//!   optimizer's default clock-net merging;
 //! * `XEZIM_EDGE_MERGE=<N>` — merges edge blocks that share an identical
-//!   sensitivity into one compiled block, the analogue of their `merge` /
-//!   `coalesceAlways`.
+//!   sensitivity into one compiled block, the analogue of their default
+//!   process-merging pass.
 //!
 //! Both rewrite the design before compilation, so the property that matters
 //! is that they change NOTHING observable. Each test runs the same source
