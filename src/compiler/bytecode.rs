@@ -2379,6 +2379,18 @@ impl<'a> BytecodeCompiler<'a> {
                         if h.path.iter().all(|s| s.selects.is_empty()))
                         && expr_simple(index)
                 }
+                // `arr[i].m` / `s.m` on a packed struct: the assign arms
+                // splice the member's static bit range, so the same two base
+                // shapes above are what they can resolve.
+                ExprKind::MemberAccess { expr, .. } => match &expr.kind {
+                    ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
+                    ExprKind::Index { expr: base, index } => {
+                        matches!(&base.kind, ExprKind::Ident(h)
+                            if h.path.iter().all(|s| s.selects.is_empty()))
+                            && expr_simple(index)
+                    }
+                    _ => false,
+                },
                 _ => false,
             }
         };
@@ -2388,6 +2400,10 @@ impl<'a> BytecodeCompiler<'a> {
                     ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
                     _ => None,
                 },
+                // See through `.m` so `arr[i].m <= arr[i].m + 1` still reaches
+                // the self-read audit below — widening lv_simple without this
+                // would let exactly the aliasing case it guards slip through.
+                ExprKind::MemberAccess { expr, .. } => lv_base_name(expr),
                 _ => None,
             }
         }
@@ -2404,6 +2420,7 @@ impl<'a> BytecodeCompiler<'a> {
                     ),
                     _ => None,
                 },
+                ExprKind::MemberAccess { expr, .. } => lv_base_full(expr),
                 _ => None,
             }
         }
@@ -8063,11 +8080,76 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Resolve `arr[i].m` into the operands an array-range store needs:
+    /// (array, index reg, hi reg, lo reg, value resized to the member width).
+    /// An indexed base keeps the lvalue a `MemberAccess` node — only the bare
+    /// `s.m` form collapses to a dotted `Ident` — so both the NBA and the
+    /// blocking arm land here. Shared so the two cannot drift apart, which
+    /// this member/container pair has done twice.
+    ///
+    /// Emits the index and constant loads, so a `None` after that point would
+    /// leave dead insns behind; every caller bails the whole block on `None`,
+    /// which discards them.
+    fn packed_array_member_store(
+        &mut self,
+        base: &Expression,
+        member: &str,
+        val_reg: RegId,
+    ) -> Option<(Box<ArrayOperand>, RegId, RegId, RegId, RegId)> {
+        let ExprKind::Index {
+            expr: arr_expr,
+            index,
+        } = &base.kind
+        else {
+            return None;
+        };
+        let ExprKind::Ident(hier) = &arr_expr.kind else {
+            return None;
+        };
+        let (_, fields) = self.packed_struct_layout_for_hier(hier)?;
+        let &(_, off, mw) = fields.iter().find(|(m, _, _)| m == member)?;
+        if mw == 0 {
+            return None;
+        }
+        let name = self.lookup_array_name(hier)?;
+        let idx_reg = self.compile_expr(index, 0)?;
+        let resized = self.alloc_reg();
+        self.emit(Insn::Move(resized, val_reg));
+        self.emit(Insn::Resize(resized, mw));
+        let hi_reg = self.alloc_reg();
+        self.emit(Insn::LoadConst(
+            hi_reg,
+            Box::new(Value::from_u64((off + mw - 1) as u64, 32)),
+        ));
+        let lo_reg = self.alloc_reg();
+        self.emit(Insn::LoadConst(
+            lo_reg,
+            Box::new(Value::from_u64(off as u64, 32)),
+        ));
+        Some((self.array_operand(name), idx_reg, hi_reg, lo_reg, resized))
+    }
+
     fn compile_nba_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.emit(Insn::NbaAssign(as_sig_id(id), val_reg, width));
+                    true
+                } else if let Some((base_id, off, mw)) = self.packed_struct_member_target(hier) {
+                    // Packed-struct member NBA (`s.m0 <= …`): mirror of the
+                    // blocking arm — splice into `[off + mw - 1 : off]` of the
+                    // container. Range NBAs compose onto a pending nba_fast
+                    // entry, so several members of one container written in the
+                    // same cycle each keep their own slice.
+                    let resized = self.alloc_reg();
+                    self.emit(Insn::Move(resized, val_reg));
+                    self.emit(Insn::Resize(resized, mw));
+                    self.emit(Insn::NbaAssignRange(
+                        as_sig_id(base_id),
+                        off + mw - 1,
+                        off,
+                        resized,
+                    ));
                     true
                 } else {
                     self.bail("nba_ident_unresolved");
@@ -8390,7 +8472,18 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 true
             }
-            ExprKind::MemberAccess { .. } => {
+            ExprKind::MemberAccess { expr, member } => {
+                // `arr[i].m <= v`: splice the member's static bit range into
+                // the selected ELEMENT, via the same NbaAssignArrayRange the
+                // `arr[i][hi:lo]` form uses.
+                if let Some((array, idx_reg, hi_reg, lo_reg, resized)) =
+                    self.packed_array_member_store(expr, &member.name, val_reg)
+                {
+                    self.emit(Insn::NbaAssignArrayRange(
+                        array, idx_reg, hi_reg, lo_reg, resized,
+                    ));
+                    return true;
+                }
                 self.bail("nba_member_access");
                 false
             }
@@ -8559,6 +8652,15 @@ impl<'a> BytecodeCompiler<'a> {
                             return true;
                         }
                     }
+                }
+                // `arr[i].m = v` — same operands as the NBA arm.
+                if let Some((array, idx_reg, hi_reg, lo_reg, resized)) =
+                    self.packed_array_member_store(expr, &member.name, val_reg)
+                {
+                    self.emit(Insn::BlockingAssignArrayRange(
+                        array, idx_reg, hi_reg, lo_reg, resized,
+                    ));
+                    return true;
                 }
                 self.bail("blocking_target_member_access");
                 false

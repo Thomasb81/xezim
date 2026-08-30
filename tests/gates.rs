@@ -21,6 +21,8 @@ mod dump_merged_sv;
 mod fst_roundtrip;
 #[path = "gates/opt_pass_equivalence.rs"]
 mod opt_pass_equivalence;
+#[path = "gates/packed_member_nba_compiles.rs"]
+mod packed_member_nba_compiles;
 #[path = "gates/specify_flags.rs"]
 mod specify_flags;
 #[path = "gates/tran_and_implicit_nets.rs"]
