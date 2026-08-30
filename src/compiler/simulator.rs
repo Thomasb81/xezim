@@ -26660,6 +26660,187 @@ impl Simulator {
             }
         }
 
+        // R1 census (XEZIM_VEC_CENSUS=1, analysis-only): size the population
+        // of per-bit comb entries that could re-coalesce into vector ops —
+        // groups doing the SAME operation on same-offset bit slices of the
+        // same parent vectors. Census-first per project discipline.
+        if std::env::var("XEZIM_VEC_CENSUS").is_ok() {
+            use super::bytecode::Insn as VI;
+            #[derive(Hash, PartialEq, Eq)]
+            struct VKey {
+                dst: u32,
+                shape: String,
+                srcs: Vec<u32>,
+                offs: Vec<i64>,
+            }
+            let mut buckets: std::collections::HashMap<VKey, Vec<u32>> =
+                std::collections::HashMap::new();
+            let mut n_entries = 0usize;
+            let mut n_gate_vecdst = 0usize;
+            let mut n_gate_scalar = 0usize;
+            let mut n_bitca = 0usize;
+            let mut n_small_unmatched = 0usize;
+            let gate_dst = |b: &BitRef| (b.sig_id, b.bit);
+            for e in entries.iter() {
+                n_entries += 1;
+                match &e.item {
+                    CombItem::FusedGate { op } => {
+                        let (dst, dbit, shape, srcs): (u32, u32, String, Vec<(u32, u32)>) =
+                            match op {
+                                FusedGate::Buf1 { dst, src, invert } => (
+                                    gate_dst(dst).0,
+                                    gate_dst(dst).1,
+                                    format!("buf{}", if *invert { "~" } else { "" }),
+                                    vec![(src.sig_id, src.bit)],
+                                ),
+                                FusedGate::Bin2 { dst, a, b, op, invert } => (
+                                    gate_dst(dst).0,
+                                    gate_dst(dst).1,
+                                    format!("{:?}{}", op, if *invert { "~" } else { "" }),
+                                    vec![(a.sig_id, a.bit), (b.sig_id, b.bit)],
+                                ),
+                                FusedGate::Mux2 { dst, s, t, e } => (
+                                    gate_dst(dst).0,
+                                    gate_dst(dst).1,
+                                    "mux2".to_string(),
+                                    vec![
+                                        (s.sig_id, s.bit),
+                                        (t.sig_id, t.bit),
+                                        (e.sig_id, e.bit),
+                                    ],
+                                ),
+                                FusedGate::UdpLut3 { dst, .. } => (
+                                    gate_dst(dst).0,
+                                    gate_dst(dst).1,
+                                    "udp3".to_string(),
+                                    Vec::new(),
+                                ),
+                            };
+                        let dw = self.signal_widths.get(dst as usize).copied().unwrap_or(1);
+                        if dw <= 1 {
+                            n_gate_scalar += 1;
+                            continue;
+                        }
+                        n_gate_vecdst += 1;
+                        let key = VKey {
+                            dst,
+                            shape,
+                            srcs: srcs.iter().map(|(s, _)| *s).collect(),
+                            offs: srcs
+                                .iter()
+                                .map(|(_, b)| *b as i64 - dbit as i64)
+                                .collect(),
+                        };
+                        buckets.entry(key).or_default().push(dbit);
+                    }
+                    CombItem::CompiledContAssign { compiled }
+                        if compiled.instructions.len() <= 10 =>
+                    {
+                        // Linear extract: reg -> (parent, bit) loads, opcode
+                        // trail, final single-bit store.
+                        let mut loads: Vec<(u32, u32)> = Vec::new();
+                        let mut shape = String::new();
+                        let mut store: Option<(u32, u32)> = None;
+                        let mut ok = true;
+                        for ins in compiled.instructions.iter() {
+                            match ins {
+                                VI::LoadSignalBit(_, id, b) => loads.push((*id, *b)),
+                                VI::LoadSignalRange(_, id, l, r) if l == r => {
+                                    loads.push((*id, *l))
+                                }
+                                VI::LoadSignal(_, id)
+                                    if self
+                                        .signal_widths
+                                        .get(*id as usize)
+                                        .is_some_and(|&w| w == 1) =>
+                                {
+                                    loads.push((*id, 0))
+                                }
+                                VI::BitAnd(..) => shape.push('&'),
+                                VI::BitOr(..) => shape.push('|'),
+                                VI::BitXor(..) => shape.push('^'),
+                                VI::BitNot(..) => shape.push('~'),
+                                VI::Move(..) | VI::MoveResize(..) | VI::Resize(..) => {}
+                                VI::BlockingAssignRange(id, hi, lo, _) if hi == lo => {
+                                    store = Some((*id, *hi));
+                                }
+                                VI::BlockingAssign(id, _, w)
+                                    if *w == 1
+                                        && self
+                                            .signal_widths
+                                            .get(*id as usize)
+                                            .is_some_and(|&sw| sw == 1) =>
+                                {
+                                    store = Some((*id, 0));
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        let Some((dst, dbit)) = store else {
+                            n_small_unmatched += 1;
+                            continue;
+                        };
+                        if !ok || loads.is_empty() {
+                            n_small_unmatched += 1;
+                            continue;
+                        }
+                        let dw = self.signal_widths.get(dst as usize).copied().unwrap_or(1);
+                        if dw <= 1 {
+                            n_gate_scalar += 1;
+                            continue;
+                        }
+                        n_bitca += 1;
+                        if shape.is_empty() {
+                            shape.push('=');
+                        }
+                        let key = VKey {
+                            dst,
+                            shape,
+                            srcs: loads.iter().map(|(s, _)| *s).collect(),
+                            offs: loads
+                                .iter()
+                                .map(|(_, b)| *b as i64 - dbit as i64)
+                                .collect(),
+                        };
+                        buckets.entry(key).or_default().push(dbit);
+                    }
+                    _ => {}
+                }
+            }
+            let mut sizes: Vec<(usize, &VKey)> =
+                buckets.iter().map(|(k, v)| (v.len(), k)).collect();
+            sizes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let coalescable: usize = sizes.iter().filter(|(n, _)| *n >= 2).map(|(n, _)| n).sum();
+            let groups = sizes.iter().filter(|(n, _)| *n >= 2).count();
+            eprintln!(
+                "[VEC-CENSUS] entries={} bit-entries: gate_vecdst={} bitca={} gate_scalar={} small_unmatched={}",
+                n_entries, n_gate_vecdst, n_bitca, n_gate_scalar, n_small_unmatched
+            );
+            eprintln!(
+                "[VEC-CENSUS] coalescable={} in {} groups (>=2 members) -> ratio {:.1}x on that set",
+                coalescable,
+                groups,
+                coalescable as f64 / groups.max(1) as f64
+            );
+            for (n, k) in sizes.iter().take(12) {
+                let name = self
+                    .id_to_name
+                    .get(k.dst as usize)
+                    .map(|s| s.as_ref())
+                    .unwrap_or("?");
+                eprintln!(
+                    "[VEC-CENSUS]   members={:5} dst={} shape={} srcs={} offs={:?}",
+                    n,
+                    name,
+                    k.shape,
+                    k.srcs.len(),
+                    k.offs
+                );
+            }
+        }
         // Step 9 (comb-region fusion, opt-in XEZIM_REGIONS=1): fuse
         // dependency-connected COMPILED comb entries into one larger
         // compiled block, so a value hop between members skips the whole
