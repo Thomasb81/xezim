@@ -12170,23 +12170,55 @@ impl Simulator {
         // from each declaring class's `static_assoc_key_types` so a
         // `static T map[string]` gets string storage (hashing the bare name
         // as NUMERIC would corrupt foreach()/first()/next()).
-        // A static-collection bare name declared by MORE THAN ONE class must be
-        // stored per DECLARING class (§8.9) — compute that set up front.
+        let static_cols: Vec<(String, bool, u32, bool)> = self
+            .module
+            .classes
+            .values()
+            .flat_map(|cd| {
+                cd.static_collections
+                    .iter()
+                    .map(move |(name, is_assoc, width)| {
+                        let is_str = cd
+                            .static_assoc_key_types
+                            .get(name)
+                            .map(|kt| kt == "string")
+                            .unwrap_or(false);
+                        (name.clone(), *is_assoc, *width, is_str)
+                    })
+            })
+            .collect();
+        // A static-collection bare name declared by TWO SIBLING classes must
+        // be stored per DECLARING class (§8.9) — compute that set up front.
+        // A name is colliding iff two classes declaring it are NOT in an
+        // ancestor/descendant relationship (a base+subclass pair like
+        // `uvm_sequence_library` / `simple_seq_lib` shares one cell and is not
+        // a collision). `module.classes` is fully populated here.
         let mut colliding_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        let mut name_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for cd in self.module.classes.values() {
-            let mut seen: Vec<&str> = Vec::new();
-            for (nm, _, _) in &cd.static_collections {
-                if !seen.contains(&nm.as_str()) {
-                    *name_counts.entry(nm.as_str()).or_insert(0) += 1;
-                    seen.push(nm.as_str());
+        let name_counts: std::collections::HashMap<&str, Vec<&str>> =
+            self.module.classes.values().fold(
+                std::collections::HashMap::new(),
+                |mut acc, cd| {
+                    let mut seen: Vec<&str> = Vec::new();
+                    for (nm, _, _) in &cd.static_collections {
+                        if !seen.contains(&nm.as_str()) {
+                            acc.entry(nm.as_str()).or_default().push(&cd.name);
+                            seen.push(nm.as_str());
+                        }
+                    }
+                    acc
+                },
+            );
+        for (nm, classes) in &name_counts {
+            let mut collides = false;
+            for (i, a) in classes.iter().enumerate() {
+                for b in &classes[i + 1..] {
+                    if !self.class_is_a(a, b) && !self.class_is_a(b, a) {
+                        collides = true;
+                    }
                 }
             }
-        }
-        for (nm, c) in name_counts {
-            if c >= 2 {
+            if collides {
                 colliding_names.insert(nm.to_string());
             }
         }
@@ -68846,7 +68878,14 @@ impl Simulator {
                 let member = &hier.path[1].name.name;
                 if self.member_is_static_coll(&cls, member) {
                     if let Some(key) = self.static_prop_key(&cls, member) {
-                        if key.contains('#') || self.static_coll_name_collides(member) {
+                        // Sibling-class collision: the bare name is stored per
+                        // DECLARING class. NOT the `#spec` case here — that is
+                        // handled by the typedef-alias block above and by
+                        // `spec_static_coll_key`, and intercepting it would
+                        // split storage for a parameterized subclass
+                        // (`simple_seq_lib::typewide` reading a per-spec key
+                        // that registration writes under the bare name).
+                        if self.static_coll_name_collides(member) {
                             return key;
                         }
                     }
@@ -89609,19 +89648,35 @@ impl Simulator {
         false
     }
 
-    /// Does MORE THAN ONE class declare a static collection with the bare
-    /// name `member`? When two sibling/unrelated classes declare a same-named
-    /// static queue/assoc member (§8.9), the materialisation and every bare
-    /// accessor would otherwise share ONE cell and collide. Such collisions
-    /// must be keyed per DECLARING class (`{Class}::{member}`); a static
-    /// collection name declared by EXACTLY ONE class keeps the bare-name
-    /// storage that the rest of the runtime relies on.
+    /// Do TWO SIBLING (non-ancestral) classes declare a static collection
+    /// with the bare name `member`? When two sibling/unrelated classes
+    /// declare a same-named static queue/assoc member (§8.9), the
+    /// materialisation and every bare accessor would otherwise share ONE cell
+    /// and collide. Such collisions must be keyed per DECLARING class
+    /// (`{Class}::{member}`). A static collection declared by a base and
+    /// merely INHERITED by its subclasses is not a collision — base and
+    /// subclass share the one static, so a name declared by exactly one class
+    /// (or only an ancestor chain) keeps the bare-name storage the rest of
+    /// the runtime relies on.
     fn static_coll_name_collides(&self, member: &str) -> bool {
-        let mut n = 0usize;
-        for cd in self.module.classes.values() {
-            if cd.static_collections.iter().any(|(nm, _, _)| nm == member) {
-                n += 1;
-                if n >= 2 {
+        // A static collection collides only when it is declared by TWO
+        // SIBLING classes (e.g. the four `uvm_cmdline_*` classes each
+        // declaring `static … settings[$]`). A subclass inheriting the member
+        // from its base (e.g. `simple_seq_lib` inheriting
+        // `m_typewide_sequences` from `uvm_sequence_library`) is NOT a second
+        // independent declaration — base and subclass must share one cell.
+        // Two entries are therefore colliding only if neither is an ancestor
+        // of the other.
+        let decls: Vec<&str> = self
+            .module
+            .classes
+            .values()
+            .filter(|cd| cd.static_collections.iter().any(|(nm, _, _)| nm == member))
+            .map(|cd| cd.name.as_str())
+            .collect();
+        for (i, a) in decls.iter().enumerate() {
+            for b in &decls[i + 1..] {
+                if !self.class_is_a(a, b) && !self.class_is_a(b, a) {
                     return true;
                 }
             }
