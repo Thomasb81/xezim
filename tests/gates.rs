@@ -19,6 +19,8 @@ mod drive_strength_pull;
 mod dump_merged_sv;
 #[path = "gates/fst_roundtrip.rs"]
 mod fst_roundtrip;
+#[path = "gates/opt_pass_equivalence.rs"]
+mod opt_pass_equivalence;
 #[path = "gates/specify_flags.rs"]
 mod specify_flags;
 #[path = "gates/tran_and_implicit_nets.rs"]
