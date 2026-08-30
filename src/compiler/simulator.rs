@@ -50648,46 +50648,46 @@ impl Simulator {
                     // to the `class_static_get` fallback below. LRM §8.9:
                     // a static property has ONE cell shared across all
                     // instances.
-                    let is_static_prop = self
-                        .class_context_stack
-                        .last()
-                        .cloned()
-                        .flatten()
-                        .map(|ctx| {
-                            let mut cur = Some(ctx);
+                    // Borrowed walk + borrowed key: this is the bare-name
+                    // property read, the most frequent operation in class
+                    // code, and it used to allocate three times per read (the
+                    // class-context name, one `extends` clone per ancestor
+                    // level, and the property key).
+                    let is_static_prop = match self.class_context_stack.last() {
+                        Some(Some(ctx)) => {
+                            let mut cur: Option<&str> = Some(ctx.as_str());
                             let mut found = false;
                             while let Some(cn) = cur {
-                                if let Some(cd) = self.module.classes.get(&cn) {
-                                    if cd.static_properties.contains(name) {
-                                        found = true;
-                                        break;
-                                    }
-                                    cur = cd.extends.clone();
-                                } else {
+                                let Some(cd) = self.module.classes.get(cn) else {
+                                    break;
+                                };
+                                if cd.static_properties.contains(name) {
+                                    found = true;
                                     break;
                                 }
+                                cur = cd.extends.as_deref();
                             }
                             found
-                        })
-                        .unwrap_or(false);
+                        }
+                        _ => false,
+                    };
                     if !is_static_prop {
                         if let Some(Some(handle)) = self.this_stack.last().copied() {
                             // §8.10: a shadowed property resolves to the copy
                             // the EXECUTING method's class declares, not the
                             // leaf's.
-                            let key = self
-                                .shadowed_prop_key(name, false)
-                                .unwrap_or_else(|| name.clone());
+                            let shadowed = self.shadowed_prop_key(name, false);
+                            let key: &str = shadowed.as_deref().unwrap_or(name.as_str());
                             // An unpacked-struct property is stored member-wise
                             // (`<prop>.<member>` cells); any container cell is
                             // stale, so assemble the members on a whole read.
                             if let Some(v) =
-                                self.read_whole_struct_class_prop(handle, &key)
+                                self.read_whole_struct_class_prop(handle, key)
                             {
                                 return v;
                             }
                             if let Some(Some(instance)) = self.heap.get(handle) {
-                                if let Some(val) = instance.properties.get(&key) {
+                                if let Some(val) = instance.properties.get(key) {
                                     return val.clone();
                                 }
                             }
@@ -94331,13 +94331,23 @@ impl Simulator {
         }
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
 
-        let mut metadata_names = std::collections::HashSet::new();
+        // Dedup by borrowed name: the formal list is tiny, so a linear
+        // scan beats a HashSet plus one String allocation per formal on
+        // EVERY call.
+        let mut metadata_names: Vec<&str> = Vec::new();
         let formal_metadata: Vec<FormalMetadataSnapshot> = fd
             .ports
             .iter()
             .map(|port| port.name.name.as_str())
             .chain(std::iter::once(fd.name.name.name.as_str()))
-            .filter(|name| metadata_names.insert((*name).to_string()))
+            .filter(|name| {
+                if metadata_names.contains(name) {
+                    false
+                } else {
+                    metadata_names.push(name);
+                    true
+                }
+            })
             .map(|name| self.snapshot_formal_metadata(name))
             .collect();
 
@@ -95233,12 +95243,22 @@ impl Simulator {
         use crate::ast::types::PortDirection;
         let normalized = Self::normalize_call_args(&td.ports, args);
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
-        let mut metadata_names = std::collections::HashSet::new();
+        // Dedup by borrowed name: the formal list is tiny, so a linear
+        // scan beats a HashSet plus one String allocation per formal on
+        // EVERY call.
+        let mut metadata_names: Vec<&str> = Vec::new();
         let formal_metadata: Vec<FormalMetadataSnapshot> = td
             .ports
             .iter()
             .map(|port| port.name.name.as_str())
-            .filter(|name| metadata_names.insert((*name).to_string()))
+            .filter(|name| {
+                if metadata_names.contains(name) {
+                    false
+                } else {
+                    metadata_names.push(name);
+                    true
+                }
+            })
             .map(|name| self.snapshot_formal_metadata(name))
             .collect();
         // Evaluate input args and collect output/ref arg expressions
@@ -105159,12 +105179,22 @@ impl Simulator {
                     ClassMethodKind::Function(f) => Some(f.name.name.name.clone()),
                     _ => None,
                 };
-                let mut metadata_names = std::collections::HashSet::new();
+                // Dedup by borrowed name: the formal list is tiny, so a linear
+                // scan beats a HashSet plus one String allocation per formal on
+                // EVERY call.
+                let mut metadata_names: Vec<&str> = Vec::new();
                 let formal_metadata: Vec<FormalMetadataSnapshot> = ports
                     .iter()
                     .map(|port| port.name.name.as_str())
                     .chain(fn_ret_name.iter().map(String::as_str))
-                    .filter(|name| metadata_names.insert((*name).to_string()))
+                    .filter(|name| {
+                if metadata_names.contains(name) {
+                    false
+                } else {
+                    metadata_names.push(name);
+                    true
+                }
+            })
                     .map(|name| self.snapshot_formal_metadata(name))
                     .collect();
                 let ret_is_string = matches!(&method.kind,
