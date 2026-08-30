@@ -27561,6 +27561,161 @@ impl Simulator {
                 );
             }
         }
+        // Cluster census (XEZIM_CLUSTER_CENSUS=1, analysis-only) — the go/no-go
+        // gate for native clustering (see the gap analysis). Forms clusters the
+        // way the region pass does (dependency-connected, size-capped) and then
+        // answers the question that decides the payoff: of the nets a cluster
+        // writes, how many are read ONLY inside that cluster and could
+        // therefore live in a local instead of being published to the signal
+        // table? Every interior net that stays local also deletes its write
+        // bridge, its dirty marking and its worklist re-trigger.
+        //
+        // Readers counted here are comb entries and edge blocks. Processes,
+        // dumps and VPI can read anything by name, so the interior figure is
+        // an UPPER BOUND that a visibility contract would have to license —
+        // exactly the gap that made the dead-cone prune unsound.
+        if std::env::var("XEZIM_CLUSTER_CENSUS").is_ok() {
+            use super::bytecode::Insn as KI;
+            let cap: usize = std::env::var("XEZIM_REGION_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16);
+            let n = entries.len();
+            // Producer map over comb entries.
+            let mut producer: HashMap<usize, usize> = HashMap::default();
+            for (i, e) in entries.iter().enumerate() {
+                for &w in &e.cold.write_signal_ids {
+                    producer.insert(w, i);
+                }
+            }
+            // Consumers of each entry, so growth can follow dataflow in both
+            // directions.
+            let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); n];
+            for (i, e) in entries.iter().enumerate() {
+                for &r in &e.cold.read_signal_ids {
+                    if let Some(&p) = producer.get(&r) {
+                        if p != i {
+                            consumers[p].push(i);
+                        }
+                    }
+                }
+            }
+            // Signals read by EDGE blocks (a cluster can never keep those local).
+            let mut edge_reads: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            for (bi, cb) in self.compiled_edge_blocks.iter().enumerate() {
+                if let Some(b) = self.edge_blocks.get(bi) {
+                    for t in &b.resolved_sensitivities {
+                        edge_reads.insert(t.signal_id);
+                    }
+                }
+                let Some(cb) = cb else { continue };
+                for ins in cb.instructions.iter() {
+                    match ins {
+                        KI::LoadSignal(_, sg)
+                        | KI::LoadSignalSigned(_, sg)
+                        | KI::LoadSignalBit(_, sg, _)
+                        | KI::LoadSignalRange(_, sg, _, _)
+                        | KI::BranchIfSignalFalse(sg, _, _) => {
+                            edge_reads.insert(*sg as usize);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // GREEDY LOCALITY-PRESERVING GROWTH: seed at an unassigned entry
+            // and pull in its producers and consumers breadth-first up to the
+            // cap. Measured against the naive alternative (chunking a
+            // dependency component in index order) this barely moves the
+            // interior share — 8.3% -> 8.4% at cap 8 — which is itself the
+            // finding: on a gate-level netlist the fanout is so wide that a
+            // net escapes almost any cluster boundary, however it is cut.
+            let mut cluster_of: HashMap<usize, usize> = HashMap::default();
+            let mut sizes: Vec<usize> = Vec::new();
+            let mut cid = 0usize;
+            for seed in 0..n {
+                if cluster_of.contains_key(&seed) {
+                    continue;
+                }
+                let mut queue = std::collections::VecDeque::new();
+                queue.push_back(seed);
+                let mut members = 0usize;
+                while let Some(m) = queue.pop_front() {
+                    if members >= cap || cluster_of.contains_key(&m) {
+                        continue;
+                    }
+                    cluster_of.insert(m, cid);
+                    members += 1;
+                    for &r in &entries[m].cold.read_signal_ids {
+                        if let Some(&p) = producer.get(&r) {
+                            if !cluster_of.contains_key(&p) {
+                                queue.push_back(p);
+                            }
+                        }
+                    }
+                    for &c in &consumers[m] {
+                        if !cluster_of.contains_key(&c) {
+                            queue.push_back(c);
+                        }
+                    }
+                }
+                sizes.push(members);
+                cid += 1;
+            }
+            // Reader sets per signal, restricted to comb entries.
+            let mut interior = 0usize;
+            let mut boundary = 0usize;
+            let mut boundary_edge = 0usize;
+            let mut unread = 0usize;
+            let mut readers: HashMap<usize, Vec<usize>> = HashMap::default();
+            for (i, e) in entries.iter().enumerate() {
+                for &r in &e.cold.read_signal_ids {
+                    readers.entry(r).or_default().push(i);
+                }
+            }
+            for (i, e) in entries.iter().enumerate() {
+                let Some(&my) = cluster_of.get(&i) else { continue };
+                for &w in &e.cold.write_signal_ids {
+                    if edge_reads.contains(&w) {
+                        boundary += 1;
+                        boundary_edge += 1;
+                        continue;
+                    }
+                    match readers.get(&w) {
+                        None => unread += 1,
+                        Some(rs) => {
+                            if rs.iter().all(|r| cluster_of.get(r) == Some(&my)) {
+                                interior += 1;
+                            } else {
+                                boundary += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            sizes.sort_unstable_by(|a, b| b.cmp(a));
+            let clustered: usize = sizes.iter().filter(|&&s| s >= 2).sum();
+            let nclusters = sizes.iter().filter(|&&s| s >= 2).count();
+            eprintln!(
+                "[CLUSTER-CENSUS] cap={} entries={} clustered={} ({:.1}%) in {} clusters (mean {:.1}, largest {:?})",
+                cap,
+                n,
+                clustered,
+                100.0 * clustered as f64 / n.max(1) as f64,
+                nclusters,
+                clustered as f64 / nclusters.max(1) as f64,
+                &sizes[..sizes.len().min(6)]
+            );
+            eprintln!(
+                "[CLUSTER-CENSUS] written nets: interior(could stay LOCAL)={} boundary={} (of which read by EDGE blocks/flops {}) unread={} -> interior share {:.1}%",
+                interior,
+                boundary,
+                boundary_edge,
+                unread,
+                100.0 * interior as f64 / (interior + boundary).max(1) as f64
+            );
+        }
+
         // Step 9 (comb-region fusion, opt-in XEZIM_REGIONS=1): fuse
         // dependency-connected COMPILED comb entries into one larger
         // compiled block, so a value hop between members skips the whole
