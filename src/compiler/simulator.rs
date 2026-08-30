@@ -3158,7 +3158,7 @@ pub struct Simulator {
     /// LEVEL. `true` = per-instance collection (`<handle>#<member>`);
     /// `Some(class)` = static fixed array owned by that class.
     #[allow(clippy::type_complexity)]
-    class_coll_index: std::cell::RefCell<HashMap<String, Arc<HashMap<String, Option<String>>>>>,
+    class_coll_index: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
     name_stats: [std::cell::Cell<u64>; 5],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
@@ -3970,6 +3970,11 @@ pub struct Simulator {
     /// still read/written route to each cell's shared value only when the
     /// SUBROUTINE-PRECISE key below also matches.)
     static_local_names: HashSet<String>,
+    /// First-byte membership filter over `static_local_names`. The eval
+    /// preamble tests EVERY bare identifier against that set, so a designs
+    /// with any static subroutine local paid a string hash per expression
+    /// node; this rejects the overwhelming majority with one array load.
+    static_local_first: [bool; 256],
     /// Persistent-cell keys ("`<cls>::<sub>::<nm>`"/"`<sub>::<nm>`") of all
     /// scalar `static` subroutine locals. A name into `static_local_names`
     /// only routes to the live shared cell when this key — which embeds the
@@ -7782,6 +7787,7 @@ impl Simulator {
             m_scope_stack: Vec::new(),
             static_local_vars: HashMap::default(),
             static_local_names: HashSet::default(),
+            static_local_first: [false; 256],
             static_local_keys: HashSet::default(),
             static_local_syncs: Vec::new(),
             in_const_param_eval: false,
@@ -34332,8 +34338,8 @@ impl Simulator {
         if std::env::var("XEZIM_NAME_STATS").is_ok() {
             let n = &self.name_stats;
             eprintln!(
-                "[NAME-STATS] get_signal_by_name={} resolve_hier_name={} dyn_name_lookup={} instance_assoc_member={}",
-                n[0].get(), n[1].get(), n[2].get(), n[3].get()
+                "[NAME-STATS] get_signal_by_name={} resolve_hier_name={} dyn_name_lookup={} instance_assoc_member={} (of which key-allocating {})",
+                n[0].get(), n[1].get(), n[2].get(), n[3].get(), n[4].get()
             );
 
         }
@@ -50207,7 +50213,10 @@ impl Simulator {
             if let ExprKind::Ident(h) = &expr.kind {
                 if h.path.len() == 1 && h.path[0].selects.is_empty() {
                     let n = &h.path[0].name.name;
-                    if self.static_local_names.contains(n.as_str())
+                    if n.as_bytes()
+                        .first()
+                        .is_some_and(|&b| self.static_local_first[b as usize])
+                        && self.static_local_names.contains(n.as_str())
                         && let Some(k) = self.static_local_key_for(n)
                     {
                         if self.static_local_keys.contains(&k)
@@ -63176,6 +63185,9 @@ impl Simulator {
                         if !self.string_signals.contains(nm.as_str())
                             && !self.module.arrays.contains_key(nm.as_str())
                         {
+                            if let Some(&b0) = nm.as_bytes().first() {
+                                self.static_local_first[b0 as usize] = true;
+                            }
                             self.static_local_names.insert(nm.clone());
                             self.static_local_keys.insert(key);
                         }
@@ -88526,8 +88538,7 @@ impl Simulator {
         // bound collection in the same class — which is what lets the
         // handle-dependent `prop_bound_collection` probe move to the miss
         // path below instead of running at every level.
-        let idx = self.class_coll_index_for(ctx);
-        if let Some(kind) = idx.get(name) {
+        if let Some(kind) = self.class_coll_lookup(ctx, name) {
             return Some(match kind {
                 None => format!("{}#{}", handle, name),
                 Some(owner) => format!("{}::{}", owner, name),
@@ -88550,10 +88561,24 @@ impl Simulator {
     /// so the first level that declares a name wins, and within a level the
     /// per-instance collections take precedence over static fixed arrays —
     /// exactly the order the original level-by-level walk used.
-    fn class_coll_index_for(&self, class_name: &str) -> Arc<HashMap<String, Option<String>>> {
-        if let Some(hit) = self.class_coll_index.borrow().get(class_name) {
-            return hit.clone();
+    /// Look a member up in the flattened index, building it on first use.
+    /// The lookup happens INSIDE the borrow so the common (miss / per-instance)
+    /// path clones nothing — an earlier version handed back an `Arc` clone,
+    /// i.e. an atomic increment on all 22.3M calls, which measured worse than
+    /// the work it saved.
+    fn class_coll_lookup(&self, class_name: &str, member: &str) -> Option<Option<String>> {
+        {
+            let b = self.class_coll_index.borrow();
+            if let Some(idx) = b.get(class_name) {
+                return idx.get(member).cloned();
+            }
         }
+        self.build_class_coll_index(class_name);
+        let b = self.class_coll_index.borrow();
+        b.get(class_name).and_then(|idx| idx.get(member).cloned())
+    }
+
+    fn build_class_coll_index(&self, class_name: &str) {
         let mut map: HashMap<String, Option<String>> = HashMap::default();
         let mut cur: Option<&str> = Some(class_name);
         while let Some(cn) = cur {
@@ -88572,11 +88597,9 @@ impl Simulator {
             }
             cur = cd.extends.as_deref();
         }
-        let arc = Arc::new(map);
         self.class_coll_index
             .borrow_mut()
-            .insert(class_name.to_string(), arc.clone());
-        arc
+            .insert(class_name.to_string(), map);
     }
 
     /// Does `class_name` or an ancestor declare `member` as an associative
