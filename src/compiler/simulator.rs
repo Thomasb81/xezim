@@ -20645,7 +20645,8 @@ impl Simulator {
         self.compiled_edge_blocks = compiled;
         self.ts_edge.clear();
 
-        // R6 (the reference ships `merge`/`mergeEnh` by DEFAULT; opt-in here):
+        // Process merging (the reference simulator ships this enabled by
+        // DEFAULT; opt-in here):
         // merge edge blocks with IDENTICAL plain sensitivities into one
         // compiled block. Same-signature members always fire together (100%
         // co-activation BY CONSTRUCTION — the recompute-waste defect that
@@ -27039,7 +27040,8 @@ impl Simulator {
         }
 
         // Dead-cone census (XEZIM_DEAD_CENSUS=1, analysis-only). Their
-        // `removeUnref` ("Hanging Logic Optimization") is Default Production
+        // hanging-logic elimination is a default, production-grade pass in the
+        // reference simulator
         // and xezim has no equivalent. Count comb entries whose outputs
         // nothing observable reads, closed transitively.
         //
@@ -27129,9 +27131,9 @@ impl Simulator {
                 opaque
             );
         }
-        // splitAlways census (XEZIM_SPLIT_CENSUS=1, analysis-only). Their
-        // `splitAlways` ("split combinatorial always blocks into single
-        // statement blocks") is Default Production, and it is the one gap
+        // Block-splitting census (XEZIM_SPLIT_CENSUS=1, analysis-only).
+        // Splitting combinational always blocks into single-statement blocks
+        // is a default pass in the reference simulator, and it is the one gap
         // that survives the per-firing filter: a block whose statements read
         // disjoint inputs currently re-runs ALL of them whenever ANY input
         // changes. Splitting narrows each piece's sensitivity.
@@ -27230,8 +27232,8 @@ impl Simulator {
             );
         }
         // Constant-propagation census (XEZIM_CONST_CENSUS=1, analysis-only).
-        // Their `replaceCA`/`backReplaceCA`/`replaceReg` family is Default
-        // Production and their c906 log reports "Propagated 8429 values
+        // Constant propagation through continuous assigns is a default pass
+        // in the reference simulator, whose own c906 log reports 8,429 values
         // through CAs". Size the same population here: nets whose driving
         // comb entry reads NOTHING (so its output never changes after t0),
         // transitively closed, then count the reader LOAD sites those

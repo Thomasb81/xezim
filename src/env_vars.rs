@@ -179,7 +179,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_RESIZE_ELIDE", "Values: elide redundant resize operations (0/1)"),
     ("XEZIM_RS_STATS", "Print resize/copy statistics for Values"),
     ("XEZIM_SETTLE_LEVELS", "Settle: print levelization depth of the comb graph"),
-    ("XEZIM_SPLIT_CENSUS", "Census: size the splitAlways opportunity (multi-statement comb blocks with disjoint statement read sets)"),
+    ("XEZIM_SPLIT_CENSUS", "Census: size the block-splitting opportunity (multi-statement comb blocks with disjoint statement read sets)"),
     ("XEZIM_STACK_MB", "Main simulation thread stack size in MB"),
     ("XEZIM_STALL_LIMIT", "Stall detector: process activations without progress before aborting"),
     ("XEZIM_STUCK_CLOCK", "Stuck-clock detector: enable (0/1)"),
