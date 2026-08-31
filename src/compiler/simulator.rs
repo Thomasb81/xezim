@@ -76745,15 +76745,19 @@ impl Simulator {
     ///   3. otherwise the simulator-wide default stream (historical behaviour:
     ///      entropy-seeded, or `+seed=<n>`).
     ///
-    /// A randomize() of an object with NO private stream deliberately falls back
-    /// to (3) rather than to the process stream, so it cannot consume draws from
-    /// (and thereby shift) a seeded thread's sequence.
+    /// An object with NO private stream draws from the CURRENT PROCESS's stream
+    /// (priority 2, else 3): `process::self().srandom(s)` therefore makes a
+    /// fresh, otherwise-unseeded object's subsequent `randomize()` reproducible
+    /// from `s` alone, exactly as an unseeded object's draw is attributed to its
+    /// calling thread (§18.14.1). Only an object with its OWN stream is immune
+    /// to the thread's seeding, so a seeded object is never perturbed by a
+    /// sibling's thread reseed.
     fn cur_rng(&mut self) -> &mut SvRng {
         if let Some(&h) = self.obj_rng_stack.last() {
             if self.obj_rng.contains_key(&h) {
                 return self.obj_rng.get_mut(&h).unwrap();
             }
-            return &mut self.rng;
+            // No private stream — fall through to the calling process's stream.
         }
         let pid = self.current_pid;
         if self.proc_rng.contains_key(&pid) {
