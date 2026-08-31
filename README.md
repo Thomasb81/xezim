@@ -110,6 +110,29 @@ and testbench flows. Portable code should not rely on them.
 
 # What's new in 0.10
 
+### Unreleased — packed-struct codegen, container arrays, opt-in waveforms
+
+* **Packed-struct member assignments compile** instead of falling back to the
+  AST interpreter. `s.m`, nested `s.p.m` (and every `union`-in-struct form),
+  `arr[i].m`, an assignment pattern into an array element (`arr[i] <= '{...}`),
+  and a function whose body is `return '{...}` were all interpreted at roughly
+  3.8 µs per statement. On a struct-payload pipeline benchmark — 8 lanes × 3
+  stages of an 88-bit struct, 20k cycles — this took the run from **16.05s to
+  0.83s**, reference-exact throughout. Neutral where the shape is absent
+  (Ibex is instruction-identical).
+* **Mailbox and semaphore ARRAY elements allocate on `new()`.** `mb[i] = new()`
+  stored a live-looking handle with nothing behind it, so every `put` silently
+  vanished, `num()` stayed 0 and `try_get` always failed, while the same
+  mailbox declared as a scalar worked. Fixed for every lvalue shape: module
+  scope, inside a class method, through `this.`, through a class handle, and
+  in associative / dynamic / queue / multi-dimensional collections.
+* **Waveform dumping is opt-in** via `--wave` (see Features). An active dump
+  forces loops that would otherwise compile onto the AST path and builds a
+  per-signal trace table, so a run that never dumps no longer pays for it, and
+  a design that calls `$dumpvars` no longer starts writing a file
+  unannounced. `--fst`/`--xtrace` imply it, so existing command lines are
+  unchanged.
+
 ### 0.10.1 – 0.10.3 — native compilation and process conformance (August 2026)
 
 * **AOT native backend** (`XEZIM_JIT=1 XEZIM_AOT=1`, needs a `--features jit` build) — the
@@ -311,8 +334,21 @@ Larger runs measured during the 0.10 campaign:
 | mbits-mirafra AVIP suite (UVM) | apb / spi / i3c / axi4 / axi4Lite base tests | 5 of 5 reproduce the reference's `UVM_ERROR` counts and end times exactly; `ahb` runs in xezim but the reference fails to elaborate it, and `uart` is a known open stall | 33s for axi4Lite (28s with FSM + AOT), seconds for the rest |
 
 On these CPU workloads a commercial reference simulator is still roughly
-4–5× faster; the campaign narrowed the Ibex CoreMark gap from about 30× to
-4.3×. The remaining cost is evaluation, not scheduling.
+4–5× faster; the campaign narrowed the Ibex CoreMark gap from about
+30× to 4.3×. The remaining cost is **scheduling, not evaluation**: running the
+reference with its optimizer disabled (321s) against optimized (77s) and xezim
+(489s) puts ~4.2× on its optimizer and only ~1.5× on the kernel itself, and a
+symbol profile of C906 spends ~34% of the run evaluating the design against
+~22% deciding what to evaluate. Every net stays externally visible, so each
+combinational result is published and its readers notified, which is the cost
+the reference's optimizer removes by keeping intermediate nets in registers.
+
+The picture is design-shape dependent, and the benchmark set above — all
+CPU cores and class-based UVM — under-represents struct-heavy modern RTL. On a
+struct-payload pipeline microbenchmark (8 lanes × 3 stages of an 88-bit packed
+struct written member-wise, 20k cycles) xezim runs it in 0.83s against the
+reference's 59.5s. That is a microbenchmark, not a workload, but it is the
+shape the table above contains none of.
 
 UVM run-phase (see [docs/uvm-guide.md](docs/uvm-guide.md)):
 
@@ -352,7 +388,7 @@ reachable from the compiled design (transitively), which reclaimed ~1870
 
 # Test Suite
 
-~2,200 integration tests run in CI, each in **both** execution modes — the
+~2,370 integration tests run in CI, each in **both** execution modes — the
 bytecode interpreter (`cargo test`) and the JIT (`cargo test --features jit`).
 A large share are differential tests whose expected values were measured on a
 commercial reference simulator; their doc comments cite the LRM section and
