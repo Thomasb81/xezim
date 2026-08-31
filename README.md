@@ -334,14 +334,24 @@ Larger runs measured during the 0.10 campaign:
 | mbits-mirafra AVIP suite (UVM) | apb / spi / i3c / axi4 / axi4Lite base tests | 5 of 5 reproduce the reference's `UVM_ERROR` counts and end times exactly; `ahb` runs in xezim but the reference fails to elaborate it, and `uart` is a known open stall | 33s for axi4Lite (28s with FSM + AOT), seconds for the rest |
 
 On these CPU workloads a commercial reference simulator is still roughly
-4–5× faster; the campaign narrowed the Ibex CoreMark gap from about
-30× to 4.3×. The remaining cost is **scheduling, not evaluation**: running the
-reference with its optimizer disabled (321s) against optimized (77s) and xezim
-(489s) puts ~4.2× on its optimizer and only ~1.5× on the kernel itself, and a
-symbol profile of C906 spends ~34% of the run evaluating the design against
-~22% deciding what to evaluate. Every net stays externally visible, so each
-combinational result is published and its readers notified, which is the cost
-the reference's optimizer removes by keeping intermediate nets in registers.
+4–5× faster; the campaign narrowed the Ibex CoreMark gap from about 30× to
+4.3×. **Where the remaining cost sits depends on the design**, and the two
+cores profile as opposites:
+
+* **C906 is scheduling-bound.** Running the reference with its optimizer
+  disabled (321s) against optimized (77s) and xezim (489s) puts ~4.2× on its
+  optimizer and only ~1.5× on the kernel itself, and a symbol profile spends
+  ~34% of the run evaluating the design against ~22% deciding what to
+  evaluate. Every net stays externally visible, so each combinational result
+  is published and its readers notified — the cost the reference's optimizer
+  removes by keeping intermediate nets in registers.
+* **Ibex is evaluation-bound.** ~62% of the run is in the bytecode
+  interpreter (`exec_insns` alone is 38%) against ~22% scheduling. It has
+  1,553 combinational entries to C906's 35,267, so the same work is spread
+  over ~23× fewer, ~37× hotter blocks.
+
+That split is why native compilation is opt-in rather than default: it is
+worth ~23% on Ibex and a net loss on C906 (see **Native compilation**).
 
 The picture is design-shape dependent, and the benchmark set above — all
 CPU cores and class-based UVM — under-represents struct-heavy modern RTL. On a
@@ -566,6 +576,24 @@ XEZIM_JIT=1 XEZIM_AOT=1 ./target/release/xezim <sources> -s <top>
 # AOT plus compiled process state machines
 XEZIM_JIT=1 XEZIM_AOT=1 XEZIM_PROC_FSM=1 ./target/release/xezim <sources> -s <top>
 ```
+
+**Whether it pays depends on the design — measure before adopting it.** Same
+binary, warm native cache, wall-clock:
+
+| | interpreter | `XEZIM_JIT` | `+AOT` | `+AOT +PROC_FSM` |
+|---|---|---|---|---|
+| Ibex CoreMark | 50.8s | **39.0s** (−23%) | **38.8s** | 39.1s |
+| C906 memcpy ×100 | 49.3s | 55.7s (**+13%**) | 49.5s | 47.8s (−3%) |
+
+The C906 loss is entirely compile time, not slower simulation: JIT takes its
+simulation phase from 43.6s to 42.9s but spends 7.0s more compiling, because
+the design has 35,267 combinational entries to Ibex's 1,553 and the per-block
+cost is amortized ~37× less. Compiling only the hot subset does not rescue it
+— the eval distribution is steep enough (15% of entries carry 99.2% of
+evaluations) that a threshold looked promising, but JIT is only worth 2.3% of
+C906's simulation phase in the first place, and on Ibex the warmup needed to
+measure hotness costs more than the compile it saves. Rule of thumb: native
+compilation pays on designs with relatively few, very hot blocks.
 
 The AOT backend covers combinational entries, edge-sensitive blocks, and — when
 `XEZIM_PROC_FSM=1` is also set — process FSMs. Blocks it cannot lower (values
