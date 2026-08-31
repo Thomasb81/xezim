@@ -71,6 +71,8 @@ mod dollar_lvalue_and_assoc_width;
 mod enum_name_formal_param;
 #[path = "types/enum_next_prev_count.rs"]
 mod enum_next_prev_count;
+#[path = "types/enum_name_cross_method_local.rs"]
+mod enum_name_cross_method_local;
 #[path = "types/enum_signedness_and_pkg_scope.rs"]
 mod enum_signedness_and_pkg_scope;
 #[path = "types/enum_typeparam_wrapper_from_name.rs"]
