@@ -120,6 +120,14 @@ and testbench flows. Portable code should not rely on them.
   stages of an 88-bit struct, 20k cycles — this took the run from **16.05s to
   0.83s**, reference-exact throughout. Neutral where the shape is absent
   (Ibex is instruction-identical).
+* **Streaming concatenations and 2-D array stores compile.** `{>>{…}}` and
+  `{<<N{…}}` lower to constant range selects plus one concat instead of the
+  AST interpreter (a byte swap written `{<<8{x}}` was ~32% slower than the
+  same swap written by hand; it is now within 7%). A store to a 2-D unpacked
+  element (`a[i][j] <= v`) reuses the row-major flat index the read path
+  already had — a 4×4 array written element-wise every cycle went from 1.92s
+  to 0.16s (**12×**), and a loop containing one no longer drops to the AST
+  path wholesale. The 1-D memory case always compiled.
 * **Mailbox and semaphore ARRAY elements allocate on `new()`.** `mb[i] = new()`
   stored a live-looking handle with nothing behind it, so every `put` silently
   vanished, `num()` stayed 0 and `try_get` always failed, while the same
