@@ -34,10 +34,11 @@ cranelift = { version = "0.134", optional = true }
 cranelift-jit = { version = "0.134", optional = true }
 cranelift-module = { version = "0.134", optional = true }
 cranelift-native = { version = "0.134", optional = true }
-fst-writer = "0.3"
-# Inflate only, for the FST time-table repair in `fst_finish`. Already in the
-# tree via fst-writer, so this adds no build cost.
-miniz_oxide = "0.8"
+# FST writer + the inflate half used by the time-table repair in `fst_finish`.
+# Both are pulled in only by `--features wave`; a default build has no FST
+# path to feed them.
+fst-writer = { version = "0.3", optional = true }
+miniz_oxide = { version = "0.8", optional = true }
 
 # macOS: link the SDK's libffi instead of building libffi-sys's vendored copy.
 # The vendored autoconf build breaks on aarch64 with modern clang two ways —
@@ -71,6 +72,10 @@ default = []
 # Off by default: the counting sits on the VM dispatch critical path.
 opcode-census = []
 jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
+# Waveform dumping (VCD via $dumpvars, FST via --fst). Off by default: a
+# simulation that never dumps should not carry the writers, the per-signal
+# trace tables, or the CLI/system-task surface that offers them.
+wave = ["dep:fst-writer", "dep:miniz_oxide"]
 
 [[bin]]
 name = "xezim"

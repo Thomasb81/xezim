@@ -190,22 +190,28 @@ fn print_usage() {
   +delay_mode_unit Collapse every nonzero structural delay to 1 time unit
   +mindelays/+typdelays/+maxdelays  min:typ:max selection (specify + SDF; default typ)
   +notimingcheck   Accepted no-op (specify timing checks are not modeled)");
-    eprintln!("  --xtrace <file>  Emit an XTrace dump to <file> (compliance Level 0:");
-    eprintln!("                   dictionary + time + signal deltas + event records).");
-    eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
-    eprintln!("  --xtrace-scope <hier>  Restrict the XTrace dump to signals under <hier>");
-    eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
-    eprintln!("  --xtrace-from <ns>  Only dump XTrace changes at/after this time (ns).");
-    eprintln!("  --xtrace-to <ns>    Stop the XTrace dump after this time (ns).");
-    eprintln!("  --xtrace-level <0>  XTrace compliance level (1-4 reserved: semantic,");
-    eprintln!("                   transactional, AI-native, retrieval layers).");
-    eprintln!("  --xtrace-format <text>  XTrace output format (binary reserved).");
-    eprintln!("  --xtrace-profile <name>  @profile header value (default: minimal).");
-    eprintln!("  --xtrace-compress <none|zstd>  Compress the XTrace stream (declared in");
-    eprintln!("                   the @compression header; forces a '.zst' file name).");
-    eprintln!("  --fst <file>     Emit an FST (GTKWave binary) waveform dump to <file>.");
-    eprintln!("  --fst-scope <hier>  Restrict the FST dump to signals under <hier>");
-    eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
+    #[cfg(feature = "wave")]
+    {
+        eprintln!("  --xtrace <file>  Emit an XTrace dump to <file> (compliance Level 0:");
+        eprintln!("                   dictionary + time + signal deltas + event records).");
+        eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
+        eprintln!("  --xtrace-scope <hier>  Restrict the XTrace dump to signals under <hier>");
+        eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
+        eprintln!("  --xtrace-from <ns>  Only dump XTrace changes at/after this time (ns).");
+        eprintln!("  --xtrace-to <ns>    Stop the XTrace dump after this time (ns).");
+        eprintln!("  --xtrace-level <0>  XTrace compliance level (1-4 reserved: semantic,");
+        eprintln!("                   transactional, AI-native, retrieval layers).");
+        eprintln!("  --xtrace-format <text>  XTrace output format (binary reserved).");
+        eprintln!("  --xtrace-profile <name>  @profile header value (default: minimal).");
+        eprintln!("  --xtrace-compress <none|zstd>  Compress the XTrace stream (declared in");
+        eprintln!("                   the @compression header; forces a '.zst' file name).");
+    }
+    #[cfg(feature = "wave")]
+    {
+        eprintln!("  --fst <file>     Emit an FST (GTKWave binary) waveform dump to <file>.");
+        eprintln!("  --fst-scope <hier>  Restrict the FST dump to signals under <hier>");
+        eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
+    }
     eprintln!("  --sv2017         Parse as IEEE 1800-2017 (default is 1800-2023)");
     eprintln!("  --sv2023         Parse as IEEE 1800-2023 (default; kept for back-compat)");
     eprintln!("  --no-strict      Disable strict negative-test diagnostics (accept LRM-illegal");
@@ -1501,19 +1507,29 @@ fn run_main() -> i32 {
     let mut dump_timescales = false;
     let mut sdf_file: Option<String> = None;
     let mut sdf_select: Option<xezim::compiler::sdf::DelaySelect> = None;
+    #[cfg_attr(not(feature = "wave"), allow(unused_mut))]
     let mut xtrace_file: Option<String> = None;
+    #[cfg_attr(not(feature = "wave"), allow(unused_mut))]
     let mut xtrace_scopes: Vec<String> = Vec::new();
+    #[cfg_attr(not(feature = "wave"), allow(unused_mut))]
     let mut xtrace_from_ns: u64 = 0;
+    #[cfg_attr(not(feature = "wave"), allow(unused_mut))]
     let mut xtrace_to_ns: u64 = u64::MAX;
     // XTrace compliance level (§24). We emit Level 0 (dictionary + time +
     // signal deltas, plus the §10.4 event record); levels 1-4 add the semantic,
     // transactional and retrieval layers and are RESERVED — asking for one is a
     // warning, not a silent lie in the header.
+    #[cfg_attr(not(feature = "wave"), allow(unused_mut))]
     let mut xtrace_level: u8 = 0;
+    #[cfg_attr(not(feature = "wave"), allow(unused_mut))]
     let mut xtrace_format = "text".to_string();
+    #[cfg_attr(not(feature = "wave"), allow(unused_mut))]
     let mut xtrace_profile: Option<String> = None;
+    #[cfg_attr(not(feature = "wave"), allow(unused_mut))]
     let mut xtrace_compress: Option<String> = None;
+    #[cfg_attr(not(feature = "wave"), allow(unused_mut))]
     let mut fst_file: Option<String> = None;
+    #[cfg_attr(not(feature = "wave"), allow(unused_mut))]
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
     let mut dump_files_list = false;
@@ -1911,95 +1927,140 @@ fn run_main() -> i32 {
             "--sdf-max" => {
                 sdf_select = Some(xezim::compiler::sdf::DelaySelect::Max);
             }
+            #[cfg(feature = "wave")]
             "--xtrace" => {
                 i += 1;
                 if i < args.len() {
                     xtrace_file = Some(args[i].clone());
                 }
             }
+            #[cfg(feature = "wave")]
             _ if arg.starts_with("--xtrace=") => {
                 xtrace_file = Some(arg["--xtrace=".len()..].to_string());
             }
+            #[cfg(feature = "wave")]
             "--xtrace-scope" => {
                 i += 1;
                 if i < args.len() {
                     xtrace_scopes.push(args[i].clone());
                 }
             }
+            #[cfg(feature = "wave")]
             _ if arg.starts_with("--xtrace-scope=") => {
                 xtrace_scopes.push(arg["--xtrace-scope=".len()..].to_string());
             }
+            #[cfg(feature = "wave")]
             "--xtrace-from" => {
                 i += 1;
                 if i < args.len() {
                     xtrace_from_ns = args[i].parse().unwrap_or(0);
                 }
             }
+            #[cfg(feature = "wave")]
             _ if arg.starts_with("--xtrace-from=") => {
                 xtrace_from_ns = arg["--xtrace-from=".len()..].parse().unwrap_or(0);
             }
+            #[cfg(feature = "wave")]
             "--xtrace-to" => {
                 i += 1;
                 if i < args.len() {
                     xtrace_to_ns = args[i].parse().unwrap_or(u64::MAX);
                 }
             }
+            #[cfg(feature = "wave")]
             _ if arg.starts_with("--xtrace-to=") => {
                 xtrace_to_ns = arg["--xtrace-to=".len()..].parse().unwrap_or(u64::MAX);
             }
+            #[cfg(feature = "wave")]
             "--xtrace-level" => {
                 i += 1;
                 if i < args.len() {
                     xtrace_level = args[i].parse().unwrap_or(0);
                 }
             }
+            #[cfg(feature = "wave")]
             _ if arg.starts_with("--xtrace-level=") => {
                 xtrace_level = arg["--xtrace-level=".len()..].parse().unwrap_or(0);
             }
+            #[cfg(feature = "wave")]
             "--xtrace-format" => {
                 i += 1;
                 if i < args.len() {
                     xtrace_format = args[i].clone();
                 }
             }
+            #[cfg(feature = "wave")]
             _ if arg.starts_with("--xtrace-format=") => {
                 xtrace_format = arg["--xtrace-format=".len()..].to_string();
             }
+            #[cfg(feature = "wave")]
             "--xtrace-profile" => {
                 i += 1;
                 if i < args.len() {
                     xtrace_profile = Some(args[i].clone());
                 }
             }
+            #[cfg(feature = "wave")]
             _ if arg.starts_with("--xtrace-profile=") => {
                 xtrace_profile = Some(arg["--xtrace-profile=".len()..].to_string());
             }
+            #[cfg(feature = "wave")]
             "--xtrace-compress" => {
                 i += 1;
                 if i < args.len() {
                     xtrace_compress = Some(args[i].clone());
                 }
             }
+            #[cfg(feature = "wave")]
             _ if arg.starts_with("--xtrace-compress=") => {
                 xtrace_compress = Some(arg["--xtrace-compress=".len()..].to_string());
             }
+            #[cfg(feature = "wave")]
             "--fst" => {
                 i += 1;
                 if i < args.len() {
                     fst_file = Some(args[i].clone());
                 }
             }
+            #[cfg(feature = "wave")]
             _ if arg.starts_with("--fst=") => {
                 fst_file = Some(arg["--fst=".len()..].to_string());
             }
+            #[cfg(feature = "wave")]
             "--fst-scope" => {
                 i += 1;
                 if i < args.len() {
                     fst_scopes.push(args[i].clone());
                 }
             }
+            #[cfg(feature = "wave")]
             _ if arg.starts_with("--fst-scope=") => {
                 fst_scopes.push(arg["--fst-scope=".len()..].to_string());
+            }
+            // Without the `wave` feature these are not options at all; name
+            // them explicitly so the error tells the user what to do instead
+            // of "unknown option".
+            #[cfg(not(feature = "wave"))]
+            _ if arg.starts_with("--xtrace") => {
+                eprintln!(
+                    "xezim: {} requires waveform support; this build has none. \
+                     Rebuild with `--features wave`.",
+                    arg.split('=').next().unwrap_or(arg)
+                );
+                std::process::exit(2);
+            }
+            #[cfg(not(feature = "wave"))]
+            _ if arg == "--fst"
+                || arg == "--fst-scope"
+                || arg.starts_with("--fst=")
+                || arg.starts_with("--fst-scope=") =>
+            {
+                eprintln!(
+                    "xezim: {} requires waveform support; this build has none. \
+                     Rebuild with `--features wave`.",
+                    arg.split('=').next().unwrap_or(arg)
+                );
+                std::process::exit(2);
             }
             // `--sim_debug` kept as a compatibility alias for existing scripts.
             "--sim-debug" | "--sim_debug" => {
@@ -2308,25 +2369,33 @@ fn run_main() -> i32 {
         xtrace_level = 0;
     }
     let _ = xtrace_level;
-    if xtrace_format != "text" {
-        eprintln!(
-            "Warning: --xtrace-format '{}' is reserved; emitting text",
-            xtrace_format
-        );
-    }
-    if xtrace_compress.as_deref() == Some("none") {
-        xtrace_compress = None;
-    }
-    if let Some(ref c) = xtrace_compress {
-        if c != "zstd" {
+    #[cfg(feature = "wave")]
+    {
+        if xtrace_format != "text" {
             eprintln!(
-                "Warning: --xtrace-compress '{}' is unknown; writing uncompressed text",
-                c
+                "Warning: --xtrace-format '{}' is reserved; emitting text",
+                xtrace_format
             );
+        }
+        if xtrace_compress.as_deref() == Some("none") {
             xtrace_compress = None;
         }
+        if let Some(ref c) = xtrace_compress {
+            if c != "zstd" {
+                eprintln!(
+                    "Warning: --xtrace-compress '{}' is unknown; writing uncompressed text",
+                    c
+                );
+                xtrace_compress = None;
+            }
+        }
+        xezim::compiler::simulator::set_xtrace_options(
+            xtrace_profile.clone(),
+            xtrace_compress.clone(),
+        );
     }
-    xezim::compiler::simulator::set_xtrace_options(xtrace_profile.clone(), xtrace_compress.clone());
+    #[cfg(not(feature = "wave"))]
+    let _ = (&xtrace_format, &xtrace_compress, &xtrace_profile);
 
     // Install the --module-timescale configuration before any elaboration.
     if !module_timescale_args.is_empty() {
@@ -2418,12 +2487,15 @@ suppressed but the explicit SDF annotation still applies."
                             sim.settle_limit = limit;
                         }
                         sim.activity_mon = activity_mon;
-                        sim.xtrace_file = xtrace_file.clone();
-                        sim.xtrace_scopes = xtrace_scopes.clone();
-                        sim.xtrace_from_ns = xtrace_from_ns;
-                        sim.xtrace_to_ns = xtrace_to_ns;
-                        sim.fst_file = fst_file.clone();
-                        sim.fst_scopes = fst_scopes.clone();
+                        #[cfg(feature = "wave")]
+                        {
+                            sim.xtrace_file = xtrace_file.clone();
+                            sim.xtrace_scopes = xtrace_scopes.clone();
+                            sim.xtrace_from_ns = xtrace_from_ns;
+                            sim.xtrace_to_ns = xtrace_to_ns;
+                            sim.fst_file = fst_file.clone();
+                            sim.fst_scopes = fst_scopes.clone();
+                        }
                         sim.set_plusargs(&plusargs);
                         // Pass the full CLI invocation (binary name +
                         // all args + plusargs) so vpi_get_vlog_info

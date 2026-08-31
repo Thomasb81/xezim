@@ -17,6 +17,7 @@ mod assign_pattern_aggregate;
 mod drive_strength_pull;
 #[path = "gates/dump_merged_sv.rs"]
 mod dump_merged_sv;
+#[cfg(feature = "wave")]
 #[path = "gates/fst_roundtrip.rs"]
 mod fst_roundtrip;
 #[path = "gates/opt_pass_equivalence.rs"]
@@ -29,11 +30,15 @@ mod specify_flags;
 mod tran_and_implicit_nets;
 #[path = "gates/udp_primitives.rs"]
 mod udp_primitives;
+#[cfg(feature = "wave")]
 #[path = "gates/vcd_lrm_compliance.rs"]
 mod vcd_lrm_compliance;
+#[cfg(feature = "wave")]
 #[path = "gates/dump_formats_agree.rs"]
 mod dump_formats_agree;
+#[cfg(feature = "wave")]
 #[path = "gates/fst_time_table_breakeven.rs"]
 mod fst_time_table_breakeven;
+#[cfg(feature = "wave")]
 #[path = "gates/interrupt_finalizes_dumps.rs"]
 mod interrupt_finalizes_dumps;

@@ -76,6 +76,7 @@ fn run(tag: &str) -> (Vec<String>, Vec<u64>) {
 
 /// §21.2.3 — `$monitor` reports the change in the slot it happened in, not in
 /// whichever later slot the nested loop finally returned to (550 ns here).
+#[cfg(feature = "wave")]
 #[test]
 fn monitor_sees_a_change_made_inside_a_nested_delay_window() {
     let (mons, _) = run("monitor");
@@ -87,6 +88,7 @@ fn monitor_sees_a_change_made_inside_a_nested_delay_window() {
 
 /// §21.7 — the dump has a record for that timestamp. Previously the VCD went
 /// straight from #0 to #550000 and the change was re-dated to 550 ns.
+#[cfg(feature = "wave")]
 #[test]
 fn dump_has_a_record_for_a_slot_inside_a_nested_delay_window() {
     let (_, stamps) = run("record");
@@ -98,6 +100,7 @@ fn dump_has_a_record_for_a_slot_inside_a_nested_delay_window() {
 
 /// The clock kept toggling throughout the delay window, so those slots must be
 /// in the dump too — they were ALL missing, not just the one under test.
+#[cfg(feature = "wave")]
 #[test]
 fn dump_keeps_slots_crossed_by_the_nested_loop() {
     let (_, stamps) = run("slots");
@@ -147,6 +150,7 @@ module top;
 endmodule
 "#;
 
+#[cfg(feature = "wave")]
 #[test]
 fn monitor_and_dump_agree_on_every_change_time() {
     let mut path = std::env::temp_dir();
@@ -222,6 +226,7 @@ module top;
 endmodule
 "#;
 
+#[cfg(feature = "wave")]
 #[test]
 fn write_after_a_delay_is_reported_in_its_own_slot() {
     let mut path = std::env::temp_dir();

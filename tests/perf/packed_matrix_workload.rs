@@ -162,16 +162,19 @@ fn packed_matrix_workload_uses_fast_paths() {
     run(Waveform::None);
 }
 
+#[cfg(feature = "wave")]
 #[test]
 fn packed_matrix_workload_writes_vcd() {
     run(Waveform::Vcd);
 }
 
+#[cfg(feature = "wave")]
 #[test]
 fn packed_matrix_workload_writes_fst() {
     run(Waveform::Fst);
 }
 
+#[cfg(feature = "wave")]
 #[test]
 fn packed_matrix_workload_writes_xtrace() {
     run(Waveform::Xtrace);
