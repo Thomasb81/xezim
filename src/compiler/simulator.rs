@@ -52997,6 +52997,12 @@ impl Simulator {
                             // store use. Match `spec_static_coll_key`.
                             name = if self.static_coll_name_collides(coll) {
                                 self.static_prop_key(cls, coll).unwrap_or_else(|| coll.to_string())
+                            } else if self.class_is_parameterized(cls) {
+                                // PARAMETERIZED class: elements live
+                                // per-specialization via the qualified form
+                                // (§8.25) — see the matching receiver rewrite
+                                // in the MemberAccess handler.
+                                name
                             } else {
                                 coll.to_string()
                             };
@@ -91529,6 +91535,15 @@ impl Simulator {
                         {
                             recv_name = if self.static_coll_name_collides(coll) {
                                 self.static_prop_key(cls, coll).unwrap_or_else(|| coll.to_string())
+                            } else if self.class_is_parameterized(cls) {
+                                // PARAMETERIZED class: statics live
+                                // per-specialization, resolved from the
+                                // qualified form via `current_spec` (§8.25);
+                                // collapsing to the bare name would drop the
+                                // specialization and miss the store (e.g.
+                                // `config_db#(int)::m_rsc` flattens to
+                                // `config_db.m_rsc`, `#(int)` stripped).
+                                recv_name
                             } else {
                                 coll.to_string()
                             };
