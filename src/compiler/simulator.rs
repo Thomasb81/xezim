@@ -11913,6 +11913,36 @@ impl Simulator {
             }
             *start = std::time::Instant::now();
         };
+        // §13.4.1: a function's return variable is named after the function
+        // and, for a packed-struct return type, has member layout — but it is
+        // not a signal, so nothing registers one. Without it `mk.a = …;`
+        // inside the body has no store path and the whole call stays on the
+        // AST interpreter (measured 11x slower than the same function written
+        // `return '{…}`). Register it once under a key that cannot collide
+        // with a signal name.
+        {
+            let ret_layouts: Vec<(String, Vec<(String, u32, u32)>)> = self
+                .module
+                .functions
+                .iter()
+                .filter_map(|(name, fd)| {
+                    let fields = super::elaborate::packed_struct_field_layout(
+                        &fd.return_type,
+                        &self.module.parameters,
+                        &self.module.typedefs,
+                        &self.module.typedef_types,
+                    )?;
+                    if fields.is_empty() {
+                        return None;
+                    }
+                    let leaf = name.rsplit('.').next().unwrap_or(name).to_string();
+                    Some((format!("fn ret:{}", leaf), fields))
+                })
+                .collect();
+            for (k, v) in ret_layouts {
+                self.module.packed_struct_fields.entry(k).or_insert(v);
+            }
+        }
         self.sanitize_class_hierarchy();
         self.init_two_state_struct_members();
         // LRM §14.3 — populate clocking-block metadata: per-cb clock
