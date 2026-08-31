@@ -17,6 +17,8 @@ mod assign_pattern_aggregate;
 mod drive_strength_pull;
 #[path = "gates/dump_merged_sv.rs"]
 mod dump_merged_sv;
+#[path = "gates/fn_return_member_inlines.rs"]
+mod fn_return_member_inlines;
 #[path = "gates/fst_roundtrip.rs"]
 mod fst_roundtrip;
 #[path = "gates/opt_pass_equivalence.rs"]

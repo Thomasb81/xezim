@@ -3030,7 +3030,14 @@ impl<'a> BytecodeCompiler<'a> {
             match &e.kind {
                 ExprKind::Ident(h) => {
                     if h.path.len() != 1 {
-                        return false;
+                        // `fname.member` may arrive as TWO segments; it is
+                        // function-local when the head is bound (the return
+                        // variable or a formal).
+                        return h.path.len() == 2
+                            && bound.contains(&h.path[0].name.name)
+                            && h.path.iter().all(|seg| {
+                                seg.selects.iter().all(|x| expr_ok(x, bound, me, ext))
+                            });
                     }
                     let n = &h.path[0].name.name;
                     // A dotted name is only acceptable when it is one of the
@@ -3039,10 +3046,14 @@ impl<'a> BytecodeCompiler<'a> {
                     // caller allows module-state READS (`ext`), in which case
                     // a free name (dotted or bare) is a signal read the body
                     // compiler resolves (or bails on) itself.
-                    if n.contains('.') && !bound.contains(n) && !ext {
+                    let head_bound = n
+                        .split_once('.')
+                        .is_some_and(|(head, _)| bound.contains(head));
+                    if n.contains('.') && !bound.contains(n) && !head_bound && !ext {
                         return false;
                     }
                     let known = ext
+                        || head_bound
                         || bound.contains(n)
                         || me.params.is_some_and(|p| p.contains_key(n));
                     known && h.path[0].selects.iter().all(|sel| expr_ok(sel, bound, me, ext))
@@ -3127,6 +3138,11 @@ impl<'a> BytecodeCompiler<'a> {
                 // Falling through to `false` here made every function whose
                 // body was `return '{...}` — the ordinary way to build a
                 // struct result — impure, and so never inlined.
+                // `fname.member` / `formal.member`: as pure as its base, which
+                // is the function's own return variable or a formal -- both
+                // bound, so this stays function-local. Inside a function body
+                // the member access is NOT collapsed to a dotted Ident.
+                ExprKind::MemberAccess { expr, .. } => expr_ok(expr, bound, me, ext),
                 ExprKind::AssignmentPattern(items) => {
                     use crate::ast::expr::AssignmentPatternItem as It;
                     items.iter().all(|it| match it {
@@ -8856,6 +8872,55 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::BlockingAssignArrayRange(
                         array, idx_reg, hi_reg, lo_reg, resized,
                     ));
+                    return true;
+                }
+                // §13.4.1 `fname.member = …`: a write to a member of the
+                // function's own RETURN VARIABLE, which an inlined body holds
+                // in a register rather than a signal — so neither the signal
+                // splice above nor the array path applies. Mask-splice the
+                // member's static bit range into that register:
+                //   r = (r & ~(mask << off)) | ((v & mask) << off)
+                // The layout is registered per function at compile start
+                // ("fn ret:<name>"), since the return variable is not a signal
+                // and nothing else records one for it.
+                if let ExprKind::Ident(bh) = &expr.kind
+                    && let Some((slot, rw)) = self.local_var_reg_of(bh)
+                    && let Some(fields) = self.packed_struct_fields.and_then(|m| {
+                        m.get(format!("fn ret:{}", Self::hier_raw_name(bh)).as_str())
+                    })
+                    && let Some(&(_, off, mw)) =
+                        fields.iter().find(|(n, _, _)| *n == member.name)
+                    && mw > 0
+                    && rw > 0
+                {
+                    let fields_w = rw;
+                    // value & mask, widened, shifted into place
+                    let vex = self.alloc_reg();
+                    self.emit(Insn::Move(vex, val_reg));
+                    self.emit(Insn::Resize(vex, mw));
+                    self.emit(Insn::Resize(vex, fields_w));
+                    let sh = self.alloc_reg();
+                    self.emit(Insn::LoadConst(
+                        sh,
+                        Box::new(Value::from_u64(off as u64, 32)),
+                    ));
+                    let vsh = self.alloc_reg();
+                    self.emit(Insn::Shl(vsh, vex, sh));
+                    // clear the destination window
+                    let mut mask = Value::from_u64(0, fields_w);
+                    for b in 0..mw {
+                        mask.set_bit((off + b) as usize, xezim_core::value::LogicBit::One);
+                    }
+                    let mreg = self.alloc_reg();
+                    self.emit(Insn::LoadConst(mreg, Box::new(mask)));
+                    let inv = self.alloc_reg();
+                    self.emit(Insn::BitNot(inv, mreg));
+                    let cleared = self.alloc_reg();
+                    self.emit(Insn::BitAnd(cleared, slot, inv));
+                    let merged = self.alloc_reg();
+                    self.emit(Insn::BitOr(merged, cleared, vsh));
+                    self.emit(Insn::Move(slot, merged));
+                    self.emit(Insn::Resize(slot, fields_w));
                     return true;
                 }
                 self.bail("blocking_target_member_access");
