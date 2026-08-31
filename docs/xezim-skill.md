@@ -99,11 +99,23 @@ What's left for the user:
   the same timestep would see the new value a delta early.)
 - **`XEZIM_BUF_COLLAPSE=1`** — folds whole-net identity continuous assigns
   (`assign y = x;`) onto their source net, the transform commercial
-  optimizers apply by default to clock and buffer trees. Measured −10%
-  instructions on a gate-level SoC, −47% of the simulation phase on a
-  larger one, −8.6% on behavioral RTL. It removes the one-delta
-  propagation step a buffer adds, so leave it off if your testbench
-  deliberately observes a buffer's input and output at different deltas.
+  optimizers apply by default to clock and buffer trees. **The single
+  largest opt-in win available**: measured on wall-clock, c906 memcpy ×100
+  50.2 s → 42.7 s (−14.9%) and ibex CoreMark 48.2 s → 43.0 s (−10.8%);
+  combined with `XEZIM_EDGE_MERGE=8`, c906 reaches 40.6 s (−19.1%). It also
+  cuts combinational entries (c906 35,267 → 29,728; ibex 1,553 → 1,130).
+  Both designs stay bit-exact against the reference.
+
+  It stays OPT-IN for a measured reason, not caution. Forcing it on turns 7
+  suite tests red, and they name exactly what it trades: `force`/`release`
+  on a collapsed name now reaches the shared net (4 tests), a continuous
+  assign's Z pass-through stops being distinguishable from a `buf` gate,
+  a parked waiter sees the post-collapse value because the buffer's delta
+  step is gone, and a VPI/DPI backdoor can no longer find the folded name.
+  Those are the same properties that make it fast, so it cannot be both.
+  Reach for it on gate-level or clock-tree-heavy designs whose testbench
+  does not force, probe, or delta-observe buffer nets. Skipped automatically
+  under SDF, where a collapsed net would lose its annotated delay.
 - **`XEZIM_EDGE_MERGE=<N>`** — merges edge blocks with identical
   sensitivities into one compiled block, at most `N` per block (8 measures
   best; large values lose more to coarser gating than they save in
