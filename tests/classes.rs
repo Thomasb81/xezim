@@ -236,3 +236,5 @@ mod class_localparam_array;
 mod member_collection_runtime_class;
 #[path = "classes/enum_local_shadows_flat_maps.rs"]
 mod enum_local_shadows_flat_maps;
+#[path = "classes/ref_formal_shadows_property.rs"]
+mod ref_formal_shadows_property;
