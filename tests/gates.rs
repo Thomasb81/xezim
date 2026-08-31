@@ -25,6 +25,8 @@ mod opt_pass_equivalence;
 mod packed_member_nba_compiles;
 #[path = "gates/packed_member_nesting_compiles.rs"]
 mod packed_member_nesting_compiles;
+#[path = "gates/streaming_op_compiles.rs"]
+mod streaming_op_compiles;
 #[path = "gates/specify_flags.rs"]
 mod specify_flags;
 #[path = "gates/tran_and_implicit_nets.rs"]

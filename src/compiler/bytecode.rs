@@ -7687,6 +7687,117 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Concat(dest, Box::new(regs)));
                 Some(dest)
             }
+            // §11.4.14 streaming concatenation. `{>>{…}}` is exactly the
+            // concatenation; `{<<N{…}}` additionally reverses the order of
+            // N-bit slices, which with a constant N and a known total width is
+            // a FIXED bit permutation — a concat of constant range selects.
+            // Previously the whole expression fell to the AST interpreter,
+            // measured at ~0.45us per evaluation (a byte-swap written as
+            // `{<<8{x}}` ran ~32% slower than the same swap written out by
+            // hand).
+            ExprKind::StreamOp {
+                left_to_right,
+                slice_size,
+                exprs,
+            } => {
+                // Widths must be known to place the slices; a part whose width
+                // the compiler cannot size keeps the AST path.
+                // The LRM self-determined width, cross-checked against
+                // `expr_max_width`: the latter is unreliable for an index
+                // select (it reports 1 for an element of a packed-struct
+                // typedef array), and a wrong total silently permutes the
+                // wrong bits. Disagreement means the width is not established
+                // well enough to place slices — keep the AST path.
+                // Placing the slices needs each part's width to be exactly
+                // right — a wrong total silently permutes the wrong bits, and
+                // the general width oracles are not trustworthy enough here:
+                // BOTH `lrm_self_width` and `expr_max_width` report 1 for an
+                // element of a packed-struct typedef array in a submodule, so
+                // cross-checking them does not catch it. Accept only shapes
+                // whose width is unambiguous here and leave every other
+                // spelling on the (correct) AST path.
+                let mut widths: Vec<u32> = Vec::with_capacity(exprs.len());
+                for e in exprs {
+                    let mut inner = e;
+                    while let ExprKind::Paren(i) = &inner.kind {
+                        inner = i;
+                    }
+                    let w = match &inner.kind {
+                        // A whole signal: the signal table is authoritative.
+                        ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => self
+                            .lookup_signal_id(h)
+                            .and_then(|id| self.signal_widths.get(id).copied())
+                            .unwrap_or(0),
+                        // `x[hi:lo]` with constant bounds: hi - lo + 1.
+                        ExprKind::RangeSelect {
+                            left,
+                            right,
+                            kind: RangeKind::Constant,
+                            ..
+                        } => match (self.eval_const_expr(left), self.eval_const_expr(right)) {
+                            (Some(hi), Some(lo)) if hi >= lo => hi - lo + 1,
+                            (Some(hi), Some(lo)) => lo - hi + 1,
+                            _ => 0,
+                        },
+                        _ => 0,
+                    };
+                    if w == 0 {
+                        self.bail("Stream_operand_shape");
+                        return None;
+                    }
+                    widths.push(w);
+                }
+                let total_w: u32 = widths.iter().sum();
+                let mut regs = Vec::with_capacity(exprs.len());
+                for e in exprs {
+                    regs.push(self.compile_expr(e, 0)?);
+                }
+                let src = self.alloc_reg();
+                self.emit(Insn::Concat(src, Box::new(regs)));
+                if !*left_to_right {
+                    return Some(src);
+                }
+                // `{<<N{…}}`: N must be a constant to know the chunking.
+                let slice = match slice_size {
+                    None => 1u32,
+                    Some(e) => match self.fold_const(e).and_then(|v| v.to_u64()) {
+                        Some(n) if n > 0 && n <= u32::MAX as u64 => n as u32,
+                        _ => {
+                            self.bail("Stream_slice_nonconst");
+                            return None;
+                        }
+                    },
+                };
+                if slice >= total_w {
+                    // One chunk (plus nothing to reverse): identity.
+                    return Some(src);
+                }
+                let full = total_w / slice;
+                let rem = total_w - full * slice;
+                // Output MSB-first is chunk0, chunk1, … chunk(full-1), then the
+                // leftover high bits of the source. Chunk k occupies source
+                // bits [k*slice + slice-1 : k*slice].
+                let mut parts: Vec<RegId> = Vec::with_capacity(full as usize + 1);
+                let mut range = |me: &mut Self, hi: u32, lo: u32| -> RegId {
+                    let hr = me.alloc_reg();
+                    me.emit(Insn::LoadConst(hr, Box::new(Value::from_u64(hi as u64, 32))));
+                    let lr = me.alloc_reg();
+                    me.emit(Insn::LoadConst(lr, Box::new(Value::from_u64(lo as u64, 32))));
+                    let d = me.alloc_reg();
+                    me.emit(Insn::RangeSelect(d, src, hr, lr));
+                    d
+                };
+                for k in 0..full {
+                    let lo = k * slice;
+                    parts.push(range(self, lo + slice - 1, lo));
+                }
+                if rem > 0 {
+                    parts.push(range(self, total_w - 1, full * slice));
+                }
+                let dst = self.alloc_reg();
+                self.emit(Insn::Concat(dst, Box::new(parts)));
+                Some(dst)
+            }
             ExprKind::SystemCall { name, args } => match name.as_str() {
                     // §21.3.3 `$sformatf` with a LITERAL template and specs the
                     // native filler covers exactly — parsed once here, filled
