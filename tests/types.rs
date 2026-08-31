@@ -171,6 +171,8 @@ mod task_formal_param_width;
 mod type_param_bound_to_specialization;
 #[path = "types/type_param_static_property.rs"]
 mod type_param_static_property;
+#[path = "types/stmt_local_scoped_decls.rs"]
+mod stmt_local_scoped_decls;
 #[path = "types/typedef_declaring_scope.rs"]
 mod typedef_declaring_scope;
 #[path = "types/typedef_specialization_dispatch.rs"]
