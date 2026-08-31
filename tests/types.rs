@@ -199,7 +199,6 @@ mod valparam_spec_cycle;
 mod value_param_specialization;
 #[path = "types/packed_elem_shift_context_width.rs"]
 mod packed_elem_shift_context_width;
-#[cfg(feature = "wave")]
 #[path = "types/vcd_param_as_wire.rs"]
 mod vcd_param_as_wire;
 #[path = "types/wide_signed_arith_and_power.rs"]
