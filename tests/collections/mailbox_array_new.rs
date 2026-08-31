@@ -141,3 +141,129 @@ endmodule
     assert!(out.contains("S2 ok=1"), "second key not available:\n{out}");
     assert!(out.contains("S3 ok=0"), "semaphore handed out more keys than it had:\n{out}");
 }
+
+// ---------------------------------------------------------------------------
+// Sibling audit: the same "indexed lvalue skips container allocation" defect
+// reached three more shapes, each with its own resolution path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_indexed_mailbox_property_allocates_from_inside_a_method() {
+    // `mb[i] = new()` and `this.mb[i] = new()` inside a class method. A class
+    // property's ARRAY carries no `type_name` (only scalars do), so the kind
+    // comes from the declared type. Both spellings must work, and both
+    // scalars must keep working.
+    let out = run(r#"
+class Holder;
+  mailbox #(int) mb [2];
+  mailbox #(int) one;
+  mailbox #(int) two;
+  function void alloc();
+    this.one   = new();
+    two        = new();
+    mb[0]      = new();
+    this.mb[1] = new();
+  endfunction
+endclass
+module sub (input logic clk);
+  Holder h;
+  initial begin
+    @(posedge clk);
+    h = new(); h.alloc();
+    h.one.put(1); h.two.put(1);
+    if (h.mb[0] != null) h.mb[0].put(1);
+    if (h.mb[1] != null) h.mb[1].put(1);
+    $display("R this_scalar=%0d bare_scalar=%0d bare_idx=%0d this_idx=%0d",
+             h.one.num(), h.two.num(),
+             (h.mb[0]==null)?-1:h.mb[0].num(),
+             (h.mb[1]==null)?-1:h.mb[1].num());
+  end
+endmodule
+module tb;
+  logic clk = 0;
+  always #500 clk = ~clk;
+  sub u (.clk(clk));
+  initial begin repeat (3) @(posedge clk); $finish; end
+endmodule
+"#);
+    // Reference: all four are 1.
+    assert!(
+        out.contains("R this_scalar=1 bare_scalar=1 bare_idx=1 this_idx=1"),
+        "indexed mailbox property not allocated inside a method:\n{out}"
+    );
+}
+
+#[test]
+fn an_indexed_mailbox_property_allocates_through_a_handle() {
+    // `h.mb[i] = new()` from OUTSIDE the class. The parser flattens this to a
+    // multi-segment Ident rather than a MemberAccess, so it needs its own
+    // spelling; the kind comes from the receiver's runtime class.
+    let out = run(r#"
+class Holder;
+  mailbox #(int) mb [2];
+endclass
+module sub (input logic clk);
+  Holder h;
+  initial begin
+    @(posedge clk);
+    h = new();
+    h.mb[1] = new();
+    h.mb[1].put(8);
+    $display("H via_handle=%0d", (h.mb[1]==null)?-1:h.mb[1].num());
+  end
+endmodule
+module tb;
+  logic clk = 0;
+  always #500 clk = ~clk;
+  sub u (.clk(clk));
+  initial begin repeat (3) @(posedge clk); $finish; end
+endmodule
+"#);
+    assert!(
+        out.contains("H via_handle=1"),
+        "indexed mailbox property not allocated through a handle:\n{out}"
+    );
+}
+
+#[test]
+fn mailboxes_in_assoc_dynamic_and_queue_collections_allocate() {
+    // Every other collection flavour reaches the same `collection[k] = new()`
+    // branch, which previously only resolved CLASS-typed elements.
+    let out = run(r#"
+class Holder2;
+  mailbox #(int) mb2 [2][2];
+  mailbox #(int) mq [$];
+  function void alloc();
+    mb2[1][0] = new();
+    mq.push_back(null);
+    mq[0] = new();
+  endfunction
+endclass
+module sub (input logic clk);
+  mailbox #(int) mba [string];
+  mailbox #(int) mbd [];
+  Holder2 h;
+  initial begin
+    @(posedge clk);
+    mba["a"] = new(); mba["a"].put(1);
+    mbd = new[2];
+    mbd[1] = new(); mbd[1].put(2);
+    h = new(); h.alloc();
+    h.mb2[1][0].put(3);
+    h.mq[0].put(4);
+    $display("C assoc=%0d dyn=%0d prop2d=%0d queue=%0d",
+             mba["a"].num(), mbd[1].num(), h.mb2[1][0].num(), h.mq[0].num());
+  end
+endmodule
+module tb;
+  logic clk = 0;
+  always #500 clk = ~clk;
+  sub u (.clk(clk));
+  initial begin repeat (3) @(posedge clk); $finish; end
+endmodule
+"#);
+    assert!(
+        out.contains("C assoc=1 dyn=1 prop2d=1 queue=1"),
+        "a collection flavour failed to allocate its mailbox element:\n{out}"
+    );
+}

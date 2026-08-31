@@ -57695,6 +57695,41 @@ impl Simulator {
                         _ => false,
                     };
                     if is_new {
+                        // §15.3/§15.4: the element type may be a MAILBOX or
+                        // SEMAPHORE rather than a class. Everything below
+                        // resolves a class and gives up when it finds none, so
+                        // `mb[i] = new()` on a container array fell through
+                        // leaving the element unallocated — a non-null handle
+                        // with nothing behind it, so every put vanished.
+                        // Allocate here, before the class walk.
+                        if let Some(kind) = self.lvalue_container_kind(lvalue) {
+                            let handle = self.heap.len();
+                            self.heap.push(Some(ClassInstance {
+                                class_name: kind.to_string(),
+                                properties: HashMap::default(),
+                                type_bindings: HashMap::default(),
+                                spec: None,
+                                creation_scope: self.active_instance_scope(),
+                            }));
+                            let cargs: &[Expression] = match &rvalue.kind {
+                                ExprKind::Call { args, .. } => args,
+                                _ => &[],
+                            };
+                            if kind == "semaphore" {
+                                let n = cargs
+                                    .first()
+                                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
+                                    .unwrap_or(0);
+                                self.semaphores.insert(handle, n);
+                            } else {
+                                self.mailboxes
+                                    .insert(handle, std::collections::VecDeque::new());
+                                self.record_mailbox_bound(handle, cargs);
+                            }
+                            self.assign_value(lvalue, &Value::from_u64(handle as u64, 32));
+                            self.settle_after_proc_write();
+                            return;
+                        }
                         // Walk a chained-Index base (`foo[i][j] = new(...)` on a
                         // multi-dim member) to the root Ident — the element
                         // class is keyed by the base collection's name.
@@ -106637,6 +106672,40 @@ impl Simulator {
     /// container-decl map and the class-property type via the current class
     /// context FIRST (both reliable), falling back to get_expr_type_name
     /// (which only serves module-scope container signals correctly).
+    /// Container kind ("mailbox"/"semaphore") of property `member` on the
+    /// runtime class of the object `handle` refers to, walking the inheritance
+    /// chain. An ARRAY property carries no `type_name` on its signal, so the
+    /// declared type is consulted as well.
+    fn handle_prop_container_kind(&self, handle: usize, member: &str) -> Option<&'static str> {
+        if handle == 0 {
+            return None;
+        }
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(c) = cur {
+            let Some(cd) = self.module.classes.get(&c) else { break };
+            if let Some(k) = cd
+                .properties
+                .get(member)
+                .and_then(|s| s.type_name.as_deref())
+                .and_then(Self::container_base)
+            {
+                return Some(k);
+            }
+            if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
+                cd.property_types.get(member)
+                && let Some(k) = Self::container_base(&name.name.name)
+            {
+                return Some(k);
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
     fn lvalue_container_kind(&self, lvalue: &Expression) -> Option<&'static str> {
         // §15.3/§15.4: `mb[i] = new()` — an ELEMENT of a mailbox/semaphore
         // ARRAY has the ARRAY's container type. Neither the local map nor
@@ -106686,6 +106755,33 @@ impl Simulator {
                     return Some(k);
                 }
             }
+            // `h.mb[i] = new()` — the collection is a PROPERTY reached through
+            // a class HANDLE from outside the class, so the `this.` arm below
+            // does not apply and an array property carries no `type_name`.
+            // Read the declared type off the receiver's runtime class.
+            // Both spellings occur: a MemberAccess node, and the FLATTENED
+            // multi-segment Ident the parser produces for `u.h.mb`.
+            ExprKind::MemberAccess { expr: recv, member } => {
+                if let ExprKind::Ident(rh) = &recv.kind
+                    && let Some(hnd) = self.eval_ident_handle(&self.resolve_hier_name(rh))
+                    && let Some(k) = self.handle_prop_container_kind(hnd, &member.name)
+                {
+                    return Some(k);
+                }
+            }
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let member = h.path[h.path.len() - 1].name.name.clone();
+                let head = h.path[..h.path.len() - 1]
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if let Some(hnd) = self.eval_ident_handle(&head)
+                    && let Some(k) = self.handle_prop_container_kind(hnd, &member)
+                {
+                    return Some(k);
+                }
+            }
             _ => {}
         }
         let prop: Option<String> = match &lvalue.kind {
@@ -106706,7 +106802,24 @@ impl Simulator {
                 while let Some(cn) = cur {
                     if let Some(cd) = self.module.classes.get(&cn) {
                         if let Some(sig) = cd.properties.get(pn) {
-                            return sig.type_name.as_deref().and_then(Self::container_base);
+                            if let Some(k) =
+                                sig.type_name.as_deref().and_then(Self::container_base)
+                            {
+                                return Some(k);
+                            }
+                            // An ARRAY property carries no `type_name` — only
+                            // scalars do — so `mailbox mb[2];` as a class member
+                            // looked like a non-container and `mb[i] = new()`
+                            // inside a method never allocated. Fall back to the
+                            // declared type before giving up.
+                            if let Some(crate::ast::types::DataType::TypeReference {
+                                name, ..
+                            }) = cd.property_types.get(pn)
+                                && let Some(k) = Self::container_base(&name.name.name)
+                            {
+                                return Some(k);
+                            }
+                            return None;
                         }
                         cur = cd.extends.clone();
                     } else {
