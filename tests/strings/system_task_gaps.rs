@@ -230,9 +230,10 @@ endmodule
 
 // ---------------------------------------------------------------- group 6
 
-#[cfg(feature = "wave")]
 #[test]
 fn fsdb_dump_tasks_write_fst() {
+    // Waveform dumping is opt-in (`--wave` on the CLI).
+    xezim::compiler::simulator::set_wave_enabled(true);
     let dir = std::env::temp_dir().join(format!("xezim_fsdb_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let fsdb = dir.join("wave.fsdb");
@@ -264,9 +265,10 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(feature = "wave")]
 #[test]
 fn vcdpluson_maps_to_vcd() {
+    // Waveform dumping is opt-in (`--wave` on the CLI).
+    xezim::compiler::simulator::set_wave_enabled(true);
     let dir = std::env::temp_dir().join(format!("xezim_vcdplus_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let vcd = dir.join("plus.vcd");

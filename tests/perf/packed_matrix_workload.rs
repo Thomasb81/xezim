@@ -68,6 +68,9 @@ fn run(mode: Waveform) {
     if let Some(path) = files.waveform.as_deref() {
         match mode {
             Waveform::Vcd => {
+                // Source-driven `$dumpvars` needs `--wave`; `--fst`/`--xtrace`
+                // below are explicit dump requests and imply it.
+                command.arg("--wave");
                 command.arg(format!("+PACKED_MATRIX_VCD={}", path.display()));
             }
             Waveform::Fst => {
@@ -162,19 +165,16 @@ fn packed_matrix_workload_uses_fast_paths() {
     run(Waveform::None);
 }
 
-#[cfg(feature = "wave")]
 #[test]
 fn packed_matrix_workload_writes_vcd() {
     run(Waveform::Vcd);
 }
 
-#[cfg(feature = "wave")]
 #[test]
 fn packed_matrix_workload_writes_fst() {
     run(Waveform::Fst);
 }
 
-#[cfg(feature = "wave")]
 #[test]
 fn packed_matrix_workload_writes_xtrace() {
     run(Waveform::Xtrace);

@@ -882,28 +882,12 @@ fn simulate_multi_inner(
         sim.settle_limit = limit;
     }
     sim.activity_mon = activity_mon;
-    // Inert without the `wave` feature: the parameters stay in the signature
-    // so library callers compile either way, but there is no dump state to set.
-    #[cfg(feature = "wave")]
-    {
-        sim.xtrace_file = xtrace_file.map(|s| s.to_string());
-        sim.xtrace_scopes = xtrace_scopes.to_vec();
-        sim.xtrace_from_ns = xtrace_from_ns;
-        sim.xtrace_to_ns = xtrace_to_ns;
-        sim.fst_file = fst_file.map(|s| s.to_string());
-        sim.fst_scopes = fst_scopes.to_vec();
-    }
-    #[cfg(not(feature = "wave"))]
-    {
-        let _ = (
-            xtrace_file,
-            xtrace_scopes,
-            xtrace_from_ns,
-            xtrace_to_ns,
-            fst_file,
-            fst_scopes,
-        );
-    }
+    sim.xtrace_file = xtrace_file.map(|s| s.to_string());
+    sim.xtrace_scopes = xtrace_scopes.to_vec();
+    sim.xtrace_from_ns = xtrace_from_ns;
+    sim.xtrace_to_ns = xtrace_to_ns;
+    sim.fst_file = fst_file.map(|s| s.to_string());
+    sim.fst_scopes = fst_scopes.to_vec();
     sim.set_plusargs(plusargs);
     // Default argv for vpi_get_vlog_info — the real CLI passes the
     // full tokenized list via set_args() in main.rs. Here we hand
