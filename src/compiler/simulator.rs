@@ -63809,7 +63809,16 @@ impl Simulator {
                                 || self.module.typedefs.contains_key(&tn)
                                 || self.module.typedef_types.contains_key(&tn)
                             {
-                                self.var_typedef_types.insert(d.name.name.clone(), tn);
+                                self.var_typedef_types.insert(d.name.name.clone(), tn.clone());
+                                // Record the frame-scoped typedef too so a
+                                // method-local enum type is resolvable without
+                                // the flat `var_class_types`/`var_typedef_types`
+                                // collision across unrelated frames (a same-
+                                // named formal `VISITOR v` in another method
+                                // must not shadow this `uvm_verbosity v;
+                                // local). `local_typedef_type_of` reads the
+                                // innermost active frame. §6.19.6.
+                                self.record_local_typedef_type(&d.name.name, &tn);
                             }
                         }
                     }
@@ -81519,6 +81528,19 @@ impl Simulator {
             .find_map(|(c, _)| c.get(name).cloned())
     }
 
+    /// Innermost-first overlay lookup for a frame-local's declared
+    /// typedef/enum type. Mirrors `local_class_type_of` for the typedef
+    /// flavor. Kept frame-scoped so an unrelated method's same-named
+    /// formal/local never shadows the currently executing method's own
+    /// declaration (`local_typedef_type_of` starts from the top of
+    /// `local_type_stack`, which holds only the ACTIVE call frames).
+    fn local_typedef_type_of(&self, name: &str) -> Option<String> {
+        self.local_type_stack
+            .iter()
+            .rev()
+            .find_map(|(_, t)| t.get(name).cloned())
+    }
+
     /// Push a local frame, keeping the type overlay in lockstep.
     fn push_local_frame(&mut self, f: HashMap<String, Value>) {
         if self.name_stats_on {
@@ -92063,6 +92085,27 @@ impl Simulator {
             }
             if mname == "name" && args.is_empty() {
                 let type_hint = self.get_expr_type_name(expr);
+                // §6.19 enum `.name()`: the flat maps key a local's type by
+                // BARE name across all frames, so an unrelated scope's same-
+                // named formal/local (e.g. a visitor adapter's `VISITOR v;`
+                // formal) can leak in and shadow this method's `uvm_verbosity
+                // v;` local — `v.name()` then resolves against the wrong type
+                // and reflects an unrelated 0-valued member (`UVM_NORADIX`).
+                // The currently executing frame's OWN typedef declaration is
+                // authoritative for enum reflection, so for a bare identifier
+                // receiver we prefer the record-local typedef when it names a
+                // real enum-member table (falling back to the flat hint when
+                // it identifies no enum). Scoped to this reflection path only;
+                // ordinary `get_expr_type_name` callers keep flat semantics.
+                let type_hint = if let ExprKind::Ident(h) = &expr.kind {
+                    let n = self.resolve_hier_name(h);
+                    match self.local_typedef_type_of(&n) {
+                        Some(t) if self.module.enum_members.contains_key(&t) => Some(t),
+                        _ => type_hint,
+                    }
+                } else {
+                    type_hint
+                };
                 let is_class_with_name_method = type_hint
                     .as_deref()
                     .and_then(|tn| self.module.classes.get(tn))
@@ -92071,6 +92114,19 @@ impl Simulator {
                     let val = self.eval_expr(expr).to_u64().unwrap_or(0);
                     if let Some(nm) = self.enum_value_name(val, type_hint.as_deref()) {
                         return Value::from_string(&nm);
+                    }
+                    // Enum value with no matching member: return empty rather
+                    // than treating the (integral) value as a heap-object
+                    // handle and falling through to an object-handle `.name()`.
+                    // Mirrors the flattened-Ident receiver branch below.
+                    // Only for a receiver DECLARED as an enum, so a genuine
+                    // class handle (whether or not it has a user `name()`) is
+                    // never caught here.
+                    if type_hint
+                        .as_deref()
+                        .is_some_and(|t| self.module.enum_members.contains_key(t))
+                    {
+                        return Value::from_string("");
                     }
                 }
             }
