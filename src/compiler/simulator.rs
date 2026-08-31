@@ -52975,6 +52975,33 @@ impl Simulator {
                     _ => None,
                 };
                 if let Some(mut name) = idx_base_name {
+                    // `ClassName.staticColl[i]` / `ClassName::staticColl[i]` —
+                    // a static-collection element read reaching the Index
+                    // handler as a qualified dotted name (the MemberAccess
+                    // form `(ClassName).coll` that `flat_member_name` renders
+                    // as `ClassName.coll`). The static collection itself is
+                    // registered under the BARE collection name (module scope
+                    // resolves the same `::` form to `q` via the hier collapse),
+                    // so a dotted `Class.coll` never matches
+                    // `dynamic_arrays`/`arrays`/`associative_arrays` here and
+                    // falls through to a scalar bit-select — reading null.
+                    if let Some((cls, coll)) = name.split_once('.') {
+                        if self.module.classes.contains_key(cls)
+                            && self.member_is_static_coll(cls, coll)
+                        {
+                            // Sibling-collision storage is per-DECLARING class
+                            // (`ClassName::coll` — e.g. the four
+                            // `uvm_cmdline_set_*` classes each declaring
+                            // `static … settings[$]`); a non-colliding static
+                            // collection keeps the BARE name its accessors and
+                            // store use. Match `spec_static_coll_key`.
+                            name = if self.static_coll_name_collides(coll) {
+                                self.static_prop_key(cls, coll).unwrap_or_else(|| coll.to_string())
+                            } else {
+                                coll.to_string()
+                            };
+                        }
+                    }
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
                     }
@@ -91483,7 +91510,30 @@ impl Simulator {
                 }
                 // Collection builtin on the flattened receiver name.
                 if segs.len() >= 2 {
-                    let recv_name = segs[..segs.len() - 1].join(".");
+                    let mut recv_name = segs[..segs.len() - 1].join(".");
+                    // A class-qualified STATIC collection receiver
+                    // (`ClassName::staticColl.push_back(x)` / `.size()`)
+                    // flattens to the DOT form `ClassName.staticColl`, which
+                    // never matches the dynamic-array/assoc membership tests
+                    // below (those see the bare registered name), so a
+                    // `push_back`/`size` reached from a non-instance context
+                    // (a static fn / module static init — e.g. `m_do_cl_init`
+                    // pushing `+uvm_set_severity`) was silently dropped.
+                    // Rewrite the receiver: a SIBLING-COLLIDING collection
+                    // stores per-DECLARING class (`ClassName::coll`, matching
+                    // `spec_static_coll_key`); a non-colliding one keeps the
+                    // bare name its in-class accessors and store use.
+                    if let Some((cls, coll)) = recv_name.split_once('.') {
+                        if self.module.classes.contains_key(cls)
+                            && self.member_is_static_coll(cls, coll)
+                        {
+                            recv_name = if self.static_coll_name_collides(coll) {
+                                self.static_prop_key(cls, coll).unwrap_or_else(|| coll.to_string())
+                            } else {
+                                coll.to_string()
+                            };
+                        }
+                    }
                     if self.module.dynamic_arrays.contains(&recv_name)
                         || self.module.associative_arrays.contains_key(&recv_name)
                         || self.module.arrays.contains_key(&recv_name)
