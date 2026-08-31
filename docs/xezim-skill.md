@@ -79,6 +79,10 @@ xezim --simulate --xtrace t.xt --xtrace-scope tb.dut \
       --xtrace-from 10000 --xtrace-to 20000 ...               # windowed text dump
 ```
 
+All dump support needs a `cargo build --features wave` build; a default build
+has no `--fst`/`--xtrace` options and ignores the `$dump*` tasks with a
+one-time warning.
+
 `$dumpfile/$dumpvars` VCD works too. For big designs, always scope and
 window the dump — the `--xtrace-from/to` window around a known-bad time is
 how divergences get diffed against another simulator's VCD.

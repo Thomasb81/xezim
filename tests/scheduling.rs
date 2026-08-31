@@ -175,6 +175,7 @@ mod vardelay_clock_period;
 mod wait_in_foreach_blocks;
 #[path = "scheduling/waiter_edge_ordering.rs"]
 mod waiter_edge_ordering;
+#[cfg(feature = "wave")]
 #[path = "scheduling/xtrace_conformance.rs"]
 mod xtrace_conformance;
 

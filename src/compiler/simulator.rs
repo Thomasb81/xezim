@@ -16,6 +16,7 @@ use crate::ast::stmt::*;
 use crate::ast::types::{DataType, IntegerAtomType, PortDirection};
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
+#[cfg(feature = "wave")]
 use fst_writer::{
     FstBodyWriter, FstHeaderWriter, FstScopeType, FstSignalId, FstSignalType, FstVarDirection,
     FstVarType,
@@ -270,23 +271,27 @@ fn apply_delay_mode(d: u64) -> u64 {
     }
 }
 
+#[cfg(feature = "wave")]
 #[derive(Clone, Default)]
 pub struct XtraceOptions {
     pub profile: Option<String>,
     pub compress: Option<String>,
 }
 
+#[cfg(feature = "wave")]
 fn xtrace_options_cell() -> &'static Mutex<XtraceOptions> {
     static XTRACE_OPTIONS: OnceLock<Mutex<XtraceOptions>> = OnceLock::new();
     XTRACE_OPTIONS.get_or_init(|| Mutex::new(XtraceOptions::default()))
 }
 
+#[cfg(feature = "wave")]
 pub fn set_xtrace_options(profile: Option<String>, compress: Option<String>) {
     if let Ok(mut guard) = xtrace_options_cell().lock() {
         *guard = XtraceOptions { profile, compress };
     }
 }
 
+#[cfg(feature = "wave")]
 fn xtrace_options() -> XtraceOptions {
     xtrace_options_cell()
         .lock()
@@ -446,14 +451,20 @@ macro_rules! sim_dbg_eprintln {
 /// + one epoch compare when the dump is active, a single branch otherwise. The
 /// rolling epoch dedups repeat writes within a flush.
 macro_rules! vcd_mark {
+    // Without the `wave` feature there are no dump writers, so this expands to
+    // nothing rather than a per-signal-write load-and-branch on a flag that can
+    // never be set.
     ($self:ident, $id:expr_2021) => {{
-        if $self.dump_dirty_active {
-            let __vm_id = $id;
-            if __vm_id < $self.dump_dirty_mark.len()
-                && $self.dump_dirty_mark[__vm_id] != $self.dump_dirty_epoch
-            {
-                $self.dump_dirty_mark[__vm_id] = $self.dump_dirty_epoch;
-                $self.dump_dirty.push(__vm_id as u32);
+        #[cfg(feature = "wave")]
+        {
+            if $self.dump_dirty_active {
+                let __vm_id = $id;
+                if __vm_id < $self.dump_dirty_mark.len()
+                    && $self.dump_dirty_mark[__vm_id] != $self.dump_dirty_epoch
+                {
+                    $self.dump_dirty_mark[__vm_id] = $self.dump_dirty_epoch;
+                    $self.dump_dirty.push(__vm_id as u32);
+                }
             }
         }
     }};
@@ -2966,6 +2977,7 @@ enum RandMemberTarget {
 /// IEEE 1800-2017 §21.7.2.1 `var_type` of a dumped object. Every `$var` used to
 /// be hardcoded `wire`, which mislabels every variable in the design and hides
 /// `event` semantics from the viewer entirely.
+#[cfg(feature = "wave")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VcdVarKind {
     Wire,
@@ -2994,6 +3006,7 @@ struct ActiveForceExpr {
     has_unresolved_reads: bool,
 }
 
+#[cfg(feature = "wave")]
 impl VcdVarKind {
     /// The §21.7.2.1 `var_type` keyword.
     fn keyword(self) -> &'static str {
@@ -4444,35 +4457,45 @@ pub struct Simulator {
     /// Swap buffer for event_waiters filtering (avoids allocation per cycle)
     event_waiters_swap: Vec<EventWaiter>,
     /// VCD dump state
+    #[cfg(feature = "wave")]
     vcd_file: Option<String>,
+    #[cfg(feature = "wave")]
     vcd_writer: Option<super::vcd_sink::VcdSink>,
     /// Per-traced-signal table: (signal_table index, output id code). Built
     /// once at dump start; the per-cycle loop walks just this vector instead
     /// of iterating the full id_to_name (36M entries on c910) and hashing
     /// every name. The identifier code is an `Arc<str>` so the VCD per-change
     /// clone is a refcount bump, not a heap allocation.
+    #[cfg(feature = "wave")]
     vcd_trace: Vec<(usize, Arc<str>)>,
+    #[cfg(feature = "wave")]
     vcd_enabled: bool,
+    #[cfg(feature = "wave")]
     vcd_last_time: u64,
     /// Optional size limit for the VCD dump ($dumplimit, §21.7.1.5).
     /// Previous emitted value per entry in `vcd_trace` (parallel vector).
     /// A plain Vec<Value> — no duplicated name strings, no hashing.
+    #[cfg(feature = "wave")]
     vcd_prev_signals: Vec<Value>,
     /// Optional scope/signal-name filters captured from `$dumpvars(level, sig...)`.
     /// When non-empty, only signals whose hierarchical name matches one of these
     /// scopes (or is a signal name given exactly) are emitted to the VCD. The
     /// strings are ABSOLUTE (they include the top module); `dump_filter_prefixes`
     /// rewrites them to the top-RELATIVE form the signal table uses.
+    #[cfg(feature = "wave")]
     vcd_filter_scopes: Vec<String>,
     /// §21.7.1.4 `$dumpvars` depth argument: 0 = every level below the given
     /// scope, N = N levels starting at it.
+    #[cfg(feature = "wave")]
     vcd_dump_depth: u32,
     /// §21.7.2.1 var type per `vcd_trace` entry (parallel vector). Drives both
     /// the `$var` declaration and the runtime record shape (an `event` emits a
     /// bare `1<id>` pulse, a `real` an `r<decimal>` record).
+    #[cfg(feature = "wave")]
     vcd_var_kinds: Vec<VcdVarKind>,
     /// Last sim time at which each `vcd_trace` entry that is an `event` emitted
     /// its trigger pulse — dedups repeat triggers inside one time slot.
+    #[cfg(feature = "wave")]
     vcd_event_last: Vec<u64>,
     /// Incremental (dirty-set) change detection, SHARED by every dump writer
     /// (VCD, XTrace, FST). The full scan is O(all dumped signals) per timestep;
@@ -4495,17 +4518,26 @@ pub struct Simulator {
     /// fire via event_triggered_time, not signal writes). Disabled — falling
     /// back to the full scan — via XEZIM_VCD_FULL=1 / XEZIM_DUMP_FULL=1 or when
     /// the maps are unbuilt.
+    #[cfg(feature = "wave")]
     dump_dirty: Vec<u32>,
+    #[cfg(feature = "wave")]
     dump_dirty_mark: Vec<u64>,
+    #[cfg(feature = "wave")]
     dump_dirty_epoch: u64,
+    #[cfg(feature = "wave")]
     vcd_id_to_trace: Vec<Vec<u32>>,
+    #[cfg(feature = "wave")]
     vcd_event_indices: Vec<usize>,
+    #[cfg(feature = "wave")]
     dump_dirty_active: bool,
     /// §21.7.1.8 `$dumplimit`: byte budget for the dump, and the running
     /// (approximate) count of bytes handed to the sink. `vcd_limit_hit` latches
     /// once the budget is spent and permanently stops the dump.
+    #[cfg(feature = "wave")]
     vcd_limit: Option<u64>,
+    #[cfg(feature = "wave")]
     vcd_bytes: u64,
+    #[cfg(feature = "wave")]
     vcd_limit_hit: bool,
     /// Persistent workers for XEZIM_DISPATCHER=pdes parallel edge dispatch.
     pdes_worker_pool: Option<ParallelWorkerPool>,
@@ -4542,65 +4574,86 @@ pub struct Simulator {
     /// Set `xtrace_file` to enable. Emits the XTrace v1.0 "minimal" profile:
     /// dictionary + per-cycle signal deltas (VCD-equivalent payload). When the
     /// filename ends in `.zst`/`.zstd` the byte stream is zstd-compressed.
+    #[cfg(feature = "wave")]
     pub xtrace_file: Option<String>,
     /// Optional hierarchical scope filters for XTrace. When non-empty, only
     /// signals matching one of these (exact, or `<scope>.` prefix) are dumped.
+    #[cfg(feature = "wave")]
     pub xtrace_scopes: Vec<String>,
+    #[cfg(feature = "wave")]
     xtrace_writer: Option<super::vcd_sink::VcdSink>,
     /// Per-traced-NET table: (signal_table index, XTrace signal id). One entry
     /// per backing net — an aliased name (§9.2 `alias=`) has its own id in the
     /// dictionary but emits no deltas of its own.
+    #[cfg(feature = "wave")]
     xtrace_trace: Vec<(usize, Arc<str>)>,
     /// Signal id → `xtrace_trace` slots, for the shared incremental dirty-set
     /// change detection (see the `dump_dirty` field docs). Empty ⇒ full scan.
+    #[cfg(feature = "wave")]
     xtrace_id_to_trace: Vec<Vec<u32>>,
     /// Previous emitted value per entry in `xtrace_trace` (parallel vector).
+    #[cfg(feature = "wave")]
     xtrace_prev_signals: Vec<Value>,
     /// Whether entry `i` of `xtrace_trace` is a `real` (parallel vector): its
     /// value token is a decimal number, not a hex bit pattern (§15.1).
+    #[cfg(feature = "wave")]
     xtrace_real: Vec<bool>,
     /// Whether entry `i` of `xtrace_trace` is a `string` (parallel vector): its
     /// value token is a §15.4 quoted, escaped string rather than a bit pattern.
+    #[cfg(feature = "wave")]
     xtrace_string: Vec<bool>,
     /// The t=0 `N,full` snapshot is emitted lazily, on the first in-window
     /// `xtrace_write_changes` call — by then the time-0 initial blocks have run
     /// and settled, so the checkpoint carries real values (matching the
     /// reference producer) instead of the pre-init all-X image.
+    #[cfg(feature = "wave")]
     xtrace_snapshot_pending: bool,
     /// SV `event` objects (signal_table index, XTrace signal id). An event has
     /// no level, so it is NOT in `xtrace_trace`: it emits an §10.4 `X` record
     /// per trigger instead of a value delta.
+    #[cfg(feature = "wave")]
     xtrace_events: Vec<(usize, Arc<str>)>,
     /// Time of the last `X` record emitted for each `xtrace_events` entry, so a
     /// 0→1→0 toggle inside one time slot still counts as exactly one trigger
     /// (mirrors `vcd_event_last`).
+    #[cfg(feature = "wave")]
     xtrace_event_last: Vec<u64>,
+    #[cfg(feature = "wave")]
     xtrace_last_time: u64,
     /// Change-emitting steps since the last durable flush of the XTrace
     /// writer. Bounds how much trailing trace a crash/SIGKILL can lose
     /// (the binary builds with `panic = "abort"`, so `Drop` does not run on
     /// panic, and the memory watchdog SIGKILLs outright).
+    #[cfg(feature = "wave")]
     xtrace_dirty_steps: u32,
     /// XTrace time window (#8) in nanoseconds, from `--xtrace-from`/`--xtrace-to`.
     /// `xtrace_to_ns == u64::MAX` means no upper bound. Set by the CLI.
+    #[cfg(feature = "wave")]
     pub xtrace_from_ns: u64,
+    #[cfg(feature = "wave")]
     pub xtrace_to_ns: u64,
     /// The same window converted to simulation ticks (tick_s units), cached at
     /// dump start. `xtrace_to_t == u64::MAX` means unbounded.
+    #[cfg(feature = "wave")]
     xtrace_from_t: u64,
+    #[cfg(feature = "wave")]
     xtrace_to_t: u64,
     /// FST dump state (GTKWave binary format via the `fst-writer` crate).
     /// Independent of VCD/XTrace — enabled by `--fst <file>`.
+    #[cfg(feature = "wave")]
     pub fst_file: Option<String>,
     /// Optional hierarchical scope filters for FST (same semantics as
     /// `--xtrace-scope`): keep signals whose name equals or sits under a scope.
+    #[cfg(feature = "wave")]
     pub fst_scopes: Vec<String>,
     /// The FST body writer (post-header phase). `None` until `fst_start_dump`.
     /// Value packing, block compression and I/O run on a background thread
     /// (`XEZIM_DUMP_INLINE=1` keeps them here); see `fst_sink::FstSink`.
+    #[cfg(feature = "wave")]
     fst_writer: Option<super::fst_sink::FstSink>,
     /// Path of the open FST dump, kept so `fst_finish` can repair the file
     /// after the writer has closed it. See `fst_repair_time_tables`.
+    #[cfg(feature = "wave")]
     fst_path: Option<String>,
     /// Named-cast targets resolvable at COMPILE time: name -> (width,
     /// signed). Built once at construction; handed to every bytecode
@@ -4636,11 +4689,14 @@ pub struct Simulator {
     /// construction path (fresh elaboration, artifact load) is covered.
     elem_dotted_bases: RefCell<Option<HashSet<String>>>,
     /// Compact per-net trace table: (signal_table index, FST signal id).
+    #[cfg(feature = "wave")]
     fst_trace: Vec<(usize, FstSignalId)>,
     /// Signal id → `fst_trace` slots, for the shared incremental dirty-set
     /// change detection (see the `dump_dirty` field docs). Empty ⇒ full scan.
+    #[cfg(feature = "wave")]
     fst_id_to_trace: Vec<Vec<u32>>,
     /// Previous emitted value per `fst_trace` entry (parallel vector).
+    #[cfg(feature = "wave")]
     fst_prev_signals: Vec<Value>,
     /// Pre-computed combinatorial entries with sensitivity sets.
     comb_entries: Vec<CombEntry>,
@@ -7916,24 +7972,43 @@ impl Simulator {
             fe_trusted_types: HashSet::default(),
             cg_event_waiters: Vec::new(),
             event_waiters_swap: Vec::new(),
+            #[cfg(feature = "wave")]
             vcd_file: None,
+            #[cfg(feature = "wave")]
             vcd_writer: None,
+            #[cfg(feature = "wave")]
             vcd_trace: Vec::new(),
+            #[cfg(feature = "wave")]
             dump_dirty: Vec::new(),
+            #[cfg(feature = "wave")]
             dump_dirty_mark: Vec::new(),
+            #[cfg(feature = "wave")]
             dump_dirty_epoch: 1,
+            #[cfg(feature = "wave")]
             vcd_id_to_trace: Vec::new(),
+            #[cfg(feature = "wave")]
             vcd_event_indices: Vec::new(),
+            #[cfg(feature = "wave")]
             dump_dirty_active: false,
+            #[cfg(feature = "wave")]
             vcd_enabled: false,
+            #[cfg(feature = "wave")]
             vcd_last_time: u64::MAX,
+            #[cfg(feature = "wave")]
             vcd_prev_signals: Vec::new(),
+            #[cfg(feature = "wave")]
             vcd_filter_scopes: Vec::new(),
+            #[cfg(feature = "wave")]
             vcd_dump_depth: 0,
+            #[cfg(feature = "wave")]
             vcd_var_kinds: Vec::new(),
+            #[cfg(feature = "wave")]
             vcd_event_last: Vec::new(),
+            #[cfg(feature = "wave")]
             vcd_limit: None,
+            #[cfg(feature = "wave")]
             vcd_bytes: 0,
+            #[cfg(feature = "wave")]
             vcd_limit_hit: false,
             pdes_worker_pool: None,
             perlp_settle_prefix: None,
@@ -7946,33 +8021,57 @@ impl Simulator {
             prof_perlp_total_ns: 0,
             perlp_after: 0,
             stdout_sink: None,
+            #[cfg(feature = "wave")]
             xtrace_file: None,
+            #[cfg(feature = "wave")]
             xtrace_scopes: Vec::new(),
+            #[cfg(feature = "wave")]
             xtrace_writer: None,
+            #[cfg(feature = "wave")]
             xtrace_trace: Vec::new(),
+            #[cfg(feature = "wave")]
             xtrace_id_to_trace: Vec::new(),
+            #[cfg(feature = "wave")]
             xtrace_prev_signals: Vec::new(),
+            #[cfg(feature = "wave")]
             xtrace_real: Vec::new(),
+            #[cfg(feature = "wave")]
             xtrace_string: Vec::new(),
+            #[cfg(feature = "wave")]
             xtrace_snapshot_pending: false,
+            #[cfg(feature = "wave")]
             xtrace_events: Vec::new(),
+            #[cfg(feature = "wave")]
             xtrace_event_last: Vec::new(),
+            #[cfg(feature = "wave")]
             xtrace_last_time: 0,
+            #[cfg(feature = "wave")]
             xtrace_dirty_steps: 0,
+            #[cfg(feature = "wave")]
             xtrace_from_ns: 0,
+            #[cfg(feature = "wave")]
             xtrace_to_ns: u64::MAX,
+            #[cfg(feature = "wave")]
             xtrace_from_t: 0,
+            #[cfg(feature = "wave")]
             xtrace_to_t: u64::MAX,
+            #[cfg(feature = "wave")]
             fst_file: None,
+            #[cfg(feature = "wave")]
             fst_scopes: Vec::new(),
+            #[cfg(feature = "wave")]
             fst_writer: None,
+            #[cfg(feature = "wave")]
             fst_path: None,
             cast_widths,
             fn_decl_cache: HashMap::default(),
             fn_pure_cache: HashMap::default(),
             elem_dotted_bases: RefCell::new(None),
+            #[cfg(feature = "wave")]
             fst_trace: Vec::new(),
+            #[cfg(feature = "wave")]
             fst_id_to_trace: Vec::new(),
+            #[cfg(feature = "wave")]
             fst_prev_signals: Vec::new(),
             comb_entries: Vec::new(),
             prepared_comb_cache_path: None,
@@ -12940,9 +13039,11 @@ impl Simulator {
         // Open the XTrace dump (if requested) AFTER initial-block scheduling
         // and time-0 settle so the dictionary captures all elaborated signals
         // and the snapshot reflects post-settle initial values.
+        #[cfg(feature = "wave")]
         if self.xtrace_file.is_some() {
             self.xtrace_start_dump();
         }
+        #[cfg(feature = "wave")]
         if self.fst_file.is_some() {
             self.fst_start_dump();
         }
@@ -15976,8 +16077,11 @@ impl Simulator {
         // Flush any `--warn-x` reports captured during the final region.
         self.drain_warn_x();
         self.drain_value_trace();
+        #[cfg(feature = "wave")]
         self.vcd_finish();
+        #[cfg(feature = "wave")]
         self.xtrace_finish();
+        #[cfg(feature = "wave")]
         self.fst_finish();
         // Barrier before the caller prints its own summary. `$display` output
         // is on a writer thread; the `[PROF]`/`[PHASE]` lines and the trailing
@@ -27118,9 +27222,9 @@ impl Simulator {
                 self.module.pending_always.len(),
                 self.module.tasks.len(),
                 self.module.functions.len(),
-                self.vcd_file.is_some(),
-                self.fst_file.is_some(),
-                self.xtrace_file.is_some(),
+                cfg!(feature = "wave") && self.wave_vcd_active(),
+                cfg!(feature = "wave") && self.wave_fst_active(),
+                self.wave_xtrace_active(),
             );
             eprintln!(
                 "[DEAD-CENSUS] UPPER BOUND (process/AST/dump reads NOT modelled): dead={} of {} comb entries ({:.1}%), {} rounds, opaque_edge={}",
@@ -56781,11 +56885,7 @@ impl Simulator {
         body: &Statement,
     ) -> bool {
         if self.warn_x
-            || self.vcd_writer.is_some()
-            || self.xtrace_file.is_some()
-            || self.xtrace_writer.is_some()
-            || self.fst_file.is_some()
-            || self.fst_writer.is_some()
+            || self.wave_any_active()
             || !self.forced_signals.is_empty()
             || !self.forced_names.is_empty()
             || !self.active_force_exprs.is_empty()
@@ -64499,6 +64599,21 @@ impl Simulator {
     }
 
     /// Emit `msg` once per distinct system-task `name` for the whole run.
+    /// A waveform system task was called in a build without the `wave`
+    /// feature. Warn once per task and carry on — a design that dumps should
+    /// still simulate, it just produces no waveform.
+    #[cfg(not(feature = "wave"))]
+    fn warn_wave_disabled(&mut self, name: &str) {
+        self.warn_system_task_once(
+            name,
+            &format!(
+                "Note: {} ignored — this build has no waveform support. \
+                 Rebuild with `--features wave` to dump VCD/FST.",
+                name
+            ),
+        );
+    }
+
     fn warn_system_task_once(&mut self, name: &str, msg: &str) {
         if self.warned_system_tasks.insert(name.to_string()) {
             eprintln!("{}", msg);
@@ -65043,6 +65158,8 @@ impl Simulator {
                 }
             }
             "$dumpfile" => {
+                #[cfg(feature = "wave")]
+                {
                 if let Some(arg) = args.first() {
                     // §21.7.2.1: the file name is any string-valued expression
                     // — a `string` VARIABLE (`$dumpfile(vcdfn)`) must use its
@@ -65054,12 +65171,17 @@ impl Simulator {
                         Some(path)
                     };
                 }
+                            }
+                #[cfg(not(feature = "wave"))]
+                self.warn_wave_disabled("$dumpfile");
             }
             // Verdi's FSDB dump tasks mapped onto xezim's native FST dump
             // machinery (FSDB is a proprietary format; FST is the closest
             // compact binary equivalent and Verdi-class viewers read it).
             // The rewritten path swaps a .fsdb extension for .fst.
             "$fsdbDumpfile" => {
+                #[cfg(feature = "wave")]
+                {
                 let path = args
                     .first()
                     .map(|a| self.system_string_arg(a))
@@ -65079,11 +65201,16 @@ impl Simulator {
                     ),
                 );
                 self.fst_file = Some(path);
+                            }
+                #[cfg(not(feature = "wave"))]
+                self.warn_wave_disabled("$fsdbDumpfile");
             }
             // `$fsdbDumpvars([depth[, scope]...])` — starts the FST dump.
             // Scope arguments narrow the dump like $dumpvars; the depth
             // argument is accepted but not depth-filtered (whole subtree).
             "$fsdbDumpvars" => {
+                #[cfg(feature = "wave")]
+                {
                 if self.fst_file.is_none() {
                     self.fst_file = Some("xezim.fst".to_string());
                 }
@@ -65107,12 +65234,17 @@ impl Simulator {
                 if self.fst_writer.is_none() {
                     self.fst_start_dump();
                 }
+                            }
+                #[cfg(not(feature = "wave"))]
+                self.warn_wave_disabled("$fsdbDumpvars");
             }
             // VCS's VPD (vcdplus) control tasks mapped onto the plain VCD
             // machinery: on first use starts a VCD dump of the whole design
             // into "vcdplus.vcd"; later calls resume/suspend like
             // $dumpon/$dumpoff.
             "$vcdpluson" => {
+                #[cfg(feature = "wave")]
+                {
                 self.warn_system_task_once(
                     "$vcdpluson",
                     "Note: $vcdpluson is not VPD — writing VCD to vcdplus.vcd instead",
@@ -65127,11 +65259,21 @@ impl Simulator {
                 } else {
                     self.vcd_dump_on();
                 }
+                            }
+                #[cfg(not(feature = "wave"))]
+                self.warn_wave_disabled("$vcdpluson");
             }
             "$vcdplusoff" => {
+                #[cfg(feature = "wave")]
+                {
                 self.vcd_dump_off();
+                            }
+                #[cfg(not(feature = "wave"))]
+                self.warn_wave_disabled("$vcdplusoff");
             }
             "$dumpvars" => {
+                #[cfg(feature = "wave")]
+                {
                 // §21.7.1.4 `$dumpvars(level, scope_or_var, ...)`.
                 // arg[0] is the DEPTH: 0 = every level below each named scope,
                 // N = N levels starting at it. args[1..] are scope or signal
@@ -65163,25 +65305,53 @@ impl Simulator {
                 self.vcd_filter_scopes = filter_scopes;
                 self.vcd_dump_depth = depth;
                 self.vcd_start_dump();
+                            }
+                #[cfg(not(feature = "wave"))]
+                self.warn_wave_disabled("$dumpvars");
             }
             "$dumpoff" => {
+                #[cfg(feature = "wave")]
+                {
                 self.vcd_dump_off();
+                            }
+                #[cfg(not(feature = "wave"))]
+                self.warn_wave_disabled("$dumpoff");
             }
             "$dumpon" => {
+                #[cfg(feature = "wave")]
+                {
                 self.vcd_dump_on();
+                            }
+                #[cfg(not(feature = "wave"))]
+                self.warn_wave_disabled("$dumpon");
             }
             "$dumpall" => {
+                #[cfg(feature = "wave")]
+                {
                 self.vcd_dump_all();
+                            }
+                #[cfg(not(feature = "wave"))]
+                self.warn_wave_disabled("$dumpall");
             }
             "$dumpflush" => {
+                #[cfg(feature = "wave")]
+                {
                 // §21.7.1.9: force everything buffered so far out to the file.
                 if let Some(w) = self.vcd_writer.as_mut() {
                     let _ = w.flush();
                 }
+                            }
+                #[cfg(not(feature = "wave"))]
+                self.warn_wave_disabled("$dumpflush");
             }
             "$dumplimit" => {
+                #[cfg(feature = "wave")]
+                {
                 // §21.7.1.8: cap the dump at N bytes.
                 self.vcd_limit = args.first().and_then(|a| self.eval_expr(a).to_u64());
+                            }
+                #[cfg(not(feature = "wave"))]
+                self.warn_wave_disabled("$dumplimit");
             }
             "$sscanf" => {
                 if args.len() >= 2 {
@@ -71576,6 +71746,7 @@ impl Simulator {
     // ═══════════════════════════════════════════════════════════════
 
     /// Generate a VCD identifier code from an index (!, ", #, ... multi-char for large designs)
+    #[cfg(feature = "wave")]
     fn vcd_id_code(mut idx: usize) -> String {
         let mut code = String::new();
         loop {
@@ -71594,6 +71765,7 @@ impl Simulator {
     /// I/O and benefits even a single-threaded sim by moving ASCII formatting
     /// and file writes off the simulation thread. Set `XEZIM_DUMP_INLINE=1` to
     /// force inline writing (deterministic debugging, or to avoid the thread).
+    #[cfg(feature = "wave")]
     fn dump_writer_threaded(&self) -> bool {
         std::env::var_os("XEZIM_DUMP_INLINE").is_none()
     }
@@ -71610,6 +71782,7 @@ impl Simulator {
     /// Rewrite dump scope arguments into the top-relative form the signal table
     /// uses. `None` means "no filter" — either no arguments at all, or an
     /// argument naming the top module itself (everything lives under it).
+    #[cfg(feature = "wave")]
     fn dump_filter_prefixes(top: &str, scopes: &[String]) -> Option<Vec<String>> {
         if scopes.is_empty() {
             return None;
@@ -71633,6 +71806,7 @@ impl Simulator {
     /// list and the `$dumpvars` depth (§21.7.1.4: 0 = all levels below the
     /// scope, N = N levels starting at the scope; a filter that names a SIGNAL
     /// rather than a scope always matches exactly).
+    #[cfg(feature = "wave")]
     fn dump_name_selected(name: &str, filters: Option<&[String]>, depth: u32) -> bool {
         // `rest` is the name relative to the selected scope: no dot = level 1.
         let level_ok = |rest: &str| depth == 0 || (rest.matches('.').count() as u32) < depth;
@@ -71665,6 +71839,7 @@ impl Simulator {
     /// stuck-at-x 1-bit wires beside their own scope), enum LITERALS (which
     /// `elaborate` registers as signals), and the base name of an unpacked array
     /// whose elements are dumped individually.
+    #[cfg(feature = "wave")]
     fn dump_signal_names(&self, scopes: &[String], depth: u32) -> Vec<String> {
         let filters = Self::dump_filter_prefixes(&self.module.name, scopes);
 
@@ -71746,6 +71921,7 @@ impl Simulator {
     /// `$dumpvars(0, top.u_sub)` still dumps `u_sub.din` under its own code), at
     /// a width change, and at a `real`/`event` boundary — a shared code may only
     /// carry one width and one record shape.
+    #[cfg(feature = "wave")]
     fn dump_backing_ids(&self, names: &[String]) -> HashMap<String, usize> {
         let selected: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
         let tbl_id = |n: &str| -> Option<usize> {
@@ -71800,6 +71976,7 @@ impl Simulator {
 
     /// §21.7.2.1 `var_type` of a dumped object. Every `$var` used to be
     /// hardcoded `wire`.
+    #[cfg(feature = "wave")]
     fn dump_var_kind(&self, name: &str, id: usize) -> VcdVarKind {
         if self.module.events.contains(name) {
             return VcdVarKind::Event;
@@ -71862,6 +72039,7 @@ impl Simulator {
     /// element's own packed bit numbering, exactly as Verilator emits it:
     ///   `$var wire 8 ) mem[0] [7:0] $end`
     /// Suppressing it (the old behaviour) left every `mem[i]` un-ranged.
+    #[cfg(feature = "wave")]
     fn dump_var_range(&self, name: &str, width: u32) -> Option<(i64, i64)> {
         // A scalar has no range.
         if width <= 1 {
@@ -71902,6 +72080,7 @@ impl Simulator {
     /// The value to dump for a signal-table id, with `is_real` forced from the
     /// declaration so a `real` always formats as an `r<decimal>` record even if
     /// the stored `Value` lost its flag along the way.
+    #[cfg(feature = "wave")]
     fn dump_value(&self, id: usize) -> Value {
         let mut v = self.signal_table[id].clone();
         if self.signal_real.get(id).copied().unwrap_or(false) {
@@ -71911,6 +72090,7 @@ impl Simulator {
     }
 
     /// `$date` content. The header used to carry no date at all.
+    #[cfg(feature = "wave")]
     fn vcd_date_string() -> String {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -71940,6 +72120,7 @@ impl Simulator {
     }
 
     /// Start VCD dumping: open file, write header, record initial values
+    #[cfg(feature = "wave")]
     fn vcd_start_dump(&mut self) {
         // §21.7.1.2: a repeat `$dumpvars` must NOT re-create the file. The old
         // sink's background thread is still draining into the same path, so a
@@ -72251,6 +72432,7 @@ impl Simulator {
     /// `*_prev_signals` from the current signal table when it opens, so it only
     /// needs to see writes from that point on, which is exactly what the dirty
     /// set carries from the next flush onward.
+    #[cfg(feature = "wave")]
     fn enable_dump_dirty_tracking(&mut self) {
         if std::env::var("XEZIM_DUMP_FULL").ok().as_deref() == Some("1") {
             self.dump_dirty_active = false;
@@ -72269,6 +72451,7 @@ impl Simulator {
     /// Build a signal-id → trace-slot reverse map for a writer's trace table.
     /// A signal can occupy several slots (aliases dumped under more than one
     /// hierarchical name), so slots are collected per id rather than assumed 1:1.
+    #[cfg(feature = "wave")]
     fn build_dump_id_to_trace<T>(&self, trace: &[(usize, T)]) -> Vec<Vec<u32>> {
         let nsig = self.signal_table.len();
         let mut id_to_trace: Vec<Vec<u32>> = vec![Vec::new(); nsig];
@@ -72284,6 +72467,7 @@ impl Simulator {
     /// signal written since the last flush, sorted and deduped so record order
     /// within a timestep is byte-identical to the full scan. `None` means the
     /// caller must fall back to scanning every slot.
+    #[cfg(feature = "wave")]
     fn dump_dirty_slots(&self, id_to_trace: &[Vec<u32>]) -> Option<Vec<u32>> {
         if !self.dump_dirty_active || id_to_trace.is_empty() {
             return None;
@@ -72300,17 +72484,52 @@ impl Simulator {
         Some(slots)
     }
 
+    /// Is a VCD / FST dump running? Defined in both feature configurations so
+    /// shared code can ask without a `cfg` of its own — without `wave` the
+    /// state does not exist and these fold to a constant `false`.
+    #[cfg(feature = "wave")]
+    fn wave_vcd_active(&self) -> bool {
+        self.vcd_file.is_some() || self.vcd_writer.is_some()
+    }
+    #[cfg(not(feature = "wave"))]
+    fn wave_vcd_active(&self) -> bool {
+        false
+    }
+    #[cfg(feature = "wave")]
+    fn wave_fst_active(&self) -> bool {
+        self.fst_file.is_some() || self.fst_writer.is_some()
+    }
+    #[cfg(not(feature = "wave"))]
+    fn wave_fst_active(&self) -> bool {
+        false
+    }
+    #[cfg(feature = "wave")]
+    fn wave_xtrace_active(&self) -> bool {
+        self.xtrace_file.is_some() || self.xtrace_writer.is_some()
+    }
+    #[cfg(not(feature = "wave"))]
+    fn wave_xtrace_active(&self) -> bool {
+        false
+    }
+    fn wave_any_active(&self) -> bool {
+        self.wave_vcd_active() || self.wave_fst_active() || self.wave_xtrace_active()
+    }
+
     /// Flush every active dump writer for this time slot, then retire the
     /// shared dirty set. The writers only READ `dump_dirty` (they each need the
     /// same list), so the clear + epoch bump happens exactly once, here.
     fn dump_write_changes(&mut self) {
+        #[cfg(feature = "wave")]
         self.vcd_write_changes();
+        #[cfg(feature = "wave")]
         if self.xtrace_writer.is_some() {
             self.xtrace_write_changes();
         }
+        #[cfg(feature = "wave")]
         if self.fst_writer.is_some() {
             self.fst_write_changes();
         }
+        #[cfg(feature = "wave")]
         if self.dump_dirty_active {
             self.dump_dirty.clear();
             self.dump_dirty_epoch = self.dump_dirty_epoch.wrapping_add(1);
@@ -72327,6 +72546,7 @@ impl Simulator {
     /// Byte length of the value-change record the sink will format for `val`.
     /// The sink formats batched changes on its own thread, so `$dumplimit`
     /// sizes them here instead of materializing them.
+    #[cfg(feature = "wave")]
     fn vcd_record_len(val: &Value, code: &str) -> u64 {
         let body = if val.is_real {
             22 // "r" + decimal + " "
@@ -72339,6 +72559,7 @@ impl Simulator {
     }
 
     /// §21.7.1.8 `$dumplimit(n)`: stop dumping once the file reaches `n` bytes.
+    #[cfg(feature = "wave")]
     fn vcd_account_bytes(&mut self, n: u64) {
         if self.vcd_limit_hit {
             return;
@@ -72362,6 +72583,7 @@ impl Simulator {
     }
 
     /// Hand a fully formatted record block to the sink and bill it to the limit.
+    #[cfg(feature = "wave")]
     fn vcd_emit(&mut self, buf: Vec<u8>) {
         if self.vcd_limit_hit {
             return;
@@ -72373,6 +72595,7 @@ impl Simulator {
     }
 
     /// Write VCD value changes for the current timestep
+    #[cfg(feature = "wave")]
     fn vcd_write_changes(&mut self) {
         if !self.vcd_enabled || self.vcd_writer.is_none() || self.vcd_limit_hit {
             return;
@@ -72468,6 +72691,7 @@ impl Simulator {
     /// Emit a `$dumpall` / `$dumpon` checkpoint (§21.7.1.5, §21.7.1.7): the
     /// CURRENT value of every dumped variable, bracketed by the keyword and
     /// `$end` and stamped with the current time.
+    #[cfg(feature = "wave")]
     fn vcd_checkpoint(&mut self, keyword: &str) {
         if self.vcd_writer.is_none() || self.vcd_limit_hit {
             return;
@@ -72492,6 +72716,7 @@ impl Simulator {
     }
 
     /// §21.7.1.5 `$dumpall` — checkpoint every dumped variable.
+    #[cfg(feature = "wave")]
     fn vcd_dump_all(&mut self) {
         if !self.vcd_enabled {
             return;
@@ -72505,6 +72730,7 @@ impl Simulator {
     /// paints the window as unknown instead of holding a stale, false level.
     /// Merely flipping a bool (the old behaviour) leaves the last value on
     /// screen across the whole off-window.
+    #[cfg(feature = "wave")]
     fn vcd_dump_off(&mut self) {
         if self.vcd_writer.is_none() || !self.vcd_enabled || self.vcd_limit_hit {
             return;
@@ -72539,6 +72765,7 @@ impl Simulator {
 
     /// §21.7.1.7 `$dumpon` — resume dumping, re-stating the current value of
     /// every dumped variable so the viewer recovers from the x window.
+    #[cfg(feature = "wave")]
     fn vcd_dump_on(&mut self) {
         if self.vcd_writer.is_none() || self.vcd_enabled || self.vcd_limit_hit {
             return;
@@ -72548,6 +72775,7 @@ impl Simulator {
     }
 
     /// Flush and close VCD file
+    #[cfg(feature = "wave")]
     fn vcd_finish(&mut self) {
         if self.vcd_writer.is_some() {
             self.vcd_write_changes();
@@ -72568,6 +72796,7 @@ impl Simulator {
 
     /// §21.7.1.4 `$dumpall`: emit a checkpoint of ALL current signal values,
     /// regardless of whether they changed.
+    #[cfg(feature = "wave")]
     fn vcd_dump_checkpoint(&mut self) {
         if !self.vcd_enabled || self.vcd_writer.is_none() {
             return;
@@ -72591,6 +72820,7 @@ impl Simulator {
     }
 
     /// §21.7.1.6 `$dumpflush`: flush the VCD writer buffer to disk.
+    #[cfg(feature = "wave")]
     fn vcd_flush(&mut self) {
         if let Some(ref mut w) = self.vcd_writer {
             let _ = w.flush();
@@ -73216,6 +73446,7 @@ impl Simulator {
     /// the seconds-per-tick of the simulator's finest timescale precision.
     /// `T,+delta` records count these ticks, so the header MUST match — a
     /// hardcoded "1ns" mislabels any design with finer precision.
+    #[cfg(feature = "wave")]
     fn xtrace_timescale_str(tick_s: f64) -> String {
         // `tick_s` is a power of ten (10^precision_exp seconds).
         let exp = tick_s.log10().round() as i32;
@@ -73243,6 +73474,7 @@ impl Simulator {
     /// the reference traces carry): `a`..`z`, `A`..`Z`, `0`..`9`, then `ab`,
     /// `bb`, ... A dictionary of a few thousand nets stays at 1-2 characters,
     /// and every D/P record pays for it on every line.
+    #[cfg(feature = "wave")]
     fn xtrace_id_code(mut idx: usize) -> String {
         const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         let base = ALPHABET.len();
@@ -73285,6 +73517,7 @@ impl Simulator {
     /// background writer exists to absorb it. This wrapper keeps the remaining
     /// simulator-side call sites (the `N,full` snapshot) reading naturally.
     #[inline]
+    #[cfg(feature = "wave")]
     fn xtrace_format_value(val: &Value, is_real: bool, is_string: bool) -> String {
         super::vcd_sink::xtrace_format_value(val, is_real, is_string)
     }
@@ -73292,6 +73525,7 @@ impl Simulator {
     /// Open the XTrace file and emit the §6 header + `@section dict` + the
     /// initial state snapshot. Called once at the start of `run()` when
     /// `xtrace_file` is set.
+    #[cfg(feature = "wave")]
     fn xtrace_start_dump(&mut self) {
         // Signal count above which an unscoped (whole-design) dump is flagged.
         const XTRACE_UNSCOPED_WARN: usize = 100_000;
@@ -73635,6 +73869,7 @@ impl Simulator {
     /// SETTLED signal values, chunked per §A.13, and reseed `xtrace_prev_signals`
     /// so subsequent writes are pure deltas. Called once, from the first
     /// in-window `xtrace_write_changes`.
+    #[cfg(feature = "wave")]
     fn xtrace_emit_pending_snapshot(&mut self) {
         self.xtrace_snapshot_pending = false;
         let delta = self.time - self.xtrace_last_time;
@@ -73683,6 +73918,7 @@ impl Simulator {
     /// Per-cycle XTrace emit. Writes a T record (if time advanced), the signal
     /// deltas as packed (P) or single (D) records, and one §10.4 `X` record per
     /// event triggered in this time slot.
+    #[cfg(feature = "wave")]
     fn xtrace_write_changes(&mut self) {
         if self.xtrace_writer.is_none() {
             return;
@@ -73814,6 +74050,7 @@ impl Simulator {
 
     /// Close the trace section and flush. Called once from `run()` after
     /// the event loop drains.
+    #[cfg(feature = "wave")]
     fn xtrace_finish(&mut self) {
         if self.xtrace_writer.is_none() {
             return;
@@ -73859,6 +74096,7 @@ impl Simulator {
     /// background writer exists to absorb it. This wrapper keeps the
     /// simulator-side call site (the t=0 header snapshot) reading naturally.
     #[inline]
+    #[cfg(feature = "wave")]
     fn fst_format_value(val: &Value) -> Vec<u8> {
         super::fst_sink::fst_format_value(val)
     }
@@ -73867,6 +74105,7 @@ impl Simulator {
     /// the body writer, and emit the t=0 snapshot. Mirrors `vcd_start_dump`:
     /// same scope-filter semantics, tick_s-derived timescale, and net dedup
     /// (aliased signal_table ids share one FST id via the `alias` parameter).
+    #[cfg(feature = "wave")]
     fn fst_start_dump(&mut self) {
         let filename = match self.fst_file.clone() {
             Some(f) => f,
@@ -74016,6 +74255,7 @@ impl Simulator {
     /// Per-timestep FST emit: `time_change` once (if anything changed), then a
     /// `signal_change` per changed net. Periodically flushes a value-change
     /// block for crash safety (parity with the XTrace durable flush).
+    #[cfg(feature = "wave")]
     fn fst_write_changes(&mut self) {
         if self.fst_writer.is_none() {
             return;
@@ -74065,6 +74305,7 @@ impl Simulator {
 
     /// Finalize and close the FST file. Blocks until the writer thread has
     /// written the trailer, so the dump is complete when this returns.
+    #[cfg(feature = "wave")]
     fn fst_finish(&mut self) {
         if self.fst_writer.is_none() {
             return;
@@ -74120,6 +74361,7 @@ impl Simulator {
     /// Best-effort by construction: every failure path leaves the file exactly
     /// as the writer left it, because a dump that is merely mis-flagged is far
     /// better than one this pass half-rewrote.
+    #[cfg(feature = "wave")]
     fn fst_repair_time_tables(path: &str) {
         use std::io::{Read, Seek, SeekFrom, Write};
         const ZLIB_MAGIC: [[u8; 2]; 4] = [[0x78, 0x9c], [0x78, 0x5e], [0x78, 0x01], [0x78, 0xda]];

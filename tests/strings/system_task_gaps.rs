@@ -230,6 +230,7 @@ endmodule
 
 // ---------------------------------------------------------------- group 6
 
+#[cfg(feature = "wave")]
 #[test]
 fn fsdb_dump_tasks_write_fst() {
     let dir = std::env::temp_dir().join(format!("xezim_fsdb_{}", std::process::id()));
@@ -263,6 +264,7 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(feature = "wave")]
 #[test]
 fn vcdpluson_maps_to_vcd() {
     let dir = std::env::temp_dir().join(format!("xezim_vcdplus_{}", std::process::id()));

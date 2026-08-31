@@ -7,6 +7,7 @@
 pub mod arena;
 pub mod bytecode;
 pub mod dispatch;
+#[cfg(feature = "wave")]
 pub mod fst_sink;
 pub mod jit;
 #[cfg(feature = "jit")]
@@ -23,5 +24,6 @@ pub use xezim_core::elaborate::{elaborate_module, ElaboratedModule};
 pub use xezim_core::sdf;
 pub use xezim_core::stdout_sink;
 pub use xezim_core::value;
+#[cfg(feature = "wave")]
 pub use xezim_core::vcd_sink;
 pub use xezim_core::Value;

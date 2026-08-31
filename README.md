@@ -34,11 +34,14 @@ Current capabilities include:
 * Combinational logic simulation
 * Sequential simulation infrastructure
 * Test execution framework
-* Waveform / trace dumps — VCD (`$dumpfile`/`$dumpvars`; IEEE 1800-2017 §21.7, and
-  matches Verilator/Icarus in GTKWave), **FST** (`--fst`, GTKWave's binary format,
-  written on a dedicated writer thread with scope filtering), and XTrace v1.0
-  (`--xtrace`, optional zstd compression + scope filtering). All three are
-  cross-checked against each other by decoding them, not by file size.
+* Waveform / trace dumps (**`--features wave`**, off by default) — VCD
+  (`$dumpfile`/`$dumpvars`; IEEE 1800-2017 §21.7, and matches Verilator/Icarus
+  in GTKWave), **FST** (`--fst`, GTKWave's binary format, written on a
+  dedicated writer thread with scope filtering), and XTrace v1.0 (`--xtrace`,
+  optional zstd compression + scope filtering). All three are cross-checked
+  against each other by decoding them, not by file size. A default build has
+  none of it: no `--fst`/`--xtrace` options, and the `$dump*` tasks warn once
+  and are ignored, so a design that dumps still simulates.
 * **UVM run-phase execution** (Accellera **1800.2-2017 and 1800.2-2020.3.1**, with
   `-DUVM_NO_DPI`) — a real UVM testbench runs end-to-end: build → connect → topology →
   `run_phase` stimulus → sequencer↔driver TLM handshake → packet collection →
@@ -469,10 +472,10 @@ Common options:
 | `+libext+<ext>+…` | Extension list for `-y` search (replaces the default `.v`/`.sv`/`.V`) |
 | `+nospecify` | Suppress specify-block path delays — zero-delay gate simulation (`-nospecify` also accepted) |
 | `+notimingcheck` | Accepted no-op: specify timing checks are not modeled (also `+notimingchecks`/`-notimingchecks`) |
-| `--fst <file>` | Emit an FST (GTKWave binary) waveform dump |
-| `--fst-scope <hier>` | Restrict the FST dump to signals under `<hier>` (repeatable) |
-| `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
-| `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
+| `--fst <file>` | Emit an FST (GTKWave binary) waveform dump — **`--features wave` only** |
+| `--fst-scope <hier>` | Restrict the FST dump to signals under `<hier>` (repeatable) — **`--features wave` only** |
+| `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) — **`--features wave` only** |
+| `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) — **`--features wave` only** |
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for vendor sources you cannot edit |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
 
