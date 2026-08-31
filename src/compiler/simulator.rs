@@ -51217,6 +51217,26 @@ impl Simulator {
                             return v;
                         }
                     }
+                    // §13.4.1: a bare PARAMETERLESS INSTANCE method name with
+                    // NO parens inside a class method — `count`, `get_action`,
+                    // `tag;`. `this` is bound, the name matched no property
+                    // (read above) but the executing class's inheritance chain
+                    // declares it as a no-argument, non-static function; invoke
+                    // it on `this` and use its return. Property / vif / static
+                    // reads above all win, so a name that IS a property never
+                    // dispatches here.
+                    if let Some(Some(this_h)) = self.this_stack.last().copied() {
+                        if let Some(inst) = self.heap.get(this_h).and_then(|o| o.as_ref()) {
+                            let cname = inst.class_name.clone();
+                            if self.class_parameterless_function(&cname, name)
+                                && !self.is_static_method(&cname, name)
+                            {
+                                let r = self.exec_method_call(this_h, name, &[]);
+                                self.return_flag = false;
+                                return r;
+                            }
+                        }
+                    }
                 } else if hier.path.len() > 1 {
                     // LRM §25.8: `<obj>.<vif>` external read — if `<obj>`
                     // is a class handle whose class declares `<vif>` as a
