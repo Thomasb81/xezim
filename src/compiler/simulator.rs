@@ -74005,6 +74005,46 @@ impl Simulator {
             self.fst_scopes.len()
         );
 
+        // Name every `--fst-scope` that selected nothing. The common cause is a
+        // generate block: the scopes are `gen[0]`/`gen[1]`, so a bare
+        // `--fst-scope top.gen` matches no signal — silently, since the count
+        // line above only reports the total.
+        if !self.fst_scopes.is_empty() {
+            let scopes = self.fst_scopes.clone();
+            for sc in &scopes {
+                if !self.dump_signal_names(std::slice::from_ref(sc), 0).is_empty() {
+                    continue;
+                }
+                // Only offer the generate hint when the indexed form actually
+                // exists, so a plain typo is not told to add "[0]".
+                let indexed = format!("{}[0]", sc);
+                if !self
+                    .dump_signal_names(std::slice::from_ref(&indexed), 0)
+                    .is_empty()
+                {
+                    eprintln!(
+                        "Warning: --fst-scope '{}' matched no signals; a generate block is \
+                         named per index — did you mean '{}'?",
+                        sc, indexed
+                    );
+                } else {
+                    eprintln!("Warning: --fst-scope '{}' matched no signals", sc);
+                }
+            }
+        }
+
+        // An FST with no variables is not a valid file — GTKWave and `fst2vcd`
+        // both refuse to open it — so writing one leaves the user a broken
+        // artifact instead of a diagnostic. Skip the file entirely.
+        if sig_names.is_empty() {
+            eprintln!(
+                "Warning: no signals selected for the FST dump; '{}' not written",
+                filename
+            );
+            self.fst_file = None;
+            return;
+        }
+
         // Timescale exponent (e.g. -9 for 1ns, -12 for 1ps) from tick_s.
         let ts_exp = self.module.tick_s.log10().round() as i8;
         let info = fst_writer::FstInfo {
