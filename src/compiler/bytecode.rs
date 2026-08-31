@@ -2387,8 +2387,15 @@ impl<'a> BytecodeCompiler<'a> {
             match &e.kind {
                 ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
                 ExprKind::Index { expr, index } => {
-                    matches!(&expr.kind, ExprKind::Ident(h)
+                    (matches!(&expr.kind, ExprKind::Ident(h)
                         if h.path.iter().all(|s| s.selects.is_empty()))
+                        // `a[i][j]` on a 2-D unpacked array — the store arm
+                        // lowers it to the same row-major flat index the read
+                        // uses.
+                        || matches!(&expr.kind, ExprKind::Index { expr: b, index: bi }
+                            if matches!(&b.kind, ExprKind::Ident(h)
+                                if h.path.iter().all(|s| s.selects.is_empty()))
+                                && expr_simple(bi)))
                         && expr_simple(index)
                 }
                 // `arr[i].m` / `s.m` on a packed struct: the assign arms
@@ -2410,6 +2417,10 @@ impl<'a> BytecodeCompiler<'a> {
             match &e.kind {
                 ExprKind::Index { expr, .. } => match &expr.kind {
                     ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                    // 2-D: peel the outer index and ask again, or widening
+                    // lv_simple above smuggles `m[i][j] <= m[i][j]+1` past the
+                    // alias guard.
+                    ExprKind::Index { .. } => lv_base_name(expr),
                     _ => None,
                 },
                 // See through `.m` so `arr[i].m <= arr[i].m + 1` still reaches
@@ -2430,6 +2441,7 @@ impl<'a> BytecodeCompiler<'a> {
                             .collect::<Vec<_>>()
                             .join("."),
                     ),
+                    ExprKind::Index { .. } => lv_base_full(expr),
                     _ => None,
                 },
                 ExprKind::MemberAccess { expr, .. } => lv_base_full(expr),
@@ -2856,6 +2868,23 @@ impl<'a> BytecodeCompiler<'a> {
         i_expr: &Expression,
         j_expr: &Expression,
     ) -> Option<RegId> {
+        let (array, flat) = self.compile_2d_flat_index(hier, i_expr, j_expr)?;
+        let dest = self.alloc_reg();
+        self.emit(Insn::LoadArrayElem(dest, array, flat));
+        Some(dest)
+    }
+
+    /// Shared row-major addressing for a DYNAMIC 2-D unpacked element
+    /// (`a[i][j]`): returns the Dense operand and the register holding
+    /// `flat = (i-lo1)*ncols + (j-lo2)`, with an out-of-range index in EITHER
+    /// dimension forced one past the operand's range so the element access
+    /// itself reports it (§7.4.6: read yields x, write is discarded).
+    fn compile_2d_flat_index(
+        &mut self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+        i_expr: &Expression,
+        j_expr: &Expression,
+    ) -> Option<(Box<ArrayOperand>, RegId)> {
         let raw = Self::hier_raw_name(hier);
         let arrays_2d = self.arrays_2d?;
         let (key, ((lo1, hi1), (lo2, hi2), _w)) = arrays_2d
@@ -2914,9 +2943,7 @@ impl<'a> BytecodeCompiler<'a> {
         let oob = self.insns.len() as u32;
         self.emit(Insn::LoadConst(flat, Box::new(Value::from_u64(count as u64, 32))));
         self.insns[br] = Insn::BranchIfFalse(ok, oob);
-        let dest = self.alloc_reg();
-        self.emit(Insn::LoadArrayElem(
-            dest,
+        Some((
             Box::new(ArrayOperand::Dense {
                 name: key,
                 first_id,
@@ -2924,8 +2951,7 @@ impl<'a> BytecodeCompiler<'a> {
                 hi: count - 1,
             }),
             flat,
-        ));
-        Some(dest)
+        ))
     }
 
     /// §13.3.1 numeric conversion to real, in place. Emitted as
@@ -8382,6 +8408,28 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::NbaAssignBitDyn(as_sig_id(id), idx_reg, val_reg));
                         return true;
                     }
+                }
+                // `a[i][j] <= v` on a 2-D unpacked array: same row-major
+                // addressing the READ path already uses, then an ordinary
+                // array store. Elements are materialized contiguously, so the
+                // flat index and its out-of-range guard are shared with
+                // `compile_2d_array_read`. Without this the whole statement —
+                // and any loop containing it — stayed on the AST path, which
+                // measured ~24x slower than the 1-D equivalent.
+                if let ExprKind::Index {
+                    expr: outer,
+                    index: j_expr,
+                } = &lhs.kind
+                    && let ExprKind::Index {
+                        expr: base,
+                        index: i_expr,
+                    } = &outer.kind
+                    && let ExprKind::Ident(hier) = &base.kind
+                    && let Some((array, flat)) =
+                        self.compile_2d_flat_index(hier, i_expr, j_expr)
+                {
+                    self.emit(Insn::NbaAssignArray(array, flat, val_reg, width));
+                    return true;
                 }
                 self.bail("nba_index_other");
                 false

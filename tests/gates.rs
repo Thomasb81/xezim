@@ -29,6 +29,8 @@ mod packed_member_nesting_compiles;
 mod streaming_op_compiles;
 #[path = "gates/specify_flags.rs"]
 mod specify_flags;
+#[path = "gates/two_d_array_store_compiles.rs"]
+mod two_d_array_store_compiles;
 #[path = "gates/tran_and_implicit_nets.rs"]
 mod tran_and_implicit_nets;
 #[path = "gates/udp_primitives.rs"]
