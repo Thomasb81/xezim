@@ -52997,12 +52997,6 @@ impl Simulator {
                             // store use. Match `spec_static_coll_key`.
                             name = if self.static_coll_name_collides(coll) {
                                 self.static_prop_key(cls, coll).unwrap_or_else(|| coll.to_string())
-                            } else if self.class_is_parameterized(cls) {
-                                // PARAMETERIZED class: elements live
-                                // per-specialization via the qualified form
-                                // (§8.25) — see the matching receiver rewrite
-                                // in the MemberAccess handler.
-                                name
                             } else {
                                 coll.to_string()
                             };
@@ -58662,6 +58656,26 @@ impl Simulator {
                 }
                 // Whole associative-array copy between class members
                 // (`a.m = b.m`) — clear the destination, copy every entry.
+                // §13.5.2: a bare-ident operand that names the CURRENT call's
+                // own queue/dyn-array formal (bound in the top `local_dyn`
+                // frame by `bind_queue_param`) must not be hijacked here by a
+                // same-named property — `expr_assoc_name` resolves it to
+                // `<handle>#member`, so `get_value_array(ref u64_t value[])`
+                // with body `value = this.value` resolved BOTH sides to the
+                // property and self-copied (the formal's ref writeback stayed
+                // empty), and the mirror `this.value = value` did the same in
+                // reverse (the property kept its stale content). Decline so
+                // the statement reaches the `resolve_coll` ladder, which
+                // prefers the current frame's formal over the property.
+                let bare_is_current_formal = |e: &Expression| matches!(e.kind, ExprKind::Ident(ref lh)
+                    if lh.path.len() == 1
+                        && self
+                            .local_dyn
+                            .last()
+                            .is_some_and(|f| f.iter().any(|(k, _)| k == &lh.path[0].name.name)));
+                let formal_operand = bare_is_current_formal(lvalue)
+                    || bare_is_current_formal(rvalue);
+                if !formal_operand {
                 if let (Some(dst), Some(src)) =
                     (self.expr_assoc_name(lvalue), self.expr_assoc_name(rvalue))
                 {
@@ -58714,6 +58728,7 @@ impl Simulator {
                     }
                     return;
                 }
+                } // !formal_operand
                 // Slice assignment for N-dimensional unpacked arrays where LHS
                 // and RHS both supply fewer indices than dimensions:
                 //   B[i][j] = A[p][q];   // with A, B both 3D ⇒ copy inner dim
@@ -59700,9 +59715,25 @@ impl Simulator {
                         // ran while an outer `make(T val)` value-param `val` was
                         // still live in `module.dynamic_arrays` resolved the LHS
                         // to bare `"val"` and the queue copy was dropped (§13.5.2).
+                        // §13.5.2/§8.24 name resolution: the CURRENT call's own
+                        // queue/dyn-array formal (bound in the top `local_dyn`
+                        // frame by `bind_queue_param`) shadows a same-named
+                        // property — only an ENCLOSING frame's registration
+                        // loses to the property. Without this, a whole-array
+                        // copy whose LHS formal shadows the property
+                        // (`uvm_reg_item::get_value_array(ref u64_t value[])`
+                        // — body `value = this.value`) resolved the LHS to the
+                        // property store: the property was clobbered and the
+                        // ref writeback shipped an empty array.
+                        let formal_in_current_frame = sim
+                            .local_dyn
+                            .last()
+                            .is_some_and(|f| f.iter().any(|(k, _)| k == &n));
                         if sim.module.dynamic_arrays.contains(&n) {
-                            if let Some(m) = sim.instance_assoc_member(&n) {
-                                return Some((m, true));
+                            if !formal_in_current_frame {
+                                if let Some(m) = sim.instance_assoc_member(&n) {
+                                    return Some((m, true));
+                                }
                             }
                             return Some((n, false));
                         }
@@ -91535,15 +91566,6 @@ impl Simulator {
                         {
                             recv_name = if self.static_coll_name_collides(coll) {
                                 self.static_prop_key(cls, coll).unwrap_or_else(|| coll.to_string())
-                            } else if self.class_is_parameterized(cls) {
-                                // PARAMETERIZED class: statics live
-                                // per-specialization, resolved from the
-                                // qualified form via `current_spec` (§8.25);
-                                // collapsing to the bare name would drop the
-                                // specialization and miss the store (e.g.
-                                // `config_db#(int)::m_rsc` flattens to
-                                // `config_db.m_rsc`, `#(int)` stripped).
-                                recv_name
                             } else {
                                 coll.to_string()
                             };
