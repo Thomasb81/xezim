@@ -51,6 +51,8 @@ mod foreach_blocking_resume;
 mod foreach_negative_dims;
 #[path = "collections/lrm_clause7_arrays.rs"]
 mod lrm_clause7_arrays;
+#[path = "collections/mailbox_array_new.rs"]
+mod mailbox_array_new;
 #[path = "collections/mailbox_bounded.rs"]
 mod mailbox_bounded;
 #[path = "collections/multidim_assoc_array.rs"]

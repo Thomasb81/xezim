@@ -51307,6 +51307,29 @@ impl Simulator {
                             self.set_queue_size(obj_name, 0);
                             return Value::zero(32);
                         }
+                        // §15.4.2: `mb[i].num()` on an ARRAY OF MAILBOXES. The
+                        // ELEMENT holds the handle and the messages live in
+                        // `self.mailboxes` keyed by it, but `obj_name` above is
+                        // the BARE first segment — the index is dropped — so
+                        // the array branch below matched the enclosing array
+                        // and reported ITS element count instead of the
+                        // mailbox's depth. `num()` then read 0 however many
+                        // times a producer had put, making every put look like
+                        // it vanished; a scalar mailbox in the same scope was
+                        // fine, which is what made this look like a
+                        // mailbox-in-instance bug rather than an indexing one.
+                        // Resolve the element's own handle first and fall
+                        // through only when it is not a mailbox.
+                        if mname == "num"
+                            && hier.path[0].selects.len() == 1
+                            && let Some(idx) = self.eval_scalar_self(&hier.path[0].selects[0])
+                            && let Some(hv) =
+                                self.get_signal_value_by_name(&format!("{}[{}]", obj_name, idx))
+                            && let Some(q) =
+                                self.mailboxes.get(&(hv.to_u64().unwrap_or(0) as usize))
+                        {
+                            return Value::from_u64(q.len() as u64, 32);
+                        }
                         if (mname == "size" || mname == "num")
                             && self.module.arrays.contains_key(obj_name)
                         {
@@ -106615,6 +106638,56 @@ impl Simulator {
     /// context FIRST (both reliable), falling back to get_expr_type_name
     /// (which only serves module-scope container signals correctly).
     fn lvalue_container_kind(&self, lvalue: &Expression) -> Option<&'static str> {
+        // §15.3/§15.4: `mb[i] = new()` — an ELEMENT of a mailbox/semaphore
+        // ARRAY has the ARRAY's container type. Neither the local map nor
+        // `get_expr_type_name` resolves an INDEXED lvalue, so the construction
+        // was not recognised as a container and no mailbox was ever registered
+        // for the handle it went on to store. Reads then found a live-looking
+        // (non-null) handle with nothing behind it, so every `put` silently
+        // vanished and `num()`/`try_get` saw an empty box — while the same
+        // mailbox declared as a scalar in the same scope worked, which is what
+        // made this look like a scope bug rather than an indexing one.
+        // Recursion terminates: an Index yields its base, and stripping the
+        // selects yields an Ident that matches neither arm.
+        match &lvalue.kind {
+            ExprKind::Index { expr, .. } => {
+                // The ARRAY's own declared type is the element's type. Neither
+                // the array nor its elements carry a `type_name` on their
+                // signals (only scalars do), so consult the declaration table
+                // — keyed bare and scope-qualified.
+                if let ExprKind::Ident(h) = &expr.kind {
+                    let full = self.resolve_hier_name(h);
+                    let leaf = h.path.last().map(|s| s.name.name.clone()).unwrap_or_default();
+                    for key in [full.as_str(), leaf.as_str()] {
+                        if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
+                            self.module.var_decl_types.get(key)
+                            && let Some(k) = Self::container_base(&name.name.name)
+                        {
+                            return Some(k);
+                        }
+                    }
+                }
+                if let Some(k) = self.lvalue_container_kind(expr) {
+                    return Some(k);
+                }
+            }
+            ExprKind::Ident(h) if h.path.len() == 1 && !h.path[0].selects.is_empty() => {
+                let mut seg = h.path[0].clone();
+                seg.selects.clear();
+                let bare = HierarchicalIdentifier {
+                    root: h.root.clone(),
+                    path: vec![seg],
+                    span: h.span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                let e = Expression::new(ExprKind::Ident(bare), lvalue.span);
+                if let Some(k) = self.lvalue_container_kind(&e) {
+                    return Some(k);
+                }
+            }
+            _ => {}
+        }
         let prop: Option<String> = match &lvalue.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => Some(h.path[0].name.name.clone()),
             ExprKind::MemberAccess { expr, member } if matches!(expr.kind, ExprKind::This) => {
