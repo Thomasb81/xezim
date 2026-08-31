@@ -111,15 +111,24 @@ What's left for the user:
   engine: it measured net-negative under `XEZIM_AOT`, where wider blocks
   shrink native coverage and defeat template deduplication.
 - **PGO build** (above) for long runs; the build cost amortizes quickly.
-- **`XEZIM_JIT=1 XEZIM_AOT=1`** with a warm native cache wins when the
-  SIMULATION phase is long enough to amortize enrolling blocks into native
-  code — c906 at `+iterations=100` runs 44.2 s against 45.7 s for the
-  default engine. It does not help elaboration-dominated runs: the same
-  stack on a c910 hello (≈16 s elaboration against ≈8 s simulation) is
-  25.5 s against 24.7 s for the default engine. The first run after any
-  design or binary change also pays a one-time rustc compile (c910: ~4 min),
-  so reach for it on long or repeated runs, not one-shots.
-  `XEZIM_AOT_TEMPLATE=1` cuts that compile by ~16× and is runtime-neutral.
+- **Native compilation (`XEZIM_JIT=1`, optionally `+XEZIM_AOT=1`) pays on
+  designs with FEW, VERY HOT blocks — measure before adopting it.** Warm
+  cache, wall-clock:
+
+  | | interp | JIT | +AOT | +AOT +FSM |
+  |---|---|---|---|---|
+  | ibex CoreMark (1,553 comb entries) | 50.8 s | **39.0 s** (−23%) | 38.8 s | 39.1 s |
+  | c906 memcpy ×100 (35,267 entries) | 49.3 s | 55.7 s (**+13%**) | 49.5 s | 47.8 s |
+
+  The c906 loss is compile time, not slower simulation — JIT takes its sim
+  phase 43.6 s → 42.9 s but spends 7.0 s more compiling, because the work is
+  spread over ~23× more blocks that are each ~37× colder. Do not try to fix
+  that with a hotness threshold: measured negative both ways (see the
+  perf-notes entry). Elaboration-dominated runs do not benefit either — a
+  c910 hello (≈16 s elaboration vs ≈8 s simulation) is 25.5 s against 24.7 s
+  for the default engine. The first run after any design or binary change
+  pays a one-time rustc compile (c910: ~4 min); `XEZIM_AOT_TEMPLATE=1` cuts
+  that by ~16× and is runtime-neutral.
 - Elaboration of huge SoCs (hundreds of files, millions of signals) can
   dominate short runs; `--cache` (experimental warm-start design cache) and
   `--artifact-compression` help repeated runs of an unchanged design.
