@@ -1118,26 +1118,38 @@ impl<'a> BytecodeCompiler<'a> {
         if hier.path.len() < 2 || hier.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
         }
-        let member = hier.path.last()?.name.name.as_str();
-        let base: String = hier.path[..hier.path.len() - 1]
-            .iter()
-            .map(|s| s.name.name.as_str())
-            .collect::<Vec<_>>()
-            .join(".");
-        // Resolve the container signal id, honoring scope_hint for a bare base.
-        let base_id = self.lookup_signal_id_by_name(&base).or_else(|| {
-            self.scope_hint
-                .as_ref()
-                .and_then(|sc| self.lookup_signal_id_by_name(&format!("{}.{}", sc, base)))
-        })?;
-        // Field layout is keyed by both the bare and scope-qualified base name.
-        let fields = fields_map.get(base.as_str()).or_else(|| {
-            self.scope_hint
-                .as_ref()
-                .and_then(|sc| fields_map.get(&format!("{}.{}", sc, base)))
-        })?;
-        let (_, off, w) = fields.iter().find(|(m, _, _)| m == member)?;
-        Some((base_id, *off, *w))
+        let seg = |i: usize| hier.path[i].name.name.as_str();
+        // A NESTED member (`s.p.hi`, and every `union`-in-struct shape) is
+        // flattened by elaboration into one dotted key — "p.hi" — stored under
+        // the ROOT signal. Splitting only the last segment therefore missed
+        // every member at depth >= 2 and sent it to the AST path. Walk the
+        // split point from the longest base down, so a genuinely hierarchical
+        // base that IS a signal (`top.dut.sig.field`) still wins over
+        // reinterpreting part of it as a member path.
+        for k in (1..hier.path.len()).rev() {
+            let base: String = (0..k).map(seg).collect::<Vec<_>>().join(".");
+            let member: String = (k..hier.path.len()).map(seg).collect::<Vec<_>>().join(".");
+            // Resolve the container signal id, honoring scope_hint for a bare base.
+            let Some(base_id) = self.lookup_signal_id_by_name(&base).or_else(|| {
+                self.scope_hint
+                    .as_ref()
+                    .and_then(|sc| self.lookup_signal_id_by_name(&format!("{}.{}", sc, base)))
+            }) else {
+                continue;
+            };
+            // Field layout is keyed by both the bare and scope-qualified base name.
+            let Some(fields) = fields_map.get(base.as_str()).or_else(|| {
+                self.scope_hint
+                    .as_ref()
+                    .and_then(|sc| fields_map.get(&format!("{}.{}", sc, base)))
+            }) else {
+                continue;
+            };
+            if let Some((_, off, w)) = fields.iter().find(|(m, _, _)| *m == member) {
+                return Some((base_id, *off, *w));
+            }
+        }
+        None
     }
 
     /// Resolve a packed-struct container and clone its flattened field layout.
@@ -3084,6 +3096,20 @@ impl<'a> BytecodeCompiler<'a> {
                         && args.iter().all(|a| expr_ok(a, bound, me, ext))
                         && me.fn_is_pure(fd2)
                 }
+                // §10.9.2: a pattern builds its value from nothing but the
+                // expressions inside it, so it is exactly as pure as they are.
+                // Falling through to `false` here made every function whose
+                // body was `return '{...}` — the ordinary way to build a
+                // struct result — impure, and so never inlined.
+                ExprKind::AssignmentPattern(items) => {
+                    use crate::ast::expr::AssignmentPatternItem as It;
+                    items.iter().all(|it| match it {
+                        It::Named(_, e) | It::Ordered(e) | It::Default(e) => {
+                            expr_ok(e, bound, me, ext)
+                        }
+                        _ => false,
+                    })
+                }
                 _ => false,
             }
         }
@@ -3578,7 +3604,18 @@ impl<'a> BytecodeCompiler<'a> {
     /// Field layout of `lv` when it names a packed-struct SIGNAL directly.
     fn lvalue_struct_layout(&self, lv: &Expression) -> Option<Vec<(String, u32, u32)>> {
         let fields_tbl = self.packed_struct_fields?;
-        let ExprKind::Ident(h) = &lv.kind else { return None };
+        // `arr[i] <= '{...}`: an ELEMENT of an array of packed structs carries
+        // the element layout, which is keyed by the array name — same keying
+        // the `arr[i].m` member store uses. Without this the pattern had no
+        // layout and the whole statement fell to the AST path.
+        let h = match &lv.kind {
+            ExprKind::Ident(h) => h,
+            ExprKind::Index { expr, .. } => match &expr.kind {
+                ExprKind::Ident(h) => h,
+                _ => return None,
+            },
+            _ => return None,
+        };
         if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
         }
