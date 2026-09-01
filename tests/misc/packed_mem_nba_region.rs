@@ -40,6 +40,31 @@ const RACE: &str = r#"module top;
 endmodule
 "#;
 
+const CELL_TRAITS: &str = r#"module top;
+  logic [7:0] plane_a [0:63];
+  bit [7:0] plane_b [0:63];
+  byte plane_c [0:63];
+  int failures = 0;
+  int slot;
+
+  initial begin
+    if (^plane_a[0] !== 1'bx) failures++;
+    if (plane_b[0] !== 8'h00) failures++;
+    plane_b[1] = 8'hxx;
+    if (plane_b[1] !== 8'h00) failures++;
+    plane_c[2] = -1;
+    if (!(plane_c[2] < 0)) failures++;
+    for (slot = 0; slot < 64; slot++) begin
+      plane_a[slot] = slot[7:0] ^ 8'h5a;
+    end
+    if (plane_a[37] !== (8'd37 ^ 8'h5a)) failures++;
+    if (^plane_a[64] !== 1'bx) failures++;
+    $display("CELL_TRAITS failures=%0d value=%0h", failures, plane_a[37]);
+    $finish;
+  end
+endmodule
+"#;
+
 #[test]
 fn packed_nba_matures_in_nba_region() {
     let path = "/tmp/packed_nba_region_test.sv";
@@ -62,4 +87,32 @@ fn packed_nba_matures_in_nba_region() {
         .expect("run xezim");
     let s2 = String::from_utf8_lossy(&out2.stdout);
     assert!(s2.contains("R1_11_aa") && s2.contains("R2_aa"), "{s2}");
+}
+
+#[test]
+fn packed_cells_preserve_traits_and_compiled_writes() {
+    let path = "/tmp/packed_cell_traits_test.sv";
+    std::fs::write(path, CELL_TRAITS).unwrap();
+    let run = |enabled: bool| {
+        let mut cmd = Command::new(xezim());
+        cmd.args(["--simulate", "-s", "top", path])
+            .env("XEZIM_LARGE_ARRAY_NAME_THRESHOLD", "16")
+            .env("XEZIM_PACKED_MEM", if enabled { "1" } else { "0" });
+        cmd.output().expect("run xezim")
+    };
+
+    let packed = run(true);
+    let regular = run(false);
+    assert!(packed.status.success(), "packed run failed: {packed:?}");
+    assert!(regular.status.success(), "regular run failed: {regular:?}");
+    let packed_stdout = String::from_utf8_lossy(&packed.stdout);
+    let regular_stdout = String::from_utf8_lossy(&regular.stdout);
+    assert!(
+        packed_stdout.contains("CELL_TRAITS failures=0 value=7f"),
+        "{packed_stdout}"
+    );
+    assert!(
+        regular_stdout.contains("CELL_TRAITS failures=0 value=7f"),
+        "{regular_stdout}"
+    );
 }
