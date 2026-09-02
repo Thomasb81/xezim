@@ -181,6 +181,8 @@ mod struct_formal_and_config_foreach;
 mod typename_param_class;
 #[path = "classes/unpacked_struct_class_property_whole_value.rs"]
 mod unpacked_struct_class_property_whole_value;
+#[path = "classes/nested_seq_method_dispatch.rs"]
+mod nested_seq_method_dispatch;
 #[path = "classes/uvm_config_db_tests.rs"]
 mod uvm_config_db_tests;
 #[path = "classes/uvm_factory_linkage.rs"]
