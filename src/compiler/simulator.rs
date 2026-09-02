@@ -102734,6 +102734,13 @@ impl Simulator {
             }
         }
 
+        // Trials in which a strict fixed-array foreach check
+        // failed. Such a class re-solves the same element system every trial
+        // (the array is not re-seeded), so when the check keeps failing the
+        // problem is almost certainly UNSATISFIABLE — stop after a bounded
+        // number of full-cost attempts and return 0, rather than paying all
+        // 1000 trials (§18.6.2 requires only that we return 0).
+        let mut fixed_fe_fail_streak: u32 = 0;
         for _trial in 0..1000 {
             // LRM §18.5.4 dist: clear the pick-once gate at each trial so a
             // failed trial doesn't permanently freeze the dist constraint.
@@ -103899,6 +103906,19 @@ impl Simulator {
                         }
                         continue;
                     }
+                    // Foreach over a FIXED-shape rand array: check strictly,
+                    // so an unsatisfied body retries the trial and an
+                    // UNSATISFIABLE one makes randomize() return 0 (§18.6.2)
+                    // instead of being silently accepted with violating
+                    // values.
+                    if let Some(ok) = self.check_fixed_foreach_item(handle, item) {
+                        if !ok {
+                            fixed_fe_fail_streak += 1;
+                            all_ok = false;
+                            break;
+                        }
+                        continue;
+                    }
                     // Skip constraints the solver structurally cannot satisfy
                     // (dynamic-array size/sum/element relations, foreach, solve
                     // ordering) so they don't block an otherwise-valid config.
@@ -103935,6 +103955,14 @@ impl Simulator {
                 self.this_stack.pop();
                 self.class_context_stack.pop();
                 return Value::from_u64(1, 32);
+            }
+            if fixed_fe_fail_streak >= 12 {
+                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                    for (name, val) in backup {
+                        inst.properties.insert(name, val);
+                    }
+                }
+                break;
             }
 
             // On the final trial, when diagnostics are requested, report which
@@ -105655,65 +105683,14 @@ impl Simulator {
                     Some(n) => n,
                     None => return false,
                 };
-                // Find the index range. First try the class's
-                // array_properties for `arr`, walking the inheritance chain.
-                let mut range: Option<(i64, i64, u32)> = None;
-                let class_name_opt = self
-                    .heap
-                    .get(handle)
-                    .and_then(|x| x.as_ref())
-                    .map(|i| i.class_name.clone());
-                if let Some(mut cn) = class_name_opt {
-                    loop {
-                        if let Some(cd) = self.module.classes.get(&cn) {
-                            if let Some(&(lo, hi, w)) = cd.array_properties.get(&arr_name) {
-                                range = Some((lo, hi, w));
-                                break;
-                            }
-                            if let Some(parent) = cd.extends.clone() {
-                                cn = parent;
-                            } else {
-                                break;
-                    }
-                        } else {
-                            break;
-                }
-                    }
-                }
-                // §18.5.8: the shape may be MULTI-dimensional. Only the 1-D
-                // table was consulted and only vars[0] was bound, so a
+                // §18.5.8: 1-D and N-D fixed shapes alike, walking the
+                // inheritance chain (`fixed_foreach_dims`). Only the 1-D table
+                // was consulted originally and only vars[0] bound, so a
                 // `foreach (m[i,j])` constraint found no range and was dropped
                 // silently — randomize() still returned 1 and every element
                 // came out unconstrained.
-                let dims: Vec<(i64, i64)> = match range {
-                    Some((lo, hi, _w)) => vec![(lo, hi)],
-                    None => {
-                        let mut nd: Option<Vec<(i64, i64)>> = None;
-                        if let Some(mut cn) = self
-                            .heap
-                            .get(handle)
-                            .and_then(|x| x.as_ref())
-                            .map(|i| i.class_name.clone())
-                        {
-                            loop {
-                                let Some(cd) = self.module.classes.get(&cn) else {
-                                    break;
-                                };
-                                if let Some((shape, _)) = cd.array_nd_properties.get(&arr_name) {
-                                    nd = Some(shape.clone());
-                                    break;
-                                }
-                                match cd.extends.clone() {
-                                    Some(p) => cn = p,
-                                    None => break,
-                                }
-                            }
-                        }
-                        match nd {
-                            Some(sh) => sh,
-                            None => return false,
-                        }
-                    }
+                let Some((dims, elem_w)) = self.fixed_foreach_dims(handle, &arr_name) else {
+                    return false;
                 };
                 // One loop variable per leading dimension (§12.7.3).
                 let idx_names: Vec<String> = vars
@@ -105749,6 +105726,60 @@ impl Simulator {
                         &suffix,
                     ) {
                         changed = true;
+                    }
+                    // Structural repair covers equality/relational/inside
+                    // shapes. Anything else the body demands of THIS element
+                    // (`% 2 == 0`, bit tests, …) falls to generate-and-test —
+                    // drawn from the body's own `inside` ranges, since a
+                    // full-width draw would virtually never land in a narrow
+                    // one. Cross-element couplings that no local draw can fix
+                    // are left to the trial checker, which retries or fails
+                    // the randomize() (§18.6.2).
+                    if idx_names.len() == dims.len()
+                        && elem_w >= 1
+                        && elem_w <= 64
+                        && !Self::constraint_unmodeled(body)
+                        && !self.item_holds(handle, body)
+                    {
+                        use rand::Rng;
+                        let mut ranges: Vec<(i64, i64)> = Vec::new();
+                        self.body_inside_ranges(body, &arr_name, &mut ranges);
+                        let scoped_key = format!("{}#{}{}", handle, arr_name, suffix);
+                        let elem_name = format!("{}{}", arr_name, suffix);
+                        let saved = self.signals.get(&scoped_key).cloned();
+                        let mut ok = false;
+                        // 24 draws: a satisfiable body (parity, bit tests)
+                        // lands in a handful; an impossible one burns every
+                        // draw for every pass of every trial, so the cap is
+                        // what bounds the UNSAT give-up time.
+                        for _ in 0..24 {
+                            let cand = if ranges.is_empty() {
+                                let mask = if elem_w >= 64 {
+                                    u64::MAX
+                                } else {
+                                    (1u64 << elem_w) - 1
+                                };
+                                Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, elem_w)
+                            } else {
+                                let (l, h) =
+                                    ranges[self.cur_rng().gen_range(0..ranges.len())];
+                                let v = if h > l { self.cur_rng().gen_range(l..=h) } else { l };
+                                Value::from_u64(v as u64, elem_w)
+                            };
+                            self.signals.insert(scoped_key.clone(), cand.clone());
+                            self.set_signal_value_by_name(&elem_name, cand);
+                            if self.item_holds(handle, body) {
+                                ok = true;
+                                changed = true;
+                                break;
+                            }
+                        }
+                        if !ok {
+                            if let Some(sv) = saved {
+                                self.signals.insert(scoped_key.clone(), sv.clone());
+                                self.set_signal_value_by_name(&elem_name, sv);
+                            }
+                        }
                     }
                     self.pop_local_frame();
                     let mut k = used.len();
@@ -106064,7 +106095,193 @@ impl Simulator {
                 }
                 changed
             }
+            // §18.5.7: a CONDITIONAL body item — `if (i == j) arr[i] % 2 == 0;
+            // else …` — was silently dropped here (only Block/Inside/Expr had
+            // arms), so every index-dependent branch of a fixed-array foreach
+            // went unenforced and unchecked. The loop indices are bound on the
+            // local frame, so the condition evaluates per element.
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                if self.eval_expr(condition).is_true() {
+                    self.solve_forced_array_elem(handle, then_item, rand_set, arr_name, idx)
+                } else if let Some(ei) = else_item {
+                    self.solve_forced_array_elem(handle, ei, rand_set, arr_name, idx)
+                } else {
+                    false
+                }
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            }
+                if self.eval_expr(condition).is_true() => {
+                    self.solve_forced_array_elem(handle, constraint, rand_set, arr_name, idx)
+                }
+            ConstraintItem::Soft(inner) => {
+                self.solve_forced_array_elem(handle, inner, rand_set, arr_name, idx)
+            }
             _ => false,
+        }
+    }
+
+    /// The FIXED shape of a class rand array member, walking the inheritance
+    /// chain: 1-D from `array_properties`, N-D from `array_nd_properties`.
+    /// Returns (per-dimension bounds, element width).
+    fn fixed_foreach_dims(
+        &self,
+        handle: usize,
+        arr_name: &str,
+    ) -> Option<(Vec<(i64, i64)>, u32)> {
+        let mut cn = self
+            .heap
+            .get(handle)
+            .and_then(|x| x.as_ref())
+            .map(|i| i.class_name.clone())?;
+        loop {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(&(lo, hi, w)) = cd.array_properties.get(arr_name) {
+                return Some((vec![(lo, hi)], w));
+            }
+            if let Some((shape, w)) = cd.array_nd_properties.get(arr_name) {
+                return Some((shape.clone(), *w));
+            }
+            cn = cd.extends.clone()?;
+        }
+    }
+
+    /// The `inside {…}` ranges the foreach BODY imposes on the current
+    /// element, evaluated with the loop indices bound — the candidate domain
+    /// for the generate-and-test backstop (a full-width draw would virtually
+    /// never land in a narrow range like `[1:500]`).
+    fn body_inside_ranges(
+        &mut self,
+        item: &ConstraintItem,
+        arr_name: &str,
+        out: &mut Vec<(i64, i64)>,
+    ) {
+        match item {
+            ConstraintItem::Block(items) => {
+                for it in items {
+                    self.body_inside_ranges(it, arr_name, out);
+                }
+            }
+            ConstraintItem::Soft(i) => self.body_inside_ranges(i, arr_name, out),
+            ConstraintItem::IfElse { condition, then_item, else_item, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.body_inside_ranges(then_item, arr_name, out);
+                } else if let Some(ei) = else_item {
+                    self.body_inside_ranges(ei, arr_name, out);
+                }
+            }
+            ConstraintItem::Implication { condition, constraint, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.body_inside_ranges(constraint, arr_name, out);
+                }
+            }
+            ConstraintItem::Inside { expr, range, is_dist, .. }
+                if !*is_dist && Self::index_chain_root_is(expr, arr_name) =>
+            {
+                for r in range {
+                    match r {
+                        ConstraintRange::Value(e) => {
+                            if let Some(v) = self.eval_expr(e).to_i64() {
+                                out.push((v, v));
+                            }
+                        }
+                        ConstraintRange::Range { lo, hi } => {
+                            if let (Some(l), Some(h)) =
+                                (self.eval_expr(lo).to_i64(), self.eval_expr(hi).to_i64())
+                            {
+                                out.push((l, h));
+                            }
+                        }
+                    }
+                }
+            }
+            ConstraintItem::Expr(e) => {
+                if let ExprKind::Inside { expr, ranges } = &e.kind {
+                    if Self::index_chain_root_is(expr, arr_name) {
+                        for r in ranges.clone() {
+                            match &r.kind {
+                                ExprKind::Range(lo, hi) => {
+                                    if let (Some(l), Some(h)) = (
+                                        self.eval_expr(lo).to_i64(),
+                                        self.eval_expr(hi).to_i64(),
+                                    ) {
+                                        out.push((l, h));
+                                    }
+                                }
+                                _ => {
+                                    if let Some(v) = self.eval_expr(&r).to_i64() {
+                                        out.push((v, v));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Strict per-element check of a `foreach` over a FIXED-shape rand array
+    /// member. None = not such a foreach (or one this checker cannot judge:
+    /// fewer loop vars than dimensions, or an unmodeled body) — the caller's
+    /// other checkers/skips then apply unchanged. Some(ok) is authoritative.
+    fn check_fixed_foreach_item(
+        &mut self,
+        handle: usize,
+        item: &ConstraintItem,
+    ) -> Option<bool> {
+        let ConstraintItem::Foreach { array, vars, item: body, .. } = item else {
+            return None;
+        };
+        let arr_name = Self::foreach_base_name(array)?;
+        let (dims, _w) = self.fixed_foreach_dims(handle, &arr_name)?;
+        let idx_names: Vec<String> = vars
+            .iter()
+            .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
+            .collect();
+        if idx_names.len() != dims.len() {
+            return None;
+        }
+        if Self::constraint_unmodeled(body) {
+            return None;
+        }
+        if dims.iter().any(|&(lo, hi)| hi < lo) {
+            return Some(true);
+        }
+        let body = (**body).clone();
+        let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+        loop {
+            let mut frame: HashMap<String, Value> = HashMap::default();
+            for (k, nm) in idx_names.iter().enumerate() {
+                frame.insert(nm.clone(), Value::from_u64(idx[k] as u64, 32));
+            }
+            self.push_local_frame(frame);
+            let ok = self.item_holds(handle, &body);
+            self.pop_local_frame();
+            if !ok {
+                return Some(false);
+            }
+            let mut k = dims.len();
+            loop {
+                if k == 0 {
+                    return Some(true);
+                }
+                k -= 1;
+                idx[k] += 1;
+                if idx[k] <= dims[k].1 {
+                    break;
+                }
+                idx[k] = dims[k].0;
+            }
         }
     }
 
