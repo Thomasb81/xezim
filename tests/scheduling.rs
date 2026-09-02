@@ -137,6 +137,8 @@ mod preprocessor_diagnostic_location;
 mod preprocessor_github_issues;
 #[path = "scheduling/process_block_local_shadowing.rs"]
 mod process_block_local_shadowing;
+#[path = "scheduling/wait_satisfaction_order.rs"]
+mod wait_satisfaction_order;
 #[path = "scheduling/procedural_loop_stall.rs"]
 mod procedural_loop_stall;
 #[path = "scheduling/pure_inline_loop_body.rs"]
