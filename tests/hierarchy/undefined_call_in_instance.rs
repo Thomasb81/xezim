@@ -133,3 +133,167 @@ fn shadowed_include_copy_is_reported_and_missing_helper_is_an_error() {
         run(&["--simulate", "-s", "top", src.to_str().unwrap(), &inc_new, &inc_old]);
     assert!(ok, "newer header rejected:\n{text}");
 }
+
+/// The field report's shape, verbatim in structure: an RTL module includes a
+/// shared header whose package should carry the `chk_*` assertion helpers;
+/// a stale copy without them sits in an earlier `+incdir+`.
+const GLUE_V: &str = r#"
+`include "common_types.h"
+module datapath_glue (
+   input  logic clk,
+   input  logic rst_l,
+   input  logic feature_mode,
+   input  logic bus4_st_valid,
+   input  logic [3:0] ch0_outstanding,
+   input  logic [3:0] ch1_outstanding
+);
+   import common_types_pkg::*;
+   localparam int MAX_CREDIT = 12;
+   always @(posedge clk) begin
+`ifndef SYNTHESIS
+      chk_implies((rst_l!==1), |(feature_mode), |(bus4_st_valid), $sformatf("%s:%0d: in %m: ERROR: feature_mode -> bus4_st_valid violated", `__FILE__, `__LINE__))
+`endif
+      ;
+`ifndef SYNTHESIS
+      chk_always((rst_l!==1), |(ch0_outstanding + ch1_outstanding <= MAX_CREDIT), $sformatf("%s:%0d: in %m: ERROR: credit violated", `__FILE__, `__LINE__))
+`endif
+      ;
+   end
+endmodule
+"#;
+
+const TB_SV: &str = r#"
+module testbench;
+   logic clk, rst_l, feature_mode, bus4_st_valid;
+   logic [3:0] ch0_outstanding, ch1_outstanding;
+   initial clk = 0;
+   always #5 clk = ~clk;
+   // feature_mode rises one cycle BEFORE bus4_st_valid: chk_implies must fire.
+   initial begin
+      rst_l = 0; feature_mode = 0; bus4_st_valid = 0;
+      ch0_outstanding = 0; ch1_outstanding = 0;
+      #10 rst_l = 1;
+      #5  feature_mode = 1;
+      #10 bus4_st_valid = 1;
+      #10 ch0_outstanding = 3;
+      #10 ch1_outstanding = 4;
+      #20 $finish;
+   end
+   datapath_glue u_datapath_glue (.clk(clk), .rst_l(rst_l), .feature_mode(feature_mode),
+      .bus4_st_valid(bus4_st_valid), .ch0_outstanding(ch0_outstanding), .ch1_outstanding(ch1_outstanding));
+endmodule
+"#;
+
+const HDR_STALE: &str = r#"
+`ifndef _COMMON_TYPES_H_
+`define _COMMON_TYPES_H_
+package common_types_pkg;
+   typedef logic [0:0] bit_t;
+endpackage
+`endif
+"#;
+
+const HDR_CURRENT: &str = r#"
+`ifndef _COMMON_TYPES_H_
+`define _COMMON_TYPES_H_
+package common_types_pkg;
+   typedef logic [0:0] bit_t;
+   function void chk_always(input reset_cond, input cond, input string msg);
+      assert(reset_cond || !($isunknown(cond) || !cond)) else $error("%s", msg);
+   endfunction
+   function void chk_implies(input reset_cond, input cond, input expr, input string msg);
+      assert(reset_cond || !($isunknown(cond) || cond && $isunknown(expr) || cond && !expr)) else $error("%s", msg);
+   endfunction
+endpackage
+`endif
+"#;
+
+const CHILD_READS_UNDECLARED: &str = r#"
+module child(input logic clk);
+  logic x;
+  always @(posedge clk) x <= undefined_sig;
+endmodule
+module top;
+  logic clk = 0;
+  child c(.clk(clk));
+  initial begin #1 clk = 1; #1 $finish; end
+endmodule
+"#;
+
+#[test]
+fn undeclared_signal_inside_a_sub_instance_is_an_error() {
+    let d = dir("undef_sig");
+    let src = d.join("top.sv");
+    std::fs::write(&src, CHILD_READS_UNDECLARED).unwrap();
+    let (ok, text) = run(&["--simulate", "-s", "top", src.to_str().unwrap()]);
+    assert!(!ok, "undeclared signal in a child was accepted:\n{text}");
+    assert!(
+        text.contains("Undeclared identifier 'undefined_sig'") && text.contains("top.sv:4"),
+        "no located diagnostic:\n{text}"
+    );
+}
+
+/// `--dump-merged-sv` must produce a self-contained file: with the current
+/// header first the dump carries the helper definitions and re-runs with the
+/// same check firing; with the stale header first the run is rejected (and
+/// names the RTL file), and the dump it still writes is rejected the same way
+/// instead of silently dropping the checks.
+#[test]
+fn dump_merged_sv_is_self_contained_and_rejected_when_helpers_are_missing() {
+    let d = dir("dump");
+    let stale = d.join("stale");
+    let current = d.join("current");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::create_dir_all(&current).unwrap();
+    std::fs::write(stale.join("common_types.h"), HDR_STALE).unwrap();
+    std::fs::write(current.join("common_types.h"), HDR_CURRENT).unwrap();
+    let tb = d.join("tb.sv");
+    let glue = d.join("datapath_glue.v");
+    std::fs::write(&tb, TB_SV).unwrap();
+    std::fs::write(&glue, GLUE_V).unwrap();
+    let inc_stale = format!("+incdir+{}", stale.display());
+    let inc_current = format!("+incdir+{}", current.display());
+    let common = ["-s", "testbench", "--max-time", "100ns", "--module-timescale", "1ns/1ns"];
+
+    // Control: current header first.
+    let good = d.join("merged_full.sv");
+    let mut args: Vec<&str> = vec![tb.to_str().unwrap(), glue.to_str().unwrap()];
+    args.extend_from_slice(&common);
+    args.extend_from_slice(&[&inc_current, &inc_stale, "--dump-merged-sv", good.to_str().unwrap()]);
+    let (ok, text) = run(&args);
+    assert!(ok, "control run failed:\n{text}");
+    assert!(
+        text.contains("feature_mode -> bus4_st_valid violated"),
+        "chk_implies did not fire in the control run:\n{text}"
+    );
+    let dumped = std::fs::read_to_string(&good).unwrap();
+    assert_eq!(
+        dumped.matches("function void chk_").count(),
+        2,
+        "dump lacks the helper definitions:\n{dumped}"
+    );
+    let (ok, text) = run(&[good.to_str().unwrap(), "-s", "testbench", "--max-time", "100ns", "--module-timescale", "1ns/1ns"]);
+    assert!(ok, "re-running the dump failed:\n{text}");
+    assert!(
+        text.contains("feature_mode -> bus4_st_valid violated"),
+        "chk_implies did not fire from the dump:\n{text}"
+    );
+
+    // Field case: stale header first.
+    let bad = d.join("merged.sv");
+    let mut args: Vec<&str> = vec![tb.to_str().unwrap(), glue.to_str().unwrap()];
+    args.extend_from_slice(&common);
+    args.extend_from_slice(&[&inc_stale, &inc_current, "--dump-merged-sv", bad.to_str().unwrap()]);
+    let (ok, text) = run(&args);
+    assert!(!ok, "stale header run was accepted:\n{text}");
+    assert!(
+        text.contains("Undeclared identifier 'chk_implies'") && text.contains("datapath_glue.v:"),
+        "diagnostic missing or unlocated:\n{text}"
+    );
+    assert!(text.contains("is shadowed by the search order"), "no shadow warning:\n{text}");
+    if let Ok(dumped) = std::fs::read_to_string(&bad) {
+        assert_eq!(dumped.matches("function void chk_").count(), 0);
+        let (ok, text) = run(&[bad.to_str().unwrap(), "-s", "testbench", "--max-time", "100ns", "--module-timescale", "1ns/1ns"]);
+        assert!(!ok && text.contains("Undeclared identifier 'chk_implies'"), "broken dump accepted:\n{text}");
+    }
+}
