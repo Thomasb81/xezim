@@ -2582,6 +2582,7 @@ struct ProcessContext {
     // under a distinct key. Stack of frames pushed/popped in sync with
     // `push_queue_frame`/`pop_and_restore_queue_frame`.
     local_dyn: Vec<Vec<(String, String)>>,
+    static_local_syncs: Vec<(String, Vec<(String, String)>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -36447,6 +36448,7 @@ impl Simulator {
             queue_frame_saves: self.queue_frame_saves.clone(),
             task_cleanup: self.task_cleanup.clone(),
             local_dyn: self.local_dyn.clone(),
+            static_local_syncs: self.static_local_syncs.clone(),
         }
     }
 
@@ -36472,6 +36474,7 @@ impl Simulator {
             queue_frame_saves: std::mem::take(&mut self.queue_frame_saves),
             task_cleanup: std::mem::take(&mut self.task_cleanup),
             local_dyn: std::mem::take(&mut self.local_dyn),
+            static_local_syncs: std::mem::take(&mut self.static_local_syncs),
         }
     }
 
@@ -36491,6 +36494,7 @@ impl Simulator {
         self.queue_frame_saves = ctx.queue_frame_saves;
         self.task_cleanup = ctx.task_cleanup;
         self.local_dyn = ctx.local_dyn;
+        self.static_local_syncs = ctx.static_local_syncs;
     }
 
     fn inherit_current_process_context(&mut self, pid: usize) {
@@ -36504,6 +36508,7 @@ impl Simulator {
             && !ctx.continue_flag
             && !ctx.return_flag
             && ctx.local_dyn.is_empty()
+            && ctx.static_local_syncs.is_empty()
         {
             self.process_contexts.remove(&pid);
         } else {
@@ -36556,7 +36561,8 @@ impl Simulator {
             && !ctx.break_flag
             && !ctx.continue_flag
             && !ctx.return_flag
-            && ctx.local_dyn.is_empty();
+            && ctx.local_dyn.is_empty()
+            && ctx.static_local_syncs.is_empty();
         if trivial {
             self.process_contexts.remove(&pid);
         } else {
@@ -101772,6 +101778,7 @@ impl Simulator {
                                 queue_frame_saves: Vec::new(),
                                 task_cleanup: Vec::new(),
                                 local_dyn: Vec::new(),
+                                static_local_syncs: Vec::new(),
                             },
                         );
                         self.event_queue.schedule(self.time, pid, t.items.clone().into());
