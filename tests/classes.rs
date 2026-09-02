@@ -91,6 +91,8 @@ mod constraint_arrays_ordering;
 mod constraint_dyn_size_pinned_scalar;
 #[path = "classes/constraint_foreach_and_casts.rs"]
 mod constraint_foreach_and_casts;
+#[path = "classes/constraint_foreach_conditional.rs"]
+mod constraint_foreach_conditional;
 #[path = "classes/constraint_funcs_aggregates.rs"]
 mod constraint_funcs_aggregates;
 #[path = "classes/constraint_inline_enclosing_scope.rs"]
