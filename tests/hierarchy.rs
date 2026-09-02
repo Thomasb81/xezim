@@ -15,6 +15,8 @@
 mod flat_actual_struct_port;
 #[path = "hierarchy/nested_member_in_instance.rs"]
 mod nested_member_in_instance;
+#[path = "hierarchy/undefined_call_in_instance.rs"]
+mod undefined_call_in_instance;
 #[path = "hierarchy/implicit_net_name_collision.rs"]
 mod implicit_net_name_collision;
 #[path = "hierarchy/typedef_array_ports_in_children.rs"]
