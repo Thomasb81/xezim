@@ -5334,6 +5334,10 @@ pub struct Simulator {
     prof_psettle_calls: u64,
     prof_psettle_deferred: u64,
     dpi_value_change_cbs: HashMap<usize, Vec<DpiCbHandle>>,
+    /// Every collection/array member name declared by ANY class — the cheap
+    /// pre-filter for chained-handle member resolution (see
+    /// `instance_assoc_member`). Built once on first use.
+    chained_coll_member_names: std::cell::OnceCell<HashSet<String>>,
     /// Registered cbNextSimTime callbacks with their registration time.
     /// Each is one-shot and fires when simulation time advances.
     dpi_next_time_cbs: Vec<(DpiCbHandle, u64)>,
@@ -8375,6 +8379,7 @@ impl Simulator {
             prof_psettle_calls: 0,
             prof_psettle_deferred: 0,
             dpi_value_change_cbs: HashMap::default(),
+            chained_coll_member_names: std::cell::OnceCell::new(),
             dpi_next_time_cbs: Vec::new(),
             dpi_after_delay_cbs: Vec::new(),
             dpi_rw_synch_cbs: Vec::new(),
@@ -90129,14 +90134,41 @@ impl Simulator {
                 };
                 (h, member.name.clone())
             }
-            ExprKind::Ident(h) if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) => {
+            // Elaboration flattens a member chain to a MULTI-SEGMENT Ident
+            // (`o.sub.g` arrives as one 3-segment path, not nested
+            // MemberAccess), so a receiver behind more than one handle hop
+            // fell to the `_` arm below and every chained element access
+            // read x / wrote nowhere. Walk the middle segments through heap
+            // properties; for two segments the loop is empty and this is the
+            // old arm exactly.
+            ExprKind::Ident(h) if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) => {
+                // 3+ segments: gate on the leaf naming SOME class's collection
+                // member before any handle evaluation — this arm sits in the
+                // hot indexed-read path, and an ungated chain attempt on every
+                // hierarchical `top.dut.arr[i]` eval cost +0.4% instructions
+                // on an axi4 UVM run.
+                if h.path.len() > 2
+                    && !self
+                        .chained_coll_members()
+                        .contains(h.path.last()?.name.name.as_str())
+                {
+                    return None;
+                }
                 let obj = &h.path[0].name.name;
-                let hh = if obj == "this" || obj == "super" {
+                let mut hh = if obj == "this" || obj == "super" {
                     self.this_stack.last().copied().flatten()?
                 } else {
                     self.eval_ident_handle(obj)?
                 };
-                (hh, h.path[1].name.name.clone())
+                for seg in &h.path[1..h.path.len() - 1] {
+                    if hh == 0 {
+                        return None;
+                    }
+                    let inst = self.heap.get(hh).and_then(|o| o.as_ref())?;
+                    hh = inst.properties.get(&seg.name.name).and_then(|v| v.to_u64())?
+                        as usize;
+                }
+                (hh, h.path.last()?.name.name.clone())
             }
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                 let hh = self.this_stack.last().copied().flatten()?;
@@ -90273,6 +90305,103 @@ impl Simulator {
         false
     }
 
+
+    /// `#[cold]` + never inlined: this hangs off a guard that runs 22M+
+    /// times on a UVM run, and letting it fatten `instance_assoc_member`
+    /// measurably perturbed that hot path's code generation.
+    #[cold]
+    #[inline(never)]
+    fn chained_member_scoped(&self, name: &str, fd: usize) -> Option<String> {
+        // A dotted name with THREE or more segments can be a HANDLE CHAIN
+        // to a collection member (`o.sub.g`). Every fallback that funnels
+        // through here got None for it, so a chained element write landed
+        // nowhere and a chained read came back x. Walk the chain through
+        // heap properties; a module hierarchical path fails the first hop
+        // (or the final class-membership check) and returns None exactly
+        // as before. Two-segment forms keep their existing paths — the
+        // last-dot probe below is a short backward scan, so they exit at
+        // nearly the original cost.
+        if self.no_class_objects() {
+            return None;
+        }
+        let ld = name.rfind('.').unwrap_or(fd);
+        if ld == fd {
+            return None;
+        }
+        // The FINAL segment must be a collection member declared by SOME
+        // class — kills module hierarchical paths before any handle
+        // evaluation (whose static-property probe walks the class-context
+        // chain on a miss). The unscanned middle keeps the '#'/'[' reject.
+        let member_leaf = &name[ld + 1..];
+        if name[fd..ld].bytes().any(|b| matches!(b, b'#' | b'[')) {
+            return None;
+        }
+        if !self.chained_coll_members().contains(member_leaf) {
+            return None;
+        }
+        let segs: Vec<&str> = name.split('.').collect();
+        let mut h = if segs[0] == "this" || segs[0] == "super" {
+            self.this_stack.last().copied().flatten()?
+        } else {
+            self.eval_ident_handle(segs[0])?
+        };
+        if h == 0 {
+            return None;
+        }
+        for seg in &segs[1..segs.len() - 1] {
+            let inst = self.heap.get(h).and_then(|o| o.as_ref())?;
+            h = inst.properties.get(*seg).and_then(|v| v.to_u64())? as usize;
+            if h == 0 {
+                return None;
+            }
+        }
+        let member = segs[segs.len() - 1];
+        // The final object's CLASS must declare the member as an
+        // array/collection property — this is what keeps an unrelated
+        // name whose value happens to collide with a live handle from
+        // hijacking the resolution.
+        let mut cur = self
+            .heap
+            .get(h)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(c) = cur {
+            let Some(cd) = self.module.classes.get(&c) else { break };
+            if cd.array_properties.contains_key(member)
+                || cd.array_nd_properties.contains_key(member)
+                || cd.queue_properties.contains_key(member)
+                || cd.assoc_properties.contains_key(member)
+            {
+                return Some(format!("{}#{}", h, member));
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// Every collection/array member name declared by ANY class, built once.
+    /// The cheap pre-filter for chained-handle resolution: a leaf that is in
+    /// no class cannot be a member chain, so no handle evaluation (whose
+    /// static-property probe walks the class-context chain on a miss) runs
+    /// for module hierarchical names.
+    fn chained_coll_members(&self) -> &HashSet<String> {
+        self.chained_coll_member_names.get_or_init(|| {
+            let mut set: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                for k in cd
+                    .array_properties
+                    .keys()
+                    .chain(cd.array_nd_properties.keys())
+                    .chain(cd.queue_properties.keys())
+                    .chain(cd.assoc_properties.keys())
+                {
+                    set.insert(k.clone());
+                }
+            }
+            set
+        })
+    }
+
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
         // §8.9: `Cls::member` / flattened `Cls.member` spellings of a static
         // fixed array resolve to the declaring class's store BEFORE the
@@ -90280,11 +90409,28 @@ impl Simulator {
         if let Some(k) = self.static_fixed_key_for_name(name) {
             return Some(k);
         }
+        // This guard sees every call (22M+ on a UVM run): keep the ORIGINAL
+        // vectorizable one-pass `any` for the overwhelmingly common bare
+        // names (a manual classify loop here measured +0.5% instructions on
+        // an axi4 UVM run), and only when a special byte exists rescan to
+        // tell a rejected spelling from a possible handle chain.
         if name
             .bytes()
             .any(|b| matches!(b, b'#' | b'.' | b'['))
         {
-            return None;
+            let mut first_dot: Option<usize> = None;
+            for (i, b) in name.bytes().enumerate() {
+                match b {
+                    b'#' | b'[' => return None,
+                    b'.' => {
+                        first_dot = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let fd = first_dot?;
+            return self.chained_member_scoped(name, fd);
         }
         // §8.9: inside a STATIC method there is no `this`; the lexical class
         // context still resolves a bare static-array member to its store.
