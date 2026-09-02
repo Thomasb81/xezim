@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "types/packed_struct_array_local.rs"]
+mod packed_struct_array_local;
 #[path = "types/packed_struct_member_width.rs"]
 mod packed_struct_member_width;
 #[path = "types/packed_struct_formal_member.rs"]
@@ -29,6 +31,8 @@ mod array_parameter;
 mod array_query_multidim_packed;
 #[path = "types/assoc_of_queue_enumeration.rs"]
 mod assoc_of_queue_enumeration;
+#[path = "types/bits_of_type_param_expr.rs"]
+mod bits_of_type_param_expr;
 #[path = "types/bits_of_signal_in_const_expr.rs"]
 mod bits_of_signal_in_const_expr;
 #[path = "types/bits_package_scoped_type_width.rs"]
@@ -69,6 +73,12 @@ mod defparam_override;
 mod dollar_lvalue_and_assoc_width;
 #[path = "types/enum_name_formal_param.rs"]
 mod enum_name_formal_param;
+#[path = "types/wide_enum_values.rs"]
+mod wide_enum_values;
+#[path = "types/enum_member_per_instance.rs"]
+mod enum_member_per_instance;
+#[path = "types/enum_reflection_in_submodules.rs"]
+mod enum_reflection_in_submodules;
 #[path = "types/enum_next_prev_count.rs"]
 mod enum_next_prev_count;
 #[path = "types/enum_name_cross_method_local.rs"]
@@ -181,6 +191,10 @@ mod task_formal_param_width;
 mod type_param_bound_to_specialization;
 #[path = "types/type_param_static_property.rs"]
 mod type_param_static_property;
+#[path = "types/stmt_local_scoped_decls.rs"]
+mod stmt_local_scoped_decls;
+#[path = "types/type_param_struct_per_instance.rs"]
+mod type_param_struct_per_instance;
 #[path = "types/typedef_declaring_scope.rs"]
 mod typedef_declaring_scope;
 #[path = "types/typedef_specialization_dispatch.rs"]

@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "strings/local_string_array_init.rs"]
+mod local_string_array_init;
 #[path = "strings/assoc_in_always_ff_and_string_element_methods.rs"]
 mod assoc_in_always_ff_and_string_element_methods;
 #[path = "strings/call_time_defaults_and_string_queries.rs"]

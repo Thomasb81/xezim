@@ -445,6 +445,29 @@ cargo build --release  # optimized (recommended for large designs)
 
 The release binary is produced at `target/release/xezim`.
 
+### Profile-guided build (recommended for long runs)
+
+`./scripts/build-pgo.sh <training-command>` instruments, trains on the command
+you give it, and rebuilds with the profile. Measured on the C906 memcpy
+benchmark (interleaved, same machine):
+
+| | instructions | wall |
+|---|---|---|
+| release | 176.92 B | 51.5 s |
+| **PGO** | **151.31 B (−14.5%)** | **44.0 s (−14.6%)** |
+
+Output stays bit-exact (C906 gate, C910 hello, and the UVM AVIP suite all
+unchanged).
+
+Two things worth knowing before you reach for it. **The wall-clock gain
+depends on the design being instruction-bound**: Ibex CoreMark also loses
+~11% of its instructions but its wall time does not move, because its host
+bottleneck is memory rather than instruction count — so measure, do not
+assume. And the profile **generalizes better than expected**: a C906-trained
+profile gave Ibex −11.1% instructions against −10.6% for an Ibex-trained one,
+so a single representative trainer is usually enough. Do not stack BOLT on a
+PGO build — measured net negative; PGO alone wins.
+
 ### Modifying xezim-core
 
 `xezim-core` (parser + elaboration) is a separate repo, consumed as a git

@@ -123,6 +123,13 @@ What's left for the user:
   engine: it measured net-negative under `XEZIM_AOT`, where wider blocks
   shrink native coverage and defeat template deduplication.
 - **PGO build** (above) for long runs; the build cost amortizes quickly.
+  Re-measured on current code: c906 memcpy ×100 **−14.5% instructions and
+  −14.6% wall** (176.92 B → 151.31 B, 51.5 s → 44.0 s, interleaved, bit-exact).
+  The WALL gain needs the design to be instruction-bound — ibex CoreMark sheds
+  ~11% of its instructions with no wall change, being memory-bound — so judge
+  by `perf stat` instructions first and confirm wall separately. The profile
+  transfers well: a c906-trained profile beat an ibex-trained one ON IBEX
+  (−11.1% vs −10.6%), so one representative trainer suffices.
 - **Native compilation (`XEZIM_JIT=1`, optionally `+XEZIM_AOT=1`) pays on
   designs with FEW, VERY HOT blocks — measure before adopting it.** Warm
   cache, wall-clock:

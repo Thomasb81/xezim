@@ -1,5 +1,4 @@
-//! Equivalence tests for the two opt-in structural optimizations added
-//! alongside the reference-simulator pass comparison:
+//! Equivalence tests for opt-in structural optimizations.
 //!
 //! * `XEZIM_BUF_COLLAPSE` — folds whole-net identity continuous assigns
 //!   (`assign y = x;`) onto their source net, the analogue of the reference
@@ -7,6 +6,8 @@
 //! * `XEZIM_EDGE_MERGE=<N>` — merges edge blocks that share an identical
 //!   sensitivity into one compiled block, the analogue of their default
 //!   process-merging pass.
+//! * `XEZIM_RANGE_COPY=1` — lowers a direct constant-range assignment to a
+//!   single four-state slice operation.
 //!
 //! Both rewrite the design before compilation, so the property that matters
 //! is that they change NOTHING observable. Each test runs the same source
@@ -115,6 +116,26 @@ module tb;
 endmodule
 "#;
 
+const RANGE_DESIGN: &str = r#"
+module tb;
+  logic [127:0] source_bus;
+  wire [63:0] result_bus;
+  assign result_bus[55:8] = source_bus[111:64];
+
+  task automatic show;
+    #1 $display("OUT src=%h dst=%h", source_bus, result_bus);
+  endtask
+
+  initial begin
+    source_bus = 128'h0123456789abcdef_fedcba9876543210; show();
+    source_bus = 128'hxxxx56789abcdef0_1111222233334444; show();
+    source_bus = 128'hzzzz56789abcdef0_5555666677778888; show();
+    source_bus = 128'hffff0000aaaa5555_9999aaaabbbbcccc; show();
+    $finish;
+  end
+endmodule
+"#;
+
 #[test]
 fn buffer_net_collapse_is_observationally_identical() {
     let (_, base) = run(BUF_DESIGN, "buf_base", &[]);
@@ -133,7 +154,7 @@ fn buffer_net_collapse_is_observationally_identical() {
 #[test]
 fn edge_block_merge_is_observationally_identical() {
     let (_, base) = run(MERGE_DESIGN, "merge_base", &[]);
-    let (text, merged) = run(MERGE_DESIGN, "merge_on", &[("XEZIM_EDGE_MERGE", "8")]);
+    let (text, merged) = run(MERGE_DESIGN, "merge_on", &[("XEZIM_EDGE_MERGE", "2")]);
     assert!(
         !base.is_empty(),
         "baseline produced no program output — the test would be vacuous"
@@ -154,8 +175,24 @@ fn collapse_and_merge_together_are_identical() {
     let (_, both) = run(
         MERGE_DESIGN,
         "both_on",
-        &[("XEZIM_BUF_COLLAPSE", "1"), ("XEZIM_EDGE_MERGE", "8")],
+        &[("XEZIM_BUF_COLLAPSE", "1"), ("XEZIM_EDGE_MERGE", "2")],
     );
     assert!(!base.is_empty(), "baseline produced no program output");
     assert_eq!(base, both, "collapse+merge changed observable output");
+}
+
+#[test]
+fn constant_range_copy_is_observationally_identical() {
+    let (_, base) = run(RANGE_DESIGN, "range_base", &[]);
+    let (text, lowered) = run(
+        RANGE_DESIGN,
+        "range_on",
+        &[("XEZIM_RANGE_COPY", "1")],
+    );
+    assert_eq!(base.len(), 4, "baseline did not exercise every vector");
+    assert!(
+        text.contains("[RANGE-COPY] lowered 1 constant-range assignments"),
+        "the range-copy path never fired:\n{text}"
+    );
+    assert_eq!(base, lowered, "range copying changed observable output");
 }
