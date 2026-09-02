@@ -47436,6 +47436,21 @@ impl Simulator {
         root: &str,
         steps: &[(Option<&str>, i64)],
     ) -> Option<(String, u32, u32)> {
+        // Inside an inlined instance a member access folds into the root
+        // (`cw.loc.descriptors`): that name carries an element width but no
+        // field layout, so every nested read below it came back 0. Peel
+        // trailing segments back into field steps until the root names the
+        // struct signal itself.
+        if !self.module.packed_struct_fields.contains_key(root)
+            && !self.module.arrays.contains_key(root)
+        {
+            if let Some((head, seg)) = root.rsplit_once('.') {
+                let mut widened: Vec<(Option<&str>, i64)> = Vec::with_capacity(steps.len() + 1);
+                widened.push((Some(seg), 0));
+                widened.extend_from_slice(steps);
+                return self.packed_path_slice(head, &widened);
+            }
+        }
         // Leading indices apply to the root's own dimensions; the rest form the
         // field path, which may carry indices of its own.
         let lead_len = steps.iter().take_while(|(field, _)| field.is_none()).count();
@@ -47506,36 +47521,90 @@ impl Simulator {
             let total = self.get_signal_value_by_name(&storage)?.width;
             return (base + off + w <= total).then_some((storage, base + off, w));
         }
-        // Otherwise the trailing index selects an ELEMENT of the field it
-        // follows (`…wdata[0]` inside a `[1:0][63:0]` member): resolve the
-        // field, then step by its element width.
-        let (last, init) = rest.split_last()?;
-        if last.0.is_some() {
-            return None;
-        }
-        let k = u32::try_from(last.1).ok()?;
-        let key2 = render_key(init);
-        let mut norm2 = String::new();
-        for (field, _) in init {
-            if let Some(field) = field {
-                if !norm2.is_empty() {
-                    norm2.push('.');
+        // Otherwise walk the path: fields and indices interleaved at any
+        // depth (`wdata[0]`, `descriptors[0].region`, `m[1].words[2]`). Every
+        // registered key is element-0-relative along its whole path, so the
+        // deepest field supplies the offset and each index step adds its
+        // member's element displacement on top. The trailing-index-only
+        // shape used to be the ceiling; a field AFTER an index read 0.
+        // Layouts come in two key conventions: element-relative
+        // (`descriptors.region`) and expanded per element with the index
+        // inline (`wdata[0].wdata`, `wdata[1].wdata`). A field step tries the
+        // path with its ACTUAL indices first (absolute offset, so the index
+        // displacement collected so far is dropped), then the index-free
+        // form, then the element-0 form (both element-0-relative, so the
+        // displacement stays).
+        let mut norm = String::new();
+        let mut actual = String::new();
+        let mut zero = String::new();
+        let mut off: u32 = 0;
+        let mut fw: u32 = struct_w;
+        let mut disp: u32 = 0;
+        let mut i = 0;
+        while i < rest.len() {
+            match rest[i] {
+                (Some(f), _) => {
+                    for k in [&mut norm, &mut actual, &mut zero] {
+                        if !k.is_empty() {
+                            k.push('.');
+                        }
+                        k.push_str(f);
+                    }
+                    if let Some((_, o, w)) = fields.iter().find(|(m, _, _)| m == &actual) {
+                        off = *o;
+                        fw = *w;
+                        disp = 0;
+                    } else {
+                        let (_, o, w) = fields
+                            .iter()
+                            .find(|(m, _, _)| m == &norm || m == &zero)?;
+                        off = *o;
+                        fw = *w;
+                    }
+                    i += 1;
                 }
-                norm2.push_str(field);
+                (None, _) => {
+                    if norm.is_empty() {
+                        return None;
+                    }
+                    let mkey = format!("{}.{}", root, norm);
+                    let mut idxs: Vec<i64> = Vec::new();
+                    while i < rest.len() && rest[i].0.is_none() {
+                        idxs.push(rest[i].1);
+                        actual.push('[');
+                        Self::push_i64(&mut actual, rest[i].1);
+                        actual.push(']');
+                        zero.push_str("[0]");
+                        i += 1;
+                    }
+                    let ew = self.module.packed_signal_elem_widths.get(&mkey).copied();
+                    let (step_w, slot) = if idxs.len() == 1 {
+                        // A member with no element width is a plain vector:
+                        // the index is a bit select.
+                        (ew.unwrap_or(1), u32::try_from(idxs[0]).ok()?)
+                    } else {
+                        let ew = ew?;
+                        let dims = self.module.packed_full_dims.get(&mkey)?;
+                        let slot = Self::flatten_packed_slot_iter(
+                            idxs.iter().copied(),
+                            Some(dims.as_slice()),
+                        )?;
+                        let inner: u32 = dims
+                            .iter()
+                            .skip(1)
+                            .take(idxs.len() - 1)
+                            .map(|(l, r)| ((l - r).unsigned_abs() + 1) as u32)
+                            .product();
+                        (ew / inner.max(1), slot)
+                    };
+                    disp += slot * step_w;
+                    fw = step_w.min(fw);
+                }
             }
         }
-        let (_, off, fw) = fields.iter().find(|(m, _, _)| m == &key2)?;
-        let (off, fw) = (*off, *fw);
-        let elem_w = self
-            .module
-            .packed_signal_elem_widths
-            .get(&format!("{}.{}", root, norm2))
-            .copied()
-            .unwrap_or(1);
-        let lsb = base + off + k * elem_w;
-        let w = elem_w.min(fw);
+        let lsb = base + off + disp;
         let total = self.get_signal_value_by_name(&storage)?.width;
-        (lsb + w <= total).then_some((storage, lsb, w))
+        (lsb + fw <= total).then_some((storage, lsb, fw))
     }
 
     /// Resolve `arr[i]…[j].field…[k]` over a PACKED array of packed structs to
