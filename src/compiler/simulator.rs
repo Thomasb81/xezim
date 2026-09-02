@@ -6389,6 +6389,50 @@ impl Simulator {
             taken.extend(module.arrays.keys().cloned());
             taken.extend(module.dynamic_arrays.iter().cloned());
             taken.extend(module.associative_arrays.keys().cloned());
+            // §6.21 extended: two processes declaring the SAME frameless
+            // block-local name (neither shadowing any module symbol) would
+            // share one `signals[name]` slot and last-write-win — e.g.
+            // `int v` in two initial blocks cross-read each other's value.
+            // The flattening executor has no per-process block-scope frame for
+            // frameless locals, so alpha-rename a frameless local like a
+            // shadow when the SAME name is a frameless local of a DIFFERENT
+            // process (reference-validated localsame.sv: p1 must read its own
+            // `v=10`, not p2's `v=1`). Single-process locals stay as-is to
+            // avoid perturbing auto-loop-var / signal-name bookkeeping.
+            fn frameless_locals(stmt: &Statement) -> std::collections::HashSet<String> {
+                let mut out = std::collections::HashSet::new();
+                // Named and unnamed process-block bodies are handled
+                // identically (the flattening executor / later auto-naming make
+                // the distinction immaterial), so collect the body's top-level
+                // locals regardless of whether the outer SeqBlock carries a
+                // label.
+                if let StatementKind::SeqBlock { stmts, .. } = &stmt.kind {
+                    for s in stmts.iter() {
+                        if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                            for d in declarators.iter() {
+                                out.insert(d.name.name.clone());
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            let mut per_proc_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            let mut all_proc = Vec::new();
+            all_proc.extend(module.initial_blocks.iter().map(|b| &b.stmt));
+            all_proc.extend(module.always_blocks.iter().map(|b| &b.stmt));
+            all_proc.extend(module.final_blocks.iter().map(|b| &b.stmt));
+            for st in all_proc.iter() {
+                for nm in frameless_locals(st) {
+                    *per_proc_counts.entry(nm).or_insert(0) += 1;
+                }
+            }
+            for (nm, c) in per_proc_counts {
+                if c >= 2 {
+                    taken.insert(nm);
+                }
+            }
             for (i, ib) in module.initial_blocks.iter_mut().enumerate() {
                 if let Some(new_stmt) = super::elaborate::rename_process_shadowed_locals(
                     &ib.stmt,
