@@ -38869,6 +38869,9 @@ impl Simulator {
                                 // member/static resolution, with a null `this`.
                                 self.this_stack.push(None);
                                 self.class_context_stack.push(Some(mclass));
+                                self.method_local_base.push(
+                                    self.local_stack.len().saturating_sub(1),
+                                );
                                 cleanup.pushed_method_this = true;
                                 let saved_spec = self.current_spec.clone();
                                 if let Some((sb, ss)) = recv_spec {
@@ -98601,6 +98604,7 @@ impl Simulator {
         if c.pushed_method_this {
             self.this_stack.pop();
             self.class_context_stack.pop();
+            self.method_local_base.pop();
             self.current_spec = c.saved_spec;
         }
         self.ref_binding_stack.pop();
@@ -99263,6 +99267,15 @@ impl Simulator {
         cleanup.pushed_method_this = true;
         self.this_stack.push(handle_opt);
         self.class_context_stack.push(Some(mclass.clone()));
+        // §23 / §13.4: record the base of THIS method's own locals so
+        // `get_expr_type_name`'s `in_any_frame` check only sees the current
+        // inlined method's locals — not a caller's same-named local that
+        // leaked into the flat `var_class_types` map (e.g. a `uvm_sequence_base
+        // seq` local on the sequencer shadowing a sequence subclass's `seq`
+        // member, breaking virtual dispatch of `body()` in nested
+        // sequence-`start()` calls). The synchronous method path pushes this
+        // right after binding the locals frame; mirror it here.
+        self.method_local_base.push(self.local_stack.len().saturating_sub(1));
         if let Some(h) = handle_opt {
             if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
                 let cn = inst.class_name.clone();
