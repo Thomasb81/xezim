@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "types/packed_struct_array_local.rs"]
+mod packed_struct_array_local;
 #[path = "types/packed_struct_member_width.rs"]
 mod packed_struct_member_width;
 #[path = "types/packed_struct_formal_member.rs"]
