@@ -88688,6 +88688,22 @@ impl Simulator {
                 if let Some(members) = self.module.enum_members.get(td_name) {
                     if let Some((_, val)) = members.iter().find(|(n, _)| n == member) {
                         let w = self.module.typedefs.get(td_name).copied().unwrap_or(32).max(1);
+                        // §6.19 wide base: `enum_members` stores u64 and
+                        // truncates past 64 bits — recompute the full value
+                        // from the class's own enum AST (rare width, cold).
+                        if w > 64 {
+                            if let DataType::Enum(et) = dt {
+                                if let Some(v) = super::elaborate::wide_enum_value_map(
+                                    et,
+                                    w,
+                                    &self.module.parameters,
+                                )
+                                .get(member)
+                                {
+                                    return Some(v.clone());
+                                }
+                            }
+                        }
                         return Some(Value::from_u64(*val, w));
                     }
                 }
@@ -88710,6 +88726,13 @@ impl Simulator {
     /// returned 0. Consulting the package's own member list fixes both.
     fn package_enum_member(&self, pkg: &str, member: &str) -> Option<Value> {
         let (val, width) = *self.module.package_enum_members.get(pkg)?.get(member)?;
+        // §6.19 wide base: the table stores u64; elaboration parks the full
+        // Value under the qualified spelling in `parameters` for these.
+        if width > 64 {
+            if let Some(v) = self.module.parameters.get(&format!("{}::{}", pkg, member)) {
+                return Some(v.clone());
+            }
+        }
         Some(Value::from_u64(val, width.max(1)))
     }
 

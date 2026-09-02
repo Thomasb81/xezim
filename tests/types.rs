@@ -67,6 +67,8 @@ mod defparam_override;
 mod dollar_lvalue_and_assoc_width;
 #[path = "types/enum_name_formal_param.rs"]
 mod enum_name_formal_param;
+#[path = "types/wide_enum_values.rs"]
+mod wide_enum_values;
 #[path = "types/enum_member_per_instance.rs"]
 mod enum_member_per_instance;
 #[path = "types/enum_next_prev_count.rs"]
