@@ -4537,6 +4537,13 @@ pub struct Simulator {
     /// fixpoint after the same-time batch drains, suspending until the
     /// condition genuinely flips instead of falsely proceeding.
     condition_waiters: Vec<(usize, ProcCont)>,
+    /// Waiters from `condition_waiters` whose conditions became true upon
+    /// blocking writes, recorded in write-satisfaction order (§9.7.4).
+    ready_condition_waiters: Vec<(usize, ProcCont)>,
+    /// Ident/member names read by the wait condition of each parked waiter.
+    cond_waiter_reads: HashMap<usize, HashSet<String>>,
+    /// Wait condition expression for each parked waiter.
+    cond_waiter_conditions: HashMap<usize, Expression>,
     /// IEEE 1800-2017 §4.4.2.3 Inactive region: continuations of `#0`
     /// delays park here instead of in the event_queue. The event_queue's
     /// batch drain in `run_one_tick` re-fetches same-time entries into the
@@ -8156,6 +8163,9 @@ impl Simulator {
             ref_alias_stack: Vec::new(),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
+            ready_condition_waiters: Vec::new(),
+            cond_waiter_reads: HashMap::default(),
+            cond_waiter_conditions: HashMap::default(),
             inactive_queue: Vec::new(),
             cond_progress: 0,
             real_time: 0.0,
@@ -33254,6 +33264,159 @@ impl Simulator {
         }
     }
 
+    fn collect_condition_read_names(e: &Expression, out: &mut HashSet<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                for seg in &h.path {
+                    out.insert(seg.name.name.clone());
+                    for sel in &seg.selects {
+                        Self::collect_condition_read_names(sel, out);
+                    }
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                out.insert(member.name.clone());
+                Self::collect_condition_read_names(expr, out);
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::collect_condition_read_names(left, out);
+                Self::collect_condition_read_names(right, out);
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                Self::collect_condition_read_names(operand, out);
+            }
+            ExprKind::Index { expr, index } => {
+                Self::collect_condition_read_names(expr, out);
+                Self::collect_condition_read_names(index, out);
+            }
+            ExprKind::RangeSelect { expr, left, right, .. } => {
+                Self::collect_condition_read_names(expr, out);
+                Self::collect_condition_read_names(left, out);
+                Self::collect_condition_read_names(right, out);
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                Self::collect_condition_read_names(condition, out);
+                Self::collect_condition_read_names(then_expr, out);
+                Self::collect_condition_read_names(else_expr, out);
+            }
+            ExprKind::Call { func, args } => {
+                Self::collect_condition_read_names(func, out);
+                for a in args {
+                    Self::collect_condition_read_names(a, out);
+                }
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    Self::collect_condition_read_names(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_lvalue_target_names(lhs: &Expression, out: &mut Vec<String>) {
+        match &lhs.kind {
+            ExprKind::Ident(h) => {
+                for seg in &h.path {
+                    out.push(seg.name.name.clone());
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                out.push(member.name.clone());
+                Self::collect_lvalue_target_names(expr, out);
+            }
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                Self::collect_lvalue_target_names(expr, out);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    Self::collect_lvalue_target_names(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn park_condition_waiter(&mut self, pid: usize, cont: ProcCont, cond: &Expression) {
+        let mut reads = HashSet::default();
+        Self::collect_condition_read_names(cond, &mut reads);
+        self.cond_waiter_reads.insert(pid, reads);
+        self.cond_waiter_conditions.insert(pid, cond.clone());
+        self.condition_waiters.push((pid, cont));
+    }
+
+    fn eval_waiter_condition(&mut self, waiter_pid: usize, cond: &Expression) -> bool {
+        let saved = self.snapshot_process_context();
+        let saved_hint = self.name_resolve_hint.borrow().clone();
+        let saved_scope = self.current_scope.clone();
+        let saved_pid = self.current_pid;
+        self.current_pid = waiter_pid;
+        if let Some(scope) = self.process_scope_hint.get(&waiter_pid).cloned() {
+            *self.name_resolve_hint.borrow_mut() = Some(scope.clone());
+            self.current_scope = scope;
+        }
+        let cond_held = if let Some(ctx) = self.process_contexts.remove(&waiter_pid) {
+            self.restore_process_context(ctx);
+            let val = self.eval_expr(cond).is_true();
+            let ctx = self.take_process_context();
+            self.process_contexts.insert(waiter_pid, ctx);
+            val
+        } else {
+            self.eval_expr(cond).is_true()
+        };
+        self.restore_process_context(saved);
+        *self.name_resolve_hint.borrow_mut() = saved_hint;
+        self.current_scope = saved_scope;
+        self.current_pid = saved_pid;
+        cond_held
+    }
+
+    fn check_condition_waiters_for_write(&mut self, lhs: &Expression) {
+        if self.condition_waiters.is_empty() {
+            return;
+        }
+        let mut target_names: Vec<String> = Vec::new();
+        Self::collect_lvalue_target_names(lhs, &mut target_names);
+        if target_names.is_empty() {
+            return;
+        }
+        let any_match = self.condition_waiters.iter().any(|(pid, _)| {
+            self.cond_waiter_reads.get(pid).is_some_and(|reads| {
+                target_names.iter().any(|tn| reads.contains(tn))
+            })
+        });
+        if !any_match {
+            return;
+        }
+
+        let mut i = 0;
+        while i < self.condition_waiters.len() {
+            let (pid, _) = self.condition_waiters[i];
+            let matches = self.cond_waiter_reads.get(&pid).is_some_and(|reads| {
+                target_names.iter().any(|tn| reads.contains(tn))
+            });
+            if !matches {
+                i += 1;
+                continue;
+            }
+            let cond_opt = self.cond_waiter_conditions.get(&pid).cloned();
+            let Some(cond) = cond_opt else {
+                i += 1;
+                continue;
+            };
+
+            let is_true = self.eval_waiter_condition(pid, &cond);
+            if is_true {
+                let (wpid, wcont) = self.condition_waiters.remove(i);
+                self.cond_waiter_reads.remove(&wpid);
+                self.cond_waiter_conditions.remove(&wpid);
+                self.ready_condition_waiters.push((wpid, wcont));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// Settle after a procedural blocking write (outside edge blocks).
     ///
     /// §5.5 + §10.3 say the driven continuous assignments' re-evaluation is a
@@ -34208,7 +34371,7 @@ impl Simulator {
     /// catch waiters satisfied by non-blocking/edge-propagated state.
     fn drain_condition_waiters(&mut self) {
         let mut guard = 0u32;
-        while !self.condition_waiters.is_empty()
+        while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
             && !self.finished
             && !self.zero_delay_defer_pending
         {
@@ -34217,8 +34380,16 @@ impl Simulator {
                 break;
             }
             let prog_before = self.cond_progress;
+            let ready = std::mem::take(&mut self.ready_condition_waiters);
+            for (cpid, cont) in ready {
+                self.cond_waiter_reads.remove(&cpid);
+                self.cond_waiter_conditions.remove(&cpid);
+                self.event_queue.schedule(self.time, cpid, cont);
+            }
             let parked = std::mem::take(&mut self.condition_waiters);
             for (cpid, cont) in parked {
+                self.cond_waiter_reads.remove(&cpid);
+                self.cond_waiter_conditions.remove(&cpid);
                 self.event_queue.schedule(self.time, cpid, cont);
             }
             while self.event_queue.next_time() == Some(self.time)
@@ -39269,7 +39440,7 @@ impl Simulator {
                     let mut cont = vec![stmt.clone()];
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
-                    self.condition_waiters.push((pid, cont));
+                    self.park_condition_waiter(pid, cont, condition);
                     return;
                 }
             }
@@ -47875,6 +48046,14 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
+        let changed = self.assign_value_inner(lhs, val);
+        if changed && !self.condition_waiters.is_empty() {
+            self.check_condition_waiters_for_write(lhs);
+        }
+        changed
+    }
+
+    fn assign_value_inner(&mut self, lhs: &Expression, val: &Value) -> bool {
         // §25.9: a just-returned vif (recorded by the Return arm) binds to
         // the FIRST assignment target after the call — `value = r.read(c)`
         // in uvm_config_db::get (issue #113). One-shot; also cleared at the
@@ -63410,7 +63589,7 @@ impl Simulator {
                     // the full continuation. If so, park the process and set
                     // return_flag to unwind all the way back to run_process_stmts.
                     if let Some(cont) = self.exec_park_cont.take() {
-                        self.condition_waiters.push((self.current_pid, cont));
+                        self.park_condition_waiter(self.current_pid, cont, condition);
                         self.parked_from_exec = true;
                         self.return_flag = true;
                         self.break_flag = true;
@@ -74932,6 +75111,9 @@ impl Simulator {
         if self.condition_waiters.iter().any(|(p, _)| *p == pid) {
             return true;
         }
+        if self.ready_condition_waiters.iter().any(|(p, _)| *p == pid) {
+            return true;
+        }
         // A process parked by `#0` in the Inactive-region queue (§4.4.2.3)
         // is suspended, not finished — its continuation resumes after the
         // NBA region of the current tick.
@@ -75090,6 +75272,11 @@ impl Simulator {
         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
         self.instance_event_waiters.retain(|w| !to_kill.contains(&w.pid));
         self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
+        self.ready_condition_waiters.retain(|(p, _)| !to_kill.contains(p));
+        for p in &to_kill {
+            self.cond_waiter_reads.remove(p);
+            self.cond_waiter_conditions.remove(p);
+        }
         self.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
         for q in self.mailbox_get_waiters.values_mut() {
             q.retain(|w| !to_kill.contains(&w.pid));
@@ -75161,6 +75348,22 @@ impl Simulator {
         // 3) Condition wait (wait(expr))
         if let Some(idx) = self.condition_waiters.iter().position(|(p, _)| *p == pid) {
             let (_, stmts) = self.condition_waiters.remove(idx);
+            self.cond_waiter_reads.remove(&pid);
+            self.cond_waiter_conditions.remove(&pid);
+            self.suspended_pids.insert(pid);
+            self.suspended_proc_info.insert(
+                pid,
+                SuspendedProc {
+                continuation: stmts,
+                original_delay_expiry: None,
+                },
+            );
+            return;
+        }
+        if let Some(idx) = self.ready_condition_waiters.iter().position(|(p, _)| *p == pid) {
+            let (_, stmts) = self.ready_condition_waiters.remove(idx);
+            self.cond_waiter_reads.remove(&pid);
+            self.cond_waiter_conditions.remove(&pid);
             self.suspended_pids.insert(pid);
             self.suspended_proc_info.insert(
                 pid,
