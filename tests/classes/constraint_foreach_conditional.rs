@@ -108,3 +108,47 @@ endmodule
 "#);
     assert!(o.contains("UNSAT=0 SAT=1 V=0"), "unsat/sat verdicts wrong:\n{o}");
 }
+
+#[test]
+fn a_globally_coupled_monotone_mesh_is_solved_not_given_up_on() {
+    // SATISFIABLE but every element depends on three predecessors, so uniform
+    // per-element repicks exhaust `[1:2000]` along a nine-step chain and the
+    // strict foreach check failed trial after trial — the give-up cap then
+    // returned 0 on a valid constraint set. After a few strict-check
+    // failures the relational repicker switches to the BOUND value
+    // (minimal feasible, intersected with the body's `inside` range), which
+    // solves a monotone chain greedily in index order. The reference solves
+    // this too (it reaches the corner at 2000; we settle for the minimal
+    // 19 — both are valid solutions).
+    let o = out(r#"
+module top;
+  class valid_mesh_test;
+    rand int grid[4][4][4];
+    constraint c {
+      foreach (grid[i, j, k]) {
+        grid[i][j][k] inside {[1 : 2000]};
+        if (i > 0) { grid[i][j][k] > grid[i-1][j][k]; }
+        if (j > 0) { grid[i][j][k] > grid[i][j-1][k]; }
+        if (k > 0) { grid[i][j][k] > grid[i][j][k-1]; }
+        if (i == 0 && j == 0 && k == 0) { grid[i][j][k] == 10; }
+      }
+    }
+  endclass
+  initial begin
+    valid_mesh_test o = new();
+    int r, viol = 0;
+    r = o.randomize();
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) for (int k = 0; k < 4; k++) begin
+      if (!(o.grid[i][j][k] >= 1 && o.grid[i][j][k] <= 2000)) viol++;
+      if (i > 0 && !(o.grid[i][j][k] > o.grid[i-1][j][k])) viol++;
+      if (j > 0 && !(o.grid[i][j][k] > o.grid[i][j-1][k])) viol++;
+      if (k > 0 && !(o.grid[i][j][k] > o.grid[i][j][k-1])) viol++;
+    end
+    if (o.grid[0][0][0] != 10) viol++;
+    $display("MESH r=%0d viol=%0d", r, viol);
+  end
+endmodule
+"#);
+    assert!(o.contains("MESH r=1 viol=0"), "valid monotone mesh not solved:\n{o}");
+}
+
