@@ -29,6 +29,8 @@ mod array_parameter;
 mod array_query_multidim_packed;
 #[path = "types/assoc_of_queue_enumeration.rs"]
 mod assoc_of_queue_enumeration;
+#[path = "types/bits_of_type_param_expr.rs"]
+mod bits_of_type_param_expr;
 #[path = "types/bits_of_signal_in_const_expr.rs"]
 mod bits_of_signal_in_const_expr;
 #[path = "types/bits_package_scoped_type_width.rs"]
