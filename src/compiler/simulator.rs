@@ -51053,7 +51053,27 @@ impl Simulator {
                                 indices.push(self.eval_expr(index).to_u64().unwrap_or(0));
                                 cur_expr = b.as_ref();
                             }
-                            ExprKind::Ident(h) => break Some(self.resolve_hier_name(h)),
+                            // A procedural LOCAL registers its layout under
+                            // its BARE name, but inside a submodule process
+                            // `resolve_hier_name` scopes a bare ident
+                            // (`u.a`) — so `a[0].p = v` on a task-local
+                            // packed array of structs found no layout and
+                            // the element read back x, while the same code
+                            // in the top module (empty scope) worked.
+                            ExprKind::Ident(h) => {
+                                let scoped = self.resolve_hier_name(h);
+                                if !self.module.packed_struct_fields.contains_key(&scoped)
+                                    && h.path.len() == 1
+                                    && h.path[0].selects.is_empty()
+                                    && self
+                                        .module
+                                        .packed_struct_fields
+                                        .contains_key(&h.path[0].name.name)
+                                {
+                                    break Some(h.path[0].name.name.clone());
+                                }
+                                break Some(scoped);
+                            }
                             // §7.4.2: root may itself be a struct-member path
                             // (`main.sub_list[0].f`) — build the dotted name so
                             // the `packed_struct_fields["main.sub_list"]` layout
@@ -51122,8 +51142,11 @@ impl Simulator {
                                         if let Some(slot) =
                                             Self::flatten_packed_slot(&indices, dims.as_deref())
                                         {
-                                            if let Some(cur_sig) =
-                                                self.get_signal_value_by_name(&arr_name)
+                                            // Frame-aware: a task/function local
+                                            // lives in the call frame, not the
+                                            // signal table (`get_local_or_signal`
+                                            // covers both).
+                                            if let Some(cur_sig) = self.get_local_or_signal(&arr_name)
                                             {
                                                 let total_w = cur_sig.width;
                                                 let mut cur = cur_sig.resize(total_w);
@@ -51135,11 +51158,8 @@ impl Simulator {
                                                         piece.get_bit(i as usize),
                                                     );
                                                 }
-                                                let changed = self
-                                                    .get_signal_value_by_name(&arr_name)
-                                                    .as_ref()
-                                                        != Some(&cur);
-                                                self.set_signal_value_by_name(&arr_name, cur);
+                                                let changed = cur != cur_sig;
+                                                self.set_local_or_signal(&arr_name, cur);
                                                 return changed;
                                             }
                                         }
@@ -57157,7 +57177,24 @@ impl Simulator {
                                 indices.push(self.eval_expr(index).to_u64().unwrap_or(0));
                                 cur_expr = b.as_ref();
                             }
-                            ExprKind::Ident(h) => break Some(self.resolve_hier_name(h)),
+                            // Same bare-name fallback as the write side: a
+                            // procedural local's layout is keyed bare, and a
+                            // submodule scope hint would otherwise turn
+                            // `a[0].p` into an unknown `u.a`.
+                            ExprKind::Ident(h) => {
+                                let scoped = self.resolve_hier_name(h);
+                                if !self.module.packed_struct_fields.contains_key(&scoped)
+                                    && h.path.len() == 1
+                                    && h.path[0].selects.is_empty()
+                                    && self
+                                        .module
+                                        .packed_struct_fields
+                                        .contains_key(&h.path[0].name.name)
+                                {
+                                    break Some(h.path[0].name.name.clone());
+                                }
+                                break Some(scoped);
+                            }
                             // §7.4.2: root may itself be a struct-member path
                             // (`main.sub_list[0].f`) — mirror of assign_value.
                             ExprKind::MemberAccess { .. } => {
@@ -57218,7 +57255,7 @@ impl Simulator {
                                         && let Some(slot) =
                                             Self::flatten_packed_slot(&indices, dims.as_deref())
                                         && let Some(sig) =
-                                            self.get_signal_value_by_name(&arr_name)
+                                            self.get_local_or_signal(&arr_name)
                                     {
                                         let lo = slot * struct_w + off;
                                         if lo + w <= sig.width {
