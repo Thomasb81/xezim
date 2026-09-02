@@ -1300,6 +1300,24 @@ impl<'a> BytecodeCompiler<'a> {
         let ExprKind::MemberAccess { expr: root, member } = &base.kind else {
             return None;
         };
+        // `a.m1[i].m2[j]`: the container is itself an element of an
+        // array-of-struct member. Slice that element out first, then the
+        // member lane within it (offsets inside the element are relative to
+        // the element-0 layout). Without this the inner member read compiled
+        // to a value and the outer index took ONE BIT of it.
+        if let ExprKind::Index { expr: mid, index: idx1 } = &root.kind
+            && let ExprKind::MemberAccess { expr: r2, member: m1 } = &mid.kind
+        {
+            let (v, key, hier, fields) = self.compile_packed_struct_value(r2)?;
+            let &(_, m1_off, _) = fields.iter().find(|(n, _, _)| n == &m1.name)?;
+            let (stride1, dim1) = self.packed_member_array_shape(&key, &hier, &m1.name)?;
+            let elem = self.emit_packed_member_slice(v, idx1, dim1, stride1, m1_off, stride1)?;
+            let (_, mem_off, _) = Self::elem_zero_field(&fields, &m1.name, &member.name)?;
+            let rel = mem_off.checked_sub(m1_off)?;
+            let nested = format!("{}.{}", m1.name, member.name);
+            let (elem_w, dim2) = self.packed_member_array_shape(&key, &hier, &nested)?;
+            return self.emit_packed_member_slice(elem, index, dim2, elem_w, rel, elem_w);
+        }
         let (root_value, root_key, hier, fields) =
             self.compile_packed_struct_value(root)?;
         let (_, field_offset, _) = fields.iter().find(|(name, _, _)| name == &member.name)?;
@@ -1324,23 +1342,90 @@ impl<'a> BytecodeCompiler<'a> {
         let ExprKind::Index { expr: base, index } = &indexed.kind else {
             return None;
         };
+        // Inside an inlined instance the member access is folded into the
+        // identifier (`cw.loc.descriptors[i].region` arrives as the single
+        // path `cw.loc.descriptors`), so the shape below never matched and
+        // every such read ran interpreted.
+        if let ExprKind::Ident(hier) = &base.kind {
+            if hier.root.is_some()
+                || hier.path.len() < 2
+                || hier.path.iter().any(|s| !s.selects.is_empty())
+            {
+                return None;
+            }
+            let mut root_hier = hier.clone();
+            let member = root_hier.path.pop()?.name.name;
+            return self.compile_indexed_folded_member(&root_hier, &member, index, leaf);
+        }
         let ExprKind::MemberAccess { expr: root, member } = &base.kind else {
             return None;
         };
         let (root_value, root_key, hier, fields) =
             self.compile_packed_struct_value(root)?;
-        let field_path = format!("{}.{}", member.name, leaf);
         let (_, field_offset, field_width) =
-            fields.iter().find(|(name, _, _)| name == &field_path)?;
+            Self::elem_zero_field(&fields, &member.name, leaf)?;
         let (elem_w, dim) = self.packed_member_array_shape(&root_key, &hier, &member.name)?;
         self.emit_packed_member_slice(
             root_value,
             index,
             dim,
             elem_w,
-            *field_offset,
-            *field_width,
+            field_offset,
+            field_width,
         )
+    }
+
+    /// Element-0 layout of `<member>[i].<leaf>`. Elaboration registers an
+    /// array-of-struct member under two conventions: element-relative
+    /// (`descriptors.region`, plain struct nets) or expanded per element
+    /// (`descriptors[0].region`, packed arrays of structs). Both put element
+    /// 0 at the member's base, so either key gives the stride origin.
+    fn elem_zero_field(
+        fields: &[(String, u32, u32)],
+        member: &str,
+        leaf: &str,
+    ) -> Option<(String, u32, u32)> {
+        let rel = format!("{}.{}", member, leaf);
+        let per_elem = format!("{}[0].{}", member, leaf);
+        fields
+            .iter()
+            .find(|(name, _, _)| name == &rel || name == &per_elem)
+            .cloned()
+    }
+
+    /// `<path>.<member>[i].<leaf>` where the container and member arrive as
+    /// one folded identifier: split the member off the path, resolve the
+    /// container's layout under the remaining name, and slice like the
+    /// member-access shape.
+    fn compile_indexed_folded_member(
+        &mut self,
+        root_hier: &HierarchicalIdentifier,
+        member: &str,
+        index: &Expression,
+        leaf: &str,
+    ) -> Option<RegId> {
+        if root_hier.root.is_some() || root_hier.path.is_empty() {
+            return None;
+        }
+        // The container may itself be an element select (`grid[1]`): the
+        // layout is keyed by the bare name, the value is the element.
+        let mut bare = root_hier.clone();
+        for seg in &mut bare.path {
+            seg.selects.clear();
+        }
+        let (root_key, fields) = self.packed_struct_layout_for_hier(&bare)?;
+        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, member, leaf)?;
+        let (elem_w, dim) = self.packed_member_array_shape(&root_key, &bare, member)?;
+        let root = if root_hier.path.iter().any(|s| !s.selects.is_empty()) {
+            let e = Expression::new(ExprKind::Ident(root_hier.clone()), root_hier.span);
+            self.compile_expr(&e, 0)?
+        } else {
+            let base_id = self.lookup_signal_id_by_name(&root_key)?;
+            let root = self.alloc_reg();
+            self.emit(Insn::LoadSignal(root, as_sig_id(base_id)));
+            root
+        };
+        self.emit_packed_member_slice(root, index, dim, elem_w, field_offset, field_width)
     }
 
     pub fn set_string_signals(&mut self, s: &'a HashSet<String>) {
@@ -8123,6 +8208,27 @@ impl<'a> BytecodeCompiler<'a> {
                 let member_reg = self.next_reg;
                 if let Some(dest) = self.compile_indexed_packed_member(base, &member.name) {
                     return Some(dest);
+                }
+                self.insns.truncate(member_start);
+                self.next_reg = member_reg;
+                // `b.descriptors[0].region` parses with the element select on
+                // the LAST path segment (`b.descriptors[0]` is one identifier):
+                // peel that segment into member + index.
+                if let ExprKind::Ident(h) = &base.kind
+                    && h.root.is_none()
+                    && h.path.len() >= 2
+                    && h.path.last().is_some_and(|s| s.selects.len() == 1)
+                    && h.path[..h.path.len() - 1].iter().all(|s| s.selects.len() <= 1)
+                {
+                    let mut root_hier = h.clone();
+                    let last = root_hier.path.pop().unwrap();
+                    let mname = last.name.name.clone();
+                    let index = last.selects[0].clone();
+                    if let Some(dest) =
+                        self.compile_indexed_folded_member(&root_hier, &mname, &index, &member.name)
+                    {
+                        return Some(dest);
+                    }
                 }
                 self.insns.truncate(member_start);
                 self.next_reg = member_reg;
