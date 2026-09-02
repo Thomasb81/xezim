@@ -75,6 +75,8 @@ mod enum_name_formal_param;
 mod wide_enum_values;
 #[path = "types/enum_member_per_instance.rs"]
 mod enum_member_per_instance;
+#[path = "types/enum_reflection_in_submodules.rs"]
+mod enum_reflection_in_submodules;
 #[path = "types/enum_next_prev_count.rs"]
 mod enum_next_prev_count;
 #[path = "types/enum_signedness_and_pkg_scope.rs"]
