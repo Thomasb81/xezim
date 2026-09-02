@@ -5379,6 +5379,17 @@ pub struct Simulator {
     /// pre-filter for chained-handle member resolution (see
     /// `instance_assoc_member`). Built once on first use.
     chained_coll_member_names: std::cell::OnceCell<HashSet<String>>,
+    /// §18.5.7 foreach solving: the `inside {…}` ranges the current body
+    /// imposes on the element being solved (indices bound), so a relational
+    /// repick (`arr[i] > arr[i-1]`) lands INSIDE the declared range instead of
+    /// anywhere in the element's full domain.
+    elem_inside_hint: Vec<(i64, i64)>,
+    /// Set after several trials failed a strict foreach check: relational
+    /// repicks take the BOUND value (minimal/maximal feasible) instead of a
+    /// uniform draw, so a globally coupled monotone chain (`g[i][j][k] >
+    /// g[i-1][j][k]` over a 4x4x4 grid in [1:2000]) is solved greedily in
+    /// index order rather than exhausting the range by luck.
+    rand_tight_mode: bool,
     /// Registered cbNextSimTime callbacks with their registration time.
     /// Each is one-shot and fires when simulation time advances.
     dpi_next_time_cbs: Vec<(DpiCbHandle, u64)>,
@@ -8473,6 +8484,8 @@ impl Simulator {
             prof_psettle_deferred: 0,
             dpi_value_change_cbs: HashMap::default(),
             chained_coll_member_names: std::cell::OnceCell::new(),
+            elem_inside_hint: Vec::new(),
+            rand_tight_mode: false,
             dpi_next_time_cbs: Vec::new(),
             dpi_after_delay_cbs: Vec::new(),
             dpi_rw_synch_cbs: Vec::new(),
@@ -104563,7 +104576,9 @@ impl Simulator {
         // number of full-cost attempts and return 0, rather than paying all
         // 1000 trials (§18.6.2 requires only that we return 0).
         let mut fixed_fe_fail_streak: u32 = 0;
+        self.rand_tight_mode = false;
         for _trial in 0..1000 {
+            self.rand_tight_mode = fixed_fe_fail_streak >= 4;
             // LRM §18.5.4 dist: clear the pick-once gate at each trial so a
             // failed trial doesn't permanently freeze the dist constraint.
             // Within a single trial the gate still ensures the fixpoint
@@ -107540,6 +107555,9 @@ impl Simulator {
                     self.push_local_frame(frame);
                     let mut elem_rand_set = rand_set.clone();
                     elem_rand_set.insert(format!("{}{}", arr_name, suffix));
+                    let mut hint: Vec<(i64, i64)> = Vec::new();
+                    self.body_inside_ranges(body, &arr_name, &mut hint);
+                    self.elem_inside_hint = hint;
                     if self.solve_forced_array_elem(
                         handle,
                         body.as_ref(),
@@ -107603,6 +107621,7 @@ impl Simulator {
                             }
                         }
                     }
+                    self.elem_inside_hint.clear();
                     self.pop_local_frame();
                     let mut k = used.len();
                     loop {
@@ -107892,14 +107911,53 @@ impl Simulator {
                                 BinaryOp::Geq => lo = lo.max(b),
                                 _ => {}
                             }
-                            if lo > hi || (cur_i >= lo && cur_i <= hi) {
-                                return false; // unsatisfiable or already OK
+                            // Intersect with the body's own `inside` ranges for
+                            // this element — a repick outside them only trades
+                            // one violation for another.
+                            if !self.elem_inside_hint.is_empty() {
+                                let mut best: Option<(i64, i64)> = None;
+                                for &(rl, rh) in &self.elem_inside_hint {
+                                    let (l2, h2) = (lo.max(rl), hi.min(rh));
+                                    if l2 <= h2 {
+                                        best = Some(match best {
+                                            None => (l2, h2),
+                                            Some((bl, bh)) => (bl.min(l2), bh.max(h2)),
+                                        });
+                                    }
+                                }
+                                match best {
+                                    Some((l2, h2)) => {
+                                        lo = l2;
+                                        hi = h2;
+                                    }
+                                    None => return false,
+                                }
+                            }
+                            if lo > hi {
+                                return false; // unsatisfiable here
+                            }
+                            // Tight mode sets the bound even when the current
+                            // draw already satisfies this item: the `inside`
+                            // repair ran first and left a random value, and
+                            // keeping it is what exhausts a long chain.
+                            if !self.rand_tight_mode && cur_i >= lo && cur_i <= hi {
+                                return false; // already OK
                             }
                             let p = if lo == hi {
                                 lo
+                            } else if self.rand_tight_mode {
+                                // Minimal/maximal feasible: leaves the most
+                                // room for the elements that depend on this one.
+                                match eff {
+                                    BinaryOp::Gt | BinaryOp::Geq => lo,
+                                    _ => hi,
+                                }
                             } else {
                                 self.cur_rng().gen_range(lo..=hi)
                             };
+                            if p == cur_i {
+                                return false;
+                            }
                             write_elem(self, Value::from_u64(p as u64, w));
                             true
                         }
