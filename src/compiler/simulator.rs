@@ -732,6 +732,17 @@ enum CombItem {
     FusedGate {
         op: FusedGate,
     },
+    /// Aligned slices of independent one-bit gates represented as one plane
+    /// operation and one destination commit.
+    VectorGate {
+        op: VectorGate,
+    },
+    /// Adjacent source lanes whose destinations remain separate scalar cells.
+    /// The vector operation is shared while each destination keeps its own
+    /// change detection and dependency dispatch.
+    ScatterGate {
+        op: ScatterGate,
+    },
     /// A coact-clustered batch of fused gates executed in one worklist
     /// dispatch, in topological member order, through the SAME per-gate
     /// evaluator as `FusedGate` — zero semantic novelty, machinery amortized
@@ -804,7 +815,7 @@ pub struct FusedAndBranch {
     other: BitRef,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 enum GateBin {
     And,
     Or,
@@ -842,6 +853,55 @@ enum FusedGate {
         inputs: [BitRef; 3],
         input_count: u8,
         table: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+struct VectorRef {
+    sig_id: u32,
+    lo: u32,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+enum VectorGate {
+    Buf {
+        dst: VectorRef,
+        src: VectorRef,
+        width: u8,
+        invert: bool,
+    },
+    Bin {
+        dst: VectorRef,
+        a: VectorRef,
+        b: VectorRef,
+        width: u8,
+        op: GateBin,
+        invert: bool,
+    },
+    Mux {
+        dst: VectorRef,
+        s: VectorRef,
+        t: VectorRef,
+        e: VectorRef,
+        width: u8,
+    },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+enum ScatterGate {
+    Buf {
+        dsts: Box<[u32]>,
+        src: VectorRef,
+        width: u8,
+        invert: bool,
+    },
+    Bin {
+        dsts: Box<[u32]>,
+        a: VectorRef,
+        b: VectorRef,
+        width: u8,
+        op: GateBin,
+        invert: bool,
     },
 }
 
@@ -925,7 +985,7 @@ struct CombEntryCold {
     span: crate::ast::Span,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB006";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB007";
 
 #[derive(serde::Serialize)]
 struct PreparedCombCacheRef<'a> {
@@ -2717,13 +2777,24 @@ pub(crate) struct PackedMem {
     pub vals: Vec<u8>,
     /// x/z mask, same indexing: 0 = known, 1 = x/z.
     pub xz: Vec<u8>,
-    /// Declared element width per cell. One byte each — admission caps the
-    /// width at 8, and carrying it here keeps every access site a plain index
-    /// instead of a per-array lookup. Still leaves the cell at 3 B vs 56 B.
+    /// Declared element metadata per cell. Bits 0..=5 hold the width, bit 6
+    /// marks a two-state element, and bit 7 marks signedness. Admission caps
+    /// width at 8, so the flags add no storage.
     pub w: Vec<u8>,
 }
 
 impl PackedMem {
+    const WIDTH_MASK: u8 = 0x3f;
+    const TWO_STATE: u8 = 0x40;
+    const SIGNED: u8 = 0x80;
+
+    #[inline]
+    fn metadata(width: u32, signed: bool, two_state: bool) -> u8 {
+        (width.max(1) as u8 & Self::WIDTH_MASK)
+            | if two_state { Self::TWO_STATE } else { 0 }
+            | if signed { Self::SIGNED } else { 0 }
+    }
+
     #[inline]
     fn off(id: usize) -> usize {
         id - PACKED_BASE
@@ -2736,7 +2807,9 @@ impl PackedMem {
     pub(crate) fn raw(&self, id: usize) -> (u64, u64, u32) {
         let o = Self::off(id);
         match (self.vals.get(o), self.xz.get(o), self.w.get(o)) {
-            (Some(&v), Some(&x), Some(&w)) => (v as u64, x as u64, (w as u32).max(1)),
+            (Some(&v), Some(&x), Some(&meta)) => {
+                (v as u64, x as u64, (meta & Self::WIDTH_MASK).max(1) as u32)
+            }
             _ => (0, 1, 1),
         }
     }
@@ -2748,7 +2821,15 @@ impl PackedMem {
         if o >= self.vals.len() {
             return false;
         }
-        let (nv, nx) = (v as u8, x as u8);
+        let meta = self.w[o];
+        let width = (meta & Self::WIDTH_MASK).max(1) as u32;
+        let mask = ((1u16 << width) - 1) as u8;
+        let nv = v as u8 & mask;
+        let nx = if meta & Self::TWO_STATE != 0 {
+            0
+        } else {
+            x as u8 & mask
+        };
         let changed = self.vals[o] != nv || self.xz[o] != nx;
         if changed {
             self.vals[o] = nv;
@@ -2759,14 +2840,27 @@ impl PackedMem {
 
     #[inline]
     pub(crate) fn width(&self, id: usize) -> u32 {
-        self.w.get(Self::off(id)).copied().unwrap_or(1).max(1) as u32
+        self.w
+            .get(Self::off(id))
+            .copied()
+            .map(|meta| (meta & Self::WIDTH_MASK).max(1) as u32)
+            .unwrap_or(1)
+    }
+    #[inline]
+    pub(crate) fn is_signed(&self, id: usize) -> bool {
+        self.w.get(Self::off(id)).copied().unwrap_or(0) & Self::SIGNED != 0
     }
     #[inline]
     pub(crate) fn read(&self, id: usize) -> Value {
         let o = Self::off(id);
-        let w = self.w.get(o).copied().unwrap_or(1).max(1) as u32;
+        let meta = self.w.get(o).copied().unwrap_or(1);
+        let w = (meta & Self::WIDTH_MASK).max(1) as u32;
         match (self.vals.get(o), self.xz.get(o)) {
-            (Some(&v), Some(&x)) => Value::from_inline(v as u64, x as u64, w),
+            (Some(&v), Some(&x)) => {
+                let mut value = Value::from_inline(v as u64, x as u64, w);
+                value.is_signed = meta & Self::SIGNED != 0;
+                value
+            }
             _ => Value::new(w),
         }
     }
@@ -2778,7 +2872,15 @@ impl PackedMem {
             return false;
         }
         let (v, x) = val.raw_bits();
-        let (nv, nx) = (v as u8, x as u8);
+        let meta = self.w[o];
+        let width = (meta & Self::WIDTH_MASK).max(1) as u32;
+        let mask = ((1u16 << width) - 1) as u8;
+        let nv = v as u8 & mask;
+        let nx = if meta & Self::TWO_STATE != 0 {
+            0
+        } else {
+            x as u8 & mask
+        };
         let changed = self.vals[o] != nv || self.xz[o] != nx;
         if changed {
             self.vals[o] = nv;
@@ -3228,6 +3330,9 @@ pub struct Simulator {
     /// `signal_has_xz.as_ptr()` is JIT-baked at compile time and must
     /// stay valid for the simulator's lifetime.
     pub(crate) signal_has_xz: Vec<u8>,
+    /// Per-destination sidecar roles used by direct commit paths. Bit 0 marks
+    /// edge-history participation; bit 1 marks armed-input fanout.
+    signal_commit_plan: Vec<u8>,
     /// Parallel storage to `signal_table`: `[val_bits, xz_bits]` per
     /// signal in a JIT-friendly flat layout.  Future JIT codegen can
     /// read signal values by direct pointer offset (base + id * 16)
@@ -5262,6 +5367,10 @@ pub struct Simulator {
     prof_psettle_calls: u64,
     prof_psettle_deferred: u64,
     dpi_value_change_cbs: HashMap<usize, Vec<DpiCbHandle>>,
+    /// Every collection/array member name declared by ANY class — the cheap
+    /// pre-filter for chained-handle member resolution (see
+    /// `instance_assoc_member`). Built once on first use.
+    chained_coll_member_names: std::cell::OnceCell<HashSet<String>>,
     /// Registered cbNextSimTime callbacks with their registration time.
     /// Each is one-shot and fires when simulation time advances.
     dpi_next_time_cbs: Vec<(DpiCbHandle, u64)>,
@@ -7039,6 +7148,10 @@ impl Simulator {
             })
             .map(|(k, s)| (k.clone(), s.value.clone()))
             .collect();
+        let arrays_with_elab_values: HashSet<String> = array_elem_inits
+            .iter()
+            .filter_map(|(name, _)| name.rsplit_once('[').map(|(base, _)| base.to_string()))
+            .collect();
         module.signals = Default::default();
         signal_table.reserve(array_elem_count);
         signal_widths_vec.reserve(array_elem_count);
@@ -7096,21 +7209,61 @@ impl Simulator {
                 census.push((base.clone(), count, w));
             }
             let register_names = count <= large_array_threshold;
+            // Resolve element traits before packed admission: arena ids have
+            // no entries in the ordinary signed/two-state side tables.
+            let elem_dt = module.var_decl_types.get(base).or_else(|| {
+                let mut b: &str = base;
+                loop {
+                    match b.rfind('[') {
+                        Some(p) => {
+                            b = &b[..p];
+                            if let Some(dt) = module.var_decl_types.get(b) {
+                                break Some(dt);
+                            }
+                        }
+                        None => break None,
+                    }
+                }
+            });
+            let elem_signed = elem_dt.is_some_and(|dt| {
+                super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
+            });
+            let elem_two_state = elem_dt.is_some_and(|dt| {
+                super::elaborate::is_type_two_state_resolved(dt, &module.typedef_types)
+            });
             // Packed admission: a wide-enough, NARROW array that already
             // forgoes per-element names. Width <= 8 keeps the cell stride at
             // one byte so `first_id + (idx - lo)` still addresses the right
             // cell (see PackedMem). Cells get ids above PACKED_BASE and no
             // `signal_table` / side-table entries at all — that omission IS
             // the 27.7x saving.
-            if packed_mem && !register_names && w <= 8 && count > 0 {
+            if packed_mem
+                && !register_names
+                && w <= 8
+                && count > 0
+                && !arrays_with_elab_values.contains(base)
+            {
                 let first_id = PACKED_BASE + packed_mem_arena.vals.len();
                 array_first_id.insert(Arc::from(base.as_str()), (first_id, lo, hi));
                 packed_arrays.insert(base.clone());
-                let init = array_init(w);
+                let init = if elem_two_state {
+                    Value::zero(w)
+                } else if module.z_init_signals.contains(base) {
+                    Value::all_z(w)
+                } else {
+                    array_init(w)
+                };
                 let (iv, ix) = init.raw_bits();
-                packed_mem_arena.vals.resize(packed_mem_arena.vals.len() + count, iv as u8);
-                packed_mem_arena.xz.resize(packed_mem_arena.xz.len() + count, ix as u8);
-                packed_mem_arena.w.resize(packed_mem_arena.w.len() + count, w as u8);
+                packed_mem_arena
+                    .vals
+                    .resize(packed_mem_arena.vals.len() + count, iv as u8);
+                packed_mem_arena
+                    .xz
+                    .resize(packed_mem_arena.xz.len() + count, ix as u8);
+                let meta = PackedMem::metadata(w, elem_signed, elem_two_state);
+                packed_mem_arena
+                    .w
+                    .resize(packed_mem_arena.w.len() + count, meta);
                 packed_cells += count;
                 continue;
             }
@@ -7162,20 +7315,6 @@ impl Simulator {
             // ("aq[0]") while var_decl_types is keyed by the declaration name
             // ("aq") — strip index suffixes until the declaration is found,
             // or `int aq[2][$]` elements read back unsigned.
-            let elem_dt = module.var_decl_types.get(base).or_else(|| {
-                let mut b: &str = base;
-                loop {
-                    match b.rfind('[') {
-                        Some(p) => {
-                            b = &b[..p];
-                            if let Some(dt) = module.var_decl_types.get(b) {
-                                break Some(dt);
-                            }
-                        }
-                        None => break None,
-                    }
-                }
-            });
             if let Some(dt) = elem_dt {
                 if super::elaborate::is_type_signed_resolved(dt, &module.typedef_types) {
                     for id in first_id..signal_table.len() {
@@ -7209,6 +7348,9 @@ impl Simulator {
         // parameter array's real init values still win.
         for base in module.two_state_signals.iter() {
             if let Some(&(first_id, lo, hi)) = array_first_id.get(base.as_str()) {
+                if is_packed_id(first_id) {
+                    continue;
+                }
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
                     signal_table[id] = Value::zero(signal_widths_vec[id]);
@@ -7217,6 +7359,9 @@ impl Simulator {
         }
         for base in module.z_init_signals.iter() {
             if let Some(&(first_id, lo, hi)) = array_first_id.get(base.as_str()) {
+                if is_packed_id(first_id) {
+                    continue;
+                }
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
                     signal_table[id] = Value::all_z(signal_widths_vec[id]);
@@ -7700,6 +7845,7 @@ impl Simulator {
             active_force_evals: 0,
             active_force_skips: 0,
             signal_has_xz: signal_has_xz_init,
+            signal_commit_plan: Vec::new(),
             signal_inline_bits: Vec::new(),
             jit_nba_side_queue: Vec::new(),
             jit_nba_side_len: 0,
@@ -8315,6 +8461,7 @@ impl Simulator {
             prof_psettle_calls: 0,
             prof_psettle_deferred: 0,
             dpi_value_change_cbs: HashMap::default(),
+            chained_coll_member_names: std::cell::OnceCell::new(),
             dpi_next_time_cbs: Vec::new(),
             dpi_after_delay_cbs: Vec::new(),
             dpi_rw_synch_cbs: Vec::new(),
@@ -13269,6 +13416,7 @@ impl Simulator {
         self.auto_partition_by_scope();
         mark_compile_phase("schedule initial blocks", &mut compile_phase_start);
         self.init_value_trace();
+        self.rebuild_signal_commit_plans();
         self.compiled = true;
     }
 
@@ -13461,7 +13609,9 @@ impl Simulator {
                 // GateRegion: serial-only in v1 (no isolated batch arm yet).
                 CombItem::Udp { .. }
                 | CombItem::UdpBatch { .. }
-                | CombItem::GateRegion { .. } => {}
+                | CombItem::GateRegion { .. }
+                | CombItem::VectorGate { .. }
+                | CombItem::ScatterGate { .. } => {}
             }
             if e.has_unresolved_reads {
                 unresolved += 1;
@@ -14110,7 +14260,9 @@ impl Simulator {
             // `has_udp` forces the serial settle. Present only for exhaustiveness.
             CombItem::Udp { .. } | CombItem::UdpBatch { .. } => true,
             // Serial-only in v1: fall back to the full-simulator path.
-            CombItem::GateRegion { .. } => false,
+            CombItem::GateRegion { .. }
+            | CombItem::VectorGate { .. }
+            | CombItem::ScatterGate { .. } => false,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 // LRM §9.3.1: skip if the destination is forced
                 if self.forced_signals.is_empty() || !self.forced_signals.contains_key(dst_id) {
@@ -14275,7 +14427,9 @@ impl Simulator {
             CombItem::Noop => true,
             // §29 UDPs never run on this isolated path (serial forced).
             CombItem::Udp { .. } | CombItem::UdpBatch { .. } => true,
-            CombItem::GateRegion { .. } => false,
+            CombItem::GateRegion { .. }
+            | CombItem::VectorGate { .. }
+            | CombItem::ScatterGate { .. } => false,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 let (mut sv, mut sx) = view[*src_id].raw_bits();
                 // §6.11.1/§10.7: a 2-state destination drops X/Z (X/Z -> 0).
@@ -15312,7 +15466,9 @@ impl Simulator {
                 // UDP never reaches a worker; represent it inertly here.
                 CombItem::Udp { .. } | CombItem::UdpBatch { .. } => SendCombItem::Noop,
                 // Not par-safe (see extract ctx safety list); never partitioned.
-                CombItem::GateRegion { .. } => SendCombItem::Noop,
+                CombItem::GateRegion { .. }
+                | CombItem::VectorGate { .. }
+                | CombItem::ScatterGate { .. } => SendCombItem::Noop,
                 CombItem::FastDirectCopy { dst_id, src_id } => SendCombItem::FastDirectCopy {
                     dst_id: *dst_id,
                     src_id: *src_id,
@@ -21183,9 +21339,6 @@ impl Simulator {
                                 instructions: Vec::new(),
                                 num_regs: 0,
                                 has_fallback: false,
-                                // Two members may NBA the same target; the
-                                // pending-queue path must keep §10.4.2
-                                // last-write-wins across the merged body.
                                 nba_dup_targets: true,
                             };
                             let mut ok = true;
@@ -24900,7 +25053,13 @@ impl Simulator {
                         // the canonical signal_table before trusting it.
                         if is_packed_id(eid) {
                             let (v, x, w) = self.packed.raw(eid);
-                            vm_store(&mut self.vm_regs[*dest as usize], v, x, w, false);
+                            vm_store(
+                                &mut self.vm_regs[*dest as usize],
+                                v,
+                                x,
+                                w,
+                                self.packed.is_signed(eid),
+                            );
                         } else if eid < soa_len && self.soa_read_ok[eid] {
                             let [v, x] = self.signal_inline_bits[eid];
                             if self.soa_shadow {
@@ -24920,11 +25079,25 @@ impl Simulator {
                         }
                     } else {
                         // x/z or out-of-range index: x at the ELEMENT width.
-                        let w = bytecode_array_elem_width(
-                            array_name,
-                            &self.array_first_id,
-                            &self.signal_table,
-                        );
+                        let first_id = match array_name.as_ref() {
+                            super::bytecode::ArrayOperand::Dense { first_id, .. } => {
+                                Some(*first_id)
+                            }
+                            super::bytecode::ArrayOperand::Named(name) => self
+                                .array_first_id
+                                .get(name.as_str())
+                                .map(|&(first, _, _)| first),
+                        };
+                        let w = first_id
+                            .filter(|id| is_packed_id(*id))
+                            .map(|id| self.packed.width(id))
+                            .unwrap_or_else(|| {
+                                bytecode_array_elem_width(
+                                    array_name,
+                                    &self.array_first_id,
+                                    &self.signal_table,
+                                )
+                            });
                         let xm = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                         vm_store(&mut self.vm_regs[*dest as usize], 0, xm, w, false);
                     }
@@ -24976,21 +25149,24 @@ impl Simulator {
                         &self.array_first_id,
                         &self.signal_name_to_id,
                     ) {
-                        let mut val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
-                        val.is_signed = self.signal_signed[eid];
                         if is_packed_id(eid) {
+                            let val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
                             let (bv, bx) = val.raw_bits();
                             if self.packed.set_raw(eid, bv, bx) {
                                 self.table_modified = true;
                             }
-                        } else if self.signal_table[eid] != val {
-                            write_sig!(self, eid, val);
-                            if !self.dirty_signals[eid] {
-                                self.dirty_signals[eid] = true;
-                                self.dirty_list.push(eid);
+                        } else {
+                            let mut val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
+                            val.is_signed = self.signal_signed[eid];
+                            if self.signal_table[eid] != val {
+                                write_sig!(self, eid, val);
+                                if !self.dirty_signals[eid] {
+                                    self.dirty_signals[eid] = true;
+                                    self.dirty_list.push(eid);
+                                }
+                                self.dirty_any = true;
+                                self.table_modified = true;
                             }
-                            self.dirty_any = true;
-                            self.table_modified = true;
                         }
                     }
                 }
@@ -25226,6 +25402,10 @@ impl Simulator {
             // Region fusion (XEZIM_REGIONS) rewrites the entry list; a cache
             // written under one setting must not be replayed under the other.
             && !matches!(std::env::var("XEZIM_REGIONS").as_deref(), Ok("1"))
+            // Vector coalescing also rewrites the entry list and remains an
+            // opt-in experiment, so keep its prepared form out of the shared
+            // cache until the mode becomes part of the cache key.
+            && !matches!(std::env::var("XEZIM_VEC_COALESCE").as_deref(), Ok("1"))
     }
 
     fn drop_comb_source_ast(&mut self) {
@@ -27046,6 +27226,80 @@ impl Simulator {
             );
         }
 
+        // A constant source slice assigned directly to an equally sized
+        // destination slice does not need a VM register. Use the existing
+        // four-state vector path so the read, partial write, observers, and
+        // dependency propagation happen in one entry operation. Restrict the
+        // first rollout to descending, at-most-word-sized ranges; those are
+        // the common bus-lane form and require no bit-order transformation.
+        if matches!(std::env::var("XEZIM_RANGE_COPY").as_deref(), Ok("1")) {
+            use super::bytecode::Insn as I;
+
+            let mut lowered = 0usize;
+            for entry in entries.iter_mut() {
+                if entry.has_unresolved_reads || entry.defer_at_time0 {
+                    continue;
+                }
+                let CombItem::CompiledContAssign { compiled } = &entry.item else {
+                    continue;
+                };
+                let [
+                    I::LoadSignalRange(reg, src, src_hi, src_lo),
+                    I::BlockingAssignRange(dst, dst_hi, dst_lo, value_reg),
+                ] = compiled.instructions.as_slice()
+                else {
+                    continue;
+                };
+                if reg != value_reg || src_hi < src_lo || dst_hi < dst_lo {
+                    continue;
+                }
+                let src_width = src_hi - src_lo + 1;
+                let dst_width = dst_hi - dst_lo + 1;
+                if src_width != dst_width || src_width == 0 || src_width > 64 {
+                    continue;
+                }
+                let src_id = *src as usize;
+                let dst_id = *dst as usize;
+                if self
+                    .signal_widths
+                    .get(src_id)
+                    .is_none_or(|&w| *src_hi >= w)
+                    || self
+                        .signal_widths
+                        .get(dst_id)
+                        .is_none_or(|&w| w > 64 || *dst_hi >= w)
+                    || self.signal_real.get(src_id).copied().unwrap_or(false)
+                    || self.signal_real.get(dst_id).copied().unwrap_or(false)
+                    || self.signal_two_state.get(dst_id).copied().unwrap_or(false)
+                    || self.sdf_delays.get(dst_id).copied().unwrap_or(0) != 0
+                {
+                    continue;
+                }
+                let overlaps = src_id == dst_id
+                    && *src_lo <= *dst_hi
+                    && *dst_lo <= *src_hi;
+                if overlaps {
+                    continue;
+                }
+                entry.item = CombItem::VectorGate {
+                    op: VectorGate::Buf {
+                        dst: VectorRef {
+                            sig_id: *dst,
+                            lo: *dst_lo,
+                        },
+                        src: VectorRef {
+                            sig_id: *src,
+                            lo: *src_lo,
+                        },
+                        width: src_width as u8,
+                        invert: false,
+                    },
+                };
+                lowered += 1;
+            }
+            eprintln!("[RANGE-COPY] lowered {} constant-range assignments", lowered);
+        }
+
         // Amalgamate straight-line compiled cont-assigns that share one read
         // set (typically the N same-shape port connects of N instances all
         // fed by one testbench net). One worklist dispatch then evaluates the
@@ -27703,6 +27957,623 @@ impl Simulator {
                 entries.len()
             );
         }
+        // Aligned bit-slice coalescing is deliberately opt-in until the large
+        // design census establishes its general payoff. Unlike dependency
+        // region fusion, every member has the same parent trigger set and no
+        // member feeds another: one vector operation replaces independent
+        // one-bit gate entries without widening sensitivity.
+        if std::env::var("XEZIM_VEC_COALESCE").ok().as_deref() == Some("1") {
+            #[derive(Clone, Copy, Hash, PartialEq, Eq)]
+            enum VShape {
+                Buf {
+                    src: u32,
+                    off: i64,
+                    invert: bool,
+                },
+                Bin {
+                    a: u32,
+                    a_off: i64,
+                    b: u32,
+                    b_off: i64,
+                    op: GateBin,
+                    invert: bool,
+                },
+                Mux {
+                    s: u32,
+                    s_off: i64,
+                    t: u32,
+                    t_off: i64,
+                    e: u32,
+                    e_off: i64,
+                },
+            }
+            #[derive(Clone, Copy, Hash, PartialEq, Eq)]
+            struct VKey {
+                dst: u32,
+                shape: VShape,
+            }
+
+            let mut buckets: HashMap<VKey, Vec<(usize, u32)>> = HashMap::default();
+            for (idx, entry) in entries.iter().enumerate() {
+                let (dst, shape) = match &entry.item {
+                    CombItem::FusedGate {
+                        op: FusedGate::Buf1 { dst, src, invert },
+                    } => {
+                        // A primitive buffer maps z to x, while a continuous
+                        // assignment passes z through. Retain the single-bit
+                        // primitive path for that case.
+                        if !*invert
+                            && self
+                                .signal_gate_driven
+                                .get(dst.sig_id as usize)
+                                .copied()
+                                .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        (
+                            *dst,
+                            VShape::Buf {
+                                src: src.sig_id,
+                                off: src.bit as i64 - dst.bit as i64,
+                                invert: *invert,
+                            },
+                        )
+                    }
+                    CombItem::FusedGate {
+                        op:
+                            FusedGate::Bin2 {
+                                dst,
+                                a,
+                                b,
+                                op,
+                                invert,
+                            },
+                    } => (
+                        *dst,
+                        VShape::Bin {
+                            a: a.sig_id,
+                            a_off: a.bit as i64 - dst.bit as i64,
+                            b: b.sig_id,
+                            b_off: b.bit as i64 - dst.bit as i64,
+                            op: *op,
+                            invert: *invert,
+                        },
+                    ),
+                    CombItem::FusedGate {
+                        op: FusedGate::Mux2 { dst, s, t, e },
+                    } => (
+                        *dst,
+                        VShape::Mux {
+                            s: s.sig_id,
+                            s_off: s.bit as i64 - dst.bit as i64,
+                            t: t.sig_id,
+                            t_off: t.bit as i64 - dst.bit as i64,
+                            e: e.sig_id,
+                            e_off: e.bit as i64 - dst.bit as i64,
+                        },
+                    ),
+                    _ => continue,
+                };
+                if entry.has_unresolved_reads || entry.defer_at_time0 {
+                    continue;
+                }
+                buckets
+                    .entry(VKey {
+                        dst: dst.sig_id,
+                        shape,
+                    })
+                    .or_default()
+                    .push((idx, dst.bit));
+            }
+
+            let mut groups: Vec<(VKey, Vec<(usize, u32)>)> = buckets.into_iter().collect();
+            groups.sort_unstable_by_key(|(_, members)| {
+                members
+                    .iter()
+                    .map(|(idx, _)| *idx)
+                    .min()
+                    .unwrap_or(usize::MAX)
+            });
+            let mut vectors = 0usize;
+            let mut members_removed = 0usize;
+            let mut bits = 0usize;
+            for (key, mut members) in groups {
+                members.sort_unstable_by_key(|&(idx, bit)| (bit, idx));
+                let mut start = 0usize;
+                while start < members.len() {
+                    let mut end = start + 1;
+                    while end < members.len()
+                        && members[end].1 == members[end - 1].1 + 1
+                        && end - start < 64
+                    {
+                        end += 1;
+                    }
+                    let run = &members[start..end];
+                    start = end;
+                    if run.len() < 2 {
+                        continue;
+                    }
+                    let dst_lo = run[0].1;
+                    let width = run.len() as u32;
+                    let dst_hi = dst_lo + width - 1;
+                    if self
+                        .signal_widths
+                        .get(key.dst as usize)
+                        .is_none_or(|&w| w > 64 || dst_hi >= w)
+                    {
+                        continue;
+                    }
+                    let overlaps_dst =
+                        |sig: u32, lo: u32, hi: u32| sig == key.dst && lo <= dst_hi && dst_lo <= hi;
+                    let (read_ids, vector_op) = match key.shape {
+                        VShape::Buf { src, off, invert } => {
+                            let src_lo_i = dst_lo as i64 + off;
+                            if src_lo_i < 0 {
+                                continue;
+                            }
+                            let src_lo = src_lo_i as u32;
+                            let src_hi = src_lo + width - 1;
+                            if self
+                                .signal_widths
+                                .get(src as usize)
+                                .is_none_or(|&w| src_hi >= w)
+                                || overlaps_dst(src, src_lo, src_hi)
+                            {
+                                continue;
+                            }
+                            (
+                                vec![src as usize],
+                                VectorGate::Buf {
+                                    dst: VectorRef {
+                                        sig_id: key.dst,
+                                        lo: dst_lo,
+                                    },
+                                    src: VectorRef {
+                                        sig_id: src,
+                                        lo: src_lo,
+                                    },
+                                    width: width as u8,
+                                    invert,
+                                },
+                            )
+                        }
+                        VShape::Bin {
+                            a,
+                            a_off,
+                            b,
+                            b_off,
+                            op,
+                            invert,
+                        } => {
+                            let a_lo_i = dst_lo as i64 + a_off;
+                            let b_lo_i = dst_lo as i64 + b_off;
+                            if a_lo_i < 0 || b_lo_i < 0 {
+                                continue;
+                            }
+                            let (a_lo, b_lo) = (a_lo_i as u32, b_lo_i as u32);
+                            let (a_hi, b_hi) = (a_lo + width - 1, b_lo + width - 1);
+                            if self
+                                .signal_widths
+                                .get(a as usize)
+                                .is_none_or(|&w| a_hi >= w)
+                                || self
+                                    .signal_widths
+                                    .get(b as usize)
+                                    .is_none_or(|&w| b_hi >= w)
+                                || overlaps_dst(a, a_lo, a_hi)
+                                || overlaps_dst(b, b_lo, b_hi)
+                            {
+                                continue;
+                            }
+                            let mut reads = vec![a as usize];
+                            if b != a {
+                                reads.push(b as usize);
+                            }
+                            (
+                                reads,
+                                VectorGate::Bin {
+                                    dst: VectorRef {
+                                        sig_id: key.dst,
+                                        lo: dst_lo,
+                                    },
+                                    a: VectorRef {
+                                        sig_id: a,
+                                        lo: a_lo,
+                                    },
+                                    b: VectorRef {
+                                        sig_id: b,
+                                        lo: b_lo,
+                                    },
+                                    width: width as u8,
+                                    op,
+                                    invert,
+                                },
+                            )
+                        }
+                        VShape::Mux {
+                            s,
+                            s_off,
+                            t,
+                            t_off,
+                            e,
+                            e_off,
+                        } => {
+                            let s_lo_i = dst_lo as i64 + s_off;
+                            let t_lo_i = dst_lo as i64 + t_off;
+                            let e_lo_i = dst_lo as i64 + e_off;
+                            if s_lo_i < 0 || t_lo_i < 0 || e_lo_i < 0 {
+                                continue;
+                            }
+                            let (s_lo, t_lo, e_lo) = (s_lo_i as u32, t_lo_i as u32, e_lo_i as u32);
+                            let (s_hi, t_hi, e_hi) =
+                                (s_lo + width - 1, t_lo + width - 1, e_lo + width - 1);
+                            if self
+                                .signal_widths
+                                .get(s as usize)
+                                .is_none_or(|&w| s_hi >= w)
+                                || self
+                                    .signal_widths
+                                    .get(t as usize)
+                                    .is_none_or(|&w| t_hi >= w)
+                                || self
+                                    .signal_widths
+                                    .get(e as usize)
+                                    .is_none_or(|&w| e_hi >= w)
+                                || overlaps_dst(s, s_lo, s_hi)
+                                || overlaps_dst(t, t_lo, t_hi)
+                                || overlaps_dst(e, e_lo, e_hi)
+                            {
+                                continue;
+                            }
+                            let mut reads = vec![s as usize];
+                            if !reads.contains(&(t as usize)) {
+                                reads.push(t as usize);
+                            }
+                            if !reads.contains(&(e as usize)) {
+                                reads.push(e as usize);
+                            }
+                            (
+                                reads,
+                                VectorGate::Mux {
+                                    dst: VectorRef {
+                                        sig_id: key.dst,
+                                        lo: dst_lo,
+                                    },
+                                    s: VectorRef {
+                                        sig_id: s,
+                                        lo: s_lo,
+                                    },
+                                    t: VectorRef {
+                                        sig_id: t,
+                                        lo: t_lo,
+                                    },
+                                    e: VectorRef {
+                                        sig_id: e,
+                                        lo: e_lo,
+                                    },
+                                    width: width as u8,
+                                },
+                            )
+                        }
+                    };
+                    let head = run.iter().map(|&(idx, _)| idx).min().unwrap();
+                    entries[head].item = CombItem::VectorGate { op: vector_op };
+                    entries[head].cold.read_signal_ids = read_ids;
+                    entries[head].cold.write_signal_ids.clear();
+                    entries[head].cold.write_signal_ids.push(key.dst as usize);
+                    entries[head].has_unresolved_reads = false;
+                    entries[head].defer_at_time0 = false;
+                    for &(idx, _) in run {
+                        if idx == head {
+                            continue;
+                        }
+                        entries[idx].item = CombItem::Noop;
+                        entries[idx].cold.read_signal_ids.clear();
+                        entries[idx].cold.write_signal_ids.clear();
+                        entries[idx].has_unresolved_reads = false;
+                        entries[idx].defer_at_time0 = false;
+                    }
+                    vectors += 1;
+                    members_removed += run.len() - 1;
+                    bits += run.len();
+                }
+            }
+
+            #[derive(Clone, Copy, Hash, PartialEq, Eq)]
+            enum SShape {
+                Buf {
+                    src: u32,
+                    invert: bool,
+                },
+                Bin {
+                    a: u32,
+                    b: u32,
+                    delta: i64,
+                    op: GateBin,
+                    invert: bool,
+                },
+            }
+            let scatter_enabled =
+                std::env::var("XEZIM_VEC_SCATTER").ok().as_deref() == Some("1");
+            let min_scatter_width = std::env::var("XEZIM_VEC_SCATTER_MIN")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&width| (2..=64).contains(&width))
+                .unwrap_or(64);
+            let mut scatter_widths = [0usize; 65];
+            let mut scatter_layout_groups = [0usize; 4];
+            let mut scatter_layout_lanes = [0usize; 4];
+            let mut scatter_kind_groups = [0usize; 4];
+            let mut scatter_kind_lanes = [0usize; 4];
+            let mut scalar_buckets: HashMap<SShape, Vec<(usize, u32, BitRef)>> = HashMap::default();
+            for (idx, entry) in entries.iter().enumerate() {
+                if !scatter_enabled {
+                    break;
+                }
+                if entry.has_unresolved_reads || entry.defer_at_time0 {
+                    continue;
+                }
+                let (dst, coord, shape) = match &entry.item {
+                    CombItem::FusedGate {
+                        op: FusedGate::Buf1 { dst, src, invert },
+                    } if self.signal_widths.get(dst.sig_id as usize).copied() == Some(1)
+                        && self
+                            .signal_widths
+                            .get(src.sig_id as usize)
+                            .copied()
+                            .unwrap_or(1)
+                            > 1
+                        && (*invert
+                            || !self
+                                .signal_gate_driven
+                                .get(dst.sig_id as usize)
+                                .copied()
+                                .unwrap_or(false)) =>
+                    {
+                        (
+                            *dst,
+                            src.bit,
+                            SShape::Buf {
+                                src: src.sig_id,
+                                invert: *invert,
+                            },
+                        )
+                    }
+                    CombItem::FusedGate {
+                        op:
+                            FusedGate::Bin2 {
+                                dst,
+                                a,
+                                b,
+                                op,
+                                invert,
+                            },
+                    } if self.signal_widths.get(dst.sig_id as usize).copied() == Some(1) => {
+                        let aw = self
+                            .signal_widths
+                            .get(a.sig_id as usize)
+                            .copied()
+                            .unwrap_or(1);
+                        let bw = self
+                            .signal_widths
+                            .get(b.sig_id as usize)
+                            .copied()
+                            .unwrap_or(1);
+                        let (a, b) = if aw <= 1 && bw > 1 {
+                            (*b, *a)
+                        } else {
+                            (*a, *b)
+                        };
+                        if self
+                            .signal_widths
+                            .get(a.sig_id as usize)
+                            .copied()
+                            .unwrap_or(1)
+                            <= 1
+                        {
+                            continue;
+                        }
+                        (
+                            *dst,
+                            a.bit,
+                            SShape::Bin {
+                                a: a.sig_id,
+                                b: b.sig_id,
+                                delta: b.bit as i64 - a.bit as i64,
+                                op: *op,
+                                invert: *invert,
+                            },
+                        )
+                    }
+                    _ => continue,
+                };
+                scalar_buckets
+                    .entry(shape)
+                    .or_default()
+                    .push((idx, coord, dst));
+            }
+            let mut scalar_groups: Vec<_> = scalar_buckets.into_iter().collect();
+            scalar_groups.sort_unstable_by_key(|(_, members)| {
+                members
+                    .iter()
+                    .map(|(idx, _, _)| *idx)
+                    .min()
+                    .unwrap_or(usize::MAX)
+            });
+            for (shape, mut members) in scalar_groups {
+                members.sort_unstable_by_key(|&(idx, bit, _)| (bit, idx));
+                let mut start = 0usize;
+                while start < members.len() {
+                    let mut end = start + 1;
+                    while end < members.len()
+                        && members[end].1 == members[end - 1].1 + 1
+                        && end - start < 64
+                    {
+                        end += 1;
+                    }
+                    let run = &members[start..end];
+                    start = end;
+                    if run.len() < 2 {
+                        continue;
+                    }
+                    scatter_widths[run.len()] += 1;
+                    if run.len() < min_scatter_width {
+                        continue;
+                    }
+                    let lo = run[0].1;
+                    let width = run.len() as u32;
+                    let dsts: Vec<u32> = run.iter().map(|(_, _, dst)| dst.sig_id).collect();
+                    let mut dst_ids: HashSet<u32> = HashSet::default();
+                    if dsts.iter().any(|&dst| !dst_ids.insert(dst)) {
+                        continue;
+                    }
+                    let stride = i64::from(dsts[1]) - i64::from(dsts[0]);
+                    let fixed_stride = dsts.windows(2).all(|pair| {
+                        i64::from(pair[1]) - i64::from(pair[0]) == stride
+                    });
+                    let layout = if stride == 1 && fixed_stride {
+                        0
+                    } else if stride == -1 && fixed_stride {
+                        1
+                    } else if fixed_stride {
+                        2
+                    } else {
+                        3
+                    };
+                    let (reads, op, kind) = match shape {
+                        SShape::Buf { src, invert } => {
+                            if dst_ids.contains(&src)
+                                || self
+                                    .signal_widths
+                                    .get(src as usize)
+                                    .is_none_or(|&w| lo + width > w)
+                            {
+                                continue;
+                            }
+                            let op = ScatterGate::Buf {
+                                dsts: dsts.into_boxed_slice(),
+                                src: VectorRef { sig_id: src, lo },
+                                width: width as u8,
+                                invert,
+                            };
+                            (vec![src as usize], op, 0)
+                        }
+                        SShape::Bin {
+                            a,
+                            b,
+                            delta,
+                            op,
+                            invert,
+                        } => {
+                            let b_lo_i = lo as i64 + delta;
+                            if b_lo_i < 0 {
+                                continue;
+                            }
+                            let b_lo = b_lo_i as u32;
+                            if dst_ids.contains(&a)
+                                || dst_ids.contains(&b)
+                                || self
+                                    .signal_widths
+                                    .get(a as usize)
+                                    .is_none_or(|&w| lo + width > w)
+                                || self
+                                    .signal_widths
+                                    .get(b as usize)
+                                    .is_none_or(|&w| b_lo + width > w)
+                            {
+                                continue;
+                            }
+                            let mut reads = vec![a as usize];
+                            if b != a {
+                                reads.push(b as usize);
+                            }
+                            (
+                                reads,
+                                ScatterGate::Bin {
+                                    dsts: dsts.into_boxed_slice(),
+                                    a: VectorRef { sig_id: a, lo },
+                                    b: VectorRef {
+                                        sig_id: b,
+                                        lo: b_lo,
+                                    },
+                                    width: width as u8,
+                                    op,
+                                    invert,
+                                },
+                                match op {
+                                    GateBin::And => 1,
+                                    GateBin::Or => 2,
+                                    GateBin::Xor => 3,
+                                },
+                            )
+                        }
+                    };
+                    scatter_layout_groups[layout] += 1;
+                    scatter_layout_lanes[layout] += run.len();
+                    scatter_kind_groups[kind] += 1;
+                    scatter_kind_lanes[kind] += run.len();
+                    let head = run.iter().map(|(idx, _, _)| *idx).min().unwrap();
+                    entries[head].item = CombItem::ScatterGate { op };
+                    entries[head].cold.read_signal_ids = reads;
+                    entries[head].cold.write_signal_ids =
+                        dst_ids.iter().map(|&id| id as usize).collect();
+                    entries[head].has_unresolved_reads = false;
+                    entries[head].defer_at_time0 = false;
+                    for &(idx, _, _) in run {
+                        if idx != head {
+                            entries[idx].item = CombItem::Noop;
+                            entries[idx].cold.read_signal_ids.clear();
+                            entries[idx].cold.write_signal_ids.clear();
+                            entries[idx].has_unresolved_reads = false;
+                            entries[idx].defer_at_time0 = false;
+                        }
+                    }
+                    vectors += 1;
+                    members_removed += run.len() - 1;
+                    bits += run.len();
+                }
+            }
+            if std::env::var_os("XEZIM_VEC_STATS").is_some() {
+                eprintln!(
+                    "[VEC] vectors={} bits={} entries_removed={}",
+                    vectors, bits, members_removed
+                );
+                let widths = scatter_widths
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &count)| count != 0)
+                    .map(|(width, count)| format!("{}:{}", width, count))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if !widths.is_empty() {
+                    eprintln!("[VEC] scatter_widths={}", widths);
+                    eprintln!(
+                        "[VEC] scatter_layout groups=forward:{},reverse:{},strided:{},irregular:{} lanes=forward:{},reverse:{},strided:{},irregular:{}",
+                        scatter_layout_groups[0],
+                        scatter_layout_groups[1],
+                        scatter_layout_groups[2],
+                        scatter_layout_groups[3],
+                        scatter_layout_lanes[0],
+                        scatter_layout_lanes[1],
+                        scatter_layout_lanes[2],
+                        scatter_layout_lanes[3]
+                    );
+                    eprintln!(
+                        "[VEC] scatter_kind groups=buf:{},and:{},or:{},xor:{} lanes=buf:{},and:{},or:{},xor:{}",
+                        scatter_kind_groups[0],
+                        scatter_kind_groups[1],
+                        scatter_kind_groups[2],
+                        scatter_kind_groups[3],
+                        scatter_kind_lanes[0],
+                        scatter_kind_lanes[1],
+                        scatter_kind_lanes[2],
+                        scatter_kind_lanes[3]
+                    );
+                }
+            }
+        }
+
         // R1 census (XEZIM_VEC_CENSUS=1, analysis-only): size the population
         // of per-bit comb entries that could re-coalesce into vector ops —
         // groups doing the SAME operation on same-offset bit slices of the
@@ -34618,6 +35489,29 @@ impl Simulator {
                 }
             }
             if !self.prof_entry_counts.is_empty() {
+                let mut scatter_evals = 0u64;
+                let mut scatter_lanes = 0u64;
+                let mut scatter_entries = 0usize;
+                for (eidx, ent) in self.comb_entries.iter().enumerate() {
+                    let lanes = match &ent.item {
+                        CombItem::ScatterGate { op } => match op {
+                            ScatterGate::Buf { dsts, .. } | ScatterGate::Bin { dsts, .. } => {
+                                dsts.len() as u64
+                            }
+                        },
+                        _ => continue,
+                    };
+                    let evals = self.prof_entry_counts.get(eidx).copied().unwrap_or(0);
+                    scatter_entries += 1;
+                    scatter_evals += evals;
+                    scatter_lanes += evals.saturating_mul(lanes);
+                }
+                if scatter_entries != 0 {
+                    eprintln!(
+                        "[PROF] scatter entries={} evals={} lane_evals={}",
+                        scatter_entries, scatter_evals, scatter_lanes
+                    );
+                }
                 // Attribute CompiledContAssign evaluations to RHS SHAPES, so
                 // the fusion work targets what actually runs rather than what
                 // is common in the netlist. Key = opcode sequence.
@@ -35350,6 +36244,22 @@ impl Simulator {
                             | FusedGate::UdpLut3 { dst, .. } => dst.sig_id as usize,
                         };
                         self.name_for_id(id)
+                    }
+                    CombItem::VectorGate { op } => {
+                        let id = match op {
+                            VectorGate::Buf { dst, .. }
+                            | VectorGate::Bin { dst, .. }
+                            | VectorGate::Mux { dst, .. } => dst.sig_id as usize,
+                        };
+                        self.name_for_id(id)
+                    }
+                    CombItem::ScatterGate { op } => {
+                        let dsts = match op {
+                            ScatterGate::Buf { dsts, .. }
+                            | ScatterGate::Bin { dsts, .. } => dsts,
+                        };
+                        let Some(dst) = dsts.first() else { continue };
+                        self.name_for_id(*dst as usize)
                     }
                     CombItem::FusedBufFanout { dsts, .. } => {
                         let Some(dst) = dsts.first() else {
@@ -45090,6 +46000,12 @@ impl Simulator {
             CombItem::FusedGate { op } => {
                 self.exec_fused_gate(op);
             }
+            CombItem::VectorGate { op } => {
+                self.exec_vector_gate(op);
+            }
+            CombItem::ScatterGate { op } => {
+                self.exec_scatter_gate(op);
+            }
             CombItem::GateRegion { gates } => {
                 for op in gates.iter() {
                     self.exec_fused_gate(op);
@@ -45839,6 +46755,67 @@ impl Simulator {
                             trigger_deps!(id, eidx);
                         }
                         n_dc += 1;
+                    }
+                    CombItem::VectorGate { op } => {
+                        let (dst, width, val, xz) = self.vector_gate_eval(op);
+                        let sdf_any = !self.sdf_delays.is_empty();
+                        if self.fused_vector_commit(dst, width, val, xz, sdf_any) {
+                            let id = dst.sig_id as usize;
+                            if capture_churn {
+                                churn.push((id, eidx));
+                            }
+                            note_toggle!(id);
+                            trigger_deps!(id, eidx);
+                        }
+                        n_dc += width as u64;
+                    }
+                    CombItem::ScatterGate { op } => {
+                        let (val, xz) = self.scatter_gate_eval(op);
+                        let dsts = match op {
+                            ScatterGate::Buf { dsts, .. }
+                            | ScatterGate::Bin { dsts, .. } => dsts,
+                        };
+                        let sdf_any = !self.sdf_delays.is_empty();
+                        if let Some((edge_active, armed_active)) =
+                            self.fused_batch_commit_state()
+                        {
+                            for (lane, &id) in dsts.iter().enumerate() {
+                                let bit =
+                                    (((val >> lane) & 1) | (((xz >> lane) & 1) << 1)) as u8;
+                                if self.fused_scalar_commit_planned(
+                                    id,
+                                    bit,
+                                    sdf_any,
+                                    edge_active,
+                                    armed_active,
+                                ) {
+                                    let id = id as usize;
+                                    if capture_churn {
+                                        churn.push((id, eidx));
+                                    }
+                                    note_toggle!(id);
+                                    trigger_deps!(id, eidx);
+                                }
+                            }
+                        } else {
+                            for (lane, &id) in dsts.iter().enumerate() {
+                                let bit =
+                                    (((val >> lane) & 1) | (((xz >> lane) & 1) << 1)) as u8;
+                                if self.fused_bit_commit(
+                                    BitRef { sig_id: id, bit: 0 },
+                                    bit,
+                                    sdf_any,
+                                ) {
+                                    let id = id as usize;
+                                    if capture_churn {
+                                        churn.push((id, eidx));
+                                    }
+                                    note_toggle!(id);
+                                    trigger_deps!(id, eidx);
+                                }
+                            }
+                        }
+                        n_dc += dsts.len() as u64;
                     }
                     CombItem::FusedBufFanout { src, dsts, invert } => {
                         let new_bit = self.fused_buf_src_bit(*src, *invert);
@@ -48643,6 +49620,9 @@ impl Simulator {
                             let idx = idx_val.to_u64().unwrap_or(0) as i64;
                             if idx >= lo && idx <= hi {
                                 let id = first_id + (idx - lo) as usize;
+                                if is_packed_id(id) {
+                                    return self.fast_signal_write_id(id, val);
+                                }
                                 let width = self.signal_widths[id];
                                 // §6.16: a string element has no declared
                                 // length — the width is a placeholder.
@@ -50339,7 +51319,27 @@ impl Simulator {
                                 indices.push(self.eval_expr(index).to_u64().unwrap_or(0));
                                 cur_expr = b.as_ref();
                             }
-                            ExprKind::Ident(h) => break Some(self.resolve_hier_name(h)),
+                            // A procedural LOCAL registers its layout under
+                            // its BARE name, but inside a submodule process
+                            // `resolve_hier_name` scopes a bare ident
+                            // (`u.a`) — so `a[0].p = v` on a task-local
+                            // packed array of structs found no layout and
+                            // the element read back x, while the same code
+                            // in the top module (empty scope) worked.
+                            ExprKind::Ident(h) => {
+                                let scoped = self.resolve_hier_name(h);
+                                if !self.module.packed_struct_fields.contains_key(&scoped)
+                                    && h.path.len() == 1
+                                    && h.path[0].selects.is_empty()
+                                    && self
+                                        .module
+                                        .packed_struct_fields
+                                        .contains_key(&h.path[0].name.name)
+                                {
+                                    break Some(h.path[0].name.name.clone());
+                                }
+                                break Some(scoped);
+                            }
                             // §7.4.2: root may itself be a struct-member path
                             // (`main.sub_list[0].f`) — build the dotted name so
                             // the `packed_struct_fields["main.sub_list"]` layout
@@ -50408,8 +51408,11 @@ impl Simulator {
                                         if let Some(slot) =
                                             Self::flatten_packed_slot(&indices, dims.as_deref())
                                         {
-                                            if let Some(cur_sig) =
-                                                self.get_signal_value_by_name(&arr_name)
+                                            // Frame-aware: a task/function local
+                                            // lives in the call frame, not the
+                                            // signal table (`get_local_or_signal`
+                                            // covers both).
+                                            if let Some(cur_sig) = self.get_local_or_signal(&arr_name)
                                             {
                                                 let total_w = cur_sig.width;
                                                 let mut cur = cur_sig.resize(total_w);
@@ -50421,11 +51424,8 @@ impl Simulator {
                                                         piece.get_bit(i as usize),
                                                     );
                                                 }
-                                                let changed = self
-                                                    .get_signal_value_by_name(&arr_name)
-                                                    .as_ref()
-                                                        != Some(&cur);
-                                                self.set_signal_value_by_name(&arr_name, cur);
+                                                let changed = cur != cur_sig;
+                                                self.set_local_or_signal(&arr_name, cur);
                                                 return changed;
                                             }
                                         }
@@ -56502,7 +57502,24 @@ impl Simulator {
                                 indices.push(self.eval_expr(index).to_u64().unwrap_or(0));
                                 cur_expr = b.as_ref();
                             }
-                            ExprKind::Ident(h) => break Some(self.resolve_hier_name(h)),
+                            // Same bare-name fallback as the write side: a
+                            // procedural local's layout is keyed bare, and a
+                            // submodule scope hint would otherwise turn
+                            // `a[0].p` into an unknown `u.a`.
+                            ExprKind::Ident(h) => {
+                                let scoped = self.resolve_hier_name(h);
+                                if !self.module.packed_struct_fields.contains_key(&scoped)
+                                    && h.path.len() == 1
+                                    && h.path[0].selects.is_empty()
+                                    && self
+                                        .module
+                                        .packed_struct_fields
+                                        .contains_key(&h.path[0].name.name)
+                                {
+                                    break Some(h.path[0].name.name.clone());
+                                }
+                                break Some(scoped);
+                            }
                             // §7.4.2: root may itself be a struct-member path
                             // (`main.sub_list[0].f`) — mirror of assign_value.
                             ExprKind::MemberAccess { .. } => {
@@ -56563,7 +57580,7 @@ impl Simulator {
                                         && let Some(slot) =
                                             Self::flatten_packed_slot(&indices, dims.as_deref())
                                         && let Some(sig) =
-                                            self.get_signal_value_by_name(&arr_name)
+                                            self.get_local_or_signal(&arr_name)
                                     {
                                         let lo = slot * struct_w + off;
                                         if lo + w <= sig.width {
@@ -61213,6 +62230,53 @@ impl Simulator {
                             name = scoped;
                         }
                     }
+                    // `foreach (obj.member[i, j])` over a FIXED array
+                    // property: the hier name resolves under the VARIABLE
+                    // scope ("o.g2"), but the per-instance shape tables key
+                    // the storage `<handle>#g2` — so every dims lookup below
+                    // missed, none of the multi-var arms ran, and the loop
+                    // collapsed to a SINGLE iteration (a 1-D member survived
+                    // only via a later element-key scan).
+                    if hier.path.len() >= 2
+                        && hier.path.iter().all(|s| s.selects.is_empty())
+                        && !self.module.arrays.contains_key(&name)
+                        && !self.module.arrays_2d.contains_key(&name)
+                        && !self.module.arrays_nd.contains_key(&name)
+                        && !self.module.dynamic_arrays.contains(&name)
+                        && !self.is_associative_array(&name)
+                    {
+                        let obj = hier.path[0].name.name.clone();
+                        let mut h = if obj == "this" || obj == "super" {
+                            self.this_stack.last().copied().flatten()
+                        } else {
+                            self.eval_ident_handle(&obj)
+                        };
+                        // Middle segments are handle-valued properties
+                        // (`o.sub.g` — follow `sub` on o's heap instance).
+                        for seg in &hier.path[1..hier.path.len() - 1] {
+                            h = h.filter(|&x| x != 0).and_then(|x| {
+                                self.heap
+                                    .get(x)
+                                    .and_then(|o| o.as_ref())
+                                    .and_then(|i| i.properties.get(&seg.name.name))
+                                    .and_then(|v| v.to_u64())
+                                    .map(|v| v as usize)
+                            });
+                        }
+                        if let Some(h) = h.filter(|&h| h != 0) {
+                            let scoped = format!(
+                                "{}#{}",
+                                h,
+                                hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("")
+                            );
+                            if self.module.arrays.contains_key(&scoped)
+                                || self.module.arrays_2d.contains_key(&scoped)
+                                || self.module.arrays_nd.contains_key(&scoped)
+                            {
+                                name = scoped;
+                            }
+                        }
+                    }
                     // A bare array name inside a SUBMODULE process resolves
                     // under the process's instance scope ("u_s.mem"), like
                     // reads/writes already do — otherwise the collection
@@ -62875,6 +63939,17 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §6.19.6: an inline-enum LOCAL (a typedef'd enum
+                        // local arrives here already folded to its enum
+                        // type) keys its member list by its own name.
+                        if matches!(data_type, crate::ast::types::DataType::Enum(_)) {
+                            if let Some(m) = super::elaborate::anon_enum_members_ordered(
+                                data_type,
+                                &self.module.parameters,
+                            ) {
+                                self.module.enum_members.insert(d.name.name.clone(), m);
+                            }
+                        }
                         if let Some(fields) = super::elaborate::packed_struct_field_layout(
                             data_type,
                             &self.module.parameters,
@@ -63015,9 +64090,24 @@ impl Simulator {
                                 }
                                 suffixes = next;
                             }
+                            let is_string_elem = matches!(
+                                data_type,
+                                crate::ast::types::DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::String,
+                                    ..
+                                }
+                            );
+                            if is_string_elem {
+                                self.string_signals.insert(name.clone());
+                            }
                             for sfx in suffixes {
                                 let elem = format!("{}{}", name, sfx);
-                                self.signals.insert(elem.clone(), default_v.clone());
+                                let seed = if is_string_elem {
+                                    Value::from_string("")
+                                } else {
+                                    default_v.clone()
+                                };
+                                self.signals.insert(elem.clone(), seed);
                                 self.widths.insert(elem, w);
                             }
                             self.widths.insert(name.clone(), w);
@@ -63356,9 +64446,34 @@ impl Simulator {
                         if descending {
                             self.module.descending_arrays.insert(name.clone());
                         }
+                        // A local FIXED array of STRINGS: mark the array name
+                        // (the element-string check keys off it, like the
+                        // string-queue branch) and seed every element as the
+                        // EMPTY string. Seeded as zero bits, an unset element
+                        // rendered under `%s` as a run of blanks, and the
+                        // declaration's `'{…}` pattern had no string-typed
+                        // element to land in — `string nm[3] = '{"a","b","c"}`
+                        // in a block printed nothing but padding.
+                        let is_string_elem = matches!(
+                            data_type,
+                            crate::ast::types::DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        );
+                        if is_string_elem {
+                            self.string_signals.insert(name.clone());
+                        } else {
+                            self.string_signals.remove(&name);
+                        }
                         for idx in lo..=hi {
                             let elem = format!("{}[{}]", name, idx);
-                            self.signals.insert(elem.clone(), default_v.clone());
+                            let seed = if is_string_elem {
+                                Value::from_string("")
+                            } else {
+                                default_v.clone()
+                            };
+                            self.signals.insert(elem.clone(), seed);
                             self.widths.insert(elem, w);
                         }
                         self.widths.insert(name.clone(), w);
@@ -69250,6 +70365,286 @@ impl Simulator {
         }
     }
 
+    #[inline(always)]
+    fn vector_ref_bits(&self, src: VectorRef, width: u8) -> (u64, u64) {
+        let value = &self.signal_table[src.sig_id as usize];
+        value.slice_bits_swar(src.lo as usize, width as usize)
+    }
+
+    #[inline(always)]
+    fn vector_gate_eval(&self, op: &VectorGate) -> (VectorRef, u8, u64, u64) {
+        let (dst, width, mut val, xz) = match *op {
+            VectorGate::Buf {
+                dst,
+                src,
+                width,
+                invert,
+            } => {
+                let (sv, sx) = self.vector_ref_bits(src, width);
+                let mask = if width == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << width) - 1
+                };
+                if invert {
+                    (dst, width, (!sv) & !sx & mask, sx & mask)
+                } else {
+                    (dst, width, sv & mask, sx & mask)
+                }
+            }
+            VectorGate::Bin {
+                dst,
+                a,
+                b,
+                width,
+                op,
+                invert,
+            } => {
+                let (av, ax) = self.vector_ref_bits(a, width);
+                let (bv, bx) = self.vector_ref_bits(b, width);
+                let mask = if width == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << width) - 1
+                };
+                let (rv, rx) = match op {
+                    GateBin::And => {
+                        let one = (av & !ax) & (bv & !bx);
+                        let zero = (!av & !ax) | (!bv & !bx);
+                        (one & mask, (!(one | zero)) & mask)
+                    }
+                    GateBin::Or => {
+                        let one = (av & !ax) | (bv & !bx);
+                        let zero = (!av & !ax) & (!bv & !bx);
+                        (one & mask, (!(one | zero)) & mask)
+                    }
+                    GateBin::Xor => {
+                        let unknown = (ax | bx) & mask;
+                        ((av ^ bv) & !unknown & mask, unknown)
+                    }
+                };
+                let rv = if invert { (!rv) & !rx & mask } else { rv };
+                (dst, width, rv, rx)
+            }
+            VectorGate::Mux {
+                dst,
+                s,
+                t,
+                e,
+                width,
+            } => {
+                let (sv, sx) = self.vector_ref_bits(s, width);
+                let (tv, tx) = self.vector_ref_bits(t, width);
+                let (ev, ex) = self.vector_ref_bits(e, width);
+                let mask = if width == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << width) - 1
+                };
+                let known_one = sv & !sx & mask;
+                let known_zero = !sv & !sx & mask;
+                let equal = !(tv ^ ev | tx ^ ex) & mask;
+                let unknown_equal = sx & equal;
+                (
+                    dst,
+                    width,
+                    (known_one & tv) | (known_zero & ev) | (unknown_equal & tv),
+                    (known_one & tx)
+                        | (known_zero & ex)
+                        | (unknown_equal & tx)
+                        | (sx & !equal & mask),
+                )
+            }
+        };
+        let mask = if width == 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+        val &= mask;
+        (dst, width, val, xz & mask)
+    }
+
+    #[inline(always)]
+    fn fused_vector_commit(
+        &mut self,
+        dst: VectorRef,
+        width: u8,
+        src_v: u64,
+        src_x: u64,
+        sdf_any: bool,
+    ) -> bool {
+        let id = dst.sig_id as usize;
+        let (base_v, base_x) = self.signal_table[id].raw_bits();
+        let high = dst.lo + width as u32 - 1;
+        let (new_v, new_x) =
+            Self::compose_inline_range_bits(base_v, base_x, src_v, src_x, dst.lo, high);
+        let mask = if width == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << width) - 1) << dst.lo
+        };
+        if (base_v ^ new_v) & mask == 0 && (base_x ^ new_x) & mask == 0 {
+            return false;
+        }
+        if sdf_any && self.sdf_delays.get(id).copied().unwrap_or(0) > 0 && self.time > 0 {
+            let mut value = self.signal_table[id].clone();
+            value.set_inline_bits(new_v, new_x);
+            value.is_signed = self.signal_signed[id];
+            self.schedule_delayed(id, value);
+            return false;
+        }
+        self.signal_table[id].set_inline_bits(new_v, new_x);
+        self.signal_table[id].is_signed = self.signal_signed[id];
+        self.sync_mirror(id);
+        self.table_modified = true;
+        self.after_signal_write_premirrored(id);
+        true
+    }
+
+    #[inline(always)]
+    fn exec_vector_gate(&mut self, op: &VectorGate) {
+        let (dst, width, val, xz) = self.vector_gate_eval(op);
+        let sdf_any = !self.sdf_delays.is_empty();
+        if self.fused_vector_commit(dst, width, val, xz, sdf_any) {
+            self.mark_dirty_id(dst.sig_id as usize);
+        }
+    }
+
+    #[inline(always)]
+    fn scatter_gate_eval(&self, op: &ScatterGate) -> (u64, u64) {
+        match op {
+            ScatterGate::Buf {
+                src, width, invert, ..
+            } => {
+                let (v, x) = self.vector_ref_bits(*src, *width);
+                let mask = if *width == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << *width) - 1
+                };
+                (if *invert { (!v) & !x & mask } else { v }, x)
+            }
+            ScatterGate::Bin {
+                a,
+                b,
+                width,
+                op,
+                invert,
+                ..
+            } => {
+                let (av, ax) = self.vector_ref_bits(*a, *width);
+                let (bv, bx) = self.vector_ref_bits(*b, *width);
+                let mask = if *width == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << *width) - 1
+                };
+                let (rv, rx) = match op {
+                    GateBin::And => {
+                        let one = (av & !ax) & (bv & !bx);
+                        let zero = (!av & !ax) | (!bv & !bx);
+                        (one & mask, (!(one | zero)) & mask)
+                    }
+                    GateBin::Or => {
+                        let one = (av & !ax) | (bv & !bx);
+                        let zero = (!av & !ax) & (!bv & !bx);
+                        (one & mask, (!(one | zero)) & mask)
+                    }
+                    GateBin::Xor => {
+                        let unknown = (ax | bx) & mask;
+                        ((av ^ bv) & !unknown & mask, unknown)
+                    }
+                };
+                (if *invert { (!rv) & !rx & mask } else { rv }, rx)
+            }
+        }
+    }
+
+    #[inline]
+    fn exec_scatter_gate(&mut self, op: &ScatterGate) {
+        let (val, xz) = self.scatter_gate_eval(op);
+        let dsts = match op {
+            ScatterGate::Buf { dsts, .. }
+            | ScatterGate::Bin { dsts, .. } => dsts,
+        };
+        let sdf_any = !self.sdf_delays.is_empty();
+        if let Some((edge_active, armed_active)) = self.fused_batch_commit_state() {
+            for (lane, &id) in dsts.iter().enumerate() {
+                let bit = (((val >> lane) & 1) | (((xz >> lane) & 1) << 1)) as u8;
+                if self.fused_scalar_commit_planned(
+                    id,
+                    bit,
+                    sdf_any,
+                    edge_active,
+                    armed_active,
+                ) {
+                    self.mark_dirty_id(id as usize);
+                }
+            }
+        } else {
+            for (lane, &id) in dsts.iter().enumerate() {
+                let bit = (((val >> lane) & 1) | (((xz >> lane) & 1) << 1)) as u8;
+                if self.fused_bit_commit(BitRef { sig_id: id, bit: 0 }, bit, sdf_any) {
+                    self.mark_dirty_id(id as usize);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn fused_batch_commit_state(&self) -> Option<(bool, bool)> {
+        if self.signal_commit_plan.is_empty()
+            || self.value_trace_ids.is_some()
+            || self.dump_dirty_active
+            || !self.active_force_exprs.is_empty()
+            || !self.signal_inline_bits.is_empty()
+            || (self.event_measure && !self.armed_edge)
+        {
+            None
+        } else {
+            Some((
+                self.dirty_edge
+                    || self.dirty_edge_shadow
+                    || self.in_edge_block
+                    || self.in_edge_cont,
+                self.armed_edge,
+            ))
+        }
+    }
+
+    #[inline(always)]
+    fn fused_scalar_commit_planned(
+        &mut self,
+        signal_id: u32,
+        new_bit: u8,
+        sdf_any: bool,
+        edge_active: bool,
+        armed_active: bool,
+    ) -> bool {
+        let id = signal_id as usize;
+        if sdf_any && self.sdf_delays.get(id).copied().unwrap_or(0) > 0 && self.time > 0 {
+            if self.signal_table[id].get_bit_code(0) != new_bit {
+                let mut value = self.signal_table[id].clone();
+                value.set_scalar_code(new_bit);
+                self.schedule_delayed(id, value);
+            }
+            return false;
+        }
+        if !self.signal_table[id].set_scalar_code(new_bit) {
+            return false;
+        }
+        self.table_modified = true;
+        let plan = self.signal_commit_plan.get(id).copied().unwrap_or(3);
+        if armed_active && plan & 2 != 0 {
+            self.note_armed_write(id);
+        }
+        if edge_active && plan & 1 != 0 {
+            self.note_edge_write(id);
+        }
+        true
+    }
+
     /// Commit one 4-state bit to a fused-gate destination. Shared by every
     /// fused evaluator (single gate, buffer fanout, AND fanout) and by the
     /// settle loop, which needs the *outcome* of the write so it can trigger
@@ -69550,6 +70945,22 @@ impl Simulator {
     /// Dirty-driven edge detect: record a write to signal `id` so check_edges
     /// can later scan only changed edge-sensitive positions. No-op (one bool
     /// load) unless XEZIM_DIRTY_EDGE / _SHADOW is active.
+    fn rebuild_signal_commit_plans(&mut self) {
+        self.signal_commit_plan.clear();
+        if std::env::var("XEZIM_COMMIT_PLAN").ok().as_deref() != Some("1") {
+            return;
+        }
+        self.signal_commit_plan.resize(self.signal_table.len(), 0);
+        for id in 0..self.signal_commit_plan.len() {
+            if self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0) {
+                self.signal_commit_plan[id] |= 1;
+            }
+            if self.armed_input_bitmap.get(id).copied().unwrap_or(false) {
+                self.signal_commit_plan[id] |= 2;
+            }
+        }
+    }
+
     #[inline(always)]
     fn note_edge_write(&mut self, id: usize) {
         // §9.2 re-trigger recording (always on) — see the write_sig! twin.
@@ -69819,7 +71230,9 @@ impl Simulator {
                     CombItem::FusedGate { .. }
                     | CombItem::FusedBufFanout { .. }
                     | CombItem::FusedAndFanout { .. }
-                    | CombItem::GateRegion { .. } => "gate primitive",
+                    | CombItem::GateRegion { .. }
+                    | CombItem::VectorGate { .. }
+                    | CombItem::ScatterGate { .. } => "gate primitive",
                     CombItem::Udp { .. } | CombItem::UdpBatch { .. } => "UDP",
                     CombItem::DirectCopy { .. }
                     | CombItem::FastDirectCopy { .. }
@@ -70042,6 +71455,7 @@ impl Simulator {
         self.value_trace_ids = Some(ids);
     }
 
+    #[inline(always)]
     fn after_signal_write(&mut self, id: usize) {
         self.after_signal_write_inner(id, false)
     }
@@ -70049,11 +71463,47 @@ impl Simulator {
     /// `after_signal_write` for callers that have ALREADY refreshed the
     /// `signal_inline_bits` mirror for `id` — skips the raw_bits repack
     /// (a 64-LogicBit walk on every wide signal).
+    #[inline(always)]
     fn after_signal_write_premirrored(&mut self, id: usize) {
         self.after_signal_write_inner(id, true)
     }
 
+    #[inline(always)]
     fn after_signal_write_inner(&mut self, id: usize, premirrored: bool) {
+        if id >= self.signal_table.len() {
+            return;
+        }
+        let (edge_sidecar, armed_sidecar) = if self.signal_commit_plan.is_empty() {
+            (true, true)
+        } else {
+            let plan = self.signal_commit_plan.get(id).copied().unwrap_or(3);
+            let edge = plan & 1 != 0
+                && (self.dirty_edge
+                    || self.dirty_edge_shadow
+                    || self.in_edge_block
+                    || self.in_edge_cont);
+            let armed = plan & 2 != 0 && self.armed_edge;
+            let global = self.value_trace_ids.is_some()
+                || self.dump_dirty_active
+                || !self.active_force_exprs.is_empty()
+                || (!premirrored && !self.signal_inline_bits.is_empty())
+                || (self.event_measure && !self.armed_edge);
+            if !edge && !armed && !global {
+                return;
+            }
+            (edge, armed)
+        };
+        self.after_signal_write_observed(id, premirrored, edge_sidecar, armed_sidecar);
+    }
+
+    #[inline(never)]
+    fn after_signal_write_observed(
+        &mut self,
+        id: usize,
+        premirrored: bool,
+        edge_sidecar: bool,
+        armed_sidecar: bool,
+    ) {
         // XEZIM_VALUE_TRACE: this hook covers the write paths that mutate
         // signal_table in place (bit/part-select, inline-bits, parallel-NBA
         // raw pointers) and so never expand write_sig!. The pre-write value
@@ -70071,15 +71521,16 @@ impl Simulator {
                 ));
             }
         }
-        self.note_armed_write(id);
-        self.note_edge_write(id);
+        if armed_sidecar {
+            self.note_armed_write(id);
+        }
+        if edge_sidecar {
+            self.note_edge_write(id);
+        }
         // Incremental VCD: this is the post-write hook for the direct
         // signal_table writes (bit/part-select, struct/array element) and the
         // NBA/vpi fast paths, so mark the id dirty here too. Superset-safe.
         vcd_mark!(self, id);
-        if id >= self.signal_table.len() {
-            return;
-        }
         // Direct/in-place write paths reach this hook after the old value is
         // gone. Treat the write as a generation change while an expression-
         // backed override is active. A redundant wakeup is conservative; the
@@ -70140,7 +71591,6 @@ impl Simulator {
     /// bit `lo`. For narrow signals this is a shift of `raw_bits`; for wide
     /// ones the (<=64) bits are gathered individually — only slice entries of
     /// gateable blocks ever take that path, and they are 1-few bits wide.
-    #[inline]
     #[inline]
     fn raw_bits_slice(v: &Value, lo: u16, w: u16) -> (u64, u64) {
         let lo = lo as usize;
@@ -70348,6 +71798,7 @@ impl Simulator {
             self.edge_block_skip_streak = Vec::new();
         }
         self.build_armed_edge_state();
+        self.rebuild_signal_commit_plans();
         eprintln!(
             "[EVENT-EDGE] measure (timestamp): {} edge blocks, {} gateable, {} gateable-with-EMPTY-data-reads, avg data-reads/gateable={:.2}",
             nb, gateable_n, empty_reads,
@@ -70450,8 +71901,6 @@ impl Simulator {
         mismatches
     }
 
-    /// Mark a signal as dirty by ID
-    #[inline]
     /// Read a cell by id, transparently across the signal table and the
     /// packed arena (see `PackedMem`).
     #[inline]
@@ -70496,6 +71945,8 @@ impl Simulator {
         false
     }
 
+    /// Mark a signal as dirty by ID.
+    #[inline]
     fn mark_dirty_id(&mut self, id: usize) {
         let has_comb_deps = id + 1 >= self.comb_dep_offsets.len()
             || self.comb_dep_offsets[id] != self.comb_dep_offsets[id + 1];
@@ -83443,6 +84894,18 @@ impl Simulator {
                 return;
             }
         }
+        // A `string` leaf is stored as-is: the width resize below padded the
+        // text with NULs to the element's nominal width, so a 2-D string
+        // local's `'{'{"a","bb"},…}` read back as a run of blanks before
+        // each value.
+        if matches!(
+            self.resolve_dt(dt),
+            DataType::Simple { kind: crate::ast::types::SimpleType::String, .. }
+        ) {
+            let v = self.eval_expr(e);
+            self.set_signal_value_by_name(target, v);
+            return;
+        }
         // §10.9.2: each item is evaluated in the context of the ELEMENT type —
         // `int d[]; d = '{1'b1 + 1'b1}` is 2, not a 1-bit wrap to 0, and a
         // signed narrower item sign-extends. Self-determined evaluation gave
@@ -88236,6 +89699,22 @@ impl Simulator {
                 if let Some(members) = self.module.enum_members.get(td_name) {
                     if let Some((_, val)) = members.iter().find(|(n, _)| n == member) {
                         let w = self.module.typedefs.get(td_name).copied().unwrap_or(32).max(1);
+                        // §6.19 wide base: `enum_members` stores u64 and
+                        // truncates past 64 bits — recompute the full value
+                        // from the class's own enum AST (rare width, cold).
+                        if w > 64 {
+                            if let DataType::Enum(et) = dt {
+                                if let Some(v) = super::elaborate::wide_enum_value_map(
+                                    et,
+                                    w,
+                                    &self.module.parameters,
+                                )
+                                .get(member)
+                                {
+                                    return Some(v.clone());
+                                }
+                            }
+                        }
                         return Some(Value::from_u64(*val, w));
                     }
                 }
@@ -88258,6 +89737,13 @@ impl Simulator {
     /// returned 0. Consulting the package's own member list fixes both.
     fn package_enum_member(&self, pkg: &str, member: &str) -> Option<Value> {
         let (val, width) = *self.module.package_enum_members.get(pkg)?.get(member)?;
+        // §6.19 wide base: the table stores u64; elaboration parks the full
+        // Value under the qualified spelling in `parameters` for these.
+        if width > 64 {
+            if let Some(v) = self.module.parameters.get(&format!("{}::{}", pkg, member)) {
+                return Some(v.clone());
+            }
+        }
         Some(Value::from_u64(val, width.max(1)))
     }
 
@@ -89682,14 +91168,41 @@ impl Simulator {
                 };
                 (h, member.name.clone())
             }
-            ExprKind::Ident(h) if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) => {
+            // Elaboration flattens a member chain to a MULTI-SEGMENT Ident
+            // (`o.sub.g` arrives as one 3-segment path, not nested
+            // MemberAccess), so a receiver behind more than one handle hop
+            // fell to the `_` arm below and every chained element access
+            // read x / wrote nowhere. Walk the middle segments through heap
+            // properties; for two segments the loop is empty and this is the
+            // old arm exactly.
+            ExprKind::Ident(h) if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) => {
+                // 3+ segments: gate on the leaf naming SOME class's collection
+                // member before any handle evaluation — this arm sits in the
+                // hot indexed-read path, and an ungated chain attempt on every
+                // hierarchical `top.dut.arr[i]` eval cost +0.4% instructions
+                // on an axi4 UVM run.
+                if h.path.len() > 2
+                    && !self
+                        .chained_coll_members()
+                        .contains(h.path.last()?.name.name.as_str())
+                {
+                    return None;
+                }
                 let obj = &h.path[0].name.name;
-                let hh = if obj == "this" || obj == "super" {
+                let mut hh = if obj == "this" || obj == "super" {
                     self.this_stack.last().copied().flatten()?
                 } else {
                     self.eval_ident_handle(obj)?
                 };
-                (hh, h.path[1].name.name.clone())
+                for seg in &h.path[1..h.path.len() - 1] {
+                    if hh == 0 {
+                        return None;
+                    }
+                    let inst = self.heap.get(hh).and_then(|o| o.as_ref())?;
+                    hh = inst.properties.get(&seg.name.name).and_then(|v| v.to_u64())?
+                        as usize;
+                }
+                (hh, h.path.last()?.name.name.clone())
             }
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                 let hh = self.this_stack.last().copied().flatten()?;
@@ -89892,6 +91405,103 @@ impl Simulator {
         false
     }
 
+
+    /// `#[cold]` + never inlined: this hangs off a guard that runs 22M+
+    /// times on a UVM run, and letting it fatten `instance_assoc_member`
+    /// measurably perturbed that hot path's code generation.
+    #[cold]
+    #[inline(never)]
+    fn chained_member_scoped(&self, name: &str, fd: usize) -> Option<String> {
+        // A dotted name with THREE or more segments can be a HANDLE CHAIN
+        // to a collection member (`o.sub.g`). Every fallback that funnels
+        // through here got None for it, so a chained element write landed
+        // nowhere and a chained read came back x. Walk the chain through
+        // heap properties; a module hierarchical path fails the first hop
+        // (or the final class-membership check) and returns None exactly
+        // as before. Two-segment forms keep their existing paths — the
+        // last-dot probe below is a short backward scan, so they exit at
+        // nearly the original cost.
+        if self.no_class_objects() {
+            return None;
+        }
+        let ld = name.rfind('.').unwrap_or(fd);
+        if ld == fd {
+            return None;
+        }
+        // The FINAL segment must be a collection member declared by SOME
+        // class — kills module hierarchical paths before any handle
+        // evaluation (whose static-property probe walks the class-context
+        // chain on a miss). The unscanned middle keeps the '#'/'[' reject.
+        let member_leaf = &name[ld + 1..];
+        if name[fd..ld].bytes().any(|b| matches!(b, b'#' | b'[')) {
+            return None;
+        }
+        if !self.chained_coll_members().contains(member_leaf) {
+            return None;
+        }
+        let segs: Vec<&str> = name.split('.').collect();
+        let mut h = if segs[0] == "this" || segs[0] == "super" {
+            self.this_stack.last().copied().flatten()?
+        } else {
+            self.eval_ident_handle(segs[0])?
+        };
+        if h == 0 {
+            return None;
+        }
+        for seg in &segs[1..segs.len() - 1] {
+            let inst = self.heap.get(h).and_then(|o| o.as_ref())?;
+            h = inst.properties.get(*seg).and_then(|v| v.to_u64())? as usize;
+            if h == 0 {
+                return None;
+            }
+        }
+        let member = segs[segs.len() - 1];
+        // The final object's CLASS must declare the member as an
+        // array/collection property — this is what keeps an unrelated
+        // name whose value happens to collide with a live handle from
+        // hijacking the resolution.
+        let mut cur = self
+            .heap
+            .get(h)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(c) = cur {
+            let Some(cd) = self.module.classes.get(&c) else { break };
+            if cd.array_properties.contains_key(member)
+                || cd.array_nd_properties.contains_key(member)
+                || cd.queue_properties.contains_key(member)
+                || cd.assoc_properties.contains_key(member)
+            {
+                return Some(format!("{}#{}", h, member));
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// Every collection/array member name declared by ANY class, built once.
+    /// The cheap pre-filter for chained-handle resolution: a leaf that is in
+    /// no class cannot be a member chain, so no handle evaluation (whose
+    /// static-property probe walks the class-context chain on a miss) runs
+    /// for module hierarchical names.
+    fn chained_coll_members(&self) -> &HashSet<String> {
+        self.chained_coll_member_names.get_or_init(|| {
+            let mut set: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                for k in cd
+                    .array_properties
+                    .keys()
+                    .chain(cd.array_nd_properties.keys())
+                    .chain(cd.queue_properties.keys())
+                    .chain(cd.assoc_properties.keys())
+                {
+                    set.insert(k.clone());
+                }
+            }
+            set
+        })
+    }
+
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
         // §8.9: `Cls::member` / flattened `Cls.member` spellings of a static
         // fixed array resolve to the declaring class's store BEFORE the
@@ -89899,11 +91509,28 @@ impl Simulator {
         if let Some(k) = self.static_fixed_key_for_name(name) {
             return Some(k);
         }
+        // This guard sees every call (22M+ on a UVM run): keep the ORIGINAL
+        // vectorizable one-pass `any` for the overwhelmingly common bare
+        // names (a manual classify loop here measured +0.5% instructions on
+        // an axi4 UVM run), and only when a special byte exists rescan to
+        // tell a rejected spelling from a possible handle chain.
         if name
             .bytes()
             .any(|b| matches!(b, b'#' | b'.' | b'['))
         {
-            return None;
+            let mut first_dot: Option<usize> = None;
+            for (i, b) in name.bytes().enumerate() {
+                match b {
+                    b'#' | b'[' => return None,
+                    b'.' => {
+                        first_dot = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let fd = first_dot?;
+            return self.chained_member_scoped(name, fd);
         }
         // §8.9: inside a STATIC method there is no `this`; the lexical class
         // context still resolves a bare static-array member to its store.
@@ -92258,7 +93885,8 @@ impl Simulator {
                     .is_some_and(|cd| cd.methods.contains_key("name"));
                 if !is_class_with_name_method {
                     let val = self.eval_expr(expr).to_u64().unwrap_or(0);
-                    if let Some(nm) = self.enum_value_name(val, type_hint.as_deref()) {
+                    let keys = self.enum_receiver_keys(expr);
+                    if let Some(nm) = self.enum_value_name_keyed(val, type_hint.as_deref(), &keys) {
                         return Value::from_string(&nm);
                     }
                     // Enum value with no matching member: return empty rather
@@ -93463,7 +95091,8 @@ impl Simulator {
                         .is_some_and(|cd| cd.methods.contains_key("name"));
                     if !is_class_name {
                         let val = self.eval_expr(&base_expr).to_u64().unwrap_or(0);
-                        if let Some(nm) = self.enum_value_name(val, hint.as_deref()) {
+                        let keys = self.enum_receiver_keys(&base_expr);
+                        if let Some(nm) = self.enum_value_name_keyed(val, hint.as_deref(), &keys) {
                             return Value::from_string(&nm);
                         }
                         // Enum value with no matching member: return empty rather
@@ -102717,6 +104346,13 @@ impl Simulator {
             }
         }
 
+        // Trials in which a strict fixed-array foreach check
+        // failed. Such a class re-solves the same element system every trial
+        // (the array is not re-seeded), so when the check keeps failing the
+        // problem is almost certainly UNSATISFIABLE — stop after a bounded
+        // number of full-cost attempts and return 0, rather than paying all
+        // 1000 trials (§18.6.2 requires only that we return 0).
+        let mut fixed_fe_fail_streak: u32 = 0;
         for _trial in 0..1000 {
             // LRM §18.5.4 dist: clear the pick-once gate at each trial so a
             // failed trial doesn't permanently freeze the dist constraint.
@@ -103882,6 +105518,19 @@ impl Simulator {
                         }
                         continue;
                     }
+                    // Foreach over a FIXED-shape rand array: check strictly,
+                    // so an unsatisfied body retries the trial and an
+                    // UNSATISFIABLE one makes randomize() return 0 (§18.6.2)
+                    // instead of being silently accepted with violating
+                    // values.
+                    if let Some(ok) = self.check_fixed_foreach_item(handle, item) {
+                        if !ok {
+                            fixed_fe_fail_streak += 1;
+                            all_ok = false;
+                            break;
+                        }
+                        continue;
+                    }
                     // Skip constraints the solver structurally cannot satisfy
                     // (dynamic-array size/sum/element relations, foreach, solve
                     // ordering) so they don't block an otherwise-valid config.
@@ -103918,6 +105567,14 @@ impl Simulator {
                 self.this_stack.pop();
                 self.class_context_stack.pop();
                 return Value::from_u64(1, 32);
+            }
+            if fixed_fe_fail_streak >= 12 {
+                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                    for (name, val) in backup {
+                        inst.properties.insert(name, val);
+                    }
+                }
+                break;
             }
 
             // On the final trial, when diagnostics are requested, report which
@@ -105638,65 +107295,14 @@ impl Simulator {
                     Some(n) => n,
                     None => return false,
                 };
-                // Find the index range. First try the class's
-                // array_properties for `arr`, walking the inheritance chain.
-                let mut range: Option<(i64, i64, u32)> = None;
-                let class_name_opt = self
-                    .heap
-                    .get(handle)
-                    .and_then(|x| x.as_ref())
-                    .map(|i| i.class_name.clone());
-                if let Some(mut cn) = class_name_opt {
-                    loop {
-                        if let Some(cd) = self.module.classes.get(&cn) {
-                            if let Some(&(lo, hi, w)) = cd.array_properties.get(&arr_name) {
-                                range = Some((lo, hi, w));
-                                break;
-                            }
-                            if let Some(parent) = cd.extends.clone() {
-                                cn = parent;
-                            } else {
-                                break;
-                    }
-                        } else {
-                            break;
-                }
-                    }
-                }
-                // §18.5.8: the shape may be MULTI-dimensional. Only the 1-D
-                // table was consulted and only vars[0] was bound, so a
+                // §18.5.8: 1-D and N-D fixed shapes alike, walking the
+                // inheritance chain (`fixed_foreach_dims`). Only the 1-D table
+                // was consulted originally and only vars[0] bound, so a
                 // `foreach (m[i,j])` constraint found no range and was dropped
                 // silently — randomize() still returned 1 and every element
                 // came out unconstrained.
-                let dims: Vec<(i64, i64)> = match range {
-                    Some((lo, hi, _w)) => vec![(lo, hi)],
-                    None => {
-                        let mut nd: Option<Vec<(i64, i64)>> = None;
-                        if let Some(mut cn) = self
-                            .heap
-                            .get(handle)
-                            .and_then(|x| x.as_ref())
-                            .map(|i| i.class_name.clone())
-                        {
-                            loop {
-                                let Some(cd) = self.module.classes.get(&cn) else {
-                                    break;
-                                };
-                                if let Some((shape, _)) = cd.array_nd_properties.get(&arr_name) {
-                                    nd = Some(shape.clone());
-                                    break;
-                                }
-                                match cd.extends.clone() {
-                                    Some(p) => cn = p,
-                                    None => break,
-                                }
-                            }
-                        }
-                        match nd {
-                            Some(sh) => sh,
-                            None => return false,
-                        }
-                    }
+                let Some((dims, elem_w)) = self.fixed_foreach_dims(handle, &arr_name) else {
+                    return false;
                 };
                 // One loop variable per leading dimension (§12.7.3).
                 let idx_names: Vec<String> = vars
@@ -105732,6 +107338,60 @@ impl Simulator {
                         &suffix,
                     ) {
                         changed = true;
+                    }
+                    // Structural repair covers equality/relational/inside
+                    // shapes. Anything else the body demands of THIS element
+                    // (`% 2 == 0`, bit tests, …) falls to generate-and-test —
+                    // drawn from the body's own `inside` ranges, since a
+                    // full-width draw would virtually never land in a narrow
+                    // one. Cross-element couplings that no local draw can fix
+                    // are left to the trial checker, which retries or fails
+                    // the randomize() (§18.6.2).
+                    if idx_names.len() == dims.len()
+                        && elem_w >= 1
+                        && elem_w <= 64
+                        && !Self::constraint_unmodeled(body)
+                        && !self.item_holds(handle, body)
+                    {
+                        use rand::Rng;
+                        let mut ranges: Vec<(i64, i64)> = Vec::new();
+                        self.body_inside_ranges(body, &arr_name, &mut ranges);
+                        let scoped_key = format!("{}#{}{}", handle, arr_name, suffix);
+                        let elem_name = format!("{}{}", arr_name, suffix);
+                        let saved = self.signals.get(&scoped_key).cloned();
+                        let mut ok = false;
+                        // 24 draws: a satisfiable body (parity, bit tests)
+                        // lands in a handful; an impossible one burns every
+                        // draw for every pass of every trial, so the cap is
+                        // what bounds the UNSAT give-up time.
+                        for _ in 0..24 {
+                            let cand = if ranges.is_empty() {
+                                let mask = if elem_w >= 64 {
+                                    u64::MAX
+                                } else {
+                                    (1u64 << elem_w) - 1
+                                };
+                                Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, elem_w)
+                            } else {
+                                let (l, h) =
+                                    ranges[self.cur_rng().gen_range(0..ranges.len())];
+                                let v = if h > l { self.cur_rng().gen_range(l..=h) } else { l };
+                                Value::from_u64(v as u64, elem_w)
+                            };
+                            self.signals.insert(scoped_key.clone(), cand.clone());
+                            self.set_signal_value_by_name(&elem_name, cand);
+                            if self.item_holds(handle, body) {
+                                ok = true;
+                                changed = true;
+                                break;
+                            }
+                        }
+                        if !ok {
+                            if let Some(sv) = saved {
+                                self.signals.insert(scoped_key.clone(), sv.clone());
+                                self.set_signal_value_by_name(&elem_name, sv);
+                            }
+                        }
                     }
                     self.pop_local_frame();
                     let mut k = used.len();
@@ -106047,7 +107707,193 @@ impl Simulator {
                 }
                 changed
             }
+            // §18.5.7: a CONDITIONAL body item — `if (i == j) arr[i] % 2 == 0;
+            // else …` — was silently dropped here (only Block/Inside/Expr had
+            // arms), so every index-dependent branch of a fixed-array foreach
+            // went unenforced and unchecked. The loop indices are bound on the
+            // local frame, so the condition evaluates per element.
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                if self.eval_expr(condition).is_true() {
+                    self.solve_forced_array_elem(handle, then_item, rand_set, arr_name, idx)
+                } else if let Some(ei) = else_item {
+                    self.solve_forced_array_elem(handle, ei, rand_set, arr_name, idx)
+                } else {
+                    false
+                }
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            }
+                if self.eval_expr(condition).is_true() => {
+                    self.solve_forced_array_elem(handle, constraint, rand_set, arr_name, idx)
+                }
+            ConstraintItem::Soft(inner) => {
+                self.solve_forced_array_elem(handle, inner, rand_set, arr_name, idx)
+            }
             _ => false,
+        }
+    }
+
+    /// The FIXED shape of a class rand array member, walking the inheritance
+    /// chain: 1-D from `array_properties`, N-D from `array_nd_properties`.
+    /// Returns (per-dimension bounds, element width).
+    fn fixed_foreach_dims(
+        &self,
+        handle: usize,
+        arr_name: &str,
+    ) -> Option<(Vec<(i64, i64)>, u32)> {
+        let mut cn = self
+            .heap
+            .get(handle)
+            .and_then(|x| x.as_ref())
+            .map(|i| i.class_name.clone())?;
+        loop {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(&(lo, hi, w)) = cd.array_properties.get(arr_name) {
+                return Some((vec![(lo, hi)], w));
+            }
+            if let Some((shape, w)) = cd.array_nd_properties.get(arr_name) {
+                return Some((shape.clone(), *w));
+            }
+            cn = cd.extends.clone()?;
+        }
+    }
+
+    /// The `inside {…}` ranges the foreach BODY imposes on the current
+    /// element, evaluated with the loop indices bound — the candidate domain
+    /// for the generate-and-test backstop (a full-width draw would virtually
+    /// never land in a narrow range like `[1:500]`).
+    fn body_inside_ranges(
+        &mut self,
+        item: &ConstraintItem,
+        arr_name: &str,
+        out: &mut Vec<(i64, i64)>,
+    ) {
+        match item {
+            ConstraintItem::Block(items) => {
+                for it in items {
+                    self.body_inside_ranges(it, arr_name, out);
+                }
+            }
+            ConstraintItem::Soft(i) => self.body_inside_ranges(i, arr_name, out),
+            ConstraintItem::IfElse { condition, then_item, else_item, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.body_inside_ranges(then_item, arr_name, out);
+                } else if let Some(ei) = else_item {
+                    self.body_inside_ranges(ei, arr_name, out);
+                }
+            }
+            ConstraintItem::Implication { condition, constraint, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.body_inside_ranges(constraint, arr_name, out);
+                }
+            }
+            ConstraintItem::Inside { expr, range, is_dist, .. }
+                if !*is_dist && Self::index_chain_root_is(expr, arr_name) =>
+            {
+                for r in range {
+                    match r {
+                        ConstraintRange::Value(e) => {
+                            if let Some(v) = self.eval_expr(e).to_i64() {
+                                out.push((v, v));
+                            }
+                        }
+                        ConstraintRange::Range { lo, hi } => {
+                            if let (Some(l), Some(h)) =
+                                (self.eval_expr(lo).to_i64(), self.eval_expr(hi).to_i64())
+                            {
+                                out.push((l, h));
+                            }
+                        }
+                    }
+                }
+            }
+            ConstraintItem::Expr(e) => {
+                if let ExprKind::Inside { expr, ranges } = &e.kind {
+                    if Self::index_chain_root_is(expr, arr_name) {
+                        for r in ranges.clone() {
+                            match &r.kind {
+                                ExprKind::Range(lo, hi) => {
+                                    if let (Some(l), Some(h)) = (
+                                        self.eval_expr(lo).to_i64(),
+                                        self.eval_expr(hi).to_i64(),
+                                    ) {
+                                        out.push((l, h));
+                                    }
+                                }
+                                _ => {
+                                    if let Some(v) = self.eval_expr(&r).to_i64() {
+                                        out.push((v, v));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Strict per-element check of a `foreach` over a FIXED-shape rand array
+    /// member. None = not such a foreach (or one this checker cannot judge:
+    /// fewer loop vars than dimensions, or an unmodeled body) — the caller's
+    /// other checkers/skips then apply unchanged. Some(ok) is authoritative.
+    fn check_fixed_foreach_item(
+        &mut self,
+        handle: usize,
+        item: &ConstraintItem,
+    ) -> Option<bool> {
+        let ConstraintItem::Foreach { array, vars, item: body, .. } = item else {
+            return None;
+        };
+        let arr_name = Self::foreach_base_name(array)?;
+        let (dims, _w) = self.fixed_foreach_dims(handle, &arr_name)?;
+        let idx_names: Vec<String> = vars
+            .iter()
+            .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
+            .collect();
+        if idx_names.len() != dims.len() {
+            return None;
+        }
+        if Self::constraint_unmodeled(body) {
+            return None;
+        }
+        if dims.iter().any(|&(lo, hi)| hi < lo) {
+            return Some(true);
+        }
+        let body = (**body).clone();
+        let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+        loop {
+            let mut frame: HashMap<String, Value> = HashMap::default();
+            for (k, nm) in idx_names.iter().enumerate() {
+                frame.insert(nm.clone(), Value::from_u64(idx[k] as u64, 32));
+            }
+            self.push_local_frame(frame);
+            let ok = self.item_holds(handle, &body);
+            self.pop_local_frame();
+            if !ok {
+                return Some(false);
+            }
+            let mut k = dims.len();
+            loop {
+                if k == 0 {
+                    return Some(true);
+                }
+                k -= 1;
+                idx[k] += 1;
+                if idx[k] <= dims[k].1 {
+                    break;
+                }
+                idx[k] = dims[k].0;
+            }
         }
     }
 
@@ -108129,13 +109975,35 @@ impl Simulator {
     }
 
     fn enum_value_name(&self, value: u64, type_hint: Option<&str>) -> Option<String> {
+        self.enum_value_name_keyed(value, type_hint, &[])
+    }
+
+    /// `enum_value_name` with the receiver's own storage names as extra list
+    /// keys: an ANONYMOUS enum (or an inline-enum local) has no typedef, so
+    /// its member list is keyed by the VARIABLE name (§6.19.6) — the
+    /// `first/last/num` path already consulted it, `.name()` did not and
+    /// fell to the design-wide by-value scan, which picks whichever enum of
+    /// the largest size happens to hold the value.
+    fn enum_value_name_keyed(
+        &self,
+        value: u64,
+        type_hint: Option<&str>,
+        var_keys: &[String],
+    ) -> Option<String> {
+        let by_key = |k: &str| -> Option<String> {
+            self.module
+                .enum_members
+                .get(k)
+                .and_then(|members| members.iter().find(|(_, v)| *v == value).map(|(n, _)| n.clone()))
+        };
         if let Some(t) = type_hint {
-            if let Some(members) = self.module.enum_members.get(t) {
-                for (n, v) in members {
-                    if *v == value {
-                        return Some(n.clone());
-                    }
-                }
+            if let Some(n) = by_key(t) {
+                return Some(n);
+            }
+        }
+        for k in var_keys {
+            if let Some(n) = by_key(k) {
+                return Some(n);
             }
         }
         let mut best: Option<(usize, String)> = None;
@@ -108250,6 +110118,21 @@ impl Simulator {
         } else {
             None
         }
+    }
+
+    /// Storage names under which an enum receiver's member list may be keyed
+    /// when it has no typedef: its resolved name and its bare leaf.
+    fn enum_receiver_keys(&self, expr: &Expression) -> Vec<String> {
+        let mut keys = Vec::new();
+        if let ExprKind::Ident(h) = &expr.kind {
+            keys.push(self.resolve_hier_name(h));
+            if let Some(leaf) = h.path.last() {
+                if h.path.len() > 1 || keys[0] != leaf.name.name {
+                    keys.push(leaf.name.name.clone());
+                }
+            }
+        }
+        keys
     }
 
     fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {

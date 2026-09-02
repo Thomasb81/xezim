@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "hierarchy/implicit_net_name_collision.rs"]
+mod implicit_net_name_collision;
 #[path = "hierarchy/typedef_array_ports_in_children.rs"]
 mod typedef_array_ports_in_children;
 #[path = "hierarchy/unpacked_struct_port.rs"]
