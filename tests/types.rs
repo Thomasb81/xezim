@@ -173,6 +173,8 @@ mod type_param_bound_to_specialization;
 mod type_param_static_property;
 #[path = "types/stmt_local_scoped_decls.rs"]
 mod stmt_local_scoped_decls;
+#[path = "types/type_param_struct_per_instance.rs"]
+mod type_param_struct_per_instance;
 #[path = "types/typedef_declaring_scope.rs"]
 mod typedef_declaring_scope;
 #[path = "types/typedef_specialization_dispatch.rs"]
