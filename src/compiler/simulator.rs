@@ -63515,6 +63515,17 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §6.19.6: an inline-enum LOCAL (a typedef'd enum
+                        // local arrives here already folded to its enum
+                        // type) keys its member list by its own name.
+                        if matches!(data_type, crate::ast::types::DataType::Enum(_)) {
+                            if let Some(m) = super::elaborate::anon_enum_members_ordered(
+                                data_type,
+                                &self.module.parameters,
+                            ) {
+                                self.module.enum_members.insert(d.name.name.clone(), m);
+                            }
+                        }
                         if let Some(fields) = super::elaborate::packed_struct_field_layout(
                             data_type,
                             &self.module.parameters,
@@ -63655,9 +63666,24 @@ impl Simulator {
                                 }
                                 suffixes = next;
                             }
+                            let is_string_elem = matches!(
+                                data_type,
+                                crate::ast::types::DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::String,
+                                    ..
+                                }
+                            );
+                            if is_string_elem {
+                                self.string_signals.insert(name.clone());
+                            }
                             for sfx in suffixes {
                                 let elem = format!("{}{}", name, sfx);
-                                self.signals.insert(elem.clone(), default_v.clone());
+                                let seed = if is_string_elem {
+                                    Value::from_string("")
+                                } else {
+                                    default_v.clone()
+                                };
+                                self.signals.insert(elem.clone(), seed);
                                 self.widths.insert(elem, w);
                             }
                             self.widths.insert(name.clone(), w);
@@ -63952,9 +63978,34 @@ impl Simulator {
                         if descending {
                             self.module.descending_arrays.insert(name.clone());
                         }
+                        // A local FIXED array of STRINGS: mark the array name
+                        // (the element-string check keys off it, like the
+                        // string-queue branch) and seed every element as the
+                        // EMPTY string. Seeded as zero bits, an unset element
+                        // rendered under `%s` as a run of blanks, and the
+                        // declaration's `'{…}` pattern had no string-typed
+                        // element to land in — `string nm[3] = '{"a","b","c"}`
+                        // in a block printed nothing but padding.
+                        let is_string_elem = matches!(
+                            data_type,
+                            crate::ast::types::DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        );
+                        if is_string_elem {
+                            self.string_signals.insert(name.clone());
+                        } else {
+                            self.string_signals.remove(&name);
+                        }
                         for idx in lo..=hi {
                             let elem = format!("{}[{}]", name, idx);
-                            self.signals.insert(elem.clone(), default_v.clone());
+                            let seed = if is_string_elem {
+                                Value::from_string("")
+                            } else {
+                                default_v.clone()
+                            };
+                            self.signals.insert(elem.clone(), seed);
                             self.widths.insert(elem, w);
                         }
                         self.widths.insert(name.clone(), w);
@@ -83958,6 +84009,18 @@ impl Simulator {
                 return;
             }
         }
+        // A `string` leaf is stored as-is: the width resize below padded the
+        // text with NULs to the element's nominal width, so a 2-D string
+        // local's `'{'{"a","bb"},…}` read back as a run of blanks before
+        // each value.
+        if matches!(
+            self.resolve_dt(dt),
+            DataType::Simple { kind: crate::ast::types::SimpleType::String, .. }
+        ) {
+            let v = self.eval_expr(e);
+            self.set_signal_value_by_name(target, v);
+            return;
+        }
         // §10.9.2: each item is evaluated in the context of the ELEMENT type —
         // `int d[]; d = '{1'b1 + 1'b1}` is 2, not a 1-bit wrap to 0, and a
         // signed narrower item sign-extends. Self-determined evaluation gave
@@ -92720,7 +92783,8 @@ impl Simulator {
                     .is_some_and(|cd| cd.methods.contains_key("name"));
                 if !is_class_with_name_method {
                     let val = self.eval_expr(expr).to_u64().unwrap_or(0);
-                    if let Some(nm) = self.enum_value_name(val, type_hint.as_deref()) {
+                    let keys = self.enum_receiver_keys(expr);
+                    if let Some(nm) = self.enum_value_name_keyed(val, type_hint.as_deref(), &keys) {
                         return Value::from_string(&nm);
                     }
                 }
@@ -93891,7 +93955,8 @@ impl Simulator {
                         .is_some_and(|cd| cd.methods.contains_key("name"));
                     if !is_class_name {
                         let val = self.eval_expr(&base_expr).to_u64().unwrap_or(0);
-                        if let Some(nm) = self.enum_value_name(val, hint.as_deref()) {
+                        let keys = self.enum_receiver_keys(&base_expr);
+                        if let Some(nm) = self.enum_value_name_keyed(val, hint.as_deref(), &keys) {
                             return Value::from_string(&nm);
                         }
                         // Enum value with no matching member: return empty rather
@@ -108590,13 +108655,35 @@ impl Simulator {
     }
 
     fn enum_value_name(&self, value: u64, type_hint: Option<&str>) -> Option<String> {
+        self.enum_value_name_keyed(value, type_hint, &[])
+    }
+
+    /// `enum_value_name` with the receiver's own storage names as extra list
+    /// keys: an ANONYMOUS enum (or an inline-enum local) has no typedef, so
+    /// its member list is keyed by the VARIABLE name (§6.19.6) — the
+    /// `first/last/num` path already consulted it, `.name()` did not and
+    /// fell to the design-wide by-value scan, which picks whichever enum of
+    /// the largest size happens to hold the value.
+    fn enum_value_name_keyed(
+        &self,
+        value: u64,
+        type_hint: Option<&str>,
+        var_keys: &[String],
+    ) -> Option<String> {
+        let by_key = |k: &str| -> Option<String> {
+            self.module
+                .enum_members
+                .get(k)
+                .and_then(|members| members.iter().find(|(_, v)| *v == value).map(|(n, _)| n.clone()))
+        };
         if let Some(t) = type_hint {
-            if let Some(members) = self.module.enum_members.get(t) {
-                for (n, v) in members {
-                    if *v == value {
-                        return Some(n.clone());
-                    }
-                }
+            if let Some(n) = by_key(t) {
+                return Some(n);
+            }
+        }
+        for k in var_keys {
+            if let Some(n) = by_key(k) {
+                return Some(n);
             }
         }
         let mut best: Option<(usize, String)> = None;
@@ -108711,6 +108798,21 @@ impl Simulator {
         } else {
             None
         }
+    }
+
+    /// Storage names under which an enum receiver's member list may be keyed
+    /// when it has no typedef: its resolved name and its bare leaf.
+    fn enum_receiver_keys(&self, expr: &Expression) -> Vec<String> {
+        let mut keys = Vec::new();
+        if let ExprKind::Ident(h) = &expr.kind {
+            keys.push(self.resolve_hier_name(h));
+            if let Some(leaf) = h.path.last() {
+                if h.path.len() > 1 || keys[0] != leaf.name.name {
+                    keys.push(leaf.name.name.clone());
+                }
+            }
+        }
+        keys
     }
 
     fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {

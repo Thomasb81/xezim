@@ -113,3 +113,25 @@ module tb; logic clk = 0; always #5 clk = ~clk; sub u (.clk(clk)); initial #40 $
     );
 }
 
+#[test]
+fn typedef_with_two_packed_dims_parses_as_a_statement_local() {
+    // §7.4.1: `s_t [1:0][1:0] m;` inside a block. The statement-declaration
+    // lookahead stopped after the FIRST balanced `[..]` and demanded an
+    // identifier, so the second `[` sent this down the expression path — a
+    // parse error, while the identical declaration at module scope parsed.
+    // The expression form `arr[i][j] = v` must still be an assignment.
+    let o = out(r#"
+module tb;
+  typedef struct packed { logic [7:0] x; } s_t;
+  logic [7:0] arr [2][2];
+  initial begin
+    s_t [1:0][1:0] loc;
+    loc[1][0].x = 8'hA5;
+    arr[1][1] = 8'h3C;                 // still an expression statement
+    $display("LOC=%02x ARR=%02x", loc[1][0].x, arr[1][1]);
+  end
+endmodule
+"#);
+    assert!(o.contains("LOC=a5 ARR=3c"), "two-dim typedef local parse/shape wrong:\n{o}");
+}
+
