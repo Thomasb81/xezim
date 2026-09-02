@@ -61788,6 +61788,53 @@ impl Simulator {
                             name = scoped;
                         }
                     }
+                    // `foreach (obj.member[i, j])` over a FIXED array
+                    // property: the hier name resolves under the VARIABLE
+                    // scope ("o.g2"), but the per-instance shape tables key
+                    // the storage `<handle>#g2` — so every dims lookup below
+                    // missed, none of the multi-var arms ran, and the loop
+                    // collapsed to a SINGLE iteration (a 1-D member survived
+                    // only via a later element-key scan).
+                    if hier.path.len() >= 2
+                        && hier.path.iter().all(|s| s.selects.is_empty())
+                        && !self.module.arrays.contains_key(&name)
+                        && !self.module.arrays_2d.contains_key(&name)
+                        && !self.module.arrays_nd.contains_key(&name)
+                        && !self.module.dynamic_arrays.contains(&name)
+                        && !self.is_associative_array(&name)
+                    {
+                        let obj = hier.path[0].name.name.clone();
+                        let mut h = if obj == "this" || obj == "super" {
+                            self.this_stack.last().copied().flatten()
+                        } else {
+                            self.eval_ident_handle(&obj)
+                        };
+                        // Middle segments are handle-valued properties
+                        // (`o.sub.g` — follow `sub` on o's heap instance).
+                        for seg in &hier.path[1..hier.path.len() - 1] {
+                            h = h.filter(|&x| x != 0).and_then(|x| {
+                                self.heap
+                                    .get(x)
+                                    .and_then(|o| o.as_ref())
+                                    .and_then(|i| i.properties.get(&seg.name.name))
+                                    .and_then(|v| v.to_u64())
+                                    .map(|v| v as usize)
+                            });
+                        }
+                        if let Some(h) = h.filter(|&h| h != 0) {
+                            let scoped = format!(
+                                "{}#{}",
+                                h,
+                                hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("")
+                            );
+                            if self.module.arrays.contains_key(&scoped)
+                                || self.module.arrays_2d.contains_key(&scoped)
+                                || self.module.arrays_nd.contains_key(&scoped)
+                            {
+                                name = scoped;
+                            }
+                        }
+                    }
                     // A bare array name inside a SUBMODULE process resolves
                     // under the process's instance scope ("u_s.mem"), like
                     // reads/writes already do — otherwise the collection
