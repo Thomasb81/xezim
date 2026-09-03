@@ -252,3 +252,5 @@ mod field_init_once_in_order;
 mod caller_local_shadows_this_cast;
 #[path = "classes/condition_waiter_yields_to_inactive.rs"]
 mod condition_waiter_yields_to_inactive;
+#[path = "classes/package_class_nested_class.rs"]
+mod package_class_nested_class;
