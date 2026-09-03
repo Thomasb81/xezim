@@ -2570,6 +2570,10 @@ struct ProcessContext {
     local_iface_aliases: Vec<HashMap<String, String>>,
     ref_binding_stack: Vec<HashMap<String, Expression>>,
     ref_alias_stack: Vec<HashMap<String, String>>,
+    /// §13.5.2 `ref` formals bound by IDENTITY (aggregates with no storage of
+    /// their own); element accesses on them are rewritten onto the actual.
+    /// Pushed/popped in lockstep with `ref_binding_stack`.
+    ref_identity_stack: Vec<Vec<String>>,
     queue_frame_saves: Vec<HashMap<String, QueueLocalSave>>,
     task_cleanup: Vec<TaskCleanup>,
     // Per-call-frame map of a local dynamic-array/queue/assoc LOCAL's bare
@@ -4570,6 +4574,14 @@ pub struct Simulator {
     /// elements keep the legacy copy-in/copy-out path (entry absent here).
     /// Pushed/popped in lockstep with `ref_binding_stack`.
     ref_alias_stack: Vec<HashMap<String, String>>,
+    /// §13.5.2 `ref` formals bound by IDENTITY (aggregates with no storage of
+    /// their own); element accesses on them are rewritten onto the actual.
+    /// Pushed/popped in lockstep with `ref_binding_stack`.
+    ref_identity_stack: Vec<Vec<String>>,
+    /// True while the top ref frame has an aliased or identity-bound formal —
+    /// the only state in which `ref_formal_redirect_*` can rewrite anything.
+    /// Maintained on push/pop/take/restore so the hot paths test one bool.
+    ref_redirect_hot: bool,
     /// Deferred teardown for inlined blocking task/method calls (LIFO). Each
     /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
     /// in ProcessContext across suspension).
@@ -8230,6 +8242,8 @@ impl Simulator {
             auto_loop_vars: Vec::new(),
             ref_binding_stack: Vec::new(),
             ref_alias_stack: Vec::new(),
+            ref_identity_stack: Vec::new(),
+            ref_redirect_hot: false,
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
             ready_condition_waiters: Vec::new(),
@@ -36777,6 +36791,7 @@ impl Simulator {
             local_iface_aliases: self.local_iface_aliases.clone(),
             ref_binding_stack: self.ref_binding_stack.clone(),
             ref_alias_stack: self.ref_alias_stack.clone(),
+            ref_identity_stack: self.ref_identity_stack.clone(),
             queue_frame_saves: self.queue_frame_saves.clone(),
             task_cleanup: self.task_cleanup.clone(),
             local_dyn: self.local_dyn.clone(),
@@ -36791,6 +36806,9 @@ impl Simulator {
     /// task is inside `run_events_until`; moving the task context aside avoids
     /// cloning its local arrays on every clock edge.
     fn take_process_context(&mut self) -> ProcessContext {
+        // The ref stacks leave with the context; nothing can redirect until
+        // a context is restored or a new ref frame is pushed.
+        self.ref_redirect_hot = false;
         ProcessContext {
             this_stack: std::mem::take(&mut self.this_stack),
             local_stack: std::mem::take(&mut self.local_stack),
@@ -36804,6 +36822,7 @@ impl Simulator {
             local_iface_aliases: std::mem::take(&mut self.local_iface_aliases),
             ref_binding_stack: std::mem::take(&mut self.ref_binding_stack),
             ref_alias_stack: std::mem::take(&mut self.ref_alias_stack),
+            ref_identity_stack: std::mem::take(&mut self.ref_identity_stack),
             queue_frame_saves: std::mem::take(&mut self.queue_frame_saves),
             task_cleanup: std::mem::take(&mut self.task_cleanup),
             local_dyn: std::mem::take(&mut self.local_dyn),
@@ -36825,6 +36844,8 @@ impl Simulator {
         self.local_iface_aliases = ctx.local_iface_aliases;
         self.ref_binding_stack = ctx.ref_binding_stack;
         self.ref_alias_stack = ctx.ref_alias_stack;
+        self.ref_identity_stack = ctx.ref_identity_stack;
+        self.refresh_ref_redirect_hot();
         self.queue_frame_saves = ctx.queue_frame_saves;
         self.task_cleanup = ctx.task_cleanup;
         self.local_dyn = ctx.local_dyn;
@@ -48347,6 +48368,113 @@ impl Simulator {
         changed
     }
 
+    /// §13.5.2: an element, bit or part-select access on a `ref` formal
+    /// (`a[i]`, `a[i][j]`, `a[7:0]`, `a[i].f`) goes THROUGH to the caller's
+    /// actual — for a formal aliased to module-visible storage the storage
+    /// name replaces the formal; for an aggregate bound by identity (no local
+    /// copy exists) the actual's own hierarchical name is extended with the
+    /// formal's selects. Whole-name reads and writes keep their existing
+    /// routing (see `ref_alias_stack`); this covers the selected forms, which
+    /// previously wrote a dead local copy while the matching read went to
+    /// the storage — `a[1] = 9` inside the task read back x.
+    fn ref_formal_redirect_hier(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+        selected: bool,
+    ) -> Option<crate::ast::expr::HierarchicalIdentifier> {
+        if hier.root.is_some() || hier.path.is_empty() {
+            return None;
+        }
+        // A bare name is redirected only underneath an `Index`/`RangeSelect`
+        // wrapper (`selected`); the whole-name forms keep their own routing.
+        if !selected && hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+            return None;
+        }
+        let name = hier.path[0].name.name.as_str();
+        if let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(name)) {
+            let mut path = hier.path.clone();
+            path[0].name.name = storage.clone();
+            return Some(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path,
+                span: hier.span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            });
+        }
+        // Identity-bound aggregate: the formal has no storage of its own.
+        // Formals the copy-in machineries own (scalars with a local slot, 1-D
+        // arrays, associative arrays, queues — copied back on return) are not
+        // listed: a direct write to the actual would be undone by the stale
+        // copy-back.
+        if !self.ref_identity_stack.last().is_some_and(|v| v.iter().any(|n| n == name)) {
+            return None;
+        }
+        let actual = self.ref_binding_stack.last().and_then(|m| m.get(name))?;
+        let ExprKind::Ident(ah) = &actual.kind else { return None };
+        if ah.path.is_empty() {
+            return None;
+        }
+        let mut path = ah.path.clone();
+        let mut rest = hier.path.clone();
+        let first = rest.remove(0);
+        path.last_mut().unwrap().selects.extend(first.selects);
+        path.extend(rest);
+        Some(crate::ast::expr::HierarchicalIdentifier {
+            root: ah.root.clone(),
+            path,
+            span: hier.span,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        })
+    }
+
+    /// `ref_formal_redirect_hier` applied through `Index`/`RangeSelect`
+    /// wrappers down to the root identifier of an lvalue or operand.
+    fn ref_formal_redirect_expr(&self, e: &Expression) -> Option<Expression> {
+        if !self.ref_redirect_possible() {
+            return None;
+        }
+        self.ref_formal_redirect_inner(e, false)
+    }
+
+    /// Cheap reject for the hot paths: only a call with an aliased or an
+    /// identity-bound `ref` formal can redirect anything.
+    #[inline(always)]
+    fn ref_redirect_possible(&self) -> bool {
+        self.ref_redirect_hot
+    }
+
+    fn refresh_ref_redirect_hot(&mut self) {
+        self.ref_redirect_hot = self.ref_alias_stack.last().is_some_and(|m| !m.is_empty())
+            || self.ref_identity_stack.last().is_some_and(|v| !v.is_empty());
+    }
+
+    fn ref_formal_redirect_inner(&self, e: &Expression, selected: bool) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Ident(h) => self
+                .ref_formal_redirect_hier(h, selected)
+                .map(|nh| Expression::new(ExprKind::Ident(nh), e.span)),
+            ExprKind::Index { expr, index } => self.ref_formal_redirect_inner(expr, true).map(|ne| {
+                Expression::new(ExprKind::Index { expr: Box::new(ne), index: index.clone() }, e.span)
+            }),
+            ExprKind::RangeSelect { expr, kind, left, right } => {
+                self.ref_formal_redirect_inner(expr, true).map(|ne| {
+                    Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(ne),
+                            kind: kind.clone(),
+                            left: left.clone(),
+                            right: right.clone(),
+                        },
+                        e.span,
+                    )
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn assign_value_inner(&mut self, lhs: &Expression, val: &Value) -> bool {
         // §25.9: a just-returned vif (recorded by the Return arm) binds to
         // the FIRST assignment target after the call — `value = r.read(c)`
@@ -48375,6 +48503,34 @@ impl Simulator {
                 crate::ast::Span::dummy(),
             );
             let _ = self.try_bind_virtual_iface(lhs, &synth);
+        }
+        // §13.5.2: a selected write through a `ref` formal lands on the
+        // caller's actual; an aliased formal's local copy is refreshed so
+        // any unredirected read path stays coherent.
+        if let Some(rewritten) = self.ref_formal_redirect_expr(lhs) {
+            let changed = self.assign_value(&rewritten, val);
+            let mut root = lhs;
+            loop {
+                match &root.kind {
+                    ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => root = expr,
+                    _ => break,
+                }
+            }
+            if let ExprKind::Ident(h) = &root.kind {
+                let fname = h.path[0].name.name.clone();
+                if let Some(storage) =
+                    self.ref_alias_stack.last().and_then(|m| m.get(&fname)).cloned()
+                {
+                    if let Some(full) = self.get_signal_value_by_name(&storage) {
+                        if let Some(frame) = self.local_stack.last_mut() {
+                            if let Some(slot) = frame.get_mut(&fname) {
+                                *slot = full;
+                            }
+                        }
+                    }
+                }
+            }
+            return changed;
         }
         if let Some(rewritten) = self.super_rewrite(lhs) {
             return self.assign_value(&rewritten, val);
@@ -52194,6 +52350,15 @@ impl Simulator {
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
+        // §13.5.2: an indexed / part-selected read through a `ref` formal
+        // reads the caller's actual (see `ref_formal_redirect_hier`).
+        if matches!(expr.kind, ExprKind::Index { .. } | ExprKind::RangeSelect { .. })
+            && self.ref_redirect_possible()
+        {
+            if let Some(rewritten) = self.ref_formal_redirect_inner(expr, false) {
+                return self.eval_expr_ctx(&rewritten, ctx_width);
+            }
+        }
         // §7.2/§13.4.2: a leaf of an unpacked struct the innermost call frame
         // OWNS — `s.a`, `s.inner.x`, `s.arr[2]`. Read it from the frame, as the
         // write path does; otherwise the lookups below reach module scope and
@@ -52361,6 +52526,14 @@ impl Simulator {
                 Value::from_string(s)
             }
             ExprKind::Ident(hier) => {
+                // §13.5.2: a selected read through a `ref` formal reads the
+                // caller's actual (see `ref_formal_redirect_hier`).
+                if self.ref_redirect_possible() {
+                    if let Some(nh) = self.ref_formal_redirect_hier(hier, false) {
+                        let rewritten = Expression::new(ExprKind::Ident(nh), expr.span);
+                        return self.eval_expr_ctx(&rewritten, ctx_width);
+                    }
+                }
                 // §26.3: a PACKAGE-scoped reference (`P::s.x` = [P, s, x])
                 // reads exactly like the bare `s.x` — the prefix carries no
                 // hierarchy at runtime, but every shape-keyed branch below
@@ -98814,6 +98987,8 @@ impl Simulator {
         }
         self.ref_binding_stack.pop();
         self.ref_alias_stack.pop();
+        self.ref_identity_stack.pop();
+        self.refresh_ref_redirect_hot();
         self.local_iface_aliases.pop();
         self.continue_flag = c.saved_continue;
         self.sync_static_locals();
@@ -99161,6 +99336,7 @@ impl Simulator {
         }
         let mut assoc_params: Vec<(String, String, bool)> = Vec::new(); // (param_name, caller_array_name, is_out)
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
+        let mut identity_formals: Vec<String> = Vec::new(); // ref aggregates bound by identity
         self.push_queue_frame();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
@@ -99319,6 +99495,7 @@ impl Simulator {
                     // array with the placeholder x (audit46 a10: the
                     // reference keeps '{11,12,13}).
                     if !port.dimensions.is_empty() {
+                        identity_formals.push(port.name.name.clone());
                         continue;
                     }
                     let val = if i < args.len() {
@@ -99424,6 +99601,8 @@ impl Simulator {
         output_bindings.retain(|(n, _)| !alias_map.contains_key(n));
         self.ref_binding_stack.push(ref_map);
         self.ref_alias_stack.push(alias_map);
+        self.ref_identity_stack.push(identity_formals);
+        self.refresh_ref_redirect_hot();
         self.return_value = None;
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
@@ -102369,6 +102548,7 @@ impl Simulator {
                                 local_iface_aliases: Vec::new(),
                                 ref_binding_stack: Vec::new(),
             ref_alias_stack: Vec::new(),
+            ref_identity_stack: Vec::new(),
                                 queue_frame_saves: Vec::new(),
                                 task_cleanup: Vec::new(),
                                 local_dyn: Vec::new(),

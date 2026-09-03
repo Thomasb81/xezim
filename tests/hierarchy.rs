@@ -149,3 +149,5 @@ mod library_dir_on_demand;
 mod modport_expression_ports;
 #[path = "hierarchy/unit_scope_library_subroutine.rs"]
 mod unit_scope_library_subroutine;
+#[path = "hierarchy/bind_grid_module_name_refs.rs"]
+mod bind_grid_module_name_refs;

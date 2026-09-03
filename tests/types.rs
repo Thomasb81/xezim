@@ -354,3 +354,7 @@ mod class_handle_nonclass_assign_compile_err;
 mod vector_type_arg_spec;
 #[path = "types/self_named_typedef_alias.rs"]
 mod self_named_typedef_alias;
+#[path = "types/tf_port_typedef_packed_dims.rs"]
+mod tf_port_typedef_packed_dims;
+#[path = "types/ref_formal_element_write.rs"]
+mod ref_formal_element_write;
