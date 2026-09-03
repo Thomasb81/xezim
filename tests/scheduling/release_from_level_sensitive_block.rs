@@ -41,7 +41,9 @@ endmodule
 fn run(jit: bool) -> String {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("release_level_sensitive");
     std::fs::create_dir_all(&dir).unwrap();
-    let sv = dir.join("t.sv");
+    // One file per variant: the two variants run on parallel test threads
+    // and a shared file can be truncated under the other run.
+    let sv = dir.join(if jit { "t_jit.sv" } else { "t_default.sv" });
     std::fs::write(&sv, DESIGN).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
     cmd.args(["--simulate", "-s", "top", "--no-cache", sv.to_str().unwrap()]);
