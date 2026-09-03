@@ -147,3 +147,5 @@ mod nonansi_modport_port_decl;
 mod library_dir_on_demand;
 #[path = "hierarchy/modport_expression_ports.rs"]
 mod modport_expression_ports;
+#[path = "hierarchy/unit_scope_library_subroutine.rs"]
+mod unit_scope_library_subroutine;
