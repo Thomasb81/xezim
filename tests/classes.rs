@@ -254,3 +254,5 @@ mod caller_local_shadows_this_cast;
 mod condition_waiter_yields_to_inactive;
 #[path = "classes/package_class_nested_class.rs"]
 mod package_class_nested_class;
+#[path = "classes/sqr_zero_time_loop.rs"]
+mod sqr_zero_time_loop;
