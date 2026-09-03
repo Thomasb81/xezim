@@ -259,3 +259,5 @@ mod condition_waiter_yields_to_inactive;
 mod package_class_nested_class;
 #[path = "classes/sqr_zero_time_loop.rs"]
 mod sqr_zero_time_loop;
+#[path = "classes/member_visibility_local_protected.rs"]
+mod member_visibility_local_protected;
