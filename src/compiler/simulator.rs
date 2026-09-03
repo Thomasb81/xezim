@@ -35457,6 +35457,7 @@ impl Simulator {
                 eprintln!("[INLINE_BITS] final invariant clean ({} iters)", iters);
             }
         }
+        self.flush_stdout();
         // PerTickAccum → local vars for the existing PROF print code.
         let t_settle = accum.t_settle;
         let t_edges = accum.t_edges;

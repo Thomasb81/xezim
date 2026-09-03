@@ -337,3 +337,5 @@ mod two_state_wide_reduction;
 mod udn_resolver_compiled;
 #[path = "misc/while_continue_final_iter.rs"]
 mod while_continue_final_iter;
+#[path = "misc/stdout_flush_at_sim_finish.rs"]
+mod stdout_flush_at_sim_finish;
