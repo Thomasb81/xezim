@@ -53,6 +53,8 @@ mod circular_typedef_diagnostics;
 mod class_module_same_name;
 #[path = "types/typedef_same_named_hierarchy.rs"]
 mod typedef_same_named_hierarchy;
+#[path = "types/class_interface_same_name.rs"]
+mod class_interface_same_name;
 #[path = "types/conditional_real_x_select.rs"]
 mod conditional_real_x_select;
 #[path = "types/const_function_params.rs"]

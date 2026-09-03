@@ -91701,6 +91701,17 @@ impl Simulator {
             DataType::TypeReference { name, .. } => {
                 let n = &name.name.name;
                 if self.module.interfaces.contains(n) {
+                    // Name collision resolution (§3.12): a plain (non-`virtual`)
+                    // `TypeReference` whose NAME is BOTH an interface and a
+                    // class (e.g. `interface shared;` + `class shared;`) is an
+                    // ambiguous probe. SV resolves the procedural block-local
+                    // declaration `shared h;` to the CLASS handle, NOT a
+                    // virtual interface, so prefer the class when one exists.
+                    // Only an explicit `virtual <iface>` (`DataType::Interface`
+                    // above) unambiguously denotes a virtual interface.
+                    if self.module.classes.contains_key(n) || self.module.covergroups.contains_key(n) {
+                        return false;
+                    }
                     return true;
                 }
                 // A TYPE-PARAM formal (`function void set(T value)` inside
