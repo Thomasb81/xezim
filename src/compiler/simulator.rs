@@ -86666,6 +86666,11 @@ impl Simulator {
             return self.string_signals.contains(name);
         };
         let mut dt = dt0;
+        // A typedef may alias a specialization of a class of the SAME name
+        // (`typedef req_t #(.DW(DW)) req_t;`, snitch mem_test) — following
+        // it lands on itself. Stop on any name seen before, or after a few
+        // hops, instead of spinning at time 0 forever.
+        let mut seen: Vec<String> = Vec::new();
         'walk: loop {
             if matches!(dt, DataType::Simple { kind: SimpleType::String, .. }) {
                 return true;
@@ -86673,6 +86678,10 @@ impl Simulator {
             match &dt {
                 DataType::TypeReference { name: tn, .. } => {
                     let n = tn.name.name.as_str();
+                    if seen.iter().any(|sn| sn == n) || seen.len() >= 16 {
+                        return false;
+                    }
+                    seen.push(n.to_string());
                     // Type parameter -> concrete bound type name.
                     if let Some(bound) = self.resolve_type_param_binding(n) {
                         if let Some(bdt) = self.module.typedef_types.get(&bound).cloned() {
@@ -96567,7 +96576,14 @@ impl Simulator {
         // Follow a typedef chain, then a type-parameter binding, then its
         // typedef, back to the base kind.
         let mut n = tn.name.name.to_string();
+        // Guard against a self-named typedef alias (`typedef req_t #(..)
+        // req_t;`) — see `p_local_is_string`.
+        let mut seen: Vec<String> = Vec::new();
         loop {
+            if seen.iter().any(|sn| *sn == n) || seen.len() >= 16 {
+                return false;
+            }
+            seen.push(n.clone());
             // A type parameter in the ACTIVE specialization binds to a
             // concrete type name (`T` -> `string` / `int` / ...).
             let bound = self

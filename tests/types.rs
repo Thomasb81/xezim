@@ -352,3 +352,5 @@ mod queue_literal_function_return;
 mod class_handle_nonclass_assign_compile_err;
 #[path = "types/vector_type_arg_spec.rs"]
 mod vector_type_arg_spec;
+#[path = "types/self_named_typedef_alias.rs"]
+mod self_named_typedef_alias;
