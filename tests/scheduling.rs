@@ -205,3 +205,5 @@ mod nba_array_elem_last_write_wins;
 mod delayed_write_pending_semantics;
 #[path = "scheduling/labeled_block_local_hier_ref.rs"]
 mod labeled_block_local_hier_ref;
+#[path = "scheduling/nba_wait_for_region_yield.rs"]
+mod nba_wait_for_region_yield;
