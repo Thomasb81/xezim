@@ -34437,6 +34437,62 @@ impl Simulator {
     /// before a `#0`-parked peer's continuation overwrites the value — and
     /// (b) at the end of the tick, after the NBA region has settled, to
     /// catch waiters satisfied by non-blocking/edge-propagated state.
+    /// Variant of `drain_condition_waiters` called in `run_one_tick` right BEFORE
+    /// the INACTIVE (`#0`) region is promoted:
+    /// 1. Does NOT commit NBA (IEEE 1800-2017 §4.5 places the NBA region strictly
+    ///    AFTER the Inactive region).
+    /// 2. If `#0` continuations are waiting in `inactive_queue`, stops after this
+    ///    round so those `#0` continuations execute in this delta rather than
+    ///    being starved by multi-generation cascades of condition waiters.
+    fn drain_condition_waiters_pre_inactive(&mut self) {
+        let mut guard = 0u32;
+        while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
+            && !self.finished
+            && !self.zero_delay_defer_pending
+        {
+            guard += 1;
+            if guard > 10000 {
+                break;
+            }
+            let prog_before = self.cond_progress;
+            let ready = std::mem::take(&mut self.ready_condition_waiters);
+            for (cpid, cont) in ready {
+                self.cond_waiter_reads.remove(&cpid);
+                self.cond_read_union_dirty = true;
+                self.cond_waiter_conditions.remove(&cpid);
+                self.event_queue.schedule(self.time, cpid, cont);
+            }
+            let parked = std::mem::take(&mut self.condition_waiters);
+            for (cpid, cont) in parked {
+                self.cond_waiter_reads.remove(&cpid);
+                self.cond_read_union_dirty = true;
+                self.cond_waiter_conditions.remove(&cpid);
+                self.event_queue.schedule(self.time, cpid, cont);
+            }
+            while self.event_queue.next_time() == Some(self.time)
+                && !self.finished
+                && !self.zero_delay_defer_pending
+            {
+                let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
+                    break;
+                };
+                self.run_scheduled_process(bpid, &stmts);
+                if !self.is_pid_suspended(bpid) {
+                    self.child_finished(bpid);
+                }
+            }
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            if !self.inactive_queue.is_empty() {
+                break;
+            }
+            if self.cond_progress == prog_before {
+                break;
+            }
+        }
+    }
+
     fn drain_condition_waiters(&mut self) {
         let mut guard = 0u32;
         while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
@@ -34633,7 +34689,7 @@ impl Simulator {
             // slave's `wait(state!=BEGIN_RESP)` wakes on the clobbered value).
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
-            self.drain_condition_waiters();
+            self.drain_condition_waiters_pre_inactive();
             if self.promote_inactive_to_active()
                 && self.event_queue.next_time() == Some(self.time)
             {
@@ -83448,8 +83504,16 @@ impl Simulator {
     }
 
     /// Innermost-first overlay lookup for a frame-local's class type.
+    /// When inside a class method (`method_local_base` is populated), only
+    /// scans frames belonging to THIS method so a caller's same-named local
+    /// does not shadow an instance property of `this`.
     fn local_class_type_of(&self, name: &str) -> Option<String> {
-        self.local_type_stack
+        let frames = if let Some(&base) = self.method_local_base.last() {
+            self.local_type_stack.get(base..).unwrap_or(&[])
+        } else {
+            &self.local_type_stack[..]
+        };
+        frames
             .iter()
             .rev()
             .find_map(|(c, _)| c.get(name).cloned())
@@ -83462,7 +83526,12 @@ impl Simulator {
     /// declaration (`local_typedef_type_of` starts from the top of
     /// `local_type_stack`, which holds only the ACTIVE call frames).
     fn local_typedef_type_of(&self, name: &str) -> Option<String> {
-        self.local_type_stack
+        let frames = if let Some(&base) = self.method_local_base.last() {
+            self.local_type_stack.get(base..).unwrap_or(&[])
+        } else {
+            &self.local_type_stack[..]
+        };
+        frames
             .iter()
             .rev()
             .find_map(|(_, t)| t.get(name).cloned())
@@ -83544,6 +83613,18 @@ impl Simulator {
                 let base = c.split('#').next().unwrap_or(&c);
                 if self.module.classes.contains_key(base) {
                     return Some(c);
+                }
+            }
+        }
+        // Member of `this` (the current object) — IEEE 1800-2023 §8.14:
+        // inside a class method, properties of `this` take precedence over
+        // outer / unrelated procedural locals in `var_class_types`.
+        if let Some(h) = self.this_stack.last().copied().flatten() {
+            if let Some(cls) = self.heap.get(h).and_then(|o| o.as_ref()).map(|i| i.class_name.clone()) {
+                if let Some(tn) = self.class_prop_type_named(&cls, vname) {
+                    if self.module.classes.contains_key(&tn) || tn.contains('#') {
+                        return Some(tn);
+                    }
                 }
             }
         }
