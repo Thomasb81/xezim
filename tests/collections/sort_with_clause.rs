@@ -25,6 +25,15 @@ module tb;
   C cq [$];
   int c0, c1;
 
+  // §7.12.2: a STRING-typed sort key must order the STRING lexicographically
+  // (§11.4.8 `str1 < str2`), NOT by the little-endian packed-byte integer the
+  // naive value sort would use. "uvm" packed (0x0075766D) compares numerically
+  // less than "common.run", so a wrong implementation sorts uvm first; the
+  // correct one puts common.run first.
+  string ss [$];
+  string sfirst, ssecond;
+  string wp0, wp1;
+
   initial begin
     q.push_back('{3, "three", '{30}});
     q.push_back('{1, "one",   '{10}});
@@ -58,6 +67,22 @@ module tb;
     cq.sort() with (item.v);
     c0 = cq[0].v;
     c1 = cq[1].v;
+
+    // String sort key: "common.run" must sort before "uvm" alphabetically.
+    // Covers both the bare `.sort()` on a string collection and the
+    // `sort with (item)` clause (§7.12.2) — the latter is the shape UVM's
+    // phase hopper uses (`succ_q.sort with (item.get_full_name())`).
+    ss.push_back("uvm");
+    ss.push_back("common.run");
+    ss.sort();
+    sfirst  = ss[0];
+    ssecond = ss[1];
+    ss.delete();
+    ss.push_back("uvm");
+    ss.push_back("common.run");
+    ss.sort() with (item);
+    wp0 = ss[0];
+    wp1 = ss[1];
   end
 endmodule
 "#;
@@ -124,6 +149,41 @@ fn unique_returns_a_deduped_queue_and_leaves_the_source_alone() {
         line(&sim, "UNIQ="),
         r#"UNIQ='{'{a:5, s:"a", in:'{k:0}}, '{a:6, s:"c", in:'{k:0}}}"#
     );
+}
+
+/// §7.12.2 + §11.4.8: a STRING-typed sort key orders lexicographically,
+/// not by packed-byte integer value. Regression for the UVM phase-hopper
+/// `succ_q.sort with (item.get_full_name())` — "uvm" packed sorts before
+/// "common.run" numerically but after it alphabetically.
+#[test]
+fn string_typed_sort_key_orders_lexicographically() {
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let s0 = sim
+        .get_signal("tb.sfirst")
+        .or_else(|| sim.get_signal("sfirst"))
+        .unwrap_or_else(|| panic!("sfirst missing"))
+        .to_sv_string();
+    let s1 = sim
+        .get_signal("tb.ssecond")
+        .or_else(|| sim.get_signal("ssecond"))
+        .unwrap_or_else(|| panic!("ssecond missing"))
+        .to_sv_string();
+    assert_eq!(s0, "common.run");
+    assert_eq!(s1, "uvm");
+    // The `sort with (item)` clause path (UVM phase-hopper shape) must give
+    // the same lexical result.
+    let w0 = sim
+        .get_signal("tb.wp0")
+        .or_else(|| sim.get_signal("wp0"))
+        .unwrap_or_else(|| panic!("wp0 missing"))
+        .to_sv_string();
+    let w1 = sim
+        .get_signal("tb.wp1")
+        .or_else(|| sim.get_signal("wp1"))
+        .unwrap_or_else(|| panic!("wp1 missing"))
+        .to_sv_string();
+    assert_eq!(w0, "common.run");
+    assert_eq!(w1, "uvm");
 }
 
 #[test]

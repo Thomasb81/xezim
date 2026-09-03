@@ -88170,7 +88170,30 @@ impl Simulator {
         let saved_iter = self.locator_iter.clone();
         self.locator_iter = iter.unwrap_or("item").to_string();
 
+        // §7.12.2: `q.sort/.rsort with (item.expr)` sorts by the value of the
+        // filter expression. When that expression is STRING-valued (e.g.
+        // `succ_q.sort with (item.get_full_name())` in the UVM phase hopper),
+        // the key's correct ordering is the CHARACTER-LEXICOGRAPHIC order
+        // (SV `<` on strings §11.4.8), NOT the little-endian byte-packed i64
+        // that `to_i64` would yield — the numeric encoding of "uvm" sorts
+        // before "common.run" even though the string compares after. Detect
+        // a string-typed filter and sort on the rendered text.
+        //
+        // A bare `item`, or the declared iterator, has the SAME type as the
+        // collection element, so sorting a string collection with `(item)`
+        // is also lexicographic even though `expr_is_string_valued` can't
+        // resolve the loop-local's declared type.
+        let bare_elem = match &filter.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let nm = &h.path[0].name.name;
+                nm == "item" || iter.is_some_and(|it| nm == it)
+            }
+            _ => false,
+        };
+        let str_keys = self.expr_is_string_valued(filter)
+            || (bare_elem && self.is_string_collection(arr));
         let mut keys: Vec<i64> = Vec::with_capacity(size);
+        let mut skeys: Vec<String> = Vec::with_capacity(size);
         for i in 0..size {
             let elem = format!("{}[{}]", arr, i);
             if elem_su.is_some() {
@@ -88185,7 +88208,12 @@ impl Simulator {
                 }
                 f.insert("item".to_string(), v);
             }
-            keys.push(self.eval_expr(filter).to_i64().unwrap_or(0));
+            let kv = self.eval_expr(filter);
+            if str_keys {
+                skeys.push(kv.to_sv_string());
+            } else {
+                keys.push(kv.to_i64().unwrap_or(0));
+            }
         }
 
         self.item_alias = saved_alias;
@@ -88210,8 +88238,20 @@ impl Simulator {
         let mut order: Vec<usize> = (0..size).collect();
         match method {
             // `sort_by_key` is stable, so equal keys keep their order.
-            "sort" => order.sort_by_key(|&i| keys[i]),
-            "rsort" => order.sort_by_key(|&i| std::cmp::Reverse(keys[i])),
+            "sort" => {
+                if str_keys {
+                    order.sort_by_key(|&i| skeys[i].clone());
+                } else {
+                    order.sort_by_key(|&i| keys[i]);
+                }
+            }
+            "rsort" => {
+                if str_keys {
+                    order.sort_by_key(|&i| std::cmp::Reverse(skeys[i].clone()));
+                } else {
+                    order.sort_by_key(|&i| std::cmp::Reverse(keys[i]));
+                }
+            }
             // `unique` is a LOCATOR (§7.12.1): it returns a queue and must not
             // reorder or shrink the source. Handled by the locator path.
             _ => return,
@@ -89130,6 +89170,10 @@ impl Simulator {
         if mname == "sort" {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
+                // §7.12.2 + §11.4.8: a STRING element collection sorts
+                // lexicographically, not by its little-endian packed-byte
+                // integer ("uvm" would sort before "common.run").
+                let is_str = self.is_string_collection(obj_name);
                 let mut elements = Vec::new();
                 for i in 0..cur_size {
                     if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
@@ -89137,7 +89181,11 @@ impl Simulator {
                         elements.push(v);
                     }
                 }
-                elements.sort_by_key(|a| a.to_u64().unwrap_or(0));
+                if is_str {
+                    elements.sort_by(|a, b| a.to_sv_string().cmp(&b.to_sv_string()));
+                } else {
+                    elements.sort_by_key(|a| a.to_u64().unwrap_or(0));
+                }
                 for (i, v) in elements.into_iter().enumerate() {
                     self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);
                 }
@@ -89147,6 +89195,7 @@ impl Simulator {
         if mname == "rsort" {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
+                let is_str = self.is_string_collection(obj_name);
                 let mut elements = Vec::new();
                 for i in 0..cur_size {
                     if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
@@ -89154,7 +89203,11 @@ impl Simulator {
                         elements.push(v);
                     }
                 }
-                elements.sort_by(|a, b| b.to_u64().unwrap_or(0).cmp(&a.to_u64().unwrap_or(0)));
+                if is_str {
+                    elements.sort_by(|a, b| b.to_sv_string().cmp(&a.to_sv_string()));
+                } else {
+                    elements.sort_by(|a, b| b.to_u64().unwrap_or(0).cmp(&a.to_u64().unwrap_or(0)));
+                }
                 for (i, v) in elements.into_iter().enumerate() {
                     self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);
                 }
