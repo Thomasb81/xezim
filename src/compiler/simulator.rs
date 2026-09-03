@@ -2583,6 +2583,14 @@ struct ProcessContext {
     // `push_queue_frame`/`pop_and_restore_queue_frame`.
     local_dyn: Vec<Vec<(String, String)>>,
     static_local_syncs: Vec<(String, Vec<(String, String)>)>,
+    // Base index into `local_stack`/`local_type_stack` of THIS method's own
+    // locals frame, so that after a process parks inside an inlined blocking
+    // method and its `local_stack` is swapped into its `ProcessContext`, the
+    // bounds for `local_class_type_of`/`local_typedef_type_of`/`in_any_frame`
+    // follow the frame rather than leaking a foreign index from whichever
+    // process runs next. Kept in `ProcessContext` (like `local_stack` itself)
+    // precisely because the base is only meaningful against that stack.
+    method_local_base: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -36767,6 +36775,7 @@ impl Simulator {
             task_cleanup: self.task_cleanup.clone(),
             local_dyn: self.local_dyn.clone(),
             static_local_syncs: self.static_local_syncs.clone(),
+            method_local_base: self.method_local_base.clone(),
         }
     }
 
@@ -36793,6 +36802,7 @@ impl Simulator {
             task_cleanup: std::mem::take(&mut self.task_cleanup),
             local_dyn: std::mem::take(&mut self.local_dyn),
             static_local_syncs: std::mem::take(&mut self.static_local_syncs),
+            method_local_base: std::mem::take(&mut self.method_local_base),
         }
     }
 
@@ -36813,6 +36823,7 @@ impl Simulator {
         self.task_cleanup = ctx.task_cleanup;
         self.local_dyn = ctx.local_dyn;
         self.static_local_syncs = ctx.static_local_syncs;
+        self.method_local_base = ctx.method_local_base;
     }
 
     fn inherit_current_process_context(&mut self, pid: usize) {
@@ -102311,6 +102322,7 @@ impl Simulator {
                                 task_cleanup: Vec::new(),
                                 local_dyn: Vec::new(),
                                 static_local_syncs: Vec::new(),
+                                method_local_base: Vec::new(),
                             },
                         );
                         self.event_queue.schedule(self.time, pid, t.items.clone().into());

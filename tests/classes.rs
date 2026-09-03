@@ -45,6 +45,9 @@ mod explicit_param_static_coll_read;
 mod typename_p_subroutine_locals;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
+
+#[path = "classes/blocking_method_keyed_method_local_base.rs"]
+mod blocking_method_keyed_method_local_base;
 #[path = "classes/class_field_named_event.rs"]
 mod class_field_named_event;
 #[path = "classes/this_chain_edge_sensitivity.rs"]
