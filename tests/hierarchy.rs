@@ -145,3 +145,5 @@ mod modport_shape_battery;
 mod nonansi_modport_port_decl;
 #[path = "hierarchy/library_dir_on_demand.rs"]
 mod library_dir_on_demand;
+#[path = "hierarchy/modport_expression_ports.rs"]
+mod modport_expression_ports;
