@@ -34493,7 +34493,7 @@ impl Simulator {
             if !self.inactive_queue.is_empty() {
                 break;
             }
-            if self.cond_progress == prog_before {
+            if self.cond_progress == prog_before && self.ready_condition_waiters.is_empty() {
                 break;
             }
         }
@@ -34552,8 +34552,13 @@ impl Simulator {
             }
             // No waiter proceeded this round → the remainder are genuinely
             // blocked (future-time change); stop re-checking until the next
-            // tick.
-            if self.cond_progress == prog_before {
+            // tick. But a waiter newly moved to `ready_condition_waiters` by
+            // a same-tick write is forward progress whether or not
+            // `cond_progress` stepped (moving to ready does not itself fire
+            // the waiter's body), so it must be consumed before we can treat
+            // the set as blocked.
+            if self.cond_progress == prog_before && self.ready_condition_waiters.is_empty()
+            {
                 break;
             }
         }
