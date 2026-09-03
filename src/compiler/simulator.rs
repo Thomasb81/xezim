@@ -4590,6 +4590,11 @@ pub struct Simulator {
     /// the event queue only at the END of the current tick, after
     /// `apply_nba` has run (see `promote_inactive_to_active`).
     inactive_queue: Vec<(usize, ProcCont)>,
+    /// Processes waiting for the NBA region to commit (e.g.
+    /// `uvm_wait_for_nba_region`: `nba <= next_nba; @(nba)` where `nba` is a
+    /// procedural variable). Resumed in `run_one_tick` after all active +
+    /// inactive (`#0`) deltas have settled and `apply_nba` has committed.
+    nba_region_waiters: Vec<(usize, ProcCont)>,
     /// Bumped whenever a `wait(expr)` condition evaluates true (a parked waiter
     /// proceeds). The condition-waiter fixpoint uses it to detect "no progress
     /// this round" and stop (genuine stall).
@@ -8217,6 +8222,7 @@ impl Simulator {
             cond_waiter_reads: HashMap::default(),
             cond_waiter_conditions: HashMap::default(),
             inactive_queue: Vec::new(),
+            nba_region_waiters: Vec::new(),
             cond_progress: 0,
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
@@ -34437,6 +34443,62 @@ impl Simulator {
     /// before a `#0`-parked peer's continuation overwrites the value — and
     /// (b) at the end of the tick, after the NBA region has settled, to
     /// catch waiters satisfied by non-blocking/edge-propagated state.
+    /// Variant of `drain_condition_waiters` called in `run_one_tick` right BEFORE
+    /// the INACTIVE (`#0`) region is promoted:
+    /// 1. Does NOT commit NBA (IEEE 1800-2017 §4.5 places the NBA region strictly
+    ///    AFTER the Inactive region).
+    /// 2. If `#0` continuations are waiting in `inactive_queue`, stops after this
+    ///    round so those `#0` continuations execute in this delta rather than
+    ///    being starved by multi-generation cascades of condition waiters.
+    fn drain_condition_waiters_pre_inactive(&mut self) {
+        let mut guard = 0u32;
+        while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
+            && !self.finished
+            && !self.zero_delay_defer_pending
+        {
+            guard += 1;
+            if guard > 10000 {
+                break;
+            }
+            let prog_before = self.cond_progress;
+            let ready = std::mem::take(&mut self.ready_condition_waiters);
+            for (cpid, cont) in ready {
+                self.cond_waiter_reads.remove(&cpid);
+                self.cond_read_union_dirty = true;
+                self.cond_waiter_conditions.remove(&cpid);
+                self.event_queue.schedule(self.time, cpid, cont);
+            }
+            let parked = std::mem::take(&mut self.condition_waiters);
+            for (cpid, cont) in parked {
+                self.cond_waiter_reads.remove(&cpid);
+                self.cond_read_union_dirty = true;
+                self.cond_waiter_conditions.remove(&cpid);
+                self.event_queue.schedule(self.time, cpid, cont);
+            }
+            while self.event_queue.next_time() == Some(self.time)
+                && !self.finished
+                && !self.zero_delay_defer_pending
+            {
+                let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
+                    break;
+                };
+                self.run_scheduled_process(bpid, &stmts);
+                if !self.is_pid_suspended(bpid) {
+                    self.child_finished(bpid);
+                }
+            }
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            if !self.inactive_queue.is_empty() {
+                break;
+            }
+            if self.cond_progress == prog_before && self.ready_condition_waiters.is_empty() {
+                break;
+            }
+        }
+    }
+
     fn drain_condition_waiters(&mut self) {
         let mut guard = 0u32;
         while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
@@ -34490,8 +34552,13 @@ impl Simulator {
             }
             // No waiter proceeded this round → the remainder are genuinely
             // blocked (future-time change); stop re-checking until the next
-            // tick.
-            if self.cond_progress == prog_before {
+            // tick. But a waiter newly moved to `ready_condition_waiters` by
+            // a same-tick write is forward progress whether or not
+            // `cond_progress` stepped (moving to ready does not itself fire
+            // the waiter's body), so it must be consumed before we can treat
+            // the set as blocked.
+            if self.cond_progress == prog_before && self.ready_condition_waiters.is_empty()
+            {
                 break;
             }
         }
@@ -34633,7 +34700,7 @@ impl Simulator {
             // slave's `wait(state!=BEGIN_RESP)` wakes on the clobbered value).
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
-            self.drain_condition_waiters();
+            self.drain_condition_waiters_pre_inactive();
             if self.promote_inactive_to_active()
                 && self.event_queue.next_time() == Some(self.time)
             {
@@ -34749,6 +34816,7 @@ impl Simulator {
         // region — so they observe post-edge state and this cycle's samples.
         self.drain_deferred_clocking_conts();
         self.drain_reactive_region();
+        self.drain_nba_region_waiters();
         self.fire_vpi_synch_cbs();
         self.check_monitor();
         self.drain_pending_strobes();
@@ -35231,10 +35299,19 @@ impl Simulator {
                 None
             };
             let next_delayed = self.next_delayed_time();
+            let next_nba_time = if !self.nba_fast.is_empty()
+                || !self.nba_queue.is_empty()
+                || !self.nba_region_waiters.is_empty()
+            {
+                Some(self.time)
+            } else {
+                None
+            };
             let next_time = [
                 next_eq_time,
                 next_clk_time,
                 next_delayed,
+                next_nba_time,
                 self.next_vpi_cb_time(),
             ]
                 .into_iter()
@@ -38869,6 +38946,9 @@ impl Simulator {
                                 // member/static resolution, with a null `this`.
                                 self.this_stack.push(None);
                                 self.class_context_stack.push(Some(mclass));
+                                self.method_local_base.push(
+                                    self.local_stack.len().saturating_sub(1),
+                                );
                                 cleanup.pushed_method_this = true;
                                 let saved_spec = self.current_spec.clone();
                                 if let Some((sb, ss)) = recv_spec {
@@ -39460,9 +39540,10 @@ impl Simulator {
                                 // waited on (uvm_wait_for_nba_region:
                                 // `nba <= next_nba; @(nba)`). Its event_waiter
                                 // would resolve to no signal_id and park forever;
-                                // treat it as a one-delta yield (its purpose is to
-                                // yield across the NBA region).
-                                self.event_queue.schedule(self.time, pid, cont);
+                                // park in nba_region_waiters so it resumes only
+                                // after the active + inactive (#0) deltas have
+                                // settled and the NBA region has committed.
+                                self.nba_region_waiters.push((pid, cont));
                             }
                             return;
                         }
@@ -69101,6 +69182,26 @@ impl Simulator {
         self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
     }
 
+    /// Resume processes waiting on NBA-region completion (such as
+    /// `uvm_wait_for_nba_region`: `nba <= next_nba; @(nba)`). Resumes in the
+    /// Reactive region after all active + inactive (`#0`) deltas have settled
+    /// and `apply_nba` has committed the NBA region.
+    fn drain_nba_region_waiters(&mut self) {
+        if self.nba_region_waiters.is_empty() {
+            return;
+        }
+        let waiters = std::mem::take(&mut self.nba_region_waiters);
+        for (pid, cont) in waiters {
+            if self.finished {
+                break;
+            }
+            self.run_scheduled_process(pid, &cont);
+            if !self.is_pid_suspended(pid) {
+                self.child_finished(pid);
+            }
+        }
+    }
+
     /// LRM §16.5: edge-detect each registered SVA clock, then for each
     /// fired clock site:
     ///   1. Drain any deferred consequents whose cycle counter reaches 0.
@@ -75264,6 +75365,9 @@ impl Simulator {
         if self.inactive_queue.iter().any(|(p, _)| *p == pid) {
             return true;
         }
+        if self.nba_region_waiters.iter().any(|(p, _)| *p == pid) {
+            return true;
+        }
         // A process blocked on `fork...join`/`join_any` is the PARENT of a
         // join_waiter — also suspended. Without this it was treated as finished,
         // so its process context (this_stack, locals) was dropped and the
@@ -75423,6 +75527,7 @@ impl Simulator {
             self.cond_waiter_conditions.remove(p);
         }
         self.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
+        self.nba_region_waiters.retain(|(p, _)| !to_kill.contains(p));
         for q in self.mailbox_get_waiters.values_mut() {
             q.retain(|w| !to_kill.contains(&w.pid));
         }
@@ -83445,8 +83550,16 @@ impl Simulator {
     }
 
     /// Innermost-first overlay lookup for a frame-local's class type.
+    /// When inside a class method (`method_local_base` is populated), only
+    /// scans frames belonging to THIS method so a caller's same-named local
+    /// does not shadow an instance property of `this`.
     fn local_class_type_of(&self, name: &str) -> Option<String> {
-        self.local_type_stack
+        let frames = if let Some(&base) = self.method_local_base.last() {
+            self.local_type_stack.get(base..).unwrap_or(&[])
+        } else {
+            &self.local_type_stack[..]
+        };
+        frames
             .iter()
             .rev()
             .find_map(|(c, _)| c.get(name).cloned())
@@ -83459,7 +83572,12 @@ impl Simulator {
     /// declaration (`local_typedef_type_of` starts from the top of
     /// `local_type_stack`, which holds only the ACTIVE call frames).
     fn local_typedef_type_of(&self, name: &str) -> Option<String> {
-        self.local_type_stack
+        let frames = if let Some(&base) = self.method_local_base.last() {
+            self.local_type_stack.get(base..).unwrap_or(&[])
+        } else {
+            &self.local_type_stack[..]
+        };
+        frames
             .iter()
             .rev()
             .find_map(|(_, t)| t.get(name).cloned())
@@ -83541,6 +83659,18 @@ impl Simulator {
                 let base = c.split('#').next().unwrap_or(&c);
                 if self.module.classes.contains_key(base) {
                     return Some(c);
+                }
+            }
+        }
+        // Member of `this` (the current object) — IEEE 1800-2023 §8.14:
+        // inside a class method, properties of `this` take precedence over
+        // outer / unrelated procedural locals in `var_class_types`.
+        if let Some(h) = self.this_stack.last().copied().flatten() {
+            if let Some(cls) = self.heap.get(h).and_then(|o| o.as_ref()).map(|i| i.class_name.clone()) {
+                if let Some(tn) = self.class_prop_type_named(&cls, vname) {
+                    if self.module.classes.contains_key(&tn) || tn.contains('#') {
+                        return Some(tn);
+                    }
                 }
             }
         }
@@ -98617,6 +98747,7 @@ impl Simulator {
         if c.pushed_method_this {
             self.this_stack.pop();
             self.class_context_stack.pop();
+            self.method_local_base.pop();
             self.current_spec = c.saved_spec;
         }
         self.ref_binding_stack.pop();
@@ -99279,6 +99410,15 @@ impl Simulator {
         cleanup.pushed_method_this = true;
         self.this_stack.push(handle_opt);
         self.class_context_stack.push(Some(mclass.clone()));
+        // §23 / §13.4: record the base of THIS method's own locals so
+        // `get_expr_type_name`'s `in_any_frame` check only sees the current
+        // inlined method's locals — not a caller's same-named local that
+        // leaked into the flat `var_class_types` map (e.g. a `uvm_sequence_base
+        // seq` local on the sequencer shadowing a sequence subclass's `seq`
+        // member, breaking virtual dispatch of `body()` in nested
+        // sequence-`start()` calls). The synchronous method path pushes this
+        // right after binding the locals frame; mirror it here.
+        self.method_local_base.push(self.local_stack.len().saturating_sub(1));
         if let Some(h) = handle_opt {
             if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
                 let cn = inst.class_name.clone();
