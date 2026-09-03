@@ -51,6 +51,8 @@ mod cast_value_param_specs;
 mod circular_typedef_diagnostics;
 #[path = "types/class_module_same_name.rs"]
 mod class_module_same_name;
+#[path = "types/typedef_same_named_hierarchy.rs"]
+mod typedef_same_named_hierarchy;
 #[path = "types/conditional_real_x_select.rs"]
 mod conditional_real_x_select;
 #[path = "types/const_function_params.rs"]
