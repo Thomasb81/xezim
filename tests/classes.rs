@@ -181,6 +181,8 @@ mod struct_formal_and_config_foreach;
 mod typename_param_class;
 #[path = "classes/unpacked_struct_class_property_whole_value.rs"]
 mod unpacked_struct_class_property_whole_value;
+#[path = "classes/nested_seq_method_dispatch.rs"]
+mod nested_seq_method_dispatch;
 #[path = "classes/uvm_config_db_tests.rs"]
 mod uvm_config_db_tests;
 #[path = "classes/uvm_factory_linkage.rs"]
@@ -246,3 +248,11 @@ mod enum_local_shadows_flat_maps;
 mod ref_formal_shadows_property;
 #[path = "classes/field_init_once_in_order.rs"]
 mod field_init_once_in_order;
+#[path = "classes/caller_local_shadows_this_cast.rs"]
+mod caller_local_shadows_this_cast;
+#[path = "classes/condition_waiter_yields_to_inactive.rs"]
+mod condition_waiter_yields_to_inactive;
+#[path = "classes/package_class_nested_class.rs"]
+mod package_class_nested_class;
+#[path = "classes/sqr_zero_time_loop.rs"]
+mod sqr_zero_time_loop;
