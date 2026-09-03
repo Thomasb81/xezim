@@ -93,6 +93,8 @@ mod fork_join_edge;
 mod fork_join_none_await_context;
 #[path = "scheduling/fork_var_sharing.rs"]
 mod fork_var_sharing;
+#[path = "scheduling/fork_var_activation_isolation.rs"]
+mod fork_var_activation_isolation;
 #[path = "scheduling/gap_fixes_scoping_and_nba.rs"]
 mod gap_fixes_scoping_and_nba;
 #[path = "scheduling/gate_rise_fall_delay.rs"]

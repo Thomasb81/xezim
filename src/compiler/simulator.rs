@@ -2557,6 +2557,12 @@ enum FsmWait {
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,
+    /// Parallel to `local_stack`: the frame generation each slot was pushed
+    /// with. Two different method activations never share a generation even
+    /// when they occupy the same slot index, so a fork child can tell whether
+    /// a parent slot still holds the activation it forked from (see
+    /// `merge_fork_writes`).
+    local_gen_stack: Vec<u64>,
     local_type_stack: Vec<(HashMap<String, String>, HashMap<String, String>)>,
     class_context_stack: Vec<Option<String>>,
     cg_this: Option<usize>,
@@ -4008,6 +4014,11 @@ pub struct Simulator {
     /// Call stack for tracking 'this' and local variables.
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,
+    /// Parallel to `local_stack`: the frame generation each slot was pushed
+    /// with (see `ProcessContext::local_gen_stack`). Kept on the active
+    /// `Simulator` exactly like `local_stack`, and moved into/out of a
+    /// `ProcessContext` by snapshot/take/restore.
+    local_gen_stack: Vec<u64>,
     /// Context for 'super' resolution: stack of (current_class_name).
     class_context_stack: Vec<Option<String>>,
     /// For each class-method call entered via `exec_method_in_class_hierarchy`,
@@ -4465,6 +4476,13 @@ pub struct Simulator {
     event_queue: TimingWheel,
     next_pid: usize,
     current_pid: usize,
+    /// Monotonic counter assigning each pushed local call-frame a unique
+    /// generation (see `local_gen_stack`). Used to tell apart two different
+    /// method activations that reuse the same `local_stack` slot index — e.g.
+    /// a fork child spawned under method-<i>A</i> that keeps running after
+    /// <i>A</i> returns must not merge its (stale) locals into the frame slot
+    /// that method-<i>B</i> now owns (regression 3627).
+    frame_gen: u64,
     /// Value that `$` resolves to in the current evaluation scope
     /// (e.g. queue upper bound during `q[a:$]`). Stack of overrides.
     dollar_bound: Vec<i64>,
@@ -8032,6 +8050,8 @@ impl Simulator {
             rand_ranges: HashMap::default(),
             class_statics: HashMap::default(),
             local_type_stack: Vec::new(),
+            local_gen_stack: Vec::new(),
+            frame_gen: 0,
             current_spec: None,
             spec_scope_stack: Vec::new(),
             gate_fall_delay_by_id: HashMap::default(),
@@ -36749,6 +36769,7 @@ impl Simulator {
         ProcessContext {
             this_stack: self.this_stack.clone(),
             local_stack: self.local_stack.clone(),
+            local_gen_stack: self.local_gen_stack.clone(),
             local_type_stack: self.local_type_stack.clone(),
             class_context_stack: self.class_context_stack.clone(),
             cg_this: self.cg_this,
@@ -36776,6 +36797,7 @@ impl Simulator {
         ProcessContext {
             this_stack: std::mem::take(&mut self.this_stack),
             local_stack: std::mem::take(&mut self.local_stack),
+            local_gen_stack: std::mem::take(&mut self.local_gen_stack),
             local_type_stack: std::mem::take(&mut self.local_type_stack),
             class_context_stack: std::mem::take(&mut self.class_context_stack),
             cg_this: self.cg_this.take(),
@@ -36797,6 +36819,7 @@ impl Simulator {
     fn restore_process_context(&mut self, ctx: ProcessContext) {
         self.this_stack = ctx.this_stack;
         self.local_stack = ctx.local_stack;
+        self.local_gen_stack = ctx.local_gen_stack;
         self.local_type_stack = ctx.local_type_stack;
         self.class_context_stack = ctx.class_context_stack;
         self.cg_this = ctx.cg_this;
@@ -36867,6 +36890,7 @@ impl Simulator {
                     }
                 } else {
                     ctx.local_stack.push(caps);
+                    ctx.local_gen_stack.push(self.next_frame_gen());
                 }
             }
         }
@@ -37352,16 +37376,23 @@ impl Simulator {
             if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
                 // (a) subroutine-frame merge
                 if let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) {
+                    // `parent_ctx` mutably borrows `self`, so snapshot the
+                    // child's generations first to avoid a self-borrow clash.
+                    let child_gen = self.local_gen_stack.clone();
                     Self::merge_fork_writes(
                         &mut parent_ctx.local_stack,
+                        &parent_ctx.local_gen_stack,
                         &child_frames,
+                        &child_gen,
                         baseline.as_ref(),
                     );
                 } else {
                     // Parent is the active process — its context is `saved`.
                     Self::merge_fork_writes(
                         &mut saved.local_stack,
+                        &saved.local_gen_stack,
                         &child_frames,
+                        &self.local_gen_stack,
                         baseline.as_ref(),
                     );
                 }
@@ -37839,13 +37870,31 @@ impl Simulator {
     /// whole-frame merge so the §9.3.2 write-visibility guarantee still
     /// holds. Only keys that exist in the parent's frame are propagated (a
     /// key the child declared itself, like a loop-local, is child-private).
+    /// Write a fork child's changed locals back into the parent's frames.
+    /// `parent_gens` / `child_gens` are the `local_gen_stack`s of the parent
+    /// (the frame set it owns *right now*) and the child (the frame set it
+    /// inherited at fork time). For slot index `i` we only propagate when the
+    /// two generations agree: slot `i` in the parent must still be the very
+    /// activation the child forked from. A fork child that outlives its
+    /// creating method and keeps writing its *stale* automatic locals must not
+    /// clobber the unrelated activation that now occupies the same slot
+    /// (regression 3627: an alpha reader orphaned by `join_any` kept overwriting
+    /// beta's `count` with its own stale value).
     fn merge_fork_writes(
         parent_frames: &mut [HashMap<String, Value>],
+        parent_gens: &[u64],
         child_frames: &[HashMap<String, Value>],
+        child_gens: &[u64],
         baseline: Option<&Vec<HashMap<String, Value>>>,
     ) {
         let n = parent_frames.len().min(child_frames.len());
         for i in 0..n {
+            let same_activation = parent_gens.get(i).copied() == child_gens.get(i).copied();
+            if !same_activation {
+                // The parent slot `i` no longer belongs to the activation this
+                // child forked from — keep this child's locals out of it.
+                continue;
+            }
             for (k, v) in &child_frames[i] {
                 if !parent_frames[i].contains_key(k) {
                     continue;
@@ -83583,11 +83632,21 @@ impl Simulator {
     }
 
     /// Push a local frame, keeping the type overlay in lockstep.
+    /// Monotonic frame-generation source for `local_gen_stack`. Each pushed
+    /// frame slot gets a distinct generation so separate activations that
+    /// reuse a slot index remain distinguishable (regression 3627).
+    fn next_frame_gen(&mut self) -> u64 {
+        self.frame_gen += 1;
+        self.frame_gen
+    }
+
     fn push_local_frame(&mut self, f: HashMap<String, Value>) {
         if self.name_stats_on {
             self.name_stats[2].set(self.name_stats[2].get() + 1);
         }
         self.local_stack.push(f);
+        let fgen = self.next_frame_gen();
+        self.local_gen_stack.push(fgen);
         self.local_type_stack
             .push((HashMap::default(), HashMap::default()));
     }
@@ -83597,6 +83656,7 @@ impl Simulator {
     /// use `pop_local_frame_take` when the caller needs the contents.
     fn pop_local_frame(&mut self) {
         self.local_type_stack.pop();
+        self.local_gen_stack.pop();
         if let Some(mut f) = self.local_stack.pop() {
             if self.frame_pool.len() < 64 {
                 f.clear();
@@ -83608,6 +83668,7 @@ impl Simulator {
     /// Pop a local frame and hand the map to the caller (writeback reads).
     fn pop_local_frame_take(&mut self) -> Option<HashMap<String, Value>> {
         self.local_type_stack.pop();
+        self.local_gen_stack.pop();
         self.local_stack.pop()
     }
 
@@ -102288,6 +102349,7 @@ impl Simulator {
                         }
                         let pid = self.next_pid;
                         self.next_pid += 1;
+                        let fgen = self.next_frame_gen();
                         if let Some(first) = t.items.first() {
                             self.process_origin.insert(pid, (first.span, "class task"));
                         }
@@ -102296,6 +102358,7 @@ impl Simulator {
                             ProcessContext {
                                 this_stack: vec![Some(handle)],
                                 local_stack: vec![locals],
+                                local_gen_stack: vec![fgen],
                                 local_type_stack: vec![(
                                     HashMap::default(),
                                     HashMap::default(),
