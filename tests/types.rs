@@ -39,6 +39,8 @@ mod bits_of_signal_in_const_expr;
 mod bits_package_scoped_type_width;
 #[path = "types/callback_typedef_static.rs"]
 mod callback_typedef_static;
+#[path = "types/cast_class_member_enum_range.rs"]
+mod cast_class_member_enum_range;
 #[path = "types/cast_typeparam.rs"]
 mod cast_typeparam;
 #[path = "types/cast_valparam_typeparam_static.rs"]
@@ -79,10 +81,18 @@ mod enum_member_per_instance;
 mod enum_reflection_in_submodules;
 #[path = "types/enum_next_prev_count.rs"]
 mod enum_next_prev_count;
+#[path = "types/enum_name_cross_method_local.rs"]
+mod enum_name_cross_method_local;
 #[path = "types/enum_signedness_and_pkg_scope.rs"]
 mod enum_signedness_and_pkg_scope;
+#[path = "types/enum_typeparam_wrapper_from_name.rs"]
+mod enum_typeparam_wrapper_from_name;
 #[path = "types/enum_xz_and_package_shapes.rs"]
 mod enum_xz_and_package_shapes;
+#[path = "types/package_base_constraint_inherited.rs"]
+mod package_base_constraint_inherited;
+#[path = "types/param_registry_typeid_identity.rs"]
+mod param_registry_typeid_identity;
 #[path = "types/formal_type_metadata_and_typedef_packed_array.rs"]
 mod formal_type_metadata_and_typedef_packed_array;
 #[path = "types/forward_referenced_parameter.rs"]
@@ -330,3 +340,13 @@ mod package_data_members_in_subroutine;
 mod per_spec_static_singletons;
 #[path = "types/signed_unsigned_compare_extension.rs"]
 mod signed_unsigned_compare_extension;
+#[path = "types/field_init_call_singletons.rs"]
+mod field_init_call_singletons;
+#[path = "types/data_decl_param_spec_type_arg.rs"]
+mod data_decl_param_spec_type_arg;
+#[path = "types/type_id_create_applies_override.rs"]
+mod type_id_create_applies_override;
+#[path = "types/queue_literal_function_return.rs"]
+mod queue_literal_function_return;
+#[path = "types/class_handle_nonclass_assign_compile_err.rs"]
+mod class_handle_nonclass_assign_compile_err;

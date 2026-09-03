@@ -61,6 +61,8 @@ mod class_local_typedef_aa;
 mod class_local_typedef_resolution;
 #[path = "classes/class_method_dispatch.rs"]
 mod class_method_dispatch;
+#[path = "classes/bare_parameterless_method_call.rs"]
+mod bare_parameterless_method_call;
 #[path = "classes/method_default_this_call.rs"]
 mod method_default_this_call;
 #[path = "classes/class_name_method_shadow.rs"]
@@ -135,6 +137,8 @@ mod ivtest_class_struct_cluster;
 mod localparam_class_not_parameterized;
 #[path = "classes/nonvirtual_dispatch_fscanf_process.rs"]
 mod nonvirtual_dispatch_fscanf_process;
+#[path = "classes/static_member_method_collision.rs"]
+mod static_member_method_collision;
 #[path = "classes/out_of_class_method_shadow.rs"]
 mod out_of_class_method_shadow;
 #[path = "classes/param_typedef_ctor_resolution.rs"]
@@ -224,6 +228,8 @@ mod struct_prop_whole_copy;
 mod randomize_obj_array_property;
 #[path = "classes/static_assoc_struct_pool.rs"]
 mod static_assoc_struct_pool;
+#[path = "classes/static_collection_qualified_access.rs"]
+mod static_collection_qualified_access;
 #[path = "classes/vif_static_roundtrip.rs"]
 mod vif_static_roundtrip;
 #[path = "classes/vif_property_named_like_instance.rs"]
@@ -236,3 +242,5 @@ mod class_localparam_array;
 mod member_collection_runtime_class;
 #[path = "classes/enum_local_shadows_flat_maps.rs"]
 mod enum_local_shadows_flat_maps;
+#[path = "classes/ref_formal_shadows_property.rs"]
+mod ref_formal_shadows_property;
