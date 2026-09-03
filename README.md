@@ -141,6 +141,7 @@ and testbench flows. Portable code should not rely on them.
   unannounced. `--fst`/`--xtrace` imply it, so existing command lines are
   unchanged.
 
+- IEEE 1801 power intent: `--upf` / `--upf-top` simulate supply nets, power switches, domain corruption, isolation clamps and retention, with the standard `UPF` package functions (`supply_on` and friends). See "Power intent (UPF)".
 ### 0.10.1 – 0.10.3 — native compilation and process conformance (August 2026)
 
 * **AOT native backend** (`XEZIM_JIT=1 XEZIM_AOT=1`, needs a `--features jit` build) — the
@@ -687,6 +688,42 @@ Two properties are worth knowing before relying on it:
 Note `--parse` above: the dump is produced before elaboration, so a design whose
 elaboration takes minutes still dumps in seconds. Only the step that appends
 adopted `-v`/`-y` library files needs `--compile` or `--simulate`.
+
+## Power intent (UPF)
+
+`--upf <file>` loads IEEE 1801 power intent and simulates it (repeat the flag
+for several files; `load_upf` inside a file resolves relative to that file).
+`--upf-top </path/to/instance>` names the instance the UPF scope refers to;
+without it the first instance of the `set_design_top` module is used.
+
+    xezim --simulate -s tb --upf power.upf --upf-top /tb/dut/core rtl.v tb.sv
+
+What is simulated:
+
+- `create_supply_net` / `create_supply_port` / `connect_supply_net` /
+  `set_domain_supply_net`: each supply net is a state (FULL_ON, OFF,
+  UNDETERMINED) plus a voltage. The testbench drives the supply ports through
+  the standard `UPF` package: `import UPF::*;` then `supply_on(path, volts)`,
+  `supply_off(path)`, `supply_partial_on`, `get_supply_on_state`,
+  `get_supply_voltage`. Paths are `/top/inst/.../NET`, dotted, or the
+  scope-relative net name.
+- `create_power_switch`: the output supply follows the input while an
+  `-on_state` boolean over the control ports holds; an x control gives
+  UNDETERMINED.
+- `create_power_domain -elements`: while a domain's primary power or ground is
+  not on, every variable, net and output inside its elements reads x and holds
+  x until written after power-up.
+- `set_isolation` / `set_isolation_control`: while the isolation control is
+  active the isolated outputs read their `-clamp_value` at the domain
+  boundary; element-specific strategies override `-applies_to outputs`. A
+  domain switching off with its isolation control inactive is reported.
+- `set_retention`: retained elements survive power-down.
+- `set_level_shifter`, `add_port_state`, `create_pst`, `add_pst_state`,
+  supply sets and `add_power_state` are parsed and reported only.
+
+Every event is logged with a `[UPF]` prefix (supply changes, switch state,
+domain power up/down, isolation enable/disable). `XEZIM_UPF_DUMP=1` prints
+the generated glue.
 
 ## Module-timescale extension
 

@@ -203,6 +203,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_TS_DENY", "Two-state: comma-separated 4-state opcode names whose blocks bail back to the interpreter (miscompile bisection)"),
     ("XEZIM_TWO_STATE", "Two-state u64 fast path: 0 disables (default on)"),
     ("XEZIM_UNRESOLVED_DUMP", "Comb settle: name the entries that re-evaluate on every settle call"),
+    ("XEZIM_UPF_DUMP", "UPF: print the generated power-intent package and glue processes"),
     ("XEZIM_UVM_DIR", "Path to a UVM source tree auto-added for UVM designs"),
     ("XEZIM_VALUE_TRACE", "Trace Value mutations for a signal id (debug)"),
     ("XEZIM_VALUE_TRACE_LIMIT", "Max Value-trace reports"),
