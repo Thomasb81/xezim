@@ -2583,6 +2583,16 @@ struct ProcessContext {
     // `push_queue_frame`/`pop_and_restore_queue_frame`.
     local_dyn: Vec<Vec<(String, String)>>,
     static_local_syncs: Vec<(String, Vec<(String, String)>)>,
+    /// See `Simulator::method_local_base`. This is per-PROCESS state: the
+    /// base indexes into `local_stack`, which is swapped out with the rest
+    /// of the context when a process parks. A process suspended inside an
+    /// inlined BLOCKING class method used to leave its base behind, so
+    /// another process's frame-local lookups (`local_class_type_of`,
+    /// `local_typedef_type_of`, `get_expr_type_name`'s `in_any_frame`) were
+    /// bounded by an index into a `local_stack` that was no longer there —
+    /// a method-local shadowing a module-scope net then resolved to the net
+    /// and `local = new()` constructed the wrong class.
+    method_local_base: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -36767,6 +36777,7 @@ impl Simulator {
             task_cleanup: self.task_cleanup.clone(),
             local_dyn: self.local_dyn.clone(),
             static_local_syncs: self.static_local_syncs.clone(),
+            method_local_base: self.method_local_base.clone(),
         }
     }
 
@@ -36793,6 +36804,7 @@ impl Simulator {
             task_cleanup: std::mem::take(&mut self.task_cleanup),
             local_dyn: std::mem::take(&mut self.local_dyn),
             static_local_syncs: std::mem::take(&mut self.static_local_syncs),
+            method_local_base: std::mem::take(&mut self.method_local_base),
         }
     }
 
@@ -36813,6 +36825,7 @@ impl Simulator {
         self.task_cleanup = ctx.task_cleanup;
         self.local_dyn = ctx.local_dyn;
         self.static_local_syncs = ctx.static_local_syncs;
+        self.method_local_base = ctx.method_local_base;
     }
 
     fn inherit_current_process_context(&mut self, pid: usize) {
@@ -36827,6 +36840,7 @@ impl Simulator {
             && !ctx.return_flag
             && ctx.local_dyn.is_empty()
             && ctx.static_local_syncs.is_empty()
+            && ctx.method_local_base.is_empty()
         {
             self.process_contexts.remove(&pid);
         } else {
@@ -36880,7 +36894,8 @@ impl Simulator {
             && !ctx.continue_flag
             && !ctx.return_flag
             && ctx.local_dyn.is_empty()
-            && ctx.static_local_syncs.is_empty();
+            && ctx.static_local_syncs.is_empty()
+            && ctx.method_local_base.is_empty();
         if trivial {
             self.process_contexts.remove(&pid);
         } else {
@@ -37304,6 +37319,12 @@ impl Simulator {
             || !self.class_context_stack.is_empty();
         let has_pid_ctx = self.process_contexts.contains_key(&pid);
         if !saved_ctx_needed && !has_pid_ctx {
+            // This path skips the context dance, so the per-method locals base
+            // is moved aside by hand: a process parked inside an inlined
+            // blocking method leaves its own base behind, and running another
+            // process under it would bound that process's frame-local lookups
+            // by an index into a `local_stack` it does not own.
+            let saved_mlb = std::mem::take(&mut self.method_local_base);
             self.run_process_payload(pid, stmts);
             let susp = self.is_pid_suspended(pid);
             if susp {
@@ -37311,11 +37332,13 @@ impl Simulator {
                 if !self.this_stack.is_empty()
                     || !self.local_stack.is_empty()
                     || !self.class_context_stack.is_empty()
+                    || !self.method_local_base.is_empty()
                 {
                     self.process_contexts
                         .insert(pid, self.snapshot_process_context());
                 }
             }
+            self.method_local_base = saved_mlb;
             self.auto_loop_vars.truncate(saved_auto_len);
             *self.name_resolve_hint.borrow_mut() = saved_hint;
             return;
@@ -102311,6 +102334,7 @@ impl Simulator {
                                 task_cleanup: Vec::new(),
                                 local_dyn: Vec::new(),
                                 static_local_syncs: Vec::new(),
+                                method_local_base: Vec::new(),
                             },
                         );
                         self.event_queue.schedule(self.time, pid, t.items.clone().into());
