@@ -203,3 +203,5 @@ mod finish_with_live_fork_child;
 mod nba_array_elem_last_write_wins;
 #[path = "scheduling/delayed_write_pending_semantics.rs"]
 mod delayed_write_pending_semantics;
+#[path = "scheduling/labeled_block_local_hier_ref.rs"]
+mod labeled_block_local_hier_ref;

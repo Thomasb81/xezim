@@ -2697,6 +2697,29 @@ struct DpiBinding {
 }
 
 
+/// Width of a spec fragment naming a DIMENSIONED vector type —
+/// `bit[7:0]`, `logic signed[3:0][7:0]` — as `data_type_to_spec_fragment`
+/// renders it for a `P#(bit [7:0])` specialization. Keyword-only fragments
+/// are `atom_type_keyword_width`'s job; anything else declines.
+fn vector_fragment_width(frag: &str) -> Option<u32> {
+    let rest = frag
+        .strip_prefix("bit")
+        .or_else(|| frag.strip_prefix("logic"))
+        .or_else(|| frag.strip_prefix("reg"))?;
+    let rest = rest.trim_start().strip_prefix("signed").unwrap_or(rest).trim();
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let mut width: u64 = 1;
+    for dim in rest.split(']').filter(|d| !d.trim().is_empty()) {
+        let inner = dim.trim().strip_prefix('[')?;
+        let (l, r) = inner.split_once(':')?;
+        let (l, r) = (l.trim().parse::<i64>().ok()?, r.trim().parse::<i64>().ok()?);
+        width = width.checked_mul((l - r).unsigned_abs() + 1)?;
+    }
+    u32::try_from(width).ok()
+}
+
 /// Parse `<base>[<idx>]` and resolve via the compact 1D-array map.
 /// Free function so it can be shared between the `&self` resolver on
 /// Simulator and the `&[Value]`-borrowed `exec_insns_isolated` path that
@@ -4156,7 +4179,19 @@ pub struct Simulator {
     /// as a string and gets resized to the 1024-bit placeholder (128 chars).
     /// Snapshot at frame entry, restore at frame exit, so a
     /// frame can never leak an add OR a remove to its caller.
-    string_signals_saves: Vec<HashSet<String>>,
+    string_signals_removed: Vec<Vec<String>>,
+    /// Union of every parked `wait(cond)` waiter's read names, rebuilt lazily
+    /// (see `cond_read_union_dirty`) so a blocking write can reject in O(1)
+    /// without allocating — `check_condition_waiters_for_write` sits on the
+    /// interpreter's hottest path.
+    cond_read_union: HashSet<String>,
+    cond_read_union_dirty: bool,
+    /// Static-collection bare names declared by two SIBLING classes (§8.9),
+    /// computed once at startup (`colliding_names` in the static-collection
+    /// registration loop). `static_coll_name_collides` used to rescan every
+    /// class on every static-collection access.
+    colliding_static_colls: HashSet<String>,
+    colliding_static_colls_ready: bool,
     /// Default random number generator — the stream used by any object or
     /// process that has not been given a private one (§18.14).
     rng: SvRng,
@@ -8066,7 +8101,11 @@ impl Simulator {
             static_local_syncs: Vec::new(),
             in_const_param_eval: false,
             return_value: None,
-            string_signals_saves: Vec::new(),
+            string_signals_removed: Vec::new(),
+            cond_read_union: HashSet::default(),
+            cond_read_union_dirty: false,
+            colliding_static_colls: HashSet::default(),
+            colliding_static_colls_ready: false,
             rng: SvRng::from_seed(SvRng::DEFAULT_SEED),
             proc_rng: HashMap::default(),
             obj_rng: HashMap::default(),
@@ -12437,6 +12476,8 @@ impl Simulator {
                 colliding_names.insert(nm.to_string());
             }
         }
+        self.colliding_static_colls = colliding_names.iter().cloned().collect();
+        self.colliding_static_colls_ready = true;
         let mut static_cols: Vec<(String, bool, u32, bool)> = Vec::new();
         for cd in self.module.classes.values() {
             for (name, is_assoc, width) in &cd.static_collections {
@@ -33354,6 +33395,7 @@ impl Simulator {
         let mut reads = HashSet::default();
         Self::collect_condition_read_names(cond, &mut reads);
         self.cond_waiter_reads.insert(pid, reads);
+        self.cond_read_union_dirty = true;
         self.cond_waiter_conditions.insert(pid, cond.clone());
         self.condition_waiters.push((pid, cont));
     }
@@ -33386,6 +33428,18 @@ impl Simulator {
 
     fn check_condition_waiters_for_write(&mut self, lhs: &Expression) {
         if self.condition_waiters.is_empty() {
+            return;
+        }
+        // Cheap reject first: nothing the lvalue names is read by any parked
+        // waiter. The union is rebuilt only after the waiter set changed.
+        if self.cond_read_union_dirty {
+            self.cond_read_union.clear();
+            for reads in self.cond_waiter_reads.values() {
+                self.cond_read_union.extend(reads.iter().cloned());
+            }
+            self.cond_read_union_dirty = false;
+        }
+        if !Self::lvalue_hits_names(lhs, &self.cond_read_union) {
             return;
         }
         let mut target_names: Vec<String> = Vec::new();
@@ -33422,6 +33476,7 @@ impl Simulator {
             if is_true {
                 let (wpid, wcont) = self.condition_waiters.remove(i);
                 self.cond_waiter_reads.remove(&wpid);
+                self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&wpid);
                 self.ready_condition_waiters.push((wpid, wcont));
             } else {
@@ -34396,12 +34451,14 @@ impl Simulator {
             let ready = std::mem::take(&mut self.ready_condition_waiters);
             for (cpid, cont) in ready {
                 self.cond_waiter_reads.remove(&cpid);
+                self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&cpid);
                 self.event_queue.schedule(self.time, cpid, cont);
             }
             let parked = std::mem::take(&mut self.condition_waiters);
             for (cpid, cont) in parked {
                 self.cond_waiter_reads.remove(&cpid);
+                self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&cpid);
                 self.event_queue.schedule(self.time, cpid, cont);
             }
@@ -55465,6 +55522,9 @@ impl Simulator {
                                     if let Some(w) = atom_type_keyword_width(&concrete) {
                                         return Value::from_u64(w as u64, 32);
                                     }
+                                    if let Some(w) = vector_fragment_width(&concrete) {
+                                        return Value::from_u64(w as u64, 32);
+                                    }
                                     if let Some(w) = self.module.typedefs.get(&concrete) {
                                         return Value::from_u64(*w as u64, 32);
                                     }
@@ -64535,7 +64595,7 @@ impl Simulator {
                                 ) {
                                     self.string_signals.insert(name.clone());
                                 } else {
-                                    self.string_signals.remove(&name);
+                                    self.forget_string_flag(&name);
                                 }
                                 // LRM §7.10 / §7.12.1 — if an initializer
                                 // is provided (e.g. `int idx[$] =
@@ -64644,7 +64704,7 @@ impl Simulator {
                                 ) {
                                     self.string_signals.insert(name.clone());
                                 } else {
-                                    self.string_signals.remove(&name);
+                                    self.forget_string_flag(&name);
                                 }
                                 // If the element type is a known class, record it
                                 // so `assoc[k] = new()` constructs the right class
@@ -64731,7 +64791,7 @@ impl Simulator {
                         if is_string_elem {
                             self.string_signals.insert(name.clone());
                         } else {
-                            self.string_signals.remove(&name);
+                            self.forget_string_flag(&name);
                         }
                         for idx in lo..=hi {
                             let elem = format!("{}[{}]", name, idx);
@@ -65165,7 +65225,7 @@ impl Simulator {
                         ) {
                             self.string_signals.insert(d.name.name.clone());
                         } else {
-                            self.string_signals.remove(&d.name.name);
+                            self.forget_string_flag(&d.name.name);
                         }
                         // Record a class-typed local's type so a later
                         // separate `name = new();` knows what to construct.
@@ -65298,8 +65358,10 @@ impl Simulator {
                                 || self.module.typedef_types.contains_key(&tn)
                             {
                                 tn
-                            } else {
+                            } else if self.current_spec.is_some() {
                                 self.resolve_type_param_binding(&tn).unwrap_or_else(|| tn)
+                            } else {
+                                tn
                             };
                             if self.module.enum_members.contains_key(&tn)
                                 || self.module.typedefs.contains_key(&tn)
@@ -75357,6 +75419,7 @@ impl Simulator {
         self.ready_condition_waiters.retain(|(p, _)| !to_kill.contains(p));
         for p in &to_kill {
             self.cond_waiter_reads.remove(p);
+            self.cond_read_union_dirty = true;
             self.cond_waiter_conditions.remove(p);
         }
         self.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
@@ -75431,6 +75494,7 @@ impl Simulator {
         if let Some(idx) = self.condition_waiters.iter().position(|(p, _)| *p == pid) {
             let (_, stmts) = self.condition_waiters.remove(idx);
             self.cond_waiter_reads.remove(&pid);
+            self.cond_read_union_dirty = true;
             self.cond_waiter_conditions.remove(&pid);
             self.suspended_pids.insert(pid);
             self.suspended_proc_info.insert(
@@ -75445,6 +75509,7 @@ impl Simulator {
         if let Some(idx) = self.ready_condition_waiters.iter().position(|(p, _)| *p == pid) {
             let (_, stmts) = self.ready_condition_waiters.remove(idx);
             self.cond_waiter_reads.remove(&pid);
+            self.cond_read_union_dirty = true;
             self.cond_waiter_conditions.remove(&pid);
             self.suspended_pids.insert(pid);
             self.suspended_proc_info.insert(
@@ -77196,6 +77261,9 @@ impl Simulator {
     fn expr_to_spec_fragment(&self, e: &Expression) -> Option<String> {
         use crate::ast::expr::{ExprKind, NumberLiteral};
         match &e.kind {
+            // A data-declaration type arg that is not a bare name
+            // (`P#(bit [7:0]) x;`) arrives as a TypeLiteral.
+            ExprKind::TypeLiteral(dt) => crate::elaborate::data_type_to_spec_fragment(dt),
             ExprKind::StringLiteral(s) => Some(format!("\"{}\"", s)),
             ExprKind::Number(NumberLiteral::Integer { value, .. }) => Some(value.clone()),
             ExprKind::Number(NumberLiteral::Real(r)) => Some(format!("{}", r)),
@@ -91622,7 +91690,39 @@ impl Simulator {
     /// subclass share the one static, so a name declared by exactly one class
     /// (or only an ancestor chain) keeps the bare-name storage the rest of
     /// the runtime relies on.
+    /// A block-local non-string declaration clears a stale string flag for
+    /// its bare name. Inside a subroutine frame the removal is logged so the
+    /// frame's exit re-inserts it — an enclosing scope's `string m` must not
+    /// be clobbered by a nested `int m` (§6.21/§23.8). Outside any frame
+    /// (process scope) it is a plain removal, as before.
+    fn forget_string_flag(&mut self, name: &str) {
+        if self.string_signals.remove(name) {
+            if let Some(log) = self.string_signals_removed.last_mut() {
+                log.push(name.to_string());
+            }
+        }
+    }
+
+    /// Does the lvalue mention any of `names` — root identifier segments or
+    /// member names — without allocating? Mirrors `collect_lvalue_target_names`.
+    fn lvalue_hits_names(lhs: &Expression, names: &HashSet<String>) -> bool {
+        match &lhs.kind {
+            ExprKind::Ident(h) => h.path.iter().any(|seg| names.contains(&seg.name.name)),
+            ExprKind::MemberAccess { expr, member } => {
+                names.contains(&member.name) || Self::lvalue_hits_names(expr, names)
+            }
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                Self::lvalue_hits_names(expr, names)
+            }
+            ExprKind::Concatenation(parts) => parts.iter().any(|p| Self::lvalue_hits_names(p, names)),
+            _ => false,
+        }
+    }
+
     fn static_coll_name_collides(&self, member: &str) -> bool {
+        if self.colliding_static_colls_ready {
+            return self.colliding_static_colls.contains(member);
+        }
         // A static collection collides only when it is declared by TWO
         // SIBLING classes (e.g. the four `uvm_cmdline_*` classes each
         // declaring `static … settings[$]`). A subclass inheriting the member
@@ -98199,7 +98299,7 @@ impl Simulator {
         // (the block-local decl clears stale flags), which would otherwise
         // permanently clobber an enclosing scope's `string m`; snapshot here
         // and restore below so a frame leaks neither an add nor a remove.
-        self.string_signals_saves.push(self.string_signals.clone());
+        self.string_signals_removed.push(Vec::new());
         if Self::is_string_data_type(&fd.return_type) {
             if self.string_signals.insert(ret_name.clone()) {
                 frame_string_signals.push(ret_name.clone());
@@ -98271,11 +98371,12 @@ impl Simulator {
         // global set now that the body is done (see frame_string_signals).
         // §6.21/§23.8: also restore the frame-scoped snapshot (see the push
         // at entry), so this frame's non-string locals can't leak a `remove`.
-        if let Some(snap) = self.string_signals_saves.pop() {
-            self.string_signals = snap;
-        } else {
-            for n in &frame_string_signals {
-                self.string_signals.remove(n);
+        for n in &frame_string_signals {
+            self.string_signals.remove(n);
+        }
+        if let Some(removed) = self.string_signals_removed.pop() {
+            for n in removed {
+                self.string_signals.insert(n);
             }
         }
         self.sync_static_locals();
@@ -98604,9 +98705,9 @@ impl Simulator {
     /// yield size 0, and `'{a,b}` must keep both elements).
     fn fn_returns_collection(&self, dt: &DataType) -> bool {
         use crate::ast::types::{DataType, UnpackedDimension};
-        let mut cur = dt.clone();
+        let mut cur: &DataType = dt;
         for _ in 0..8 {
-            match &cur {
+            match cur {
                 DataType::TypeReference {
                     name, dimensions, ..
                 } if dimensions.is_empty() => {
@@ -98619,7 +98720,7 @@ impl Simulator {
                         );
                     }
                     match self.module.typedef_types.get(tn) {
-                        Some(inner) => cur = inner.clone(),
+                        Some(inner) => cur = inner,
                         _ => return false,
                     }
                 }
@@ -100525,10 +100626,10 @@ impl Simulator {
                 // list (`Mix #(int A, type T, int B)`) comes from the full
                 // `param_order`, not `type_param_names` (which would wrong-
                 // index `T` onto the `A` slot).
-                let order = if cd.param_order.is_empty() {
-                    cd.type_param_names.clone()
+                let order: &[String] = if cd.param_order.is_empty() {
+                    &cd.type_param_names
                 } else {
-                    cd.param_order.clone()
+                    &cd.param_order
                 };
                 if let Some(idx) = order.iter().position(|p| p == tn) {
                     let frags = Self::split_spec_args(sig);
@@ -101685,29 +101786,19 @@ impl Simulator {
             // `uvm_factory factory = cs.get_factory();`). `property_inits` is an
             // unordered map, so repeat the pass until a full round changes
             // nothing — dependency chains settle regardless of iteration order.
+            // §8.7: field initializers run ONCE each, in DECLARATION order (as
+            // if they were the first statements of `new()`), so a later field
+            // may read an earlier one and an initializer with side effects
+            // (`int id = counter::take();`) fires exactly once. A fixed-point
+            // loop over the unordered map re-ran every initializer up to N+1
+            // times (reference: ids 1/2 3/4 5/6; the loop gave 5/6 11/12 17/18).
             if !deferred_call_inits.is_empty() {
-                for _ in 0..=deferred_call_inits.len() {
-                    let mut changed = false;
-                    for (pname, init) in deferred_call_inits.clone() {
-                        let before = self
-                            .heap
-                            .get(handle)
-                            .and_then(|o| o.as_ref())
-                            .and_then(|i| i.properties.get(&pname).cloned());
-                        if self.evaluate_call_init_at_construct(handle, &pname, &init) {
-                            let after = self
-                                .heap
-                                .get(handle)
-                                .and_then(|o| o.as_ref())
-                                .and_then(|i| i.properties.get(&pname).cloned());
-                            if before.as_ref() != after.as_ref() {
-                                changed = true;
-                            }
-                        }
-                    }
-                    if !changed {
-                        break;
-                    }
+                let order = &cdef.property_order;
+                deferred_call_inits.sort_by_key(|(pname, _)| {
+                    order.iter().position(|p| p == pname).unwrap_or(usize::MAX)
+                });
+                for (pname, init) in &deferred_call_inits {
+                    self.evaluate_call_init_at_construct(handle, pname, init);
                 }
             }
             self.class_context_stack.pop();
@@ -109532,7 +109623,7 @@ impl Simulator {
                 // free-function path) so this method's non-string locals can't
                 // leak a `string_signals.remove` that clobbers an enclosing
                 // scope's `string <name>`.
-                self.string_signals_saves.push(self.string_signals.clone());
+                self.string_signals_removed.push(Vec::new());
                 if let ClassMethodKind::Function(f) = &method.kind {
                     if Self::is_string_data_type(&f.return_type) {
                         if self.string_signals.insert(f.name.name.name.clone()) {
@@ -109776,11 +109867,12 @@ impl Simulator {
                 // method's non-string locals can't leak a `remove` (parking
                 // mirrors the free-function path: the frame is torn down and
                 // re-entered on resume, re-pushing the snapshot).
-                if let Some(snap) = self.string_signals_saves.pop() {
-                    self.string_signals = snap;
-                } else {
-                    for n in &frame_string_signals {
-                        self.string_signals.remove(n);
+                for n in &frame_string_signals {
+                    self.string_signals.remove(n);
+                }
+                if let Some(removed) = self.string_signals_removed.pop() {
+                    for n in removed {
+                        self.string_signals.insert(n);
                     }
                 }
                 self.current_spec = saved_spec;
