@@ -110,7 +110,7 @@ and testbench flows. Portable code should not rely on them.
 
 # What's new in 0.10
 
-### Unreleased — packed-struct codegen, container arrays, opt-in waveforms
+### 0.10.4 — power intent, packed-struct codegen, opt-in waveforms (September 2026)
 
 * **Packed-struct member assignments compile** instead of falling back to the
   AST interpreter. `s.m`, nested `s.p.m` (and every `union`-in-struct form),
@@ -141,9 +141,17 @@ and testbench flows. Portable code should not rely on them.
   unannounced. `--fst`/`--xtrace` imply it, so existing command lines are
   unchanged.
 
-- IEEE 1801 power intent: `--upf` / `--upf-top` simulate supply nets, power switches, domain corruption, isolation clamps and retention, with the standard `UPF` package functions (`supply_on` and friends). See "Power intent (UPF)".
-- `release` inside a level-sensitive block (`always @(en)`, `@*`, or a process resumed by `@(en)`) now returns the net to its continuous drivers immediately; it used to keep the forced value until the driver changed again.
-- UPF: `load_upf -scope` applies the nested file below that instance, `set_isolation -update` merges into the named strategy, and `-elements {.}` names the scope instance; `examples/upf/` is a runnable power-intent example.
+* **IEEE 1801 power intent** via `--upf` / `--upf-top`: supply nets with
+  state and voltage, power switches, corruption of powered-down elements,
+  isolation clamps and retention, driven from the testbench through the
+  standard `UPF` package (`supply_on` and friends). Multi-file intent chains
+  with `load_upf -scope`, `-update` merges into a named strategy, and
+  `-elements {.}` names the scope instance. `examples/upf/` is a runnable
+  example; see "Power intent (UPF)".
+* **`release` inside a level-sensitive block** (`always @(en)`, `@*`, or a
+  process resumed by `@(en)`) now returns the net to its continuous drivers
+  immediately. It used to keep the forced value until the driver happened to
+  change again, because the re-drive was lost inside the settle pass.
 ### 0.10.1 – 0.10.3 — native compilation and process conformance (August 2026)
 
 * **AOT native backend** (`XEZIM_JIT=1 XEZIM_AOT=1`, needs a `--features jit` build) — the
