@@ -49,6 +49,8 @@ mod cast_valparam_typeparam_static;
 mod cast_value_param_specs;
 #[path = "types/circular_typedef_diagnostics.rs"]
 mod circular_typedef_diagnostics;
+#[path = "types/class_module_same_name.rs"]
+mod class_module_same_name;
 #[path = "types/conditional_real_x_select.rs"]
 mod conditional_real_x_select;
 #[path = "types/const_function_params.rs"]
