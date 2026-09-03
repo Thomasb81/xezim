@@ -12477,20 +12477,25 @@ impl Simulator {
             .collect();
         // A static-collection bare name declared by TWO SIBLING classes must
         // be stored per DECLARING class (§8.9) — compute that set up front.
-        // A name is colliding iff two classes declaring it are NOT in an
-        // ancestor/descendant relationship (a base+subclass pair like
-        // `uvm_sequence_library` / `simple_seq_lib` shares one cell and is not
-        // a collision). `module.classes` is fully populated here.
+        // A static-collection name needs per-DECLARING-class storage whenever
+        // two or more classes declare it (§8.9 each gets its own cell). This
+        // covers sibling collisions (the four `uvm_cmdline_*` classes each
+        // declaring `static … settings[$]`) AND a derived class that
+        // REDECLARES a base's static collection (`d` extends `b`, both declare
+        // `static m_q[$]` → `d::m_q` and `b::m_q` are separate). Inherited-ONLY
+        // access (a single declarer further up the chain) is not a collision
+        // and keeps the bare, shared store the runtime relies on.
+        // `module.classes` is fully populated here.
         let mut colliding_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        let name_counts: std::collections::HashMap<&str, Vec<&str>> =
+        let name_counts: std::collections::HashMap<String, Vec<String>> =
             self.module.classes.values().fold(
                 std::collections::HashMap::new(),
                 |mut acc, cd| {
                     let mut seen: Vec<&str> = Vec::new();
                     for (nm, _, _) in &cd.static_collections {
                         if !seen.contains(&nm.as_str()) {
-                            acc.entry(nm.as_str()).or_default().push(&cd.name);
+                            acc.entry(nm.clone()).or_default().push(cd.name.clone());
                             seen.push(nm.as_str());
                         }
                     }
@@ -12498,15 +12503,15 @@ impl Simulator {
                 },
             );
         for (nm, classes) in &name_counts {
-            let mut collides = false;
-            for (i, a) in classes.iter().enumerate() {
-                for b in &classes[i + 1..] {
-                    if !self.class_is_a(a, b) && !self.class_is_a(b, a) {
-                        collides = true;
-                    }
-                }
-            }
-            if collides {
+            // A single class may be materialised under several keys in
+            // `module.classes` (parameterized specializations that collapse
+            // to the same name); count DISTINCT class names so we detect true
+            // cross-class collisions / redeclarations, not the same class
+            // twice. The only names left are genuinely declared by 2+ classes.
+            let mut uniq: Vec<&String> = classes.iter().collect();
+            uniq.sort();
+            uniq.dedup();
+            if uniq.len() >= 2 {
                 colliding_names.insert(nm.to_string());
             }
         }
@@ -70608,26 +70613,44 @@ impl Simulator {
             // `A.settings.size()` / `A.settings[k]` must resolve to that
             // per-class key, not collapse to the bare `settings` (which would
             // hit whichever sibling stored under the bare name).
-            if hier.path[0].selects.is_empty()
-                && self.module.classes.contains_key(&hier.path[0].name.name)
-            {
-                let cls = hier.path[0].name.name.clone();
-                let member = &hier.path[1].name.name;
-                if self.member_is_static_coll(&cls, member) {
-                    if let Some(key) = self.static_prop_key(&cls, member) {
-                        // Sibling-class collision: the bare name is stored per
-                        // DECLARING class. NOT the `#spec` case here — that is
+            if hier.path[0].selects.is_empty() {
+                let lead = hier.path[0].name.name.clone();
+                // The leading segment may be a class-LOCAL through a typedef
+                // alias (`this_type` inside a base method — each class
+                // declares `typedef base this_type`), so resolve it to the
+                // concrete class first; a real class name resolves to itself.
+                let cls = self
+                    .resolve_typeref_class_name_str(&lead)
+                    .filter(|c| self.module.classes.contains_key(c))
+                    .unwrap_or(lead.clone());
+                if self.module.classes.contains_key(&cls) {
+                    let member = &hier.path[1].name.name;
+                    if self.member_is_static_coll(&cls, member) {
+                        if let Some(key) = self.static_prop_key(&cls, member) {
+                        // Per-declaring-class storage (§8.9). A static
+                        // collection COLLIDES when two classes declare it;
+                        // and a derived class that REDECLARES a static
+                        // collection (rather than merely inheriting it) also
+                        // gets its OWN cell keyed by the declaring class —
+                        // `d::m_q` must not share `b::m_q` when `d` declares
+                        // its own `static m_q`. Inherited-only access (the
+                        // sole declarer is an ancestor) keeps the bare name,
+                        // sharing the ancestor's single cell. NOT the
+                        // `#spec` case here — that is
                         // handled by the typedef-alias block above and by
                         // `spec_static_coll_key`, and intercepting it would
                         // split storage for a parameterized subclass
                         // (`simple_seq_lib::typewide` reading a per-spec key
                         // that registration writes under the bare name).
-                        if self.static_coll_name_collides(member) {
+                        if self.static_coll_name_collides(member)
+                            || self.class_declares_coll(&cls, member)
+                        {
                             return key;
                         }
                     }
                 }
             }
+        }
         }
 
         // Multi-segment suffix fallback: for paths like "uut.picorv32_core.cpu_state",
@@ -91932,8 +91955,19 @@ impl Simulator {
 
     /// Is `member` a STATIC queue/assoc/dynamic-array collection property of
     /// `start_class` or an ancestor (i.e. it is in `static_collections`)?
-    fn member_is_static_coll(&self, start_class: &str, member: &str) -> bool {
-        let mut cur: Option<&str> = Some(start_class);
+    /// Does `cls` itself (not an ancestor) declare `member` as a STATIC
+    /// collection in its own body? Used to distinguish a derived class that
+    /// REDECLARES a static collection (gets its own §8.9 cell) from one that
+    /// merely INHERITS it (shares the ancestor's cell).
+    fn class_declares_coll(&self, cls: &str, member: &str) -> bool {
+        self.module
+            .classes
+            .get(cls)
+            .map(|cd| cd.static_collections.iter().any(|(n, _, _)| n == member))
+            .unwrap_or(false)
+    }
+
+    fn member_is_static_coll(&self, start_class: &str, member: &str) -> bool {        let mut cur: Option<&str> = Some(start_class);
         while let Some(cn) = cur {
             if let Some(cd) = self.module.classes.get(cn) {
                 if cd.static_collections.iter().any(|(n, _, _)| n == member) {
