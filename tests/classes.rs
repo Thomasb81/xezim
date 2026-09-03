@@ -248,3 +248,7 @@ mod enum_local_shadows_flat_maps;
 mod ref_formal_shadows_property;
 #[path = "classes/field_init_once_in_order.rs"]
 mod field_init_once_in_order;
+#[path = "classes/caller_local_shadows_this_cast.rs"]
+mod caller_local_shadows_this_cast;
+#[path = "classes/condition_waiter_yields_to_inactive.rs"]
+mod condition_waiter_yields_to_inactive;
