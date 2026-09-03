@@ -2447,6 +2447,12 @@ suppressed but the explicit SDF annotation still applies."
                         sim.set_args(&args);
                         let compilation_start = std::time::Instant::now();
                         sim.compile();
+                        if !sim.compile_errors.is_empty() {
+                            for e in &sim.compile_errors {
+                                eprintln!("Error: {}", e);
+                            }
+                            std::process::exit(1);
+                        }
                         eprintln!(
                             "[PHASE] compilation: {:.1}ms",
                             compilation_start.elapsed().as_secs_f64() * 1000.0

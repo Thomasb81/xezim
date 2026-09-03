@@ -912,6 +912,12 @@ fn simulate_multi_inner(
         sim.sdf_annotation = Some(annotation);
     }
     sim.compile();
+    // A compile-time failure (e.g. §6.18 illegal non-class to class-handle
+    // assignment) aborts before any block is scheduled; surface it as `Err` so
+    // library callers see the compile error instead of a bogus run.
+    if !sim.compile_errors.is_empty() {
+        return Err(sim.compile_errors.join("; "));
+    }
     eprintln!(
         "[PHASE] compilation: {:.1}ms",
         compilation_start.elapsed().as_secs_f64() * 1000.0
