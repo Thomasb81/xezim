@@ -4590,6 +4590,11 @@ pub struct Simulator {
     /// the event queue only at the END of the current tick, after
     /// `apply_nba` has run (see `promote_inactive_to_active`).
     inactive_queue: Vec<(usize, ProcCont)>,
+    /// Processes waiting for the NBA region to commit (e.g.
+    /// `uvm_wait_for_nba_region`: `nba <= next_nba; @(nba)` where `nba` is a
+    /// procedural variable). Resumed in `run_one_tick` after all active +
+    /// inactive (`#0`) deltas have settled and `apply_nba` has committed.
+    nba_region_waiters: Vec<(usize, ProcCont)>,
     /// Bumped whenever a `wait(expr)` condition evaluates true (a parked waiter
     /// proceeds). The condition-waiter fixpoint uses it to detect "no progress
     /// this round" and stop (genuine stall).
@@ -8217,6 +8222,7 @@ impl Simulator {
             cond_waiter_reads: HashMap::default(),
             cond_waiter_conditions: HashMap::default(),
             inactive_queue: Vec::new(),
+            nba_region_waiters: Vec::new(),
             cond_progress: 0,
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
@@ -34805,6 +34811,7 @@ impl Simulator {
         // region — so they observe post-edge state and this cycle's samples.
         self.drain_deferred_clocking_conts();
         self.drain_reactive_region();
+        self.drain_nba_region_waiters();
         self.fire_vpi_synch_cbs();
         self.check_monitor();
         self.drain_pending_strobes();
@@ -35287,10 +35294,19 @@ impl Simulator {
                 None
             };
             let next_delayed = self.next_delayed_time();
+            let next_nba_time = if !self.nba_fast.is_empty()
+                || !self.nba_queue.is_empty()
+                || !self.nba_region_waiters.is_empty()
+            {
+                Some(self.time)
+            } else {
+                None
+            };
             let next_time = [
                 next_eq_time,
                 next_clk_time,
                 next_delayed,
+                next_nba_time,
                 self.next_vpi_cb_time(),
             ]
                 .into_iter()
@@ -39519,9 +39535,10 @@ impl Simulator {
                                 // waited on (uvm_wait_for_nba_region:
                                 // `nba <= next_nba; @(nba)`). Its event_waiter
                                 // would resolve to no signal_id and park forever;
-                                // treat it as a one-delta yield (its purpose is to
-                                // yield across the NBA region).
-                                self.event_queue.schedule(self.time, pid, cont);
+                                // park in nba_region_waiters so it resumes only
+                                // after the active + inactive (#0) deltas have
+                                // settled and the NBA region has committed.
+                                self.nba_region_waiters.push((pid, cont));
                             }
                             return;
                         }
@@ -69160,6 +69177,26 @@ impl Simulator {
         self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
     }
 
+    /// Resume processes waiting on NBA-region completion (such as
+    /// `uvm_wait_for_nba_region`: `nba <= next_nba; @(nba)`). Resumes in the
+    /// Reactive region after all active + inactive (`#0`) deltas have settled
+    /// and `apply_nba` has committed the NBA region.
+    fn drain_nba_region_waiters(&mut self) {
+        if self.nba_region_waiters.is_empty() {
+            return;
+        }
+        let waiters = std::mem::take(&mut self.nba_region_waiters);
+        for (pid, cont) in waiters {
+            if self.finished {
+                break;
+            }
+            self.run_scheduled_process(pid, &cont);
+            if !self.is_pid_suspended(pid) {
+                self.child_finished(pid);
+            }
+        }
+    }
+
     /// LRM §16.5: edge-detect each registered SVA clock, then for each
     /// fired clock site:
     ///   1. Drain any deferred consequents whose cycle counter reaches 0.
@@ -75323,6 +75360,9 @@ impl Simulator {
         if self.inactive_queue.iter().any(|(p, _)| *p == pid) {
             return true;
         }
+        if self.nba_region_waiters.iter().any(|(p, _)| *p == pid) {
+            return true;
+        }
         // A process blocked on `fork...join`/`join_any` is the PARENT of a
         // join_waiter — also suspended. Without this it was treated as finished,
         // so its process context (this_stack, locals) was dropped and the
@@ -75482,6 +75522,7 @@ impl Simulator {
             self.cond_waiter_conditions.remove(p);
         }
         self.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
+        self.nba_region_waiters.retain(|(p, _)| !to_kill.contains(p));
         for q in self.mailbox_get_waiters.values_mut() {
             q.retain(|w| !to_kill.contains(&w.pid));
         }
