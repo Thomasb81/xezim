@@ -98200,6 +98200,13 @@ impl Simulator {
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut assoc_params: Vec<(String, String, bool, Option<bool>)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
+        // Class-typed / class-TYPE-PARAMETER formals, gathered while binding so
+        // they can be recorded into THIS function's freshly-pushed frame overlay
+        // (right after `push_local_frame`) rather than the CALLER's top overlay
+        // (which `local_class_type_of`/`method_local_base` cannot see from here).
+        // Recording them inline into `var_class_types` only leaves a bare-name
+        // entry that unrelated scopes clobber. Mirrors the method path.
+        let mut frame_class_formals: Vec<(String, String)> = Vec::new();
         // `output`/`inout`/`ref` STRUCT formals are bound member-wise (locals
         // `o.a`, `o.b`), so they bypass the whole-value `output_bindings`
         // path — collect their `(local_key, caller_lvalue)` pairs to copy
@@ -98362,7 +98369,7 @@ impl Simulator {
                     self.record_local_typedef_type(&port.name.name, &type_name);
                     self.var_typedef_types.insert(port.name.name.clone(), type_name);
                 } else if self.module.classes.contains_key(&type_name) {
-                    self.record_local_class_type(&port.name.name, &type_name);
+                    frame_class_formals.push((port.name.name.clone(), type_name.clone()));
                     self.var_class_types.insert(port.name.name.clone(), type_name);
                 } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
                     // The formal is typed with a class TYPE PARAMETER
@@ -98386,7 +98393,7 @@ impl Simulator {
                                 .classes
                                 .contains_key(concrete.split('#').next().unwrap_or(&concrete)));
                     if cn_is_class {
-                        self.record_local_class_type(&port.name.name, &concrete);
+                        frame_class_formals.push((port.name.name.clone(), concrete.clone()));
                         self.var_class_types.insert(port.name.name.clone(), concrete);
                     }
                 }
@@ -98537,6 +98544,11 @@ impl Simulator {
         }
         self.local_iface_aliases.push(iface_alias_frame);
         self.push_local_frame(locals);
+        // Record this function's class-typed / class-type-param formals into
+        // this function's freshly-pushed frame overlay (see collector decl above).
+        for (fname, fcls) in &frame_class_formals {
+            self.record_local_class_type(fname, fcls);
+        }
         self.return_value = None;
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
@@ -109465,6 +109477,16 @@ impl Simulator {
                 // Member-wise struct `output`/`inout`/`ref` formals bypass the
                 // whole-value `output_bindings` path (see exec_function_call).
                 let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
+                // Class-typed and class-TYPE-PARAMETER formals, collected while
+                // binding so they can be recorded into the CALLEE's fresh frame
+                // overlay AFTER `push_local_frame` (the overlay is only pushed
+                // once the value frame is). Recording them during the binding
+                // loop would land them on the CALLER's top frame, where the
+                // callee's `local_class_type_of` cannot see them (it starts at
+                // `method_local_base`) — leaving `class_of_var` to fall through
+                // to the FLAT `var_class_types` map, whose bare-name key is
+                // clobbered by unrelated scopes (UVM config_db's `imp`).
+                let mut frame_class_formals: Vec<(String, String)> = Vec::new();
                 for (i, port) in ports.iter().enumerate() {
                     if matches!(self.resolve_dt(&port.data_type), DataType::Struct(_)) {
                         self.register_formal_type_metadata(
@@ -109716,7 +109738,7 @@ impl Simulator {
                             self.record_local_typedef_type(&port.name.name, &type_name);
                             self.var_typedef_types.insert(port.name.name.clone(), type_name);
                         } else if self.module.classes.contains_key(&type_name) {
-                            self.record_local_class_type(&port.name.name, &type_name);
+                            frame_class_formals.push((port.name.name.clone(), type_name.clone()));
                             self.var_class_types.insert(port.name.name.clone(), type_name.clone());
                         } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
                             // See the identical branch in exec_function_call's
@@ -109739,7 +109761,7 @@ impl Simulator {
                                             concrete.split('#').next().unwrap_or(&concrete),
                                         ));
                             if cn_is_class {
-                                self.record_local_class_type(&port.name.name, &concrete);
+                                frame_class_formals.push((port.name.name.clone(), concrete.clone()));
                                 self.var_class_types.insert(port.name.name.clone(), concrete);
                             }
                         }
@@ -110036,6 +110058,16 @@ impl Simulator {
                     }
                 };
                 self.push_local_frame(locals);
+                // Record this method's class-typed / class-type-param formals
+                // into the CALLEE's freshly-pushed frame overlay, so the body's
+                // `class_of_var`/`local_class_type_of` resolve them from THIS
+                // activation instead of the flat bare-name `var_class_types` map
+                // (whose `imp`-style keys unrelated scopes clobber). They were
+                // collected during the formals loops above because recording
+                // there targeted the CALLER's already-top overlay.
+                for (fname, fcls) in &frame_class_formals {
+                    self.record_local_class_type(fname, fcls);
+                }
                 // Record the `local_stack` depth BEFORE this method's own
                 // frame (i.e. the count of caller frames) so that
                 // `get_expr_type_name`'s `in_any_frame` check only considers
