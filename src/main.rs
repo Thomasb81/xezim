@@ -130,6 +130,10 @@ fn print_usage() {
     eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
     eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
     eprintln!("                     sources in parse order, -v library files, -y library dirs");
+    eprintln!("  --upf <file>             Load IEEE 1801 power intent (repeatable): supply nets, power");
+    eprintln!("                           switches, domain corruption, isolation; UPF package functions");
+    eprintln!("  --upf-top <path>         Instance the UPF scope applies to (default: first instance of");
+    eprintln!("                           the set_design_top module)");
     eprintln!("  --dump-merged-sv <file>  Write the sources, fully preprocessed (`ifdef");
     eprintln!("                     resolved, macros expanded, `includes inlined), into one");
     eprintln!("                     self-contained .sv file — a standalone repro for");
@@ -1524,6 +1528,8 @@ fn run_main() -> i32 {
     let mut sim_debug = false;
     let mut dump_files_list = false;
     let mut dump_merged_sv: Option<String> = None;
+    let mut upf_files: Vec<String> = Vec::new();
+    let mut upf_top: Option<String> = None;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
@@ -2016,6 +2022,26 @@ fn run_main() -> i32 {
             }
             "--dump-files-list" => {
                 dump_files_list = true;
+            }
+            "--upf" => {
+                i += 1;
+                if i < args.len() {
+                    upf_files.push(args[i].clone());
+                    xezim_core::upf::add_upf_file(args[i].clone());
+                } else {
+                    eprintln!("Error: --upf requires a UPF file name");
+                    std::process::exit(1);
+                }
+            }
+            "--upf-top" => {
+                i += 1;
+                if i < args.len() {
+                    upf_top = Some(args[i].clone());
+                    xezim_core::upf::set_upf_top(args[i].clone());
+                } else {
+                    eprintln!("Error: --upf-top requires an instance path");
+                    std::process::exit(1);
+                }
             }
             "--dump-merged-sv" => {
                 i += 1;
