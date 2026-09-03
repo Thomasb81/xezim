@@ -3278,6 +3278,9 @@ pub struct Simulator {
     pub signals: SignalMap,
     /// Signals currently under force/release control (LRM §9.3.1).
     forced_signals: HashMap<usize, Value>,
+    /// Nets released while a settle pass was running (the entry table is
+    /// taken out then); re-driven when the pass ends.
+    pending_release_ids: Vec<usize>,
     /// Memoization for `prop_bound_collection`: (class, member) → resolved
     /// raw type name (hierarchy walk), and type name → is-collection verdict
     /// (which otherwise LINEAR-SCANS every class's local typedefs — 5% of an
@@ -7896,6 +7899,7 @@ impl Simulator {
             real_signals,
             multi_dim_array_names,
             forced_signals: HashMap::default(),
+            pending_release_ids: Vec::new(),
             prop_raw_ty_cache: std::cell::RefCell::new(HashMap::default()),
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
@@ -45547,6 +45551,27 @@ impl Simulator {
         // §29: sequential UDPs mutate per-instance state during evaluation,
         // which the parallel/BSP isolated eval (`&self`, view-based) cannot do.
         // Force the serial fixpoint path whenever the design contains any UDP.
+        self.settle_dispatch();
+        // A `release` executed inside the pass (by a level-sensitive block
+        // evaluated as a comb entry) could not re-drive its net because the
+        // entry table was taken out: do it now and settle again until quiet.
+        let mut rounds = 0;
+        while !self.pending_release_ids.is_empty() && rounds < 8 {
+            rounds += 1;
+            let ids = std::mem::take(&mut self.pending_release_ids);
+            for id in ids {
+                self.mark_release_sources_dirty(id);
+            }
+            if self.dirty_any {
+                self.settle_dispatch();
+            }
+        }
+        if !self.active_force_exprs.is_empty() {
+            self.refresh_active_forces();
+        }
+    }
+
+    fn settle_dispatch(&mut self) {
         if self.has_udp || self.proc_settle_defer || !self.deferred_proc_entries.is_empty() {
             self.settle_combinatorial_inner();
         } else if self.perlp_settle.is_some() {
@@ -45571,8 +45596,34 @@ impl Simulator {
         // cannot re-trigger the very entries that fed it (no oscillation);
         // a target with comb readers marks them dirty and the caller's
         // next settle picks that up as usual.
-        if !self.active_force_exprs.is_empty() {
-            self.refresh_active_forces();
+    }
+
+    /// `release` of a net: its continuous drivers must re-evaluate. Outside a
+    /// settle the source signals of every entry writing the net are marked
+    /// dirty right away; inside one (entry table taken out, dirty marks
+    /// dropped with the pass) the id is queued for `settle_combinatorial`.
+    fn redrive_released_signal(&mut self, id: usize) {
+        if self.settling || self.comb_entries.is_empty() {
+            self.pending_release_ids.push(id);
+            self.dirty_any = true;
+            return;
+        }
+        self.mark_release_sources_dirty(id);
+    }
+
+    fn mark_release_sources_dirty(&mut self, id: usize) {
+        let mut sources: Vec<usize> = Vec::new();
+        for entry in self.comb_entries.iter() {
+            if entry.cold.write_signal_ids.contains(&id) {
+                sources.extend(entry.cold.read_signal_ids.iter().copied());
+            }
+        }
+        for src_id in sources {
+            if src_id < self.dirty_signals.len() && !self.dirty_signals[src_id] {
+                self.dirty_signals[src_id] = true;
+                self.dirty_list.push(src_id);
+                self.dirty_any = true;
+            }
         }
     }
 
@@ -64038,21 +64089,9 @@ impl Simulator {
                         if let Some(id) = id {
                             self.forced_signals.remove(&id);
                             // Re-evaluate continuous drivers (nets). For a
-                            // variable no comb entry writes it, so this loop
+                            // variable no comb entry writes it, so the scan
                             // finds nothing and the value is retained.
-                            let mut sources: Vec<usize> = Vec::new();
-                            for entry in self.comb_entries.iter() {
-                                if entry.cold.write_signal_ids.contains(&id) {
-                                    sources.extend(entry.cold.read_signal_ids.iter().copied());
-                                }
-                            }
-                            for src_id in sources {
-                                if src_id < self.dirty_signals.len() && !self.dirty_signals[src_id]
-                                {
-                                    self.dirty_signals[src_id] = true;
-                                    self.dirty_list.push(src_id);
-                                }
-                            }
+                            self.redrive_released_signal(id);
                         }
                     }
                     // A released signal that is a gateable flop's output (`q` in
@@ -113839,19 +113878,8 @@ pub extern "C" fn vpi_put_value(
         if flags == vpi::RELEASE_FLAG {
             // Release: remove from forced_signals and trigger settle
             sim.forced_signals.remove(&sig_id);
-            // Find comb entries that write to this signal and add their source
-            // signals to dirty_list. This ensures settle sees the source as dirty
-            // and triggers the comb entry through the dep_entries mechanism.
-            for entry in sim.comb_entries.iter() {
-                if entry.cold.write_signal_ids.contains(&sig_id) {
-                    for &src_id in &entry.cold.read_signal_ids {
-                        if src_id < sim.dirty_signals.len() && !sim.dirty_signals[src_id] {
-                            sim.dirty_signals[src_id] = true;
-                            sim.dirty_list.push(src_id);
-                        }
-                    }
-                }
-            }
+            // Re-evaluate the continuous drivers of the released net.
+            sim.redrive_released_signal(sig_id);
             // Release invalidates the event-edge assumption that a flop's
             // output still reflects its last sampled inputs.
             sim.edge_block_snap_valid
