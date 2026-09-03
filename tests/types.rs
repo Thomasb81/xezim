@@ -350,3 +350,5 @@ mod type_id_create_applies_override;
 mod queue_literal_function_return;
 #[path = "types/class_handle_nonclass_assign_compile_err.rs"]
 mod class_handle_nonclass_assign_compile_err;
+#[path = "types/vector_type_arg_spec.rs"]
+mod vector_type_arg_spec;

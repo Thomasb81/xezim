@@ -244,3 +244,5 @@ mod member_collection_runtime_class;
 mod enum_local_shadows_flat_maps;
 #[path = "classes/ref_formal_shadows_property.rs"]
 mod ref_formal_shadows_property;
+#[path = "classes/field_init_once_in_order.rs"]
+mod field_init_once_in_order;
