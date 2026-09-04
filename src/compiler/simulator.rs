@@ -46302,6 +46302,7 @@ impl Simulator {
                 // ELEMENT type. The generic eval concatenates items at their
                 // own widths, which scrambles any item that is not exactly
                 // element-sized.
+                //
                 let val = if let ExprKind::AssignmentPattern(items) = &rhs.kind {
                     self.packed_pattern_for_lhs(lhs, items)
                         .or_else(|| self.eval_packed_struct_pattern(lhs, items))
@@ -48413,6 +48414,10 @@ impl Simulator {
         let actual = self.ref_binding_stack.last().and_then(|m| m.get(name))?;
         let ExprKind::Ident(ah) = &actual.kind else { return None };
         if ah.path.is_empty() {
+            return None;
+        }
+        // A self-mapped binding (`a` -> `a`) would rewrite forever.
+        if ah.path.len() == 1 && ah.path[0].selects.is_empty() && ah.path[0].name.name == name {
             return None;
         }
         let mut path = ah.path.clone();
@@ -53618,6 +53623,31 @@ impl Simulator {
                 // arrays — module-level OR class-property, accessed as bare
                 // `a`, `this.a`, or `obj.a`. `rhs_.sa == lhs.sa` in a class
                 // method (`compare`/`do_compare`) is the common case.
+                // Multi-dimensional unpacked arrays (or a row of one) compare
+                // element-wise by suffix; the 1-D arm below sees no shape.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
+                    && !(self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
+                {
+                    if let (Some((lb, ls, l_nd)), Some((rb, rs, r_nd))) =
+                        (self.nd_array_operand(left), self.nd_array_operand(right))
+                    {
+                        if l_nd || r_nd {
+                            let mut equal = ls.len() == rs.len();
+                            if equal {
+                                for (a, b) in ls.iter().zip(rs.iter()) {
+                                    let lv = self.get_signal_value_by_name(&format!("{}{}", lb, a));
+                                    let rv = self.get_signal_value_by_name(&format!("{}{}", rb, b));
+                                    if lv.is_none() || rv.is_none() || lv != rv {
+                                        equal = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            let bit = if matches!(op, BinaryOp::Eq) { equal } else { !equal };
+                            return Value::from_u64(bit as u64, 1);
+                        }
+                    }
+                }
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
                     if let (Some((ln, llo, lhi)), Some((rn, rlo, rhi))) =
                         (self.fixed_array_operand(left), self.fixed_array_operand(right))
@@ -61523,6 +61553,13 @@ impl Simulator {
                     return;
                 }
                 // LHS fixed array  ←  RHS dynamic array/prop
+                // Multi-dimensional unpacked arrays: whole copy (`w = v`) and
+                // row copy (`r = v[1]`, `v[1] = r`) go element-wise by suffix;
+                // the arms below only know one dimension.
+                if self.copy_multi_dim_array(lvalue, rvalue) {
+                    self.settle_after_proc_write();
+                    return;
+                }
                 if let (Some((dst, lo, hi)), Some(src)) = (l_fix, r_dyn.clone()) {
                     let desc = self.module.descending_arrays.contains(&dst);
                     let cap = (hi - lo + 1) as u64;
@@ -86737,7 +86774,14 @@ impl Simulator {
             DataType::Struct(su) => Self::spreads_member_wise(&su),
             _ => false,
         };
-        if !dt_is_unpacked_struct && !self.module.dynamic_arrays.contains(base) {
+        // A dotted name that is a REGISTERED fixed array (an inlined
+        // instance's `u.v[2][2]`, a generate block's `g.w`) keeps its shape:
+        // the dynamic-array fallback below reclassified it and handed each
+        // row a bare pattern.
+        let registered_fixed = self.module.arrays.contains_key(base)
+            || self.module.arrays_2d.contains_key(base)
+            || self.module.arrays_nd.contains_key(base);
+        if !dt_is_unpacked_struct && !self.module.dynamic_arrays.contains(base) && !registered_fixed {
             // Only register SUB-PATHS (dotted, like `info.addr`) in
             // `dynamic_arrays` — a bare variable like `src` is NOT a queue
             // even if `p_elem_type` finds an element type for it.
@@ -97811,6 +97855,33 @@ impl Simulator {
                 caller = scoped;
             }
         }
+        // §13.5.2 multi-dimensional formal (`int a[R][C]`, `a[X][Y][Z]`): copy
+        // every element of the caller's array in under the formal's name and
+        // register the same shape, so element, `foreach`, `%p`, `$size` and
+        // whole-array uses inside the body see a real array; out/inout/ref
+        // copy back through `writeback_array_args`. Only the first dimension
+        // was handled before: a 2-D formal read x and never wrote back.
+        if dims.len() >= 2 {
+            let param = port.name.name.clone();
+            let suffixes = if let Some(&((a0, a1), (b0, b1), w)) = self.module.arrays_2d.get(&caller) {
+                self.module.arrays_2d.insert(param.clone(), ((a0, a1), (b0, b1), w));
+                Self::nd_elem_suffixes(&[(a0, a1), (b0, b1)])
+            } else if let Some((shape, w)) = self.module.arrays_nd.get(&caller).cloned() {
+                self.module.arrays_nd.insert(param.clone(), (shape.clone(), w));
+                Self::nd_elem_suffixes(&shape)
+            } else {
+                return None;
+            };
+            self.multi_dim_array_names.insert(param.clone());
+            if param != caller {
+                for sfx in &suffixes {
+                    if let Some(v) = self.get_signal_value_by_name(&format!("{}{}", caller, sfx)) {
+                        self.signals.insert(format!("{}{}", param, sfx), v);
+                    }
+                }
+            }
+            return Some((param, caller, lo, hi));
+        }
         if !self.module.arrays.contains_key(&caller) {
             return None;
         }
@@ -97839,8 +97910,119 @@ impl Simulator {
 
     /// Copy an array formal's elements back onto the caller's array, then drop
     /// the formal's element signals.
+    /// `[i][j]…` element suffixes of an N-dimensional shape, row-major.
+    fn nd_elem_suffixes(dims: &[(i64, i64)]) -> Vec<String> {
+        let mut out: Vec<String> = vec![String::new()];
+        for &(d0, d1) in dims {
+            let (lo, hi) = (d0.min(d1), d0.max(d1));
+            let mut next = Vec::with_capacity(out.len() * ((hi - lo + 1).max(0) as usize));
+            for prefix in &out {
+                for i in lo..=hi {
+                    next.push(format!("{}[{}]", prefix, i));
+                }
+            }
+            out = next;
+        }
+        out
+    }
+
+    /// Element suffixes of a name registered as a multi-dimensional array.
+    fn nd_formal_suffixes(&self, name: &str) -> Option<Vec<String>> {
+        if let Some(&(a, b, _)) = self.module.arrays_2d.get(name) {
+            return Some(Self::nd_elem_suffixes(&[a, b]));
+        }
+        if let Some((shape, _)) = self.module.arrays_nd.get(name) {
+            return Some(Self::nd_elem_suffixes(shape));
+        }
+        None
+    }
+
+    /// Drop the array registrations a formal received in `bind_array_arg`.
+    fn purge_array_formal(&mut self, param: &str) {
+        self.module.arrays.remove(param);
+        if self.module.arrays_2d.remove(param).is_some() | self.module.arrays_nd.remove(param).is_some() {
+            self.multi_dim_array_names.remove(param);
+        }
+    }
+
+    /// An unpacked-array operand as `(base, element suffixes)`: a whole
+    /// N-D array (`v`), a row of one (`v[1]` -> base `v[1]`, suffixes over
+    /// the remaining dimensions), or a plain fixed 1-D array. `None` for
+    /// anything else (dynamic / associative / queue / scalar).
+    fn nd_array_operand(&mut self, e: &Expression) -> Option<(String, Vec<String>, bool)> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                let name = self.resolve_hier_name(h);
+                if let Some(sfx) = self.nd_formal_suffixes(&name) {
+                    return Some((name, sfx, true));
+                }
+                if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
+                    if !self.module.dynamic_arrays.contains(&name) {
+                        let desc = self.module.descending_arrays.contains(&name);
+                        let mut sfx: Vec<String> = (lo..=hi).map(|i| format!("[{}]", i)).collect();
+                        if desc {
+                            sfx.reverse();
+                        }
+                        return Some((name, sfx, false));
+                    }
+                }
+                None
+            }
+            ExprKind::Index { expr, index } => {
+                let ExprKind::Ident(h) = &expr.kind else { return None };
+                if !h.path.iter().all(|s| s.selects.is_empty()) {
+                    return None;
+                }
+                let name = self.resolve_hier_name(h);
+                let rest: Vec<(i64, i64)> = if let Some(&(_, b, _)) = self.module.arrays_2d.get(&name) {
+                    vec![b]
+                } else if let Some((shape, _)) = self.module.arrays_nd.get(&name) {
+                    if shape.len() < 2 {
+                        return None;
+                    }
+                    shape[1..].to_vec()
+                } else {
+                    return None;
+                };
+                let i = self.eval_expr(index).to_i64()?;
+                Some((format!("{}[{}]", name, i), Self::nd_elem_suffixes(&rest), true))
+            }
+            _ => None,
+        }
+    }
+
+    /// `w = v` / `r = v[1]` / `v[1] = r` over multi-dimensional unpacked
+    /// arrays. Returns true when it performed the copy.
+    fn copy_multi_dim_array(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        if self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty() {
+            return false;
+        }
+        let Some((lbase, lsfx, l_nd)) = self.nd_array_operand(lvalue) else { return false };
+        let Some((rbase, rsfx, r_nd)) = self.nd_array_operand(rvalue) else { return false };
+        if !(l_nd || r_nd) || (lbase == rbase && lsfx == rsfx) {
+            return false;
+        }
+        for (ls, rs) in lsfx.iter().zip(rsfx.iter()) {
+            let v = self
+                .get_signal_value_by_name(&format!("{}{}", rbase, rs))
+                .unwrap_or_else(|| Value::zero(32));
+            self.set_signal_value_by_name(&format!("{}{}", lbase, ls), v);
+        }
+        true
+    }
+
     fn writeback_array_args(&mut self, wb: &[(String, String, i64, i64)]) {
         for (param, caller, lo, hi) in wb {
+            if let Some(sfxs) = self.nd_formal_suffixes(param) {
+                if param != caller {
+                    for sfx in sfxs {
+                        if let Some(v) = self.get_signal_value_by_name(&format!("{}{}", param, sfx)) {
+                            self.set_signal_value_by_name(&format!("{}{}", caller, sfx), v);
+                        }
+                    }
+                }
+                continue;
+            }
             // §7.2: elements of an UNPACKED-struct array are member leaves, so
             // copying `a[i]` alone wrote nothing back — an `output pkt_t a[3]`
             // formal left every member of the caller's array untouched.
@@ -98862,7 +99044,7 @@ impl Simulator {
             for k in keys {
                 self.signals.remove(&k);
             }
-            self.module.arrays.remove(param);
+            self.purge_array_formal(param);
         }
         // Copy `output`/`inout`/`ref` formals back to the caller's actuals
         // before popping this frame's locals.
@@ -99042,7 +99224,7 @@ impl Simulator {
             for k in keys {
                 self.signals.remove(&k);
             }
-            self.module.arrays.remove(param_name);
+            self.purge_array_formal(param_name);
         }
         self.break_flag = c.saved_break;
         self.return_flag = c.saved_return;
@@ -99591,7 +99773,23 @@ impl Simulator {
                 if let Some(frozen) = self.ref_alias_target(&args[i]) {
                     alias_map.insert(port.name.name.clone(), frozen);
                 }
-                ref_map.insert(port.name.name.clone(), args[i].clone());
+                // Chained identity binding: an actual that is itself the
+                // caller's identity-bound formal resolves to the caller's
+                // actual (the callee's frames are not pushed yet, so the top
+                // of the stacks is the caller's). Without this a formal named
+                // like its actual rewrote `a` to `a` forever.
+                let mut actual = args[i].clone();
+                if let ExprKind::Ident(h) = &actual.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        let n = h.path[0].name.name.clone();
+                        if self.ref_identity_stack.last().is_some_and(|v| v.iter().any(|x| *x == n)) {
+                            if let Some(up) = self.ref_binding_stack.last().and_then(|m| m.get(&n)).cloned() {
+                                actual = up;
+                            }
+                        }
+                    }
+                }
+                ref_map.insert(port.name.name.clone(), actual);
             }
         }
         // An aliased ref writes through during the call — a return copy-out

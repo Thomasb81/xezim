@@ -358,3 +358,5 @@ mod self_named_typedef_alias;
 mod tf_port_typedef_packed_dims;
 #[path = "types/ref_formal_element_write.rs"]
 mod ref_formal_element_write;
+#[path = "types/multi_dim_unpacked_arrays.rs"]
+mod multi_dim_unpacked_arrays;
