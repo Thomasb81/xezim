@@ -4582,6 +4582,10 @@ pub struct Simulator {
     /// the only state in which `ref_formal_redirect_*` can rewrite anything.
     /// Maintained on push/pop/take/restore so the hot paths test one bool.
     ref_redirect_hot: bool,
+    /// Per-call-site receiver expressions for `obj.coll.method()` dispatch.
+    method_receiver_cache: HashMap<(usize, usize, usize), std::rc::Rc<Expression>>,
+    /// `resolve_typeref_class_name` memo: name -> (scope, class ctx) -> (class-table size, answer).
+    typeref_class_memo: std::cell::RefCell<HashMap<String, HashMap<(String, String), (usize, Option<String>)>>>,
     /// Deferred teardown for inlined blocking task/method calls (LIFO). Each
     /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
     /// in ProcessContext across suspension).
@@ -8244,6 +8248,8 @@ impl Simulator {
             ref_alias_stack: Vec::new(),
             ref_identity_stack: Vec::new(),
             ref_redirect_hot: false,
+            method_receiver_cache: HashMap::default(),
+            typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
             ready_condition_waiters: Vec::new(),
@@ -38133,7 +38139,8 @@ impl Simulator {
             _ => false,
         };
         if !eligible || stmt.span.start == 0 && stmt.span.end == 0 {
-            if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some()
+            static LOOP_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *LOOP_STATS.get_or_init(|| std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some())
                 && matches!(
                     stmt.kind,
                     StatementKind::For { .. } | StatementKind::If { .. }
@@ -38447,7 +38454,8 @@ impl Simulator {
         // env) also evaluate through the AST. A disagreement means the
         // bytecode compiled this expression with different semantics — pin
         // the span to the AST permanently and use the AST's answer.
-        if audits > 0 || std::env::var_os("XEZIM_PROC_COND_VERIFY").is_some() {
+        static COND_VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if audits > 0 || *COND_VERIFY.get_or_init(|| std::env::var_os("XEZIM_PROC_COND_VERIFY").is_some()) {
             let ast = self.eval_expr(cond).is_true();
             if ast != truth {
                 if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some()
@@ -62548,9 +62556,9 @@ impl Simulator {
                         _ => None,
                     })
                     .collect();
-                let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                static LOOP_LIMIT_ENV: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+                let loop_limit: u64 = (*LOOP_LIMIT_ENV
+                    .get_or_init(|| std::env::var("XEZIM_LOOP_LIMIT").ok().and_then(|s| s.parse().ok())))
                     .unwrap_or(10_000_000);
                 let mut iters: u64 = 0;
                 loop {
@@ -63451,9 +63459,9 @@ impl Simulator {
                 if !self.return_flag { self.break_flag = false; }
             }
             StatementKind::While { condition, body } => {
-                let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                static LOOP_LIMIT_ENV: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+                let loop_limit: u64 = (*LOOP_LIMIT_ENV
+                    .get_or_init(|| std::env::var("XEZIM_LOOP_LIMIT").ok().and_then(|s| s.parse().ok())))
                     .unwrap_or(10_000_000);
                 let mut i: u64 = 0;
                 loop {
@@ -63491,9 +63499,9 @@ impl Simulator {
                 }
             }
             StatementKind::DoWhile { body, condition } => {
-                let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                static LOOP_LIMIT_ENV: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+                let loop_limit: u64 = (*LOOP_LIMIT_ENV
+                    .get_or_init(|| std::env::var("XEZIM_LOOP_LIMIT").ok().and_then(|s| s.parse().ok())))
                     .unwrap_or(10_000_000);
                 let mut i: u64 = 0;
                 loop {
@@ -70358,6 +70366,28 @@ impl Simulator {
         }
     }
 
+    /// The receiver of `a.b.method(...)` as an expression, built ONCE per
+    /// call site (keyed by the identifier's span) and reused: rebuilding it
+    /// per call cloned every path segment string and, worse, discarded the
+    /// identifier's resolved-name cache, so each call re-resolved from
+    /// scratch. Same context-insensitive caching the AST node itself uses.
+    fn method_receiver_expr(&mut self, hier: &HierarchicalIdentifier, keep: usize) -> std::rc::Rc<Expression> {
+        let key = (hier.span.start as usize, hier.span.end as usize, keep);
+        if let Some(e) = self.method_receiver_cache.get(&key) {
+            return e.clone();
+        }
+        let base = HierarchicalIdentifier {
+            root: hier.root.clone(),
+            path: hier.path[..keep].to_vec(),
+            span: hier.span,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        };
+        let e = std::rc::Rc::new(Expression::new(ExprKind::Ident(base), hier.span));
+        self.method_receiver_cache.insert(key, e.clone());
+        e
+    }
+
     fn resolve_hier_name(&self, hier: &HierarchicalIdentifier) -> String {
         if self.name_stats_on {
             self.name_stats[1].set(self.name_stats[1].get() + 1);
@@ -77208,13 +77238,14 @@ impl Simulator {
             if let Ok(handle) = name[..pos].parse::<usize>() {
                 let member = &name[pos + 1..];
                 if let Some(Some(inst)) = self.heap.get(handle) {
-                    let mut cur = Some(inst.class_name.clone());
+                    // Borrowed chain walk: no String clone per ancestor.
+                    let mut cur: Option<&str> = Some(inst.class_name.as_str());
                     while let Some(cn) = cur {
-                        if let Some(cd) = self.module.classes.get(&cn) {
+                        if let Some(cd) = self.module.classes.get(cn) {
                             if cd.assoc_properties.contains_key(member) {
                                 return true;
                             }
-                            cur = cd.extends.clone();
+                            cur = cd.extends.as_deref();
                         } else {
                             break;
                         }
@@ -77293,6 +77324,37 @@ impl Simulator {
     /// `typedef_targets`. Used both to default a typedef'd handle to `null` and
     /// to let `rsrc_q_t rq = new()` construct the right class (`queue`).
     fn resolve_typeref_class_name(&self, tref: &crate::ast::types::TypeName) -> Option<String> {
+        // Memoized on (name, scope, class context): the miss path below
+        // scans every class's typedef table, and the same type name is
+        // resolved on every property access / call that carries it. The
+        // class table only grows (lazy specializations), so an entry is
+        // keyed to the table size it was computed against.
+        let ctx_key: &str = match self.class_context_stack.last() {
+            Some(Some(c)) => c.as_str(),
+            _ => "",
+        };
+        let scope_key: &str = tref.scope.as_ref().map(|s| s.name.as_str()).unwrap_or("");
+        let ncls = self.module.classes.len();
+        {
+            let memo = self.typeref_class_memo.borrow();
+            if let Some(by_scope) = memo.get(tref.name.name.as_str()) {
+                if let Some((n, hit)) = by_scope.get(&(scope_key.to_string(), ctx_key.to_string())) {
+                    if *n == ncls {
+                        return hit.clone();
+                    }
+                }
+            }
+        }
+        let out = self.resolve_typeref_class_name_uncached(tref);
+        self.typeref_class_memo
+            .borrow_mut()
+            .entry(tref.name.name.clone())
+            .or_default()
+            .insert((scope_key.to_string(), ctx_key.to_string()), (ncls, out.clone()));
+        out
+    }
+
+    fn resolve_typeref_class_name_uncached(&self, tref: &crate::ast::types::TypeName) -> Option<String> {
         use crate::ast::types::DataType;
         let base_class = |s: &str| -> Option<String> {
             if self.module.classes.contains_key(s) {
@@ -77360,7 +77422,7 @@ impl Simulator {
                 if name.name.name == *nm {
                     return None; // self-reference guard
                 }
-                self.resolve_typeref_class_name(&name)
+                self.resolve_typeref_class_name_uncached(&name)
             }
             _ => None,
         }
@@ -79575,7 +79637,8 @@ impl Simulator {
     /// modelled by a flat per-frame map; it is rare in practice.)
     fn declare_local_dyn(&mut self, bare: &str) -> String {
         // Kill-switch for debugging the per-process local-dyn-array rename.
-        if std::env::var("XEZIM_NO_DYN_RENAME").is_ok() {
+        static NO_DYN_RENAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NO_DYN_RENAME.get_or_init(|| std::env::var_os("XEZIM_NO_DYN_RENAME").is_some()) {
             return bare.to_string();
         }
         if self.local_dyn.is_empty() {
@@ -90853,6 +90916,20 @@ impl Simulator {
     /// live interface instance — bound names always bottom out at one, so
     /// anything else (an ordinary variable, an indexed storage name) is
     /// rejected. Keeps the propagation hooks from polluting bindings.
+    /// Can a formal of this declared type be bound to a virtual interface?
+    /// `virtual x_if` / bare interface types and typedef references (which
+    /// may resolve to one) can; integral, real, string, struct, enum and
+    /// class-less simple types cannot.
+    #[inline]
+    fn formal_may_carry_vif(dt: &crate::ast::types::DataType) -> bool {
+        matches!(
+            dt,
+            crate::ast::types::DataType::Interface { .. }
+                | crate::ast::types::DataType::TypeReference { .. }
+                | crate::ast::types::DataType::Implicit { .. }
+        )
+    }
+
     fn resolve_vif_rhs_name_strict(&self, rvalue: &Expression) -> Option<String> {
         // `iface.member` where the dotted name is a real SIGNAL is a value
         // read, not a modport view — `dd1 = u.d` must not classify dd1 as a
@@ -95651,14 +95728,7 @@ impl Simulator {
                     ))
             {
                 let m = path[len - 1].name.name.clone();
-                let base = HierarchicalIdentifier {
-                    root: hier.root.clone(),
-                    path: path[..len - 1].to_vec(),
-                    span: hier.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
-                };
-                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                let base_expr = self.method_receiver_expr(hier, len - 1);
                 if let Some(an) = self.expr_assoc_name(&base_expr) {
                     if let Some(res) = self.eval_builtin_method(&an, &m, args) {
                         return res;
@@ -95714,14 +95784,7 @@ impl Simulator {
                 )
             {
                 let m = path[len - 1].name.name.clone();
-                let base = HierarchicalIdentifier {
-                    root: hier.root.clone(),
-                    path: path[..len - 1].to_vec(),
-                    span: hier.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
-                };
-                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                let base_expr = self.method_receiver_expr(hier, len - 1);
                 let recv = self.eval_expr(&base_expr);
                 let recv_h = recv.to_u64().unwrap_or(0) as usize;
                 let is_user_method = recv_h != 0
@@ -95779,14 +95842,7 @@ impl Simulator {
                 )
             {
                 let m = path[len - 1].name.name.clone();
-                let base = HierarchicalIdentifier {
-                    root: hier.root.clone(),
-                    path: path[..len - 1].to_vec(),
-                    span: hier.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
-                };
-                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                let base_expr = self.method_receiver_expr(hier, len - 1);
                 // Guarded: a user class method (e.g. UVM's inherited
                 // `uvm_object::compare`) must NOT be shadowed by the string
                 // builtins dispatched by `string_method`.
@@ -95815,14 +95871,7 @@ impl Simulator {
                 )
             {
                 let m = path[len - 1].name.name.clone();
-                let base = HierarchicalIdentifier {
-                    root: hier.root.clone(),
-                    path: path[..len - 1].to_vec(),
-                    span: hier.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
-                };
-                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                let base_expr = self.method_receiver_expr(hier, len - 1);
                 // LRM §6.19.6: enum reflection on a hier-Ident receiver.
                 // Same logic as the MemberAccess branch above — but the
                 // parser flattens `c.next()` into `Call{Ident([c,next])}`
@@ -96752,7 +96801,9 @@ impl Simulator {
                     full
                 };
                 let scope = full.rsplit_once('.').map(|(s, _)| s.to_string());
-                if let Some(fd) = self.module.functions.get(&full).cloned() {
+                // Refcounted declaration (see `fn_decl_rc`): this arm cloned the
+                // whole FunctionDeclaration AST on every scoped call.
+                if let Some(fd) = self.fn_decl_rc(&full) {
                     let saved = self.name_resolve_hint.borrow().clone();
                     *self.name_resolve_hint.borrow_mut() = scope.clone();
                     // §20.3: `$time`/`$realtime`/`%m` inside a subroutine reference
@@ -98540,11 +98591,21 @@ impl Simulator {
         // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
         // records its interface under the formal's name (cleared otherwise so
         // a stale same-named formal from an earlier call can't leak).
+        // Only a formal whose declared type can name an interface (`virtual
+        // x_if v`, or a typedef that may resolve to one) can carry a vif;
+        // an `int`/`bit`/`string` formal never had a key to set or clear, so
+        // the per-port format + resolve + hash was pure overhead on every
+        // call of every function.
+        let mut vif_keyed: Vec<&str> = Vec::new();
         for (i, port) in fd.ports.iter().enumerate() {
+            if !Self::formal_may_carry_vif(&port.data_type) {
+                continue;
+            }
             let key = format!("__vif_local__{}", port.name.name);
             match args.get(i).and_then(|a| self.resolve_vif_rhs_name_strict(a)) {
                 Some(nm) => {
                     self.signals.insert(key, Value::from_string(&nm));
+                    vif_keyed.push(port.name.name.as_str());
                 }
                 None => {
                     self.signals.remove(&key);
@@ -99074,7 +99135,7 @@ impl Simulator {
             // A vif binding recorded on the formal (out/inout) propagates to
             // the caller's actual — instance prop or another plain name.
             let key = format!("__vif_local__{}", pn);
-            if self.signals.contains_key(&key) {
+            if vif_keyed.iter().any(|k| *k == pn) && self.signals.contains_key(&key) {
                 let synth = Expression::new(
                     ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
                         root: None,
@@ -99506,6 +99567,9 @@ impl Simulator {
         // records its interface under the formal's name (cleared otherwise so
         // a stale same-named formal from an earlier call can't leak).
         for (i, port) in td.ports.iter().enumerate() {
+            if !Self::formal_may_carry_vif(&port.data_type) {
+                continue;
+            }
             let key = format!("__vif_local__{}", port.name.name);
             match args.get(i).and_then(|a| self.resolve_vif_rhs_name_strict(a)) {
                 Some(nm) => {
@@ -99667,7 +99731,8 @@ impl Simulator {
                     ) {
                         continue;
                     }
-                    if std::env::var("XEZIM_REF_DBG").is_ok() {
+                    static REF_DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *REF_DBG.get_or_init(|| std::env::var_os("XEZIM_REF_DBG").is_some()) {
                         eprintln!("[REFDBG] task-ref formal={} dims={}", port.name.name, port.dimensions.len());
                     }
                     // §13.5.2: a ref formal with UNPACKED dimensions
@@ -105022,7 +105087,8 @@ impl Simulator {
                             if sig.is_signed {
                                 signed_rand_props.insert(prop.clone());
                             }
-                            if std::env::var_os("XEZIM_RAND_DBG").is_some() {
+                            static RAND_DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                            if *RAND_DBG.get_or_init(|| std::env::var_os("XEZIM_RAND_DBG").is_some()) {
                                 eprintln!("RPROP {} w={} signed={}", prop, sig.width, sig.is_signed);
                             }
                             if let Some(tn) = enum_t {
