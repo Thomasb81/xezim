@@ -8860,6 +8860,92 @@ impl Drop for ValparamResolveGuard {
     }
 }
 
+/// Builtin collection / string / enum methods `eval_builtin_method`
+/// implements, classified once per call from the method name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BuiltinM {
+    First,
+    Last,
+    Num,
+    Next,
+    Prev,
+    Size,
+    Len,
+    Getc,
+    Substr,
+    PushBack,
+    PushFront,
+    PopFront,
+    PopBack,
+    Sort,
+    Rsort,
+    Reverse,
+    Shuffle,
+    Insert,
+    Sum,
+    Product,
+    And,
+    Or,
+    Xor,
+    Min,
+    Max,
+    Unique,
+    UniqueIndex,
+    Find,
+    FindFirst,
+    FindLast,
+    FindIndex,
+    FindFirstIndex,
+    FindLastIndex,
+    Exists,
+    Delete,
+    Other,
+}
+
+impl BuiltinM {
+    #[inline]
+    fn classify(mname: &str) -> BuiltinM {
+        match mname {
+            "first" => BuiltinM::First,
+            "last" => BuiltinM::Last,
+            "num" => BuiltinM::Num,
+            "next" => BuiltinM::Next,
+            "prev" => BuiltinM::Prev,
+            "size" => BuiltinM::Size,
+            "len" => BuiltinM::Len,
+            "getc" => BuiltinM::Getc,
+            "substr" => BuiltinM::Substr,
+            "push_back" => BuiltinM::PushBack,
+            "push_front" => BuiltinM::PushFront,
+            "pop_front" => BuiltinM::PopFront,
+            "pop_back" => BuiltinM::PopBack,
+            "sort" => BuiltinM::Sort,
+            "rsort" => BuiltinM::Rsort,
+            "reverse" => BuiltinM::Reverse,
+            "shuffle" => BuiltinM::Shuffle,
+            "insert" => BuiltinM::Insert,
+            "sum" => BuiltinM::Sum,
+            "product" => BuiltinM::Product,
+            "and" => BuiltinM::And,
+            "or" => BuiltinM::Or,
+            "xor" => BuiltinM::Xor,
+            "min" => BuiltinM::Min,
+            "max" => BuiltinM::Max,
+            "unique" => BuiltinM::Unique,
+            "unique_index" => BuiltinM::UniqueIndex,
+            "find" => BuiltinM::Find,
+            "find_first" => BuiltinM::FindFirst,
+            "find_last" => BuiltinM::FindLast,
+            "find_index" => BuiltinM::FindIndex,
+            "find_first_index" => BuiltinM::FindFirstIndex,
+            "find_last_index" => BuiltinM::FindLastIndex,
+            "exists" => BuiltinM::Exists,
+            "delete" => BuiltinM::Delete,
+            _ => BuiltinM::Other,
+        }
+    }
+}
+
 impl Simulator {
     /// Phase-1 multicore exploration: dump the edge-block dependency
     /// graph as an hMETIS hypergraph (vertex = parallel-eligible edge
@@ -89067,6 +89153,14 @@ impl Simulator {
         mname: &str,
         args: &[Expression],
     ) -> Option<Value> {
+        // One string match classifies the method up front; every check below
+        // is then an integer compare, and a name this function does not
+        // implement returns before the receiver-key allocation and the scans
+        // (the sequential `mname == ".."` chain cost a memcmp per arm).
+        let bm = BuiltinM::classify(mname);
+        if bm == BuiltinM::Other {
+            return None;
+        }
         // Per-specialization keying for STATIC collection properties of
         // parameterized classes (e.g. `static T m_q[$]` in `uvmq#(T)`):
         // rewrite the bare member name to the spec-aware storage key so each
@@ -89129,10 +89223,10 @@ impl Simulator {
         // signal_id), since `self.module.signals` may not be the storage.
         // §6.19.6: first/last/num take no argument; next/prev take an OPTIONAL
         // count N (default 1) — `c.next(2)` steps two forward with wrapping.
-        if (matches!(mname, "first" | "last" | "num") && args.is_empty())
-            || (matches!(mname, "next" | "prev") && args.len() <= 1)
+        if (matches!(bm, BuiltinM::First | BuiltinM::Last | BuiltinM::Num) && args.is_empty())
+            || (matches!(bm, BuiltinM::Next | BuiltinM::Prev) && args.len() <= 1)
         {
-            let step_n: u64 = if matches!(mname, "next" | "prev") {
+            let step_n: u64 = if matches!(bm, BuiltinM::Next | BuiltinM::Prev) {
                 args.first()
                     .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                     .unwrap_or(1)
@@ -89187,11 +89281,11 @@ impl Simulator {
                         v.is_signed = esigned;
                         v
                     };
-                    return Some(match mname {
-                        "num"   => Value::from_u64(members.len() as u64, 32),
-                        "first" => mk(members[0].1),
-                        "last"  => mk(members[members.len()-1].1),
-                        "next" | "prev" => {
+                    return Some(match bm {
+                        BuiltinM::Num => Value::from_u64(members.len() as u64, 32),
+                        BuiltinM::First => mk(members[0].1),
+                        BuiltinM::Last => mk(members[members.len()-1].1),
+                        BuiltinM::Next | BuiltinM::Prev => {
                             // Read the receiver like an ordinary identifier —
                             // LOCAL FRAME first. `get_signal_value_by_name`
                             // consults only the flat table, so a method-local
@@ -89220,7 +89314,7 @@ impl Simulator {
                                 // -> last). N defaults to 1; N==0 returns current.
                                 let len = members.len() as u64;
                                 let step = (step_n % len) as usize;
-                                let new_p = if mname == "next" {
+                                let new_p = if bm == BuiltinM::Next {
                                     (p + step) % members.len()
                                 } else {
                                     (p + members.len() - step) % members.len()
@@ -89257,7 +89351,7 @@ impl Simulator {
                 }
             }
         }
-        if mname == "size" || mname == "len" {
+        if bm == BuiltinM::Size || bm == BuiltinM::Len {
             // An associative array's size() == num(): count populated keys.
             // (Without this it falls through to the queue/.size-shadow/string
             // paths and reads 0 for a true assoc array — sv_22.)
@@ -89301,7 +89395,7 @@ impl Simulator {
         // Was unimplemented (returned 0), which made string glob matchers compare
         // every char as 0==0 — exact matches passed by accident but `*`/`?`
         // wildcards were never detected.
-        if mname == "getc" {
+        if bm == BuiltinM::Getc {
             if let Some(idx_arg) = args.first() {
                 let idx = self.eval_expr(idx_arg).to_u64().unwrap_or(0) as usize;
                 // Byte indexing, not UTF-8: a char above 0x7F is one SV byte.
@@ -89316,7 +89410,7 @@ impl Simulator {
             }
             return Some(Value::zero(8));
         }
-        if mname == "substr" {
+        if bm == BuiltinM::Substr {
             if let Some(first) = args.first() {
                 if let Some(second) = args.get(1) {
                     let start = self.eval_expr(first).to_u64().unwrap_or(0) as usize;
@@ -89385,7 +89479,7 @@ impl Simulator {
                 }
             }
         }
-        if mname == "push_back" {
+        if bm == BuiltinM::PushBack {
             if let Some(arg) = args.first() {
                 // LRM §8.4: if the queue's element type is a class and
                 // the arg is a bare `new(...)` call, construct the
@@ -89404,7 +89498,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "push_front" {
+        if bm == BuiltinM::PushFront {
             if let Some(arg) = args.first() {
                 let cur_size = self.get_queue_size(obj_name);
                 if let Some(&max) = self.module.queue_max_sizes.get(obj_name) {
@@ -89421,7 +89515,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "pop_front" {
+        if bm == BuiltinM::PopFront {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
                 let val = self
@@ -89435,7 +89529,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "pop_back" {
+        if bm == BuiltinM::PopBack {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
                 let val = self
@@ -89446,7 +89540,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "sort" {
+        if bm == BuiltinM::Sort {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
                 let mut elements = Vec::new();
@@ -89463,7 +89557,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "rsort" {
+        if bm == BuiltinM::Rsort {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
                 let mut elements = Vec::new();
@@ -89480,7 +89574,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "reverse" {
+        if bm == BuiltinM::Reverse {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
                 let order: Vec<usize> = (0..cur_size).rev().collect();
@@ -89490,7 +89584,7 @@ impl Simulator {
         }
         // LRM §7.12.1 array `shuffle()` — Fisher-Yates in place using
         // the simulator's PRNG so seeded runs are reproducible.
-        if mname == "shuffle" {
+        if bm == BuiltinM::Shuffle {
             use rand::Rng;
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 1 {
@@ -89504,7 +89598,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "insert" {
+        if bm == BuiltinM::Insert {
             if args.len() >= 2 {
                 let idx = self.eval_expr(&args[0]).to_u64().unwrap_or(0);
                 let cur_size = self.get_queue_size(obj_name);
@@ -89519,7 +89613,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "num" {
+        if bm == BuiltinM::Num {
             // §15.4.2: a mailbox's `num()` counts queued messages, which live in
             // `self.mailboxes` (keyed by handle), not in `obj[i]` signal slots.
             // This expression path (e.g. `m.num()` inside `$display(...)`) must
@@ -89539,10 +89633,10 @@ impl Simulator {
             // assoc-of-queue, queues, and dynamic arrays.
             return Some(Value::from_u64(self.assoc_top_level_keys(obj_name).len() as u64, 32));
         }
-        if matches!(mname, "sum" | "product") {
+        if matches!(bm, BuiltinM::Sum | BuiltinM::Product) {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let (w, signed) = self.array_elem_sign_width(obj_name);
-            let mut total: u64 = if mname == "sum" { 0 } else { 1 };
+            let mut total: u64 = if bm == BuiltinM::Sum { 0 } else { 1 };
             for i in 0..cur_size {
                 if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
                     let x = if signed {
@@ -89550,7 +89644,7 @@ impl Simulator {
                     } else {
                         v.to_u64().unwrap_or(0)
                     };
-                    total = if mname == "sum" {
+                    total = if bm == BuiltinM::Sum {
                         total.wrapping_add(x)
                     } else {
                         total.wrapping_mul(x)
@@ -89565,7 +89659,7 @@ impl Simulator {
             out.is_signed = signed;
             return Some(out);
         }
-        if matches!(mname, "and" | "or" | "xor") {
+        if matches!(bm, BuiltinM::And | BuiltinM::Or | BuiltinM::Xor) {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let mut acc: Option<u64> = None;
             for i in 0..cur_size {
@@ -89582,7 +89676,7 @@ impl Simulator {
             }
             return Some(Value::from_u64(acc.unwrap_or(0), 32));
         }
-        if mname == "min" {
+        if bm == BuiltinM::Min {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let mut min_val: Option<Value> = None;
             for i in 0..cur_size {
@@ -89602,7 +89696,7 @@ impl Simulator {
             }
             return Some(min_val.unwrap_or(Value::zero(32)));
         }
-        if mname == "max" {
+        if bm == BuiltinM::Max {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let mut max_val: Option<Value> = None;
             for i in 0..cur_size {
@@ -89622,13 +89716,13 @@ impl Simulator {
             }
             return Some(max_val.unwrap_or(Value::zero(32)));
         }
-        if mname == "unique" {
+        if bm == BuiltinM::Unique {
             // §7.12.1: a locator method RETURNS a queue; it must not modify the
             // source. `r = q.unique()` is handled by the locator path in
             // BlockingAssign; a bare `q.unique();` is simply a no-op.
             return Some(Value::zero(32));
         }
-        if mname == "unique_index" {
+        if bm == BuiltinM::UniqueIndex {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let mut seen = std::collections::HashSet::new();
             let mut indices = Vec::new();
@@ -89649,12 +89743,12 @@ impl Simulator {
             self.set_queue_size(obj_name, indices.len() as u64);
             return Some(Value::zero(32));
         }
-        if (mname == "find"
-            || mname == "find_first"
-            || mname == "find_last"
-            || mname == "find_index"
-            || mname == "find_first_index"
-            || mname == "find_last_index")
+        if (bm == BuiltinM::Find
+            || bm == BuiltinM::FindFirst
+            || bm == BuiltinM::FindLast
+            || bm == BuiltinM::FindIndex
+            || bm == BuiltinM::FindFirstIndex
+            || bm == BuiltinM::FindLastIndex)
             && (self.module.arrays.contains_key(obj_name)
                 || self.is_associative_array(obj_name)
                 || self.module.dynamic_arrays.contains(obj_name))
@@ -89700,7 +89794,7 @@ impl Simulator {
                 results[0].clone()
             });
         }
-        if mname == "exists" {
+        if bm == BuiltinM::Exists {
             if let Some(arg) = args.first() {
                 let kv = self.eval_expr(arg);
                 let key = self.assoc_key_str(obj_name, &kv);
@@ -89726,7 +89820,7 @@ impl Simulator {
                 return Some(Value::from_u64(found as u64, 1));
             }
         }
-        if mname == "delete" {
+        if bm == BuiltinM::Delete {
             if self.is_associative_array(obj_name) {
                 if let Some(arg) = args.first() {
                     let key = self.eval_expr(arg);
@@ -89759,7 +89853,7 @@ impl Simulator {
                 return Some(Value::zero(32));
             }
         }
-        if (mname == "first" || mname == "last" || mname == "next" || mname == "prev")
+        if (bm == BuiltinM::First || bm == BuiltinM::Last || bm == BuiltinM::Next || bm == BuiltinM::Prev)
             && self.is_associative_array(obj_name) {
                 let keys = self.assoc_top_level_keys(obj_name);
                 // i128, not i64: a full-range unsigned 64-bit key
@@ -89769,9 +89863,9 @@ impl Simulator {
                 if keys.is_empty() {
                     return Some(Value::zero(32));
                 }
-                let result_key = if mname == "first" {
+                let result_key = if bm == BuiltinM::First {
                     Some(keys[0].clone())
-                } else if mname == "last" {
+                } else if bm == BuiltinM::Last {
                     Some(keys[keys.len() - 1].clone())
                 } else {
                     if let Some(arg) = args.first() {
@@ -89786,7 +89880,7 @@ impl Simulator {
                             cur_val.to_sv_string()
                         };
                         if let Some(pos) = keys.iter().position(|k| *k == cur) {
-                            if mname == "next" {
+                            if bm == BuiltinM::Next {
                                 if pos + 1 < keys.len() {
                                     Some(keys[pos + 1].clone())
                                 } else {
