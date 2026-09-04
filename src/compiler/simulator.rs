@@ -10464,8 +10464,8 @@ impl Simulator {
             }
             _ => return None,
         };
-        if self.module.arrays.contains_key(&resolved) {
-            return Some(resolved);
+        if self.module.arrays.contains_key(&*resolved) {
+            return Some(resolved.to_string());
         }
         if self.module.arrays.contains_key(&raw) {
             return Some(raw);
@@ -11416,12 +11416,12 @@ impl Simulator {
         };
         if let ExprKind::Ident(hier) = &e.kind {
             let name = self.resolve_hier_name(hier);
-            if let Some((lo, hi, _elem_w)) = self.module.arrays.get(&name).copied() {
+            if let Some((lo, hi, _elem_w)) = self.module.arrays.get(&*name).copied() {
                 let mut out = Vec::new();
                 // Compact-resolver fast path: if the array is in
                 // array_first_id, walk the contiguous id range with no
                 // per-element name allocation.
-                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_str()) {
+                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
                     for off in 0..=(hi - lo) as usize {
                         let id = first_id + off;
                         out.push(self.signal_table[id].to_i64().unwrap_or(0) as i32);
@@ -11440,7 +11440,7 @@ impl Simulator {
                         out.push(vv.to_i64().unwrap_or(0) as i32);
                     }
                 }
-                return (Some(name), out);
+                return (Some(name.to_string()), out);
             }
         }
         (None, vec![self.eval_expr(e).to_i64().unwrap_or(0) as i32])
@@ -11449,10 +11449,10 @@ impl Simulator {
     fn dpi_writeback_i32_array_arg(&mut self, expr: &Expression, data: &[i32]) {
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
-            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&name).copied() {
+            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
                 let mut k = 0usize;
                 // Compact-resolver fast path.
-                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_str()) {
+                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
                     for off in 0..=(hi - lo) as usize {
                         if k >= data.len() {
                             break;
@@ -26386,7 +26386,7 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                     let full = self.resolve_hier_name(&hier);
                     *self.name_resolve_hint.borrow_mut() = saved_hint;
-                    if let Some(&id) = self.signal_name_to_id.get(full.as_str()) {
+                    if let Some(&id) = self.signal_name_to_id.get(full.as_ref()) {
                         if !rids.contains(&id) {
                             rids.push(id);
                         }
@@ -26728,7 +26728,7 @@ impl Simulator {
                         *self.name_resolve_hint.borrow_mut() = saved;
                         if resolved != *r {
                             if let Some(&id) =
-                                self.signal_name_to_id.get(resolved.as_str())
+                                self.signal_name_to_id.get(resolved.as_ref())
                             {
                                 if !rids.contains(&id) {
                                     rids.push(id);
@@ -30906,10 +30906,10 @@ impl Simulator {
                     return false;
                 };
                 let name = self.resolve_hier_name(hier);
-                !self.module.arrays.contains_key(&name)
-                    && !self.module.arrays_2d.contains_key(&name)
-                    && !self.module.arrays_nd.contains_key(&name)
-                    && !self.signal_name_to_id.contains_key(name.as_str())
+                !self.module.arrays.contains_key(&*name)
+                    && !self.module.arrays_2d.contains_key(&*name)
+                    && !self.module.arrays_nd.contains_key(&*name)
+                    && !self.signal_name_to_id.contains_key(name.as_ref())
             }
             ExprKind::Index { expr, .. } => {
                 let ExprKind::Index {
@@ -30925,9 +30925,9 @@ impl Simulator {
                 // A multi-D PACKED vector root (`logic [1:0][3:0][7:0] foo`)
                 // is a real write target for `foo[i][j]` — only drop the
                 // assign when the root resolves to nothing at all.
-                !self.module.arrays_2d.contains_key(&name)
-                    && !self.module.arrays_nd.contains_key(&name)
-                    && !self.signal_name_to_id.contains_key(name.as_str())
+                !self.module.arrays_2d.contains_key(&*name)
+                    && !self.module.arrays_nd.contains_key(&*name)
+                    && !self.signal_name_to_id.contains_key(name.as_ref())
             }
             _ => false,
         }
@@ -32535,11 +32535,11 @@ impl Simulator {
                 let resolved = self.resolve_hier_name(&ident);
                 *self.name_resolve_hint.borrow_mut() = saved;
                 if resolved != *r
-                    && self.signal_name_to_id.contains_key(resolved.as_str())
-                    && seen.insert(resolved.clone())
+                    && self.signal_name_to_id.contains_key(resolved.as_ref())
+                    && seen.insert(resolved.to_string())
                 {
                     out.push(Sensitivity {
-                        signal_name: resolved,
+                        signal_name: resolved.to_string(),
                         edge: EdgeKind::AnyEdge,
                         iff: None,
                         value_of: None,
@@ -32680,7 +32680,7 @@ impl Simulator {
                             // literal index resolves here; a variable index
                             // keeps the old base-name behavior.
                             let bn = self.resolve_hier_name(bh);
-                            if self.module.arrays.contains_key(&bn) {
+                            if self.module.arrays.contains_key(&*bn) {
                                 out.push(Sensitivity {
                                     signal_name: format!("{}[{}]", bn, value.replace('_', "")),
                                     edge,
@@ -32755,17 +32755,17 @@ impl Simulator {
                         // raw chain through the live handles instead (the
                         // snitch driver stall: every wait degenerated to a
                         // same-time yield and the run never left time 0).
-                        if !self.signal_name_to_id.contains_key(sig.as_str())
-                            && !self.signals.contains_key(&sig)
+                        if !self.signal_name_to_id.contains_key(sig.as_ref())
+                            && !self.signals.contains_key(&*sig)
                         {
                             let raw = segs.join(".");
                             if let Some(resolved) = self.resolve_sens_name_via_handles(&raw) {
-                                sig = resolved;
+                                sig = std::borrow::Cow::Owned(resolved);
                             }
                         }
                         let cb_key = self
                             .resolve_clocking_key(&segs)
-                            .unwrap_or_else(|| sig.clone());
+                            .unwrap_or_else(|| sig.to_string());
                         if ee.edge.is_none() {
                             if let Some((clk, _)) = self.clocking_meta.get(&cb_key) {
                                 out.push(Sensitivity {
@@ -32789,8 +32789,8 @@ impl Simulator {
                         // let the wake path compare the FIELD's value against
                         // the armed snapshot (the non-trivial-expression
                         // machinery).
-                        if !self.signal_name_to_id.contains_key(sig.as_str())
-                            && !self.signals.contains_key(&sig)
+                        if !self.signal_name_to_id.contains_key(sig.as_ref())
+                            && !self.signals.contains_key(&*sig)
                         {
                             if let Some((base, _off, _w)) = self.packed_leaf_of_hier(&sig) {
                                 out.push(Sensitivity {
@@ -32803,7 +32803,7 @@ impl Simulator {
                             }
                         }
                         out.push(Sensitivity {
-                            signal_name: sig,
+                            signal_name: sig.to_string(),
                             edge,
                             iff: ee.iff.clone(),
                             value_of: None,
@@ -32960,7 +32960,7 @@ impl Simulator {
                         }
                     }
                     vec![Sensitivity {
-                        signal_name: self.resolve_hier_name(h),
+                        signal_name: self.resolve_hier_name(h).into_owned(),
                         edge: EdgeKind::AnyEdge,
                         iff: None,
                         value_of: None,
@@ -33302,7 +33302,7 @@ impl Simulator {
                         return true;
                     }
                     let sig = self.resolve_hier_name(h);
-                    sig == "__xz_default_clocking" || self.clocking_meta.contains_key(&sig)
+                    sig == "__xz_default_clocking" || self.clocking_meta.contains_key(&*sig)
                 } else {
                     false
                 }
@@ -41260,7 +41260,7 @@ impl Simulator {
     /// collection, in which case there is no bound to install.
     fn dollar_bound_for_base(&mut self, base: &Expression) -> Option<i64> {
         let n = match &base.kind {
-            ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+            ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
             _ => self.flat_member_name(base),
         }?;
         if self.module.dynamic_arrays.contains(&n) {
@@ -41425,7 +41425,7 @@ impl Simulator {
                 ExprKind::StringLiteral(_) => return None,
                 ExprKind::Ident(h) => {
                     let n = sim.resolve_hier_name(h);
-                    if sim.string_signals.contains(&n) {
+                    if sim.string_signals.contains(&*n) {
                         return None;
                     }
                 }
@@ -41558,7 +41558,7 @@ impl Simulator {
                     }
                 }
                 let name = self.resolve_hier_name(hier);
-                if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     hier.cached_signal_id.set(Some(id));
                     return Some(id);
                 }
@@ -41584,12 +41584,12 @@ impl Simulator {
                     // `module.arrays`, which is why assoc was always correct).
                     // Static arrays keep the fast path: their element ids ARE
                     // what comb readers depend on.
-                    if self.module.dynamic_arrays.contains(&name)
-                        || self.module.queue_vars.contains(&name)
+                    if self.module.dynamic_arrays.contains(&*name)
+                        || self.module.queue_vars.contains(&*name)
                     {
                         return None;
                     }
-                    if self.module.arrays.contains_key(&name) {
+                    if self.module.arrays.contains_key(&*name) {
                         // `$` here is the collection's last index (§11.4.12);
                         // without the bound it evaluates to u64::MAX and the
                         // element lookup misses, silently dropping the write.
@@ -41708,14 +41708,14 @@ impl Simulator {
             return false;
         }
         let name = self.resolve_hier_name(hier);
-        if self.module.arrays.contains_key(&name)
-            || self.module.queue_vars.contains(&name)
-            || self.module.dynamic_arrays.contains(&name)
-            || self.module.associative_arrays.contains_key(&name)
+        if self.module.arrays.contains_key(&*name)
+            || self.module.queue_vars.contains(&*name)
+            || self.module.dynamic_arrays.contains(&*name)
+            || self.module.associative_arrays.contains_key(&*name)
         {
             return false;
         }
-        let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+        let Some(&id) = self.signal_name_to_id.get(name.as_ref()) else {
             return false;
         };
         let selected = self.eval_expr(index);
@@ -41728,7 +41728,7 @@ impl Simulator {
         let elem_width = self
             .module
             .packed_signal_elem_widths
-            .get(&name)
+            .get(&*name)
             .copied()
             .unwrap_or(1);
         let Some(low) = self.packed_elem_lsb(&name, label, elem_width) else {
@@ -42368,7 +42368,7 @@ impl Simulator {
                 }
             }
             let resolved = self.resolve_hier_name(hier);
-            if let Some(&id) = self.signal_name_to_id.get(resolved.as_str()) {
+            if let Some(&id) = self.signal_name_to_id.get(resolved.as_ref()) {
                 return Some(id);
             }
             // Fallback for legacy single-segment names.
@@ -47798,8 +47798,8 @@ impl Simulator {
         if let ExprKind::Ident(hier) = &lv.kind {
             if hier.path.iter().all(|s| s.selects.is_empty()) {
                 let name = self.resolve_hier_name(hier);
-                let id = self.signal_name_to_id.get(name.as_str()).copied();
-                return Some((name, id));
+                let id = self.signal_name_to_id.get(name.as_ref()).copied();
+                return Some((name.to_string(), id));
             }
         }
         // §10.6.2: a HIERARCHICAL target (`force u.internal = v`) parses as
@@ -47842,10 +47842,10 @@ impl Simulator {
             if let ExprKind::Ident(bh) = &base.kind {
                 if bh.path.iter().all(|s| s.selects.is_empty()) {
                     let bname = self.resolve_hier_name(bh);
-                    if self.module.arrays.contains_key(&bname)
-                        && !self.module.dynamic_arrays.contains(&bname)
-                        && !self.module.queue_vars.contains(&bname)
-                        && !self.module.associative_arrays.contains_key(&bname)
+                    if self.module.arrays.contains_key(&*bname)
+                        && !self.module.dynamic_arrays.contains(&*bname)
+                        && !self.module.queue_vars.contains(&*bname)
+                        && !self.module.associative_arrays.contains_key(&*bname)
                     {
                         let idx = self.eval_expr(index).to_i64()?;
                         if let Some(id) = self.get_array_elem_id(&bname, idx) {
@@ -48101,7 +48101,7 @@ impl Simulator {
         let ExprKind::Ident(h) = &cur.kind else {
             return None;
         };
-        Some((self.resolve_hier_name(h), steps))
+        Some((self.resolve_hier_name(h).into_owned(), steps))
     }
 
     /// Resolve a walked path over a PACKED aggregate to the
@@ -48587,12 +48587,12 @@ impl Simulator {
                 // discard-out-of-range semantics.
                 if let ExprKind::Ident(h) = &base.kind {
                     let qn = self.resolve_hier_name(h);
-                    if self.module.queue_vars.contains(&qn) {
+                    if self.module.queue_vars.contains(&*qn) {
                         let sz = self.get_queue_size(&qn);
                         let within_max = self
                             .module
                             .queue_max_sizes
-                            .get(&qn)
+                            .get(&*qn)
                             .is_none_or(|&m| sz < m as u64);
                         if within_max && iv.to_u64() == Some(sz) {
                             self.set_queue_size(&qn, sz + 1);
@@ -49024,7 +49024,7 @@ impl Simulator {
                         if self.module.classes.contains_key(&cls)
                             && !self
                                 .signal_name_to_id
-                                .contains_key(self.resolve_hier_name(hier).as_str())
+                                .contains_key(self.resolve_hier_name(hier).as_ref())
                             && self.class_static_set(&cls, &prop, val.clone())
                         {
                             return true;
@@ -49254,7 +49254,7 @@ impl Simulator {
                     }
                 }
                 let name = self.resolve_hier_name(hier);
-                if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     hier.cached_signal_id.set(Some(id));
                     let resized = self.fit_value_to_signal(id, val);
                     let changed = self.signal_table[id] != resized;
@@ -49297,16 +49297,16 @@ impl Simulator {
                 // LRM §10.6/§10.6.1: a target under an active force or
                 // procedural continuous assign ignores ordinary procedural
                 // writes until the matching release/deassign.
-                if self.forced_names.contains(&name) {
+                if self.forced_names.contains(&*name) {
                     return false;
                 }
                 let width = self
                     .widths
-                    .get(&name)
+                    .get(&*name)
                     .copied()
                     .filter(|w| *w > 0)
                     .unwrap_or(val.width);
-                let is_real = self.real_signals.contains(&name);
+                let is_real = self.real_signals.contains(&*name);
                 // §6.16: a string has no declared length — for a `string`
                 // LOCAL the widths-map entry is the 1024-bit placeholder
                 // `resolve_type_width` hands the dynamic type, and resizing to
@@ -49316,7 +49316,7 @@ impl Simulator {
                 // map-backed store is where PROCEDURAL LOCALS land, so exempt
                 // them here too. Issue #64: a 129-char `$system` command came
                 // back as 128 chars shifted one byte left ("echo …" → "cho …").
-                let is_str = self.string_signals.contains(&name)
+                let is_str = self.string_signals.contains(&*name)
                     || hier
                         .path
                         .last()
@@ -49336,21 +49336,21 @@ impl Simulator {
                         val.resize(width)
                     }
                 };
-                resized.is_signed = self.signed_signals.contains(&name);
-                let changed = self.signals.get(&name).is_none_or(|p| *p != resized);
+                resized.is_signed = self.signed_signals.contains(&*name);
+                let changed = self.signals.get(&*name).is_none_or(|p| *p != resized);
                 if changed {
                     self.mark_dirty(&name);
                 }
-                self.signals.insert(name.clone(), resized.clone());
+                self.signals.insert(name.to_string(), resized.clone());
 
                 // If this is an array or queue, and we are assigning a packed value,
                 // we might want to split it into elements.
                 if std::env::var("XEZIM_A1_DBG").is_ok() && name.contains('m') {
                     eprintln!("[A1DBG] whole-name write name={:?} in_arrays={} hint={:?}",
-                        name, self.module.arrays.contains_key(&name),
+                        name, self.module.arrays.contains_key(&*name),
                         self.name_resolve_hint.borrow().clone());
                 }
-                if let Some((lo, hi, elem_width)) = self.module.arrays.get(&name).cloned() {
+                if let Some((lo, hi, elem_width)) = self.module.arrays.get(&*name).cloned() {
                     let num_elements = (resized.width / elem_width) as usize;
                     // For queues/dynamic arrays, we update the size
                     let is_dynamic = hi < lo || hi == 63 && lo == 0; // simplistic check for [lo:hi] vs []/[$]
@@ -49419,9 +49419,9 @@ impl Simulator {
                     if h.path.len() == 1 && h.path[0].selects.is_empty() {
                         let base = self.resolve_hier_name(h);
                         let bare = &h.path[0].name.name;
-                        let elem_key = if self.module.packed_signal_elem_widths.contains_key(&base)
+                        let elem_key = if self.module.packed_signal_elem_widths.contains_key(&*base)
                         {
-                            Some(base.clone())
+                            Some(base.to_string())
                         } else if self
                             .module
                             .packed_signal_elem_widths
@@ -49432,10 +49432,10 @@ impl Simulator {
                             None
                         };
                         // Collections keep their own semantics.
-                        let is_collection = self.module.arrays.contains_key(&base)
+                        let is_collection = self.module.arrays.contains_key(&*base)
                             || self.module.arrays.contains_key(bare.as_str())
-                            || self.module.dynamic_arrays.contains(&base)
-                            || self.module.associative_arrays.contains_key(&base);
+                            || self.module.dynamic_arrays.contains(&*base)
+                            || self.module.associative_arrays.contains_key(&*base);
                         if let Some(pkey) = elem_key.filter(|_| !is_collection) {
                             let elem_w =
                                 *self.module.packed_signal_elem_widths.get(&pkey).unwrap();
@@ -49448,7 +49448,7 @@ impl Simulator {
                             // the call frame, module vars in the signal maps —
                             // get/set_local_or_signal covers both.
                             let storage_key = if self.get_local_or_signal(&base).is_some() {
-                                Some(base.clone())
+                                Some(base.to_string())
                             } else if self.get_local_or_signal(bare).is_some() {
                                 Some(bare.clone())
                             } else {
@@ -49496,17 +49496,17 @@ impl Simulator {
                         if h.path.iter().all(|seg| seg.selects.is_empty()) {
                             let name = self.resolve_hier_name(h);
                             if let Some(&(first_id, lo, hi)) =
-                                self.array_first_id.get(name.as_str())
+                                self.array_first_id.get(name.as_ref())
                             {
-                                if !self.module.queue_vars.contains(&name)
-                                    && !self.module.dynamic_arrays.contains(&name)
-                                    && !self.module.associative_arrays.contains_key(&name)
+                                if !self.module.queue_vars.contains(&*name)
+                                    && !self.module.dynamic_arrays.contains(&*name)
+                                    && !self.module.associative_arrays.contains_key(&*name)
                                     // string elements are DYNAMIC-length; the
                                     // resize-to-declared-width below would
                                     // truncate them (a 200-char element came
                                     // back 16 chars) — the general path stores
                                     // strings unresized.
-                                    && !self.module.string_signals.contains(&name)
+                                    && !self.module.string_signals.contains(&*name)
                                 {
                                     let idx =
                                         self.eval_expr(index).to_i64().unwrap_or(i64::MIN);
@@ -49629,7 +49629,7 @@ impl Simulator {
                     // hijack class-member arrays and virtual-interface writes,
                     // which own their own storage.
                     let (base, may_create) = match &expr.kind {
-                        ExprKind::Ident(h) => (Some(self.resolve_hier_name(h)), true),
+                        ExprKind::Ident(h) => (Some(self.resolve_hier_name(h).into_owned()), true),
                         ExprKind::MemberAccess { .. } => (self.flat_member_name(expr), false),
                         _ => (None, false),
                     };
@@ -49729,8 +49729,8 @@ impl Simulator {
                 // label i targets internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
-                    if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
-                        if let Some(&id) = self.signal_name_to_id.get(nm.as_str()) {
+                    if let Some(w) = self.module.ascending_packed.get(&*nm).copied() {
+                        if let Some(&id) = self.signal_name_to_id.get(nm.as_ref()) {
                             let i = self.eval_expr(index).to_u64().unwrap_or(0) as u32;
                             if i < w {
                                 let pos = (w - 1 - i) as usize;
@@ -49803,20 +49803,20 @@ impl Simulator {
                         let mut base_name = self.resolve_hier_name(hier);
                         // Bare class-member N-D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_nd.contains_key(&base_name) {
+                        if !self.module.arrays_nd.contains_key(&*base_name) {
                             if let Some(s) = self.instance_assoc_member(&base_name) {
-                                base_name = s;
+                                base_name = std::borrow::Cow::Owned(s);
                             }
                         }
-                        if let Some((shape, _w)) = self.module.arrays_nd.get(&base_name).cloned() {
+                        if let Some((shape, _w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
                                 for i in (0..rev_idxs.len()).rev() {
                                     let v =
                                         self.eval_expr(rev_idxs[i]).to_u64().unwrap_or(0) as i64;
-                                    name = format!("{}[{}]", name, v);
+                                    name = std::borrow::Cow::Owned(format!("{}[{}]", name, v));
                                 }
-                                if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                                if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                                     let width = self.signal_widths[id];
                                     let resized = val.resize(width);
                                     let changed = self.signal_table[id] != resized;
@@ -49831,9 +49831,9 @@ impl Simulator {
                                     }
                                     return changed;
                                 }
-                                let changed = self.signals.get(&name).is_none_or(|p| *p != *val);
+                                let changed = self.signals.get(&*name).is_none_or(|p| *p != *val);
                                 if changed {
-                                    self.signals.insert(name.clone(), val.clone());
+                                    self.signals.insert(name.to_string(), val.clone());
                                     self.mark_dirty(&name);
                                 }
                                 return changed;
@@ -49855,16 +49855,16 @@ impl Simulator {
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
                         let mut name = self.resolve_hier_name(hier);
-                        if !self.module.arrays.contains_key(&name) {
+                        if !self.module.arrays.contains_key(&*name) {
                             if let Some(s) = self.instance_assoc_member(&name) {
-                                name = s;
+                                name = std::borrow::Cow::Owned(s);
                             }
                         }
                         // Only a plain unpacked array: an `arrays_2d` entry is a
                         // genuine two-dimensional index and is handled below.
-                        if self.module.arrays.contains_key(&name)
-                            && !self.module.arrays_2d.contains_key(&name)
-                            && !self.module.arrays_nd.contains_key(&name)
+                        if self.module.arrays.contains_key(&*name)
+                            && !self.module.arrays_2d.contains_key(&*name)
+                            && !self.module.arrays_nd.contains_key(&*name)
                         {
                             let i = self.eval_expr(inner_idx).to_i64().unwrap_or(0);
                             let elem = format!("{}[{}]", name, i);
@@ -49877,7 +49877,7 @@ impl Simulator {
                                 // through to the pre-existing normalizing
                                 // paths below, which already resolve it.
                                 // (Casting such a label to u32 overflowed.)
-                                let pos = match self.module.ascending_packed.get(&name).copied() {
+                                let pos = match self.module.ascending_packed.get(&*name).copied() {
                                     Some(aw) if raw >= 0 && (raw as u32) < aw => {
                                         Some(aw - 1 - raw as u32)
                                     }
@@ -49892,7 +49892,7 @@ impl Simulator {
                                 let ew = self
                                     .module
                                     .packed_signal_elem_widths
-                                    .get(&name)
+                                    .get(&*name)
                                     .copied()
                                     .unwrap_or(1)
                                     .max(1);
@@ -49990,9 +49990,9 @@ impl Simulator {
                         let mut name = self.resolve_hier_name(hier);
                         // Bare class-member 2D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_2d.contains_key(&name) {
+                        if !self.module.arrays_2d.contains_key(&*name) {
                             if let Some(s) = self.instance_assoc_member(&name) {
-                                name = s;
+                                name = std::borrow::Cow::Owned(s);
                             }
                         }
                         // A bare name written from inside a SUBMODULE — e.g. the
@@ -50001,7 +50001,7 @@ impl Simulator {
                         // per-node name cache may already hold the unscoped form.
                         // Try the hint, then a UNIQUE suffix match, so the write
                         // lands instead of being silently dropped.
-                        if !self.module.arrays_2d.contains_key(&name) && !name.contains('.') {
+                        if !self.module.arrays_2d.contains_key(&*name) && !name.contains('.') {
                             let hinted = self
                                 .name_resolve_hint
                                 .borrow()
@@ -50009,7 +50009,7 @@ impl Simulator {
                                 .map(|h| format!("{}.{}", h, name));
                             if let Some(h) = hinted.filter(|h| self.module.arrays_2d.contains_key(h))
                             {
-                                name = h;
+                                name = std::borrow::Cow::Owned(h);
                             } else {
                                 let suffix = format!(".{}", name);
                                 let mut hit: Option<String> = None;
@@ -50024,11 +50024,11 @@ impl Simulator {
                                     }
                                 }
                                 if let (Some(k), false) = (hit, many) {
-                                    name = k;
+                                    name = std::borrow::Cow::Owned(k);
                                 }
                             }
                         }
-                        if self.module.arrays_2d.contains_key(&name) {
+                        if self.module.arrays_2d.contains_key(&*name) {
                             let i = self.eval_expr(inner_idx).to_u64().unwrap_or(0) as i64;
                             let j = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
                             let elem_name = format!("{}[{}][{}]", name, i, j);
@@ -50116,8 +50116,8 @@ impl Simulator {
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
                         let base = self.resolve_hier_name(hier);
-                        if let Some(&elem_w) = self.module.packed_signal_elem_widths.get(&base) {
-                            if let Some(&id) = self.signal_name_to_id.get(base.as_str()) {
+                        if let Some(&elem_w) = self.module.packed_signal_elem_widths.get(&*base) {
+                            if let Some(&id) = self.signal_name_to_id.get(base.as_ref()) {
                                 let total_w = self.signal_widths[id] as usize;
                                 let i = self.eval_expr(outer_idx).to_u64().unwrap_or(0) as usize;
                                 let j = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
@@ -50211,7 +50211,7 @@ impl Simulator {
                     Option<String>,
                     Option<&crate::ast::expr::HierarchicalIdentifier>,
                 ) = match &expr.kind {
-                    ExprKind::Ident(hier) => (Some(self.resolve_hier_name(hier)), Some(hier)),
+                    ExprKind::Ident(hier) => (Some(self.resolve_hier_name(hier).into_owned()), Some(hier)),
                     ExprKind::MemberAccess { .. } => (self.flat_member_name(expr), None),
                     _ => (None, None),
                 };
@@ -50645,15 +50645,15 @@ impl Simulator {
                     let is_multi_d = self
                         .module
                         .packed_signal_elem_widths
-                        .get(&nm)
+                        .get(&*nm)
                         .copied()
                         .unwrap_or(0)
                         > 1;
-                    let is_ascending = self.module.ascending_packed.contains_key(&nm);
-                    let is_unpacked = self.module.arrays.contains_key(&nm);
+                    let is_ascending = self.module.ascending_packed.contains_key(&*nm);
+                    let is_unpacked = self.module.arrays.contains_key(&*nm);
                     if !is_multi_d && !is_ascending && !is_unpacked {
                         if let Some(&(dl, dr)) =
-                            self.module.packed_full_dims.get(&nm).and_then(|d| d.first())
+                            self.module.packed_full_dims.get(&*nm).and_then(|d| d.first())
                         {
                             let lo_b = dl.min(dr);
                             if lo_b != 0 {
@@ -50708,7 +50708,7 @@ impl Simulator {
                     if let Some(&elem_w) = self
                         .module
                         .packed_signal_elem_widths
-                        .get(&nm)
+                        .get(&*nm)
                         .filter(|&&w| w > 1)
                     {
                         let (lab_a, lab_b): (i64, i64) = match kind {
@@ -50719,7 +50719,7 @@ impl Simulator {
                         let dim = self
                             .module
                             .packed_full_dims
-                            .get(&nm)
+                            .get(&*nm)
                             .and_then(|d| d.first())
                             .copied();
                         let lsb_of = |idx: i64| -> i64 {
@@ -50747,7 +50747,7 @@ impl Simulator {
                 if !elem_scaled {
                     if let ExprKind::Ident(h) = &expr.kind {
                         let nm = self.resolve_hier_name(h);
-                        if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
+                        if let Some(w) = self.module.ascending_packed.get(&*nm).copied() {
                             let top = w as usize - 1;
                             // The bounds reaching here are already resolved to a
                             // [msb:lsb] pair for every RangeKind, so one mapping
@@ -50776,9 +50776,9 @@ impl Simulator {
                 // Unpacked array slice assignment: copy element-by-element
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
-                    if let Some(&(arr_lo, arr_hi, elem_w)) = self.module.arrays.get(&name) {
+                    if let Some(&(arr_lo, arr_hi, elem_w)) = self.module.arrays.get(&*name) {
                         let count = msb + 1 - lsb;
-                        let descending = self.module.descending_arrays.contains(&name);
+                        let descending = self.module.descending_arrays.contains(&*name);
                         let mut changed = false;
                         let _ = (arr_lo, descending);
                         for i in 0..count {
@@ -50855,7 +50855,7 @@ impl Simulator {
                             Some(id)
                         } else {
                             let name = self.resolve_hier_name(hier);
-                            if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                            if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                                 hier.cached_signal_id.set(Some(id));
                                 Some(id)
                             } else {
@@ -50869,7 +50869,7 @@ impl Simulator {
                     } => {
                         if let ExprKind::Ident(hier) = &arr_expr.kind {
                             let name = self.resolve_hier_name(hier);
-                            if self.module.arrays.contains_key(&name) {
+                            if self.module.arrays.contains_key(&*name) {
                                 // §7.4.6: SIGNED index — a negative-lo array
                                 // (`m[-2:1]`) loses its negative elements when
                                 // the index goes through to_u64.
@@ -51152,7 +51152,7 @@ impl Simulator {
                     }
                     // signals slow-path
                     let name = self.resolve_hier_name(hier);
-                    if let Some(cur) = self.signals.get(&name).cloned() {
+                    if let Some(cur) = self.signals.get(&*name).cloned() {
                         let width = cur.width as usize;
                         let mut nv = cur.clone();
                         let mut changed = false;
@@ -51164,7 +51164,7 @@ impl Simulator {
                             }
                         }
                         if changed {
-                            self.signals.insert(name.clone(), nv);
+                            self.signals.insert(name.to_string(), nv);
                             self.mark_dirty(&name);
                         }
                         return changed;
@@ -51213,13 +51213,13 @@ impl Simulator {
                     if let ExprKind::Ident(bh) = &base.kind {
                         let base_name = self.resolve_hier_name(bh);
                         if let Some(fields) =
-                            self.module.packed_struct_fields.get(&base_name).cloned()
+                            self.module.packed_struct_fields.get(&*base_name).cloned()
                         {
                             if let Some((_, field_off, field_w)) =
                                 fields.iter().find(|(m, _, _)| m == &member.name).cloned()
                             {
                                 // signal_table path
-                                if let Some(&id) = self.signal_name_to_id.get(base_name.as_str()) {
+                                if let Some(&id) = self.signal_name_to_id.get(base_name.as_ref()) {
                                     let total_w = self.signal_widths[id] as usize;
                                     let lo = (field_off as usize) + lsb;
                                     let hi = (field_off as usize)
@@ -51245,7 +51245,7 @@ impl Simulator {
                                     }
                                 }
                                 // signals slow-path
-                                if let Some(cur_sig) = self.signals.get(&base_name).cloned() {
+                                if let Some(cur_sig) = self.signals.get(&*base_name).cloned() {
                                     let total_w = cur_sig.width as usize;
                                     let lo = (field_off as usize) + lsb;
                                     let hi = (field_off as usize)
@@ -51261,7 +51261,7 @@ impl Simulator {
                                             }
                                         }
                                         if changed {
-                                            self.signals.insert(base_name.clone(), nv);
+                                            self.signals.insert(base_name.to_string(), nv);
                                             self.mark_dirty(&base_name);
                                         }
                                         return changed;
@@ -51282,7 +51282,7 @@ impl Simulator {
                 {
                     if let ExprKind::Ident(ah) = &arr_expr.kind {
                         let arr_name = self.resolve_hier_name(ah);
-                        if let Some(&elem_w) = self.module.packed_signal_elem_widths.get(&arr_name)
+                        if let Some(&elem_w) = self.module.packed_signal_elem_widths.get(&*arr_name)
                         {
                             let idx = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                             let Some(base_off) =
@@ -51304,7 +51304,7 @@ impl Simulator {
                             };
                             let lo = base_off + b_lsb.min(b_msb);
                             let hi = base_off + b_lsb.max(b_msb);
-                            if let Some(&id) = self.signal_name_to_id.get(arr_name.as_str()) {
+                            if let Some(&id) = self.signal_name_to_id.get(arr_name.as_ref()) {
                                 let total_w = self.signal_widths[id] as usize;
                                 if hi < total_w {
                                     let mut changed = false;
@@ -51326,7 +51326,7 @@ impl Simulator {
                                     return changed;
                                 }
                             }
-                            if let Some(cur_sig) = self.signals.get(&arr_name).cloned() {
+                            if let Some(cur_sig) = self.signals.get(&*arr_name).cloned() {
                                 let total_w = cur_sig.width as usize;
                                 if hi < total_w {
                                     let mut nv = cur_sig.clone();
@@ -51339,7 +51339,7 @@ impl Simulator {
                                         }
                                     }
                                     if changed {
-                                        self.signals.insert(arr_name.clone(), nv);
+                                        self.signals.insert(arr_name.to_string(), nv);
                                         self.mark_dirty(&arr_name);
                                     }
                                     return changed;
@@ -51403,7 +51403,7 @@ impl Simulator {
                 {
                     if let ExprKind::Ident(ah) = &arr_expr.kind {
                         let arr_name = self.resolve_hier_name(ah);
-                        if !self.module.packed_signal_elem_widths.contains_key(&arr_name) {
+                        if !self.module.packed_signal_elem_widths.contains_key(&*arr_name) {
                             let idxv = self.eval_expr(index);
                             if let Some(idx) = idxv.to_i64().filter(|_| !idxv.has_xz()) {
                                 let ename = format!("{}[{}]", arr_name, idx);
@@ -51916,7 +51916,7 @@ impl Simulator {
                 // packed_struct_fields for signal-based structs
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
-                    if let Some(fields) = self.module.packed_struct_fields.get(&name).cloned() {
+                    if let Some(fields) = self.module.packed_struct_fields.get(&*name).cloned() {
                         if let Some((_, off, w)) =
                             fields.iter().find(|(m, _, _)| m == &member.name).cloned()
                         {
@@ -51976,7 +51976,7 @@ impl Simulator {
                             // in the top module (empty scope) worked.
                             ExprKind::Ident(h) => {
                                 let scoped = self.resolve_hier_name(h);
-                                if !self.module.packed_struct_fields.contains_key(&scoped)
+                                if !self.module.packed_struct_fields.contains_key(&*scoped)
                                     && h.path.len() == 1
                                     && h.path[0].selects.is_empty()
                                     && self
@@ -51986,7 +51986,7 @@ impl Simulator {
                                 {
                                     break Some(h.path[0].name.name.clone());
                                 }
-                                break Some(scoped);
+                                break Some(scoped.to_string());
                             }
                             // §7.4.2: root may itself be a struct-member path
                             // (`main.sub_list[0].f`) — build the dotted name so
@@ -52000,7 +52000,7 @@ impl Simulator {
                                     c = b.as_ref();
                                 }
                                 if let ExprKind::Ident(h) = &c.kind {
-                                    segs.push(self.resolve_hier_name(h));
+                                    segs.push(self.resolve_hier_name(h).into_owned());
                                     segs.reverse();
                                     break Some(segs.join("."));
                                 }
@@ -52157,14 +52157,14 @@ impl Simulator {
             return None;
         };
         let nm = self.resolve_hier_name(h);
-        let dims = self.module.packed_full_dims.get(&nm)?;
-        let mut udepth = if let Some((sh, _)) = self.module.arrays_nd.get(&nm) {
+        let dims = self.module.packed_full_dims.get(&*nm)?;
+        let mut udepth = if let Some((sh, _)) = self.module.arrays_nd.get(&*nm) {
             sh.len()
-        } else if self.module.arrays_2d.contains_key(&nm) {
+        } else if self.module.arrays_2d.contains_key(&*nm) {
             2
-        } else if self.module.arrays.contains_key(&nm)
-            || self.module.dynamic_arrays.contains(&nm)
-            || self.module.associative_arrays.contains_key(&nm)
+        } else if self.module.arrays.contains_key(&*nm)
+            || self.module.dynamic_arrays.contains(&*nm)
+            || self.module.associative_arrays.contains_key(&*nm)
         {
             1
         } else {
@@ -53037,7 +53037,7 @@ impl Simulator {
                         if self.module.classes.contains_key(cls)
                             && !self
                                 .signal_name_to_id
-                                .contains_key(self.resolve_hier_name(hier).as_str())
+                                .contains_key(self.resolve_hier_name(hier).as_ref())
                         {
                             // `Class::method` with NO parens invokes a
                             // parameterless STATIC function (LRM §13.4.1: a
@@ -54170,11 +54170,11 @@ impl Simulator {
                     // Special case: dynamic array/queue ident → concat all elements, idx0 at MSB.
                     let piece = if let ExprKind::Ident(h) = &p.kind {
                         let n = self.resolve_hier_name(h);
-                        if self.module.arrays.contains_key(&n) {
+                        if self.module.arrays.contains_key(&*n) {
                             let ew = self
                                 .lookup_signal_width(&format!("{}[0]", n))
                                 .unwrap_or_else(|| {
-                                    self.module.arrays.get(&n).map(|t| t.2).unwrap_or(8)
+                                    self.module.arrays.get(&*n).map(|t| t.2).unwrap_or(8)
                                 })
                                 .max(1);
                             let sz = self.get_queue_size(&n) as usize;
@@ -54303,7 +54303,7 @@ impl Simulator {
                 // memoized path deliberately skips the scope-hint ratchet, so
                 // the repeats were pure overhead, not a second decision.
                 let base_nm: Option<String> = match &expr.kind {
-                    ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                    ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
                     _ => None,
                 };
                 // §7.4.6 / §11.5.1: an x/z index reads x at the ELEMENT width,
@@ -54348,12 +54348,12 @@ impl Simulator {
                         let elemish = self
                             .module
                             .packed_signal_elem_widths
-                            .get(&nm)
+                            .get(&*nm)
                             .is_some_and(|&ew| ew > 1)
                             || self
                                 .module
                                 .packed_full_dims
-                                .get(&nm)
+                                .get(&*nm)
                                 .is_some_and(|d| d.len() > 1);
                         if elemish {
                             let norm = Expression::new(
@@ -54637,27 +54637,27 @@ impl Simulator {
                         let mut base_name = self.resolve_hier_name(hier);
                         // Bare class-member N-D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_nd.contains_key(&base_name) {
+                        if !self.module.arrays_nd.contains_key(&*base_name) {
                             if let Some(s) = self.instance_assoc_member(&base_name) {
-                                base_name = s;
+                                base_name = std::borrow::Cow::Owned(s);
                             }
                         }
-                        if let Some((shape, w)) = self.module.arrays_nd.get(&base_name).cloned() {
+                        if let Some((shape, w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
                                 for i in (0..rev_idxs.len()).rev() {
                                     let v =
                                         self.eval_expr(rev_idxs[i]).to_u64().unwrap_or(0) as i64;
-                                    name = format!("{}[{}]", name, v);
+                                    name = std::borrow::Cow::Owned(format!("{}[{}]", name, v));
                                 }
-                                if let Some(&eid) = self.signal_name_to_id.get(name.as_str()) {
+                                if let Some(&eid) = self.signal_name_to_id.get(name.as_ref()) {
                                     let mut v = self.signal_table[eid].clone();
                                     if self.signal_signed[eid] {
                                         v.is_signed = true;
                                     }
                                     return v;
                                 }
-                                if let Some(sv) = self.signals.get(&name) {
+                                if let Some(sv) = self.signals.get(&*name) {
                                     return sv.clone();
                                 }
                                 return Value::new(w);
@@ -54675,12 +54675,12 @@ impl Simulator {
                         let mut name = self.resolve_hier_name(hier);
                         // Bare class-member 2D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_2d.contains_key(&name) {
+                        if !self.module.arrays_2d.contains_key(&*name) {
                             if let Some(s) = self.instance_assoc_member(&name) {
-                                name = s;
+                                name = std::borrow::Cow::Owned(s);
                             }
                         }
-                        if self.module.arrays_2d.contains_key(&name) {
+                        if self.module.arrays_2d.contains_key(&*name) {
                             let i = self.eval_expr(inner_idx).to_u64().unwrap_or(0) as i64;
                             let j = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
                             let elem_name = format!("{}[{}][{}]", name, i, j);
@@ -54694,7 +54694,7 @@ impl Simulator {
                             if let Some(sv) = self.signals.get(&elem_name) {
                                 return sv.clone();
                             }
-                            let w = self.module.arrays_2d.get(&name).map(|t| t.2).unwrap_or(1);
+                            let w = self.module.arrays_2d.get(&*name).map(|t| t.2).unwrap_or(1);
                             return Value::new(w);
                         }
                     }
@@ -54704,7 +54704,7 @@ impl Simulator {
                 // (`u_h.mem[q]` from a parent scope) — mirror of the same
                 // shape in assign_value.
                 let idx_base_name: Option<String> = match &expr.kind {
-                    ExprKind::Ident(hier) => Some(self.resolve_hier_name(hier)),
+                    ExprKind::Ident(hier) => Some(self.resolve_hier_name(hier).into_owned()),
                     ExprKind::MemberAccess { .. } => self.flat_member_name(expr),
                     _ => None,
                 };
@@ -54917,7 +54917,7 @@ impl Simulator {
                     if rev_idx_exprs.len() >= 2 {
                         if let ExprKind::Ident(h) = &cur.kind {
                             let nm = self.resolve_hier_name(h);
-                            if let Some(dims) = self.module.packed_full_dims.get(&nm).cloned() {
+                            if let Some(dims) = self.module.packed_full_dims.get(&*nm).cloned() {
                                 if dims.len() >= rev_idx_exprs.len() {
                                     let base_v = self.eval_expr(cur);
                                     let total = base_v.width as u64;
@@ -54977,7 +54977,7 @@ impl Simulator {
                     let mut candidates: Vec<String> = Vec::new();
                     match &expr.kind {
                         ExprKind::Ident(h) => {
-                            candidates.push(self.resolve_hier_name(h));
+                            candidates.push(self.resolve_hier_name(h).into_owned());
                             if h.path.len() >= 2 {
                                 let dotted: String = h
                                     .path
@@ -55104,7 +55104,7 @@ impl Simulator {
                     // (`q[0].arr[i]`), so the base is a MemberAccess over an
                     // Index rather than a plain Ident.
                     let base = match &expr.kind {
-                        ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                        ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
                         ExprKind::MemberAccess { .. } => self.flat_member_name(expr),
                         _ => None,
                     };
@@ -55123,7 +55123,7 @@ impl Simulator {
                 // Fall back to bit select
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
-                    if let Some(dims) = self.module.packed_full_dims.get(&nm) {
+                    if let Some(dims) = self.module.packed_full_dims.get(&*nm) {
                         if let Some(&(dl, dr)) = dims.first() {
                             let lo_b = dl.min(dr);
                             if lo_b != 0 {
@@ -55146,8 +55146,8 @@ impl Simulator {
                 // Unpacked array slice: concatenate elements
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
-                    if let Some(&(arr_lo, arr_hi, elem_w)) = self.module.arrays.get(&name) {
-                        let is_dyn = self.module.dynamic_arrays.contains(&name);
+                    if let Some(&(arr_lo, arr_hi, elem_w)) = self.module.arrays.get(&*name) {
+                        let is_dyn = self.module.dynamic_arrays.contains(&*name);
                         let upper_bound: i64 = if is_dyn {
                             (self.get_queue_size(&name) as i64) - 1
                         } else {
@@ -55199,7 +55199,7 @@ impl Simulator {
                     if let ExprKind::Ident(h) = &expr.kind {
                         let nm = self.resolve_hier_name(h);
                         if let Some(&elem_w) =
-                            self.module.packed_signal_elem_widths.get(&nm).filter(|&&w| w > 1)
+                            self.module.packed_signal_elem_widths.get(&*nm).filter(|&&w| w > 1)
                         {
                             let li = self.eval_expr(left).to_i64().unwrap_or(0);
                             let ri = self.eval_expr(right).to_i64().unwrap_or(0);
@@ -55217,7 +55217,7 @@ impl Simulator {
                             let dim = self
                                 .module
                                 .packed_full_dims
-                                .get(&nm)
+                                .get(&*nm)
                                 .and_then(|d| d.first())
                                 .copied();
                             let lsb_of = |idx: i64| -> i64 {
@@ -55247,7 +55247,7 @@ impl Simulator {
                 // [(W-1)-a : (W-1)-b] (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
-                    if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
+                    if let Some(w) = self.module.ascending_packed.get(&*nm).copied() {
                         if matches!(kind, RangeKind::Constant) {
                             let a = self.eval_expr(left).to_u64().unwrap_or(0) as u32;
                             let b = self.eval_expr(right).to_u64().unwrap_or(0) as u32;
@@ -55304,7 +55304,7 @@ impl Simulator {
                         let nm = self.resolve_hier_name(h);
                         self.module
                             .packed_full_dims
-                            .get(&nm)
+                            .get(&*nm)
                             .and_then(|d| d.first())
                             .copied()
                     }
@@ -55507,7 +55507,7 @@ impl Simulator {
                     }
                     let sig_name = match args.first().map(|a| &a.kind) {
                         Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
-                        _ => String::new(),
+                        _ => std::borrow::Cow::Owned(String::new()),
                     };
                     let n_cycles = args
                         .get(1)
@@ -55522,7 +55522,7 @@ impl Simulator {
                         if let Some(ring) = self
                             .sva_sites
                             .get(site_idx)
-                            .and_then(|s| s.past_snapshots.get(&sig_name))
+                            .and_then(|s| s.past_snapshots.get(&*sig_name))
                         {
                             if let Some(v) = ring.get(idx) {
                                 return v.clone();
@@ -55562,7 +55562,7 @@ impl Simulator {
                     }
                     let sig_name = match args.first().map(|a| &a.kind) {
                         Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
-                        _ => String::new(),
+                        _ => std::borrow::Cow::Owned(String::new()),
                     };
                     let cur = self
                         .get_signal_value_by_name(&sig_name)
@@ -55570,7 +55570,7 @@ impl Simulator {
                     let prev_opt = self.active_sva_site.and_then(|si| {
                         self.sva_sites
                             .get(si)
-                            .and_then(|s| s.past_snapshots.get(&sig_name))
+                            .and_then(|s| s.past_snapshots.get(&*sig_name))
                             .and_then(|r| r.get(1).cloned())
                     });
                     let cur_bit = (cur.to_u64().unwrap_or(0) & 1) as u8;
@@ -55758,7 +55758,7 @@ impl Simulator {
                                     let mut found_member = false;
                                     while let Some(cn) = &cur {
                                         if let Some(cd) = self.module.classes.get(cn) {
-                                            if cd.properties.contains_key(&name) {
+                                            if cd.properties.contains_key(&*name) {
                                                 found_member = true;
                                                 break;
                                             }
@@ -55779,18 +55779,18 @@ impl Simulator {
                             // dimension sizes (IEEE 1800-2017 §20.6.2). The
                             // signal's own Value holds only one element, so the
                             // array shape must be consulted explicitly.
-                            if let Some(&(lo, hi, ew)) = self.module.arrays.get(&name) {
+                            if let Some(&(lo, hi, ew)) = self.module.arrays.get(&*name) {
                                 let n = (hi - lo).unsigned_abs() + 1;
                                 return Value::from_u64(n * ew as u64, 32);
                             }
                             if let Some(&((a0, a1), (b0, b1), ew)) =
-                                self.module.arrays_2d.get(&name)
+                                self.module.arrays_2d.get(&*name)
                             {
                                 let n =
                                     ((a1 - a0).unsigned_abs() + 1) * ((b1 - b0).unsigned_abs() + 1);
                                 return Value::from_u64(n * ew as u64, 32);
                             }
-                            if let Some((shape, ew)) = self.module.arrays_nd.get(&name) {
+                            if let Some((shape, ew)) = self.module.arrays_nd.get(&*name) {
                                 let n: u64 = shape
                                     .iter()
                                     .map(|(l, h)| (h - l).unsigned_abs() + 1)
@@ -55804,7 +55804,7 @@ impl Simulator {
                             // parameterized instances don't collide. Resolve
                             // through the process's scope hint, outermost
                             // scope walked inward (ivtest sv_enum1).
-                            let typedef_w = self.module.typedefs.get(&name).copied().or_else(|| {
+                            let typedef_w = self.module.typedefs.get(&*name).copied().or_else(|| {
                                 let mut h = self.name_resolve_hint.borrow().clone()?;
                                 loop {
                                     if let Some(&w) =
@@ -56942,20 +56942,20 @@ impl Simulator {
                             let elem_w = self
                                 .module
                                 .arrays
-                                .get(&aname)
+                                .get(&*aname)
                                 .map(|&(_, _, w)| w)
-                                .or_else(|| self.module.arrays_2d.get(&aname).map(|&(_, _, w)| w))
-                                .or_else(|| self.module.arrays_nd.get(&aname).map(|(_, w)| *w))
+                                .or_else(|| self.module.arrays_2d.get(&*aname).map(|&(_, _, w)| w))
+                                .or_else(|| self.module.arrays_nd.get(&*aname).map(|(_, w)| *w))
                                 .or_else(|| {
                                     self.signal_name_to_id
-                                        .get(aname.as_str())
+                                        .get(aname.as_ref())
                                         .map(|&id| self.signal_widths[id])
                                 })
                                 .unwrap_or(0);
                             let packed_dim: u64 = self
                                 .module
                                 .packed_full_dims
-                                .get(&aname)
+                                .get(&*aname)
                                 .map(|d| d.len() as u64)
                                 .unwrap_or(if elem_w > 1 { 1 } else { 0 });
                             let total = packed_dim + unpacked_dim;
@@ -57051,15 +57051,15 @@ impl Simulator {
                             // `<handle>#<member>`; the bare name has no dims.
                             if let Some(scoped) = self.instance_assoc_member(&aname) {
                                 if self.module.arrays.contains_key(&scoped) {
-                                    aname = scoped;
+                                    aname = std::borrow::Cow::Owned(scoped);
                                 }
                             }
                             // §8.9: `$size(Cls::S)` — the resolver collapses
                             // the 2-segment form to the bare leaf; map from
                             // the original segments to the qualified store.
-                            if !self.module.arrays.contains_key(&aname) {
+                            if !self.module.arrays.contains_key(&*aname) {
                                 if let Some(k) = self.static_fixed_key_from_hier(hier) {
-                                    aname = k;
+                                    aname = std::borrow::Cow::Owned(k);
                                 }
                             }
                             // Every unpacked dimension, outermost first. Only the
@@ -57069,13 +57069,13 @@ impl Simulator {
                             let elem_w = self
                                 .module
                                 .arrays
-                                .get(&aname)
+                                .get(&*aname)
                                 .map(|&(_, _, w)| w)
-                                .or_else(|| self.module.arrays_2d.get(&aname).map(|&(_, _, w)| w))
-                                .or_else(|| self.module.arrays_nd.get(&aname).map(|(_, w)| *w));
+                                .or_else(|| self.module.arrays_2d.get(&*aname).map(|&(_, _, w)| w))
+                                .or_else(|| self.module.arrays_nd.get(&*aname).map(|(_, w)| *w));
                             let packed_w = if let Some(w) = elem_w {
                                 w
-                            } else if let Some(&id) = self.signal_name_to_id.get(aname.as_str()) {
+                            } else if let Some(&id) = self.signal_name_to_id.get(aname.as_ref()) {
                                 self.signal_widths[id]
                             } else {
                                 // Block-local vector: width lives in the
@@ -57101,17 +57101,17 @@ impl Simulator {
                             let decl_sel = self
                                 .module
                                 .unpacked_decl_dims
-                                .get(&aname)
+                                .get(&*aname)
                                 .and_then(|d| d.get(dim.saturating_sub(1)))
                                 .copied();
                             let (lo, hi, descending) = if let Some((l, r)) = decl_sel {
                                 (l.min(r), l.max(r), l > r)
                             } else if let Some(&(l, h)) = sel {
                                 let desc =
-                                    dim == 1 && self.module.descending_arrays.contains(&aname);
+                                    dim == 1 && self.module.descending_arrays.contains(&*aname);
                                 (l, h, desc)
                             } else if let Some(&(l, r)) =
-                                self.module.packed_full_dims.get(&aname).and_then(|pd| {
+                                self.module.packed_full_dims.get(&*aname).and_then(|pd| {
                                     pd.get(dim.saturating_sub(1).saturating_sub(n_unpacked))
                                 })
                             {
@@ -57281,7 +57281,7 @@ impl Simulator {
                                 }
                             }
                             let name = self.resolve_hier_name(hier);
-                            if self.signal_name_to_id.contains_key(name.as_str()) {
+                            if self.signal_name_to_id.contains_key(name.as_ref()) {
                                 return Value::from_string("logic");
                             }
                         }
@@ -57481,12 +57481,12 @@ impl Simulator {
                             let elemish = self
                                 .module
                                 .packed_signal_elem_widths
-                                .get(&nm)
+                                .get(&*nm)
                                 .is_some_and(|&ew| ew > 1)
                                 || self
                                     .module
                                     .packed_full_dims
-                                    .get(&nm)
+                                    .get(&*nm)
                                     .is_some_and(|d| d.len() > 1);
                             if elemish {
                                 let norm = Expression::new(
@@ -57844,10 +57844,10 @@ impl Simulator {
                     // For `Index.field`: look up packed_struct_fields[base_arr_name]
                     // For `Call.field`: try the function's return type layout
                     let struct_base_name: Option<String> = match &expr.kind {
-                        ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                        ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
                         ExprKind::Index { expr: base, .. } => {
                             if let ExprKind::Ident(h) = &base.kind {
-                                Some(self.resolve_hier_name(h))
+                                Some(self.resolve_hier_name(h).into_owned())
                             } else {
                                 None
                             }
@@ -58137,13 +58137,13 @@ impl Simulator {
                     if let ExprKind::Ident(hier) = &idx_base.kind {
                         let mut an = self.resolve_hier_name(hier);
                         if let Some(scoped) = self.instance_assoc_member(&an) {
-                            an = scoped;
+                            an = std::borrow::Cow::Owned(scoped);
                         } else if !self.is_associative_array(&an)
-                            && !self.module.dynamic_arrays.contains(&an)
-                            && !self.module.arrays.contains_key(&an)
+                            && !self.module.dynamic_arrays.contains(&*an)
+                            && !self.module.arrays.contains_key(&*an)
                         {
                             // Through an object handle (`c.slices[0].path`).
-                            an = self.resolve_locator_storage(&an);
+                            an = std::borrow::Cow::Owned(self.resolve_locator_storage(&an));
                         }
                         if self.is_associative_array(&an) {
                             let idx_val = self.eval_expr(index);
@@ -58152,8 +58152,8 @@ impl Simulator {
                             if let Some(v) = self.get_signal_value_by_name(&target) {
                                 return v;
                             }
-                        } else if (self.module.dynamic_arrays.contains(&an)
-                            || self.module.arrays.contains_key(&an))
+                        } else if (self.module.dynamic_arrays.contains(&*an)
+                            || self.module.arrays.contains_key(&*an))
                             && self.queue_elem_struct(&an).is_some()
                         {
                             // Same leaf read for a DYNAMIC/fixed collection of
@@ -58201,7 +58201,7 @@ impl Simulator {
                             // `a[0].p` into an unknown `u.a`.
                             ExprKind::Ident(h) => {
                                 let scoped = self.resolve_hier_name(h);
-                                if !self.module.packed_struct_fields.contains_key(&scoped)
+                                if !self.module.packed_struct_fields.contains_key(&*scoped)
                                     && h.path.len() == 1
                                     && h.path[0].selects.is_empty()
                                     && self
@@ -58211,7 +58211,7 @@ impl Simulator {
                                 {
                                     break Some(h.path[0].name.name.clone());
                                 }
-                                break Some(scoped);
+                                break Some(scoped.to_string());
                             }
                             // §7.4.2: root may itself be a struct-member path
                             // (`main.sub_list[0].f`) — mirror of assign_value.
@@ -58223,7 +58223,7 @@ impl Simulator {
                                     c = b.as_ref();
                                 }
                                 if let ExprKind::Ident(h) = &c.kind {
-                                    segs.push(self.resolve_hier_name(h));
+                                    segs.push(self.resolve_hier_name(h).into_owned());
                                     segs.reverse();
                                     break Some(segs.join("."));
                                 }
@@ -58290,7 +58290,7 @@ impl Simulator {
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
-                    if let Some(fields) = self.module.packed_struct_fields.get(&name).cloned() {
+                    if let Some(fields) = self.module.packed_struct_fields.get(&*name).cloned() {
                         if let Some((_, off, w)) =
                             fields.iter().find(|(m, _, _)| m == &member.name).cloned()
                         {
@@ -58360,8 +58360,8 @@ impl Simulator {
                             // the CURRENT scope (§8.10): then the user
                             // method must dispatch, not a same-named global.
                             if !self.bare_receiver_is_class_handle(&name)
-                                && (self.module.arrays.contains_key(&name)
-                                    || self.module.dynamic_arrays.contains(&name)
+                                && (self.module.arrays.contains_key(&*name)
+                                    || self.module.dynamic_arrays.contains(&*name)
                                     || self.signals.contains_key(&format!("{}.size", name)))
                             {
                                 return Value::from_u64(self.get_queue_size(&name), 32);
@@ -58553,7 +58553,7 @@ impl Simulator {
                                 member,
                             } => {
                             if let ExprKind::Ident(h) = &arr_e.kind {
-                                Some((self.resolve_hier_name(h), member.name.clone()))
+                                Some((self.resolve_hier_name(h).into_owned(), member.name.clone()))
                             } else {
                                 None
                             }
@@ -58561,7 +58561,7 @@ impl Simulator {
                         ExprKind::Ident(h) if h.path.len() >= 2 => {
                             let mut head = h.clone();
                             let last = head.path.pop().unwrap().name.name;
-                            Some((self.resolve_hier_name(&head), last))
+                            Some((self.resolve_hier_name(&head).into_owned(), last))
                         }
                         _ => None,
                     }
@@ -58569,7 +58569,7 @@ impl Simulator {
                     if h.path.len() >= 2 {
                         let mut head = h.clone();
                         let last = head.path.pop().unwrap().name.name;
-                        Some((self.resolve_hier_name(&head), last))
+                        Some((self.resolve_hier_name(&head).into_owned(), last))
                     } else {
                         None
                     }
@@ -58579,7 +58579,7 @@ impl Simulator {
                     } = &expr.kind
                     {
                     if let ExprKind::Ident(h) = &arr_e.kind {
-                        Some((self.resolve_hier_name(h), member.name.clone()))
+                        Some((self.resolve_hier_name(h).into_owned(), member.name.clone()))
                     } else {
                         None
                     }
@@ -58709,7 +58709,7 @@ impl Simulator {
     fn subject_union_tag(&self, subject: &Expression) -> Option<String> {
         if let ExprKind::Ident(h) = &subject.kind {
             let n = self.resolve_hier_name(h);
-            return self.active_union_tag.get(&n).cloned();
+            return self.active_union_tag.get(&*n).cloned();
         }
         None
     }
@@ -59026,18 +59026,18 @@ impl Simulator {
                 return false;
             };
             let root_name = self.resolve_hier_name(root);
-            if self.module.arrays.contains_key(&root_name)
-                || self.module.arrays_2d.contains_key(&root_name)
-                || self.module.arrays_nd.contains_key(&root_name)
-                || self.module.dynamic_arrays.contains(&root_name)
-                || self.module.associative_arrays.contains_key(&root_name)
+            if self.module.arrays.contains_key(&*root_name)
+                || self.module.arrays_2d.contains_key(&*root_name)
+                || self.module.arrays_nd.contains_key(&*root_name)
+                || self.module.dynamic_arrays.contains(&*root_name)
+                || self.module.associative_arrays.contains_key(&*root_name)
             {
                 return false;
             }
             let Some(&(decl_l, decl_r)) = self
                 .module
                 .packed_full_dims
-                .get(&root_name)
+                .get(&*root_name)
                 .and_then(|dims| dims.get(depth))
             else {
                 return false;
@@ -59306,7 +59306,7 @@ impl Simulator {
                     };
                     if let Some((n_expr, src_expr)) = sized_new {
                         let target = match &lvalue.kind {
-                            ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
+                            ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh).into_owned()),
                             _ => self.flat_member_name(lvalue),
                         };
                         // A class-property dynamic array (`c.p = new[n]`)
@@ -60212,8 +60212,8 @@ impl Simulator {
                     if is_new && args.len() == 1 {
                         if let ExprKind::Ident(lh) = &lvalue.kind {
                             let mut lname = self.resolve_hier_name(lh);
-                            if !(self.module.dynamic_arrays.contains(&lname)
-                                || self.module.arrays.contains_key(&lname))
+                            if !(self.module.dynamic_arrays.contains(&*lname)
+                                || self.module.arrays.contains_key(&*lname))
                             {
                                 // A class-member dynamic array reached either
                                 // via the CURRENT instance (`base` → this
@@ -60251,25 +60251,25 @@ impl Simulator {
                                     })
                                     .or_else(|| self.expr_assoc_name(lvalue));
                                 if let Some(s) = scoped {
-                                    lname = s;
+                                    lname = std::borrow::Cow::Owned(s);
                                 }
                             }
-                            if self.module.dynamic_arrays.contains(&lname)
-                                || self.module.arrays.contains_key(&lname)
+                            if self.module.dynamic_arrays.contains(&*lname)
+                                || self.module.arrays.contains_key(&*lname)
                                 || lname.contains('#')
                             {
                             let size = self.eval_expr(&args[0]).to_u64().unwrap_or(0);
-                            let w = self.module.arrays.get(&lname).map(|t| t.2).unwrap_or(32);
+                            let w = self.module.arrays.get(&*lname).map(|t| t.2).unwrap_or(32);
                             // Drop any stale elements, then size + zero-fill.
                             let prefix = format!("{}[", lname);
                             let stale: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
                             for k in stale {
                                 self.signals.remove(&k);
                             }
-                            self.module.dynamic_arrays.insert(lname.clone());
+                            self.module.dynamic_arrays.insert(lname.to_string());
                                 self.module
                                     .arrays
-                                    .entry(lname.clone())
+                                    .entry(lname.to_string())
                                     .or_insert((0, 63, w));
                             // A STRUCT-element array keeps each member in its
                             // own leaf signal (`arr[i].path`); registering a
@@ -60328,7 +60328,7 @@ impl Simulator {
                         } else {
                             tag.name.clone()
                         };
-                        self.active_union_tag.insert(lname.clone(), tag_name);
+                        self.active_union_tag.insert(lname.to_string(), tag_name);
                         if let Some(inner_expr) = inner {
                             let v = self.eval_expr(inner_expr);
                             self.set_signal_value_by_name(&lname, v);
@@ -60359,10 +60359,10 @@ impl Simulator {
                     // A string QUEUE is in `string_signals` too (so its
                     // elements render as strings), but `q = {...}` on it is a
                     // QUEUE assignment — `q = {}` clears it — not a byte concat.
-                    let lhs_is_queue = self.module.dynamic_arrays.contains(&lname)
-                        || self.module.arrays.contains_key(&lname);
+                    let lhs_is_queue = self.module.dynamic_arrays.contains(&*lname)
+                        || self.module.arrays.contains_key(&*lname);
                     if !lhs_is_queue
-                        && (self.string_signals.contains(&lname)
+                        && (self.string_signals.contains(&*lname)
                             || self.string_signals.contains(
                                 &lh.path
                                     .last()
@@ -60389,12 +60389,12 @@ impl Simulator {
                         if self
                             .local_stack
                             .last()
-                            .is_some_and(|f| f.contains_key(&lname))
+                            .is_some_and(|f| f.contains_key(&*lname))
                         {
                             self.local_stack
                                 .last_mut()
                                 .unwrap()
-                                .insert(lname.clone(), sval);
+                                .insert(lname.to_string(), sval);
                         } else {
                             self.assign_value(lvalue, &sval);
                         }
@@ -60511,8 +60511,8 @@ impl Simulator {
                     if let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lbase.kind, &rbase.kind) {
                         let lname = self.resolve_hier_name(lh);
                         let rname = self.resolve_hier_name(rh);
-                        let lshape = self.module.arrays_nd.get(&lname).cloned();
-                        let rshape = self.module.arrays_nd.get(&rname).cloned();
+                        let lshape = self.module.arrays_nd.get(&*lname).cloned();
+                        let rshape = self.module.arrays_nd.get(&*rname).cloned();
                         if let (Some((ls, _)), Some((rs, _))) = (lshape, rshape) {
                             if ls.len() == rs.len()
                                 && lrev.len() < ls.len()
@@ -60524,8 +60524,8 @@ impl Simulator {
                                 for i in (0..given).rev() {
                                     let lv = self.eval_expr(lrev[i]).to_u64().unwrap_or(0) as i64;
                                     let rv = self.eval_expr(rrev[i]).to_u64().unwrap_or(0) as i64;
-                                    l_prefix = format!("{}[{}]", l_prefix, lv);
-                                    r_prefix = format!("{}[{}]", r_prefix, rv);
+                                    l_prefix = std::borrow::Cow::Owned(format!("{}[{}]", l_prefix, lv));
+                                    r_prefix = std::borrow::Cow::Owned(format!("{}[{}]", r_prefix, rv));
                                 }
                                 let remaining: Vec<(i64, i64)> =
                                     ls[given..].to_vec();
@@ -60552,7 +60552,7 @@ impl Simulator {
                                         }
                                     }
                                     let mut pairs = Vec::new();
-                                    enum_idx(&remaining, l_prefix, r_prefix, &mut pairs);
+                                    enum_idx(&remaining, l_prefix.into_owned(), r_prefix.into_owned(), &mut pairs);
                                     for (lp, rp) in pairs {
                                         let v = self
                                             .get_signal_value_by_name(&rp)
@@ -60573,11 +60573,11 @@ impl Simulator {
                 if let ExprKind::StreamOp { .. } = &rvalue.kind {
                     if let ExprKind::Ident(lh) = &lvalue.kind {
                         let lname = self.resolve_hier_name(lh);
-                        if self.module.arrays.contains_key(&lname) {
+                        if self.module.arrays.contains_key(&*lname) {
                             let elem_w = self
                                 .lookup_signal_width(&format!("{}[0]", lname))
                                 .unwrap_or_else(|| {
-                                    self.module.arrays.get(&lname).map(|t| t.2).unwrap_or(8)
+                                    self.module.arrays.get(&*lname).map(|t| t.2).unwrap_or(8)
                                 })
                                 .max(1);
                             // Evaluate stream raw (no pad) by using ctx 0.
@@ -60619,14 +60619,14 @@ impl Simulator {
                     // element type, concatenate elements with index 0 at the MSB.
                     let rhs_val = if let ExprKind::Ident(rhier) = &rvalue.kind {
                         let rname = self.resolve_hier_name(rhier);
-                        if self.module.arrays.contains_key(&rname)
-                            || self.module.dynamic_arrays.contains(&rname)
+                        if self.module.arrays.contains_key(&*rname)
+                            || self.module.dynamic_arrays.contains(&*rname)
                         {
                             let n = self.get_queue_size(&rname) as usize;
                             let elem_w = self
                                 .lookup_signal_width(&format!("{}[0]", rname))
                                 .unwrap_or_else(|| {
-                                    self.module.arrays.get(&rname).map(|t| t.2).unwrap_or(8)
+                                    self.module.arrays.get(&*rname).map(|t| t.2).unwrap_or(8)
                                 });
                             let total_w = (n as u32) * elem_w;
                             let mut packed = Value::zero(total_w);
@@ -60690,15 +60690,15 @@ impl Simulator {
                         if is_last {
                             if let ExprKind::Ident(h) = &e.kind {
                                 let n = self.resolve_hier_name(h);
-                                if self.module.dynamic_arrays.contains(&n)
-                                    || self.module.arrays.contains_key(&n)
+                                if self.module.dynamic_arrays.contains(&*n)
+                                    || self.module.arrays.contains_key(&*n)
                                 {
                                     let ew = self
                                         .lookup_signal_width(&format!("{}[0]", n))
                                         .unwrap_or_else(|| {
-                                            self.module.arrays.get(&n).map(|t| t.2).unwrap_or(8)
+                                            self.module.arrays.get(&*n).map(|t| t.2).unwrap_or(8)
                                         });
-                                    dyn_last = Some(n);
+                                    dyn_last = Some(n.to_string());
                                     dyn_last_elem_w = ew;
                                     continue;
                                 }
@@ -61133,7 +61133,7 @@ impl Simulator {
                                 let is_frame_local = self
                                     .local_stack
                                     .last()
-                                    .is_some_and(|f| f.contains_key(&lhs_name));
+                                    .is_some_and(|f| f.contains_key(&*lhs_name));
                                 let has_field_sigs = decl_order.iter().all(|(fn_, _, _, _)| {
                                     let dotted = format!("{}.{}", lhs_name, fn_);
                                     self.signals.contains_key(&dotted)
@@ -61147,7 +61147,7 @@ impl Simulator {
                                             self.local_stack
                                                 .last()
                                                 .unwrap()
-                                                .get(&lhs_name)
+                                                .get(&*lhs_name)
                                                 .cloned()
                                                 .unwrap_or_else(|| Value::zero(65))
                                         } else {
@@ -61186,7 +61186,7 @@ impl Simulator {
                                             self.local_stack
                                                 .last_mut()
                                                 .unwrap()
-                                                .insert(lhs_name.clone(), cur);
+                                                .insert(lhs_name.to_string(), cur);
                                         } else {
                                             self.set_signal_value_by_name(&lhs_name, cur);
                                         }
@@ -61353,7 +61353,7 @@ impl Simulator {
                                         // dynamic array, named flat as `d[i]`.
                                         let target = match &lvalue.kind {
                                             ExprKind::Ident(lhier) => {
-                                                Some(self.resolve_hier_name(lhier))
+                                                Some(self.resolve_hier_name(lhier).into_owned())
                                             }
                                             _ => {
                                                 let f = self.flat_member_name(lvalue);
@@ -61443,7 +61443,7 @@ impl Simulator {
                                 let n = self
                                     .dyn_name_lookup(bare)
                                     .map(str::to_string)
-                                    .unwrap_or_else(|| self.resolve_hier_name(h));
+                                    .unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
                                 self.module.dynamic_arrays.contains(&n).then_some(n)
                             } else {
                                 None
@@ -61612,21 +61612,21 @@ impl Simulator {
                         self.settle_after_proc_write();
                         return;
                     }
-                    if self.module.arrays.contains_key(&lname)
-                        && self.module.arrays.contains_key(&rname)
+                    if self.module.arrays.contains_key(&*lname)
+                        && self.module.arrays.contains_key(&*rname)
                     {
-                        let (llo, lhi, _) = self.module.arrays[&lname];
-                        let (rlo, rhi, _) = self.module.arrays[&rname];
+                        let (llo, lhi, _) = self.module.arrays[&*lname];
+                        let (rlo, rhi, _) = self.module.arrays[&*rname];
                         let lsize = (lhi - llo + 1) as usize;
                         let rsize = (rhi - rlo + 1) as usize;
                         // §7.6: assigning a FIXED array to a DYNAMIC array
                         // resizes the destination to the source's size —
                         // the placeholder (0,63) registration made this look
                         // like fixed-to-fixed and left the old size in place.
-                        if self.module.dynamic_arrays.contains(&lname)
-                            && !self.module.dynamic_arrays.contains(&rname)
+                        if self.module.dynamic_arrays.contains(&*lname)
+                            && !self.module.dynamic_arrays.contains(&*rname)
                         {
-                            let r_desc = self.module.descending_arrays.contains(&rname);
+                            let r_desc = self.module.descending_arrays.contains(&*rname);
                             for i in 0..rsize {
                                 let ridx = if r_desc {
                                     rhi - i as i64
@@ -61646,8 +61646,8 @@ impl Simulator {
                             return;
                         }
                         let count = lsize.min(rsize);
-                        let l_desc = self.module.descending_arrays.contains(&lname);
-                        let r_desc = self.module.descending_arrays.contains(&rname);
+                        let l_desc = self.module.descending_arrays.contains(&*lname);
+                        let r_desc = self.module.descending_arrays.contains(&*rname);
                         for i in 0..count {
                             let ridx = if r_desc {
                                 rhi - i as i64
@@ -61673,9 +61673,9 @@ impl Simulator {
                     // An instance-scoped queue/array member (`q` inside a method,
                     // or `obj.q`) lives under `<handle>#q`, not the bare name.
                     if let Some(s) = self.instance_assoc_member(&lname) {
-                        lname = s;
+                        lname = std::borrow::Cow::Owned(s);
                     }
-                    if self.module.arrays.contains_key(&lname) {
+                    if self.module.arrays.contains_key(&*lname) {
                         // Queue/array slice assignment: lq = rq[a:b]
                         if let ExprKind::RangeSelect {
                             expr: rbase,
@@ -61689,11 +61689,11 @@ impl Simulator {
                                 // Same instance scoping as the LHS: a member queue
                                 // slice (`instr_list[a:b]`) reads `<handle>#name`.
                                 if let Some(s) = self.instance_assoc_member(&rname) {
-                                    rname = s;
+                                    rname = std::borrow::Cow::Owned(s);
                                 }
-                                if self.module.arrays.contains_key(&rname) {
-                                    let (r_lo_a, r_hi_a, _) = self.module.arrays[&rname];
-                                    let r_is_dyn = self.module.dynamic_arrays.contains(&rname);
+                                if self.module.arrays.contains_key(&*rname) {
+                                    let (r_lo_a, r_hi_a, _) = self.module.arrays[&*rname];
+                                    let r_is_dyn = self.module.dynamic_arrays.contains(&*rname);
                                     let r_upper: i64 = if r_is_dyn {
                                         (self.get_queue_size(&rname) as i64) - 1
                                     } else {
@@ -61723,8 +61723,8 @@ impl Simulator {
                                                 .collect()
                                         }
                                     };
-                                    let (l_lo, l_hi, _) = self.module.arrays[&lname];
-                                    let is_dyn = self.module.dynamic_arrays.contains(&lname);
+                                    let (l_lo, l_hi, _) = self.module.arrays[&*lname];
+                                    let is_dyn = self.module.dynamic_arrays.contains(&*lname);
                                     for (i, v) in results.iter().enumerate() {
                                         let idx = l_lo + i as i64;
                                         // Dynamic arrays / queues start
@@ -61748,14 +61748,14 @@ impl Simulator {
                             }
                         }
                         if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
-                            let is_dyn = self.module.dynamic_arrays.contains(&lname);
+                            let is_dyn = self.module.dynamic_arrays.contains(&*lname);
                             let (lo, hi, _w) = self
                                 .module
                                 .arrays
-                                .get(&lname)
+                                .get(&*lname)
                                 .copied()
                                 .unwrap_or((0, -1, 32));
-                            let descending = self.module.descending_arrays.contains(&lname);
+                            let descending = self.module.descending_arrays.contains(&*lname);
                             for (i, item) in items.iter().enumerate() {
                                 let idx = if descending {
                                     hi - i as i64
@@ -61843,12 +61843,12 @@ impl Simulator {
                                         // Instance-scope a member-queue slice
                                         // operand inside a concat (`{q[0:i], …}`).
                                         if let Some(s) = self.instance_assoc_member(&rname) {
-                                            rname = s;
+                                            rname = std::borrow::Cow::Owned(s);
                                         }
-                                        if self.module.arrays.contains_key(&rname) {
-                                            let (r_lo_a, r_hi_a, _) = self.module.arrays[&rname];
+                                        if self.module.arrays.contains_key(&*rname) {
+                                            let (r_lo_a, r_hi_a, _) = self.module.arrays[&*rname];
                                             let r_is_dyn =
-                                                self.module.dynamic_arrays.contains(&rname);
+                                                self.module.dynamic_arrays.contains(&*rname);
                                             let r_upper: i64 = if r_is_dyn {
                                                 (self.get_queue_size(&rname) as i64) - 1
                                             } else {
@@ -61880,11 +61880,11 @@ impl Simulator {
                                 }
                                 all_vals.push(self.eval_expr(expr));
                             }
-                            let is_dyn = self.module.dynamic_arrays.contains(&lname);
+                            let is_dyn = self.module.dynamic_arrays.contains(&*lname);
                             let (lo, hi, _w) = self
                                 .module
                                 .arrays
-                                .get(&lname)
+                                .get(&*lname)
                                 .copied()
                                 .unwrap_or((0, -1, 32));
                             for (i, v) in all_vals.iter().enumerate() {
@@ -61910,8 +61910,8 @@ impl Simulator {
                 // When assigning a locator/reduction method result to a queue, store as single-element queue
                 if let ExprKind::Ident(lhier) = &lvalue.kind {
                     let lname = self.resolve_hier_name(lhier);
-                    if self.module.dynamic_arrays.contains(&lname)
-                        && self.module.arrays.contains_key(&lname)
+                    if self.module.dynamic_arrays.contains(&*lname)
+                        && self.module.arrays.contains_key(&*lname)
                     {
                         if let ExprKind::MemberAccess { member, .. } = &rvalue.kind {
                             let mname = member.name.as_str();
@@ -62921,13 +62921,13 @@ impl Simulator {
                     // (UVM's get_full_hdl_path parent_paths loop, so every
                     // backdoor access lost its hdl path).
                     if let Some(rn) = self.dyn_name_lookup(&name) {
-                        name = rn.to_string();
+                        name = std::borrow::Cow::Owned(rn.to_string());
                     } else {
                         let spec_key = self.spec_static_coll_key(&name);
                         if spec_key != name {
-                            name = spec_key;
+                            name = std::borrow::Cow::Owned(spec_key);
                         } else if let Some(scoped) = self.instance_assoc_member(&name) {
-                            name = scoped;
+                            name = std::borrow::Cow::Owned(scoped);
                         }
                     }
                     // `foreach (obj.member[i, j])` over a FIXED array
@@ -62939,10 +62939,10 @@ impl Simulator {
                     // only via a later element-key scan).
                     if hier.path.len() >= 2
                         && hier.path.iter().all(|s| s.selects.is_empty())
-                        && !self.module.arrays.contains_key(&name)
-                        && !self.module.arrays_2d.contains_key(&name)
-                        && !self.module.arrays_nd.contains_key(&name)
-                        && !self.module.dynamic_arrays.contains(&name)
+                        && !self.module.arrays.contains_key(&*name)
+                        && !self.module.arrays_2d.contains_key(&*name)
+                        && !self.module.arrays_nd.contains_key(&*name)
+                        && !self.module.dynamic_arrays.contains(&*name)
                         && !self.is_associative_array(&name)
                     {
                         let obj = hier.path[0].name.name.clone();
@@ -62973,7 +62973,7 @@ impl Simulator {
                                 || self.module.arrays_2d.contains_key(&scoped)
                                 || self.module.arrays_nd.contains_key(&scoped)
                             {
-                                name = scoped;
+                                name = std::borrow::Cow::Owned(scoped);
                             }
                         }
                     }
@@ -62981,10 +62981,10 @@ impl Simulator {
                     // under the process's instance scope ("u_s.mem"), like
                     // reads/writes already do — otherwise the collection
                     // lookups all miss and the foreach body never runs.
-                    if !self.module.arrays.contains_key(&name)
-                        && !self.module.arrays_2d.contains_key(&name)
-                        && !self.module.arrays_nd.contains_key(&name)
-                        && !self.module.dynamic_arrays.contains(&name)
+                    if !self.module.arrays.contains_key(&*name)
+                        && !self.module.arrays_2d.contains_key(&*name)
+                        && !self.module.arrays_nd.contains_key(&*name)
+                        && !self.module.dynamic_arrays.contains(&*name)
                         && !self.is_associative_array(&name)
                     {
                         let hint = self.name_resolve_hint.borrow().clone();
@@ -62996,7 +62996,7 @@ impl Simulator {
                                 || self.module.dynamic_arrays.contains(&scoped)
                                 || self.is_associative_array(&scoped)
                             {
-                                name = scoped;
+                                name = std::borrow::Cow::Owned(scoped);
                             }
                         }
                     }
@@ -63008,10 +63008,10 @@ impl Simulator {
                     // UNIQUE suffix match: accept `<scope>.m` only when exactly
                     // one registered array ends that way, so this can never pick
                     // between same-named arrays in sibling instances.
-                    if !self.module.arrays.contains_key(&name)
-                        && !self.module.arrays_2d.contains_key(&name)
-                        && !self.module.arrays_nd.contains_key(&name)
-                        && !self.module.dynamic_arrays.contains(&name)
+                    if !self.module.arrays.contains_key(&*name)
+                        && !self.module.arrays_2d.contains_key(&*name)
+                        && !self.module.arrays_nd.contains_key(&*name)
+                        && !self.module.dynamic_arrays.contains(&*name)
                         && !self.is_associative_array(&name)
                         && !name.contains('.')
                     {
@@ -63034,7 +63034,7 @@ impl Simulator {
                             }
                         }
                         if let (Some(k), false) = (hit, many) {
-                            name = k;
+                            name = std::borrow::Cow::Owned(k);
                         }
                     }
                     // The array's instance prefix ("u_s" from "u_s.mem") —
@@ -63051,7 +63051,7 @@ impl Simulator {
                     // fallbacks below sized a 2-D fixed array wrong (one
                     // iteration).
                     if vars.len() == 1
-                        && !self.module.dynamic_arrays.contains(&name)
+                        && !self.module.dynamic_arrays.contains(&*name)
                         && !self.is_associative_array(&name)
                     {
                         if let Some(dims) = self.foreach_dims(&name) {
@@ -63071,7 +63071,7 @@ impl Simulator {
                             // A dynamic outer dimension (`T a[][16]`) is backed
                             // by a fixed 64-slot buffer; iterate only the
                             // CURRENT size, like the 1-var dynamic path below.
-                            if self.module.dynamic_arrays.contains(&name) {
+                            if self.module.dynamic_arrays.contains(&*name) {
                                 let sz = self.get_queue_size(&name) as i64;
                                 dims[0] = (0, sz - 1);
                             }
@@ -63089,7 +63089,7 @@ impl Simulator {
                             // record (e.g. a bare `reg [W-1:0]` element).
                             let mut descs: Vec<bool> = vec![false; dims.len()];
                             if dims.len() < vars.len() {
-                                if let Some(pdims) = self.module.packed_full_dims.get(&name) {
+                                if let Some(pdims) = self.module.packed_full_dims.get(&*name) {
                                     for &(l, r) in pdims.iter() {
                                         if dims.len() >= vars.len() {
                                             break;
@@ -63103,13 +63103,13 @@ impl Simulator {
                                     let ew = self
                                         .module
                                         .arrays
-                                        .get(&name)
+                                        .get(&*name)
                                         .map(|&(_, _, w)| w)
                                         .or_else(|| {
-                                            self.module.arrays_2d.get(&name).map(|&(_, _, w)| w)
+                                            self.module.arrays_2d.get(&*name).map(|&(_, _, w)| w)
                                         })
                                         .or_else(|| {
-                                            self.module.arrays_nd.get(&name).map(|(_, w)| *w)
+                                            self.module.arrays_nd.get(&*name).map(|(_, w)| *w)
                                         });
                                     if let Some(w) = ew.filter(|&w| w > 1) {
                                         dims.push((0, w as i64 - 1));
@@ -63117,7 +63117,7 @@ impl Simulator {
                                         // lone packed dim is `[w-1:0]` unless
                                         // the ascending map says otherwise.
                                         descs.push(
-                                            !self.module.ascending_packed.contains_key(&name),
+                                            !self.module.ascending_packed.contains_key(&*name),
                                         );
                                     }
                                 }
@@ -63164,7 +63164,7 @@ impl Simulator {
                                 let is_str = self
                                     .module
                                     .associative_arrays
-                                    .get(&name)
+                                    .get(&*name)
                                     .copied()
                                     .unwrap_or(false);
                                 'akeys: for key in &akeys {
@@ -63211,7 +63211,7 @@ impl Simulator {
                     }
                     if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                         self.widths.insert(var.name.clone(), 32);
-                        if self.string_signals.contains(&name)
+                        if self.string_signals.contains(&*name)
                             // A QUEUE/dyn array OF STRINGS is in
                             // `string_signals` too (so its elements render as
                             // strings) — but foreach over it walks ELEMENTS,
@@ -63219,11 +63219,11 @@ impl Simulator {
                             // `string pp[$]` in a class method iterated zero
                             // times (UVM get_full_hdl_path's parent_paths
                             // loop — every backdoor access lost its path).
-                            && !self.module.dynamic_arrays.contains(&name)
+                            && !self.module.dynamic_arrays.contains(&*name)
                             && !self.is_associative_array(&name)
-                            && !self.module.arrays.contains_key(&name)
-                            && !self.module.arrays_2d.contains_key(&name)
-                            && !self.module.arrays_nd.contains_key(&name)
+                            && !self.module.arrays.contains_key(&*name)
+                            && !self.module.arrays_2d.contains_key(&*name)
+                            && !self.module.arrays_nd.contains_key(&*name)
                         {
                             // foreach over a STRING iterates its characters
                             // [0..len) by CONTENT length, and must be checked
@@ -63289,7 +63289,7 @@ impl Simulator {
                             let is_str = self
                                 .module
                                 .associative_arrays
-                                .get(&name)
+                                .get(&*name)
                                 .copied()
                                 .unwrap_or(false)
                                 || self.is_string_keyed_array(&name);
@@ -63328,7 +63328,7 @@ impl Simulator {
                                 }
                                 self.continue_flag = false;
                             }
-                        } else if self.module.dynamic_arrays.contains(&name) {
+                        } else if self.module.dynamic_arrays.contains(&*name) {
                             // Queue / dynamic array: iterate 0..current size.
                             let size = self.get_queue_size(&name);
                             for i in 0..size {
@@ -63350,9 +63350,9 @@ impl Simulator {
                                 }
                                 self.continue_flag = false;
                             }
-                        } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
+                        } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&*name) {
                             // Fixed unpacked array: iterate its declared index range.
-                            let descending = self.module.descending_arrays.contains(&name);
+                            let descending = self.module.descending_arrays.contains(&*name);
                             let mut idx = lo;
                             while idx <= hi {
                                 if self.finished {
@@ -63375,7 +63375,7 @@ impl Simulator {
                                 self.continue_flag = false;
                                 idx += 1;
                             }
-                        } else if self.string_signals.contains(&name) {
+                        } else if self.string_signals.contains(&*name) {
                             // foreach over a string iterates its characters
                             // [0..len). Use the CONTENT length: a string is held
                             // in a fixed-width container (e.g. 1024 bits), so
@@ -63401,7 +63401,7 @@ impl Simulator {
                         } else if let Some(&(l, r)) = self
                             .module
                             .packed_full_dims
-                            .get(&name)
+                            .get(&*name)
                             .filter(|d| d.len() >= 2)
                             .and_then(|d| d.first())
                         {
@@ -63872,7 +63872,7 @@ impl Simulator {
                             .dyn_name_lookup(bare)
                             .map(str::to_string)
                             .or_else(|| self.instance_assoc_member(bare))
-                            .unwrap_or_else(|| self.resolve_hier_name(h));
+                            .unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
                         if self.module.dynamic_arrays.contains(&n) {
                             // Frame teardown wipes a subroutine-LOCAL
                             // collection before the caller's assignment
@@ -64187,7 +64187,7 @@ impl Simulator {
                         let span_key = a.span.start;
                         if !self.sva_sites.iter().any(|s| s.span_key == span_key) {
                             let clock_signal = match &clock.kind {
-                                ExprKind::Ident(h) => self.resolve_hier_name(h),
+                                ExprKind::Ident(h) => self.resolve_hier_name(h).into_owned(),
                                 _ => String::new(),
                             };
                             // LRM §16.5.1: collect the ids of every signal
@@ -65998,7 +65998,7 @@ impl Simulator {
                     keys.push(seg.name.name.clone());
                 }
             }
-            keys.push(self.resolve_hier_name(h));
+            keys.push(self.resolve_hier_name(h).into_owned());
         }
         // Container element (`q[0].triggered`): the element VALUE is the key.
         if let ExprKind::Ident(h) = &e.kind {
@@ -66701,7 +66701,7 @@ impl Simulator {
                 let td = self
                     .module
                     .tasks
-                    .get(&name)
+                    .get(&*name)
                     .or_else(|| raw.as_deref().and_then(|r| self.module.tasks.get(r)))
                     .cloned();
                 if let Some(td) = td {
@@ -67026,7 +67026,7 @@ impl Simulator {
                 // module timescale; no argument means the calling scope.
                 let arg_inst: Option<String> = args.first().and_then(|a| {
                     if let ExprKind::Ident(h) = &a.kind {
-                        Some(self.resolve_hier_name(h))
+                        Some(self.resolve_hier_name(h).into_owned())
                     } else {
                         None
                     }
@@ -67547,7 +67547,7 @@ impl Simulator {
                     if let ExprKind::Ident(hier) = &a.kind {
                         let s = self.resolve_hier_name(hier);
                         if !s.is_empty() {
-                            scopes.push(s);
+                            scopes.push(s.to_string());
                         }
                     }
                 }
@@ -68138,7 +68138,7 @@ impl Simulator {
             // A bare or member reference whose declared type is `string`, or an
             // element of a string-typed queue/array.
             ExprKind::Ident(h) => {
-                self.string_signals.contains(&self.resolve_hier_name(h))
+                self.string_signals.contains(&*self.resolve_hier_name(h))
                     || self.class_member_is_string(expr)
                     || self
                         .get_expr_type_name(expr)
@@ -68147,7 +68147,7 @@ impl Simulator {
             }
             ExprKind::Index { expr: base, .. } => {
                 (if let ExprKind::Ident(h) = &base.kind {
-                    self.string_signals.contains(&self.resolve_hier_name(h))
+                    self.string_signals.contains(&*self.resolve_hier_name(h))
                 } else {
                     false
                 }) || self
@@ -68700,7 +68700,7 @@ impl Simulator {
                                 }
                                 if let ExprKind::Ident(h) = &arg.kind {
                                     let name = self.resolve_hier_name(h);
-                                    if let Some(tag) = self.active_union_tag.get(&name).cloned() {
+                                    if let Some(tag) = self.active_union_tag.get(&*name).cloned() {
                                         let v = self.eval_expr(arg);
                                         result.push_str(&format!(
                                             "'{{{}:{}}}",
@@ -68827,7 +68827,7 @@ impl Simulator {
                                         let is_str = match &fexpr.kind {
                                             ExprKind::Ident(fh) => {
                                                 let n = self.resolve_hier_name(fh);
-                                                self.string_signals.contains(&n)
+                                                self.string_signals.contains(&*n)
                                             }
                                             _ => false,
                                         };
@@ -68860,15 +68860,15 @@ impl Simulator {
                                     if matches!(kind, RangeKind::Constant) {
                                         if let ExprKind::Ident(h) = &expr.kind {
                                             let nm = self.resolve_hier_name(h);
-                                            let is_coll = self.module.arrays.contains_key(&nm)
-                                                || self.module.dynamic_arrays.contains(&nm);
+                                            let is_coll = self.module.arrays.contains_key(&*nm)
+                                                || self.module.dynamic_arrays.contains(&*nm);
                                             if is_coll {
                                                 let is_dyn =
-                                                    self.module.dynamic_arrays.contains(&nm);
+                                                    self.module.dynamic_arrays.contains(&*nm);
                                                 let (arr_lo, arr_hi) = self
                                                     .module
                                                     .arrays
-                                                    .get(&nm)
+                                                    .get(&*nm)
                                                     .map(|&(lo, hi, _)| (lo, hi))
                                                     .unwrap_or((0, 0));
                                                 // `$` in the slice resolves to the
@@ -68892,7 +68892,7 @@ impl Simulator {
                                                 // element range.
                                                 l = l.max(arr_lo);
                                                 r = r.min(upper);
-                                                let is_str = self.string_signals.contains(&nm);
+                                                let is_str = self.string_signals.contains(&*nm);
                                                 let mut parts: Vec<String> = Vec::new();
                                                 for i in l..=r {
                                                     let en = format!("{}[{}]", nm, i);
@@ -69838,7 +69838,7 @@ impl Simulator {
             {
                 if let Some(arg) = args.first() {
                     if let ExprKind::Ident(h) = &arg.kind {
-                        out.push(self.resolve_hier_name(h));
+                        out.push(self.resolve_hier_name(h).into_owned());
                     }
                 }
                 for a in args {
@@ -70388,10 +70388,50 @@ impl Simulator {
         e
     }
 
-    fn resolve_hier_name(&self, hier: &HierarchicalIdentifier) -> String {
+    /// Resolved flat name of a hierarchical identifier, BORROWED from the
+    /// node's own cache whenever it has one (`Cow::Borrowed`), so the hot
+    /// read paths stop allocating a String per resolution. The lifetime is
+    /// the node's, not `self`'s, so callers can keep the name across `&mut
+    /// self` calls. Owned only on the frame-dependent paths (per-process
+    /// local-dyn rename, package-ambiguous free names) and the first
+    /// computation of an uncacheable shape.
+    fn resolve_hier_name<'h>(&self, hier: &'h HierarchicalIdentifier) -> std::borrow::Cow<'h, str> {
         if self.name_stats_on {
             self.name_stats[1].set(self.name_stats[1].get() + 1);
         }
+        if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+            if let Some(uq) = self.dyn_name_lookup(&hier.path[0].name.name) {
+                return std::borrow::Cow::Owned(uq.to_string());
+            }
+        }
+        if !self.pkg_ambiguous_names.is_empty() && hier.path.len() == 1 {
+            let leaf = hier.path[0].name.name.as_str();
+            if self.pkg_ambiguous_names.contains(leaf)
+                && !self
+                    .local_stack
+                    .last()
+                    .is_some_and(|l| l.contains_key(leaf))
+            {
+                if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
+                    let qual = format!("{}::{}", pkg, leaf);
+                    if self.signal_name_to_id.contains_key(qual.as_str()) {
+                        return std::borrow::Cow::Owned(qual);
+                    }
+                }
+            }
+        }
+        if let Some(cached) = hier.cached_resolved_name.get() {
+            return std::borrow::Cow::Borrowed(cached.as_str());
+        }
+        let owned = self.resolve_hier_name_slow(hier);
+        // The slow path memoizes every cacheable shape: borrow that copy.
+        if let Some(cached) = hier.cached_resolved_name.get() {
+            return std::borrow::Cow::Borrowed(cached.as_str());
+        }
+        std::borrow::Cow::Owned(owned)
+    }
+
+    fn resolve_hier_name_slow(&self, hier: &HierarchicalIdentifier) -> String {
         // Per-process local dynamic arrays: resolve the bare name through the
         // current process's per-frame rename map and BYPASS the AST-node cache.
         // The cache is shared across concurrent processes (they share AST
@@ -71064,7 +71104,7 @@ impl Simulator {
         }
         // First access: resolve name and cache ID
         let name = self.resolve_hier_name(hier);
-        if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+        if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
             hier.cached_signal_id.set(Some(id));
             let mut v = self.signal_table[id].clone();
             if self.signal_signed[id] {
@@ -71078,10 +71118,10 @@ impl Simulator {
         // Fallback
         let mut v = self
             .signals
-            .get(&name)
+            .get(&*name)
             .cloned()
             .unwrap_or_else(|| Value::new(1));
-        if self.signed_signals.contains(&name) {
+        if self.signed_signals.contains(&*name) {
             v.is_signed = true;
         }
         v
@@ -73704,10 +73744,10 @@ impl Simulator {
                 {
                     let mut head = hier.clone();
                     head.path.pop();
-                    names.push(self.resolve_hier_name(&head));
+                    names.push(self.resolve_hier_name(&head).into_owned());
                     return;
                 }
-                names.push(self.resolve_hier_name(hier));
+                names.push(self.resolve_hier_name(hier).into_owned());
             }
             // Virtual-interface member access (`vif.signal`) and other dotted
             // refs to interface signals. Flatten the chain into a dotted name
@@ -73720,13 +73760,13 @@ impl Simulator {
                 if member.name == "triggered" {
                     if let ExprKind::Ident(h) = &base.kind {
                         let ev = self.resolve_hier_name(h);
-                        if self.module.events.contains(&ev)
+                        if self.module.events.contains(&*ev)
                             || self
                                 .module
                                 .events
                                 .contains(ev.rsplit('.').next().unwrap_or(&ev))
                         {
-                            names.push(ev);
+                            names.push(ev.to_string());
                             return;
                         }
                     }
@@ -74226,14 +74266,14 @@ impl Simulator {
                     }
                 }
                 let name = self.resolve_hier_name(h);
-                if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     h.cached_signal_id.set(Some(id));
                     return self.signal_widths[id];
                 }
                 // A width of 0 is never valid for an lvalue — it usually
                 // means the flat `widths` map was polluted by a same-named
                 // class-handle elsewhere. Ignore it and fall through.
-                if let Some(w) = self.widths.get(&name).copied() {
+                if let Some(w) = self.widths.get(&*name).copied() {
                     if w > 0 {
                         return w;
                     }
@@ -74294,7 +74334,7 @@ impl Simulator {
                     if let Some(&ew) = self
                         .module
                         .packed_signal_elem_widths
-                        .get(&nm)
+                        .get(&*nm)
                         .filter(|&&w| w > 1)
                     {
                         return count * ew;
@@ -74317,16 +74357,16 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &cur.kind {
                     let n = self.resolve_hier_name(h);
                     if depth == 1 {
-                        if let Some((_, _, w)) = self.module.arrays.get(&n) {
+                        if let Some((_, _, w)) = self.module.arrays.get(&*n) {
                             return *w;
                         }
                     }
                     if depth == 2 {
-                        if let Some((_, _, w)) = self.module.arrays_2d.get(&n) {
+                        if let Some((_, _, w)) = self.module.arrays_2d.get(&*n) {
                             return *w;
                         }
                     }
-                    if let Some((shape, w)) = self.module.arrays_nd.get(&n) {
+                    if let Some((shape, w)) = self.module.arrays_nd.get(&*n) {
                         if depth == shape.len() {
                             return *w;
                         }
@@ -74342,16 +74382,16 @@ impl Simulator {
                     // dim list and the lvalue fell through to width 1 — a
                     // continuous assign then resized its RHS to one bit and
                     // wrote the LSB (0x12 -> 0).
-                    let num_unpacked = if let Some((d, _)) = self.module.arrays_nd.get(&n) {
+                    let num_unpacked = if let Some((d, _)) = self.module.arrays_nd.get(&*n) {
                         d.len()
-                    } else if self.module.arrays_2d.contains_key(&n) {
+                    } else if self.module.arrays_2d.contains_key(&*n) {
                         2
-                    } else if self.module.arrays.contains_key(&n) {
+                    } else if self.module.arrays.contains_key(&*n) {
                         1
                     } else {
                         0
                     };
-                    if let Some(dims) = self.module.packed_full_dims.get(&n) {
+                    if let Some(dims) = self.module.packed_full_dims.get(&*n) {
                         let pdepth = depth.saturating_sub(num_unpacked);
                         if pdepth < dims.len() {
                             let w: u64 = dims[pdepth..]
@@ -74363,7 +74403,7 @@ impl Simulator {
                             }
                         }
                     } else if depth == 1 {
-                        if let Some(&ew) = self.module.packed_signal_elem_widths.get(&n) {
+                        if let Some(&ew) = self.module.packed_signal_elem_widths.get(&*n) {
                             if ew > 1 {
                                 return ew;
                             }
@@ -78606,7 +78646,7 @@ impl Simulator {
         let base_name = match &cur.kind {
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);
-                if !self.module.packed_full_dims.contains_key(&n) && h.path.len() >= 2 {
+                if !self.module.packed_full_dims.contains_key(&*n) && h.path.len() >= 2 {
                     let dotted: String = h
                         .path
                         .iter()
@@ -78616,10 +78656,10 @@ impl Simulator {
                     if self.module.packed_full_dims.contains_key(&dotted) {
                         dotted
                     } else {
-                        n
+                        n.to_string()
                     }
                 } else {
-                    n
+                    n.into_owned()
                 }
             }
             ExprKind::MemberAccess { expr: e, member } => {
@@ -79113,9 +79153,9 @@ impl Simulator {
         // guard falsely reported them equal (skipping the update).
         if let ExprKind::Ident(h) = &expr.kind {
             let name = self.resolve_hier_name(h);
-            if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
-                if !self.module.dynamic_arrays.contains(&name) && !(hi < lo) {
-                    return Some((name, lo, hi));
+            if let Some(&(lo, hi, _)) = self.module.arrays.get(&*name) {
+                if !self.module.dynamic_arrays.contains(&*name) && !(hi < lo) {
+                    return Some((name.to_string(), lo, hi));
                 }
             }
         }
@@ -79534,14 +79574,14 @@ impl Simulator {
         if let ExprKind::Ident(hier) = &array.kind {
             let mut name = self.resolve_hier_name(hier);
             if let Some(scoped) = self.instance_assoc_member(&name) {
-                name = scoped;
+                name = std::borrow::Cow::Owned(scoped);
             }
             // A bare array name inside a SUBMODULE process resolves under the
             // process's instance scope, like the synchronous foreach path.
-            if !self.module.arrays.contains_key(&name)
-                && !self.module.arrays_2d.contains_key(&name)
-                && !self.module.arrays_nd.contains_key(&name)
-                && !self.module.dynamic_arrays.contains(&name)
+            if !self.module.arrays.contains_key(&*name)
+                && !self.module.arrays_2d.contains_key(&*name)
+                && !self.module.arrays_nd.contains_key(&*name)
+                && !self.module.dynamic_arrays.contains(&*name)
                 && !self.is_associative_array(&name)
             {
                 let hint = self.name_resolve_hint.borrow().clone();
@@ -79553,7 +79593,7 @@ impl Simulator {
                         || self.module.dynamic_arrays.contains(&scoped)
                         || self.is_associative_array(&scoped)
                     {
-                        name = scoped;
+                        name = std::borrow::Cow::Owned(scoped);
                     }
                 }
             }
@@ -79566,13 +79606,13 @@ impl Simulator {
                 let kw = self.assoc_index_width_for(&name).unwrap_or((32, false));
                 return Some((keys, is_str, var_scope, None, kw));
             }
-            if self.module.dynamic_arrays.contains(&name) {
+            if self.module.dynamic_arrays.contains(&*name) {
                 let size = self.get_queue_size(&name);
                 let keys: Vec<String> = (0..size).map(|i| i.to_string()).collect();
-                return Some((keys, false, var_scope, Some(name), (32, false)));
+                return Some((keys, false, var_scope, Some(name.to_string()), (32, false)));
             }
-            if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
-                let descending = self.module.descending_arrays.contains(&name);
+            if let Some(&(lo, hi, _)) = self.module.arrays.get(&*name) {
+                let descending = self.module.descending_arrays.contains(&*name);
                 let mut keys: Vec<String> = Vec::new();
                 let mut idx = lo;
                 while idx <= hi {
@@ -79587,7 +79627,7 @@ impl Simulator {
             if keys.is_empty() {
                 return None;
             }
-            return Some((keys, is_str, var_scope, Some(name), (32, false)));
+            return Some((keys, is_str, var_scope, Some(name.to_string()), (32, false)));
         }
         None
     }
@@ -79922,13 +79962,13 @@ impl Simulator {
                                 // field-level constraints keep working.
                                 if self.is_packed_struct_var(a) {
                                     if let ExprKind::Ident(hh) = &a.kind {
-                                        targets.push((self.resolve_hier_name(hh), a.clone()));
+                                        targets.push((self.resolve_hier_name(hh).into_owned(), a.clone()));
                                     }
                                 }
                                 if let Some(fields) = self.expand_struct_target(a) {
                                     targets.extend(fields);
                                 } else if let ExprKind::Ident(hh) = &a.kind {
-                                    targets.push((self.resolve_hier_name(hh), a.clone()));
+                                    targets.push((self.resolve_hier_name(hh).into_owned(), a.clone()));
                                 }
                             }
                             let mut satisfied = false;
@@ -80441,10 +80481,10 @@ impl Simulator {
         if let ExprKind::Ident(h) = &expr.kind {
             let mut nm = self.resolve_hier_name(h);
             if let Some(s) = self.instance_assoc_member(&nm) {
-                nm = s;
+                nm = std::borrow::Cow::Owned(s);
             }
-            if self.module.arrays.contains_key(&nm) || self.module.dynamic_arrays.contains(&nm) {
-                return Some(nm);
+            if self.module.arrays.contains_key(&*nm) || self.module.dynamic_arrays.contains(&*nm) {
+                return Some(nm.to_string());
             }
         }
         // `obj.q` / `arr[i].q` — an instance-scoped queue/array member.
@@ -80498,12 +80538,12 @@ impl Simulator {
             return None;
         }
         let resolved = self.resolve_hier_name(hier);
-        if self.signal_name_to_id.contains_key(resolved.as_str())
-            || self.module.arrays.contains_key(&resolved)
-            || self.module.arrays_2d.contains_key(&resolved)
-            || self.module.arrays_nd.contains_key(&resolved)
-            || self.module.dynamic_arrays.contains(&resolved)
-            || self.module.associative_arrays.contains_key(&resolved)
+        if self.signal_name_to_id.contains_key(resolved.as_ref())
+            || self.module.arrays.contains_key(&*resolved)
+            || self.module.arrays_2d.contains_key(&*resolved)
+            || self.module.arrays_nd.contains_key(&*resolved)
+            || self.module.dynamic_arrays.contains(&*resolved)
+            || self.module.associative_arrays.contains_key(&*resolved)
             || self.lookup_signal_width(&resolved).is_some()
             || self.get_signal_value_by_name(&seg.name.name).is_some()
         {
@@ -80706,7 +80746,7 @@ impl Simulator {
         };
         let mut bn = self.resolve_hier_name(bh);
         if let Some(s) = self.instance_assoc_member(&bn) {
-            bn = s;
+            bn = std::borrow::Cow::Owned(s);
         } else if bh.path.len() >= 2 {
             // `obj.member` accessed from module/lower scope where the first
             // path segment is an OBJECT handle and the member is an
@@ -80720,7 +80760,7 @@ impl Simulator {
                 if h != 0 {
                     let cand = format!("{h}#{member}");
                     if self.is_associative_array(&cand) {
-                        bn = cand;
+                        bn = std::borrow::Cow::Owned(cand);
                     }
                 }
             }
@@ -80733,9 +80773,9 @@ impl Simulator {
         for idx in rev.iter().rev() {
             let kv = self.eval_expr(idx);
             let ks = self.assoc_key_str(&bn, &kv);
-            name = format!("{}[{}]", name, ks);
+            name = std::borrow::Cow::Owned(format!("{}[{}]", name, ks));
         }
-        Some(name)
+        Some(name.to_string())
     }
 
     /// Resolve a base expression to its associative-array STORAGE name if it
@@ -80747,7 +80787,7 @@ impl Simulator {
             if h.path.len() == 1 && h.path[0].selects.is_empty() {
                 let nm = self.resolve_hier_name(h);
                 if self.is_associative_array(&nm) {
-                    return Some(nm);
+                    return Some(nm.to_string());
                 }
                 if let Some(scoped) = self.instance_assoc_member(&nm) {
                     if self.is_associative_array(&scoped) {
@@ -81094,8 +81134,8 @@ impl Simulator {
             return None;
         };
         let nm = self.resolve_hier_name(h);
-        if self.module.dynamic_arrays.contains(&nm) || self.module.arrays.contains_key(&nm) {
-            Some(nm)
+        if self.module.dynamic_arrays.contains(&*nm) || self.module.arrays.contains_key(&*nm) {
+            Some(nm.to_string())
         } else {
             None
         }
@@ -82431,7 +82471,7 @@ impl Simulator {
     /// Returns `None` for anything else.
     fn constraint_operand_name(&self, e: &Expression) -> Option<String> {
         match &e.kind {
-            ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+            ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
             ExprKind::MemberAccess { expr, member } => {
                 if let ExprKind::Ident(bh) = &expr.kind {
                     if bh.path.len() == 1 {
@@ -82445,7 +82485,7 @@ impl Simulator {
                         });
                         fh.cached_signal_id = std::cell::Cell::new(None);
                         fh.cached_resolved_name = std::cell::OnceCell::new();
-                        return Some(self.resolve_hier_name(&fh));
+                        return Some(self.resolve_hier_name(&fh).into_owned());
                     }
                 }
                 None
@@ -82727,10 +82767,10 @@ impl Simulator {
                 ExprKind::Ident(h) => {
                     let mut name = self.resolve_hier_name(h);
                     if let Some(s) = self.instance_assoc_member(&name) {
-                        name = s;
+                        name = std::borrow::Cow::Owned(s);
                     }
-                    if self.module.arrays.contains_key(&name)
-                        || self.module.dynamic_arrays.contains(&name)
+                    if self.module.arrays.contains_key(&*name)
+                        || self.module.dynamic_arrays.contains(&*name)
                     {
                         let sz = self.get_queue_size(&name);
                         for i in 0..sz {
@@ -82843,7 +82883,7 @@ impl Simulator {
     fn vpi_arg_handle(&mut self, e: &Expression) -> VpiHandle {
         if let ExprKind::Ident(h) = &e.kind {
             let name = self.resolve_hier_name(h);
-            if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+            if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                 let ty = vpi_type_of(self, &name, id);
                 let leaf = name.rsplit('.').next().unwrap_or(&name).to_string();
                 let full = vpi_full_name(self, &name);
@@ -83520,7 +83560,7 @@ impl Simulator {
             let name = self.resolve_hier_name(h);
             self.module
                 .net_strengths
-                .get(&name)
+                .get(&*name)
                 .or_else(|| {
                     h.path
                         .last()
@@ -86709,11 +86749,11 @@ impl Simulator {
             }
             _ => return None,
         };
-        let packed_elem_w = self.module.packed_signal_elem_widths.get(&name).copied();
+        let packed_elem_w = self.module.packed_signal_elem_widths.get(&*name).copied();
         let total_w = if is_elem {
-            self.module.arrays.get(&name).map(|t| t.2)?
+            self.module.arrays.get(&*name).map(|t| t.2)?
         } else {
-            if self.module.arrays.contains_key(&name) {
+            if self.module.arrays.contains_key(&*name) {
                 return None; // whole-array target: the unpacked path owns it
             }
             self.lookup_signal_width(&name)?
@@ -86722,7 +86762,7 @@ impl Simulator {
             Some(ew) => self
                 .module
                 .packed_full_dims
-                .get(&name)
+                .get(&*name)
                 .cloned()
                 .unwrap_or_else(|| vec![((total_w as i64 / ew as i64) - 1, 0)]),
             None => {
@@ -86734,13 +86774,13 @@ impl Simulator {
                 // zero-extended it to 16'h0001 (a reset that armed only bank 0).
                 // Aggregates with their own pattern path must not be diverted
                 // here.
-                if self.module.packed_struct_fields.contains_key(&name)
-                    || self.module.associative_arrays.contains_key(&name)
-                    || self.module.dynamic_arrays.contains(&name)
-                    || self.module.arrays_2d.contains_key(&name)
-                    || self.module.arrays_nd.contains_key(&name)
-                    || self.module.string_signals.contains(&name)
-                    || self.real_signals.contains(&name)
+                if self.module.packed_struct_fields.contains_key(&*name)
+                    || self.module.associative_arrays.contains_key(&*name)
+                    || self.module.dynamic_arrays.contains(&*name)
+                    || self.module.arrays_2d.contains_key(&*name)
+                    || self.module.arrays_nd.contains_key(&*name)
+                    || self.module.string_signals.contains(&*name)
+                    || self.real_signals.contains(&*name)
                     || total_w <= 1
                 {
                     return None;
@@ -86758,7 +86798,7 @@ impl Simulator {
     fn pattern_aggregate_names(&mut self, lvalue: &Expression) -> Vec<String> {
         let mut out = Vec::new();
         if let ExprKind::Ident(h) = &lvalue.kind {
-            out.push(self.resolve_hier_name(h));
+            out.push(self.resolve_hier_name(h).into_owned());
             if h.path.len() > 1 {
                 let joined = h
                     .path
@@ -86928,7 +86968,7 @@ impl Simulator {
             return false;
         };
         let bname = self.resolve_hier_name(bh);
-        let Some(dt) = self.module.var_decl_types.get(&bname).cloned() else {
+        let Some(dt) = self.module.var_decl_types.get(&*bname).cloned() else {
             return false;
         };
         let DataType::Struct(su) = self.resolve_dt(&dt) else {
@@ -86938,7 +86978,7 @@ impl Simulator {
             return false;
         }
         let iv = self.eval_expr(index);
-        let key = if self.module.associative_arrays.contains_key(&bname) {
+        let key = if self.module.associative_arrays.contains_key(&*bname) {
             self.assoc_key_str(&bname, &iv)
         } else {
             iv.to_i64().unwrap_or(0).to_string()
@@ -87800,7 +87840,7 @@ impl Simulator {
             });
             fh.cached_signal_id = std::cell::Cell::new(None);
             fh.cached_resolved_name = std::cell::OnceCell::new();
-            let name = self.resolve_hier_name(&fh);
+            let name = self.resolve_hier_name(&fh).into_owned();
             let fexpr = Expression {
                 kind: ExprKind::Ident(fh),
                 span: a.span,
@@ -88263,7 +88303,7 @@ impl Simulator {
         fn flatten_dotted(sim: &Simulator, e: &Expression) -> Option<String> {
             match &e.kind {
                 ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
-                    Some(sim.resolve_hier_name(h))
+                    Some(sim.resolve_hier_name(h).into_owned())
                 }
                 ExprKind::MemberAccess { expr, member } => {
                     Some(format!("{}.{}", flatten_dotted(sim, expr)?, member.name))
@@ -88723,9 +88763,9 @@ impl Simulator {
                 // `get_full_hdl_path(paths)` returned an empty path list —
                 // every backdoor access read 0).
                 if let Some(r) = self.dyn_name_lookup(&n) {
-                    n = r.to_string();
+                    n = std::borrow::Cow::Owned(r.to_string());
                 } else if let Some(s) = self.instance_assoc_member(&n) {
-                    n = s;
+                    n = std::borrow::Cow::Owned(s);
                 }
                 n
             }
@@ -88763,20 +88803,20 @@ impl Simulator {
                 for seg in h.path.iter().take(h.path.len() - 1).skip(1) {
                     handle = self.member_handle(handle, &seg.name.name)?;
                 }
-                self.handle_collection_name(handle, &leaf)?
+                std::borrow::Cow::Owned(self.handle_collection_name(handle, &leaf)?)
             }
             ExprKind::MemberAccess { expr, member } => {
                 let handle = self.eval_handle_expr(expr)?;
-                self.handle_collection_name(handle, &member.name)?
+                std::borrow::Cow::Owned(self.handle_collection_name(handle, &member.name)?)
             }
             _ => return None,
         };
-        if !self.module.arrays.contains_key(&cname) && !self.module.dynamic_arrays.contains(&cname)
+        if !self.module.arrays.contains_key(&*cname) && !self.module.dynamic_arrays.contains(&*cname)
         {
             return None;
         }
         let size = self.get_queue_size(&cname);
-        let w = self.module.arrays.get(&cname).map(|t| t.2).unwrap_or(32);
+        let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
         let vals: Vec<Value> = (0..size)
             .map(|j| {
                 self.get_signal_value_by_name(&format!("{}[{}]", cname, j))
@@ -88819,7 +88859,7 @@ impl Simulator {
                 frame.push((pname.to_string(), pname.to_string()));
             }
         }
-        Some(cname)
+        Some(cname.into_owned())
     }
 
     /// §13.5.2: stage a queue FORMAL's contents under a fresh temporary
@@ -95015,14 +95055,14 @@ impl Simulator {
             if let ExprKind::Ident(hier) = &expr.kind {
                 let mut name = self.resolve_hier_name(hier);
                 if let Some(scoped) = self.instance_assoc_member(&name) {
-                    name = scoped;
+                    name = std::borrow::Cow::Owned(scoped);
                 }
                 if let Some(res) = self.eval_builtin_method(&name, mname, args) {
                     return res;
                 }
                 // Package scope resolution: `pkg::func(args)`. Only when LHS is an
                 // explicitly known package name — not a class, signal, or handle.
-                if hier.path.len() == 1 && self.module.packages.contains(&name) {
+                if hier.path.len() == 1 && self.module.packages.contains(&*name) {
                     // §26.3: `pkg::f(...)` calls THAT package's subroutine.
                     // Package subroutines are hoisted under their BARE name, so
                     // two packages declaring the same one collided and whichever
@@ -95038,7 +95078,7 @@ impl Simulator {
                         .or_else(|| self.module.functions.get(mname))
                         .cloned();
                     if let Some(fd) = fd {
-                        self.pending_pkg_scope = Some(name.clone());
+                        self.pending_pkg_scope = Some(name.to_string());
                         return self.exec_function_call(&fd, args);
                     }
                     let td = self
@@ -95048,7 +95088,7 @@ impl Simulator {
                         .or_else(|| self.module.tasks.get(mname))
                         .cloned();
                     if let Some(td) = td {
-                        self.pending_pkg_scope = Some(name.clone());
+                        self.pending_pkg_scope = Some(name.to_string());
                         self.exec_task_call(&td, args);
                         return Value::zero(32);
                     }
@@ -95072,9 +95112,9 @@ impl Simulator {
                     && !self
                         .local_stack
                         .last()
-                        .is_some_and(|m| m.contains_key(&name))
-                    && !self.signal_name_to_id.contains_key(name.as_str())
-                    && !self.signals.contains_key(&name)
+                        .is_some_and(|m| m.contains_key(&*name))
+                    && !self.signal_name_to_id.contains_key(name.as_ref())
+                    && !self.signals.contains_key(&*name)
                 {
                     // Type-parameter used as a class name: `Tregistry::get()`.
 
@@ -95119,13 +95159,13 @@ impl Simulator {
                         if let Some(v) = res {
                             return v;
                         }
-                    } else if self.module.classes.contains_key(&name) {
+                    } else if self.module.classes.contains_key(&*name) {
                         if let Some(res) = self.exec_static_method(&name, mname, args) {
                             return res;
                         }
                         // `ClassName::new(...)` — explicit constructor call.
                         if mname == "new" {
-                            if let Some(cd) = self.module.classes.get(&name).cloned() {
+                            if let Some(cd) = self.module.classes.get(&*name).cloned() {
                                 return self.instantiate_class(&cd, args);
                             }
                         }
@@ -95742,8 +95782,8 @@ impl Simulator {
                 if let ExprKind::Ident(bh) = &base_expr.kind {
                     let bn = self.resolve_hier_name(bh);
                     if self.is_associative_array(&bn)
-                        || self.module.arrays.contains_key(&bn)
-                        || self.module.dynamic_arrays.contains(&bn)
+                        || self.module.arrays.contains_key(&*bn)
+                        || self.module.dynamic_arrays.contains(&*bn)
                     {
                         if let Some(res) = self.eval_builtin_method(&bn, &m, args) {
                             return res;
@@ -97793,7 +97833,7 @@ impl Simulator {
                 frame.push((param.clone(), param.clone()));
             }
         }
-        Some((param, caller, prior))
+        Some((param, caller.to_string(), prior))
     }
 
     /// Drop a formal associative array's entries and registration. Restores
@@ -97901,9 +97941,9 @@ impl Simulator {
         // §18.5.12 / §13.5.2: the actual may be a fixed-array CLASS member
         // (`calculate_array_parity(payload_bytes)` inside a constraint), whose
         // storage lives at `<handle>#<member>`, not under the bare name.
-        if !self.module.arrays.contains_key(&caller) {
+        if !self.module.arrays.contains_key(&*caller) {
             if let Some(scoped) = self.instance_assoc_member(&caller) {
-                caller = scoped;
+                caller = std::borrow::Cow::Owned(scoped);
             }
         }
         // §13.5.2 multi-dimensional formal (`int a[R][C]`, `a[X][Y][Z]`): copy
@@ -97914,10 +97954,10 @@ impl Simulator {
         // was handled before: a 2-D formal read x and never wrote back.
         if dims.len() >= 2 {
             let param = port.name.name.clone();
-            let suffixes = if let Some(&((a0, a1), (b0, b1), w)) = self.module.arrays_2d.get(&caller) {
+            let suffixes = if let Some(&((a0, a1), (b0, b1), w)) = self.module.arrays_2d.get(&*caller) {
                 self.module.arrays_2d.insert(param.clone(), ((a0, a1), (b0, b1), w));
                 Self::nd_elem_suffixes(&[(a0, a1), (b0, b1)])
-            } else if let Some((shape, w)) = self.module.arrays_nd.get(&caller).cloned() {
+            } else if let Some((shape, w)) = self.module.arrays_nd.get(&*caller).cloned() {
                 self.module.arrays_nd.insert(param.clone(), (shape.clone(), w));
                 Self::nd_elem_suffixes(&shape)
             } else {
@@ -97931,9 +97971,9 @@ impl Simulator {
                     }
                 }
             }
-            return Some((param, caller, lo, hi));
+            return Some((param, caller.to_string(), lo, hi));
         }
-        if !self.module.arrays.contains_key(&caller) {
+        if !self.module.arrays.contains_key(&*caller) {
             return None;
         }
         let param = port.name.name.clone();
@@ -97954,9 +97994,9 @@ impl Simulator {
                 self.signals.insert(format!("{}[{}]", param, idx), v);
             }
         }
-        let w = self.module.arrays.get(&caller).map(|t| t.2).unwrap_or(32);
+        let w = self.module.arrays.get(&*caller).map(|t| t.2).unwrap_or(32);
         self.module.arrays.insert(param.clone(), (lo, hi, w));
-        Some((param, caller, lo, hi))
+        Some((param, caller.to_string(), lo, hi))
     }
 
     /// Copy an array formal's elements back onto the caller's array, then drop
@@ -98005,16 +98045,16 @@ impl Simulator {
             ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
                 let name = self.resolve_hier_name(h);
                 if let Some(sfx) = self.nd_formal_suffixes(&name) {
-                    return Some((name, sfx, true));
+                    return Some((name.to_string(), sfx, true));
                 }
-                if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
-                    if !self.module.dynamic_arrays.contains(&name) {
-                        let desc = self.module.descending_arrays.contains(&name);
+                if let Some(&(lo, hi, _)) = self.module.arrays.get(&*name) {
+                    if !self.module.dynamic_arrays.contains(&*name) {
+                        let desc = self.module.descending_arrays.contains(&*name);
                         let mut sfx: Vec<String> = (lo..=hi).map(|i| format!("[{}]", i)).collect();
                         if desc {
                             sfx.reverse();
                         }
-                        return Some((name, sfx, false));
+                        return Some((name.to_string(), sfx, false));
                     }
                 }
                 None
@@ -98025,9 +98065,9 @@ impl Simulator {
                     return None;
                 }
                 let name = self.resolve_hier_name(h);
-                let rest: Vec<(i64, i64)> = if let Some(&(_, b, _)) = self.module.arrays_2d.get(&name) {
+                let rest: Vec<(i64, i64)> = if let Some(&(_, b, _)) = self.module.arrays_2d.get(&*name) {
                     vec![b]
-                } else if let Some((shape, _)) = self.module.arrays_nd.get(&name) {
+                } else if let Some((shape, _)) = self.module.arrays_nd.get(&*name) {
                     if shape.len() < 2 {
                         return None;
                     }
@@ -99698,7 +99738,7 @@ impl Simulator {
                     self.module
                         .associative_arrays
                         .insert(param_name.clone(), is_string_key);
-                    assoc_params.push((param_name, caller_name, assoc_is_out));
+                    assoc_params.push((param_name, caller_name.to_string(), assoc_is_out));
                 }
                 continue;
             }
@@ -110747,7 +110787,7 @@ impl Simulator {
 
     fn resolve_expr_name(&self, expr: &Expression) -> String {
         match &expr.kind {
-            ExprKind::Ident(hier) => self.resolve_hier_name(hier),
+            ExprKind::Ident(hier) => self.resolve_hier_name(hier).into_owned(),
             _ => "expr".to_string(),
         }
     }
@@ -110876,7 +110916,7 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &expr.kind {
                     let full = self.resolve_hier_name(h);
                     let leaf = h.path.last().map(|s| s.name.name.clone()).unwrap_or_default();
-                    for key in [full.as_str(), leaf.as_str()] {
+                    for key in [full.as_ref(), leaf.as_str()] {
                         if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
                             self.module.var_decl_types.get(key)
                             && let Some(k) = Self::container_base(&name.name.name)
@@ -111138,7 +111178,7 @@ impl Simulator {
             let name = self.resolve_hier_name(hier);
             if self
                 .var_container_types
-                .get(&name)
+                .get(&*name)
                 .is_some_and(|k| says_mailbox(k))
             {
                 return true;
@@ -111217,7 +111257,7 @@ impl Simulator {
     fn enum_receiver_keys(&self, expr: &Expression) -> Vec<String> {
         let mut keys = Vec::new();
         if let ExprKind::Ident(h) = &expr.kind {
-            keys.push(self.resolve_hier_name(h));
+            keys.push(self.resolve_hier_name(h).into_owned());
             if let Some(leaf) = h.path.last() {
                 if h.path.len() > 1 || keys[0] != leaf.name.name {
                     keys.push(leaf.name.name.clone());
@@ -111236,8 +111276,8 @@ impl Simulator {
                 // including a same-named class property, which otherwise won
                 // below and gave UVM's severity summary the type of an
                 // unrelated ancestor property.
-                if hier.path.len() == 1 && self.fe_trusted_types.contains(&name) {
-                    if let Some(t) = self.var_typedef_types.get(&name) {
+                if hier.path.len() == 1 && self.fe_trusted_types.contains(&*name) {
+                    if let Some(t) = self.var_typedef_types.get(&*name) {
                         return Some(t.clone());
                     }
                 }
@@ -111289,7 +111329,7 @@ impl Simulator {
                                 .unwrap_or(&[])
                                 .iter()
                                 .rev()
-                                .any(|m| m.contains_key(&name))
+                                .any(|m| m.contains_key(&*name))
                         })
                         // Outside any class method (initial/always blocks):
                         // locals live as signals/flat-map entries with no
@@ -111299,22 +111339,22 @@ impl Simulator {
                             self.local_stack
                                 .iter()
                                 .rev()
-                                .any(|m| m.contains_key(&name))
+                                .any(|m| m.contains_key(&*name))
                         });
                 if in_any_frame {
                     // A class-typed procedural local declared in this scope.
-                    if let Some(t) = self.var_class_types.get(&name) {
+                    if let Some(t) = self.var_class_types.get(&*name) {
                         return Some(t.clone());
                     }
                     // LRM §6.19.6: typedef-typed local — used by
                     // `local.next/.first/.last/.num/.prev` resolution.
-                    if let Some(t) = self.var_typedef_types.get(&name) {
+                    if let Some(t) = self.var_typedef_types.get(&*name) {
                         return Some(t.clone());
                     }
                 }
                 if let Some(t) = self
                     .signal_name_to_id
-                    .get(name.as_str())
+                    .get(name.as_ref())
                     .and_then(|id| self.signal_type_names.get(id).cloned())
                 {
                     return Some(t);
@@ -111363,12 +111403,12 @@ impl Simulator {
                 let trust_flat_maps = in_any_frame || !in_class_method;
                 if trust_flat_maps {
                     // A class-typed procedural local declared in this scope.
-                    if let Some(t) = self.var_class_types.get(&name) {
+                    if let Some(t) = self.var_class_types.get(&*name) {
                         return Some(t.clone());
                     }
                     // LRM §6.19.6: typedef-typed local — used by
                     // `local.next/.first/.last/.num/.prev` resolution.
-                    if let Some(t) = self.var_typedef_types.get(&name) {
+                    if let Some(t) = self.var_typedef_types.get(&*name) {
                         return Some(t.clone());
                     }
                 }
@@ -111454,7 +111494,7 @@ impl Simulator {
                 }
                 if let ExprKind::Ident(bh) = &cur.kind {
                     let bname = self.resolve_hier_name(bh);
-                    if let Some(cn) = self.module.array_elem_class.get(&bname).cloned() {
+                    if let Some(cn) = self.module.array_elem_class.get(&*bname).cloned() {
                         return Some(cn);
                     }
                     // §8.20 + §6.20.3: a class-MEMBER array whose element
@@ -111584,8 +111624,8 @@ impl Simulator {
     ) -> Option<(String, Vec<Expression>)> {
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
-            if let Some(base) = self.var_class_types.get(&name) {
-                let ta = self.var_type_args.get(&name).cloned().unwrap_or_default();
+            if let Some(base) = self.var_class_types.get(&*name) {
+                let ta = self.var_type_args.get(&*name).cloned().unwrap_or_default();
                 return Some((base.clone(), ta));
             }
             let bname = &hier.path[0].name.name;
