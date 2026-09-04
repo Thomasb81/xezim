@@ -41346,13 +41346,13 @@ impl Simulator {
     /// collection, in which case there is no bound to install.
     fn dollar_bound_for_base(&mut self, base: &Expression) -> Option<i64> {
         let n = match &base.kind {
-            ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
-            _ => self.flat_member_name(base),
+            ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+            _ => self.flat_member_name(base).map(std::borrow::Cow::Owned),
         }?;
-        if self.module.dynamic_arrays.contains(&n) {
+        if self.module.dynamic_arrays.contains(&*n) {
             Some(self.get_queue_size(&n) as i64 - 1)
         } else {
-            self.module.arrays.get(&n).map(|&(_, hi, _)| hi)
+            self.module.arrays.get(&*n).map(|&(_, hi, _)| hi)
         }
     }
 
@@ -49715,8 +49715,8 @@ impl Simulator {
                     // hijack class-member arrays and virtual-interface writes,
                     // which own their own storage.
                     let (base, may_create) = match &expr.kind {
-                        ExprKind::Ident(h) => (Some(self.resolve_hier_name(h).into_owned()), true),
-                        ExprKind::MemberAccess { .. } => (self.flat_member_name(expr), false),
+                        ExprKind::Ident(h) => (Some(self.resolve_hier_name(h)), true),
+                        ExprKind::MemberAccess { .. } => (self.flat_member_name(expr).map(std::borrow::Cow::Owned), false),
                         _ => (None, false),
                     };
                     // A member of a PACKED struct is a bit-slice of the
@@ -49740,8 +49740,8 @@ impl Simulator {
                         })
                     };
                     if let Some(base) = base.filter(|b| !base_is_packed_member(self, b)) {
-                    if !self.signal_name_to_id.contains_key(base.as_str())
-                        && !self.signals.contains_key(&base)
+                    if !self.signal_name_to_id.contains_key(base.as_ref())
+                        && !self.signals.contains_key(&*base)
                     {
                         let i = self.eval_expr(index).to_i64().unwrap_or(0);
                         let elem = format!("{}[{}]", base, i);
@@ -50294,31 +50294,31 @@ impl Simulator {
                 // dropped while reads (which go through flat_member_name)
                 // worked.
                 let (base_name, hier_opt): (
-                    Option<String>,
+                    Option<std::borrow::Cow<str>>,
                     Option<&crate::ast::expr::HierarchicalIdentifier>,
                 ) = match &expr.kind {
-                    ExprKind::Ident(hier) => (Some(self.resolve_hier_name(hier).into_owned()), Some(hier)),
-                    ExprKind::MemberAccess { .. } => (self.flat_member_name(expr), None),
+                    ExprKind::Ident(hier) => (Some(self.resolve_hier_name(hier)), Some(hier)),
+                    ExprKind::MemberAccess { .. } => (self.flat_member_name(expr).map(std::borrow::Cow::Owned), None),
                     _ => (None, None),
                 };
                 if let Some(mut name) = base_name {
                     if let Some(scoped) = self.instance_assoc_member(&name) {
-                        name = scoped;
+                        name = std::borrow::Cow::Owned(scoped);
                     }
                     // §8.9: `Cls::S[i] = v` reaches here with the resolver's
                     // bare-leaf collapse of the 2-segment form; the original
                     // segments name the qualified store.
-                    if !self.module.arrays.contains_key(&name) {
+                    if !self.module.arrays.contains_key(&*name) {
                         if let Some(h) = hier_opt {
                             if let Some(k) = self.static_fixed_key_from_hier(h) {
-                                name = k;
+                                name = std::borrow::Cow::Owned(k);
                             }
                         }
                     }
                     // A bare name inside a SUBMODULE process resolves under
                     // the process's instance scope (name_resolve_hint), like
                     // scalar reads/writes already do.
-                    if !self.module.arrays.contains_key(&name) && !self.is_associative_array(&name)
+                    if !self.module.arrays.contains_key(&*name) && !self.is_associative_array(&name)
                     {
                         let hint = self.name_resolve_hint.borrow().clone();
                         if let Some(h) = hint {
@@ -50326,7 +50326,7 @@ impl Simulator {
                             if self.module.arrays.contains_key(&scoped)
                                 || self.is_associative_array(&scoped)
                             {
-                                name = scoped;
+                                name = std::borrow::Cow::Owned(scoped);
                             }
                         }
                     }
@@ -50344,13 +50344,13 @@ impl Simulator {
                         idx_val.to_u64().unwrap_or(0).to_string()
                     };
                     // Check if this is an array element assignment
-                    if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
+                    if self.module.arrays.contains_key(&*name) || self.is_associative_array(&name) {
                         // Compact-resolver fast path for 1D arrays: compute
                         // signal_id directly without `format!()` + HashMap
                         // lookup. Required for correctness now that 1D
                         // array elements are no longer materialised as
                         // per-element entries in signal_name_to_id.
-                        if let Some(&(first_id, lo, hi)) = self.array_first_id.get(name.as_str()) {
+                        if let Some(&(first_id, lo, hi)) = self.array_first_id.get(name.as_ref()) {
                             let idx = idx_val.to_u64().unwrap_or(0) as i64;
                             if idx >= lo && idx <= hi {
                                 let id = first_id + (idx - lo) as usize;
@@ -50435,7 +50435,7 @@ impl Simulator {
                             // collection's `.size` proxy, not the per-key
                             // entry — mark it or they never re-fire.
                             if self.is_associative_array(&name)
-                                || self.module.dynamic_arrays.contains(&name)
+                                || self.module.dynamic_arrays.contains(&*name)
                             {
                                 self.touch_queue(&name);
                             }
@@ -50445,7 +50445,7 @@ impl Simulator {
                     // String character assignment: `s[i] = "."` replaces the
                     // i-th character (byte). `s[0]` is the leftmost char, which
                     // sits in the most-significant byte of the packed value.
-                    if self.string_signals.contains(&name) {
+                    if self.string_signals.contains(&*name) {
                         // Replace the i-th character of the string CONTENT (not
                         // a byte of the fixed-width container, which would write
                         // the wrong position and grow the string). Mirrors putc.
@@ -50466,8 +50466,8 @@ impl Simulator {
                     // either `name` (resolved hier) or the dotted-Ident form
                     // (`pp.words`) is in packed_signal_elem_widths.
                     let pkt_key: Option<String> = {
-                        if self.module.packed_signal_elem_widths.contains_key(&name) {
-                            Some(name.clone())
+                        if self.module.packed_signal_elem_widths.contains_key(&*name) {
+                            Some(name.to_string())
                         } else if let ExprKind::Ident(h) = &expr.kind {
                             if h.path.len() >= 2 {
                                 let dotted: String = h
@@ -50494,7 +50494,7 @@ impl Simulator {
                         // Resolve underlying signal by either `name` or `pkey`.
                         let sig_id = self
                             .signal_name_to_id
-                            .get(name.as_str())
+                            .get(name.as_ref())
                             .copied()
                             .or_else(|| self.signal_name_to_id.get(pkey.as_str()).copied());
                         if let Some(id) = sig_id {
@@ -50530,7 +50530,7 @@ impl Simulator {
                         // bug: reference models and DUT shared the defect).
                         {
                             let key = if self.get_signal_value_by_name(&name).is_some() {
-                                Some(name.clone())
+                                Some(name.to_string())
                             } else if self.get_signal_value_by_name(&pkey).is_some() {
                                 Some(pkey.clone())
                             } else {
@@ -50650,7 +50650,7 @@ impl Simulator {
                         }
                     }
                     // Bit select needs signal_table
-                    if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                    if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                         if idx < self.signal_widths[id] as usize {
                             let nb = val.bits_first();
                             let old = self.signal_table[id].get_bit(idx);
@@ -50670,7 +50670,7 @@ impl Simulator {
                     // signal_id, e.g. `bit [7:0] x;` declared inside an
                     // initial begin/task). Without this branch the write
                     // would silently no-op.
-                    if let Some(cur) = self.signals.get(&name).cloned() {
+                    if let Some(cur) = self.signals.get(&*name).cloned() {
                         if idx < cur.width as usize {
                             let nb = val.bits_first();
                             let old = cur.get_bit(idx);
@@ -50678,7 +50678,7 @@ impl Simulator {
                             if c {
                                 let mut nv = cur;
                                 nv.set_bit(idx, nb);
-                                self.signals.insert(name.clone(), nv);
+                                self.signals.insert(name.to_string(), nv);
                                 self.mark_dirty(&name);
                             }
                             return c;
@@ -54388,8 +54388,8 @@ impl Simulator {
                 // Sound: for one AST node the result is idempotent — the
                 // memoized path deliberately skips the scope-hint ratchet, so
                 // the repeats were pure overhead, not a second decision.
-                let base_nm: Option<String> = match &expr.kind {
-                    ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
+                let base_nm: Option<std::borrow::Cow<str>> = match &expr.kind {
+                    ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
                     _ => None,
                 };
                 // §7.4.6 / §11.5.1: an x/z index reads x at the ELEMENT width,
@@ -54789,9 +54789,9 @@ impl Simulator {
                 // The base may be a flat/hier Ident OR a MemberAccess chain
                 // (`u_h.mem[q]` from a parent scope) — mirror of the same
                 // shape in assign_value.
-                let idx_base_name: Option<String> = match &expr.kind {
-                    ExprKind::Ident(hier) => Some(self.resolve_hier_name(hier).into_owned()),
-                    ExprKind::MemberAccess { .. } => self.flat_member_name(expr),
+                let idx_base_name: Option<std::borrow::Cow<str>> = match &expr.kind {
+                    ExprKind::Ident(hier) => Some(self.resolve_hier_name(hier)),
+                    ExprKind::MemberAccess { .. } => self.flat_member_name(expr).map(std::borrow::Cow::Owned),
                     _ => None,
                 };
                 if let Some(mut name) = idx_base_name {
@@ -54816,7 +54816,7 @@ impl Simulator {
                             // collection keeps the BARE name its accessors and
                             // store use. Match `spec_static_coll_key`.
                             name = if self.static_coll_name_collides(coll) {
-                                self.static_prop_key(cls, coll).unwrap_or_else(|| coll.to_string())
+                                std::borrow::Cow::Owned(self.static_prop_key(cls, coll).unwrap_or_else(|| coll.to_string()))
                             } else if self.class_is_parameterized(cls) {
                                 // PARAMETERIZED class: elements live
                                 // per-specialization via the qualified form
@@ -54824,17 +54824,17 @@ impl Simulator {
                                 // in the MemberAccess handler.
                                 name
                             } else {
-                                coll.to_string()
+                                std::borrow::Cow::Owned(coll.to_string())
                             };
                         }
                     }
                     if let Some(scoped) = self.instance_assoc_member(&name) {
-                        name = scoped;
+                        name = std::borrow::Cow::Owned(scoped);
                     }
                     // A bare name inside a SUBMODULE process resolves under
                     // the process's instance scope (name_resolve_hint), like
                     // scalar reads/writes already do.
-                    if !self.module.arrays.contains_key(&name) && !self.is_associative_array(&name)
+                    if !self.module.arrays.contains_key(&*name) && !self.is_associative_array(&name)
                     {
                         let hint = self.name_resolve_hint.borrow().clone();
                         if let Some(h) = hint {
@@ -54842,11 +54842,11 @@ impl Simulator {
                             if self.module.arrays.contains_key(&scoped)
                                 || self.is_associative_array(&scoped)
                             {
-                                name = scoped;
+                                name = std::borrow::Cow::Owned(scoped);
                             }
                         }
                     }
-                    if self.module.arrays.contains_key(&name) || self.module.dynamic_arrays.contains(&name) || self.is_associative_array(&name) {
+                    if self.module.arrays.contains_key(&*name) || self.module.dynamic_arrays.contains(&*name) || self.is_associative_array(&name) {
                         // Check if `name` is a queue/dynamic array. This
                         // handles struct-field sub-paths (`info.addr`) and
                         // class-property paths (`c.addr`) that aren't in
@@ -54856,7 +54856,7 @@ impl Simulator {
                         // element read like `info.addr[0]` returns X because
                         // the enum arm exits before reaching the dynamic-array
                         // signal lookup below.
-                        if self.module.dynamic_arrays.contains(&name) {
+                        if self.module.dynamic_arrays.contains(&*name) {
                             // fall through to the element lookup below
                         }
                         // Per-spec storage key for STATIC collection properties
@@ -54867,12 +54867,12 @@ impl Simulator {
                         // `eval_builtin_method`'s push_back/size).
                         let store_name = self.spec_static_coll_key(&name);
                         // Array element access: look up signal "name[idx]"
-                        if self.module.dynamic_arrays.contains(&name) {
+                        if self.module.dynamic_arrays.contains(&*name) {
                             self.dollar_bound
                                 .push((self.get_queue_size(&store_name) as i64) - 1);
                         }
                         let idx_val = self.eval_expr(index);
-                        if self.module.dynamic_arrays.contains(&name) {
+                        if self.module.dynamic_arrays.contains(&*name) {
                             self.dollar_bound.pop();
                         }
                         // Fast path for 1-D arrays: compute signal_id directly
@@ -54883,7 +54883,7 @@ impl Simulator {
                         // every element, silently corrupting reads.
                         if !self.is_associative_array(&name) {
                             if let Some(&(first_id, lo, hi)) =
-                                self.array_first_id.get(name.as_str())
+                                self.array_first_id.get(name.as_ref())
                             {
                                 // §7.4.6: SIGNED index — negative-lo arrays.
                                 let idx = idx_val.to_i64().unwrap_or(0);
@@ -54928,7 +54928,7 @@ impl Simulator {
                         let mut v = if let Some(sv) = self.signals.get(&elem_name) {
                             sv.clone()
                         } else if let Some(def_expr) =
-                            self.module.assoc_defaults.get(&name).cloned()
+                            self.module.assoc_defaults.get(&*name).cloned()
                         {
                             self.eval_expr(&def_expr)
                         } else {
@@ -54943,7 +54943,7 @@ impl Simulator {
                             // `num()` is unchanged, which is why this is a
                             // value-only fallback.)
                             let ew = self.assoc_elem_width(&name).unwrap_or(1).max(1);
-                            if self.module.two_state_signals.contains(&name)
+                            if self.module.two_state_signals.contains(&*name)
                                 || name
                                     .rsplit('.')
                                     .next()
@@ -55190,13 +55190,13 @@ impl Simulator {
                     // (`q[0].arr[i]`), so the base is a MemberAccess over an
                     // Index rather than a plain Ident.
                     let base = match &expr.kind {
-                        ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
-                        ExprKind::MemberAccess { .. } => self.flat_member_name(expr),
+                        ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                        ExprKind::MemberAccess { .. } => self.flat_member_name(expr).map(std::borrow::Cow::Owned),
                         _ => None,
                     };
                     if let Some(base) = base {
-                        if !self.signal_name_to_id.contains_key(base.as_str())
-                            && !self.signals.contains_key(&base)
+                        if !self.signal_name_to_id.contains_key(base.as_ref())
+                            && !self.signals.contains_key(&*base)
                         {
                             let i = self.eval_expr(index).to_i64().unwrap_or(0);
                             let elem = format!("{}[{}]", base, i);
@@ -57929,11 +57929,11 @@ impl Simulator {
                     // For `Ident.field`: look up packed_struct_fields[Ident]
                     // For `Index.field`: look up packed_struct_fields[base_arr_name]
                     // For `Call.field`: try the function's return type layout
-                    let struct_base_name: Option<String> = match &expr.kind {
-                        ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
+                    let struct_base_name: Option<std::borrow::Cow<str>> = match &expr.kind {
+                        ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
                         ExprKind::Index { expr: base, .. } => {
                             if let ExprKind::Ident(h) = &base.kind {
-                                Some(self.resolve_hier_name(h).into_owned())
+                                Some(self.resolve_hier_name(h))
                             } else {
                                 None
                             }
@@ -57945,7 +57945,7 @@ impl Simulator {
                                 // (we register it there for nettype resolver functions)
                                 let fn_name =
                                     h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                                Some(fn_name.to_string())
+                                Some(std::borrow::Cow::Owned(fn_name.to_string()))
                             } else {
                                 None
                             }
@@ -57963,10 +57963,10 @@ impl Simulator {
                             let dt_opt =
                                 self.module
                                     .typedef_types
-                                    .get(&base_name)
+                                    .get(&*base_name)
                                     .cloned()
                                 .or_else(|| {
-                                        self.var_typedef_types.get(&base_name).cloned().and_then(
+                                        self.var_typedef_types.get(&*base_name).cloned().and_then(
                                             |tn| {
                                                 self.module.typedef_types.get(tn.as_str()).cloned()
                                             },
@@ -57974,7 +57974,7 @@ impl Simulator {
                                 })
                                 .or_else(|| {
                                         self.signal_name_to_id
-                                            .get(base_name.as_str())
+                                            .get(base_name.as_ref())
                                         .and_then(|id| self.signal_type_names.get(id).cloned())
                                             .and_then(|tn| {
                                                 self.module.typedef_types.get(tn.as_str()).cloned()
@@ -57995,7 +57995,7 @@ impl Simulator {
                         let from_packed = self
                             .module
                             .packed_struct_fields
-                            .get(&base_name)
+                            .get(&*base_name)
                             .cloned()
                             .map(|fs| {
                                 fs.into_iter()
@@ -58021,7 +58021,7 @@ impl Simulator {
                                         None
                                     }
                                 } else if let Some(type_name) =
-                                    self.var_typedef_types.get(&base_name)
+                                    self.var_typedef_types.get(&*base_name)
                                 {
                                     // Local variable/parameter with typedef type
                                     let dt = self.module.typedef_types.get(type_name.as_str())?;
@@ -58034,7 +58034,7 @@ impl Simulator {
                                     // signal_type_names → typedef_types.
                                     let sig_tn = self
                                         .signal_name_to_id
-                                        .get(base_name.as_str())
+                                        .get(base_name.as_ref())
                                         .and_then(|id| self.signal_type_names.get(id).cloned());
                                     if let Some(tn) = sig_tn {
                                         let dt = self.module.typedef_types.get(tn.as_str())?;
@@ -58043,7 +58043,7 @@ impl Simulator {
                                         Self::struct_field_layout(&resolved)
                                     } else {
                                         // Try resolving base_name as a typedef
-                                        let dt = self.module.typedef_types.get(&base_name)?;
+                                        let dt = self.module.typedef_types.get(&*base_name)?;
                                         let resolved =
                                             Self::resolve_type_ref(dt, &self.module.typedef_types);
                                         Self::struct_field_layout(&resolved)
@@ -59392,8 +59392,8 @@ impl Simulator {
                     };
                     if let Some((n_expr, src_expr)) = sized_new {
                         let target = match &lvalue.kind {
-                            ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh).into_owned()),
-                            _ => self.flat_member_name(lvalue),
+                            ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
+                            _ => self.flat_member_name(lvalue).map(std::borrow::Cow::Owned),
                         };
                         // A class-property dynamic array (`c.p = new[n]`)
                         // lives under the instance-scoped `<handle>#p`, which
@@ -59403,10 +59403,10 @@ impl Simulator {
                         // non-associative collections (dynamic arrays /
                         // queues); `new[n]` is invalid for assoc arrays.
                         let name = target
-                            .filter(|n| self.module.dynamic_arrays.contains(n))
+                            .filter(|n| self.module.dynamic_arrays.contains(n.as_ref()))
                             .or_else(|| {
                                 self.expr_assoc_name(lvalue)
-                                    .filter(|an| !self.is_associative_array(an))
+                                    .filter(|an| !self.is_associative_array(an)).map(std::borrow::Cow::Owned)
                             });
                         if let Some(name) = name {
                             let n = self.eval_expr(n_expr).to_u64().unwrap_or(0);
@@ -59439,12 +59439,12 @@ impl Simulator {
                             let inner: Option<(Vec<(i64, i64)>, u32)> = self
                                 .module
                                 .arrays_2d
-                                .get(&name)
+                                .get(&*name)
                                 .map(|&(_, d2, w)| (vec![d2], w))
                                 .or_else(|| {
                                     self.module
                                         .arrays_nd
-                                        .get(&name)
+                                        .get(&*name)
                                         .map(|(sh, w)| (sh[1..].to_vec(), *w))
                                 });
                             if let Some((shape, w)) = inner {
@@ -59474,7 +59474,7 @@ impl Simulator {
                                 let w = self
                                     .module
                                     .arrays
-                                    .get(&name)
+                                    .get(&*name)
                                     .map(|&(_, _, w)| w)
                                     .unwrap_or(32);
                                 let four_state = self.p_elem_type(&name).is_some_and(|dt| {
@@ -61439,11 +61439,11 @@ impl Simulator {
                                         // dynamic array, named flat as `d[i]`.
                                         let target = match &lvalue.kind {
                                             ExprKind::Ident(lhier) => {
-                                                Some(self.resolve_hier_name(lhier).into_owned())
+                                                Some(self.resolve_hier_name(lhier))
                                             }
                                             _ => {
                                                 let f = self.flat_member_name(lvalue);
-                                                f.filter(|n| self.module.dynamic_arrays.contains(n))
+                                                f.filter(|n| self.module.dynamic_arrays.contains(n)).map(std::borrow::Cow::Owned)
                                             }
                                         };
                                         if let Some(name) = target {
@@ -61520,7 +61520,7 @@ impl Simulator {
                 // its `return` statement): copy it into a collection lvalue.
                 if matches!(&rvalue.kind, ExprKind::Call { .. }) {
                     if let Some(src) = self.pending_ret_collection.take() {
-                        let dst: Option<String> = {
+                        let dst: Option<std::borrow::Cow<str>> = {
                             let byname = if let ExprKind::Ident(h) = &lvalue.kind {
                                 // The LHS may itself be a renamed local dyn
                                 // (`byte_array b;` inside an initial/method).
@@ -61528,15 +61528,15 @@ impl Simulator {
                                     h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                                 let n = self
                                     .dyn_name_lookup(bare)
-                                    .map(str::to_string)
-                                    .unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
-                                self.module.dynamic_arrays.contains(&n).then_some(n)
+                                    .map(|s| std::borrow::Cow::Owned(s.to_string()))
+                                    .unwrap_or_else(|| self.resolve_hier_name(h));
+                                self.module.dynamic_arrays.contains(&*n).then_some(n)
                             } else {
                                 None
                             };
                             byname.or_else(|| {
                                 self.expr_assoc_name(lvalue)
-                                    .filter(|an| !self.is_associative_array(an))
+                                    .filter(|an| !self.is_associative_array(an)).map(std::borrow::Cow::Owned)
                             })
                         };
                         if let Some(dst) = dst {
@@ -63956,10 +63956,10 @@ impl Simulator {
                         // `dynamic_arrays` (ivtest sv_darray_function).
                         let n = self
                             .dyn_name_lookup(bare)
-                            .map(str::to_string)
-                            .or_else(|| self.instance_assoc_member(bare))
-                            .unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
-                        if self.module.dynamic_arrays.contains(&n) {
+                            .map(|s| std::borrow::Cow::Owned(s.to_string()))
+                            .or_else(|| self.instance_assoc_member(bare).map(std::borrow::Cow::Owned))
+                            .unwrap_or_else(|| self.resolve_hier_name(h));
+                        if self.module.dynamic_arrays.contains(&*n) {
                             // Frame teardown wipes a subroutine-LOCAL
                             // collection before the caller's assignment
                             // consumes it (the recorded name read back size
@@ -63973,7 +63973,7 @@ impl Simulator {
                                 self.copy_whole_queue(RET_SNAP, &n);
                                 self.pending_ret_collection = Some(RET_SNAP.to_string());
                             } else {
-                                self.pending_ret_collection = Some(n);
+                                self.pending_ret_collection = Some(n.to_string());
                             }
                         }
                     }
@@ -67110,9 +67110,9 @@ impl Simulator {
             "$printtimescale" => {
                 // §20.11: an instance argument selects THAT instance's
                 // module timescale; no argument means the calling scope.
-                let arg_inst: Option<String> = args.first().and_then(|a| {
+                let arg_inst: Option<std::borrow::Cow<str>> = args.first().and_then(|a| {
                     if let ExprKind::Ident(h) = &a.kind {
-                        Some(self.resolve_hier_name(h).into_owned())
+                        Some(self.resolve_hier_name(h))
                     } else {
                         None
                     }
