@@ -54489,8 +54489,24 @@ impl Simulator {
                     // `dynamic_arrays`/`arrays`/`associative_arrays` here and
                     // falls through to a scalar bit-select — reading null.
                     if let Some((cls, coll)) = name.split_once('.') {
-                        if self.module.classes.contains_key(cls)
-                            && self.member_is_static_coll(cls, coll)
+                        // §8.25: the leading segment may be a class-LOCAL
+                        // TYPEDEF alias of a parameterized class (`this_type`
+                        // -> `seqlib#(REQ,RSP)`), which the parser folds into
+                        // a dotted member access `this_type.member`. Resolve it
+                        // to the concrete per-spec class, so a STATIC-collection
+                        // ELEMENT read `this_type::m[i]` keys under the per-spec
+                        // cell (`seqlib#item,item::m`) that the ::-form size()
+                        // and bare static writes share — NOT the literal
+                        // `this_type.m` (which reads empty).
+                        let real_cls = if self.module.classes.contains_key(cls) {
+                            Some(cls.to_string())
+                        } else {
+                            self.resolve_typedef_spec(cls)
+                                .map(|(b, _)| b)
+                                .filter(|b| self.module.classes.contains_key(b))
+                        };
+                        if let Some(real_cls) = real_cls
+                            && self.member_is_static_coll(&real_cls, coll)
                         {
                             // Sibling-collision storage is per-DECLARING class
                             // (`ClassName::coll` — e.g. the four
@@ -54499,13 +54515,27 @@ impl Simulator {
                             // collection keeps the BARE name its accessors and
                             // store use. Match `spec_static_coll_key`.
                             name = if self.static_coll_name_collides(coll) {
-                                self.static_prop_key(cls, coll).unwrap_or_else(|| coll.to_string())
-                            } else if self.class_is_parameterized(cls) {
+                                self.static_prop_key(&real_cls, coll)
+                                    .unwrap_or_else(|| coll.to_string())
+                            } else if self.class_is_parameterized(&real_cls) {
                                 // PARAMETERIZED class: elements live
                                 // per-specialization via the qualified form
                                 // (§8.25) — see the matching receiver rewrite
-                                // in the MemberAccess handler.
-                                name
+                                // in the MemberAccess handler. For a TYPEDEF
+                                // alias of a parameterized class (`this_type`)
+                                // resolve its specialization explicitly, since
+                                // the MemberAccess pre-rewrite only fires for a
+                                // plain class receiver.
+                                if let Some((b, sig)) = self.resolve_typedef_spec(cls) {
+                                    format!(
+                                        "{}#{}::{}",
+                                        b,
+                                        self.canonicalize_spec_sig(&b, &sig),
+                                        coll
+                                    )
+                                } else {
+                                    name
+                                }
                             } else {
                                 coll.to_string()
                             };
@@ -54529,7 +54559,11 @@ impl Simulator {
                             }
                         }
                     }
-                    if self.module.arrays.contains_key(&name) || self.module.dynamic_arrays.contains(&name) || self.is_associative_array(&name) {
+                    if self.module.arrays.contains_key(&name)
+                        || self.module.dynamic_arrays.contains(&name)
+                        || self.is_associative_array(&name)
+                        || self.is_per_spec_dynamic_static(&name)
+                    {
                         // Check if `name` is a queue/dynamic array. This
                         // handles struct-field sub-paths (`info.addr`) and
                         // class-property paths (`c.addr`) that aren't in
@@ -62686,6 +62720,9 @@ impl Simulator {
                         name = rn.to_string();
                     } else {
                         let spec_key = self.spec_static_coll_key(&name);
+                        // §8.25: the per-spec key for a static collection
+                        // (`Class#spec::member`) is authoritative — do not
+                        // re-scope it into the instance/collision namespace.
                         if spec_key != name {
                             name = spec_key;
                         } else if let Some(scoped) = self.instance_assoc_member(&name) {
@@ -63090,7 +63127,9 @@ impl Simulator {
                                 }
                                 self.continue_flag = false;
                             }
-                        } else if self.module.dynamic_arrays.contains(&name) {
+                        } else if self.module.dynamic_arrays.contains(&name)
+                            || self.is_per_spec_dynamic_static(&name)
+                        {
                             // Queue / dynamic array: iterate 0..current size.
                             let size = self.get_queue_size(&name);
                             for i in 0..size {
@@ -70597,12 +70636,13 @@ impl Simulator {
             if let Some((base, sig)) = self.resolve_typedef_spec(&hier.path[0].name.name) {
                 let member = &hier.path[1].name.name;
                 if self.member_is_static_coll(&base, member) {
-                    return format!(
+                    let r = format!(
                         "{}#{}::{}",
                         base,
                         self.canonicalize_spec_sig(&base, &sig),
                         member
                     );
+                    return r;
                 }
             }
             // §8.9: a 2-segment path `[Class, member]` where the leading
@@ -76979,6 +77019,28 @@ impl Simulator {
         }
         let leaf = name.rsplit('.').next().unwrap_or(name);
         self.module.assoc_elem_widths.get(leaf).copied()
+    }
+
+    /// §8.25: a per-specialization static collection key
+    /// (`Class#spec::member`, e.g. `seqlib#int::m_typewide_sequences`)
+    /// produced by `spec_static_coll_key` / the typed-qualifier rewrite. The
+    /// BARE `member` may be registered in `module.dynamic_arrays`, but the
+    /// per-spec key itself is not — and when a DERIVED class re-declares the
+    /// same static (`seqlib_RST extends seqlib#(int); static … m_…;`), even the
+    /// bare member may not sit in `module.dynamic_arrays`. Element reads
+    /// (`Class#spec::m[i]`) and `foreach` must still treat the key as a
+    /// queue/dynamic collection (the mirror of `is_associative_array`'s
+    /// `#…::` branch). ASSOC collections are handled separately by
+    /// `is_associative_array`, so this need only confirm the member is a
+    /// static collection reached through a per-spec key.
+    fn is_per_spec_dynamic_static(&self, name: &str) -> bool {
+        if let Some((head, sig_member)) = name.split_once('#')
+            && let Some((_, member)) = sig_member.rsplit_once("::")
+            && self.member_is_static_coll(head, member)
+        {
+            return true;
+        }
+        false
     }
 
     fn is_associative_array(&self, name: &str) -> bool {
@@ -89590,6 +89652,70 @@ impl Simulator {
     /// that revisits an already-seen class is cleared to `None`.
     fn sanitize_class_hierarchy(&mut self) {
         let names: Vec<String> = self.module.classes.keys().cloned().collect();
+        // Resolve each `extends` base that is a typedef ALIAS to its concrete
+        // class key. `class d extends simple_lib` where `simple_lib` is
+        // `typedef base#(bit) simple_lib` stores `extends = "simple_lib"`, which
+        // is NOT a `module.classes` key — every hierarchy walk (method lookup,
+        // inherited-field registration, property resolution) then stops one
+        // hop early and loses the base's members/methods. Rewrite it to the
+        // concrete key (`"base"`) so the walks see the real ancestor.
+        for cname in &names {
+            let mut resolved_extends = None;
+            let mut resolved_args: Vec<String> = Vec::new();
+            {
+                let cd = self.module.classes.get(cname);
+                resolved_extends = cd.and_then(|cd| cd.extends.clone()).and_then(|e| {
+                    if self.module.classes.contains_key(&e) {
+                        Some(e)
+                    } else {
+                        self.resolve_typeref_class_name_str(&e)
+                            .filter(|r| self.module.classes.contains_key(r))
+                    }
+                });
+                // When the `extends` alias is a TYPEDEF of a PARAMETERIZED
+                // class (`class D extends simple_lib` where
+                // `typedef uvm_sequence_library#(sequence_item) simple_lib;`),
+                // `extends_type_args` was recorded as EMPTY (a bare alias name).
+                // Every ancestor walk that rebinds the base's type params
+                // (`static_receiver_spec`, `static_prop_key`) then cites only
+                // the base class with its UNBOUND declared params, so a derived
+                // instance's base method resolves `this_type` to the DEFAULT
+                // specialization instead of the concrete one. Carry the alias's
+                // specialization args here (positional, per the base's
+                // param_order) so those walks rebind REQ/RSP to `simple_item`.
+                if let Some(real) = &resolved_extends {
+                    if let Some(cd) = self.module.classes.get(cname) {
+                        let already = cd
+                            .extends_type_args
+                            .iter()
+                            .any(|a| a != "<unknown>");
+                        if !already
+                            && self.module.classes.get(real).is_some_and(|p| {
+                                !p.type_param_names.is_empty() || !p.param_order.is_empty()
+                            })
+                            && let Some((rb, rsig)) =
+                                self.resolve_typedef_spec(cd.extends.as_deref().unwrap_or(""))
+                            && rb == *real
+                        {
+                            resolved_args = Self::split_spec_args(&rsig);
+                        }
+                    }
+                }
+            }
+            if let Some(real) = resolved_extends {
+                if let Some(cd) = self
+                    .module
+                    .classes
+                    .get_mut(cname)
+                    .map(std::sync::Arc::make_mut)
+                {
+                    cd.extends = Some(real);
+                    if cd.extends_type_args.is_empty() && !resolved_args.is_empty() {
+                        cd.extends_type_args = resolved_args;
+                    }
+                }
+            }
+        }
         for start in names {
             let mut seen: HashSet<String> = HashSet::default();
             let mut cur = Some(start.clone());
@@ -90081,6 +90207,31 @@ impl Simulator {
             }
             break; // no default for this position — stop (leave partial)
         }
+        // §8.25: transitively resolve a type-param default that names ANOTHER
+        // type param of the same class (`RSP=REQ`, where `REQ` is bound to a
+        // concrete type). After the per-position substitution above, `REQ` is
+        // concrete at its own index; a later position whose default is `REQ`
+        // must follow it (`#(item, REQ)` -> `#(item, item)`), not leak the raw
+        // param name into the sig. Otherwise a static write that binds `REQ`
+        // and an instance-method read through `this_type` (which re-expands
+        // `REQ,RSP`) would key DIFFERENT cells -> systemverilog static
+        // collections (e.g. UVM's `m_typewide_sequences`) come up empty.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for i in 0..frags.len() {
+                let f = frags[i].trim().to_string();
+                if let Some(j) = order.iter().position(|p| *p == f) {
+                    if let Some(bind) = frags.get(j) {
+                        let bind = bind.trim().to_string();
+                        if !bind.is_empty() && bind != f {
+                            frags[i] = bind.clone();
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
         let canon_frags: Vec<String> = frags.iter().map(|f| self.canonicalize_spec_frag(f)).collect();
         canon_frags.join(",")
     }
@@ -90100,14 +90251,9 @@ impl Simulator {
             .copied()
             .flatten()
             .filter(|&h| h != 0);
-        // Instance method: collection storage is instance-scoped
-        // (`<handle>#name`), not static. A static method carries a ZERO
-        // `this` handle, so filter that out.
-        if this_h.is_some() {
-            return name.to_string();
-        }
         let Some(Some(ctx)) = self.class_context_stack.last().cloned() else {
-            return name.to_string();
+            let r = name.to_string();
+            return r;
         };
         // Walk ctx's inheritance chain for a STATIC collection property.
         // Static collections are registered in `static_collections`
@@ -90127,6 +90273,18 @@ impl Simulator {
                         // of the runtime uses; rewriting it would split
                         // storage and break the many bare-name accessors
                         // (including the UVM phase machinery).
+                        //
+                        // An INSTANCE method reaches the SAME parameterized
+                        // static cell as a static method (§8.25: a static
+                        // accessed through `this` still belongs to the class's
+                        // per-specialization store). Both must resolve to the
+                        // `#spec` key; otherwise static writes land in
+                        // `base#seq::m` while an instance-method read looks up
+                        // the bare `m` and returns a DIFFERENT (empty) cell.
+                        // Non-parameterized / non-colliding statics retain the
+                        // bare name, so instance collections (which never match
+                        // the static-collection check) and the phase machinery
+                        // are unaffected.
                         if key.contains('#') || self.static_coll_name_collides(name) {
                             return key;
                         }
@@ -92547,6 +92705,26 @@ impl Simulator {
                             self.static_fixed_key_in(&bh.path[0].name.name, &member.name)
                         {
                             return Some(k);
+                        }
+                    } else if let Some((tb, ts)) =
+                        self.resolve_typedef_spec(&bh.path[0].name.name)
+                    {
+                        // §8.25: a class-LOCAL TYPEDEF alias (e.g. `this_type`
+                        // -> `seqlib#(REQ)`) of a parameterized class with a
+                        // STATIC-collection member, reached as
+                        // `this_type::m.size()` from a DERIVED class that
+                        // re-declares the same static (`seqlib_RST`). Resolve it
+                        // to the per-spec cell (`seqlib#int::m`) — the same cell
+                        // the bare static write and the element read use — not
+                        // the bare class name (`seqlib::m`), which would miss the
+                        // written elements and report size/`exists` empty.
+                        if self.member_is_static_coll(&tb, &member.name) {
+                            return Some(format!(
+                                "{}#{}::{}",
+                                tb,
+                                self.canonicalize_spec_sig(&tb, &ts),
+                                member.name
+                            ));
                         }
                     }
                     obj_member(self, &bh.path[0].name.name, &member.name)

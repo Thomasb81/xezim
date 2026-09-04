@@ -58,6 +58,8 @@ mod class_handle_return_preservation;
 mod class_output_handle_copyback;
 #[path = "classes/typedef_extends_cast.rs"]
 mod typedef_extends_cast;
+#[path = "classes/typedef_param_base_inherits_spec_arg.rs"]
+mod typedef_param_base_inherits_spec_arg;
 #[path = "classes/class_local_typedef_aa.rs"]
 mod class_local_typedef_aa;
 #[path = "classes/class_local_typedef_resolution.rs"]
