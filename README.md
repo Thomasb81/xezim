@@ -110,7 +110,40 @@ and testbench flows. Portable code should not rely on them.
 
 # What's new in 0.10
 
-### Unreleased — class covergroups, compilation-unit DPI, assertions in instances
+### Unreleased
+
+* **`bind` with a parameter value assignment is applied**: `bind dut
+  dut_harness #(.NUM_ROWS(NUM_ROWS), .NUM_COLS(NUM_COLS)) v_tl_harness
+  (.*);` was dropped by the parser as an unrecognised directive, so the
+  harness never existed: hierarchical reads of it gave x, task calls into it
+  did nothing, and a scoreboard driven that way passed without ever
+  running. The parameters now reach the bound instance.
+* **A `ref` formal named like its actual no longer overflows the stack**:
+  `task sum(ref int cnt)` called as `sum(cnt)` rewrote the identifier to
+  itself and evaluation re-entered the redirect until the stack was gone;
+  such a formal now resolves straight to the actual's storage, for element
+  reads and writes as well.
+* **Fewer per-identifier lookups inside class methods**: a bare name that
+  no class in the chain declares as a property (a local, a formal, a module
+  signal) used to trigger a class-chain walk with collection-table probes and
+  string clones on every evaluation; the verdict is now cached per class.
+  The struct-or-not question asked on every class property access no longer
+  clones the class name per level or allocates a cycle-guard set, and its
+  negative answer is cached too. An unsized literal reads its width from its
+  cached parse instead of rescanning its text. The axi4 AVIP retires 4.9 %
+  fewer instructions, output identical.
+
+### 0.10.5 — class covergroups, DPI exports and unit scope, faster UVM (September 2026)
+* **Typedef'd packed arrays keep their dimensions inside instances**: a
+  `u7_t [4:0][1:0] a` declared in an instantiated module (including every
+  top of a multi-top design, which runs under the synthetic wrapper) had no
+  packed geometry recorded, so `foreach (a[i, j])` walked its 70 bits
+  instead of its 10 elements while the same module run as the selected top
+  was right. The declared dimensions are now chained with the typedef's for
+  instance variables, ports and nets alike.
+* **`--profile`** prints the end-of-run profile report (by design unit,
+  instance and construct, plus the opcode and entry histograms); the same
+  as `XEZIM_PROFILE_REPORT=1`.
 
 * **`foreach` and `std::randomize` over multi-dimensional targets**: a
   `foreach (a[i, j])` over a purely packed array (`u7_t [4:0][1:0]`,
@@ -123,6 +156,14 @@ and testbench flows. Portable code should not rely on them.
   relational bounds, `elem == e` pins, and `$countones(mask[i][j]) ==
   count[i][j]` couplings, which draw the mask with exactly that many ones.
   A `rand` class property wider than 64 bits is drawn in full as well.
+* **`export "DPI-C"` aliases and package-scope exports reach C**: an export
+  with a C linkage name (`export "DPI-C" c_reg_write = task reg_write;`)
+  now emits the `c_reg_write` symbol the loaded library calls (it emitted the
+  SV name, and the library died with `undefined symbol: c_reg_write` on its
+  first call). Exports declared inside a package are registered whether the
+  package is wildcard-imported, imported by name, or never imported (they
+  name a global symbol either way); an unimported package's subroutine is
+  reached under its qualified name.
 * **Loop variables shadow a same-named variable of an inlined instance**: a
   `for (integer i = 0; ...)` or `foreach (a[i])` inside a child module that
   also declares `integer i` at module scope now binds `i` to the loop. The
@@ -698,6 +739,7 @@ Common options:
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for vendor sources you cannot edit |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
+| `--profile` | Print the `[PROF]` end-of-run profile report (edge-block, settle and timing counters). Same as `XEZIM_PROFILE_REPORT=1` |
 
 Selected env knobs (off by default unless noted):
 
@@ -717,6 +759,7 @@ Selected env knobs (off by default unless noted):
 | `XEZIM_NO_CACHE=1` | Disable the automatic elaborated-design cache |
 | `XEZIM_COMPILE_PHASES=1` | Report detailed simulator compilation phase timings |
 | `XEZIM_ALLOW_IMPLICIT_STATIC=1` | Same as `--relax-implicit-static` |
+| `XEZIM_PROFILE_REPORT=1` | Same as `--profile` |
 | `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
 | `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
 | `XEZIM_VALUE_TRACE=<substr>[,...]` | Print every committed change of signals whose hierarchical name contains a pattern: time, name, old→new value, dispatch phase, writing process origin (file:line). NBA commits are labeled `nba` |

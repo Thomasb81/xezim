@@ -3397,6 +3397,15 @@ pub struct Simulator {
     /// `Some(class)` = static fixed array owned by that class.
     #[allow(clippy::type_complexity)]
     class_coll_index: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
+    /// Per class: bare names that NO class in its inheritance chain declares
+    /// as a property (locals, module signals, method formals). Every bare
+    /// identifier evaluated inside a class method asked
+    /// `instance_assoc_member`, which walked the chain and probed the
+    /// collection tables per level, on every evaluation; such a name can
+    /// never become a collection member, so the verdict is cached.
+    class_non_member_cache: std::cell::RefCell<HashMap<String, HashSet<String>>>,
+    /// Per class: properties that are NOT structs (see `class_prop_struct`).
+    class_prop_struct_neg: std::cell::RefCell<HashMap<String, HashSet<String>>>,
     name_stats: [std::cell::Cell<u64>; 5],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
@@ -8019,6 +8028,8 @@ impl Simulator {
             force_epoch_gen: 0,
             force_refresh_done_gen: 0,
             class_coll_index: std::cell::RefCell::new(HashMap::default()),
+            class_non_member_cache: std::cell::RefCell::new(HashMap::default()),
+            class_prop_struct_neg: std::cell::RefCell::new(HashMap::default()),
             name_stats: Default::default(),
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
@@ -10978,10 +10989,14 @@ impl Simulator {
             "extern long long __xezim_dpi_export_dispatch(long long id, long long n, const long long* a);\n",
         );
         let mut emitted = 0usize;
+        let c_names = self.module.dpi_export_c_names.clone();
         for (id, name) in exports.iter().enumerate() {
             let Some((ret, args)) = self.dpi_export_signature(name) else {
                 continue;
             };
+            // The symbol the C side links against: the export's alias when
+            // one was declared, else the SV name.
+            let c_name: &str = c_names.get(id).map(|s| s.as_str()).unwrap_or(name);
             let supported = ret != DpiExpKind::Bad && !args.contains(&DpiExpKind::Bad);
             let params: Vec<String> = if supported {
                 args.iter().enumerate().map(|(i, k)| format!("{} a{}", c_ty(*k), i)).collect()
@@ -11000,9 +11015,9 @@ impl Simulator {
                 );
                 let ret_c = if ret == DpiExpKind::Void { "void" } else { "long long" };
                 if ret == DpiExpKind::Void {
-                    body.push_str(&format!("void {}({}) {{ }}\n", name, param_list));
+                    body.push_str(&format!("void {}({}) {{ }}\n", c_name, param_list));
                 } else {
-                    body.push_str(&format!("{} {}({}) {{ return 0; }}\n", ret_c, name, param_list));
+                    body.push_str(&format!("{} {}({}) {{ return 0; }}\n", ret_c, c_name, param_list));
                 }
                 emitted += 1;
                 continue;
@@ -11029,15 +11044,15 @@ impl Simulator {
             match ret {
                 DpiExpKind::Void => body.push_str(&format!(
                     "void {}({}) {{\n{}    (void){};\n}}\n",
-                    name, param_list, pack, call
+                    c_name, param_list, pack, call
                 )),
                 DpiExpKind::Real => body.push_str(&format!(
                     "double {}({}) {{\n{}    long long __r = {};\n    double __d; memcpy(&__d, &__r, 8); return __d;\n}}\n",
-                    name, param_list, pack, call
+                    c_name, param_list, pack, call
                 )),
                 _ => body.push_str(&format!(
                     "{} {}({}) {{\n{}    return ({}){};\n}}\n",
-                    c_ty(ret), name, param_list, pack, c_ty(ret), call
+                    c_ty(ret), c_name, param_list, pack, c_ty(ret), call
                 )),
             }
             emitted += 1;
@@ -48704,6 +48719,14 @@ impl Simulator {
         }
         let name = hier.path[0].name.name.as_str();
         if let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(name)) {
+            // A formal bound to an actual of the SAME name (`run_checks(ref
+            // u7_t [..] cnt)` called as `run_checks(cnt)`) rewrote the
+            // identifier to itself, and the evaluator re-entered this
+            // redirect on the rewritten node until the stack overflowed.
+            // Plain resolution of the name already reaches that storage.
+            if storage == name {
+                return None;
+            }
             let mut path = hier.path.clone();
             path[0].name.name = storage.clone();
             return Some(crate::ast::expr::HierarchicalIdentifier {
@@ -59248,9 +59271,16 @@ impl Simulator {
                 // §5.7.1: an UNSIZED literal is at least 32 bits, but must not
                 // drop digits the source wrote — `'h123456789ABCDEF0` is 64 bits
                 // of value and a flat 32 kept only the low half, silently.
+                // The cached triple already carries the width the literal
+                // was parsed at; an UNSIZED literal used to recompute it from
+                // its text on every evaluation.
+                let cached = cached_val.get();
                 let w = match size {
                     Some(sz) => *sz,
-                    None => Value::unsized_literal_width(value, r_for_w),
+                    None => match cached {
+                        Some((_, _, cw)) => cw,
+                        None => Value::unsized_literal_width(value, r_for_w),
+                    },
                 };
                 // §5.7.1: an unsized all-x/all-z literal ('bx, 'hz, 'b?) is a
                 // FILL — it must replicate to the consuming context, not stop
@@ -59258,7 +59288,7 @@ impl Simulator {
                 let xz_fill =
                     size.is_none() && Value::unsized_xz_fill_char(value).is_some();
                 // Fast path: return cached value (avoids re-parsing string)
-                if let Some((vb, xz, cw)) = cached_val.get() {
+                if let Some((vb, xz, cw)) = cached {
                     if cw == w {
                         let mut v = Value::from_inline(vb, xz, w);
                         v.is_signed = *signed;
@@ -85624,14 +85654,34 @@ impl Simulator {
         // typedef name to look up, but its declared type is retained verbatim
         // in `property_types` — use it directly; whole-value access worked
         // while `s.f` read x without this.
-        if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
-            let mut cur = Some(inst.class_name.clone());
-            let mut seen: HashSet<String> = HashSet::default();
+        let class_name: &str = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.as_str())
+            .unwrap_or("");
+        // The common answer for a scalar property is "not a struct"; it
+        // depends only on the class chain and the name, so it is cached
+        // per class. The walk below used to clone the class name per level
+        // and allocate a cycle-guard set on every property access.
+        if !class_name.is_empty()
+            && self
+                .class_prop_struct_neg
+                .borrow()
+                .get(class_name)
+                .is_some_and(|set| set.contains(prop))
+        {
+            return None;
+        }
+        if !class_name.is_empty() {
+            let mut cur: Option<&str> = Some(class_name);
+            let mut hops = 0usize;
             while let Some(cn) = cur {
-                if !seen.insert(cn.clone()) {
+                hops += 1;
+                if hops > 64 {
                     break;
                 }
-                let cd = self.module.classes.get(&cn)?;
+                let cd = self.module.classes.get(cn)?;
                 // A COLLECTION property (assoc/queue/array — incl. a STATIC
                 // one, which elaboration gates out of the per-instance maps)
                 // is NOT a scalar struct: its unpacked dimension indexes
@@ -85662,18 +85712,25 @@ impl Simulator {
                 if cd.properties.contains_key(prop) {
                     break;
                 }
-                cur = cd.extends.clone();
+                cur = cd.extends.as_deref();
             }
         }
-        let tn = self.class_prop_type_name(handle, prop)?;
-        let dt = self
-            .module
-            .typedef_types
-            .get(tn.as_str())?;
-        match Self::resolve_type_ref(dt, &self.module.typedef_types) {
-            DataType::Struct(su) => Some(su),
-            _ => None,
+        let verdict = (|| {
+            let tn = self.class_prop_type_name(handle, prop)?;
+            let dt = self.module.typedef_types.get(tn.as_str())?;
+            match Self::resolve_type_ref(dt, &self.module.typedef_types) {
+                DataType::Struct(su) => Some(su),
+                _ => None,
+            }
+        })();
+        if verdict.is_none() && !class_name.is_empty() {
+            self.class_prop_struct_neg
+                .borrow_mut()
+                .entry(class_name.to_string())
+                .or_default()
+                .insert(prop.to_string());
         }
+        verdict
     }
 
     /// The CONCRETE type name a property's declared type denotes on this
@@ -93874,13 +93931,33 @@ impl Simulator {
             });
         }
         // Miss: only the per-instance type-binding case can still match.
+        if self
+            .class_non_member_cache
+            .borrow()
+            .get(ctx)
+            .is_some_and(|set| set.contains(name))
+        {
+            return None;
+        }
         let mut cur: Option<&str> = Some(ctx);
+        let mut declared = false;
         while let Some(cn) = cur {
             let cd = self.module.classes.get(cn)?;
+            declared |= cd.properties.contains_key(name);
             if self.prop_bound_collection(handle, cn, name) {
                 return Some(format!("{}#{}", handle, name));
             }
             cur = cd.extends.as_deref();
+        }
+        if !declared {
+            // Not a property anywhere in the chain: the verdict cannot
+            // depend on this instance's type bindings, so it holds for
+            // every object of the class.
+            self.class_non_member_cache
+                .borrow_mut()
+                .entry(ctx.to_string())
+                .or_default()
+                .insert(name.to_string());
         }
         None
     }
@@ -93937,6 +94014,25 @@ impl Simulator {
     /// a property declared with a type parameter that this instance binds to
     /// a typedef carrying a dynamic/queue unpacked dimension (§6.20.3)?
     fn prop_bound_collection(&self, handle: usize, class_name: &str, member: &str) -> bool {
+        // Hit path without allocations: the cached raw type and the
+        // instance's binding are borrowed, and the dimension verdict is
+        // read by `&str`.
+        {
+            let cache = self.prop_raw_ty_cache.borrow();
+            if let Some(hit) = cache.get(class_name).and_then(|m| m.get(member)) {
+                let Some(raw) = hit.as_deref() else { return false };
+                let concrete: &str = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.type_bindings.get(raw))
+                    .map(String::as_str)
+                    .unwrap_or(raw);
+                if let Some(&v) = self.collection_dim_cache.borrow().get(concrete) {
+                    return v;
+                }
+            }
+        }
         let raw_ty: Option<String> = {
             let hit = self
                 .prop_raw_ty_cache
@@ -101305,6 +101401,18 @@ impl Simulator {
         // the callee's stale copy).
         output_bindings.retain(|(n, _)| !alias_map.contains_key(n));
         self.ref_binding_stack.push(ref_map);
+        // A `ref` formal whose actual has the SAME name (`sum(ref int cnt)`
+        // called as `sum(cnt)`) cannot be steered by the alias map: the
+        // redirect would rewrite the name to itself (see
+        // `ref_formal_redirect_hier`). Drop its frame copy instead, so plain
+        // resolution reaches the actual's storage for reads and writes.
+        if let Some(frame) = self.local_stack.last_mut() {
+            for (formal, storage) in &alias_map {
+                if formal == storage {
+                    frame.remove(formal);
+                }
+            }
+        }
         self.ref_alias_stack.push(alias_map);
         self.ref_identity_stack.push(identity_formals);
         self.refresh_ref_redirect_hot();
