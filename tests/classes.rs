@@ -264,3 +264,5 @@ mod class_covergroups;
 mod parked_task_local_vif_alias;
 #[path = "classes/class_randomize_multidim.rs"]
 mod class_randomize_multidim;
+#[path = "classes/class_method_sibling_instance_oomr.rs"]
+mod class_method_sibling_instance_oomr;

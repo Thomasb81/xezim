@@ -58313,6 +58313,34 @@ impl Simulator {
                         None => base_flat,
                     };
                     let flat = format!("{}.{}", base_flat, member.name);
+                    // A dotted read from a hinted scope (`core.seq` inside a
+                    // class method of an object built in `u_w`, issue #155):
+                    // `a.b` parses as a MemberAccess, so the identifier
+                    // resolver's hint walk never saw it and the flat name
+                    // missed. Try it under the hint and each parent scope.
+                    let flat = if self.get_signal_value_by_name(&flat).is_some() {
+                        flat
+                    } else {
+                        let hint = self.name_resolve_hint.borrow().clone();
+                        let mut found: Option<String> = None;
+                        if let Some(hint) = hint.as_deref() {
+                            let mut scope = hint;
+                            loop {
+                                let scoped = format!("{}.{}", scope, flat);
+                                if self.signal_name_to_id.contains_key(scoped.as_str())
+                                    || self.signals.contains_key(&scoped)
+                                {
+                                    found = Some(scoped);
+                                    break;
+                                }
+                                match scope.rsplit_once('.') {
+                                    Some((p, _)) => scope = p,
+                                    None => break,
+                                }
+                            }
+                        }
+                        found.unwrap_or(flat)
+                    };
                     // A leaf may live in the compact table OR the runtime map (a
                     // LOCAL unpacked-struct array element is only in the latter),
                     // so consult both — `sa[1].a` read 0 while `%p` showed 2.
@@ -71136,6 +71164,44 @@ impl Simulator {
     /// The instance scope currently executing — the same precedence `%m` uses:
     /// a sensitivity-driven block records `m_block_scope`, a procedural process
     /// records `current_scope`.
+    /// Strip the top module's name from a `%m`-form scope (`tb.u_w` ->
+    /// `u_w`; `tb` -> ``), giving the instance path signal keys use.
+    fn instance_relative_scope(&self, scope: &str) -> String {
+        let top = self.module.name.as_str();
+        if scope == top {
+            return String::new();
+        }
+        match scope.strip_prefix(top) {
+            Some(rest) if rest.starts_with('.') => rest[1..].to_string(),
+            _ => scope.to_string(),
+        }
+    }
+
+    /// The module a class (or an ancestor of it) is declared inside, if any.
+    fn class_enclosing_module(&self, handle: usize) -> Option<String> {
+        let mut cur: Option<String> = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        let mut hops = 0;
+        while let Some(cn) = cur {
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(m) = &cd.declaring_module {
+                return Some(m.clone());
+            }
+            if let Some(enc) = &cd.enclosing {
+                return Some(enc.clone());
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
     fn active_instance_scope(&self) -> String {
         if !self.m_block_scope.is_empty() {
             self.m_block_scope.clone()
@@ -71649,6 +71715,29 @@ impl Simulator {
                 let scoped = format!("{}.{}", hint, raw);
                 if self.signal_name_to_id.contains_key(scoped.as_str()) {
                     return scoped;
+                }
+            }
+        } else if !self.signal_name_to_id.contains_key(raw.as_str()) {
+            // A DOTTED reference from a hinted scope (`core.seq` inside a
+            // class method of an object built in `u_w`, or inside a
+            // nested block of `u_w`) names a sibling instance's member:
+            // try it under the hint and each parent scope (§23.6 upward
+            // resolution). Only when the raw name is not itself a signal,
+            // so an absolute path keeps winning.
+            let hint = self.name_resolve_hint.borrow().clone();
+            if let Some(hint) = hint.as_deref() {
+                let mut scope = hint;
+                loop {
+                    let scoped = format!("{}.{}", scope, raw);
+                    if self.signal_name_to_id.contains_key(scoped.as_str()) {
+                        let parent = parent_of(&scoped).to_string();
+                        *self.name_resolve_hint.borrow_mut() = Some(parent);
+                        return scoped;
+                    }
+                    match scope.rsplit_once('.') {
+                        Some((p, _)) => scope = p,
+                        None => break,
+                    }
                 }
             }
         }
@@ -95555,6 +95644,30 @@ impl Simulator {
                     self.exec_task_call(&td, args);
                     return Value::zero(32);
                 }
+                // The same key under the resolution hint and its parents:
+                // `core.get_seq()` from a class method of an object built in
+                // `u_w` is `u_w.core.get_seq` (issue #155). Class bodies are
+                // not instance-rewritten, so the bare join misses.
+                {
+                    let hint = self.name_resolve_hint.borrow().clone();
+                    if let Some(hint) = hint.as_deref() {
+                        let mut scope = hint;
+                        loop {
+                            let scoped = format!("{}.{}", scope, joined);
+                            if let Some(fd) = self.fn_decl_rc(&scoped) {
+                                return self.exec_function_call(&fd, args);
+                            }
+                            if let Some(td) = self.module.tasks.get(&scoped).cloned() {
+                                self.exec_task_call(&td, args);
+                                return Value::zero(32);
+                            }
+                            match scope.rsplit_once('.') {
+                                Some((p, _)) => scope = p,
+                                None => break,
+                            }
+                        }
+                    }
+                }
                 // Collection builtin on the flattened receiver name.
                 if segs.len() >= 2 {
                     let mut recv_name = segs[..segs.len() - 1].join(".");
@@ -98278,6 +98391,24 @@ impl Simulator {
                     self.timescale_scope_override = saved_ts;
                     *self.name_resolve_hint.borrow_mut() = saved;
                     return Value::zero(32);
+                }
+                // A METHOD on an object reached by a hierarchical path
+                // (`u_w.p.peek()`, the UVM-MS proxy pattern of issue #155):
+                // the callee parses as one identifier path, no subroutine
+                // has that flat name, and the call used to fall through the
+                // remaining fallbacks to a silent 0. Evaluate the prefix path
+                // as a variable; a live class handle takes the call.
+                {
+                    let mut recv = hier.clone();
+                    recv.path.pop();
+                    recv.cached_signal_id = std::cell::Cell::new(None);
+                    recv.cached_resolved_name = std::cell::OnceCell::new();
+                    let recv_expr = Expression::new(ExprKind::Ident(recv), func.span);
+                    let h = self.eval_expr(&recv_expr).to_u64().unwrap_or(0) as usize;
+                    if h != 0 && self.heap.get(h).and_then(|o| o.as_ref()).is_some() {
+                        let mname = hier.path.last().unwrap().name.name.clone();
+                        return self.exec_method_call(h, &mname, args);
+                    }
                 }
             }
             // Handle static/constructor call: class_name::f() or new()
@@ -112100,6 +112231,32 @@ impl Simulator {
                         .and_then(|o| o.as_ref())
                         .map(|i| i.creation_scope.clone())
                         .unwrap_or_default();
+                    // `creation_scope` is kept in `%m` form (`tb.u_w`, top
+                    // module first) for the method's own `%m`; the
+                    // resolution hint must be instance-relative (`u_w`,
+                    // the key form of every signal). Installing the `%m`
+                    // form made every hinted lookup miss, so a method of an
+                    // object built inside `u_w` could not read `u_w`'s own
+                    // variables or reach its sibling instances (issue #155).
+                    let mut birth = self.instance_relative_scope(&birth);
+                    if birth.is_empty() {
+                        // No usable birth scope (the object was built at the
+                        // top or in a package): a class declared INSIDE a
+                        // module resolves bare and sibling names in that
+                        // module; when the module has exactly one instance
+                        // its path is the scope.
+                        if let Some(enc) = self.class_enclosing_module(handle) {
+                            let mut paths = self
+                                .module
+                                .instances
+                                .iter()
+                                .filter(|i| i.def_name == enc)
+                                .map(|i| i.path.as_str());
+                            if let (Some(only), None) = (paths.next(), paths.next()) {
+                                birth = only.to_string();
+                            }
+                        }
+                    }
                     if birth.is_empty() {
                         None
                     } else {

@@ -112,6 +112,18 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased
 
+* **Class methods reach sibling module instances by hierarchical reference**
+  (issue #155, the UVM-MS proxy pattern): a class declared inside a module
+  can read `core.seq` and call `core.get_seq()` on a sibling instance from
+  its methods, and `u_w.p.peek()` calls a method on an object reached by a
+  hierarchical path. Reads used to return 0 and calls were dropped without a
+  message: the object's creation scope was installed as the resolution
+  hint in its `%m` form, the resolver applied that hint only to
+  single-segment names, a hierarchical-path method call matched no
+  subroutine and fell through, and a module-scope class recorded no
+  declaring module for objects built elsewhere.
+### Unreleased
+
 * **`bind` with a parameter value assignment is applied**: `bind dut
   dut_harness #(.NUM_ROWS(NUM_ROWS), .NUM_COLS(NUM_COLS)) v_tl_harness
   (.*);` was dropped by the parser as an unrecognised directive, so the
