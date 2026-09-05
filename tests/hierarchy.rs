@@ -153,3 +153,9 @@ mod unit_scope_library_subroutine;
 mod bind_grid_module_name_refs;
 #[path = "hierarchy/instance_loop_local_shadows_module_var.rs"]
 mod instance_loop_local_shadows_module_var;
+#[path = "hierarchy/multi_top_typedef_packed_dims.rs"]
+mod multi_top_typedef_packed_dims;
+#[path = "hierarchy/bind_with_parameters.rs"]
+mod bind_with_parameters;
+#[path = "hierarchy/ref_formal_same_name.rs"]
+mod ref_formal_same_name;
