@@ -5163,6 +5163,9 @@ pub struct Simulator {
     /// never admitting. Demotion returns such a block to exactly its
     /// pre-admission engine; clean runners keep the fast path.
     ts_exec_aborted: bool,
+    /// Set by a two-state executor that read an x/z bit; the guard reports
+    /// it as an x-read bail (no demotion), not as an abort.
+    ts_xread_bail: bool,
     /// Per-slot mid-exec abort counts; at `TS_ABORT_DEMOTE` the slot flips
     /// to No / Interp for the rest of the run. (Re-promotion after init
     /// settles is future work.)
@@ -8545,6 +8548,7 @@ impl Simulator {
             prof_ts_bail_xread: 0,
             prof_ts_bail_abort: 0,
             ts_exec_aborted: false,
+            ts_xread_bail: false,
             ts_edge_abortn: Vec::new(),
             ts_comb_abortn: Vec::new(),
             comb_plan_abortn: Vec::new(),
@@ -19813,35 +19817,17 @@ impl Simulator {
             self.prof_ts_bail_forced += 1;
             return false;
         }
-        for &sig in ts.reads_whole.iter() {
-            // Plane-direct xz word (fallback to raw_bits when the mirror is
-            // absent, i.e. non-JIT runs).
-            let x = match self.signal_inline_bits.get(sig as usize) {
-                Some(sl) => sl[1],
-                None => self.signal_table[sig as usize].raw_bits().1,
-            };
-            if x != 0 {
-                self.prof_ts_bail_xread += 1;
-                return false;
-            }
-        }
-        for &(sig, lo, w) in ts.reads_slice.iter() {
-            let (_, x) = Self::raw_bits_slice(&self.signal_table[sig as usize], lo, w);
-            if x != 0 {
-                self.prof_ts_bail_xread += 1;
-                return false;
-            }
-        }
-        if !ts.reads_wide.is_empty() {
-            let mut scratch = [0u64; 2];
-            for &sig in ts.reads_wide.iter() {
-                if !self.signal_table[sig as usize].words128_if_clean(&mut scratch) {
-                    self.prof_ts_bail_xread += 1;
-                    return false;
-                }
-            }
-        }
+        // The x/z check rides on the executor's own loads (every signal
+        // read tests the xz plane it fetches alongside the value) instead
+        // of a separate pass over the block's read lists: that pre-scan
+        // was 11 % of a c906 run while 97 % of evaluations passed it. A
+        // store made before an x read used only clean inputs, so the
+        // four-state re-run writes the same value back.
         if !self.exec_two_state(ts) {
+            if std::mem::take(&mut self.ts_xread_bail) {
+                self.prof_ts_bail_xread += 1;
+                return false;
+            }
             self.prof_ts_bail_abort += 1;
             self.ts_exec_aborted = true;
             return false;
@@ -19929,6 +19915,12 @@ impl Simulator {
                 return false;
             }};
         }
+        macro_rules! xbail {
+            () => {{
+                self.ts_xread_bail = true;
+                bail!();
+            }};
+        }
         while pc < insns_len {
             match unsafe { &*insns_ptr.add(pc) } {
                 TsInsn::LoadSig { d, sig } => {
@@ -19936,35 +19928,50 @@ impl Simulator {
                     // branch (raw_bits showed at 5% of settle post-PGO).
                     // The mirror is authoritative in JIT runs and absent in
                     // non-JIT runs (fall back).
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v;
                 }
                 TsInsn::Const { d, v } => regs[*d as usize] = *v,
                 TsInsn::SigBit { d, sig, bit } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = (v >> lo) & mask;
                 }
                 TsInsn::SigBitW { d, sig, bit } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *bit, 1);
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v;
                 }
                 TsInsn::SigRangeW { d, sig, lo, w, mask } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *lo, *w);
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v & mask;
                 }
                 TsInsn::Bit { d, s, bit } => {
@@ -20128,14 +20135,20 @@ impl Simulator {
                 }
                 TsInsn::BrSigFalse { sig, bit, t } => {
                     let cond = if *bit == u32::MAX {
-                        let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                        let (v, x) = self.signal_table[*sig as usize].raw_bits();
+                        if x != 0 {
+                            xbail!();
+                        }
                         v != 0
                     } else {
-                        let (v, _) = Self::raw_bits_slice(
+                        let (v, x) = Self::raw_bits_slice(
                             &self.signal_table[*sig as usize],
                             *bit as u16,
                             1,
                         );
+                        if x != 0 {
+                            xbail!();
+                        }
                         v != 0
                     };
                     if !cond {
@@ -20296,7 +20309,7 @@ impl Simulator {
                     // Prefilter proved cleanliness; a failure here means the
                     // value changed representation mid-eval — bail safely.
                     if !self.signal_table[*sig as usize].words128_if_clean(&mut w2) {
-                        bail!();
+                        xbail!();
                     }
                     wregs[*d as usize] = w2;
                 }
@@ -20403,6 +20416,13 @@ impl Simulator {
         if regs.len() < ts.num_regs as usize {
             regs.resize(ts.num_regs as usize, 0);
         }
+        macro_rules! xbail {
+            () => {{
+                self.ts_xread_bail = true;
+                self.ts_regs = regs;
+                return false;
+            }};
+        }
         for insn in &ts.insns {
             match insn {
                 TsInsn::LoadSig { d, sig } => {
@@ -20410,35 +20430,50 @@ impl Simulator {
                     // branch (raw_bits showed at 5% of settle post-PGO).
                     // The mirror is authoritative in JIT runs and absent in
                     // non-JIT runs (fall back).
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v;
                 }
                 TsInsn::Const { d, v } => regs[*d as usize] = *v,
                 TsInsn::SigBit { d, sig, bit } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = (v >> lo) & mask;
                 }
                 TsInsn::SigBitW { d, sig, bit } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *bit, 1);
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v;
                 }
                 TsInsn::SigRangeW { d, sig, lo, w, mask } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *lo, *w);
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v & mask;
                 }
                 TsInsn::Bit { d, s, bit } => {
@@ -20840,6 +20875,13 @@ impl Simulator {
         if regs.len() < ts.num_regs as usize {
             regs.resize(ts.num_regs as usize, 0);
         }
+        macro_rules! xbail {
+            () => {{
+                self.ts_xread_bail = true;
+                self.ts_regs = regs;
+                return false;
+            }};
+        }
         // Raw-ptr walk mirrors exec_insns: the indexed form's bounds check
         // per instruction cost ~14% on a comb-dense fabric. Targets were
         // range-checked against the lowered stream at fixup time.
@@ -20853,35 +20895,50 @@ impl Simulator {
                     // branch (raw_bits showed at 5% of settle post-PGO).
                     // The mirror is authoritative in JIT runs and absent in
                     // non-JIT runs (fall back).
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v;
                 }
                 TsInsn::Const { d, v } => regs[*d as usize] = *v,
                 TsInsn::SigBit { d, sig, bit } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = (v >> lo) & mask;
                 }
                 TsInsn::SigBitW { d, sig, bit } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *bit, 1);
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v;
                 }
                 TsInsn::SigRangeW { d, sig, lo, w, mask } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *lo, *w);
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v & mask;
                 }
                 TsInsn::Bit { d, s, bit } => {
@@ -21026,14 +21083,20 @@ impl Simulator {
                 TsInsn::BrSigFalse { sig, bit, t } => {
                     let cond = if *bit == u32::MAX {
                         // Whole-value form was lowered only for <=64-bit sigs.
-                        let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                        let (v, x) = self.signal_table[*sig as usize].raw_bits();
+                        if x != 0 {
+                            xbail!();
+                        }
                         v != 0
                     } else {
-                        let (v, _) = Self::raw_bits_slice(
+                        let (v, x) = Self::raw_bits_slice(
                             &self.signal_table[*sig as usize],
                             *bit as u16,
                             1,
                         );
+                        if x != 0 {
+                            xbail!();
+                        }
                         v != 0
                     };
                     if !cond {
