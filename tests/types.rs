@@ -27,6 +27,8 @@ mod ansi_port_name_with_unpacked_dim;
 mod array_element_declared_signedness;
 #[path = "types/array_parameter.rs"]
 mod array_parameter;
+#[path = "types/nested_packed_member_lvalue.rs"]
+mod nested_packed_member_lvalue;
 #[path = "types/array_query_multidim_packed.rs"]
 mod array_query_multidim_packed;
 #[path = "types/assoc_of_queue_enumeration.rs"]
