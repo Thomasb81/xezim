@@ -112,6 +112,12 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased
 
+* **Two-state blocks check for x/z as they load**: before every
+  evaluation of a two-state block the simulator scanned the block's read
+  list for x/z bits, then loaded the same signals again to execute. The
+  check now rides on the loads themselves and a block that meets an x/z
+  bit falls back to the four-state path as before. The C906 CoreMark run retires a further 3.6 % fewer
+  instructions with identical results.
 * **Wide values are handled a word at a time**: copying a value wider
   than 64 bits into a signal, testing it for x/z, and resizing it walked
   the bits one at a time; a concatenation wider than 64 bits built a
