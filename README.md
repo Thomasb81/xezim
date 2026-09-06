@@ -112,6 +112,15 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased
 
+* **Wide values are handled a word at a time**: copying a value wider
+  than 64 bits into a signal, testing it for x/z, and resizing it walked
+  the bits one at a time; a concatenation wider than 64 bits built a
+  freshly allocated value for every evaluation, 3.5 million times per
+  CoreMark iteration on the C906 core. Copies, x/z tests and resizes now
+  work on 64-bit words, and a concatenation of up to 128 bits is
+  accumulated in two words and written into its register in place.
+  The C906 CoreMark run retires 11 % fewer instructions with identical
+  results; UVM benches are unchanged.
 * **Arithmetic no longer evaluates its operands twice**: to size a `+`, `&`
   or any other arithmetic/bitwise operator the interpreter asked each
   operand for its width, and for a property read, an element select or a
