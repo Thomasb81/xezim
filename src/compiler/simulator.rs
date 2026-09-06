@@ -60341,6 +60341,30 @@ impl Simulator {
                 // spread, not collapsed into one packed value. This is also
                 // what makes a DECLARATION initializer work — elaboration
                 // lowers `T v[int] = '{...}` to `v = '{...}` in an initial block.
+                // §10.9.2: a whole-ARRAY pattern on a CLASS PROPERTY whose
+                // elements are unpacked structs — expand per element so each
+                // lands in the cells the READ path uses, by the same store rule
+                // as the whole-element write above. Must precede the spread
+                // below: `assign_class_fixed_array_pattern` writes the
+                // instance-scoped SIGNAL names (`<h>#arr[i].<m>`) that nothing
+                // reads back, which is what left every element 0.
+                if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+                    if let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) {
+                        let probe0 = Self::index_expr(lvalue, 0);
+                        if self.class_unpacked_elem_is_heap_owned(&probe0) {
+                            let ord: Vec<Expression> =
+                                self.pattern_ordered(items).into_iter().cloned().collect();
+                            if !ord.is_empty() {
+                                for (i, item) in ord.iter().enumerate() {
+                                    let elem = Self::index_expr(lvalue, i as i64);
+                                    self.assign_class_unpacked_elem(&elem, item, &su);
+                                }
+                                self.settle_after_proc_write();
+                                return;
+                            }
+                        }
+                    }
+                }
                 if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
                     let spread = self.assign_class_fixed_array_pattern(lvalue, items)
                         || self.assign_class_collection_pattern(lvalue, items)
@@ -60685,6 +60709,27 @@ impl Simulator {
                 // generic arm below can't resolve the container (`p_elem_type`
                 // only knows module-scope names), so the copy fell to a packed
                 // store and every member of the element stayed blank.
+                // §7.2/§18.4: ...unless the READ path owns this element's
+                // leaves. A CLASS PROPERTY that is a fixed array of unpacked
+                // structs is resolved on the read side by `class_unpacked_leaf`
+                // into the instance property map (`arr[i].<m>`) — which is also
+                // where a per-leaf write (`arr[i].m = v`) and a scalar-struct
+                // property write land. Only the whole-element path below routed
+                // to the instance-scoped SIGNAL name `<h>#arr[i].<m>`, so the
+                // value was written and then unreachable and every such element
+                // read back 0. Ask the read resolver where the leaves live and
+                // decompose into the same cells. A genuine queue/dynamic/assoc
+                // element is NOT claimed by it and keeps the signal-name copy
+                // below (UVM uvm_hdl_path_concat::add_slice).
+                if self.queue_pop_call(rvalue).is_none()
+                    && self.class_unpacked_elem_is_heap_owned(lvalue)
+                {
+                    if let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) {
+                        self.assign_class_unpacked_elem(lvalue, rvalue, &su);
+                        self.settle_after_proc_write();
+                        return;
+                    }
+                }
                 if self.queue_pop_call(rvalue).is_none() {
                     if let Some(dst) = self.flat_member_name(lvalue) {
                         // Only a BARE element lvalue (`slices[i] = ...`) — a
@@ -87281,6 +87326,103 @@ impl Simulator {
         params
     }
 
+    /// `(handle, prop, elem_struct)` when `lvalue` — with any trailing element
+    /// select stripped — names a CLASS PROPERTY whose element type is an
+    /// unpacked struct. Drives a member-wise decomposition of a whole-element
+    /// write into the same cells `class_unpacked_leaf` reads back.
+    fn class_unpacked_array_prop_of(
+        &mut self,
+        lvalue: &Expression,
+    ) -> Option<(usize, String, crate::ast::types::StructUnionType)> {
+        if self.no_class_objects() {
+            return None;
+        }
+        let recv = match self.class_prop_receiver(lvalue) {
+            Some(r) => Some(r),
+            None => match &lvalue.kind {
+                ExprKind::Index { expr, .. } => self.class_prop_receiver(expr),
+                ExprKind::Ident(h) if h.path.len() == 1 && !h.path[0].selects.is_empty() => {
+                    let bare = crate::ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: vec![crate::ast::expr::HierPathSegment {
+                            name: h.path[0].name.clone(),
+                            selects: Vec::new(),
+                        }],
+                        span: h.span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    };
+                    let e = Expression::new(ExprKind::Ident(bare), lvalue.span);
+                    self.class_prop_receiver(&e)
+                }
+                _ => None,
+            },
+        };
+        let (handle, prop) = recv?;
+        let su = self.class_prop_struct(handle, &prop)?;
+        Self::spreads_member_wise(&su).then_some((handle, prop, su))
+    }
+
+    /// True when the READ path (`class_unpacked_leaf`) owns this element's
+    /// leaves — i.e. they live in the instance property map as
+    /// `<prop>[i].<member>`, not under an instance-scoped SIGNAL name. Used to
+    /// keep whole-element / whole-array writes in the same store the reads use.
+    fn class_unpacked_elem_is_heap_owned(&mut self, lvalue: &Expression) -> bool {
+        let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) else {
+            return false;
+        };
+        let Some(m0) = su
+            .members
+            .first()
+            .and_then(|m| m.declarators.first())
+            .map(|d| d.name.name.clone())
+        else {
+            return false;
+        };
+        let probe = Self::append_member_expr(lvalue, &m0);
+        self.class_unpacked_leaf(&probe).is_some()
+    }
+
+    /// Write one unpacked-struct value into a class-property element's leaf
+    /// cells, member by member, so each lands via the (working) per-leaf path.
+    fn assign_class_unpacked_elem(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+        su: &crate::ast::types::StructUnionType,
+    ) {
+        let items: Option<Vec<&Expression>> = match &rvalue.kind {
+            ExprKind::AssignmentPattern(its) => {
+                let ord = self.pattern_ordered(its);
+                (!ord.is_empty()).then_some(ord)
+            }
+            _ => None,
+        };
+        let mut k = 0usize;
+        for m in &su.members {
+            for md in &m.declarators {
+                let mn = md.name.name.as_str();
+                let lhs_f = Self::append_member_expr(lvalue, mn);
+                let v = match &items {
+                    // Ordered pattern: item k belongs to the k-th declared member.
+                    Some(its) => match its.get(k) {
+                        Some(e) => {
+                            let e = (*e).clone();
+                            self.eval_expr(&e)
+                        }
+                        None => continue,
+                    },
+                    None => {
+                        let rhs_f = Self::append_member_expr(rvalue, mn);
+                        self.eval_expr(&rhs_f)
+                    }
+                };
+                self.assign_value(&lhs_f, &v);
+                k += 1;
+            }
+        }
+    }
+
     /// `class_agg_member` for an already-split `<base>.<field>`.
     fn class_agg_member_parts(&mut self, base: &Expression, field: &str) -> Option<ClassAggRef> {
         if self.no_class_objects() {
@@ -99955,6 +100097,26 @@ impl Simulator {
 
     /// Build a member-access lvalue for the write-back of a struct formal.
     /// See `bind_unpacked_struct_arg` for why the `Ident` form is preferred.
+    /// `<base>[i]` as an expression, for driving per-element decomposition.
+    fn index_expr(base: &Expression, i: i64) -> Expression {
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(base.clone()),
+                index: Box::new(Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: None,
+                        signed: true,
+                        base: NumberBase::Decimal,
+                        value: i.to_string(),
+                        cached_val: std::cell::Cell::new(None),
+                    }),
+                    base.span,
+                )),
+            },
+            base.span,
+        )
+    }
+
     fn struct_member_lvalue(base: &Expression, member: &str) -> Expression {
         if let ExprKind::Ident(hier) = &base.kind {
             let mut path = hier.path.clone();
@@ -104802,6 +104964,49 @@ impl Simulator {
                     let scoped = format!("{}#{}", handle, pname);
                     if let ExprKind::AssignmentPattern(items) = &init.kind {
                         let indices: Vec<i64> = (lo..=hi).collect();
+                        // §7.2/§18.4: an UNPACKED-STRUCT element has no single
+                        // cell — its members live as `<prop>[i].<m>` in the
+                        // instance property map, which is where the read path
+                        // (`class_unpacked_leaf`) looks. Storing the element as
+                        // one packed value under the signal name `<h>#<prop>[i]`
+                        // wrote something nothing reads, so every element of a
+                        // `localparam`/`const` array of unpacked structs came
+                        // back 0 — the shape a directed-stimulus table uses.
+                        // Decompose into the same cells the runtime element
+                        // write now uses.
+                        if let Some(su) = self.class_prop_struct(handle, &pname) {
+                            if Self::spreads_member_wise(&su) {
+                                let base = Expression::new(
+                                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![crate::ast::expr::HierPathSegment {
+                                            name: crate::ast::Identifier {
+                                                name: pname.clone(),
+                                                span: crate::ast::Span::dummy(),
+                                            },
+                                            selects: Vec::new(),
+                                        }],
+                                        span: crate::ast::Span::dummy(),
+                                        cached_signal_id: std::cell::Cell::new(None),
+                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                    }),
+                                    crate::ast::Span::dummy(),
+                                );
+                                let elems = self.pattern_elems(items, &indices);
+                                let owned: Vec<(usize, Option<Expression>)> = elems
+                                    .into_iter()
+                                    .map(|e| e.cloned())
+                                    .enumerate()
+                                    .collect();
+                                for (k, e) in owned {
+                                    if let Some(e) = e {
+                                        let elem = Self::index_expr(&base, indices[k]);
+                                        self.assign_class_unpacked_elem(&elem, &e, &su);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                         let elems = self.pattern_elems(items, &indices);
                         for (k, e) in elems.into_iter().enumerate() {
                             if let Some(e) = e {
