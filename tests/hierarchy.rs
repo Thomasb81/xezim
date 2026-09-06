@@ -161,3 +161,5 @@ mod bind_with_parameters;
 mod ref_formal_same_name;
 #[path = "hierarchy/instance_block_locals_shadow_module_names.rs"]
 mod instance_block_locals_shadow_module_names;
+#[path = "hierarchy/vif_packed_array_elem_nba.rs"]
+mod vif_packed_array_elem_nba;
