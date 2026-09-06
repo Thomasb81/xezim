@@ -2396,10 +2396,66 @@ impl TimingWheel {
     }
 }
 
+/// Bumped by every mutation of the STRING-KEYED stores a parked `wait(cond)`
+/// can depend on: class properties (`PropMap`), the runtime signal map
+/// (`SignalMap`), and every procedural / name-based NBA assignment. The
+/// id-based RTL signal table is deliberately NOT counted: a clock toggle must
+/// not re-arm the UVM housekeeping waits (see `drain_condition_waiters`).
+static STORE_WRITE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn bump_store_gen() {
+    STORE_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn store_gen() -> u64 {
+    STORE_WRITE_GEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A class object's property map. Reads deref to the plain map; every
+/// mutating entry point bumps `STORE_WRITE_GEN`, so no write site can be
+/// missed by the condition-waiter gate.
+#[derive(Debug, Clone, Default)]
+struct PropMap(HashMap<String, Value>);
+
+impl PropMap {
+    #[inline]
+    fn insert(&mut self, k: String, v: Value) -> Option<Value> {
+        bump_store_gen();
+        self.0.insert(k, v)
+    }
+    #[inline]
+    fn get_mut(&mut self, k: &str) -> Option<&mut Value> {
+        bump_store_gen();
+        self.0.get_mut(k)
+    }
+    #[inline]
+    fn remove(&mut self, k: &str) -> Option<Value> {
+        bump_store_gen();
+        self.0.remove(k)
+    }
+}
+
+impl std::ops::Deref for PropMap {
+    type Target = HashMap<String, Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a PropMap {
+    type Item = (&'a String, &'a Value);
+    type IntoIter = <&'a HashMap<String, Value> as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ClassInstance {
     class_name: String,
-    properties: HashMap<String, Value>,
+    properties: PropMap,
     /// Maps a class TYPE-parameter name (e.g. `T` in
     /// `class Mk #(type T=Base)`) to the concrete class name it was
     /// specialized with (e.g. `Base`). Populated by
@@ -3236,6 +3292,7 @@ impl SignalMap {
     }
 
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
+        bump_store_gen();
         if let Some(b) = Self::base_of(&k) {
             if !self.map.contains_key(&k) {
                 self.elems
@@ -3248,6 +3305,7 @@ impl SignalMap {
     }
 
     pub fn remove(&mut self, k: &str) -> Option<Value> {
+        bump_store_gen();
         let r = self.map.remove(k);
         if r.is_some() {
             if let Some(b) = Self::base_of(k) {
@@ -3327,6 +3385,7 @@ impl std::ops::Deref for SignalMap {
 
 impl std::ops::DerefMut for SignalMap {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        bump_store_gen();
         &mut self.map
     }
 }
@@ -4697,6 +4756,13 @@ pub struct Simulator {
     cond_waiter_reads: HashMap<usize, HashSet<String>>,
     /// Wait condition expression for each parked waiter.
     cond_waiter_conditions: HashMap<usize, Expression>,
+    /// Per parked condition waiter: `Some(gen)` when every name its
+    /// condition reads is a property or static of its own object (or a
+    /// collection builtin), with the store generation at park time. Such a
+    /// waiter is skipped by the bulk re-schedule while the generation is
+    /// unchanged — nothing it can observe has been written. `None` keeps the
+    /// unconditional re-schedule (RTL signals, locals, calls, no `this`).
+    cond_waiter_gate: HashMap<usize, Option<u64>>,
     /// IEEE 1800-2017 §4.4.2.3 Inactive region: continuations of `#0`
     /// delays park here instead of in the event_queue. The event_queue's
     /// batch drain in `run_one_tick` re-fetches same-time entries into the
@@ -8365,6 +8431,7 @@ impl Simulator {
             ready_condition_waiters: Vec::new(),
             cond_waiter_reads: HashMap::default(),
             cond_waiter_conditions: HashMap::default(),
+            cond_waiter_gate: HashMap::default(),
             inactive_queue: Vec::new(),
             nba_region_waiters: Vec::new(),
             cond_progress: 0,
@@ -12909,7 +12976,7 @@ impl Simulator {
                 let ch = self.heap.len();
                 self.heap.push(Some(ClassInstance {
                     class_name: kind.to_string(),
-                    properties: HashMap::default(),
+                    properties: PropMap::default(),
                     type_bindings: HashMap::default(),
                 spec: None,
                 creation_scope: self.active_instance_scope(),
@@ -33719,10 +33786,45 @@ impl Simulator {
     fn park_condition_waiter(&mut self, pid: usize, cont: ProcCont, cond: &Expression) {
         let mut reads = HashSet::default();
         Self::collect_condition_read_names(cond, &mut reads);
+        let gate = self.cond_gate_for(&reads);
+        self.cond_waiter_gate.insert(pid, gate);
         self.cond_waiter_reads.insert(pid, reads);
         self.cond_read_union_dirty = true;
         self.cond_waiter_conditions.insert(pid, cond.clone());
         self.condition_waiters.push((pid, cont));
+    }
+
+    /// Can the bulk re-schedule skip this waiter while nothing in the
+    /// string-keyed stores changed? Only when every read name is a property
+    /// (or static) of the parking process's `this` object or a collection
+    /// builtin: those live in `PropMap` / `SignalMap`, whose every mutation
+    /// bumps `STORE_WRITE_GEN`. Anything else (an RTL signal, a local, a
+    /// free function) keeps the unconditional re-schedule.
+    fn cond_gate_for(&self, reads: &HashSet<String>) -> Option<u64> {
+        let Some(handle) = self.this_stack.last().copied().flatten().filter(|&h| h != 0) else {
+            return None;
+        };
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
+        let cn = inst.class_name.clone();
+        for n in reads {
+            if matches!(
+                n.as_str(),
+                "this" | "super" | "size" | "num" | "exists" | "first" | "last" | "next" | "prev"
+            ) {
+                continue;
+            }
+            if inst.properties.contains_key(n) {
+                continue;
+            }
+            if self.class_prop_type_name(handle, n).is_some() {
+                continue;
+            }
+            if self.static_prop_key(&cn, n).is_some() {
+                continue;
+            }
+            return None;
+        }
+        Some(store_gen())
     }
 
     fn eval_waiter_condition(&mut self, waiter_pid: usize, cond: &Expression) -> bool {
@@ -33806,6 +33908,7 @@ impl Simulator {
             let is_true = self.eval_waiter_condition(pid, &cond);
             if is_true {
                 let (wpid, wcont) = self.condition_waiters.remove(i);
+                self.cond_waiter_gate.remove(&wpid);
                 self.cond_waiter_reads.remove(&wpid);
                 self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&wpid);
@@ -34801,18 +34904,38 @@ impl Simulator {
             let prog_before = self.cond_progress;
             let ready = std::mem::take(&mut self.ready_condition_waiters);
             for (cpid, cont) in ready {
+                self.cond_waiter_gate.remove(&cpid);
                 self.cond_waiter_reads.remove(&cpid);
                 self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&cpid);
                 self.event_queue.schedule(self.time, cpid, cont);
             }
+            // Parked waiters used to be resumed wholesale on every drain:
+            // eight UVM housekeeping waits (`wait(m_premature_end)`, the
+            // phase hopper's `.size() != 0`, `wait(0)`) each restored a
+            // process, re-evaluated, merged fork frames and parked again —
+            // ~40 µs per tick, most of a 5 GHz-clock UVM run. A waiter
+            // whose condition reads only its own object's properties is
+            // skipped while the store generation is unchanged.
             let parked = std::mem::take(&mut self.condition_waiters);
+            let now_gen = store_gen();
+            let mut still_parked: Vec<(usize, ProcCont)> = Vec::new();
             for (cpid, cont) in parked {
+                if let Some(Some(g)) = self.cond_waiter_gate.get(&cpid) {
+                    if *g == now_gen {
+                        still_parked.push((cpid, cont));
+                        continue;
+                    }
+                }
+                self.cond_waiter_gate.remove(&cpid);
                 self.cond_waiter_reads.remove(&cpid);
                 self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&cpid);
                 self.event_queue.schedule(self.time, cpid, cont);
             }
+            let newly = std::mem::take(&mut self.condition_waiters);
+            self.condition_waiters = still_parked;
+            self.condition_waiters.extend(newly);
             while self.event_queue.next_time() == Some(self.time)
                 && !self.finished
                 && !self.zero_delay_defer_pending
@@ -60367,7 +60490,7 @@ impl Simulator {
                             let handle = self.heap.len();
                             self.heap.push(Some(ClassInstance {
                                 class_name: kind.to_string(),
-                                properties: HashMap::default(),
+                                properties: PropMap::default(),
                                 type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
@@ -61901,7 +62024,7 @@ impl Simulator {
                                 let handle = self.heap.len();
                                 self.heap.push(Some(ClassInstance {
                                     class_name: kind.to_string(),
-                                    properties: HashMap::default(),
+                                    properties: PropMap::default(),
                                     type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
@@ -61970,7 +62093,7 @@ impl Simulator {
                                     let handle = self.heap.len();
                                     self.heap.push(Some(ClassInstance {
                                         class_name: tname.clone(),
-                                        properties: HashMap::default(),
+                                        properties: PropMap::default(),
                                         type_bindings: HashMap::default(),
                                     spec: None,
                                     creation_scope: self.active_instance_scope(),
@@ -61985,7 +62108,7 @@ impl Simulator {
                                     let handle = self.heap.len();
                                     self.heap.push(Some(ClassInstance {
                                         class_name: tname.clone(),
-                                        properties: HashMap::default(),
+                                        properties: PropMap::default(),
                                         type_bindings: HashMap::default(),
                                     spec: None,
                                     creation_scope: self.active_instance_scope(),
@@ -62055,7 +62178,7 @@ impl Simulator {
                                         let h = self.heap.len();
                                         self.heap.push(Some(ClassInstance {
                                             class_name: tname.clone(),
-                                            properties: HashMap::default(),
+                                            properties: PropMap::default(),
                                             type_bindings: HashMap::default(),
                                         spec: None,
                                         creation_scope: self.active_instance_scope(),
@@ -62082,7 +62205,7 @@ impl Simulator {
                                     let h = self.heap.len();
                                     self.heap.push(Some(ClassInstance {
                                         class_name: String::new(),
-                                        properties: HashMap::default(),
+                                        properties: PropMap::default(),
                                         type_bindings: HashMap::default(),
                                     spec: None,
                                     creation_scope: self.active_instance_scope(),
@@ -91427,7 +91550,7 @@ impl Simulator {
                 let ch = self.heap.len();
                 self.heap.push(Some(ClassInstance {
                     class_name: kind.to_string(),
-                    properties: HashMap::default(),
+                    properties: PropMap::default(),
                     type_bindings: HashMap::default(),
                     spec: None,
                     creation_scope: self.active_instance_scope(),
@@ -103589,7 +103712,7 @@ impl Simulator {
         let handle = self.heap.len();
         let mut instance = ClassInstance {
             class_name: class_def.name.clone(),
-            properties: HashMap::default(),
+            properties: PropMap::default(),
             type_bindings: HashMap::default(),
             spec: None,
             creation_scope: self.active_instance_scope(),
@@ -104138,7 +104261,7 @@ impl Simulator {
                     let ch = self.heap.len();
                     self.heap.push(Some(ClassInstance {
                         class_name: kind.to_string(),
-                        properties: HashMap::default(),
+                        properties: PropMap::default(),
                         type_bindings: HashMap::default(),
                     spec: None,
                     creation_scope: self.active_instance_scope(),

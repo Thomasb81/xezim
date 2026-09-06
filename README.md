@@ -112,6 +112,14 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased
 
+* **Parked `wait(cond)` processes are no longer resumed on every tick**: a
+  waiter whose condition reads only its own object's properties or statics
+  (UVM's phase, objection and sequencer waits) stays parked while nothing in
+  the class-property or string-keyed stores has been written, tracked by a
+  store-write generation that every such mutation bumps. Waiters that read
+  RTL signals, locals or free functions keep the unconditional re-check. A
+  UVM bench on a 5 GHz clock retires 11 % fewer instructions; the axi4 AVIP
+  is unchanged; simulation output is identical.
 * **Class methods reach sibling module instances by hierarchical reference**
   (issue #155, the UVM-MS proxy pattern): a class declared inside a module
   can read `core.seq` and call `core.get_seq()` on a sibling instance from
