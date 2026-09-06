@@ -48518,6 +48518,33 @@ impl Simulator {
         None
     }
 
+    /// The registered packed-struct base of a dotted member lvalue, as
+    /// `(base_name, bit_offset, width)` of the selected member within it.
+    ///
+    /// `packed_struct_fields[base]` is FLATTENED — a nested member is a key in
+    /// its own right (`"hdr.d.x"`), and no entry exists for an intermediate
+    /// member on its own (`packed_struct_fields["f.hdr"]` is None). So the
+    /// single split at the last dot only ever resolved a DEPTH-1 member, and
+    /// `f.hdr.d = v` inside a subroutine — where the lvalue parses as
+    /// MemberAccess rather than a dotted Ident — matched nothing and was
+    /// silently dropped. Walk the split points LONGEST BASE FIRST, exactly as
+    /// `resolve_packed_struct_target` does for assignment patterns (which is
+    /// why the same write with a `'{...}` RHS always worked): the base may
+    /// itself be instance-scoped (`u.r2`), so the first-dot split is wrong too.
+    fn packed_struct_member_slice(&mut self, lvalue: &Expression) -> Option<(String, u32, u32)> {
+        let flat = self.flat_member_name(lvalue)?;
+        for (i, _) in flat.match_indices('.').collect::<Vec<_>>().into_iter().rev() {
+            let (base, prefix) = (&flat[..i], &flat[i + 1..]);
+            let Some(layout) = self.module.packed_struct_fields.get(base) else {
+                continue;
+            };
+            if let Some((_, o, w)) = layout.iter().find(|(k, _, _)| k == prefix) {
+                return Some((base.to_string(), *o, *w));
+            }
+        }
+        None
+    }
+
     /// Resolve a packed-struct lvalue to `(base_signal, field_prefix, layout,
     /// base_offset, width)` for assignment-pattern packing. `layout` is the
     /// base signal's flattened `(dotted_field, offset, width)` list; `prefix`
@@ -52354,27 +52381,21 @@ impl Simulator {
                 }
                 // A nested PACKED struct member inside an unpacked aggregate
                 // (`arr[i].tag.vlan`): slice the parent's own signal.
-                if let Some(pflat) = self.flat_member_name(expr) {
-                    if let Some(fields) = self.module.packed_struct_fields.get(&pflat).cloned() {
-                        if let Some((_, off, w)) =
-                            fields.iter().find(|(m, _, _)| *m == member.name).cloned()
-                        {
-                            // The container may be a procedural LOCAL: a packed
-                            // struct declared inside a task lives in the call
-                            // frame, not the signal table, so a member write
-                            // reached nothing and the struct read back as X.
-                            if let Some(cur_sig) = self.get_local_or_signal(&pflat) {
-                                let total_w = cur_sig.width;
-                                let mut cur = cur_sig.resize(total_w);
-                                let piece = val.resize(w);
-                                for i in 0..w {
-                                    cur.set_bit((off + i) as usize, piece.get_bit(i as usize));
-                                }
-                                let changed = cur != cur_sig;
-                                self.set_local_or_signal(&pflat, cur);
-                                return changed;
-                            }
+                if let Some((base, off, w)) = self.packed_struct_member_slice(lhs) {
+                    // The container may be a procedural LOCAL: a packed
+                    // struct declared inside a task lives in the call
+                    // frame, not the signal table, so a member write
+                    // reached nothing and the struct read back as X.
+                    if let Some(cur_sig) = self.get_local_or_signal(&base) {
+                        let total_w = cur_sig.width;
+                        let mut cur = cur_sig.resize(total_w);
+                        let piece = val.resize(w);
+                        for i in 0..w {
+                            cur.set_bit((off + i) as usize, piece.get_bit(i as usize));
                         }
+                        let changed = cur != cur_sig;
+                        self.set_local_or_signal(&base, cur);
+                        return changed;
                     }
                 }
                 // LRM §25.10 — `vif_arr[i].member = ...` (indexed
