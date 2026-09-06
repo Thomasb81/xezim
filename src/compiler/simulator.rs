@@ -24770,11 +24770,17 @@ impl Simulator {
                                 vm_store(&mut self.vm_regs[d], v, x, total, false)
                             }
                             None => {
-                                let result = Value::concat_refs(std::iter::repeat_n(
-                                    &self.vm_regs[s],
-                                    n,
-                                ));
-                                self.vm_regs[d] = result;
+                                let src = &self.vm_regs[s];
+                                if src.width == 1 && !src.is_fill && !src.is_real {
+                                    // `{N{bit}}` over a wide bus: a word fill
+                                    // written into the register in place.
+                                    let (v, x) = src.raw_bits();
+                                    let total = n as u32;
+                                    self.vm_regs[d].assign_replicated_bit(v, x, total);
+                                } else {
+                                    let result = src.replicate(n);
+                                    self.vm_regs[d] = result;
+                                }
                             }
                         }
                     }
@@ -42501,7 +42507,27 @@ impl Simulator {
         // §10.7: fit the queued value to the destination type (real / 2-state /
         // width / signedness). A bare `resize` here dropped real conversions
         // (integer bits reinterpreted as a double) and left X/Z in 2-state nets.
-        let mut val = self.fit_value_to_signal(id, &entry.value);
+        // A value already at the signal's width (the usual `q <= d`) is
+        // MOVED into place instead of cloned through the fitting path: for
+        // a wide value that clone was a fresh allocation per non-blocking
+        // assignment per edge. The move is exact — a resize to the same
+        // width copies the bits unchanged — and the shapes the fitting
+        // path converts (fills, reals, strings, two-state targets with x/z)
+        // are excluded.
+        let width = self.signal_widths[id];
+        let v = &entry.value;
+        let mut val = if width != 0
+            && v.width == width
+            && !v.is_fill
+            && !v.is_real
+            && !self.signal_real[id]
+            && !self.signal_is_string.get(id).copied().unwrap_or(false)
+            && !(self.signal_two_state.get(id).copied().unwrap_or(false) && v.has_xz())
+        {
+            entry.value
+        } else {
+            self.fit_value_to_signal(id, v)
+        };
         if val.is_signed != signed {
             val.is_signed = signed;
         }

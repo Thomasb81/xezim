@@ -119,8 +119,11 @@ and testbench flows. Portable code should not rely on them.
   CoreMark iteration on the C906 core. Copies, x/z tests and resizes now
   work on 64-bit words, and a concatenation of up to 128 bits is
   accumulated in two words and written into its register in place.
-  The C906 CoreMark run retires 11 % fewer instructions with identical
-  results; UVM benches are unchanged.
+  Replicating one bit across a bus (`{N{sel}}`, 1.5 billion copies per
+  iteration on the same core) is a word fill, and a non-blocking value
+  already at its signal's width is moved into place rather than copied.
+  The C906 CoreMark run retires 20 % fewer instructions with
+  identical results; UVM benches are unchanged.
 * **Arithmetic no longer evaluates its operands twice**: to size a `+`, `&`
   or any other arithmetic/bitwise operator the interpreter asked each
   operand for its width, and for a property read, an element select or a
