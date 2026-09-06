@@ -46309,7 +46309,9 @@ impl Simulator {
                 self.settle_triggered_list.push(eidx);
             }
         }
-        if self.time == 0 && !self.comb_time0_fired {
+        // See `settle_combinatorial_inner`: the one-shot must not retire on a
+        // static-init settle that runs before the comb graph is built.
+        if self.time == 0 && !self.comb_time0_fired && !self.comb_entries.is_empty() {
             for ti in 0..self.comb_time0_idx.len() {
                 let eidx = self.comb_time0_idx[ti];
                 if eidx < num_entries && !self.settle_triggered[eidx] {
@@ -47188,7 +47190,19 @@ impl Simulator {
         // at the same (or later) time rely on dirty propagation through the
         // worklist. The prior O(num_entries) scan per call was ~500μs on
         // c910 and dominated per-assign cost during memory-init loops.
-        if self.time == 0 && !self.comb_time0_fired {
+        //
+        // `num_entries > 0` keeps the one-shot from being CONSUMED before the
+        // comb graph exists. Class static initializers run during elaboration
+        // (the `registry spec static init` phase), long before
+        // `build combinational entries`; a blocking write in one of them
+        // reaches `settle_after_proc_write`, whose settle finds an empty
+        // entry list. Latching there seeded nothing yet retired the flag, so
+        // the real time-0 settle skipped `comb_time0_idx` entirely and every
+        // entry with an EMPTY READ SET — a constant-RHS continuous assign
+        // such as `assign a[i][v][j] = '0;` — never evaluated at all, leaving
+        // its net x for the whole run. UVM's parameterized-class registry
+        // makes that early static-init settle happen in any UVM testbench.
+        if self.time == 0 && !self.comb_time0_fired && num_entries > 0 {
             for &eidx in self.comb_time0_idx.iter() {
                 if eidx < num_entries && !triggered[eidx] {
                     triggered[eidx] = true;
