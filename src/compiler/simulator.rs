@@ -24722,6 +24722,23 @@ impl Simulator {
                             offset += val.width;
                         }
                         vm_store(&mut self.vm_regs[d], out_v, out_x, total, false);
+                    } else if total <= 128 {
+                        // Two 128-bit accumulators, written into the
+                        // destination register IN PLACE: the register keeps
+                        // its two-word allocation across evaluations instead
+                        // of a fresh three-allocation `Value` per concat.
+                        let (mut out_v, mut out_x, mut offset) = (0u128, 0u128, 0u32);
+                        for p in part_regs.iter().rev() {
+                            let val = &self.vm_regs[*p as usize];
+                            if val.width == 0 {
+                                continue;
+                            }
+                            let (v, x) = val.bits128();
+                            out_v |= v << offset;
+                            out_x |= x << offset;
+                            offset += val.width;
+                        }
+                        self.vm_regs[d].assign_wide128(out_v, out_x, total);
                     } else {
                         let result = Value::concat_refs(
                             part_regs.iter().map(|r| &self.vm_regs[*r as usize]),
