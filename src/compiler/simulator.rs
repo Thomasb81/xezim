@@ -42062,6 +42062,56 @@ impl Simulator {
         false
     }
 
+    /// LRM §25.8 — resolve `vif.member` (or `this.vif.member`) to the FLAT
+    /// name of the bound interface signal, `"<iface_instance>.<member>"`.
+    ///
+    /// `resolve_nba_target` asks the same question but only ever returns a
+    /// registered signal id, which is no use to a caller that needs the NAME
+    /// — to look up the member's packed dimensions, say. The binding lives
+    /// either in `local_iface_aliases` (a vif passed as a task formal) or in
+    /// `virtual_iface_bindings` keyed by the current `this`; both lookups are
+    /// the ones that arm already does.
+    fn vif_member_flat_name(&self, expr: &Expression) -> Option<String> {
+        let ExprKind::MemberAccess { expr: base, member } = &expr.kind else {
+            return None;
+        };
+        let prop = match &base.kind {
+            ExprKind::Ident(hier) if hier.path.len() == 1 => {
+                hier.path[0].name.name.as_str()
+            }
+            ExprKind::MemberAccess {
+                expr: inner,
+                member: vprop,
+            } if matches!(&inner.kind, ExprKind::This) => vprop.name.as_str(),
+            _ => return None,
+        };
+        if let Some(bound) = self
+            .local_iface_aliases
+            .last()
+            .and_then(|frame| frame.get(prop))
+        {
+            return Some(format!("{}.{}", bound, member.name));
+        }
+        let this_h = self.this_stack.last().copied().flatten()?;
+        let cls_name = self
+            .heap
+            .get(this_h)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.as_str())?;
+        if !self
+            .module
+            .classes
+            .get(cls_name)
+            .is_some_and(|cd| cd.virtual_iface_properties.contains_key(prop))
+        {
+            return None;
+        }
+        let (bound_name, _modport) = self
+            .virtual_iface_bindings
+            .get(&(this_h, prop.to_string()))?;
+        Some(format!("{}.{}", bound_name, member.name))
+    }
+
     fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -75857,8 +75907,20 @@ impl Simulator {
                     depth += 1;
                     cur = inner.as_ref();
                 }
-                if let ExprKind::Ident(h) = &cur.kind {
-                    let n = self.resolve_hier_name(h);
+                // §25.8: for `vif.member[i]` the root is a MemberAccess, not an
+                // Ident, so the whole block below was skipped and the lvalue
+                // fell through to width 1 — an NBA then resized its RHS to ONE
+                // BIT before queueing it, and `vif.data[p] <= flit` wrote the
+                // flit's LSB. Resolve the binding to the interface signal's
+                // flat name and ask the same width questions about it.
+                let root_name: Option<std::borrow::Cow<'_, str>> = match &cur.kind {
+                    ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                    ExprKind::MemberAccess { .. } => {
+                        self.vif_member_flat_name(cur).map(std::borrow::Cow::Owned)
+                    }
+                    _ => None,
+                };
+                if let Some(n) = root_name {
                     if depth == 1 {
                         if let Some((_, _, w)) = self.module.arrays.get(&*n) {
                             return *w;
