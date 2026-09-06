@@ -54430,10 +54430,31 @@ impl Simulator {
                         | BinaryOp::Gt
                         | BinaryOp::Geq
                 );
+                // Operands the width probe had to evaluate are kept and
+                // reused below instead of being evaluated again.
+                let mut pre_l: Option<Value> = None;
+                let mut pre_r: Option<Value> = None;
                 let self_det_w = if is_arith_or_bitwise {
-                    let lw = self.infer_width(left);
-                    let rw = self.infer_width(right);
-                    lw.max(rw).max(ctx_width)
+                    let (lw, lv) = self.width_probe(left);
+                    let (rw, rv) = self.width_probe(right);
+                    pre_l = lv;
+                    pre_r = rv;
+                    let w = lw.max(rw).max(ctx_width);
+                    // A narrow x/z value (a missing associative key reads as
+                    // x) fills the whole context when evaluated there; keep
+                    // that by letting such an operand evaluate again. A fill
+                    // literal replicates on resize and needs no re-run.
+                    let keep = |v: &Option<Value>| {
+                        !v.as_ref()
+                            .is_some_and(|v| v.width < w && v.has_xz() && !v.is_fill)
+                    };
+                    if !keep(&pre_l) {
+                        pre_l = None;
+                    }
+                    if !keep(&pre_r) {
+                        pre_r = None;
+                    }
+                    w
                 } else if widens_left {
                     // The LRM self width, NOT the carry-aware infer_width:
                     // `(a<<4)>>2` in an 8-bit context otherwise evaluates the
@@ -54480,8 +54501,9 @@ impl Simulator {
                 // the call we are trying to avoid. Evaluating the mask first is
                 // unobservable precisely because the call is pure — it has no
                 // effects to reorder against.
-                let mut pre_r: Option<Value> = None;
                 if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr)
+                    && pre_l.is_none()
+                    && pre_r.is_none()
                     && self.pure_call_name(left).is_some()
                 {
                     let want_ones = matches!(op, BinaryOp::BitOr);
@@ -54496,7 +54518,10 @@ impl Simulator {
                     }
                     pre_r = Some(r0);
                 }
-                let mut l = self.eval_expr_ctx(left, self_det_w);
+                let mut l = match pre_l.take() {
+                    Some(v) => v,
+                    None => self.eval_expr_ctx(left, self_det_w),
+                };
                 // §11.4.8 zero-mask elision. `0 & anything` is 0 for EVERY
                 // value the other side can take — `0 & x` and `0 & z` are both
                 // 0 — so the result cannot depend on the call. Gating a
@@ -69324,8 +69349,7 @@ impl Simulator {
                 let cn = self
                     .runtime_recv_class(&Expression {
                         kind: ExprKind::Ident(h.clone()),
-                        span: h.span,
-                    })
+                        span: h.span, cached_width: std::cell::Cell::new(None) })
                     .or_else(|| self.var_class_types.get(first).cloned())
                     .or_else(|| Some(first.clone()));
                     let mn = h.path.last().unwrap().name.name.clone();
@@ -75050,12 +75074,81 @@ impl Simulator {
         }
     }
 
+    /// Self-determined width of `expr`. Cached on the node when the answer
+    /// is a static property of it (signal and packed-layout widths, literals,
+    /// declared system-function results, and compositions of those); a width
+    /// that depends on runtime state — a local's current value, a user
+    /// function's return type, or the evaluate-and-measure fallback — is
+    /// recomputed every time. The binary arm of the evaluator asks for both
+    /// operand widths on every arithmetic evaluation, each a full tree walk
+    /// (7 % of an axi4 run before the cache).
     fn infer_width(&mut self, expr: &Expression) -> u32 {
+        if let Some(w) = expr.cached_width.get() {
+            return w;
+        }
+        let (w, is_static) = self.infer_width_walk(expr);
+        if is_static {
+            expr.cached_width.set(Some(w));
+        }
+        w
+    }
+
+    /// `infer_width` for an operand that is about to be EVALUATED anyway.
+    /// Shapes the walk can only size by evaluating (a property read, an
+    /// element select, a method whose return type it cannot resolve) are
+    /// evaluated here ONCE and the value handed back, so the caller does not
+    /// evaluate them a second time. The binary arm probed both operands of
+    /// every `+`/`&`/... and then evaluated them again: every `obj.prop + 1`
+    /// read the property twice, and a method in an arithmetic expression ran
+    /// twice (6 % of an axi4 run). Static shapes go through the cached walk
+    /// and return no value.
+    fn width_probe(&mut self, expr: &Expression) -> (u32, Option<Value>) {
+        if let Some(w) = expr.cached_width.get() {
+            return (w, None);
+        }
+        let evaluates = match &expr.kind {
+            ExprKind::Ident(_)
+            | ExprKind::Number(NumberLiteral::Integer { .. })
+            | ExprKind::Concatenation(_)
+            | ExprKind::Paren(_)
+            | ExprKind::AssignExpr { .. }
+            | ExprKind::Binary { .. }
+            | ExprKind::Unary { .. }
+            | ExprKind::Conditional { .. } => false,
+            ExprKind::SystemCall { name, args } => {
+                !(vpi_systf_is_func(name)
+                    || (super::bytecode::system_function_carries_arg(name) && !args.is_empty())
+                    || super::bytecode::system_function_result(name).is_some())
+            }
+            ExprKind::Call { func, .. } => {
+                if let Some(w) = self.call_return_width(func) {
+                    return (w, None);
+                }
+                true
+            }
+            // A streaming concatenation pads to the CONTEXT width on the
+            // right; a value taken here would be extended on the left.
+            ExprKind::StreamOp { .. } => false,
+            _ => true,
+        };
+        if evaluates {
+            let v = self.eval_expr(expr);
+            return (v.width, Some(v));
+        }
+        (self.infer_width(expr), None)
+    }
+
+    /// `infer_width` body; the flag says whether every branch taken was
+    /// static, i.e. safe to pin on the node.
+    fn infer_width_walk(&mut self, expr: &Expression) -> (u32, bool) {
         match &expr.kind {
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);
+                // The resolution is node-stable only once the resolver has
+                // pinned the name on the node.
+                let stable = h.cached_resolved_name.get().is_some();
                 if let Some(w) = self.lookup_signal_width(&n) {
-                    return w;
+                    return (w, stable);
                 }
                 // A method formal or local variable has no signal entry —
                 // infer from the local's current Value width. Without this,
@@ -75071,7 +75164,7 @@ impl Simulator {
                         .map(|v| v.width)
                         .filter(|w| *w > 1)
                     {
-                        return w;
+                        return (w, false);
                     }
                 }
                 // A packed struct/union member (`word3.high`) has no leaf
@@ -75082,36 +75175,50 @@ impl Simulator {
                     let (parent, field) = (&n[..dot], &n[dot + 1..]);
                     if let Some(fields) = self.module.packed_struct_fields.get(parent) {
                         if let Some((_, _, w)) = fields.iter().find(|(m, _, _)| m == field) {
-                            return *w;
+                            return (*w, stable);
                         }
                     }
                 }
-                1
+                (1, false)
             }
-            ExprKind::Number(NumberLiteral::Integer { size, .. }) => size.unwrap_or(32),
+            ExprKind::Number(NumberLiteral::Integer { size, .. }) => (size.unwrap_or(32), true),
             ExprKind::Concatenation(p) => {
                 let mut total = 0;
+                let mut st = true;
                 for x in p {
                     total += self.infer_width(x);
+                    st &= x.cached_width.get().is_some();
                 }
-                total
+                (total, st)
             }
-            ExprKind::Paren(inner) => self.infer_width(inner),
-            ExprKind::AssignExpr { lvalue, .. } => self.infer_width(lvalue),
+            ExprKind::Paren(inner) => (self.infer_width(inner), inner.cached_width.get().is_some()),
+            ExprKind::AssignExpr { lvalue, .. } => {
+                (self.infer_width(lvalue), lvalue.cached_width.get().is_some())
+            }
             ExprKind::Binary { left, right, .. } => {
-                self.infer_width(left).max(self.infer_width(right))
+                let w = self.infer_width(left).max(self.infer_width(right));
+                (w, left.cached_width.get().is_some() && right.cached_width.get().is_some())
             }
-            ExprKind::Unary { operand, .. } => self.infer_width(operand),
+            ExprKind::Unary { operand, .. } => {
+                (self.infer_width(operand), operand.cached_width.get().is_some())
+            }
             ExprKind::Conditional {
                 then_expr,
                 else_expr,
                 ..
-            } => self.infer_width(then_expr).max(self.infer_width(else_expr)),
+            } => {
+                let w = self.infer_width(then_expr).max(self.infer_width(else_expr));
+                (
+                    w,
+                    then_expr.cached_width.get().is_some()
+                        && else_expr.cached_width.get().is_some(),
+                )
+            }
             // A VPI system function has a declared return width. The fallback
             // below infers a width by EVALUATING, which for a `$systf` means
             // running its calltf — twice, once here and once for the value.
             ExprKind::SystemCall { name, .. } if vpi_systf_is_func(name) => {
-                vpi_sysfunc_ret_width(name)
+                (vpi_sysfunc_ret_width(name), true)
             }
             // A built-in system function's width comes from its LRM result
             // type. Sizing it by EVALUATING (the fallback below) ran the
@@ -75120,12 +75227,15 @@ impl Simulator {
             ExprKind::SystemCall { name, args }
                 if super::bytecode::system_function_carries_arg(name) && !args.is_empty() =>
             {
-                self.infer_width(&args[0])
+                (self.infer_width(&args[0]), args[0].cached_width.get().is_some())
             }
             ExprKind::SystemCall { name, .. }
                 if super::bytecode::system_function_result(name).is_some() =>
             {
-                super::bytecode::system_function_result(name).map(|(w, _)| w).unwrap_or(32)
+                (
+                    super::bytecode::system_function_result(name).map(|(w, _)| w).unwrap_or(32),
+                    true,
+                )
             }
             // Same for a user function: its width comes from its declared
             // return type, never from calling it. `f() + 1` used to call `f`
@@ -75133,12 +75243,12 @@ impl Simulator {
             // a side effect ran twice.
             ExprKind::Call { func, .. } => {
                 if let Some(w) = self.call_return_width(func) {
-                    w
+                    (w, false)
                 } else {
-                    self.eval_expr(expr).width
+                    (self.eval_expr(expr).width, false)
                 }
             }
-            _ => self.eval_expr(expr).width,
+            _ => (self.eval_expr(expr).width, false),
         }
     }
     /// Cheaply test whether the method name of a call callee (`recv.m(...)`
@@ -85814,8 +85924,7 @@ impl Simulator {
                 Some((
                     Expression {
                         kind: ExprKind::Ident(base),
-                        span: e.span,
-                    },
+                        span: e.span, cached_width: std::cell::Cell::new(None) },
                     last.name.name,
                 ))
             }
@@ -86066,8 +86175,7 @@ impl Simulator {
                 (
                     Some(Expression {
                         kind: ExprKind::Ident(base),
-                        span: func.span,
-                    }),
+                        span: func.span, cached_width: std::cell::Cell::new(None) }),
                     last.name.name,
                 )
             }
@@ -89235,8 +89343,7 @@ impl Simulator {
                 fname.clone(),
                 Expression {
                     kind: ExprKind::Ident(fh),
-                    span: a.span,
-                },
+                    span: a.span, cached_width: std::cell::Cell::new(None) },
             ));
         }
         Some(out)
@@ -89345,8 +89452,7 @@ impl Simulator {
             let name = self.resolve_hier_name(&fh).into_owned();
             let fexpr = Expression {
                 kind: ExprKind::Ident(fh),
-                span: a.span,
-            };
+                span: a.span, cached_width: std::cell::Cell::new(None) };
             out.push((name, fexpr));
         }
         Some(out)
