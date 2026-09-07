@@ -112,6 +112,12 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased
 
+* **Faster process re-parks and two-state execution**: a `forever` loop
+  re-parking on the same `@(...)` wait resolved its sensitivity list from
+  scratch on every iteration; it is now cached per wait site. The two-state
+  executor accesses its registers without bounds checks, which the block
+  compiler already guarantees. The C906 CoreMark run retires 2 % fewer
+  instructions with identical results.
 * **`always @(sig)` no longer goes quiet after a write made inside an edge
   continuation**: when a process resumed by a clock edge wrote a signal
   another `always` waits on, the edge scan queued the signal on a list it

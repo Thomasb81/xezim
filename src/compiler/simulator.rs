@@ -5509,6 +5509,12 @@ pub struct Simulator {
     /// every wake-up of a `forever @(posedge clk)` / `always` process
     /// deep-cloned its statement list and its whole body into a fresh
     /// frame: 5 % of the c906 memcpy steady state was that cloning.
+    /// Resolved sensitivity ids of a `forever` loop's wait, keyed by (pid,
+    /// wait-statement span start): the loop re-parks on the same wait every
+    /// iteration, and resolving it meant rebuilding signal-name strings and
+    /// hashing them per wake-up (a clocked testbench monitor routed to the
+    /// process path did this every cycle).
+    forever_sens_cache: HashMap<(usize, u32), (Vec<SensitivityId>, bool)>,
     forever_cont_cache: HashMap<(usize, usize, usize, usize, u8), Arc<[Statement]>>,
     /// §11.8.1: while narrowing relational constraint bounds for a target whose
     /// comparison context is UNSIGNED (the target, or the other operand, is
@@ -8689,6 +8695,7 @@ impl Simulator {
             prof_par_blocks: 0,
             forever_depth: 0,
             forever_cont_cache: HashMap::default(),
+            forever_sens_cache: HashMap::default(),
             constraint_cmp_unsigned: false,
             stall_iters: 0,
             zero_delay_defer_pending: false,
@@ -20416,6 +20423,16 @@ impl Simulator {
         if regs.len() < ts.num_regs as usize {
             regs.resize(ts.num_regs as usize, 0);
         }
+        // Register indices are assigned by the block compiler below
+        // `num_regs`, and `regs` was just sized to it: the bounds checks on
+        // every operand access are provably redundant, so go through a raw
+        // pointer (this loop is a quarter of a c906 run).
+        let rp: *mut u64 = regs.as_mut_ptr();
+        macro_rules! r {
+            ($i:expr) => {
+                (*rp.add($i as usize))
+            };
+        }
         macro_rules! xbail {
             () => {{
                 self.ts_xread_bail = true;
@@ -20424,7 +20441,7 @@ impl Simulator {
             }};
         }
         for insn in &ts.insns {
-            match insn {
+            unsafe { match insn {
                 TsInsn::LoadSig { d, sig } => {
                     // Plane-direct: one flat load vs the Value discriminant
                     // branch (raw_bits showed at 5% of settle post-PGO).
@@ -20437,9 +20454,9 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d as usize] = v;
+                    r!(*d) = v;
                 }
-                TsInsn::Const { d, v } => regs[*d as usize] = *v,
+                TsInsn::Const { d, v } => r!(*d) = *v,
                 TsInsn::SigBit { d, sig, bit } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
                         Some(sl) => (sl[0], sl[1]),
@@ -20448,7 +20465,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d as usize] = (v >> bit) & 1;
+                    r!(*d) = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -20458,7 +20475,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d as usize] = (v >> lo) & mask;
+                    r!(*d) = (v >> lo) & mask;
                 }
                 TsInsn::SigBitW { d, sig, bit } => {
                     let (v, x) =
@@ -20466,7 +20483,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d as usize] = v;
+                    r!(*d) = v;
                 }
                 TsInsn::SigRangeW { d, sig, lo, w, mask } => {
                     let (v, x) =
@@ -20474,92 +20491,92 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d as usize] = v & mask;
+                    r!(*d) = v & mask;
                 }
                 TsInsn::Bit { d, s, bit } => {
-                    regs[*d as usize] = (regs[*s as usize] >> bit) & 1;
+                    r!(*d) = (r!(*s) >> bit) & 1;
                 }
                 TsInsn::Range { d, s, lo, mask } => {
-                    regs[*d as usize] = (regs[*s as usize] >> lo) & mask;
+                    r!(*d) = (r!(*s) >> lo) & mask;
                 }
                 TsInsn::Xor { d, a, b } => {
-                    regs[*d as usize] = regs[*a as usize] ^ regs[*b as usize];
+                    r!(*d) = r!(*a) ^ r!(*b);
                 }
                 TsInsn::And { d, a, b } => {
-                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                    r!(*d) = r!(*a) & r!(*b);
                 }
                 TsInsn::Or { d, a, b } => {
-                    regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
+                    r!(*d) = r!(*a) | r!(*b);
                 }
                 TsInsn::Sel { d, c, a, b } => {
-                    regs[*d as usize] = if regs[*c as usize] != 0 {
-                        regs[*a as usize]
+                    r!(*d) = if r!(*c) != 0 {
+                        r!(*a)
                     } else {
-                        regs[*b as usize]
+                        r!(*b)
                     };
                 }
                 TsInsn::Not { d, s, mask } => {
-                    regs[*d as usize] = !regs[*s as usize] & mask;
+                    r!(*d) = !r!(*s) & mask;
                 }
                 TsInsn::XorC { d, s, k } => {
-                    regs[*d as usize] = regs[*s as usize] ^ k;
+                    r!(*d) = r!(*s) ^ k;
                 }
                 TsInsn::EqC { d, s, k } => {
-                    regs[*d as usize] = (regs[*s as usize] == *k) as u64;
+                    r!(*d) = (r!(*s) == *k) as u64;
                 }
                 TsInsn::Add { d, a, b, mask } => {
-                    regs[*d as usize] =
-                        regs[*a as usize].wrapping_add(regs[*b as usize]) & mask;
+                    r!(*d) =
+                        r!(*a).wrapping_add(r!(*b)) & mask;
                 }
                 TsInsn::AddC { d, s: sr, k, mask } => {
-                    regs[*d as usize] = regs[*sr as usize].wrapping_add(*k) & mask;
+                    r!(*d) = r!(*sr).wrapping_add(*k) & mask;
                 }
                 TsInsn::Shl { d, a, b, w, mask } => {
-                    let amt = regs[*b as usize];
-                    regs[*d as usize] = if amt >= *w as u64 {
+                    let amt = r!(*b);
+                    r!(*d) = if amt >= *w as u64 {
                         0
                     } else {
-                        (regs[*a as usize] << amt) & mask
+                        (r!(*a) << amt) & mask
                     };
                 }
                 TsInsn::Shr { d, a, b, w } => {
-                    let amt = regs[*b as usize];
-                    regs[*d as usize] = if amt >= *w as u64 {
+                    let amt = r!(*b);
+                    r!(*d) = if amt >= *w as u64 {
                         0
                     } else {
-                        regs[*a as usize] >> amt
+                        r!(*a) >> amt
                     };
                 }
                 TsInsn::Sub { d, a, b, mask } => {
-                    regs[*d as usize] =
-                        regs[*a as usize].wrapping_sub(regs[*b as usize]) & mask;
+                    r!(*d) =
+                        r!(*a).wrapping_sub(r!(*b)) & mask;
                 }
                 TsInsn::Eq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) == r!(*b)) as u64;
                 }
                 TsInsn::Neq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] != regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) != r!(*b)) as u64;
                 }
                 TsInsn::Lt { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] < regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) < r!(*b)) as u64;
                 }
                 TsInsn::Leq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] <= regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) <= r!(*b)) as u64;
                 }
                 TsInsn::Gt { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] > regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) > r!(*b)) as u64;
                 }
                 TsInsn::Geq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] >= regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) >= r!(*b)) as u64;
                 }
                 TsInsn::LogNot { d, s } => {
-                    regs[*d as usize] = (regs[*s as usize] == 0) as u64;
+                    r!(*d) = (r!(*s) == 0) as u64;
                 }
                 TsInsn::RedOr { d, s } => {
-                    regs[*d as usize] = (regs[*s as usize] != 0) as u64;
+                    r!(*d) = (r!(*s) != 0) as u64;
                 }
                 TsInsn::RedAnd { d, s, mask } => {
-                    regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
+                    r!(*d) = (r!(*s) == *mask) as u64;
                 }
                 TsInsn::WRedOr { .. } | TsInsn::WRedAnd { .. } => {
                     unreachable!("wide insn outside the wide executor")
@@ -20567,9 +20584,9 @@ impl Simulator {
                 TsInsn::BitStoreDyn { sig, i, s, w } => {
                     // §11.5.1: an out-of-range dynamic bit-select target
                     // drops the write (`Value::set_bit` is a no-op there).
-                    let idx = regs[*i as usize];
+                    let idx = r!(*i);
                     if idx < *w as u64 {
-                        let b = regs[*s as usize] & 1;
+                        let b = r!(*s) & 1;
                         self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
                     }
                 }
@@ -20580,34 +20597,34 @@ impl Simulator {
                     self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
                 }
                 TsInsn::LogAnd { d, a, b } => {
-                    regs[*d as usize] =
-                        (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
+                    r!(*d) =
+                        (r!(*a) != 0 && r!(*b) != 0) as u64;
                 }
                 TsInsn::LogOr { d, a, b } => {
-                    regs[*d as usize] =
-                        (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
+                    r!(*d) =
+                        (r!(*a) != 0 || r!(*b) != 0) as u64;
                 }
                 TsInsn::Concat { d, parts } => {
                     let mut acc = 0u64;
                     for &(r, w) in parts.iter() {
-                        acc = (acc << w) | regs[r as usize];
+                        acc = (acc << w) | r!(r);
                     }
-                    regs[*d as usize] = acc;
+                    r!(*d) = acc;
                 }
                 TsInsn::Mask { d, mask } => {
-                    regs[*d as usize] &= mask;
+                    r!(*d) &= mask;
                 }
                 TsInsn::Mul { d, a, b, mask } => {
-                    regs[*d as usize] =
-                        regs[*a as usize].wrapping_mul(regs[*b as usize]) & mask;
+                    r!(*d) =
+                        r!(*a).wrapping_mul(r!(*b)) & mask;
                 }
                 TsInsn::Repl { d, s, w, count } => {
-                    let part = regs[*s as usize];
+                    let part = r!(*s);
                     let mut acc = 0u64;
                     for _ in 0..*count {
                         acc = (acc << *w) | part;
                     }
-                    regs[*d as usize] = acc;
+                    r!(*d) = acc;
                 }
                 TsInsn::WSigRange { .. } => {
                     unreachable!("wide insn outside the wide executor")
@@ -20616,7 +20633,7 @@ impl Simulator {
                     unreachable!("wide insn outside the wide executor")
                 }
                 TsInsn::ElemLoad(op) => {
-                    let i = regs[op.idx as usize] as i64;
+                    let i = r!(op.idx) as i64;
                     if i < op.lo || i > op.hi {
                         self.ts_regs = regs;
                         return false;
@@ -20627,22 +20644,22 @@ impl Simulator {
                         self.ts_regs = regs;
                         return false;
                     }
-                    regs[op.s as usize] = v;
+                    r!(op.s) = v;
                 }
                 TsInsn::ElemStoreNba(op) => {
-                    let i = regs[op.idx as usize] as i64;
+                    let i = r!(op.idx) as i64;
                     if i >= op.lo && i <= op.hi {
                         let eid = op.first as usize + (i - op.lo) as usize;
-                        let v = regs[op.s as usize] & op.mask;
+                        let v = r!(op.s) & op.mask;
                         self.ts_store_nba(eid, v, op.w);
                     }
                     // Out-of-range: silent drop, as in 4-state.
                 }
                 TsInsn::ElemStore(op) => {
-                    let i = regs[op.idx as usize] as i64;
+                    let i = r!(op.idx) as i64;
                     if i >= op.lo && i <= op.hi {
                         let eid = op.first as usize + (i - op.lo) as usize;
-                        let v = regs[op.s as usize] & op.mask;
+                        let v = r!(op.s) & op.mask;
                         self.ts_store(eid, v, op.mask);
                     }
                 }
@@ -20663,7 +20680,7 @@ impl Simulator {
                     self.ts_store_nba(op.dst as usize, ev & m, op.w);
                 }
                 TsInsn::Store { sig, s, mask } => {
-                    let v = regs[*s as usize] & mask;
+                    let v = r!(*s) & mask;
                     self.ts_store(*sig as usize, v, *mask);
                 }
                 TsInsn::RangeStore { sig, hi, lo, s, mask } => {
@@ -20675,13 +20692,13 @@ impl Simulator {
                     // the same merge the NBA arm below uses.
                     self.ts_range_store(
                         *sig as usize,
-                        regs[*s as usize] & mask,
+                        r!(*s) & mask,
                         *lo,
                         *hi,
                     );
                 }
                 TsInsn::StoreNba { sig, s, w, mask } => {
-                    let v = regs[*s as usize] & mask;
+                    let v = r!(*s) & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
                 }
                 TsInsn::ConstStoreNba { sig, v, w } => {
@@ -20693,7 +20710,7 @@ impl Simulator {
                     // the signal, with eval-time elision. Plane-based, so an
                     // X base composes instead of aborting.
                     let id = *sig as usize;
-                    let (src_v, src_x) = (regs[*s as usize] & mask, 0u64);
+                    let (src_v, src_x) = (r!(*s) & mask, 0u64);
                     if let Some(i) = self.nba_fast_index.get(id) {
                         let target = &mut self.nba_fast[i].value;
                         let (base_v, base_x) = target.raw_bits();
@@ -20745,7 +20762,7 @@ impl Simulator {
                 | TsInsn::Jmp { .. }
                 | TsInsn::CaseJmp { .. }
                 | TsInsn::CaseMaskJmp { .. } => unreachable!("ctrl insn in straight-line block"),
-            }
+            } }
         }
         self.ts_regs = regs;
         true
@@ -33640,8 +33657,12 @@ impl Simulator {
         continuation: ProcCont,
         is_clocking: bool,
     ) -> EventWaiter {
-        let resolved: Vec<SensitivityId> = sens
-            .iter()
+        let resolved = self.resolve_sens_ids(&sens);
+        self.make_event_waiter_resolved(pid, resolved, continuation, is_clocking)
+    }
+
+    fn resolve_sens_ids(&self, sens: &[Sensitivity]) -> Vec<SensitivityId> {
+        sens.iter()
             .filter_map(|s| {
                 self.signal_name_to_id
                     .get(s.signal_name.as_str())
@@ -33652,7 +33673,16 @@ impl Simulator {
                         value_of: s.value_of.clone(),
                     })
             })
-            .collect();
+            .collect()
+    }
+
+    fn make_event_waiter_resolved(
+        &mut self,
+        pid: usize,
+        resolved: Vec<SensitivityId>,
+        continuation: ProcCont,
+        is_clocking: bool,
+    ) -> EventWaiter {
         // §9.4.2 value guard: capture each non-trivial term's value at arm.
         let guard_prev: Vec<Option<Value>> = resolved
             .iter()
@@ -41608,13 +41638,30 @@ impl Simulator {
                         return;
                     }
                     TimingControl::Event(event) => {
-                        let sens = self.event_to_sens(event);
-                        let is_clk_ev = self.is_clocking_event(event);
-                        if !sens.is_empty() {
+                        let key = (pid, s.span.start as u32);
+                        let cached = self.forever_sens_cache.get(&key).cloned();
+                        let (resolved, is_clk_ev) = match cached {
+                            Some(c) => c,
+                            None => {
+                                let sens = self.event_to_sens(event);
+                                let is_clk_ev = self.is_clocking_event(event);
+                                let resolved = self.resolve_sens_ids(&sens);
+                                if !sens.is_empty() && resolved.len() == sens.len() {
+                                    self.forever_sens_cache
+                                        .insert(key, (resolved.clone(), is_clk_ev));
+                                }
+                                if sens.is_empty() {
+                                    (Vec::new(), is_clk_ev)
+                                } else {
+                                    (resolved, is_clk_ev)
+                                }
+                            }
+                        };
+                        if !resolved.is_empty() {
                             let cont = self.forever_cont(pid, body, body_stmts, i, 1, tbody);
-                            { let w = self.make_event_waiter_kind(
+                            { let w = self.make_event_waiter_resolved(
                                     pid,
-                                    sens,
+                                    resolved,
                                     pc.pushed_frame(cont, resume_at),
                                     is_clk_ev,
                                 ); self.event_waiters.push(w); }
