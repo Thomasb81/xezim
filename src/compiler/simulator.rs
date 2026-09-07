@@ -43208,8 +43208,22 @@ impl Simulator {
                     self.edge_pos_seen[p] = false;
                 }
             }
+            // A process resumed INSIDE the scan (an edge continuation) may
+            // write an edge-sensitive signal; that position is pushed onto
+            // the fresh list during the scan. Overwriting the list with the
+            // emptied subset dropped it while its `edge_pos_seen` stayed
+            // set, so no later write to that signal could ever queue it
+            // again: an `always @(sig)` fired once and was dead for the
+            // rest of the run. Carry those positions into the next pass.
+            let pushed_during_scan = std::mem::take(&mut self.changed_edge_pos);
             let mut s = subset;
             s.clear();
+            s.extend_from_slice(&pushed_during_scan);
+            for &p in &pushed_during_scan {
+                if p < self.edge_pos_seen.len() {
+                    self.edge_pos_seen[p] = true;
+                }
+            }
             self.changed_edge_pos = s;
             return;
         }
@@ -53500,6 +53514,51 @@ impl Simulator {
                 }
                 // LRM §14.3 clocking-block input read — `cb.<sig>` returns
                 // the snapshot taken at the block's most recent clock edge.
+                // `w.r.c` with three or more segments: a handle chain. The
+                // two-segment case above reads the property off the head
+                // handle; longer chains had no such path and fell through to
+                // hierarchical-name resolution, which inside a sub-instance
+                // applied the instance scope hint and read x (the same chain
+                // parenthesised, `(w.r).c`, or split in two steps was fine).
+                // Walk the handles property by property; any miss falls
+                // through to the existing resolution unchanged.
+                if hier.path.len() >= 3
+                    && hier.path.iter().all(|s| s.selects.is_empty())
+                    && !self.no_class_objects()
+                {
+                    let head = hier.path[0].name.name.as_str();
+                    if let Some(mut h) = self.eval_ident_handle(head) {
+                        let mut ok = h != 0;
+                        let last = hier.path.len() - 1;
+                        for seg in &hier.path[1..last] {
+                            if !ok {
+                                break;
+                            }
+                            match self
+                                .heap
+                                .get(h)
+                                .and_then(|o| o.as_ref())
+                                .and_then(|inst| inst.properties.get(&seg.name.name))
+                                .and_then(|v| v.to_u64())
+                            {
+                                Some(next) if next != 0 && self.heap.get(next as usize).is_some_and(|o| o.is_some()) => {
+                                    h = next as usize;
+                                }
+                                _ => ok = false,
+                            }
+                        }
+                        if ok {
+                            if let Some(v) = self
+                                .heap
+                                .get(h)
+                                .and_then(|o| o.as_ref())
+                                .and_then(|inst| inst.properties.get(&hier.path[last].name.name))
+                            {
+                                return v.clone();
+                            }
+                        }
+                    }
+                }
                 if hier.path.len() >= 2 {
                     let segs: Vec<&str> =
                         hier.path.iter().map(|s| s.name.name.as_str()).collect();
@@ -112330,6 +112389,24 @@ impl Simulator {
                             // `T=int` formal renders signed like the reference.
                             val.is_signed = true;
                         }
+                    } else if matches!(&port.data_type, DataType::IntegerAtom { .. }) {
+                        // A built-in integer formal (`int`, `byte`, ...) has a
+                        // fixed width that no class type-parameter can alter,
+                        // so widen the actual FIRST and stamp the signedness
+                        // after: marking a 2-bit unsigned actual signed and
+                        // letting the frame widen it later sign-extended
+                        // `2'b10` into -2 for every `int` method formal.
+                        let pw = super::elaborate::resolve_type_width(
+                            &port.data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        );
+                        if val.is_real {
+                            val = Self::real_to_int(val.to_f64(), pw.max(1));
+                        } else if pw > 0 && pw != val.width {
+                            val = val.resize_for_assign(pw);
+                        }
+                        val.is_signed = super::elaborate::is_type_signed(&port.data_type);
                     } else if super::elaborate::is_type_signed(&port.data_type) {
                         val.is_signed = true;
                     }
