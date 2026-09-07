@@ -128,6 +128,17 @@ and testbench flows. Portable code should not rely on them.
   runs with no scope hint, so the receiver cache above now keys on the
   instance-prefixed identifier too — `q.size()` inside a loop in ten
   sibling instances read the first sibling's queue.
+* **Settle passes run in dependency order and clocked monitors stop
+  re-cloning their bodies**: a combinational entry triggered mid-pass by a
+  producer earlier in the same pass was appended to the end of the pass, so
+  the entries that read it had already run and were evaluated again in a
+  second pass (15% of all entry evaluations on a CPU core were repeats).
+  A clocked block that reaches a blocking `begin/end` or a blocking `if`
+  branch on the process path cloned the whole statement list on every
+  activation; the list is immutable and is shared now. A non-blocking
+  assignment whose value already matches the target no longer clones the
+  value before deciding to drop it. Together 5.3% fewer instructions on
+  the C906 CoreMark run; UVM runs unchanged.
 * **Faster process re-parks and two-state execution**: a `forever` loop
   re-parking on the same `@(...)` wait resolved its sensitivity list from
   scratch on every iteration; it is now cached per wait site. The two-state
