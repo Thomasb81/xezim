@@ -3410,6 +3410,7 @@ enum CombPlan {
 
 pub struct Simulator {
     pub signals: SignalMap,
+    vpi_port_directions: HashMap<String, PortDirection>,
     /// Signals currently under force/release control (LRM §9.3.1).
     forced_signals: HashMap<usize, Value>,
     /// Nets released while a settle pass was running (the entry table is
@@ -8073,6 +8074,11 @@ impl Simulator {
             }
             m
         };
+        let vpi_port_directions: HashMap<String, PortDirection> = module
+            .signals
+            .iter()
+            .filter_map(|(name, signal)| signal.direction.clone().map(|dir| (name.clone(), dir)))
+            .collect();
         let mut sim = Self {
             prev_val,
             prev_xz,
@@ -8084,6 +8090,7 @@ impl Simulator {
             edge_blocks_with_iff: Vec::new(),
             edge_iff_denied: Vec::new(),
             signals,
+            vpi_port_directions,
             widths,
             signed_signals,
             real_signals,
@@ -49149,7 +49156,7 @@ impl Simulator {
         } else {
             lhs
         };
-        
+
         // §7.4.6 / §11.5.1: an ELEMENT index containing x or z selects nothing,
         // so the write is discarded — `a['hx] = v` must leave every element
         // alone. The index folded to 0 through `to_u64`, so it silently
@@ -114684,6 +114691,12 @@ mod vpi {
     pub const SCALAR: c_int = 17;
     pub const VECTOR: c_int = 18;
     pub const SIGNED: c_int = 65;
+    pub const DIRECTION: c_int = 20;
+    pub const INPUT: c_int = 1;
+    pub const OUTPUT: c_int = 2;
+    pub const INOUT: c_int = 3;
+    pub const MIXED_IO: c_int = 4;
+    pub const NO_DIRECTION: c_int = 5;
 
     // vpi_control operations.
     pub const STOP: c_int = 66;
@@ -114725,6 +114738,8 @@ mod vpi {
     pub const VARIABLES: c_int = 100;
     pub const INTEGER_VAR: c_int = 25;
     pub const NET: c_int = 36;
+    pub const PORT: c_int = 44;
+    pub const PORT_BIT: c_int = 45;
     pub const REAL_VAR: c_int = 47;
     /// Also `vpiLogicVar` — the standard aliases them.
     pub const REG: c_int = 48;
@@ -115048,6 +115063,7 @@ struct VpiHandle {
     /// handle is created. It must not be derived from the current value:
     /// a `logic` signal is a `vpiReg` whether or not it happens to hold X.
     type_code: libc::c_int,
+    direction: libc::c_int,
     /// Slice only: bit range within `signal_id`.
     lsb: u32,
     width: u32,
@@ -115074,6 +115090,7 @@ impl VpiHandle {
             kind: VpiKind::Signal,
             signal_id: id,
             type_code,
+            direction: vpi::NO_DIRECTION,
             lsb: 0,
             width: 0,
             inst_idx: -1,
@@ -115097,6 +115114,7 @@ impl VpiHandle {
             kind: VpiKind::Constant,
             signal_id: 0,
             type_code: vpi::CONSTANT,
+            direction: vpi::NO_DIRECTION,
             lsb: 0,
             width: v.width,
             inst_idx: -1,
@@ -115120,6 +115138,7 @@ impl VpiHandle {
             } else {
                 vpi::SYS_TASK_CALL
             },
+            direction: vpi::NO_DIRECTION,
             lsb: 0,
             width: ret_width,
             inst_idx: -1,
@@ -115333,6 +115352,9 @@ where
 /// declaration we cannot see, which is the safe answer: a caller that
 /// believes a signal may hold X will read it with a 4-state format.
 fn vpi_type_of(sim: &Simulator, name: &str, id: usize) -> libc::c_int {
+    if sim.vpi_port_directions.contains_key(name) {
+        return vpi::PORT;
+    }
     use xezim_core::ast::types::{
         DataType, IntegerAtomType, IntegerVectorType, RealType, SimpleType, StructUnionKind,
     };
@@ -115386,10 +115408,21 @@ fn vpi_type_of(sim: &Simulator, name: &str, id: usize) -> libc::c_int {
     }
 }
 
+fn vpi_direction_of(sim: &Simulator, name: &str) -> libc::c_int {
+    match sim.vpi_port_directions.get(name) {
+        Some(PortDirection::Input) => vpi::INPUT,
+        Some(PortDirection::Output) => vpi::OUTPUT,
+        Some(PortDirection::Inout) => vpi::INOUT,
+        Some(PortDirection::Ref) | None => vpi::NO_DIRECTION,
+    }
+}
+
 fn new_vpi_handle(sim: &Simulator, name: &str, id: usize) -> *mut libc::c_void {
     let type_code = vpi_type_of(sim, name, id);
     let leaf = name.rsplit('.').next().unwrap_or(name);
-    VpiHandle::signal(id, type_code, leaf, &vpi_full_name(sim, name)).into_raw()
+    let mut handle = VpiHandle::signal(id, type_code, leaf, &vpi_full_name(sim, name));
+    handle.direction = vpi_direction_of(sim, name);
+    handle.into_raw()
 }
 
 /// Prefix a design-relative name with the top module, the way
@@ -115440,6 +115473,7 @@ fn vpi_module_handle(sim: &Simulator, inst_idx: isize) -> *mut libc::c_void {
         kind: VpiKind::Module,
         signal_id: 0,
         type_code: vpi::MODULE,
+        direction: vpi::NO_DIRECTION,
         lsb: 0,
         width: 0,
         inst_idx,
@@ -115480,6 +115514,7 @@ fn vpi_slice_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
         kind: VpiKind::Slice,
         signal_id: id,
         type_code: vpi::PART_SELECT,
+        direction: vpi::NO_DIRECTION,
         lsb,
         width,
         inst_idx: -1,
@@ -115598,6 +115633,7 @@ fn vpi_memory_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
         kind: VpiKind::Memory,
         signal_id: id,
         type_code: vpi::MEMORY,
+        direction: vpi::NO_DIRECTION,
         lsb: lo.min(hi) as u32,
         width: count,
         inst_idx: -1,
@@ -115812,6 +115848,7 @@ pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *m
         let want = |ty: libc::c_int| -> bool {
             match type_ {
                 vpi::NET => ty == vpi::NET,
+                vpi::PORT => ty == vpi::PORT,
                 vpi::REG => ty == vpi::REG || ty == vpi::BIT_VAR,
                 vpi::PARAMETER => ty == vpi::PARAMETER,
                 vpi::MEMORY => ty == vpi::MEMORY,
@@ -115833,7 +115870,9 @@ pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *m
             let ty = vpi_type_of(sim, &name, id);
             if want(ty) {
                 let leaf = name.rsplit('.').next().unwrap_or(&name);
-                items.push(VpiHandle::signal(id, ty, leaf, &vpi_full_name(sim, &name)));
+                let mut handle = VpiHandle::signal(id, ty, leaf, &vpi_full_name(sim, &name));
+                handle.direction = vpi_direction_of(sim, &name);
+                items.push(handle);
             }
         }
         vpi_make_iterator(items)
@@ -115849,6 +115888,7 @@ fn vpi_make_iterator(items: Vec<VpiHandle>) -> *mut libc::c_void {
         kind: VpiKind::Iterator,
         signal_id: 0,
         type_code: vpi::ITERATOR,
+        direction: vpi::NO_DIRECTION,
         lsb: 0,
         width: 0,
         inst_idx: -1,
@@ -115896,6 +115936,8 @@ fn vpi_type_name(code: libc::c_int) -> Option<&'static str> {
         vpi::MEMORY => "vpiMemory",
         vpi::MODULE => "vpiModule",
         vpi::NET => "vpiNet",
+        vpi::PORT => "vpiPort",
+        vpi::PORT_BIT => "vpiPortBit",
         vpi::PARAMETER => "vpiParameter",
         vpi::PART_SELECT => "vpiPartSelect",
         vpi::REAL_VAR => "vpiRealVar",
@@ -116276,6 +116318,9 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
     };
     if property == vpi::TYPE {
         return h.type_code;
+    }
+    if property == vpi::DIRECTION {
+        return h.direction;
     }
     // vpiFuncType of a system function call is its `sysfunctype`.
     if h.kind == VpiKind::SysTfCall {
