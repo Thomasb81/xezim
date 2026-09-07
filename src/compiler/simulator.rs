@@ -5518,6 +5518,8 @@ pub struct Simulator {
     /// process path did this every cycle).
     forever_sens_cache: HashMap<(usize, u32), (Vec<SensitivityId>, bool)>,
     forever_cont_cache: HashMap<(usize, usize, usize, usize, u8), Arc<[Statement]>>,
+    /// See `blocking_cont_frame`.
+    blocking_cont_cache: HashMap<(usize, usize, usize, u8), Arc<[Statement]>>,
     /// §11.8.1: while narrowing relational constraint bounds for a target whose
     /// comparison context is UNSIGNED (the target, or the other operand, is
     /// unsigned), a bound literal must be read by its unsigned value — e.g. the
@@ -8698,6 +8700,7 @@ impl Simulator {
             prof_par_blocks: 0,
             forever_depth: 0,
             forever_cont_cache: HashMap::default(),
+            blocking_cont_cache: HashMap::default(),
             forever_sens_cache: HashMap::default(),
             constraint_cmp_unsigned: false,
             stall_iters: 0,
@@ -23064,6 +23067,25 @@ impl Simulator {
                 }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let sig_id = &(*sig_id as usize);
+                    // Unchanged-value elision BEFORE the resize: an equal-width,
+                    // non-fill, non-real register resizes to an exact copy of
+                    // itself, so comparing the register against the signal table
+                    // decides the elision without cloning the value first (flop
+                    // outputs reload the same value most cycles — the clone was
+                    // made only to be dropped).
+                    {
+                        let reg = &vm_regs[*val_reg as usize];
+                        if !nba_dup
+                            && *width != 0
+                            && reg.width == *width
+                            && !reg.is_fill
+                            && !reg.is_real
+                            && signal_table[*sig_id] == *reg
+                        {
+                            pc += 1;
+                            continue;
+                        }
+                    }
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
                     // Eval-time elision: skip the queue push when the
                     // value already matches signal_table.  apply_nba_entry
@@ -39110,10 +39132,10 @@ impl Simulator {
             // inside them are properly handled with process suspension.
             if let StatementKind::SeqBlock { stmts: inner, .. } = &stmt.kind {
                 if self.stmts_have_blocking(inner) {
-                    let mut expanded = inner.clone();
-                    // Chain the caller's tail instead of copying it onto the end of
-                    // the spliced body (ProcCont::pushed).
-                    self.run_process_stmts(pid, &pc.pushed(expanded, pc.start + i + 1));
+                    // Immutable AST: share one Arc frame per (process, span)
+                    // instead of cloning the whole list on every entry.
+                    let frame = self.blocking_cont_frame(pid, stmt.span, 0, inner);
+                    self.run_process_stmts(pid, &pc.pushed_frame(frame, pc.start + i + 1));
                     return;
                 }
             }
@@ -40375,14 +40397,23 @@ impl Simulator {
                     };
                     match chosen {
                         Some(branch) if self.stmt_is_blocking(branch) => {
-                            let branch_stmts: Vec<Statement> = match &branch.kind {
-                                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
-                                _ => vec![branch.clone()],
+                            // The chosen branch is immutable AST: share one
+                            // Arc frame per (process, span) instead of cloning
+                            // its statements on every activation (a clocked
+                            // monitor whose else-chain ends in a rare `#delay`
+                            // did this every cycle — 3% of c906).
+                            let frame = match &branch.kind {
+                                StatementKind::SeqBlock { stmts, .. } => {
+                                    self.blocking_cont_frame(pid, branch.span, 1, stmts)
+                                }
+                                _ => self.blocking_cont_frame(
+                                    pid,
+                                    branch.span,
+                                    2,
+                                    std::slice::from_ref(branch),
+                                ),
                             };
-                            let mut cont = branch_stmts;
-                            // Chain the caller's tail instead of copying it onto the end of
-                            // the spliced body (ProcCont::pushed).
-                            self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                            self.run_process_stmts(pid, &pc.pushed_frame(frame, pc.start + i + 1));
                             return;
                         }
                         // Run the branch we already selected, rather than
@@ -41556,6 +41587,26 @@ impl Simulator {
     /// cannot be recycled by another allocation. The ForeverTail inside the
     /// shared frame is what the next iteration keys on, so from the second
     /// wake-up on every iteration of every loop is a lookup.
+    /// Shared continuation frame for an immutable statement list entered
+    /// from the process path (a blocking `begin/end` or a blocking chosen
+    /// `if` branch). Keyed per process like `forever_cont_cache`: sibling
+    /// instances share spans but never a pid.
+    fn blocking_cont_frame(
+        &mut self,
+        pid: usize,
+        span: crate::ast::Span,
+        kind: u8,
+        stmts: &[Statement],
+    ) -> Arc<[Statement]> {
+        let key = (pid, span.start as usize, span.end as usize, kind);
+        if let Some(f) = self.blocking_cont_cache.get(&key) {
+            return f.clone();
+        }
+        let f: Arc<[Statement]> = Arc::from(stmts.to_vec());
+        self.blocking_cont_cache.insert(key, f.clone());
+        f
+    }
+
     fn forever_cont(
         &mut self,
         pid: usize,
@@ -47267,6 +47318,8 @@ impl Simulator {
         let warn_x_on = self.warn_x && self.time > 0;
         // Profiling counters accumulate in registers and fold back into `self`
         // once, instead of a read-modify-write per evaluation.
+        let mut inject_heap: std::collections::BinaryHeap<std::cmp::Reverse<usize>> =
+            std::collections::BinaryHeap::new();
         let mut n_evals = 0u64;
         let mut n_dc = 0u64;
         let mut n_ab = 0u64;
@@ -47296,7 +47349,13 @@ impl Simulator {
                         if !triggered[__dep] {
                             triggered[__dep] = true;
                             if __dep > $eidx {
-                                cur_list.push(__dep);
+                                // Keep the pass in entry (topological)
+                                // order: an injected dependent runs BEFORE
+                                // the entries that read it, so they are not
+                                // re-triggered into a second pass. Appending
+                                // it to the pass list ran it last and cost
+                                // 15% more entry evaluations on c906.
+                                inject_heap.push(std::cmp::Reverse(__dep));
                             } else {
                                 next_list.push(__dep);
                             }
@@ -47341,9 +47400,19 @@ impl Simulator {
             // cache-state interaction we haven't traced yet. Don't
             // re-enable without a c910 t=1 k=0 + t=4 k=4 cmark sanity.
             let mut cur_pos = 0usize;
-            while cur_pos < cur_list.len() {
-                let eidx = cur_list[cur_pos];
-                cur_pos += 1;
+            while cur_pos < cur_list.len() || !inject_heap.is_empty() {
+                let eidx = if let Some(&std::cmp::Reverse(h)) = inject_heap.peek() {
+                    if cur_pos < cur_list.len() && cur_list[cur_pos] <= h {
+                        cur_pos += 1;
+                        cur_list[cur_pos - 1]
+                    } else {
+                        inject_heap.pop();
+                        h
+                    }
+                } else {
+                    cur_pos += 1;
+                    cur_list[cur_pos - 1]
+                };
                 // The entry header load is the loop's dominant stall (~19%
                 // of settle self-time: 35k 64-byte entries visited in
                 // data-dependent order). The worklist names the upcoming
