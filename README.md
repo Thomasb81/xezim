@@ -112,6 +112,22 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased
 
+* **Method calls on a collection inside sibling instances no longer share
+  the first instance's receiver**: the receiver of `q.push_back(..)`,
+  `q.size()` or `aa.exists(..)` was cached per source line without regard
+  to the instance, so every instance of a module executing that line used
+  the first executing instance's queue; the other instances' queues stayed
+  empty, their `always_comb` size mirrors never woke, and a packed-struct
+  element's fields read 0. Ten per-client BFM request queues collapsed into
+  one and never granted a request.
+* **Packed-struct elements of a queue, dynamic, associative or fixed array
+  declared in a sub-instance now carry their field layout**: `q[i].field`
+  read 0 and `q[0].field = v` was lost inside any instance (the top module
+  was fine), because the inliner registered the container but not the
+  element layout under the instance path. A `for` body or `$display` also
+  runs with no scope hint, so the receiver cache above now keys on the
+  instance-prefixed identifier too — `q.size()` inside a loop in ten
+  sibling instances read the first sibling's queue.
 * **Faster process re-parks and two-state execution**: a `forever` loop
   re-parking on the same `@(...)` wait resolved its sensitivity list from
   scratch on every iteration; it is now cached per wait site. The two-state

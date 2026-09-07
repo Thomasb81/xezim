@@ -4731,7 +4731,9 @@ pub struct Simulator {
     /// `type_option.f = v;` items on first access.
     cg_type_options: HashMap<String, HashMap<String, Value>>,
     /// Per-call-site receiver expressions for `obj.coll.method()` dispatch.
-    method_receiver_cache: HashMap<(usize, usize, usize), std::rc::Rc<Expression>>,
+    method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
+    /// Interned scope hints and head identifiers for `method_receiver_cache` keys (see there).
+    method_receiver_hint_ids: HashMap<String, u32>,
     /// `resolve_typeref_class_name` memo: name -> (scope, class ctx) -> (class-table size, answer).
     typeref_class_memo: std::cell::RefCell<HashMap<String, HashMap<(String, String), (usize, Option<String>)>>>,
     /// Deferred teardown for inlined blocking task/method calls (LIFO). Each
@@ -8434,6 +8436,7 @@ impl Simulator {
             ref_redirect_hot: false,
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
+            method_receiver_hint_ids: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
@@ -71695,7 +71698,40 @@ impl Simulator {
     /// identifier's resolved-name cache, so each call re-resolved from
     /// scratch. Same context-insensitive caching the AST node itself uses.
     fn method_receiver_expr(&mut self, hier: &HierarchicalIdentifier, keep: usize) -> std::rc::Rc<Expression> {
-        let key = (hier.span.start as usize, hier.span.end as usize, keep);
+        // The cached receiver node carries its own resolution cells, which
+        // the first evaluation fills under ITS scope hint. Keyed by span
+        // alone, every instance of a module executing the same source line
+        // then read the first instance's resolution: `q.push_back(..)` in
+        // ten sibling instances pushed into one instance's queue. The
+        // scope hint is part of the key (interned, so the hot path pays one
+        // string hash and no clone).
+        let hint_id = match self.name_resolve_hint.borrow().as_deref() {
+            None => 0,
+            Some(h) => match self.method_receiver_hint_ids.get(h) {
+                Some(&id) => id,
+                None => {
+                    let id = self.method_receiver_hint_ids.len() as u32 + 1;
+                    self.method_receiver_hint_ids.insert(h.to_string(), id);
+                    id
+                }
+            },
+        };
+        // The hint alone is not enough: a loop body or a display runs with
+        // NO hint, and every instance's inlined copy of the same source line
+        // shares one span. The inliner already prefixed the head identifier
+        // per instance (`u0.q` / `u1.q`), so interning it too keeps the
+        // entry per instance — `q.size()` inside a `for` in ten siblings
+        // otherwise read the first sibling's queue.
+        let head = hier.path[0].name.name.as_str();
+        let head_id = match self.method_receiver_hint_ids.get(head) {
+            Some(&id) => id,
+            None => {
+                let id = self.method_receiver_hint_ids.len() as u32 + 1;
+                self.method_receiver_hint_ids.insert(head.to_string(), id);
+                id
+            }
+        };
+        let key = (hier.span.start as usize, hier.span.end as usize, keep, hint_id, head_id);
         if let Some(e) = self.method_receiver_cache.get(&key) {
             return e.clone();
         }
