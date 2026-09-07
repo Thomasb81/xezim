@@ -268,3 +268,7 @@ mod parked_task_local_vif_alias;
 mod class_randomize_multidim;
 #[path = "classes/class_method_sibling_instance_oomr.rs"]
 mod class_method_sibling_instance_oomr;
+#[path = "classes/method_int_formal_zero_extends.rs"]
+mod method_int_formal_zero_extends;
+#[path = "classes/handle_chain_read_in_instance_task.rs"]
+mod handle_chain_read_in_instance_task;
