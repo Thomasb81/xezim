@@ -119,13 +119,16 @@ and testbench flows. Portable code should not rely on them.
   cleared, so no later write from any process could wake that block again.
 * **A narrow actual bound to an `int` class-method or constructor formal is
   zero-extended**: `new(v[25:24])` and even `new(2'b10)` read -2 because
-  the actual was marked signed before it was widened. Module functions
-  were unaffected.
-* **`#delay` inside a package class, a compilation-unit class, or a `$unit`
-  task or function scales by the timescale in effect**: those scopes were
-  skipped by the delay pre-scaling pass that modules and module-level
-  classes get, so under `timescale 1ns/1ps a `#200` was 200 raw ticks and
-  rounded to zero time.
+  the actual was marked signed before it was widened. The same held for a
+  `logic signed [15:0]` or `bit signed [7:0]` formal with literal bounds.
+  Module functions were unaffected.
+* **`#delay` inside a package class, a compilation-unit class, a `$unit`
+  task or function, or a `program` block scales by the timescale in
+  effect**: those scopes were skipped by the delay pre-scaling pass that
+  modules and module-level classes get, so under `timescale 1ns/1ps a
+  `#200` was 200 raw ticks and rounded to zero time. A `timeunit`
+  declared inside a package, previously dropped by the parser, now
+  overrides the file directive for that package.
 * **A three-level handle chain reads correctly from a task inside a
   sub-instance**: `w.r.c`, where `w` is a task local holding an object whose
   `r` property is another object, read x inside an instance because the
@@ -133,7 +136,16 @@ and testbench flows. Portable code should not rely on them.
   scope; the same chain parenthesised or split in two steps was fine. The
   identifier evaluator now walks handle chains of any length. A UVM-style
   BFM host reading `wake_obj.req_item.client_num` from a mailbox-delivered
-  object hit this.
+  object hit this. A task-local handle that shares its name with a sibling
+  instance (`core.n` next to an instance `core`) likewise read x and now
+  reads the object's property.
+* **Locals declared inside an instance's tasks, functions and blocks shadow
+  the module's own names**: the inliner prefixed every use of a module-level
+  name, sub-instance names included, with the instance path, without regard
+  to an intervening declaration. `begin int u; u = 5; end` overwrote the
+  module-level `u`, a task-local `core` next to an instance `core` read
+  `core.c` as x, and a block-local handle named like the enclosing instance
+  read null. A declaration now shadows for the statements that follow it.
 * **Two-state blocks check for x/z as they load**: before every
   evaluation of a two-state block the simulator scanned the block's read
   list for x/z bits, then loaded the same signals again to execute. The

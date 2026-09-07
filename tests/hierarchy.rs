@@ -159,3 +159,5 @@ mod multi_top_typedef_packed_dims;
 mod bind_with_parameters;
 #[path = "hierarchy/ref_formal_same_name.rs"]
 mod ref_formal_same_name;
+#[path = "hierarchy/instance_block_locals_shadow_module_names.rs"]
+mod instance_block_locals_shadow_module_names;

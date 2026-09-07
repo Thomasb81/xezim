@@ -53486,6 +53486,28 @@ impl Simulator {
                     }
                 }
                 if hier.path.len() == 2 {
+                    // A variable holding a live object shadows any signal or
+                    // instance of the same name: `core.n` with a local `core`
+                    // read x when a sibling instance was also called `core`,
+                    // because the dotted signal lookup ran first and answered
+                    // for the instance.
+                    if hier.path[0].selects.is_empty()
+                        && hier.path[1].selects.is_empty()
+                        && !self.no_class_objects()
+                    {
+                        if let Some(hval) = self.eval_ident_handle(&hier.path[0].name.name) {
+                            if hval != 0 {
+                                if let Some(v) = self
+                                    .heap
+                                    .get(hval)
+                                    .and_then(|o| o.as_ref())
+                                    .and_then(|inst| inst.properties.get(&hier.path[1].name.name))
+                                {
+                                    return v.clone();
+                                }
+                            }
+                        }
+                    }
                     let dotted = format!("{}.{}", hier.path[0].name.name, hier.path[1].name.name);
                     if let Some(v) = self.get_signal_value_by_name(&dotted) {
                         return v;
@@ -53527,7 +53549,12 @@ impl Simulator {
                     && !self.no_class_objects()
                 {
                     let head = hier.path[0].name.name.as_str();
-                    if let Some(mut h) = self.eval_ident_handle(head) {
+                    let head_handle = if head == "this" {
+                        self.this_stack.last().copied().flatten()
+                    } else {
+                        self.eval_ident_handle(head)
+                    };
+                    if let Some(mut h) = head_handle {
                         let mut ok = h != 0;
                         let last = hier.path.len() - 1;
                         for seg in &hier.path[1..last] {
@@ -86100,6 +86127,26 @@ impl Simulator {
     /// Resolve a receiver expression to the `(handle, property)` pair it names:
     /// a bare `prop` inside a class method/constraint (implicit `this`), or an
     /// `<obj>.prop` access from outside.
+    /// A packed integer vector whose every dimension is a literal range
+    /// (`[15:0]`, not `[W-1:0]`): its width is known without any parameter
+    /// or class type-argument lookup.
+    fn packed_dims_are_literal(dt: &DataType) -> bool {
+        use crate::ast::types::PackedDimension;
+        match dt {
+            DataType::IntegerVector { dimensions, .. } => {
+                !dimensions.is_empty()
+                    && dimensions.iter().all(|d| match d {
+                        PackedDimension::Range { left, right, .. } => {
+                            matches!(left.kind, ExprKind::Number(_))
+                                && matches!(right.kind, ExprKind::Number(_))
+                        }
+                        PackedDimension::Unsized(_) => false,
+                    })
+            }
+            _ => false,
+        }
+    }
+
     fn class_prop_receiver(&mut self, base: &Expression) -> Option<(usize, String)> {
         if let Some((obj, prop)) = Self::split_trailing_member(base) {
             let h = self.eval_expr(&obj).to_u64()? as usize;
@@ -112389,13 +112436,17 @@ impl Simulator {
                             // `T=int` formal renders signed like the reference.
                             val.is_signed = true;
                         }
-                    } else if matches!(&port.data_type, DataType::IntegerAtom { .. }) {
-                        // A built-in integer formal (`int`, `byte`, ...) has a
-                        // fixed width that no class type-parameter can alter,
-                        // so widen the actual FIRST and stamp the signedness
-                        // after: marking a 2-bit unsigned actual signed and
-                        // letting the frame widen it later sign-extended
-                        // `2'b10` into -2 for every `int` method formal.
+                    } else if matches!(&port.data_type, DataType::IntegerAtom { .. })
+                        || Self::packed_dims_are_literal(&port.data_type)
+                    {
+                        // A built-in integer formal (`int`, `byte`, ...) or a
+                        // packed vector with LITERAL bounds (`logic signed
+                        // [15:0]`) has a fixed width that no class
+                        // type-parameter can alter, so widen the actual FIRST
+                        // and stamp the signedness after: marking a 2-bit
+                        // unsigned actual signed and letting the frame widen it
+                        // later sign-extended `2'b10` into -2 for every such
+                        // method formal.
                         let pw = super::elaborate::resolve_type_width(
                             &port.data_type,
                             Some(&self.module.parameters),
