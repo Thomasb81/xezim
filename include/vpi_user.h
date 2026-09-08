@@ -126,6 +126,7 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiScalar             17
 #define vpiVector             18
 #define vpiDirection          20
+#define vpiSigned             65
 
 /* --- vpiDirection values --------------------------------------------- */
 #define vpiInput               1
@@ -139,7 +140,6 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiSimTime             2
 #define vpiSuppressTime        3
 
-#define vpiSigned             65
 /* --- vpi_control operations ------------------------------------------- */
 #define vpiStop               66   /* ends the run, like $stop */
 #define vpiFinish             67   /* ends the run, like $finish */
