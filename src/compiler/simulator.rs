@@ -76181,7 +76181,10 @@ impl Simulator {
                 // assignment. Its STATIC answers (a signal's declared width, a
                 // declared local/module width) are remembered per identifier
                 // span; the class-property and default answers are not.
-                let leaf_key = if is_ambiguous_leaf {
+                // Synthetic identifiers all carry the dummy (0, 0) span and
+                // must not share a cache slot: a never-driven trireg's implicit
+                // self-driver read a 1-bit width from another synthetic name.
+                let leaf_key = if is_ambiguous_leaf && !(h.span.start == 0 && h.span.end == 0) {
                     let k = (h.span.start as usize, h.span.end as usize);
                     if let Some(&w) = self.lhs_leaf_width_cache.get(&k) {
                         return w;
