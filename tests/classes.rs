@@ -235,6 +235,8 @@ mod struct_prop_whole_copy;
 mod randomize_obj_array_property;
 #[path = "classes/static_assoc_struct_pool.rs"]
 mod static_assoc_struct_pool;
+#[path = "classes/static_instance_assoc_object.rs"]
+mod static_instance_assoc_object;
 #[path = "classes/static_collection_qualified_access.rs"]
 mod static_collection_qualified_access;
 #[path = "classes/vif_static_roundtrip.rs"]

@@ -90255,17 +90255,25 @@ impl Simulator {
             let r = name.to_string();
             return r;
         };
-        // Walk ctx's inheritance chain for a STATIC collection property.
-        // Static collections are registered in `static_collections`
-        // (name, is_assoc, width) — NOT queue_properties/assoc_properties,
-        // which are gated to non-static members during elaboration.
-        let mut cur = Some(ctx.clone());
+        self.spec_static_coll_key_in_class(name, &ctx)
+    }
+
+    /// Resolve a bare static-collection member `name` to its storage key,
+    /// walking the class hierarchy of the given concrete class `ctx`.
+    /// Shared by the static-method path (ctx from `class_context_stack`) and
+    /// the instance-method path (ctx from the runtime class of `this`), so
+    /// a static COLLECTION (registered in `static_collections`, not in
+    /// `assoc_properties`/`queue_properties`) read/written BARE from an
+    /// instance method lands in the SAME shared store the static-method path
+    /// (and any `ClassName::m[...]` spelling) uses.
+    fn spec_static_coll_key_in_class(&self, name: &str, ctx: &str) -> String {
+        let mut cur = Some(ctx.to_string());
         while let Some(cn) = cur {
             if let Some(cd) = self.module.classes.get(&cn) {
                 if cd.static_properties.contains(name)
                     && cd.static_collections.iter().any(|(n, _, _)| n == name)
                 {
-                    if let Some(key) = self.static_prop_key(&ctx, name) {
+                    if let Some(key) = self.static_prop_key(&cn, name) {
                         // Rewrite storage to the per-DECLARING-class key ONLY
                         // when the bare name collides across classes (§8.9) or
                         // the class is parameterized (`#spec`). A statically
@@ -90273,18 +90281,6 @@ impl Simulator {
                         // of the runtime uses; rewriting it would split
                         // storage and break the many bare-name accessors
                         // (including the UVM phase machinery).
-                        //
-                        // An INSTANCE method reaches the SAME parameterized
-                        // static cell as a static method (§8.25: a static
-                        // accessed through `this` still belongs to the class's
-                        // per-specialization store). Both must resolve to the
-                        // `#spec` key; otherwise static writes land in
-                        // `base#seq::m` while an instance-method read looks up
-                        // the bare `m` and returns a DIFFERENT (empty) cell.
-                        // Non-parameterized / non-colliding statics retain the
-                        // bare name, so instance collections (which never match
-                        // the static-collection check) and the phase machinery
-                        // are unaffected.
                         if key.contains('#') || self.static_coll_name_collides(name) {
                             return key;
                         }
@@ -92428,6 +92424,18 @@ impl Simulator {
                 Some(owner) => format!("{}::{}", owner, name),
             });
         }
+        // §8.25: a STATIC collection member (registered in `static_collections`, so
+        // absent from `assoc_properties`/`queue_properties`/`class_coll_index`)
+        // accessed BARE from an INSTANCE method must still resolve to the class's
+        // shared static store — the same cell a static method (`spec_static_coll_key`)
+        // and a `ClassName::m[...]` spelling use. Without this the element write
+        // `m[k]=v` and later `m[k]`/`m.exists(k)` resolve to DIFFERENT stores
+        // (the write auto-created a fresh empty cell), so values read back `x`/0
+        // and `exists` is false — uvm_config_db's `m_waiters` waiter map broke
+        // exactly this way. Uses the runtime class of `this` as the concrete ctx.
+        if self.collection_is_static_in(ctx, name) {
+            return Some(self.spec_static_coll_key_in_class(name, ctx));
+        }
         // Miss: only the per-instance type-binding case can still match.
         let mut cur: Option<&str> = Some(ctx);
         while let Some(cn) = cur {
@@ -92841,6 +92849,54 @@ impl Simulator {
                     }
                     let hd = self.eval_expr(&base_expr).to_u64().unwrap_or(0) as usize;
                     return self.handle_collection_name(hd, &h.path[1].name.name);
+                }
+                // `ClassName::coll` — first segment is a CLASS name, not an
+                // object variable. A STATIC collection member (`static T m[..]`)
+                // is stored globally under its bare class-qualified key; route it
+                // there (mirroring the MemberAccess arm above) so
+                // `ClassName::m[key] = v` / reads hit the shared store instead of
+                // `obj_member`, which treats the class name as an object handle
+                // (0 -> None) and silently drops the element.
+                if !h.path[0].selects.is_empty() {
+                    // done below via selects arm — already handled above
+                } else if self.module.classes.contains_key(&h.path[0].name.name) {
+                    let cname = &h.path[0].name.name;
+                    let member = &h.path[1].name.name;
+                    if self.member_is_static_coll(cname, member) {
+                        // §8.25: an EXPLICITLY parameterized access
+                        // (`config_db#(int)::m`) arrives as a bare Ident receiver
+                        // with an active `current_spec`; resolve the per-spec key.
+                        if let Some((cb, cs)) = &self.current_spec {
+                            if cb == cname && self.member_is_static_coll(cb, member) {
+                                let sb = cb.clone();
+                                let ss = cs.clone();
+                                let saved = self.current_spec.take();
+                                self.current_spec = Some((sb.clone(), ss));
+                                let key = self.static_prop_key(&sb, member);
+                                self.current_spec = saved;
+                                return key;
+                            }
+                        }
+                        if self.is_associative_array(member) {
+                            return Some(member.clone());
+                        }
+                        // Fixed-size static array (`ClassName::S[i]`).
+                        if let Some(k) = self.static_fixed_key_in(cname, member) {
+                            return Some(k);
+                        }
+                    }
+                    // A class-LOCAL TYPEDEF alias of a parameterized class
+                    // (member is the alias name, not a real class).
+                    if let Some((tb, ts)) = self.resolve_typedef_spec(cname) {
+                        if self.member_is_static_coll(&tb, member) {
+                            return Some(format!(
+                                "{}#{}::{}",
+                                tb,
+                                self.canonicalize_spec_sig(&tb, &ts),
+                                member
+                            ));
+                        }
+                    }
                 }
                 obj_member(
                     self,
