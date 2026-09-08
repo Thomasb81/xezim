@@ -215,3 +215,5 @@ mod sva_instances_and_sequences;
 mod always_value_change_after_edge_continuation;
 #[path = "scheduling/package_and_unit_delays_scale_by_timescale.rs"]
 mod package_and_unit_delays_scale_by_timescale;
+#[path = "scheduling/clocking_cont_trigger_same_step.rs"]
+mod clocking_cont_trigger_same_step;

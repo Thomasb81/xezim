@@ -112,160 +112,72 @@ and testbench flows. Portable code should not rely on them.
 
 ### Unreleased
 
-* **Method calls on a collection inside sibling instances no longer share
-  the first instance's receiver**: the receiver of `q.push_back(..)`,
-  `q.size()` or `aa.exists(..)` was cached per source line without regard
-  to the instance, so every instance of a module executing that line used
-  the first executing instance's queue; the other instances' queues stayed
-  empty, their `always_comb` size mirrors never woke, and a packed-struct
-  element's fields read 0. Ten per-client BFM request queues collapsed into
-  one and never granted a request.
-* **Packed-struct elements of a queue, dynamic, associative or fixed array
-  declared in a sub-instance now carry their field layout**: `q[i].field`
-  read 0 and `q[0].field = v` was lost inside any instance (the top module
-  was fine), because the inliner registered the container but not the
-  element layout under the instance path. A `for` body or `$display` also
-  runs with no scope hint, so the receiver cache above now keys on the
-  instance-prefixed identifier too — `q.size()` inside a loop in ten
-  sibling instances read the first sibling's queue.
-* **Constrained random: an implication's antecedent is drawn in
-  proportion to the solution space it selects**: without `solve … before`
-  every solution is equally likely (§18.5.10), so `sel inside {0,1,2}`
-  with two narrow address windows and one complement window must land on
-  the complement case almost always; it landed on each case a third of
-  the time because the antecedent was drawn uniformly and the address
-  repaired afterwards. Fired implications now also narrow the ranges of
-  the consequent's properties before they are drawn. An explicit
-  `solve … before` keeps the antecedent uniform.
-* **VPI ports**: `vpi_iterate(vpiPort, module)` yields port objects
-  (`vpiName`, `vpiFullName`, `vpiDirection`, `vpiSize`, value reads through
-  the connected signal) for the top module and for sub-instances; the
-  connected nets and variables keep their `vpiNet`/`vpiReg` types, and a
-  signal handle answers `vpiDirection` with its port's direction. The
-  `vpiPort`, `vpiPortBit`, `vpiDirection` and direction constants are in
-  `include/vpi_user.h`.
-* **Five write-path and scheduling fixes** (an x/z bit-select index writes
-  nothing; a constant continuous assign survives an early settle; NBA to a
-  packed-array element through a virtual interface keeps its width; nested
-  packed-struct member writes land; class unpacked-struct array elements
-  are written where their reads look) — the class array write path is
-  gated on the lvalue's root name so UVM runs pay nothing for it.
-* **Settle passes run in dependency order and clocked monitors stop
-  re-cloning their bodies**: a combinational entry triggered mid-pass by a
-  producer earlier in the same pass was appended to the end of the pass, so
-  the entries that read it had already run and were evaluated again in a
-  second pass (15% of all entry evaluations on a CPU core were repeats).
-  A clocked block that reaches a blocking `begin/end` or a blocking `if`
-  branch on the process path cloned the whole statement list on every
-  activation; the list is immutable and is shared now. A non-blocking
-  assignment whose value already matches the target no longer clones the
-  value before deciding to drop it. Together 5.3% fewer instructions on
-  the C906 CoreMark run; UVM runs unchanged.
-* **Faster process re-parks and two-state execution**: a `forever` loop
-  re-parking on the same `@(...)` wait resolved its sensitivity list from
-  scratch on every iteration; it is now cached per wait site. The two-state
-  executor accesses its registers without bounds checks, which the block
-  compiler already guarantees. The C906 CoreMark run retires 2 % fewer
-  instructions with identical results.
-* **`always @(sig)` no longer goes quiet after a write made inside an edge
-  continuation**: when a process resumed by a clock edge wrote a signal
-  another `always` waits on, the edge scan queued the signal on a list it
-  then discarded, and the signal's "already queued" mark was never
-  cleared, so no later write from any process could wake that block again.
-* **A narrow actual bound to an `int` class-method or constructor formal is
-  zero-extended**: `new(v[25:24])` and even `new(2'b10)` read -2 because
-  the actual was marked signed before it was widened. The same held for a
-  `logic signed [15:0]` or `bit signed [7:0]` formal with literal bounds.
-  Module functions were unaffected.
-* **`#delay` inside a package class, a compilation-unit class, a `$unit`
-  task or function, or a `program` block scales by the timescale in
-  effect**: those scopes were skipped by the delay pre-scaling pass that
-  modules and module-level classes get, so under `timescale 1ns/1ps a
-  `#200` was 200 raw ticks and rounded to zero time. A `timeunit`
-  declared inside a package, previously dropped by the parser, now
-  overrides the file directive for that package.
-* **A three-level handle chain reads correctly from a task inside a
-  sub-instance**: `w.r.c`, where `w` is a task local holding an object whose
-  `r` property is another object, read x inside an instance because the
-  dotted name fell through to hierarchical resolution under the instance's
-  scope; the same chain parenthesised or split in two steps was fine. The
-  identifier evaluator now walks handle chains of any length. A UVM-style
-  BFM host reading `wake_obj.req_item.client_num` from a mailbox-delivered
-  object hit this. A task-local handle that shares its name with a sibling
-  instance (`core.n` next to an instance `core`) likewise read x and now
-  reads the object's property.
-* **Locals declared inside an instance's tasks, functions and blocks shadow
-  the module's own names**: the inliner prefixed every use of a module-level
-  name, sub-instance names included, with the instance path, without regard
-  to an intervening declaration. `begin int u; u = 5; end` overwrote the
-  module-level `u`, a task-local `core` next to an instance `core` read
-  `core.c` as x, and a block-local handle named like the enclosing instance
-  read null. A declaration now shadows for the statements that follow it.
-* **Two-state blocks check for x/z as they load**: before every
-  evaluation of a two-state block the simulator scanned the block's read
-  list for x/z bits, then loaded the same signals again to execute. The
-  check now rides on the loads themselves and a block that meets an x/z
-  bit falls back to the four-state path as before. The C906 CoreMark run retires a further 3.6 % fewer
-  instructions with identical results.
-* **Wide values are handled a word at a time**: copying a value wider
-  than 64 bits into a signal, testing it for x/z, and resizing it walked
-  the bits one at a time; a concatenation wider than 64 bits built a
-  freshly allocated value for every evaluation, 3.5 million times per
-  CoreMark iteration on the C906 core. Copies, x/z tests and resizes now
-  work on 64-bit words, and a concatenation of up to 128 bits is
-  accumulated in two words and written into its register in place.
-  Replicating one bit across a bus (`{N{sel}}`, 1.5 billion copies per
-  iteration on the same core) is a word fill, and a non-blocking value
-  already at its signal's width is moved into place rather than copied.
-  The C906 CoreMark run retires 20 % fewer instructions with
-  identical results; UVM benches are unchanged.
-* **Arithmetic no longer evaluates its operands twice**: to size a `+`, `&`
-  or any other arithmetic/bitwise operator the interpreter asked each
-  operand for its width, and for a property read, an element select or a
-  method call it found that width by evaluating the operand, then
-  evaluated it again for the value. Such operands are now evaluated once
-  and the value reused; widths that are a fixed property of the expression
-  (signals, literals, declared return types and compositions of those) are
-  cached on the node. The axi4 AVIP retires 9 % fewer instructions, a
-  UVM bench on a 5 GHz clock 1.4 % fewer; simulation output is identical.
-* **Parked `wait(cond)` processes are no longer resumed on every tick**: a
-  waiter whose condition reads only its own object's properties or statics
-  (UVM's phase, objection and sequencer waits) stays parked while nothing in
-  the class-property or string-keyed stores has been written, tracked by a
-  store-write generation that every such mutation bumps. Waiters that read
-  RTL signals, locals or free functions keep the unconditional re-check. A
-  UVM bench on a 5 GHz clock retires 11 % fewer instructions; the axi4 AVIP
-  is unchanged; simulation output is identical.
-* **Class methods reach sibling module instances by hierarchical reference**
-  (issue #155, the UVM-MS proxy pattern): a class declared inside a module
-  can read `core.seq` and call `core.get_seq()` on a sibling instance from
-  its methods, and `u_w.p.peek()` calls a method on an object reached by a
-  hierarchical path. Reads used to return 0 and calls were dropped without a
-  message: the object's creation scope was installed as the resolution
-  hint in its `%m` form, the resolver applied that hint only to
-  single-segment names, a hierarchical-path method call matched no
-  subroutine and fell through, and a module-scope class recorded no
-  declaring module for objects built elsewhere.
-* **`bind` with a parameter value assignment is applied**: `bind dut
-  dut_harness #(.NUM_ROWS(NUM_ROWS), .NUM_COLS(NUM_COLS)) v_tl_harness
-  (.*);` was dropped by the parser as an unrecognised directive, so the
-  harness never existed: hierarchical reads of it gave x, task calls into it
-  did nothing, and a scoreboard driven that way passed without ever
-  running. The parameters now reach the bound instance.
-* **A `ref` formal named like its actual no longer overflows the stack**:
-  `task sum(ref int cnt)` called as `sum(cnt)` rewrote the identifier to
-  itself and evaluation re-entered the redirect until the stack was gone;
-  such a formal now resolves straight to the actual's storage, for element
-  reads and writes as well.
-* **Fewer per-identifier lookups inside class methods**: a bare name that
-  no class in the chain declares as a property (a local, a formal, a module
-  signal) used to trigger a class-chain walk with collection-table probes and
-  string clones on every evaluation; the verdict is now cached per class.
-  The struct-or-not question asked on every class property access no longer
-  clones the class name per level or allocates a cycle-guard set, and its
-  negative answer is cached too. An unsized literal reads its width from its
-  cached parse instead of rescanning its text. The axi4 AVIP retires 4.9 %
-  fewer instructions, output identical.
+**Correctness**
+
+* Collections declared in a module keep one copy per instance. Sibling
+  instances of the same module no longer share a queue, dynamic array or
+  associative array, and a packed-struct element of such a collection
+  (`q[i].field`) reads and writes correctly inside any sub-instance. A
+  UVM-style BFM with ten per-client request queues now grants requests.
+* Constrained random: without `solve … before`, the antecedent of an
+  implication is drawn in proportion to the solution space it selects, as
+  §18.5.10 requires, and the consequent's variables are drawn inside the
+  implied ranges. `solve … before` keeps the antecedent uniform.
+* VPI: `vpi_iterate(vpiPort, module)` yields port objects with name,
+  full name, direction and size for the top module and sub-instances, and
+  values read through the connected signal; nets and variables keep their
+  `vpiNet`/`vpiReg` types. `vpiPort`, `vpiPortBit`, `vpiDirection` and the
+  direction values are in `include/vpi_user.h`.
+* Write-path fixes: a bit-select write whose index is x or z modifies
+  nothing; a continuous assign with a constant right-hand side drives its
+  net in a UVM testbench; a non-blocking assignment to a packed-array
+  element through a virtual interface keeps its width; a write to a nested
+  packed-struct member (`f.hdr.d = v`) lands; elements of a class
+  unpacked-struct array read back what was written.
+* `always @(sig)` keeps firing after a write made by a process that a
+  clock edge resumed.
+* A named event or signal written by a process that a clocking block
+  resumed (`##2; -> ev;`) wakes its waiters in the same time step instead
+  of one clock toggle later.
+* A narrow actual bound to an `int`, `logic signed` or `bit signed`
+  class-method or constructor formal is extended correctly (`new(2'b10)`
+  read −2).
+* `#delay` inside a package class, a compilation-unit class, a `$unit`
+  task or function, or a `program` scales by the timescale in effect; a
+  `timeunit` declared inside a package is honoured.
+* Handle chains of any length (`w.r.c`) read correctly from a task inside a
+  sub-instance, including a task-local handle named like a sibling
+  instance.
+* Locals declared inside an instance's tasks, functions and blocks shadow
+  the module's own names.
+* `bind` with a parameter value assignment is applied; previously the
+  bound harness never existed.
+* A `ref` formal named like its actual no longer overflows the stack.
+* Class methods reach sibling module instances by hierarchical reference
+  (issue #155): `core.seq`, `core.get_seq()` and `u_w.p.peek()` work from a
+  method of a class declared inside a module.
+
+**Performance** (instruction counts, output identical)
+
+* Clocked monitor blocks that contain a rare `#delay` run compiled instead
+  of interpreted, with the same process semantics: 0.3 % fewer instructions
+  on C906 CoreMark.
+* Combinational settle passes evaluate each entry once per pass, and
+  clocked blocks with a blocking statement no longer copy their body on
+  every activation: 5.3 % fewer instructions on the C906 CoreMark run.
+* Two-state blocks check for x/z as they load: 3.6 % fewer on C906
+  CoreMark.
+* Wide values (over 64 bits) are copied, tested and resized a word at a
+  time; 128-bit concatenations and single-bit replications are built in
+  place: 20 % fewer on C906 CoreMark.
+* Faster process re-parks and two-state block execution:
+  2 % fewer on C906 CoreMark.
+* Arithmetic operands are evaluated once when their width is needed: 9 %
+  fewer on the axi4 AVIP.
+* Parked `wait(cond)` processes that read only class state stay parked
+  until that state changes: 11 % fewer on a UVM bench.
+* Fewer per-identifier lookups inside class methods: 4.9 % fewer on the
+  axi4 AVIP.
 
 ### 0.10.5 — class covergroups, DPI exports and unit scope, faster UVM (September 2026)
 * **Typedef'd packed arrays keep their dimensions inside instances**: a
@@ -811,15 +723,6 @@ single command when `../xezim-core` exists.
 `cargo tree -p xezim-core` shows which copy is in use (a path in parentheses
 means your local checkout is active).
 
-**Bumping the pin** (after pushing core): from this repo,
-
-```bash
-git -C ../xezim-core rev-parse origin/main   # the freshly pushed rev
-# edit both rev = "..." fields in Cargo.toml to that hash, commit, push
-```
-
-CI builds the bare-clone path on every push, so a mismatched pin fails
-loudly instead of producing a subtly incompatible binary.
 
 ---
 
@@ -1165,24 +1068,6 @@ mixed-timescale design; give it a source `` `timescale `` or a
 IEEE 1800 §3.14.2.2; xezim uses `1ns/1ns` for both delays and `$realtime`, so
 an untimed module's `#1` is one nanosecond — declare a timescale explicitly when
 you mean something else.)
-
----
-
-# Development Workflow
-
-Typical development loop:
-
-```
-edit code
-↓
-cargo build
-↓
-run tests
-↓
-add new SystemVerilog features
-```
-
-Rust provides strong guarantees for memory safety and concurrency, making it well suited for building large-scale EDA infrastructure.
 
 ---
 
