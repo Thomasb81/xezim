@@ -27,6 +27,8 @@ mod ansi_port_name_with_unpacked_dim;
 mod array_element_declared_signedness;
 #[path = "types/array_parameter.rs"]
 mod array_parameter;
+#[path = "types/nested_packed_member_lvalue.rs"]
+mod nested_packed_member_lvalue;
 #[path = "types/array_query_multidim_packed.rs"]
 mod array_query_multidim_packed;
 #[path = "types/assoc_of_queue_enumeration.rs"]
@@ -366,3 +368,5 @@ mod real_to_integral_local;
 mod system_function_result_width;
 #[path = "types/packed_member_select_name_collision.rs"]
 mod packed_member_select_name_collision;
+#[path = "types/bit_write_unknown_index_discarded.rs"]
+mod bit_write_unknown_index_discarded;
