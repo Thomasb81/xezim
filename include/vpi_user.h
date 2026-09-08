@@ -50,6 +50,8 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiNetBit             37
 #define vpiParameter          41
 #define vpiPartSelect         42   /* part-select / packed-struct member */
+#define vpiPort               44   /* module port */
+#define vpiPortBit            45   /* bit of vector module port */
 #define vpiRealVar            47   /* real variable */
 #define vpiReg                48   /* scalar or vector reg (4-state) */
 #define vpiRegBit             49
@@ -123,13 +125,21 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiDefName             9   /* module definition name */
 #define vpiScalar             17
 #define vpiVector             18
-#define vpiSigned             65
+#define vpiDirection          20
+
+/* --- vpiDirection values --------------------------------------------- */
+#define vpiInput               1
+#define vpiOutput              2
+#define vpiInout               3
+#define vpiMixedIO             4
+#define vpiNoDirection         5
 
 /* --- vpi_time types --------------------------------------------------- */
 #define vpiScaledRealTime      1
 #define vpiSimTime             2
 #define vpiSuppressTime        3
 
+#define vpiSigned             65
 /* --- vpi_control operations ------------------------------------------- */
 #define vpiStop               66   /* ends the run, like $stop */
 #define vpiFinish             67   /* ends the run, like $finish */
