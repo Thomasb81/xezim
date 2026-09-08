@@ -237,6 +237,8 @@ mod randomize_obj_array_property;
 mod static_assoc_struct_pool;
 #[path = "classes/static_instance_assoc_object.rs"]
 mod static_instance_assoc_object;
+#[path = "classes/typedef_receiver_static_task.rs"]
+mod typedef_receiver_static_task;
 #[path = "classes/static_collection_qualified_access.rs"]
 mod static_collection_qualified_access;
 #[path = "classes/vif_static_roundtrip.rs"]

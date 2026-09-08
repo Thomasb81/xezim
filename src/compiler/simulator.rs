@@ -38925,50 +38925,89 @@ impl Simulator {
                     // (the `::` static form). Stage 1b already tried — and
                     // failed — to resolve the receiver as a handle, so a
                     // bare class name reaching here is a static call.
-                    let scoped: Option<(String, String)> = match &func.kind {
-                        ExprKind::Ident(h)
-                            if h.path.len() == 2
-                                && self.module.classes.contains_key(&h.path[0].name.name) =>
-                        {
-                            Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
-                        }
-                        ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
-                            // `C#(T)::method(...)` — the receiver is a
-                            // parameterized static class. Stage 1b's receiver
-                            // is a HANDLE; a `Specialization` receiver is a
-                            // TYPE, so it reaches here (static form). Build
-                            // the concrete specialized class name and classify
-                            // its blocking method like the plain static form.
-                            ExprKind::Specialization { base, type_args_text } => {
-                                let bn = Self::leaf_ident_name(base).unwrap_or_default();
-                                if bn.is_empty() {
-                                    None
-                                } else {
-                                    let spec = format!(
-                                        "{}#({})",
-                                        bn,
-                                        Self::normalize_spec_ws(type_args_text)
-                                    );
-                                    let mut cand = vec![spec.clone(), bn];
-                                    cand.retain(|c| self.module.classes.contains_key(c));
-                                    cand.first()
-                                        .map(|c| (c.clone(), member.name.clone()))
-                                }
-                            }
+                    let scoped: Option<(String, String, Option<(String, String)>)> =
+                        match &func.kind {
                             ExprKind::Ident(h)
-                                if h.path.len() == 1
-                                    && self
-                                        .module
-                                        .classes
-                                        .contains_key(&h.path[0].name.name) =>
+                                if h.path.len() == 2
+                                    && self.module.classes.contains_key(&h.path[0].name.name) =>
                             {
-                                Some((h.path[0].name.name.clone(), member.name.clone()))
+                                Some((h.path[0].name.name.clone(), h.path[1].name.name.clone(), None))
                             }
+                            ExprKind::Ident(h) if h.path.len() == 2 => {
+                                // A module-scoped TYPEDEF receiver (`T::method`
+                                // where `T` aliases a class or a specialization,
+                                // e.g. `typedef uvm_config_db#(uvm_bitstream_t)
+                                // uvm_config_int;`). The typedef alias is not
+                                // itself a class, so follow it to the real class
+                                // (and its specialization) so a blocking static
+                                // task call is recognized and inlined like the
+                                // `Class::` / `Class#(params)::` spellings.
+                                let tname = &h.path[0].name.name;
+                                let spec = self.resolve_typedef_spec(tname);
+                                spec.clone()
+                                    .map(|(b, _s)| (b, h.path[1].name.name.clone(), spec))
+                                    .or_else(|| {
+                                        self.resolve_simple_typedef_class(tname)
+                                            .map(|c| (c, h.path[1].name.name.clone(), None))
+                                    })
+                            }
+                            ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
+                                // `C#(T)::method(...)` — the receiver is a
+                                // parameterized static class. Stage 1b's receiver
+                                // is a HANDLE; a `Specialization` receiver is a
+                                // TYPE, so it reaches here (static form). Build
+                                // the concrete specialized class name and classify
+                                // its blocking method like the plain static form.
+                                ExprKind::Specialization { base, type_args_text } => {
+                                    let bn = Self::leaf_ident_name(base).unwrap_or_default();
+                                    if bn.is_empty() {
+                                        None
+                                    } else {
+                                        let spec = format!(
+                                            "{}#({})",
+                                            bn,
+                                            Self::normalize_spec_ws(type_args_text)
+                                        );
+                                        let mut cand = vec![spec.clone(), bn];
+                                        cand.retain(|c| self.module.classes.contains_key(c));
+                                        cand.first()
+                                            .map(|c| (c.clone(), member.name.clone(), None))
+                                    }
+                                }
+                                ExprKind::Ident(h) if h.path.len() == 1 => {
+                                    let bn = &h.path[0].name.name;
+                                    if self.module.classes.contains_key(bn) {
+                                        Some((bn.clone(), member.name.clone(), None))
+                                    } else {
+                                        // A module/package TYPEDEF receiver
+                                        // (`uvm_config_int::wait_modified` where
+                                        // `typedef uvm_config_db#(uvm_bitstream_t)
+                                        // uvm_config_int;`): the typedef alias is
+                                        // not itself a class, so the static-call
+                                        // dispatcher must follow it to the real
+                                        // class (and its specialization, so the
+                                        // static-collection store keys match the
+                                        // `Class#(params)::` spelling) before
+                                        // inlining a blocking task. Otherwise the
+                                        // call is treated as synchronous and its
+                                        // event wait spins forever.
+                                        let spec = self.resolve_typedef_spec(bn);
+                                        let simple = if spec.is_none() {
+                                            self.resolve_simple_typedef_class(bn)
+                                                .map(|c| (c.clone(), member.name.clone(), None))
+                                        } else {
+                                            None
+                                        };
+                                        spec.clone()
+                                            .map(|(b, _s)| (b, member.name.clone(), spec))
+                                            .or(simple)
+                                    }
+                                }
+                                _ => None,
+                            },
                             _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some((cls, mn)) = scoped {
+                        };
+                    if let Some((cls, mn, tf_spec)) = scoped {
                         // A `C#(params)::task` receiver dispatches on the
                         // bare class but must ALSO establish the receiver
                         // specialization as `current_spec`, or a bare type
@@ -38982,15 +39021,22 @@ impl Simulator {
                         // locals with `type_bindings={T:"T"}`, casting to
                         // `uvm_callback` failed, and every `$cast` inside the
                         // callback `get_all` saw a plain `uvm_callback` with
-                        // no callbacks.
-                        let mut recv_spec: Option<(String, String)> = None;
-                        if let ExprKind::MemberAccess { expr: mrecv, .. } = &func.kind {
-                            if let ExprKind::Specialization { .. } = &mrecv.kind {
-                                recv_spec = self
-                                    .resolve_call_spec_params(
-                                        Self::extract_call_spec(&func.clone()),
-                                        &self.current_spec.clone(),
-                                    );
+                        // no callbacks. A TYPEDEF receiver (`T::task`, T a
+                        // typedef alias of a parameterized class) has no
+                        // `Specialization` receiver to seed `current_spec`
+                        // from, so `tf_spec` (resolved when the typedef was
+                        // followed to its class above) carries the same
+                        // specialization here.
+                        let mut recv_spec: Option<(String, String)> = tf_spec;
+                        if recv_spec.is_none() {
+                            if let ExprKind::MemberAccess { expr: mrecv, .. } = &func.kind {
+                                if let ExprKind::Specialization { .. } = &mrecv.kind {
+                                    recv_spec = self
+                                        .resolve_call_spec_params(
+                                            Self::extract_call_spec(&func.clone()),
+                                            &self.current_spec.clone(),
+                                        );
+                                }
                             }
                         }
                         if let Some((td, mclass)) = self.resolve_class_task(&cls, &mn) {
