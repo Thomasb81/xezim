@@ -17967,6 +17967,14 @@ impl Simulator {
                     // clk)` paced response streamed with zero latency).
                     || (!all_level && Self::stmt_contains_event_control(&body))
                 {
+                    // This body already leaves the edge path for the process path
+                    // (§9.2.2: edges arriving mid-flight are missed). A compiled process
+                    // FSM implements the same semantics without the per-activation AST
+                    // walk; use it whenever the body compiles (c906's tb monitors: an
+                    // else-chain ending in a rare `#10`, ~9% of the run).
+                    if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
+                        return None;
+                    }
                     let forever_stmt = Statement::new(
                         StatementKind::Forever {
                             body: Box::new(ab.stmt.clone()),
@@ -18142,6 +18150,11 @@ impl Simulator {
             &self.widths,
         );
         compiler.allow_waits = true;
+        // System-task statements (`$display`, `$write`, `$finish`, ...)
+        // lower to statement fallbacks; the gate below admits only those,
+        // and only because the body has no process locals for the
+        // interpreter to miss (LoadProcessLocal is rejected there).
+        compiler.allow_ast_fallback = true;
         compiler.set_scope_hint(scope_hint);
         compiler.set_tasks(&self.module.tasks);
         compiler.set_functions(&self.module.functions);
@@ -18228,7 +18241,14 @@ impl Simulator {
         // Gate: fallback-free, at least one wait (else it belongs on the
         // comb/edge paths), and no process-local frame reads (the FSM has
         // no AST call frames).
-        if cb.has_fallback
+        let non_systask_fallback = cb.instructions.iter().any(|i| match i {
+            Insn::StmtFallback(payload) => !matches!(
+                &payload.0.kind,
+                StatementKind::Expr(e) if matches!(&e.kind, ExprKind::SystemCall { .. })
+            ),
+            _ => false,
+        });
+        if non_systask_fallback
             || cb.instructions
                 .iter()
                 .any(|i| matches!(i, Insn::LoadProcessLocal(..)))
@@ -38216,6 +38236,16 @@ impl Simulator {
     /// payload marker), then settle — the same scheduling boundary
     /// `run_fast_delay_always` maintains.
     fn run_proc_fsm(&mut self, pid: usize) {
+        // The FSM gate admits only system-task statement fallbacks
+        // (`$display` and friends); they are the design, not a compile
+        // gap, so they must not show up in the edge path's `fallbacks=`
+        // coverage statistic.
+        let fallbacks_before = self.prof_fallback_insns;
+        self.run_proc_fsm_inner(pid);
+        self.prof_fallback_insns = fallbacks_before;
+    }
+
+    fn run_proc_fsm_inner(&mut self, pid: usize) {
         self.current_pid = pid;
         let Some(mut f) = self.proc_fsm.remove(&pid) else {
             return;
@@ -71763,12 +71793,14 @@ impl Simulator {
     /// samples (§14.13). Mirrors the Active-region waiter run loop.
     fn drain_deferred_clocking_conts(&mut self) {
         let mut guard = 0u32;
+        let mut ran_any = false;
         while !self.deferred_clocking_conts.is_empty() {
             let conts = std::mem::take(&mut self.deferred_clocking_conts);
             for (pid, stmts) in conts {
                 if self.finished {
                     break;
                 }
+                ran_any = true;
                 self.run_scheduled_process(pid, &stmts);
                 if !self.is_pid_suspended(pid) {
                     self.child_finished(pid);
@@ -71781,6 +71813,21 @@ impl Simulator {
             if self.finished || guard > 10_000 {
                 break;
             }
+        }
+        // These continuations run after the tick's edge pass. A named event
+        // or signal they write (`##2; -> ev;`) had no pass left to wake its
+        // `@(ev)` / `@(sig)` waiters, which then resumed one tick late
+        // (a clocking-synchronised trigger was seen a clock toggle after
+        // it fired). Give their writes the same edge pass the clocking
+        // mirror gets above.
+        if ran_any && !self.finished {
+            self.settle_combinatorial();
+            let saved = self.edge_dispatch_phase;
+            self.edge_dispatch_phase = "clocking-conts";
+            self.check_edges();
+            self.edge_dispatch_phase = saved;
+            let limit = self.cascade_limit;
+            let _ = self.drain_edge_cascade(limit);
         }
     }
 
