@@ -3068,22 +3068,39 @@ fn dyn_bit_index(v: &Value) -> Option<usize> {
     Some(v.to_u64().unwrap_or(0) as usize)
 }
 
+/// Every array access in a compiled block lands here; on a CPU core all of
+/// them are `Dense` (a bounds check and an add), so that arm is inlined
+/// at the thirteen call sites and only the name-keyed lookup stays out of
+/// line.
+#[inline(always)]
 fn resolve_bytecode_array_elem(
     array: &super::bytecode::ArrayOperand,
     idx: i64,
     array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
     signal_name_to_id: &HashMap<Arc<str>, usize>,
 ) -> Option<usize> {
+    if let super::bytecode::ArrayOperand::Dense {
+        first_id, lo, hi, ..
+    } = array
+    {
+        return if idx >= *lo && idx <= *hi {
+            Some(*first_id + (idx - *lo) as usize)
+        } else {
+            None
+        };
+    }
+    resolve_bytecode_array_elem_named(array, idx, array_first_id, signal_name_to_id)
+}
+
+#[inline(never)]
+fn resolve_bytecode_array_elem_named(
+    array: &super::bytecode::ArrayOperand,
+    idx: i64,
+    array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
+    signal_name_to_id: &HashMap<Arc<str>, usize>,
+) -> Option<usize> {
     match array {
-        super::bytecode::ArrayOperand::Dense {
-            first_id, lo, hi, ..
-        } => {
-            if idx >= *lo && idx <= *hi {
-                Some(*first_id + (idx - *lo) as usize)
-            } else {
-                None
-            }
-        }
+        super::bytecode::ArrayOperand::Dense { .. } => None,
         super::bytecode::ArrayOperand::Named(name) => array_first_id
             .get(name.as_str())
             .and_then(|&(first, lo, hi)| {
@@ -4751,6 +4768,8 @@ pub struct Simulator {
     cg_type_options: HashMap<String, HashMap<String, Value>>,
     /// Per-call-site receiver expressions for `obj.coll.method()` dispatch.
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
+    /// Reused buffer for `frame_leaf_key_of`'s marker probe.
+    marker_key_scratch: String,
     /// See `lvalue_root_is_unpacked_struct_prop`.
     unpacked_struct_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// Interned scope hints and head identifiers for `method_receiver_cache` keys (see there).
@@ -5539,6 +5558,8 @@ pub struct Simulator {
     /// process path did this every cycle).
     forever_sens_cache: HashMap<(usize, u32), (Vec<SensitivityId>, bool)>,
     forever_cont_cache: HashMap<(usize, usize, usize, usize, u8), Arc<[Statement]>>,
+    /// Pending-injection bitset for `settle_combinatorial_inner` (kept to avoid reallocation).
+    settle_inject_bits: Vec<u64>,
     /// See `blocking_cont_frame`.
     blocking_cont_cache: HashMap<(usize, usize, usize, u8), Arc<[Statement]>>,
     /// §11.8.1: while narrowing relational constraint bounds for a target whose
@@ -8475,6 +8496,7 @@ impl Simulator {
             ref_redirect_hot: false,
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
+            marker_key_scratch: String::new(),
             unpacked_struct_prop_names: std::cell::OnceCell::new(),
             method_receiver_hint_ids: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
@@ -8738,6 +8760,7 @@ impl Simulator {
             prof_par_blocks: 0,
             forever_depth: 0,
             forever_cont_cache: HashMap::default(),
+            settle_inject_bits: Vec::new(),
             blocking_cont_cache: HashMap::default(),
             forever_sens_cache: HashMap::default(),
             constraint_cmp_unsigned: false,
@@ -47462,8 +47485,33 @@ impl Simulator {
         let warn_x_on = self.warn_x && self.time > 0;
         // Profiling counters accumulate in registers and fold back into `self`
         // once, instead of a read-modify-write per evaluation.
-        let mut inject_heap: std::collections::BinaryHeap<std::cmp::Reverse<usize>> =
-            std::collections::BinaryHeap::new();
+        // Dependents injected into the running pass, as a bitset plus the
+        // index of the smallest pending one. A binary heap here cost a
+        // push/pop per dependency edge (~780M per CoreMark run); the bitset
+        // is one OR per injection and a forward word scan per take.
+        let mut inject_bits: Vec<u64> = std::mem::take(&mut self.settle_inject_bits);
+        let words = num_entries.div_ceil(64).max(1);
+        if inject_bits.len() < words {
+            inject_bits.resize(words, 0);
+        }
+        let mut next_inject: usize = usize::MAX;
+        fn next_set_bit(bits: &[u64], from: usize) -> usize {
+            let mut w = from >> 6;
+            if w >= bits.len() {
+                return usize::MAX;
+            }
+            let mut word = bits[w] & (u64::MAX << (from & 63));
+            loop {
+                if word != 0 {
+                    return (w << 6) + word.trailing_zeros() as usize;
+                }
+                w += 1;
+                if w >= bits.len() {
+                    return usize::MAX;
+                }
+                word = bits[w];
+            }
+        }
         let mut n_evals = 0u64;
         let mut n_dc = 0u64;
         let mut n_ab = 0u64;
@@ -47499,7 +47547,10 @@ impl Simulator {
                                 // re-triggered into a second pass. Appending
                                 // it to the pass list ran it last and cost
                                 // 15% more entry evaluations on c906.
-                                inject_heap.push(std::cmp::Reverse(__dep));
+                                inject_bits[__dep >> 6] |= 1u64 << (__dep & 63);
+                                if __dep < next_inject {
+                                    next_inject = __dep;
+                                }
                             } else {
                                 next_list.push(__dep);
                             }
@@ -47544,15 +47595,14 @@ impl Simulator {
             // cache-state interaction we haven't traced yet. Don't
             // re-enable without a c910 t=1 k=0 + t=4 k=4 cmark sanity.
             let mut cur_pos = 0usize;
-            while cur_pos < cur_list.len() || !inject_heap.is_empty() {
-                let eidx = if let Some(&std::cmp::Reverse(h)) = inject_heap.peek() {
-                    if cur_pos < cur_list.len() && cur_list[cur_pos] <= h {
-                        cur_pos += 1;
-                        cur_list[cur_pos - 1]
-                    } else {
-                        inject_heap.pop();
-                        h
-                    }
+            while cur_pos < cur_list.len() || next_inject != usize::MAX {
+                let eidx = if next_inject != usize::MAX
+                    && (cur_pos >= cur_list.len() || next_inject < cur_list[cur_pos])
+                {
+                    let e = next_inject;
+                    inject_bits[e >> 6] &= !(1u64 << (e & 63));
+                    next_inject = next_set_bit(&inject_bits, e + 1);
+                    e
                 } else {
                     cur_pos += 1;
                     cur_list[cur_pos - 1]
@@ -48181,6 +48231,7 @@ impl Simulator {
         self.comb_entries = entries;
         self.comb_dep_offsets = dep_offsets;
         self.comb_dep_entries = dep_entries;
+        self.settle_inject_bits = inject_bits;
         self.settle_triggered = triggered;
         self.settle_triggered_list = next_list;
         self.settle_dirty_ids = cur_list;
@@ -93204,7 +93255,7 @@ impl Simulator {
                 ) {
                     return false;
                 }
-                let lname = h.path[0].name.name.clone();
+                let lname: &str = h.path[0].name.name.as_str();
                 // A bare name that is a PROPERTY of `this` stores per-instance
                 // (each uvm_resource's `val` must keep its own interface);
                 // otherwise the flat local/static key.
@@ -93221,43 +93272,47 @@ impl Simulator {
                     .flatten()
                     .filter(|&th| th != 0)
                 {
-                    let mut cur = self
+                    let mut cur: Option<&str> = self
                         .heap
                         .get(th)
                         .and_then(|o| o.as_ref())
-                        .map(|i| i.class_name.clone());
+                        .map(|i| i.class_name.as_str());
                     while let Some(cn) = cur {
-                        let Some(cd) = self.module.classes.get(&cn) else { break };
-                        if cd.virtual_iface_properties.contains_key(&lname) {
+                        let Some(cd) = self.module.classes.get(cn) else { break };
+                        if cd.virtual_iface_properties.contains_key(lname) {
                             is_vif_prop_of = Some(th);
                             break;
                         }
-                        if cd.properties.contains_key(&lname) {
+                        if cd.properties.contains_key(lname) {
                             is_prop_of = Some(th);
                             break;
                         }
-                        cur = cd.extends.clone();
+                        cur = cd.extends.as_deref();
                     }
                 }
                 if let Some(th) = is_vif_prop_of {
                     if matches!(&rvalue.kind, ExprKind::Null) {
-                        self.virtual_iface_bindings.remove(&(th, lname.clone()));
+                        self.virtual_iface_bindings.remove(&(th, lname.to_string()));
                         return true;
                     }
                     if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
                         self.virtual_iface_bindings
-                            .insert((th, lname.clone()), (nm, None));
+                            .insert((th, lname.to_string()), (nm, None));
                         return true;
                     }
                     return false;
                 }
-                let key = match is_prop_of {
-                    Some(th) => format!("__vif_local__{}#{}", th, lname),
-                    None => format!("__vif_local__{}", lname),
+                let make_key = |is_prop_of: Option<usize>| -> String {
+                    match is_prop_of {
+                        Some(th) => format!("__vif_local__{}#{}", th, lname),
+                        None => format!("__vif_local__{}", lname),
+                    }
                 };
                 if matches!(&rvalue.kind, ExprKind::Null) {
+                    let key = make_key(is_prop_of);
                     self.signals.remove(&key);
                 } else if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
+                    let key = make_key(is_prop_of);
                     self.signals.insert(key, Value::from_string(&nm));
                 }
             }
@@ -100224,12 +100279,17 @@ impl Simulator {
         // `<base>.` marker for each unpacked-struct variable it owns, so an
         // expression rooted anywhere else costs one hash lookup.
         let root = Self::expr_root_ident(e)?;
-        let marker = format!("{}.", root);
-        if !self
+        // `"<root>."` marker probe without allocating: reuse one buffer.
+        let mut marker = std::mem::take(&mut self.marker_key_scratch);
+        marker.clear();
+        marker.push_str(root);
+        marker.push('.');
+        let has = self
             .local_stack
             .last()
-            .is_some_and(|l| l.contains_key(&marker))
-        {
+            .is_some_and(|l| l.contains_key(marker.as_str()));
+        self.marker_key_scratch = marker;
+        if !has {
             return None;
         }
         let flat = self.flat_member_name(e)?;
