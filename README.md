@@ -159,6 +159,11 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* Combinational settle passes track entries triggered mid-pass in a bitset
+  instead of a heap, array element accesses in compiled blocks resolve
+  inline, and an assignment whose value already has the target width copies
+  it directly: 5.6 % fewer instructions on the C906 CoreMark run and 1 %
+  fewer on the axi4 AVIP.
 * Clocked monitor blocks that contain a rare `#delay` run compiled instead
   of interpreted, with the same process semantics: 0.3 % fewer instructions
   on C906 CoreMark.
