@@ -378,6 +378,25 @@ fn cached_env_flag(name: &'static str, slot: &'static OnceLock<bool>) -> bool {
     *slot.get_or_init(|| std::env::var(name).ok().as_deref() == Some("1"))
 }
 
+
+fn cached_env_set(name: &'static str, slot: &'static OnceLock<bool>) -> bool {
+    *slot.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+macro_rules! env_set_cached {
+    ($name:literal) => {{
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        cached_env_set($name, &FLAG)
+    }};
+}
+
+macro_rules! env_is_one_cached {
+    ($name:literal) => {{
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        cached_env_flag($name, &FLAG)
+    }};
+}
+
 fn xz_copy_debug_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("XEZIM_CP_DBG").is_some())
@@ -2377,10 +2396,66 @@ impl TimingWheel {
     }
 }
 
+/// Bumped by every mutation of the STRING-KEYED stores a parked `wait(cond)`
+/// can depend on: class properties (`PropMap`), the runtime signal map
+/// (`SignalMap`), and every procedural / name-based NBA assignment. The
+/// id-based RTL signal table is deliberately NOT counted: a clock toggle must
+/// not re-arm the UVM housekeeping waits (see `drain_condition_waiters`).
+static STORE_WRITE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn bump_store_gen() {
+    STORE_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn store_gen() -> u64 {
+    STORE_WRITE_GEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A class object's property map. Reads deref to the plain map; every
+/// mutating entry point bumps `STORE_WRITE_GEN`, so no write site can be
+/// missed by the condition-waiter gate.
+#[derive(Debug, Clone, Default)]
+struct PropMap(HashMap<String, Value>);
+
+impl PropMap {
+    #[inline]
+    fn insert(&mut self, k: String, v: Value) -> Option<Value> {
+        bump_store_gen();
+        self.0.insert(k, v)
+    }
+    #[inline]
+    fn get_mut(&mut self, k: &str) -> Option<&mut Value> {
+        bump_store_gen();
+        self.0.get_mut(k)
+    }
+    #[inline]
+    fn remove(&mut self, k: &str) -> Option<Value> {
+        bump_store_gen();
+        self.0.remove(k)
+    }
+}
+
+impl std::ops::Deref for PropMap {
+    type Target = HashMap<String, Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a PropMap {
+    type Item = (&'a String, &'a Value);
+    type IntoIter = <&'a HashMap<String, Value> as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ClassInstance {
     class_name: String,
-    properties: HashMap<String, Value>,
+    properties: PropMap,
     /// Maps a class TYPE-parameter name (e.g. `T` in
     /// `class Mk #(type T=Base)`) to the concrete class name it was
     /// specialized with (e.g. `Base`). Populated by
@@ -2431,6 +2506,9 @@ struct SvaClockedSite {
     /// Unique identifier (hash of span position) so dedup across
     /// re-executions is cheap.
     span_key: usize,
+    /// 0 assert, 1 assume, 2 cover (§16.5): a cover miss is not a failure
+    /// and fires no else-action; a cover match fires the pass action.
+    kind: u8,
     /// Resolved signal name for the clock; we re-resolve to value
     /// each tick rather than caching an id (small site count).
     clock_signal: String,
@@ -2475,9 +2553,19 @@ struct SvaClockedSite {
     sampled_ids: Vec<usize>,
 }
 
+/// Covergroup handles live above this tag; class handles are plain heap indices.
+const CG_HANDLE_TAG: usize = 1 << 30;
+
 #[derive(Debug, Clone)]
 struct CovergroupInstance {
     cg_name: String,
+    /// The object whose constructor ran `cg = new` (a class-body
+    /// covergroup): coverpoint expressions read ITS properties, so sampling
+    /// from outside the class (`e.cg.sample()`) evaluates with this `this`.
+    owner: Option<usize>,
+    /// §19.3 constructor formals bound at `new(...)`: visible to coverpoint
+    /// expressions, bins and options of this instance.
+    ctor_args: Vec<(String, Value)>,
     /// Hits: coverpoint_name -> Set of observed values
     point_hits: HashMap<String, HashSet<Value>>,
     /// Cross hits: cross_name -> Set of observed tuples
@@ -2553,6 +2641,17 @@ enum FsmWait {
     Edge(u32),
 }
 
+/// One clocking block's per-tick poll state: its clock resolved to a
+/// signal-table id once (None: fall back to the by-name read), the edge it
+/// advances on, and the level seen on the previous tick.
+struct ClockingTick {
+    cb: String,
+    clk: String,
+    id: Option<usize>,
+    edge: EdgeKind,
+    prev: u8,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
@@ -2576,6 +2675,10 @@ struct ProcessContext {
     local_iface_aliases: Vec<HashMap<String, String>>,
     ref_binding_stack: Vec<HashMap<String, Expression>>,
     ref_alias_stack: Vec<HashMap<String, String>>,
+    /// §13.5.2 `ref` formals bound by IDENTITY (aggregates with no storage of
+    /// their own); element accesses on them are rewritten onto the actual.
+    /// Pushed/popped in lockstep with `ref_binding_stack`.
+    ref_identity_stack: Vec<Vec<String>>,
     queue_frame_saves: Vec<HashMap<String, QueueLocalSave>>,
     task_cleanup: Vec<TaskCleanup>,
     // Per-call-frame map of a local dynamic-array/queue/assoc LOCAL's bare
@@ -2951,22 +3054,57 @@ fn bytecode_array_elem_width(
         .max(1)
 }
 
+/// §11.5.1: the effective index of a DYNAMIC bit-select. `None` when the index
+/// contains x or z, in which case a WRITE must be discarded ("no bits shall be
+/// modified") and a read yields x.
+///
+/// `Value::to_u64` masks x bits to ZERO and returns `Some(0)` rather than
+/// `None`, so it cannot answer this question. Every dynamic bit-store used
+/// `to_u64().unwrap_or(0)` and therefore wrote BIT 0 whenever the index was
+/// unknown. Out-of-range indices need no help here: `Value::set_bit` already
+/// drops them. Same defect, and same fix, as the `LoadArrayElem` x-index
+/// sentinel on the read side.
+#[inline]
+fn dyn_bit_index(v: &Value) -> Option<usize> {
+    if v.has_xz() {
+        return None;
+    }
+    Some(v.to_u64().unwrap_or(0) as usize)
+}
+
+/// Every array access in a compiled block lands here; on a CPU core all of
+/// them are `Dense` (a bounds check and an add), so that arm is inlined
+/// at the thirteen call sites and only the name-keyed lookup stays out of
+/// line.
+#[inline(always)]
 fn resolve_bytecode_array_elem(
     array: &super::bytecode::ArrayOperand,
     idx: i64,
     array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
     signal_name_to_id: &HashMap<Arc<str>, usize>,
 ) -> Option<usize> {
+    if let super::bytecode::ArrayOperand::Dense {
+        first_id, lo, hi, ..
+    } = array
+    {
+        return if idx >= *lo && idx <= *hi {
+            Some(*first_id + (idx - *lo) as usize)
+        } else {
+            None
+        };
+    }
+    resolve_bytecode_array_elem_named(array, idx, array_first_id, signal_name_to_id)
+}
+
+#[inline(never)]
+fn resolve_bytecode_array_elem_named(
+    array: &super::bytecode::ArrayOperand,
+    idx: i64,
+    array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
+    signal_name_to_id: &HashMap<Arc<str>, usize>,
+) -> Option<usize> {
     match array {
-        super::bytecode::ArrayOperand::Dense {
-            first_id, lo, hi, ..
-        } => {
-            if idx >= *lo && idx <= *hi {
-                Some(*first_id + (idx - *lo) as usize)
-            } else {
-                None
-            }
-        }
+        super::bytecode::ArrayOperand::Dense { .. } => None,
         super::bytecode::ArrayOperand::Named(name) => array_first_id
             .get(name.as_str())
             .and_then(|&(first, lo, hi)| {
@@ -3193,6 +3331,7 @@ impl SignalMap {
     }
 
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
+        bump_store_gen();
         if let Some(b) = Self::base_of(&k) {
             if !self.map.contains_key(&k) {
                 self.elems
@@ -3205,6 +3344,7 @@ impl SignalMap {
     }
 
     pub fn remove(&mut self, k: &str) -> Option<Value> {
+        bump_store_gen();
         let r = self.map.remove(k);
         if r.is_some() {
             if let Some(b) = Self::base_of(k) {
@@ -3245,6 +3385,34 @@ impl SignalMap {
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Borrowing form of `keys_with_elem_prefix`: the element keys under
+    /// `prefix` (which must end in `[`) without cloning them.
+    pub fn elem_keys_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        let base = &prefix[..prefix.len().saturating_sub(1)];
+        let outer = Self::base_of(base).unwrap_or(base);
+        self.elems
+            .get(outer)
+            .into_iter()
+            .flat_map(|set| set.iter().map(|k| k.as_str()))
+            .filter(move |k| k.starts_with(prefix))
+    }
+
+    /// Is any key under the outermost base of `prefix` prefixed by it?
+    /// Every key that contains `[` is indexed under the text before its
+    /// FIRST `[`, so `obj[k][j]` and `obj[k].field` are both found under
+    /// `obj`; this replaces a scan of the whole map.
+    pub fn any_key_with_prefix(&self, prefix: &str) -> bool {
+        let Some(outer) = Self::base_of(prefix) else {
+            return self.map.keys().any(|k| k.starts_with(prefix));
+        };
+        self.elems
+            .get(outer)
+            .is_some_and(|set| set.iter().any(|k| k.starts_with(prefix)))
+    }
 }
 
 impl std::ops::Deref for SignalMap {
@@ -3256,6 +3424,7 @@ impl std::ops::Deref for SignalMap {
 
 impl std::ops::DerefMut for SignalMap {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        bump_store_gen();
         &mut self.map
     }
 }
@@ -3280,8 +3449,12 @@ enum CombPlan {
 
 pub struct Simulator {
     pub signals: SignalMap,
+    vpi_port_directions: HashMap<String, PortDirection>,
     /// Signals currently under force/release control (LRM §9.3.1).
     forced_signals: HashMap<usize, Value>,
+    /// Nets released while a settle pass was running (the entry table is
+    /// taken out then); re-driven when the pass ends.
+    pending_release_ids: Vec<usize>,
     /// Memoization for `prop_bound_collection`: (class, member) → resolved
     /// raw type name (hierarchy walk), and type name → is-collection verdict
     /// (which otherwise LINEAR-SCANS every class's local typedefs — 5% of an
@@ -3323,6 +3496,15 @@ pub struct Simulator {
     /// `Some(class)` = static fixed array owned by that class.
     #[allow(clippy::type_complexity)]
     class_coll_index: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
+    /// Per class: bare names that NO class in its inheritance chain declares
+    /// as a property (locals, module signals, method formals). Every bare
+    /// identifier evaluated inside a class method asked
+    /// `instance_assoc_member`, which walked the chain and probed the
+    /// collection tables per level, on every evaluation; such a name can
+    /// never become a collection member, so the verdict is cached.
+    class_non_member_cache: std::cell::RefCell<HashMap<String, HashSet<String>>>,
+    /// Per class: properties that are NOT structs (see `class_prop_struct`).
+    class_prop_struct_neg: std::cell::RefCell<HashMap<String, HashSet<String>>>,
     name_stats: [std::cell::Cell<u64>; 5],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
@@ -3639,6 +3821,11 @@ pub struct Simulator {
     clocking_output_pending: HashMap<String, Vec<(String, Value)>>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
+    /// Per-tick clock poll table for `tick_clocking_blocks` (see there).
+    clocking_tick_cache: Vec<ClockingTick>,
+    /// Buffer-collapse exclusions (override-target leaves, procedural write
+    /// names), collected once while the process bodies are still present.
+    buf_collapse_write_sets: Option<(HashSet<String>, HashSet<String>)>,
     /// LRM §14.3: each clocking block's clock EDGE (`@(posedge/negedge clk)`).
     /// `tick_clocking_blocks` and `@(cb)` resolution consult this so a
     /// `@(negedge clk)` block samples/advances on the negedge, not the posedge.
@@ -4583,6 +4770,32 @@ pub struct Simulator {
     /// elements keep the legacy copy-in/copy-out path (entry absent here).
     /// Pushed/popped in lockstep with `ref_binding_stack`.
     ref_alias_stack: Vec<HashMap<String, String>>,
+    /// §13.5.2 `ref` formals bound by IDENTITY (aggregates with no storage of
+    /// their own); element accesses on them are rewritten onto the actual.
+    /// Pushed/popped in lockstep with `ref_binding_stack`.
+    ref_identity_stack: Vec<Vec<String>>,
+    /// True while the top ref frame has an aliased or identity-bound formal —
+    /// the only state in which `ref_formal_redirect_*` can rewrite anything.
+    /// Maintained on push/pop/take/restore so the hot paths test one bool.
+    ref_redirect_hot: bool,
+    /// §19.7.1 `cg::type_option.<field>` per covergroup TYPE (weight, goal,
+    /// comment, strobe, merge_instances), seeded from the body's
+    /// `type_option.f = v;` items on first access.
+    cg_type_options: HashMap<String, HashMap<String, Value>>,
+    /// Per-call-site receiver expressions for `obj.coll.method()` dispatch.
+    method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
+    /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
+    hint_key_scratch: std::cell::RefCell<String>,
+    /// Reused buffer for the `__vif_local__` key probes (`&self` paths).
+    vif_key_scratch: std::cell::RefCell<String>,
+    /// Reused buffer for `frame_leaf_key_of`'s marker probe.
+    marker_key_scratch: String,
+    /// See `lvalue_root_is_unpacked_struct_prop`.
+    unpacked_struct_prop_names: std::cell::OnceCell<HashSet<String>>,
+    /// Interned scope hints and head identifiers for `method_receiver_cache` keys (see there).
+    method_receiver_hint_ids: HashMap<String, u32>,
+    /// `resolve_typeref_class_name` memo: name -> (scope, class ctx) -> (class-table size, answer).
+    typeref_class_memo: std::cell::RefCell<HashMap<String, HashMap<(String, String), (usize, Option<String>)>>>,
     /// Deferred teardown for inlined blocking task/method calls (LIFO). Each
     /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
     /// in ProcessContext across suspension).
@@ -4605,6 +4818,13 @@ pub struct Simulator {
     cond_waiter_reads: HashMap<usize, HashSet<String>>,
     /// Wait condition expression for each parked waiter.
     cond_waiter_conditions: HashMap<usize, Expression>,
+    /// Per parked condition waiter: `Some(gen)` when every name its
+    /// condition reads is a property or static of its own object (or a
+    /// collection builtin), with the store generation at park time. Such a
+    /// waiter is skipped by the bulk re-schedule while the generation is
+    /// unchanged — nothing it can observe has been written. `None` keeps the
+    /// unconditional re-schedule (RTL signals, locals, calls, no `this`).
+    cond_waiter_gate: HashMap<usize, Option<u64>>,
     /// IEEE 1800-2017 §4.4.2.3 Inactive region: continuations of `#0`
     /// delays park here instead of in the event_queue. The event_queue's
     /// batch drain in `run_one_tick` re-fetches same-time entries into the
@@ -5005,6 +5225,9 @@ pub struct Simulator {
     /// never admitting. Demotion returns such a block to exactly its
     /// pre-admission engine; clean runners keep the fast path.
     ts_exec_aborted: bool,
+    /// Set by a two-state executor that read an x/z bit; the guard reports
+    /// it as an x-read bail (no demotion), not as an abort.
+    ts_xread_bail: bool,
     /// Per-slot mid-exec abort counts; at `TS_ABORT_DEMOTE` the slot flips
     /// to No / Interp for the rest of the run. (Re-promotion after init
     /// settles is future work.)
@@ -5337,6 +5560,28 @@ pub struct Simulator {
     /// already true) would otherwise recurse once per iteration and overflow the
     /// Rust stack; past this depth the continuation goes back to the scheduler.
     forever_depth: u32,
+    /// Continuation frames built by `exec_forever_sched`, keyed by the
+    /// process, the loop body's source span, the index of the statement it
+    /// parked on, and the site kind. The span identifies the LOOP: the
+    /// `ForeverTail` inside each continuation carries a clone of the body,
+    /// so an address key would change on every iteration (the first cut of
+    /// this cache missed on every wake-up and grew without bound). The
+    /// process id keeps two inlined instances of the same source loop —
+    /// same span, different rewritten names — apart. Before this cache
+    /// every wake-up of a `forever @(posedge clk)` / `always` process
+    /// deep-cloned its statement list and its whole body into a fresh
+    /// frame: 5 % of the c906 memcpy steady state was that cloning.
+    /// Resolved sensitivity ids of a `forever` loop's wait, keyed by (pid,
+    /// wait-statement span start): the loop re-parks on the same wait every
+    /// iteration, and resolving it meant rebuilding signal-name strings and
+    /// hashing them per wake-up (a clocked testbench monitor routed to the
+    /// process path did this every cycle).
+    forever_sens_cache: HashMap<(usize, u32), (Vec<SensitivityId>, bool)>,
+    forever_cont_cache: HashMap<(usize, usize, usize, usize, u8), Arc<[Statement]>>,
+    /// Pending-injection bitset for `settle_combinatorial_inner` (kept to avoid reallocation).
+    settle_inject_bits: Vec<u64>,
+    /// See `blocking_cont_frame`.
+    blocking_cont_cache: HashMap<(usize, usize, usize, u8), Arc<[Statement]>>,
     /// §11.8.1: while narrowing relational constraint bounds for a target whose
     /// comparison context is UNSIGNED (the target, or the other operand, is
     /// unsigned), a bound literal must be read by its unsigned value — e.g. the
@@ -5553,6 +5798,10 @@ struct SampledWatch {
     expr: Expression,
     hist: std::collections::VecDeque<Value>,
     depth: usize,
+    /// Time of the most recent sample. A PROCEDURAL `$past` runs before this
+    /// slot's sampler (an SVA site after it), so the reader checks whether the
+    /// current edge is already at the front of `hist` before indexing.
+    last_sample_time: Option<u64>,
 }
 
 /// Empty static used as fallback name for unnamed array-element ids
@@ -5665,6 +5914,13 @@ fn sv_ato_value(text: &str, radix: u32) -> Value {
     }
     v.is_signed = true;
     v
+}
+
+/// The consequent of a class-constraint implication: a constraint item
+/// (`ConstraintItem::Implication`) or the right operand of a `->` expression.
+enum ImpCons<'a> {
+    Item(&'a ConstraintItem),
+    Expr(&'a Expression),
 }
 
 impl Simulator {
@@ -6870,6 +7126,14 @@ impl Simulator {
         for name in module.signals.keys() {
             names.push(name.clone());
         }
+        // Port directions for the VPI layer (`vpiPort` iteration and
+        // `vpiDirection`). Taken here because `module.signals` is freed once
+        // the indexed signal table exists, further down this constructor.
+        let vpi_port_directions: HashMap<String, PortDirection> = module
+            .signals
+            .iter()
+            .filter_map(|(name, signal)| signal.direction.map(|dir| (name.clone(), dir)))
+            .collect();
         for name in module.parameters.keys() {
             // Parameter and signal can share a name — dedup after sort.
             names.push(name.clone());
@@ -7907,11 +8171,13 @@ impl Simulator {
             edge_blocks_with_iff: Vec::new(),
             edge_iff_denied: Vec::new(),
             signals,
+            vpi_port_directions,
             widths,
             signed_signals,
             real_signals,
             multi_dim_array_names,
             forced_signals: HashMap::default(),
+            pending_release_ids: Vec::new(),
             prop_raw_ty_cache: std::cell::RefCell::new(HashMap::default()),
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
@@ -7919,6 +8185,8 @@ impl Simulator {
             force_epoch_gen: 0,
             force_refresh_done_gen: 0,
             class_coll_index: std::cell::RefCell::new(HashMap::default()),
+            class_non_member_cache: std::cell::RefCell::new(HashMap::default()),
+            class_prop_struct_neg: std::cell::RefCell::new(HashMap::default()),
             name_stats: Default::default(),
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
@@ -7985,6 +8253,8 @@ impl Simulator {
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
+            clocking_tick_cache: Vec::new(),
+            buf_collapse_write_sets: None,
             clocking_edge: HashMap::default(),
             clocking_mirror_dirty: false,
             clocking_cycle_pending: HashMap::default(),
@@ -8244,11 +8514,22 @@ impl Simulator {
             auto_loop_vars: Vec::new(),
             ref_binding_stack: Vec::new(),
             ref_alias_stack: Vec::new(),
+            ref_identity_stack: Vec::new(),
+            ref_redirect_hot: false,
+            cg_type_options: HashMap::default(),
+            method_receiver_cache: HashMap::default(),
+            hint_key_scratch: std::cell::RefCell::new(String::new()),
+            vif_key_scratch: std::cell::RefCell::new(String::new()),
+            marker_key_scratch: String::new(),
+            unpacked_struct_prop_names: std::cell::OnceCell::new(),
+            method_receiver_hint_ids: HashMap::default(),
+            typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
             ready_condition_waiters: Vec::new(),
             cond_waiter_reads: HashMap::default(),
             cond_waiter_conditions: HashMap::default(),
+            cond_waiter_gate: HashMap::default(),
             inactive_queue: Vec::new(),
             nba_region_waiters: Vec::new(),
             cond_progress: 0,
@@ -8362,6 +8643,7 @@ impl Simulator {
             prof_ts_bail_xread: 0,
             prof_ts_bail_abort: 0,
             ts_exec_aborted: false,
+            ts_xread_bail: false,
             ts_edge_abortn: Vec::new(),
             ts_comb_abortn: Vec::new(),
             comb_plan_abortn: Vec::new(),
@@ -8501,6 +8783,10 @@ impl Simulator {
             prof_par_ticks: 0,
             prof_par_blocks: 0,
             forever_depth: 0,
+            forever_cont_cache: HashMap::default(),
+            settle_inject_bits: Vec::new(),
+            blocking_cont_cache: HashMap::default(),
+            forever_sens_cache: HashMap::default(),
             constraint_cmp_unsigned: false,
             stall_iters: 0,
             zero_delay_defer_pending: false,
@@ -8851,6 +9137,92 @@ struct ValparamResolveGuard;
 impl Drop for ValparamResolveGuard {
     fn drop(&mut self) {
         VALPARAM_RESOLVING.with(|r| r.borrow_mut().pop());
+    }
+}
+
+/// Builtin collection / string / enum methods `eval_builtin_method`
+/// implements, classified once per call from the method name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BuiltinM {
+    First,
+    Last,
+    Num,
+    Next,
+    Prev,
+    Size,
+    Len,
+    Getc,
+    Substr,
+    PushBack,
+    PushFront,
+    PopFront,
+    PopBack,
+    Sort,
+    Rsort,
+    Reverse,
+    Shuffle,
+    Insert,
+    Sum,
+    Product,
+    And,
+    Or,
+    Xor,
+    Min,
+    Max,
+    Unique,
+    UniqueIndex,
+    Find,
+    FindFirst,
+    FindLast,
+    FindIndex,
+    FindFirstIndex,
+    FindLastIndex,
+    Exists,
+    Delete,
+    Other,
+}
+
+impl BuiltinM {
+    #[inline]
+    fn classify(mname: &str) -> BuiltinM {
+        match mname {
+            "first" => BuiltinM::First,
+            "last" => BuiltinM::Last,
+            "num" => BuiltinM::Num,
+            "next" => BuiltinM::Next,
+            "prev" => BuiltinM::Prev,
+            "size" => BuiltinM::Size,
+            "len" => BuiltinM::Len,
+            "getc" => BuiltinM::Getc,
+            "substr" => BuiltinM::Substr,
+            "push_back" => BuiltinM::PushBack,
+            "push_front" => BuiltinM::PushFront,
+            "pop_front" => BuiltinM::PopFront,
+            "pop_back" => BuiltinM::PopBack,
+            "sort" => BuiltinM::Sort,
+            "rsort" => BuiltinM::Rsort,
+            "reverse" => BuiltinM::Reverse,
+            "shuffle" => BuiltinM::Shuffle,
+            "insert" => BuiltinM::Insert,
+            "sum" => BuiltinM::Sum,
+            "product" => BuiltinM::Product,
+            "and" => BuiltinM::And,
+            "or" => BuiltinM::Or,
+            "xor" => BuiltinM::Xor,
+            "min" => BuiltinM::Min,
+            "max" => BuiltinM::Max,
+            "unique" => BuiltinM::Unique,
+            "unique_index" => BuiltinM::UniqueIndex,
+            "find" => BuiltinM::Find,
+            "find_first" => BuiltinM::FindFirst,
+            "find_last" => BuiltinM::FindLast,
+            "find_index" => BuiltinM::FindIndex,
+            "find_first_index" => BuiltinM::FindFirstIndex,
+            "find_last_index" => BuiltinM::FindLastIndex,
+            "exists" => BuiltinM::Exists,
+            "delete" => BuiltinM::Delete,
+            _ => BuiltinM::Other,
+        }
     }
 }
 
@@ -9938,14 +10310,14 @@ impl Simulator {
 
     fn eval_value_plusargs(&mut self, args: &[Expression]) -> Value {
         if args.len() < 2 {
-            return Value::zero(1);
+            return Value::zero(32);
         }
         let fmt = match &args[0].kind {
             ExprKind::StringLiteral(s) => s.clone(),
             _ => self.eval_expr(&args[0]).to_sv_string(),
         };
         let Some((prefix, spec)) = Self::parse_plusarg_format(&fmt) else {
-            return Value::zero(1);
+            return Value::zero(32);
         };
 
         for arg in &self.plusargs {
@@ -9956,10 +10328,10 @@ impl Simulator {
             let suffix = &payload[prefix.len()..];
             if let Some(v) = Self::parse_plusarg_value(suffix, spec) {
                 self.assign_value(&args[1], &v);
-                return Value::from_u64(1, 1);
+                return Value::from_u64(1, 32);
             }
         }
-        Value::zero(1)
+        Value::zero(32)
     }
 
     fn system_string_arg(&mut self, expr: &Expression) -> String {
@@ -10458,8 +10830,8 @@ impl Simulator {
             }
             _ => return None,
         };
-        if self.module.arrays.contains_key(&resolved) {
-            return Some(resolved);
+        if self.module.arrays.contains_key(&*resolved) {
+            return Some(resolved.to_string());
         }
         if self.module.arrays.contains_key(&raw) {
             return Some(raw);
@@ -10786,10 +11158,14 @@ impl Simulator {
             "extern long long __xezim_dpi_export_dispatch(long long id, long long n, const long long* a);\n",
         );
         let mut emitted = 0usize;
+        let c_names = self.module.dpi_export_c_names.clone();
         for (id, name) in exports.iter().enumerate() {
             let Some((ret, args)) = self.dpi_export_signature(name) else {
                 continue;
             };
+            // The symbol the C side links against: the export's alias when
+            // one was declared, else the SV name.
+            let c_name: &str = c_names.get(id).map(|s| s.as_str()).unwrap_or(name);
             let supported = ret != DpiExpKind::Bad && !args.contains(&DpiExpKind::Bad);
             let params: Vec<String> = if supported {
                 args.iter().enumerate().map(|(i, k)| format!("{} a{}", c_ty(*k), i)).collect()
@@ -10808,9 +11184,9 @@ impl Simulator {
                 );
                 let ret_c = if ret == DpiExpKind::Void { "void" } else { "long long" };
                 if ret == DpiExpKind::Void {
-                    body.push_str(&format!("void {}({}) {{ }}\n", name, param_list));
+                    body.push_str(&format!("void {}({}) {{ }}\n", c_name, param_list));
                 } else {
-                    body.push_str(&format!("{} {}({}) {{ return 0; }}\n", ret_c, name, param_list));
+                    body.push_str(&format!("{} {}({}) {{ return 0; }}\n", ret_c, c_name, param_list));
                 }
                 emitted += 1;
                 continue;
@@ -10837,15 +11213,15 @@ impl Simulator {
             match ret {
                 DpiExpKind::Void => body.push_str(&format!(
                     "void {}({}) {{\n{}    (void){};\n}}\n",
-                    name, param_list, pack, call
+                    c_name, param_list, pack, call
                 )),
                 DpiExpKind::Real => body.push_str(&format!(
                     "double {}({}) {{\n{}    long long __r = {};\n    double __d; memcpy(&__d, &__r, 8); return __d;\n}}\n",
-                    name, param_list, pack, call
+                    c_name, param_list, pack, call
                 )),
                 _ => body.push_str(&format!(
                     "{} {}({}) {{\n{}    return ({}){};\n}}\n",
-                    c_ty(ret), name, param_list, pack, c_ty(ret), call
+                    c_ty(ret), c_name, param_list, pack, c_ty(ret), call
                 )),
             }
             emitted += 1;
@@ -11410,12 +11786,12 @@ impl Simulator {
         };
         if let ExprKind::Ident(hier) = &e.kind {
             let name = self.resolve_hier_name(hier);
-            if let Some((lo, hi, _elem_w)) = self.module.arrays.get(&name).copied() {
+            if let Some((lo, hi, _elem_w)) = self.module.arrays.get(&*name).copied() {
                 let mut out = Vec::new();
                 // Compact-resolver fast path: if the array is in
                 // array_first_id, walk the contiguous id range with no
                 // per-element name allocation.
-                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_str()) {
+                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
                     for off in 0..=(hi - lo) as usize {
                         let id = first_id + off;
                         out.push(self.signal_table[id].to_i64().unwrap_or(0) as i32);
@@ -11434,7 +11810,7 @@ impl Simulator {
                         out.push(vv.to_i64().unwrap_or(0) as i32);
                     }
                 }
-                return (Some(name), out);
+                return (Some(name.to_string()), out);
             }
         }
         (None, vec![self.eval_expr(e).to_i64().unwrap_or(0) as i32])
@@ -11443,10 +11819,10 @@ impl Simulator {
     fn dpi_writeback_i32_array_arg(&mut self, expr: &Expression, data: &[i32]) {
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
-            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&name).copied() {
+            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
                 let mut k = 0usize;
                 // Compact-resolver fast path.
-                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_str()) {
+                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
                     for off in 0..=(hi - lo) as usize {
                         if k >= data.len() {
                             break;
@@ -11823,9 +12199,28 @@ impl Simulator {
         for (i, kind) in arg_kinds.iter().enumerate() {
             match kind {
                 DpiArgKind::Int32In => {
+                    // §35.5.6.1: a 1-bit 4-state formal (`logic`/`reg`) travels
+                    // as svLogic — x is 3 and z is 2, not the 0 a plain
+                    // integer conversion produced.
+                    let four_state_bit = match &spec.proto {
+                        crate::ast::decl::DPIProto::Function(fd) => fd.ports.get(i),
+                        crate::ast::decl::DPIProto::Task(td) => td.ports.get(i),
+                    }
+                    .map(|pt| {
+                        !super::elaborate::is_type_two_state_resolved(&pt.data_type, &self.module.typedef_types)
+                            && self.scalar_formal_integral(&pt.data_type).is_some_and(|(w, _)| w == 1)
+                    })
+                    .unwrap_or(false);
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| self.eval_expr(e).to_i64().unwrap_or(0) as i32)
+                            .map(|e| {
+                                let val = self.eval_expr(e);
+                                if four_state_bit && val.has_xz() {
+                                    if matches!(val.get_bit(0), LogicBit::Z) { 2 } else { 3 }
+                                } else {
+                                    val.to_i64().unwrap_or(0) as i32
+                                }
+                            })
                             .unwrap_or(0),
                     );
                     i32_vals.push(v);
@@ -12138,6 +12533,21 @@ impl Simulator {
                 }
             }
         };
+        // §35.5.5: the C ABI hands a small integral return back promoted to
+        // 32/64 bits; the SV side sees the DECLARED type. `byte unsigned`
+        // returning 256 and `shortint` reading 65530 in an expression were
+        // the symptoms (an assignment to a typed variable fitted it, a direct
+        // use in `$display` did not).
+        if matches!(ret_kind, DpiRetKind::Int32 | DpiRetKind::Int64) {
+            if let crate::ast::decl::DPIProto::Function(fd) = &spec.proto {
+                if let Some((w, signed)) = self.scalar_formal_integral(&fd.return_type) {
+                    if w > 0 && w <= 64 && (w != result.width || signed != result.is_signed) {
+                        result = result.resize(w);
+                        result.is_signed = signed;
+                    }
+                }
+            }
+        }
 
         // Write back output/ref/inout values.
         for (idx, kind, expr) in writebacks {
@@ -12673,7 +13083,7 @@ impl Simulator {
                 let ch = self.heap.len();
                 self.heap.push(Some(ClassInstance {
                     class_name: kind.to_string(),
-                    properties: HashMap::default(),
+                    properties: PropMap::default(),
                     type_bindings: HashMap::default(),
                 spec: None,
                 creation_scope: self.active_instance_scope(),
@@ -17609,6 +18019,14 @@ impl Simulator {
                     // clk)` paced response streamed with zero latency).
                     || (!all_level && Self::stmt_contains_event_control(&body))
                 {
+                    // This body already leaves the edge path for the process path
+                    // (§9.2.2: edges arriving mid-flight are missed). A compiled process
+                    // FSM implements the same semantics without the per-activation AST
+                    // walk; use it whenever the body compiles (c906's tb monitors: an
+                    // else-chain ending in a rare `#10`, ~9% of the run).
+                    if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
+                        return None;
+                    }
                     let forever_stmt = Statement::new(
                         StatementKind::Forever {
                             body: Box::new(ab.stmt.clone()),
@@ -17784,6 +18202,11 @@ impl Simulator {
             &self.widths,
         );
         compiler.allow_waits = true;
+        // System-task statements (`$display`, `$write`, `$finish`, ...)
+        // lower to statement fallbacks; the gate below admits only those,
+        // and only because the body has no process locals for the
+        // interpreter to miss (LoadProcessLocal is rejected there).
+        compiler.allow_ast_fallback = true;
         compiler.set_scope_hint(scope_hint);
         compiler.set_tasks(&self.module.tasks);
         compiler.set_functions(&self.module.functions);
@@ -17870,7 +18293,14 @@ impl Simulator {
         // Gate: fallback-free, at least one wait (else it belongs on the
         // comb/edge paths), and no process-local frame reads (the FSM has
         // no AST call frames).
-        if cb.has_fallback
+        let non_systask_fallback = cb.instructions.iter().any(|i| match i {
+            Insn::StmtFallback(payload) => !matches!(
+                &payload.0.kind,
+                StatementKind::Expr(e) if matches!(&e.kind, ExprKind::SystemCall { .. })
+            ),
+            _ => false,
+        });
+        if non_systask_fallback
             || cb.instructions
                 .iter()
                 .any(|i| matches!(i, Insn::LoadProcessLocal(..)))
@@ -19510,35 +19940,17 @@ impl Simulator {
             self.prof_ts_bail_forced += 1;
             return false;
         }
-        for &sig in ts.reads_whole.iter() {
-            // Plane-direct xz word (fallback to raw_bits when the mirror is
-            // absent, i.e. non-JIT runs).
-            let x = match self.signal_inline_bits.get(sig as usize) {
-                Some(sl) => sl[1],
-                None => self.signal_table[sig as usize].raw_bits().1,
-            };
-            if x != 0 {
-                self.prof_ts_bail_xread += 1;
-                return false;
-            }
-        }
-        for &(sig, lo, w) in ts.reads_slice.iter() {
-            let (_, x) = Self::raw_bits_slice(&self.signal_table[sig as usize], lo, w);
-            if x != 0 {
-                self.prof_ts_bail_xread += 1;
-                return false;
-            }
-        }
-        if !ts.reads_wide.is_empty() {
-            let mut scratch = [0u64; 2];
-            for &sig in ts.reads_wide.iter() {
-                if !self.signal_table[sig as usize].words128_if_clean(&mut scratch) {
-                    self.prof_ts_bail_xread += 1;
-                    return false;
-                }
-            }
-        }
+        // The x/z check rides on the executor's own loads (every signal
+        // read tests the xz plane it fetches alongside the value) instead
+        // of a separate pass over the block's read lists: that pre-scan
+        // was 11 % of a c906 run while 97 % of evaluations passed it. A
+        // store made before an x read used only clean inputs, so the
+        // four-state re-run writes the same value back.
         if !self.exec_two_state(ts) {
+            if std::mem::take(&mut self.ts_xread_bail) {
+                self.prof_ts_bail_xread += 1;
+                return false;
+            }
             self.prof_ts_bail_abort += 1;
             self.ts_exec_aborted = true;
             return false;
@@ -19626,6 +20038,12 @@ impl Simulator {
                 return false;
             }};
         }
+        macro_rules! xbail {
+            () => {{
+                self.ts_xread_bail = true;
+                bail!();
+            }};
+        }
         while pc < insns_len {
             match unsafe { &*insns_ptr.add(pc) } {
                 TsInsn::LoadSig { d, sig } => {
@@ -19633,35 +20051,50 @@ impl Simulator {
                     // branch (raw_bits showed at 5% of settle post-PGO).
                     // The mirror is authoritative in JIT runs and absent in
                     // non-JIT runs (fall back).
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v;
                 }
                 TsInsn::Const { d, v } => regs[*d as usize] = *v,
                 TsInsn::SigBit { d, sig, bit } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = (v >> lo) & mask;
                 }
                 TsInsn::SigBitW { d, sig, bit } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *bit, 1);
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v;
                 }
                 TsInsn::SigRangeW { d, sig, lo, w, mask } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *lo, *w);
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v & mask;
                 }
                 TsInsn::Bit { d, s, bit } => {
@@ -19825,14 +20258,20 @@ impl Simulator {
                 }
                 TsInsn::BrSigFalse { sig, bit, t } => {
                     let cond = if *bit == u32::MAX {
-                        let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                        let (v, x) = self.signal_table[*sig as usize].raw_bits();
+                        if x != 0 {
+                            xbail!();
+                        }
                         v != 0
                     } else {
-                        let (v, _) = Self::raw_bits_slice(
+                        let (v, x) = Self::raw_bits_slice(
                             &self.signal_table[*sig as usize],
                             *bit as u16,
                             1,
                         );
+                        if x != 0 {
+                            xbail!();
+                        }
                         v != 0
                     };
                     if !cond {
@@ -19993,7 +20432,7 @@ impl Simulator {
                     // Prefilter proved cleanliness; a failure here means the
                     // value changed representation mid-eval — bail safely.
                     if !self.signal_table[*sig as usize].words128_if_clean(&mut w2) {
-                        bail!();
+                        xbail!();
                     }
                     wregs[*d as usize] = w2;
                 }
@@ -20100,128 +20539,160 @@ impl Simulator {
         if regs.len() < ts.num_regs as usize {
             regs.resize(ts.num_regs as usize, 0);
         }
+        // Register indices are assigned by the block compiler below
+        // `num_regs`, and `regs` was just sized to it: the bounds checks on
+        // every operand access are provably redundant, so go through a raw
+        // pointer (this loop is a quarter of a c906 run).
+        let rp: *mut u64 = regs.as_mut_ptr();
+        macro_rules! r {
+            ($i:expr) => {
+                (*rp.add($i as usize))
+            };
+        }
+        macro_rules! xbail {
+            () => {{
+                self.ts_xread_bail = true;
+                self.ts_regs = regs;
+                return false;
+            }};
+        }
         for insn in &ts.insns {
-            match insn {
+            unsafe { match insn {
                 TsInsn::LoadSig { d, sig } => {
                     // Plane-direct: one flat load vs the Value discriminant
                     // branch (raw_bits showed at 5% of settle post-PGO).
                     // The mirror is authoritative in JIT runs and absent in
                     // non-JIT runs (fall back).
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
-                    regs[*d as usize] = v;
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*d) = v;
                 }
-                TsInsn::Const { d, v } => regs[*d as usize] = *v,
+                TsInsn::Const { d, v } => r!(*d) = *v,
                 TsInsn::SigBit { d, sig, bit } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
-                    regs[*d as usize] = (v >> bit) & 1;
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*d) = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
-                    regs[*d as usize] = (v >> lo) & mask;
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*d) = (v >> lo) & mask;
                 }
                 TsInsn::SigBitW { d, sig, bit } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *bit, 1);
-                    regs[*d as usize] = v;
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*d) = v;
                 }
                 TsInsn::SigRangeW { d, sig, lo, w, mask } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *lo, *w);
-                    regs[*d as usize] = v & mask;
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*d) = v & mask;
                 }
                 TsInsn::Bit { d, s, bit } => {
-                    regs[*d as usize] = (regs[*s as usize] >> bit) & 1;
+                    r!(*d) = (r!(*s) >> bit) & 1;
                 }
                 TsInsn::Range { d, s, lo, mask } => {
-                    regs[*d as usize] = (regs[*s as usize] >> lo) & mask;
+                    r!(*d) = (r!(*s) >> lo) & mask;
                 }
                 TsInsn::Xor { d, a, b } => {
-                    regs[*d as usize] = regs[*a as usize] ^ regs[*b as usize];
+                    r!(*d) = r!(*a) ^ r!(*b);
                 }
                 TsInsn::And { d, a, b } => {
-                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                    r!(*d) = r!(*a) & r!(*b);
                 }
                 TsInsn::Or { d, a, b } => {
-                    regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
+                    r!(*d) = r!(*a) | r!(*b);
                 }
                 TsInsn::Sel { d, c, a, b } => {
-                    regs[*d as usize] = if regs[*c as usize] != 0 {
-                        regs[*a as usize]
+                    r!(*d) = if r!(*c) != 0 {
+                        r!(*a)
                     } else {
-                        regs[*b as usize]
+                        r!(*b)
                     };
                 }
                 TsInsn::Not { d, s, mask } => {
-                    regs[*d as usize] = !regs[*s as usize] & mask;
+                    r!(*d) = !r!(*s) & mask;
                 }
                 TsInsn::XorC { d, s, k } => {
-                    regs[*d as usize] = regs[*s as usize] ^ k;
+                    r!(*d) = r!(*s) ^ k;
                 }
                 TsInsn::EqC { d, s, k } => {
-                    regs[*d as usize] = (regs[*s as usize] == *k) as u64;
+                    r!(*d) = (r!(*s) == *k) as u64;
                 }
                 TsInsn::Add { d, a, b, mask } => {
-                    regs[*d as usize] =
-                        regs[*a as usize].wrapping_add(regs[*b as usize]) & mask;
+                    r!(*d) =
+                        r!(*a).wrapping_add(r!(*b)) & mask;
                 }
                 TsInsn::AddC { d, s: sr, k, mask } => {
-                    regs[*d as usize] = regs[*sr as usize].wrapping_add(*k) & mask;
+                    r!(*d) = r!(*sr).wrapping_add(*k) & mask;
                 }
                 TsInsn::Shl { d, a, b, w, mask } => {
-                    let amt = regs[*b as usize];
-                    regs[*d as usize] = if amt >= *w as u64 {
+                    let amt = r!(*b);
+                    r!(*d) = if amt >= *w as u64 {
                         0
                     } else {
-                        (regs[*a as usize] << amt) & mask
+                        (r!(*a) << amt) & mask
                     };
                 }
                 TsInsn::Shr { d, a, b, w } => {
-                    let amt = regs[*b as usize];
-                    regs[*d as usize] = if amt >= *w as u64 {
+                    let amt = r!(*b);
+                    r!(*d) = if amt >= *w as u64 {
                         0
                     } else {
-                        regs[*a as usize] >> amt
+                        r!(*a) >> amt
                     };
                 }
                 TsInsn::Sub { d, a, b, mask } => {
-                    regs[*d as usize] =
-                        regs[*a as usize].wrapping_sub(regs[*b as usize]) & mask;
+                    r!(*d) =
+                        r!(*a).wrapping_sub(r!(*b)) & mask;
                 }
                 TsInsn::Eq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) == r!(*b)) as u64;
                 }
                 TsInsn::Neq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] != regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) != r!(*b)) as u64;
                 }
                 TsInsn::Lt { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] < regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) < r!(*b)) as u64;
                 }
                 TsInsn::Leq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] <= regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) <= r!(*b)) as u64;
                 }
                 TsInsn::Gt { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] > regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) > r!(*b)) as u64;
                 }
                 TsInsn::Geq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] >= regs[*b as usize]) as u64;
+                    r!(*d) = (r!(*a) >= r!(*b)) as u64;
                 }
                 TsInsn::LogNot { d, s } => {
-                    regs[*d as usize] = (regs[*s as usize] == 0) as u64;
+                    r!(*d) = (r!(*s) == 0) as u64;
                 }
                 TsInsn::RedOr { d, s } => {
-                    regs[*d as usize] = (regs[*s as usize] != 0) as u64;
+                    r!(*d) = (r!(*s) != 0) as u64;
                 }
                 TsInsn::RedAnd { d, s, mask } => {
-                    regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
+                    r!(*d) = (r!(*s) == *mask) as u64;
                 }
                 TsInsn::WRedOr { .. } | TsInsn::WRedAnd { .. } => {
                     unreachable!("wide insn outside the wide executor")
@@ -20229,9 +20700,9 @@ impl Simulator {
                 TsInsn::BitStoreDyn { sig, i, s, w } => {
                     // §11.5.1: an out-of-range dynamic bit-select target
                     // drops the write (`Value::set_bit` is a no-op there).
-                    let idx = regs[*i as usize];
+                    let idx = r!(*i);
                     if idx < *w as u64 {
-                        let b = regs[*s as usize] & 1;
+                        let b = r!(*s) & 1;
                         self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
                     }
                 }
@@ -20242,34 +20713,34 @@ impl Simulator {
                     self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
                 }
                 TsInsn::LogAnd { d, a, b } => {
-                    regs[*d as usize] =
-                        (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
+                    r!(*d) =
+                        (r!(*a) != 0 && r!(*b) != 0) as u64;
                 }
                 TsInsn::LogOr { d, a, b } => {
-                    regs[*d as usize] =
-                        (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
+                    r!(*d) =
+                        (r!(*a) != 0 || r!(*b) != 0) as u64;
                 }
                 TsInsn::Concat { d, parts } => {
                     let mut acc = 0u64;
                     for &(r, w) in parts.iter() {
-                        acc = (acc << w) | regs[r as usize];
+                        acc = (acc << w) | r!(r);
                     }
-                    regs[*d as usize] = acc;
+                    r!(*d) = acc;
                 }
                 TsInsn::Mask { d, mask } => {
-                    regs[*d as usize] &= mask;
+                    r!(*d) &= mask;
                 }
                 TsInsn::Mul { d, a, b, mask } => {
-                    regs[*d as usize] =
-                        regs[*a as usize].wrapping_mul(regs[*b as usize]) & mask;
+                    r!(*d) =
+                        r!(*a).wrapping_mul(r!(*b)) & mask;
                 }
                 TsInsn::Repl { d, s, w, count } => {
-                    let part = regs[*s as usize];
+                    let part = r!(*s);
                     let mut acc = 0u64;
                     for _ in 0..*count {
                         acc = (acc << *w) | part;
                     }
-                    regs[*d as usize] = acc;
+                    r!(*d) = acc;
                 }
                 TsInsn::WSigRange { .. } => {
                     unreachable!("wide insn outside the wide executor")
@@ -20278,7 +20749,7 @@ impl Simulator {
                     unreachable!("wide insn outside the wide executor")
                 }
                 TsInsn::ElemLoad(op) => {
-                    let i = regs[op.idx as usize] as i64;
+                    let i = r!(op.idx) as i64;
                     if i < op.lo || i > op.hi {
                         self.ts_regs = regs;
                         return false;
@@ -20289,22 +20760,22 @@ impl Simulator {
                         self.ts_regs = regs;
                         return false;
                     }
-                    regs[op.s as usize] = v;
+                    r!(op.s) = v;
                 }
                 TsInsn::ElemStoreNba(op) => {
-                    let i = regs[op.idx as usize] as i64;
+                    let i = r!(op.idx) as i64;
                     if i >= op.lo && i <= op.hi {
                         let eid = op.first as usize + (i - op.lo) as usize;
-                        let v = regs[op.s as usize] & op.mask;
+                        let v = r!(op.s) & op.mask;
                         self.ts_store_nba(eid, v, op.w);
                     }
                     // Out-of-range: silent drop, as in 4-state.
                 }
                 TsInsn::ElemStore(op) => {
-                    let i = regs[op.idx as usize] as i64;
+                    let i = r!(op.idx) as i64;
                     if i >= op.lo && i <= op.hi {
                         let eid = op.first as usize + (i - op.lo) as usize;
-                        let v = regs[op.s as usize] & op.mask;
+                        let v = r!(op.s) & op.mask;
                         self.ts_store(eid, v, op.mask);
                     }
                 }
@@ -20325,7 +20796,7 @@ impl Simulator {
                     self.ts_store_nba(op.dst as usize, ev & m, op.w);
                 }
                 TsInsn::Store { sig, s, mask } => {
-                    let v = regs[*s as usize] & mask;
+                    let v = r!(*s) & mask;
                     self.ts_store(*sig as usize, v, *mask);
                 }
                 TsInsn::RangeStore { sig, hi, lo, s, mask } => {
@@ -20337,13 +20808,13 @@ impl Simulator {
                     // the same merge the NBA arm below uses.
                     self.ts_range_store(
                         *sig as usize,
-                        regs[*s as usize] & mask,
+                        r!(*s) & mask,
                         *lo,
                         *hi,
                     );
                 }
                 TsInsn::StoreNba { sig, s, w, mask } => {
-                    let v = regs[*s as usize] & mask;
+                    let v = r!(*s) & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
                 }
                 TsInsn::ConstStoreNba { sig, v, w } => {
@@ -20355,7 +20826,7 @@ impl Simulator {
                     // the signal, with eval-time elision. Plane-based, so an
                     // X base composes instead of aborting.
                     let id = *sig as usize;
-                    let (src_v, src_x) = (regs[*s as usize] & mask, 0u64);
+                    let (src_v, src_x) = (r!(*s) & mask, 0u64);
                     if let Some(i) = self.nba_fast_index.get(id) {
                         let target = &mut self.nba_fast[i].value;
                         let (base_v, base_x) = target.raw_bits();
@@ -20407,7 +20878,7 @@ impl Simulator {
                 | TsInsn::Jmp { .. }
                 | TsInsn::CaseJmp { .. }
                 | TsInsn::CaseMaskJmp { .. } => unreachable!("ctrl insn in straight-line block"),
-            }
+            } }
         }
         self.ts_regs = regs;
         true
@@ -20537,6 +21008,13 @@ impl Simulator {
         if regs.len() < ts.num_regs as usize {
             regs.resize(ts.num_regs as usize, 0);
         }
+        macro_rules! xbail {
+            () => {{
+                self.ts_xread_bail = true;
+                self.ts_regs = regs;
+                return false;
+            }};
+        }
         // Raw-ptr walk mirrors exec_insns: the indexed form's bounds check
         // per instruction cost ~14% on a comb-dense fabric. Targets were
         // range-checked against the lowered stream at fixup time.
@@ -20550,35 +21028,50 @@ impl Simulator {
                     // branch (raw_bits showed at 5% of settle post-PGO).
                     // The mirror is authoritative in JIT runs and absent in
                     // non-JIT runs (fall back).
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v;
                 }
                 TsInsn::Const { d, v } => regs[*d as usize] = *v,
                 TsInsn::SigBit { d, sig, bit } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
-                    let v = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => sl[0],
-                        None => self.signal_table[*sig as usize].raw_bits().0,
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
                     };
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = (v >> lo) & mask;
                 }
                 TsInsn::SigBitW { d, sig, bit } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *bit, 1);
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v;
                 }
                 TsInsn::SigRangeW { d, sig, lo, w, mask } => {
-                    let (v, _) =
+                    let (v, x) =
                         Self::raw_bits_slice(&self.signal_table[*sig as usize], *lo, *w);
+                    if x != 0 {
+                        xbail!();
+                    }
                     regs[*d as usize] = v & mask;
                 }
                 TsInsn::Bit { d, s, bit } => {
@@ -20723,14 +21216,20 @@ impl Simulator {
                 TsInsn::BrSigFalse { sig, bit, t } => {
                     let cond = if *bit == u32::MAX {
                         // Whole-value form was lowered only for <=64-bit sigs.
-                        let (v, _) = self.signal_table[*sig as usize].raw_bits();
+                        let (v, x) = self.signal_table[*sig as usize].raw_bits();
+                        if x != 0 {
+                            xbail!();
+                        }
                         v != 0
                     } else {
-                        let (v, _) = Self::raw_bits_slice(
+                        let (v, x) = Self::raw_bits_slice(
                             &self.signal_table[*sig as usize],
                             *bit as u16,
                             1,
                         );
+                        if x != 0 {
+                            xbail!();
+                        }
                         v != 0
                     };
                     if !cond {
@@ -21013,9 +21512,36 @@ impl Simulator {
         // optimizer applies), and a runtime force on the buffered name now
         // reaches the shared net. Skipped entirely under SDF (a collapsed
         // net would lose its annotated delay).
-        if std::env::var("XEZIM_BUF_COLLAPSE").map(|v| v == "1").unwrap_or(false)
+        // Whole-net identity buffers (`assign y = x`) alias onto their source
+        // by default; `XEZIM_BUF_COLLAPSE=0` turns the pass off. A net keeps
+        // its own storage when aliasing would be observable: it is a force /
+        // release / procedural-assign target anywhere in the design, its
+        // two-state-ness differs from the source (a 2-state copy must drop
+        // X/Z), the design carries SDF delays, or a DPI/VPI backdoor may look
+        // the folded name up by itself.
+        let buf_collapse_on = !matches!(std::env::var("XEZIM_BUF_COLLAPSE").as_deref(), Ok("0"))
             && self.sdf_delays.is_empty()
-        {
+            && self.module.dpi_imports.is_empty()
+            && configured_vpi_libs().is_empty()
+            && configured_dpi_libs().is_empty();
+        if buf_collapse_on {
+            // Same rule as the port pass above: never alias onto a source a
+            // process WRITES. A reader parked on the same edge that writes
+            // the source relies on the copy's delta step (reference-verified
+            // in tests/scheduling/waiter_edge_ordering.rs); gate primitives
+            // keep their z→x mapping on the net they drive. This pass runs
+            // again after the always blocks have been drained into compiled
+            // form, so the two name sets are collected on the FIRST call,
+            // while every process body is still on the module, and kept.
+            if self.buf_collapse_write_sets.is_none() {
+                self.buf_collapse_write_sets = Some((
+                    super::elaborate::collect_override_target_leaves(&self.module),
+                    super::elaborate::collect_procedural_write_names(&self.module),
+                ));
+            }
+            let (override_leaves, proc_writes) =
+                self.buf_collapse_write_sets.clone().unwrap_or_default();
+            let leaf_of = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
             let mut buf_collapsed = 0usize;
             for _ in 0..8 {
                 let mut changed = false;
@@ -21044,9 +21570,14 @@ impl Simulator {
                     if lid == rid
                         || self.signal_widths[lid] != self.signal_widths[rid]
                         || self.signal_real[lid] != self.signal_real[rid]
+                        || self.signal_two_state[lid] != self.signal_two_state[rid]
                         || self.module.events.contains(ln.as_str())
                         || self.module.events.contains(rn.as_str())
                         || ca_driver_counts.get(ln.as_str()).copied().unwrap_or(0) != 1
+                        || override_leaves.contains(&leaf_of(ln.as_str()))
+                        || override_leaves.contains(&leaf_of(rn.as_str()))
+                        || proc_writes.contains(rn.as_str())
+                        || self.signal_gate_driven.get(lid).copied().unwrap_or(false)
                     {
                         continue;
                     }
@@ -21059,7 +21590,7 @@ impl Simulator {
                     break;
                 }
             }
-            if buf_collapsed > 0 {
+            if buf_collapsed > 0 && std::env::var("XEZIM_DEBUG").is_ok() {
                 eprintln!("[BUF-COLLAPSE] {} identity buffer nets collapsed", buf_collapsed);
             }
         }
@@ -22646,6 +23177,25 @@ impl Simulator {
                 }
                 Insn::NbaAssign(sig_id, val_reg, width) => {
                     let sig_id = &(*sig_id as usize);
+                    // Unchanged-value elision BEFORE the resize: an equal-width,
+                    // non-fill, non-real register resizes to an exact copy of
+                    // itself, so comparing the register against the signal table
+                    // decides the elision without cloning the value first (flop
+                    // outputs reload the same value most cycles — the clone was
+                    // made only to be dropped).
+                    {
+                        let reg = &vm_regs[*val_reg as usize];
+                        if !nba_dup
+                            && *width != 0
+                            && reg.width == *width
+                            && !reg.is_fill
+                            && !reg.is_real
+                            && signal_table[*sig_id] == *reg
+                        {
+                            pc += 1;
+                            continue;
+                        }
+                    }
                     let val = vm_regs[*val_reg as usize].resize_for_assign(*width);
                     // Eval-time elision: skip the queue push when the
                     // value already matches signal_table.  apply_nba_entry
@@ -22722,23 +23272,25 @@ impl Simulator {
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = vm_regs[*val_reg as usize].get_bit(0);
-                    let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
-                    if let Some(i) = existing {
-                        let mut new_val = nba_out[i].value.clone();
-                        new_val.set_bit(idx, bit);
-                        nba_out[i].value = new_val;
-                    } else {
-                        let cur = &signal_table[*sig_id];
-                        if cur.get_bit(idx) != bit {
-                            let mut new_val = cur.clone();
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
+                        let bit = vm_regs[*val_reg as usize].get_bit(0);
+                        let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
+                        if let Some(i) = existing {
+                            let mut new_val = nba_out[i].value.clone();
                             new_val.set_bit(idx, bit);
-                            nba_out.push(NbaFast {
-                                signal_id: *sig_id,
-                                value: new_val,
-                                block_index,
-                            });
+                            nba_out[i].value = new_val;
+                        } else {
+                            let cur = &signal_table[*sig_id];
+                            if cur.get_bit(idx) != bit {
+                                let mut new_val = cur.clone();
+                                new_val.set_bit(idx, bit);
+                                nba_out.push(NbaFast {
+                                    signal_id: *sig_id,
+                                    value: new_val,
+                                    block_index,
+                                });
+                            }
                         }
                     }
                 }
@@ -23422,13 +23974,15 @@ impl Simulator {
                 }
                 Insn::BlockingAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = vm_regs[*val_reg as usize].get_bit(0);
-                    if view[*sig_id].get_bit(idx) != bit {
-                        let mut new_val = view[*sig_id].clone();
-                        new_val.set_bit(idx, bit);
-                        view[*sig_id] = new_val;
-                        dirtied.push(*sig_id as u32);
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
+                        let bit = vm_regs[*val_reg as usize].get_bit(0);
+                        if view[*sig_id].get_bit(idx) != bit {
+                            let mut new_val = view[*sig_id].clone();
+                            new_val.set_bit(idx, bit);
+                            view[*sig_id] = new_val;
+                            dirtied.push(*sig_id as u32);
+                        }
                     }
                 }
                 Insn::BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
@@ -23570,21 +24124,23 @@ impl Simulator {
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = vm_regs[*val_reg as usize].get_bit(0);
-                    let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
-                    if let Some(i) = existing {
-                        let mut new_val = nba_out[i].value.clone();
-                        new_val.set_bit(idx, bit);
-                        nba_out[i].value = new_val;
-                    } else if view[*sig_id].get_bit(idx) != bit {
-                        let mut new_val = view[*sig_id].clone();
-                        new_val.set_bit(idx, bit);
-                        nba_out.push(NbaFast {
-                            signal_id: *sig_id,
-                            value: new_val,
-                            block_index,
-                        });
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
+                        let bit = vm_regs[*val_reg as usize].get_bit(0);
+                        let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
+                        if let Some(i) = existing {
+                            let mut new_val = nba_out[i].value.clone();
+                            new_val.set_bit(idx, bit);
+                            nba_out[i].value = new_val;
+                        } else if view[*sig_id].get_bit(idx) != bit {
+                            let mut new_val = view[*sig_id].clone();
+                            new_val.set_bit(idx, bit);
+                            nba_out.push(NbaFast {
+                                signal_id: *sig_id,
+                                value: new_val,
+                                block_index,
+                            });
+                        }
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
@@ -24387,6 +24943,23 @@ impl Simulator {
                             offset += val.width;
                         }
                         vm_store(&mut self.vm_regs[d], out_v, out_x, total, false);
+                    } else if total <= 128 {
+                        // Two 128-bit accumulators, written into the
+                        // destination register IN PLACE: the register keeps
+                        // its two-word allocation across evaluations instead
+                        // of a fresh three-allocation `Value` per concat.
+                        let (mut out_v, mut out_x, mut offset) = (0u128, 0u128, 0u32);
+                        for p in part_regs.iter().rev() {
+                            let val = &self.vm_regs[*p as usize];
+                            if val.width == 0 {
+                                continue;
+                            }
+                            let (v, x) = val.bits128();
+                            out_v |= v << offset;
+                            out_x |= x << offset;
+                            offset += val.width;
+                        }
+                        self.vm_regs[d].assign_wide128(out_v, out_x, total);
                     } else {
                         let result = Value::concat_refs(
                             part_regs.iter().map(|r| &self.vm_regs[*r as usize]),
@@ -24418,11 +24991,17 @@ impl Simulator {
                                 vm_store(&mut self.vm_regs[d], v, x, total, false)
                             }
                             None => {
-                                let result = Value::concat_refs(std::iter::repeat_n(
-                                    &self.vm_regs[s],
-                                    n,
-                                ));
-                                self.vm_regs[d] = result;
+                                let src = &self.vm_regs[s];
+                                if src.width == 1 && !src.is_fill && !src.is_real {
+                                    // `{N{bit}}` over a wide bus: a word fill
+                                    // written into the register in place.
+                                    let (v, x) = src.raw_bits();
+                                    let total = n as u32;
+                                    self.vm_regs[d].assign_replicated_bit(v, x, total);
+                                } else {
+                                    let result = src.replicate(n);
+                                    self.vm_regs[d] = result;
+                                }
                             }
                         }
                     }
@@ -24809,25 +25388,27 @@ impl Simulator {
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = self.vm_regs[*val_reg as usize].get_bit(0);
-                    let id = *sig_id;
-                    if let Some(i) = self.nba_fast_index.get(id) {
-                        self.nba_fast[i].value.set_bit(idx, bit);
-                    } else {
-                        // Single-bit elision: if the bit is already what
-                        // we're about to write, skip the queue push.
-                        if self.signal_table[id].get_bit(idx) == bit {
-                            self.prof_nba_elided += 1;
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&self.vm_regs[*idx_reg as usize]) {
+                        let bit = self.vm_regs[*val_reg as usize].get_bit(0);
+                        let id = *sig_id;
+                        if let Some(i) = self.nba_fast_index.get(id) {
+                            self.nba_fast[i].value.set_bit(idx, bit);
                         } else {
-                            let mut new_val = self.signal_table[id].clone();
-                            new_val.set_bit(idx, bit);
-                            self.nba_fast_index.insert(id, self.nba_fast.len());
-                            self.nba_fast.push(NbaFast {
-                                block_index: 0,
-                                signal_id: id,
-                                value: new_val,
-                            });
+                            // Single-bit elision: if the bit is already what
+                            // we're about to write, skip the queue push.
+                            if self.signal_table[id].get_bit(idx) == bit {
+                                self.prof_nba_elided += 1;
+                            } else {
+                                let mut new_val = self.signal_table[id].clone();
+                                new_val.set_bit(idx, bit);
+                                self.nba_fast_index.insert(id, self.nba_fast.len());
+                                self.nba_fast.push(NbaFast {
+                                    block_index: 0,
+                                    signal_id: id,
+                                    value: new_val,
+                                });
+                            }
                         }
                     }
                 }
@@ -24953,22 +25534,26 @@ impl Simulator {
                     // this dominated allocator + memcpy time. Now: read
                     // current bit, skip the write if it matches; otherwise
                     // set in-place and mark dirty.
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = self.vm_regs[*val_reg as usize].get_bit(0);
-                    let id = *sig_id;
-                    if idx < self.signal_widths[id] as usize {
-                        let cur = self.signal_table[id].get_bit(idx);
-                        if cur != bit {
-                            self.signal_table[id].set_bit(idx, bit);
-                            self.sync_mirror(id);
-                            self.signal_table[id].is_signed = self.signal_signed[id];
-                            if !self.dirty_signals[id] {
-                                self.dirty_signals[id] = true;
-                                self.dirty_list.push(id);
+                    // §11.5.1: an x/z index modifies no bits. `to_u64` masks
+                    // x bits to zero, so this cannot be folded into the range
+                    // check below -- an unknown index looked like bit 0.
+                    if let Some(idx) = dyn_bit_index(&self.vm_regs[*idx_reg as usize]) {
+                        let bit = self.vm_regs[*val_reg as usize].get_bit(0);
+                        let id = *sig_id;
+                        if idx < self.signal_widths[id] as usize {
+                            let cur = self.signal_table[id].get_bit(idx);
+                            if cur != bit {
+                                self.signal_table[id].set_bit(idx, bit);
+                                self.sync_mirror(id);
+                                self.signal_table[id].is_signed = self.signal_signed[id];
+                                if !self.dirty_signals[id] {
+                                    self.dirty_signals[id] = true;
+                                    self.dirty_list.push(id);
+                                }
+                                self.dirty_any = true;
+                                self.table_modified = true;
+                                self.after_signal_write(id);
                             }
-                            self.dirty_any = true;
-                            self.table_modified = true;
-                            self.after_signal_write(id);
                         }
                     }
                 }
@@ -26385,7 +26970,7 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                     let full = self.resolve_hier_name(&hier);
                     *self.name_resolve_hint.borrow_mut() = saved_hint;
-                    if let Some(&id) = self.signal_name_to_id.get(full.as_str()) {
+                    if let Some(&id) = self.signal_name_to_id.get(full.as_ref()) {
                         if !rids.contains(&id) {
                             rids.push(id);
                         }
@@ -26727,7 +27312,7 @@ impl Simulator {
                         *self.name_resolve_hint.borrow_mut() = saved;
                         if resolved != *r {
                             if let Some(&id) =
-                                self.signal_name_to_id.get(resolved.as_str())
+                                self.signal_name_to_id.get(resolved.as_ref())
                             {
                                 if !rids.contains(&id) {
                                     rids.push(id);
@@ -30905,10 +31490,10 @@ impl Simulator {
                     return false;
                 };
                 let name = self.resolve_hier_name(hier);
-                !self.module.arrays.contains_key(&name)
-                    && !self.module.arrays_2d.contains_key(&name)
-                    && !self.module.arrays_nd.contains_key(&name)
-                    && !self.signal_name_to_id.contains_key(name.as_str())
+                !self.module.arrays.contains_key(&*name)
+                    && !self.module.arrays_2d.contains_key(&*name)
+                    && !self.module.arrays_nd.contains_key(&*name)
+                    && !self.signal_name_to_id.contains_key(name.as_ref())
             }
             ExprKind::Index { expr, .. } => {
                 let ExprKind::Index {
@@ -30924,9 +31509,9 @@ impl Simulator {
                 // A multi-D PACKED vector root (`logic [1:0][3:0][7:0] foo`)
                 // is a real write target for `foo[i][j]` — only drop the
                 // assign when the root resolves to nothing at all.
-                !self.module.arrays_2d.contains_key(&name)
-                    && !self.module.arrays_nd.contains_key(&name)
-                    && !self.signal_name_to_id.contains_key(name.as_str())
+                !self.module.arrays_2d.contains_key(&*name)
+                    && !self.module.arrays_nd.contains_key(&*name)
+                    && !self.signal_name_to_id.contains_key(name.as_ref())
             }
             _ => false,
         }
@@ -32534,11 +33119,11 @@ impl Simulator {
                 let resolved = self.resolve_hier_name(&ident);
                 *self.name_resolve_hint.borrow_mut() = saved;
                 if resolved != *r
-                    && self.signal_name_to_id.contains_key(resolved.as_str())
-                    && seen.insert(resolved.clone())
+                    && self.signal_name_to_id.contains_key(resolved.as_ref())
+                    && seen.insert(resolved.to_string())
                 {
                     out.push(Sensitivity {
-                        signal_name: resolved,
+                        signal_name: resolved.to_string(),
                         edge: EdgeKind::AnyEdge,
                         iff: None,
                         value_of: None,
@@ -32679,7 +33264,7 @@ impl Simulator {
                             // literal index resolves here; a variable index
                             // keeps the old base-name behavior.
                             let bn = self.resolve_hier_name(bh);
-                            if self.module.arrays.contains_key(&bn) {
+                            if self.module.arrays.contains_key(&*bn) {
                                 out.push(Sensitivity {
                                     signal_name: format!("{}[{}]", bn, value.replace('_', "")),
                                     edge,
@@ -32754,17 +33339,17 @@ impl Simulator {
                         // raw chain through the live handles instead (the
                         // snitch driver stall: every wait degenerated to a
                         // same-time yield and the run never left time 0).
-                        if !self.signal_name_to_id.contains_key(sig.as_str())
-                            && !self.signals.contains_key(&sig)
+                        if !self.signal_name_to_id.contains_key(sig.as_ref())
+                            && !self.signals.contains_key(&*sig)
                         {
                             let raw = segs.join(".");
                             if let Some(resolved) = self.resolve_sens_name_via_handles(&raw) {
-                                sig = resolved;
+                                sig = std::borrow::Cow::Owned(resolved);
                             }
                         }
                         let cb_key = self
                             .resolve_clocking_key(&segs)
-                            .unwrap_or_else(|| sig.clone());
+                            .unwrap_or_else(|| sig.to_string());
                         if ee.edge.is_none() {
                             if let Some((clk, _)) = self.clocking_meta.get(&cb_key) {
                                 out.push(Sensitivity {
@@ -32788,8 +33373,8 @@ impl Simulator {
                         // let the wake path compare the FIELD's value against
                         // the armed snapshot (the non-trivial-expression
                         // machinery).
-                        if !self.signal_name_to_id.contains_key(sig.as_str())
-                            && !self.signals.contains_key(&sig)
+                        if !self.signal_name_to_id.contains_key(sig.as_ref())
+                            && !self.signals.contains_key(&*sig)
                         {
                             if let Some((base, _off, _w)) = self.packed_leaf_of_hier(&sig) {
                                 out.push(Sensitivity {
@@ -32802,7 +33387,7 @@ impl Simulator {
                             }
                         }
                         out.push(Sensitivity {
-                            signal_name: sig,
+                            signal_name: sig.to_string(),
                             edge,
                             iff: ee.iff.clone(),
                             value_of: None,
@@ -32959,7 +33544,7 @@ impl Simulator {
                         }
                     }
                     vec![Sensitivity {
-                        signal_name: self.resolve_hier_name(h),
+                        signal_name: self.resolve_hier_name(h).into_owned(),
                         edge: EdgeKind::AnyEdge,
                         iff: None,
                         value_of: None,
@@ -33219,8 +33804,12 @@ impl Simulator {
         continuation: ProcCont,
         is_clocking: bool,
     ) -> EventWaiter {
-        let resolved: Vec<SensitivityId> = sens
-            .iter()
+        let resolved = self.resolve_sens_ids(&sens);
+        self.make_event_waiter_resolved(pid, resolved, continuation, is_clocking)
+    }
+
+    fn resolve_sens_ids(&self, sens: &[Sensitivity]) -> Vec<SensitivityId> {
+        sens.iter()
             .filter_map(|s| {
                 self.signal_name_to_id
                     .get(s.signal_name.as_str())
@@ -33231,7 +33820,16 @@ impl Simulator {
                         value_of: s.value_of.clone(),
                     })
             })
-            .collect();
+            .collect()
+    }
+
+    fn make_event_waiter_resolved(
+        &mut self,
+        pid: usize,
+        resolved: Vec<SensitivityId>,
+        continuation: ProcCont,
+        is_clocking: bool,
+    ) -> EventWaiter {
         // §9.4.2 value guard: capture each non-trivial term's value at arm.
         let guard_prev: Vec<Option<Value>> = resolved
             .iter()
@@ -33319,7 +33917,7 @@ impl Simulator {
                         return true;
                     }
                     let sig = self.resolve_hier_name(h);
-                    sig == "__xz_default_clocking" || self.clocking_meta.contains_key(&sig)
+                    sig == "__xz_default_clocking" || self.clocking_meta.contains_key(&*sig)
                 } else {
                     false
                 }
@@ -33451,14 +34049,48 @@ impl Simulator {
     fn park_condition_waiter(&mut self, pid: usize, cont: ProcCont, cond: &Expression) {
         let mut reads = HashSet::default();
         Self::collect_condition_read_names(cond, &mut reads);
+        let gate = self.cond_gate_for(&reads);
+        self.cond_waiter_gate.insert(pid, gate);
         self.cond_waiter_reads.insert(pid, reads);
         self.cond_read_union_dirty = true;
         self.cond_waiter_conditions.insert(pid, cond.clone());
         self.condition_waiters.push((pid, cont));
     }
 
+    /// Can the bulk re-schedule skip this waiter while nothing in the
+    /// string-keyed stores changed? Only when every read name is a property
+    /// (or static) of the parking process's `this` object or a collection
+    /// builtin: those live in `PropMap` / `SignalMap`, whose every mutation
+    /// bumps `STORE_WRITE_GEN`. Anything else (an RTL signal, a local, a
+    /// free function) keeps the unconditional re-schedule.
+    fn cond_gate_for(&self, reads: &HashSet<String>) -> Option<u64> {
+        let Some(handle) = self.this_stack.last().copied().flatten().filter(|&h| h != 0) else {
+            return None;
+        };
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
+        let cn = inst.class_name.clone();
+        for n in reads {
+            if matches!(
+                n.as_str(),
+                "this" | "super" | "size" | "num" | "exists" | "first" | "last" | "next" | "prev"
+            ) {
+                continue;
+            }
+            if inst.properties.contains_key(n) {
+                continue;
+            }
+            if self.class_prop_type_name(handle, n).is_some() {
+                continue;
+            }
+            if self.static_prop_key(&cn, n).is_some() {
+                continue;
+            }
+            return None;
+        }
+        Some(store_gen())
+    }
+
     fn eval_waiter_condition(&mut self, waiter_pid: usize, cond: &Expression) -> bool {
-        let saved = self.snapshot_process_context();
         let saved_hint = self.name_resolve_hint.borrow().clone();
         let saved_scope = self.current_scope.clone();
         let saved_pid = self.current_pid;
@@ -33468,15 +34100,22 @@ impl Simulator {
             self.current_scope = scope;
         }
         let cond_held = if let Some(ctx) = self.process_contexts.remove(&waiter_pid) {
+            // The caller's context is moved aside, not cloned: the waiter's
+            // context replaces it wholesale and the original comes back
+            // untouched afterwards.
+            let saved = self.take_process_context();
             self.restore_process_context(ctx);
             let val = self.eval_expr(cond).is_true();
             let ctx = self.take_process_context();
             self.process_contexts.insert(waiter_pid, ctx);
+            self.restore_process_context(saved);
             val
         } else {
-            self.eval_expr(cond).is_true()
+            let saved = self.snapshot_process_context();
+            let val = self.eval_expr(cond).is_true();
+            self.restore_process_context(saved);
+            val
         };
-        self.restore_process_context(saved);
         *self.name_resolve_hint.borrow_mut() = saved_hint;
         self.current_scope = saved_scope;
         self.current_pid = saved_pid;
@@ -33532,6 +34171,7 @@ impl Simulator {
             let is_true = self.eval_waiter_condition(pid, &cond);
             if is_true {
                 let (wpid, wcont) = self.condition_waiters.remove(i);
+                self.cond_waiter_gate.remove(&wpid);
                 self.cond_waiter_reads.remove(&wpid);
                 self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&wpid);
@@ -33594,7 +34234,7 @@ impl Simulator {
         if !self.deferred_proc_entries.is_empty() {
             self.dirty_any = true;
         }
-        if std::env::var_os("XEZIM_PSETTLE_STATS").is_some() {
+        if env_set_cached!("XEZIM_PSETTLE_STATS") {
             self.prof_psettle_calls += 1;
             if self.settle_calls != __sc_before {
                 self.prof_psettle_deferred += 1;
@@ -34527,18 +35167,38 @@ impl Simulator {
             let prog_before = self.cond_progress;
             let ready = std::mem::take(&mut self.ready_condition_waiters);
             for (cpid, cont) in ready {
+                self.cond_waiter_gate.remove(&cpid);
                 self.cond_waiter_reads.remove(&cpid);
                 self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&cpid);
                 self.event_queue.schedule(self.time, cpid, cont);
             }
+            // Parked waiters used to be resumed wholesale on every drain:
+            // eight UVM housekeeping waits (`wait(m_premature_end)`, the
+            // phase hopper's `.size() != 0`, `wait(0)`) each restored a
+            // process, re-evaluated, merged fork frames and parked again —
+            // ~40 µs per tick, most of a 5 GHz-clock UVM run. A waiter
+            // whose condition reads only its own object's properties is
+            // skipped while the store generation is unchanged.
             let parked = std::mem::take(&mut self.condition_waiters);
+            let now_gen = store_gen();
+            let mut still_parked: Vec<(usize, ProcCont)> = Vec::new();
             for (cpid, cont) in parked {
+                if let Some(Some(g)) = self.cond_waiter_gate.get(&cpid) {
+                    if *g == now_gen {
+                        still_parked.push((cpid, cont));
+                        continue;
+                    }
+                }
+                self.cond_waiter_gate.remove(&cpid);
                 self.cond_waiter_reads.remove(&cpid);
                 self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&cpid);
                 self.event_queue.schedule(self.time, cpid, cont);
             }
+            let newly = std::mem::take(&mut self.condition_waiters);
+            self.condition_waiters = still_parked;
+            self.condition_waiters.extend(newly);
             while self.event_queue.next_time() == Some(self.time)
                 && !self.finished
                 && !self.zero_delay_defer_pending
@@ -36786,6 +37446,7 @@ impl Simulator {
             local_iface_aliases: self.local_iface_aliases.clone(),
             ref_binding_stack: self.ref_binding_stack.clone(),
             ref_alias_stack: self.ref_alias_stack.clone(),
+            ref_identity_stack: self.ref_identity_stack.clone(),
             queue_frame_saves: self.queue_frame_saves.clone(),
             task_cleanup: self.task_cleanup.clone(),
             local_dyn: self.local_dyn.clone(),
@@ -36800,6 +37461,9 @@ impl Simulator {
     /// task is inside `run_events_until`; moving the task context aside avoids
     /// cloning its local arrays on every clock edge.
     fn take_process_context(&mut self) -> ProcessContext {
+        // The ref stacks leave with the context; nothing can redirect until
+        // a context is restored or a new ref frame is pushed.
+        self.ref_redirect_hot = false;
         ProcessContext {
             this_stack: std::mem::take(&mut self.this_stack),
             local_stack: std::mem::take(&mut self.local_stack),
@@ -36814,6 +37478,7 @@ impl Simulator {
             local_iface_aliases: std::mem::take(&mut self.local_iface_aliases),
             ref_binding_stack: std::mem::take(&mut self.ref_binding_stack),
             ref_alias_stack: std::mem::take(&mut self.ref_alias_stack),
+            ref_identity_stack: std::mem::take(&mut self.ref_identity_stack),
             queue_frame_saves: std::mem::take(&mut self.queue_frame_saves),
             task_cleanup: std::mem::take(&mut self.task_cleanup),
             local_dyn: std::mem::take(&mut self.local_dyn),
@@ -36836,6 +37501,8 @@ impl Simulator {
         self.local_iface_aliases = ctx.local_iface_aliases;
         self.ref_binding_stack = ctx.ref_binding_stack;
         self.ref_alias_stack = ctx.ref_alias_stack;
+        self.ref_identity_stack = ctx.ref_identity_stack;
+        self.refresh_ref_redirect_hot();
         self.queue_frame_saves = ctx.queue_frame_saves;
         self.task_cleanup = ctx.task_cleanup;
         self.local_dyn = ctx.local_dyn;
@@ -36855,6 +37522,7 @@ impl Simulator {
             && !ctx.return_flag
             && ctx.local_dyn.is_empty()
             && ctx.static_local_syncs.is_empty()
+            && ctx.method_local_base.is_empty()
         {
             self.process_contexts.remove(&pid);
         } else {
@@ -36909,7 +37577,8 @@ impl Simulator {
             && !ctx.continue_flag
             && !ctx.return_flag
             && ctx.local_dyn.is_empty()
-            && ctx.static_local_syncs.is_empty();
+            && ctx.static_local_syncs.is_empty()
+            && ctx.method_local_base.is_empty();
         if trivial {
             self.process_contexts.remove(&pid);
         } else {
@@ -37333,6 +38002,12 @@ impl Simulator {
             || !self.class_context_stack.is_empty();
         let has_pid_ctx = self.process_contexts.contains_key(&pid);
         if !saved_ctx_needed && !has_pid_ctx {
+            // This path skips the context dance, so the per-method locals base
+            // is moved aside by hand: a process parked inside an inlined
+            // blocking method leaves its own base behind, and running another
+            // process under it would bound that process's frame-local lookups
+            // by an index into a `local_stack` it does not own.
+            let saved_mlb = std::mem::take(&mut self.method_local_base);
             self.run_process_payload(pid, stmts);
             let susp = self.is_pid_suspended(pid);
             if susp {
@@ -37340,25 +38015,28 @@ impl Simulator {
                 if !self.this_stack.is_empty()
                     || !self.local_stack.is_empty()
                     || !self.class_context_stack.is_empty()
+                    || !self.method_local_base.is_empty()
                 {
                     self.process_contexts
                         .insert(pid, self.snapshot_process_context());
                 }
             }
+            self.method_local_base = saved_mlb;
             self.auto_loop_vars.truncate(saved_auto_len);
             *self.name_resolve_hint.borrow_mut() = saved_hint;
             return;
         }
-        let mut saved = self.snapshot_process_context();
+        // The caller's context is MOVED aside (the restore below overwrites
+        // every field, so a clone bought nothing) and moved back at the end.
+        let mut saved = self.take_process_context();
         let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
         self.restore_process_context(ctx);
         self.run_process_payload(pid, stmts);
-        if self.is_pid_suspended(pid) {
-            self.process_contexts
-                .insert(pid, self.snapshot_process_context());
-        } else {
-            self.process_contexts.remove(&pid);
-        }
+        let suspended = self.is_pid_suspended(pid);
+        // The process's own context is moved out once; its frames are read
+        // for the fork merge below and the whole context is parked in the
+        // table only if the process suspended.
+        let child_ctx = self.take_process_context();
         // IEEE 1800-2023 §6.21/§9.3.2: automatic variables declared in the
         // parent scope are SHARED with fork children — a child's write must be
         // visible to the parent. xezim gives each fork child a COPY of the
@@ -37375,9 +38053,9 @@ impl Simulator {
         //       copied them into the child's frame and recorded the names in
         //       `fork_signal_captures`. Write the child's changed values back
         //       into `self.signals`, which is what the parent reads from.
-        let child_frames: Vec<HashMap<String, Value>> = self.local_stack.clone();
-        let baseline = self.fork_baselines.get(&pid).cloned();
-        let signal_caps = self.fork_signal_captures.get(&pid).cloned();
+        let child_frames: &[HashMap<String, Value>] = &child_ctx.local_stack;
+        let baseline = self.fork_baselines.get(&pid);
+        let signal_caps = self.fork_signal_captures.get(&pid);
         if !child_frames.is_empty() {
             if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
                 // (a) subroutine-frame merge
@@ -37390,7 +38068,7 @@ impl Simulator {
                         &parent_ctx.local_gen_stack,
                         &child_frames,
                         &child_gen,
-                        baseline.as_ref(),
+                        baseline,
                     );
                 } else {
                     // Parent is the active process — its context is `saved`.
@@ -37399,7 +38077,7 @@ impl Simulator {
                         &saved.local_gen_stack,
                         &child_frames,
                         &self.local_gen_stack,
-                        baseline.as_ref(),
+                        baseline,
                     );
                 }
             }
@@ -37408,14 +38086,13 @@ impl Simulator {
         // `self.signals`. Write only keys the child CHANGED (relative to the
         // fork-time baseline) so an inherited-unchanged value doesn't
         // clobber a sibling's or the parent's concurrent write.
-        if let Some(caps) = &signal_caps {
+        if let Some(caps) = signal_caps {
             let top = child_frames.last();
             for nm in caps {
                 let Some(v) = top.and_then(|f| f.get(nm)) else {
                     continue;
                 };
                 let inherited_unchanged = baseline
-                    .as_ref()
                     .and_then(|b| b.last())
                     .and_then(|f| f.get(nm))
                     .is_some_and(|old| old == v);
@@ -37424,7 +38101,10 @@ impl Simulator {
                 }
             }
         }
-        if !self.is_pid_suspended(pid) {
+        if suspended {
+            self.process_contexts.insert(pid, child_ctx);
+        } else {
+            self.process_contexts.remove(&pid);
             self.fork_baselines.remove(&pid);
             self.fork_signal_captures.remove(&pid);
         }
@@ -37620,6 +38300,16 @@ impl Simulator {
     /// payload marker), then settle — the same scheduling boundary
     /// `run_fast_delay_always` maintains.
     fn run_proc_fsm(&mut self, pid: usize) {
+        // The FSM gate admits only system-task statement fallbacks
+        // (`$display` and friends); they are the design, not a compile
+        // gap, so they must not show up in the edge path's `fallbacks=`
+        // coverage statistic.
+        let fallbacks_before = self.prof_fallback_insns;
+        self.run_proc_fsm_inner(pid);
+        self.prof_fallback_insns = fallbacks_before;
+    }
+
+    fn run_proc_fsm_inner(&mut self, pid: usize) {
         self.current_pid = pid;
         let Some(mut f) = self.proc_fsm.remove(&pid) else {
             return;
@@ -38139,7 +38829,8 @@ impl Simulator {
             _ => false,
         };
         if !eligible || stmt.span.start == 0 && stmt.span.end == 0 {
-            if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some()
+            static LOOP_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *LOOP_STATS.get_or_init(|| std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some())
                 && matches!(
                     stmt.kind,
                     StatementKind::For { .. } | StatementKind::If { .. }
@@ -38453,7 +39144,8 @@ impl Simulator {
         // env) also evaluate through the AST. A disagreement means the
         // bytecode compiled this expression with different semantics — pin
         // the span to the AST permanently and use the AST's answer.
-        if audits > 0 || std::env::var_os("XEZIM_PROC_COND_VERIFY").is_some() {
+        static COND_VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if audits > 0 || *COND_VERIFY.get_or_init(|| std::env::var_os("XEZIM_PROC_COND_VERIFY").is_some()) {
             let ast = self.eval_expr(cond).is_true();
             if ast != truth {
                 if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some()
@@ -38602,10 +39294,10 @@ impl Simulator {
             // inside them are properly handled with process suspension.
             if let StatementKind::SeqBlock { stmts: inner, .. } = &stmt.kind {
                 if self.stmts_have_blocking(inner) {
-                    let mut expanded = inner.clone();
-                    // Chain the caller's tail instead of copying it onto the end of
-                    // the spliced body (ProcCont::pushed).
-                    self.run_process_stmts(pid, &pc.pushed(expanded, pc.start + i + 1));
+                    // Immutable AST: share one Arc frame per (process, span)
+                    // instead of cloning the whole list on every entry.
+                    let frame = self.blocking_cont_frame(pid, stmt.span, 0, inner);
+                    self.run_process_stmts(pid, &pc.pushed_frame(frame, pc.start + i + 1));
                     return;
                 }
             }
@@ -39178,7 +39870,7 @@ impl Simulator {
                                             cont,
                                             is_peek: method == "peek",
                                         });
-                                    if std::env::var("XEZIM_MBX_DBG").is_ok() {
+                                    if env_set_cached!("XEZIM_MBX_DBG") {
                                         eprintln!("[MBX] t={} pid={} PARKED {} handle={}",
                                             self.time, pid, method, handle);
                                     }
@@ -39648,7 +40340,7 @@ impl Simulator {
                             return;
                         }
                         // Star/empty sensitivity — just execute body
-                        if !is_star && std::env::var_os("XEZIM_TRACE_SPIN").is_some() {
+                        if !is_star && env_set_cached!("XEZIM_TRACE_SPIN") {
                             eprintln!(
                                 "[EMPTYSENS] pid={} t={} event={:?} span={:?}",
                                 pid, self.time, event, stmt.span
@@ -39913,14 +40605,23 @@ impl Simulator {
                     };
                     match chosen {
                         Some(branch) if self.stmt_is_blocking(branch) => {
-                            let branch_stmts: Vec<Statement> = match &branch.kind {
-                                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
-                                _ => vec![branch.clone()],
+                            // The chosen branch is immutable AST: share one
+                            // Arc frame per (process, span) instead of cloning
+                            // its statements on every activation (a clocked
+                            // monitor whose else-chain ends in a rare `#delay`
+                            // did this every cycle — 3% of c906).
+                            let frame = match &branch.kind {
+                                StatementKind::SeqBlock { stmts, .. } => {
+                                    self.blocking_cont_frame(pid, branch.span, 1, stmts)
+                                }
+                                _ => self.blocking_cont_frame(
+                                    pid,
+                                    branch.span,
+                                    2,
+                                    std::slice::from_ref(branch),
+                                ),
                             };
-                            let mut cont = branch_stmts;
-                            // Chain the caller's tail instead of copying it onto the end of
-                            // the spliced body (ProcCont::pushed).
-                            self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                            self.run_process_stmts(pid, &pc.pushed_frame(frame, pc.start + i + 1));
                             return;
                         }
                         // Run the branch we already selected, rather than
@@ -41087,11 +41788,65 @@ impl Simulator {
     /// the enclosing block (its `$finish` included) the moment it broke out,
     /// which presented as a hang. Take the chain and splice with
     /// `ProcCont::pushed`, exactly like the other suspend-aware arms.
+    /// The continuation a forever loop parks with at statement `i` of its
+    /// body: `[first, rest of the body, ForeverTail { body }]`, built once
+    /// per (body, i, site) and shared afterwards. `pc.stmts` — the frame
+    /// that owns `body` — is kept alive by the entry so the address key
+    /// cannot be recycled by another allocation. The ForeverTail inside the
+    /// shared frame is what the next iteration keys on, so from the second
+    /// wake-up on every iteration of every loop is a lookup.
+    /// Shared continuation frame for an immutable statement list entered
+    /// from the process path (a blocking `begin/end` or a blocking chosen
+    /// `if` branch). Keyed per process like `forever_cont_cache`: sibling
+    /// instances share spans but never a pid.
+    fn blocking_cont_frame(
+        &mut self,
+        pid: usize,
+        span: crate::ast::Span,
+        kind: u8,
+        stmts: &[Statement],
+    ) -> Arc<[Statement]> {
+        let key = (pid, span.start as usize, span.end as usize, kind);
+        if let Some(f) = self.blocking_cont_cache.get(&key) {
+            return f.clone();
+        }
+        let f: Arc<[Statement]> = Arc::from(stmts.to_vec());
+        self.blocking_cont_cache.insert(key, f.clone());
+        f
+    }
+
+    fn forever_cont(
+        &mut self,
+        pid: usize,
+        body: &Statement,
+        body_stmts: &[Statement],
+        i: usize,
+        kind: u8,
+        first: &Statement,
+    ) -> Arc<[Statement]> {
+        let key = (pid, body.span.start, body.span.end, i, kind);
+        if let Some(cont) = self.forever_cont_cache.get(&key) {
+            return cont.clone();
+        }
+        let mut cont: Vec<Statement> = Vec::with_capacity(body_stmts.len() - i + 1);
+        cont.push(first.clone());
+        cont.extend_from_slice(&body_stmts[i + 1..]);
+        cont.push(Statement::new(
+            StatementKind::ForeverTail {
+                body: Box::new(body.clone()),
+            },
+            body.span,
+        ));
+        let cont: Arc<[Statement]> = Arc::from(cont);
+        self.forever_cont_cache.insert(key, cont.clone());
+        cont
+    }
+
     fn exec_forever_sched(&mut self, pid: usize, body: &Statement, pc: &ProcCont, idx: usize) {
         let resume_at = pc.start + idx + 1;
-        let body_stmts = match &body.kind {
-            StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
-            _ => vec![body.clone()],
+        let body_stmts: &[Statement] = match &body.kind {
+            StatementKind::SeqBlock { stmts, .. } => stmts.as_slice(),
+            _ => std::slice::from_ref(body),
         };
         for (i, s) in body_stmts.iter().enumerate() {
             if self.finished {
@@ -41131,42 +41886,45 @@ impl Simulator {
                             self.inactive_queue.push((pid, pc.pushed(restart, resume_at)));
                             return;
                         }
-                        let mut cont = vec![*tbody.clone()];
-                        cont.extend_from_slice(&body_stmts[i + 1..]);
-                        cont.push(Statement::new(
-                            StatementKind::ForeverTail {
-                                body: Box::new(body.clone()),
-                            },
-                            body.span,
-                        ));
+                        let cont = self.forever_cont(pid, body, body_stmts, i, 0, tbody);
                         if delay == 0 {
                             // `forever begin ... #0 ... end` — same §4.4.2.3
                             // Inactive-region parking as the run_process_stmts
                             // Delay handler above: resume only after this
                             // tick's NBA region (commercial consensus).
-                            self.inactive_queue.push((pid, pc.pushed(cont, resume_at)));
+                            self.inactive_queue.push((pid, pc.pushed_frame(cont, resume_at)));
                         } else {
                             self.event_queue
-                                .schedule(self.time + delay, pid, pc.pushed(cont, resume_at));
+                                .schedule(self.time + delay, pid, pc.pushed_frame(cont, resume_at));
                         }
                         return;
                     }
                     TimingControl::Event(event) => {
-                        let sens = self.event_to_sens(event);
-                        let is_clk_ev = self.is_clocking_event(event);
-                        if !sens.is_empty() {
-                            let mut cont = vec![*tbody.clone()];
-                            cont.extend_from_slice(&body_stmts[i + 1..]);
-                            cont.push(Statement::new(
-                                StatementKind::ForeverTail {
-                                    body: Box::new(body.clone()),
-                                },
-                                body.span,
-                            ));
-                            { let w = self.make_event_waiter_kind(
+                        let key = (pid, s.span.start as u32);
+                        let cached = self.forever_sens_cache.get(&key).cloned();
+                        let (resolved, is_clk_ev) = match cached {
+                            Some(c) => c,
+                            None => {
+                                let sens = self.event_to_sens(event);
+                                let is_clk_ev = self.is_clocking_event(event);
+                                let resolved = self.resolve_sens_ids(&sens);
+                                if !sens.is_empty() && resolved.len() == sens.len() {
+                                    self.forever_sens_cache
+                                        .insert(key, (resolved.clone(), is_clk_ev));
+                                }
+                                if sens.is_empty() {
+                                    (Vec::new(), is_clk_ev)
+                                } else {
+                                    (resolved, is_clk_ev)
+                                }
+                            }
+                        };
+                        if !resolved.is_empty() {
+                            let cont = self.forever_cont(pid, body, body_stmts, i, 1, tbody);
+                            { let w = self.make_event_waiter_resolved(
                                     pid,
-                                    sens,
-                                    pc.pushed(cont, resume_at),
+                                    resolved,
+                                    pc.pushed_frame(cont, resume_at),
                                     is_clk_ev,
                                 ); self.event_waiters.push(w); }
                             return;
@@ -41195,14 +41953,7 @@ impl Simulator {
                 if !Self::stmt_is_mailbox_get(s) && self.blocking_call_on_null_receiver(s) {
                     return;
                 }
-                let mut cont: Vec<Statement> = vec![s.clone()];
-                cont.extend_from_slice(&body_stmts[i + 1..]);
-                cont.push(Statement::new(
-                    StatementKind::ForeverTail {
-                        body: Box::new(body.clone()),
-                    },
-                    body.span,
-                ));
+                let cont = self.forever_cont(pid, body, body_stmts, i, 2, s);
 
                 // The statement is only POTENTIALLY blocking: `wait (cond)` with
                 // cond already true runs straight through, reaches the Forever
@@ -41213,7 +41964,7 @@ impl Simulator {
                 // continuation to the scheduler as a delta at the current time.
                 // The loop then spins through the event loop, where it is bounded,
                 // and the stall detector can see it and name it.
-                let contp = pc.pushed(cont, resume_at);
+                let contp = pc.pushed_frame(cont, resume_at);
                 if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
                     self.event_queue.schedule(self.time, pid, contp);
                     return;
@@ -41239,7 +41990,7 @@ impl Simulator {
         let mut broke = false;
         while !self.finished && safety < cap {
             safety += 1;
-            for s in &body_stmts {
+            for s in body_stmts {
                 self.exec_statement(s);
                 // §12.7.2: `break` (and a `return` out of the enclosing
                 // task/function, which sets the same flag) LEAVES the loop —
@@ -41305,12 +42056,12 @@ impl Simulator {
     fn dollar_bound_for_base(&mut self, base: &Expression) -> Option<i64> {
         let n = match &base.kind {
             ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
-            _ => self.flat_member_name(base),
+            _ => self.flat_member_name(base).map(std::borrow::Cow::Owned),
         }?;
-        if self.module.dynamic_arrays.contains(&n) {
+        if self.module.dynamic_arrays.contains(&*n) {
             Some(self.get_queue_size(&n) as i64 - 1)
         } else {
-            self.module.arrays.get(&n).map(|&(_, hi, _)| hi)
+            self.module.arrays.get(&*n).map(|&(_, hi, _)| hi)
         }
     }
 
@@ -41469,7 +42220,7 @@ impl Simulator {
                 ExprKind::StringLiteral(_) => return None,
                 ExprKind::Ident(h) => {
                     let n = sim.resolve_hier_name(h);
-                    if sim.string_signals.contains(&n) {
+                    if sim.string_signals.contains(&*n) {
                         return None;
                     }
                 }
@@ -41590,6 +42341,56 @@ impl Simulator {
         false
     }
 
+    /// LRM §25.8 — resolve `vif.member` (or `this.vif.member`) to the FLAT
+    /// name of the bound interface signal, `"<iface_instance>.<member>"`.
+    ///
+    /// `resolve_nba_target` asks the same question but only ever returns a
+    /// registered signal id, which is no use to a caller that needs the NAME
+    /// — to look up the member's packed dimensions, say. The binding lives
+    /// either in `local_iface_aliases` (a vif passed as a task formal) or in
+    /// `virtual_iface_bindings` keyed by the current `this`; both lookups are
+    /// the ones that arm already does.
+    fn vif_member_flat_name(&self, expr: &Expression) -> Option<String> {
+        let ExprKind::MemberAccess { expr: base, member } = &expr.kind else {
+            return None;
+        };
+        let prop = match &base.kind {
+            ExprKind::Ident(hier) if hier.path.len() == 1 => {
+                hier.path[0].name.name.as_str()
+            }
+            ExprKind::MemberAccess {
+                expr: inner,
+                member: vprop,
+            } if matches!(&inner.kind, ExprKind::This) => vprop.name.as_str(),
+            _ => return None,
+        };
+        if let Some(bound) = self
+            .local_iface_aliases
+            .last()
+            .and_then(|frame| frame.get(prop))
+        {
+            return Some(format!("{}.{}", bound, member.name));
+        }
+        let this_h = self.this_stack.last().copied().flatten()?;
+        let cls_name = self
+            .heap
+            .get(this_h)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.as_str())?;
+        if !self
+            .module
+            .classes
+            .get(cls_name)
+            .is_some_and(|cd| cd.virtual_iface_properties.contains_key(prop))
+        {
+            return None;
+        }
+        let (bound_name, _modport) = self
+            .virtual_iface_bindings
+            .get(&(this_h, prop.to_string()))?;
+        Some(format!("{}.{}", bound_name, member.name))
+    }
+
     fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -41602,7 +42403,7 @@ impl Simulator {
                     }
                 }
                 let name = self.resolve_hier_name(hier);
-                if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     hier.cached_signal_id.set(Some(id));
                     return Some(id);
                 }
@@ -41628,12 +42429,12 @@ impl Simulator {
                     // `module.arrays`, which is why assoc was always correct).
                     // Static arrays keep the fast path: their element ids ARE
                     // what comb readers depend on.
-                    if self.module.dynamic_arrays.contains(&name)
-                        || self.module.queue_vars.contains(&name)
+                    if self.module.dynamic_arrays.contains(&*name)
+                        || self.module.queue_vars.contains(&*name)
                     {
                         return None;
                     }
-                    if self.module.arrays.contains_key(&name) {
+                    if self.module.arrays.contains_key(&*name) {
                         // `$` here is the collection's last index (§11.4.12);
                         // without the bound it evaluates to u64::MAX and the
                         // element lookup misses, silently dropping the write.
@@ -41752,14 +42553,14 @@ impl Simulator {
             return false;
         }
         let name = self.resolve_hier_name(hier);
-        if self.module.arrays.contains_key(&name)
-            || self.module.queue_vars.contains(&name)
-            || self.module.dynamic_arrays.contains(&name)
-            || self.module.associative_arrays.contains_key(&name)
+        if self.module.arrays.contains_key(&*name)
+            || self.module.queue_vars.contains(&*name)
+            || self.module.dynamic_arrays.contains(&*name)
+            || self.module.associative_arrays.contains_key(&*name)
         {
             return false;
         }
-        let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+        let Some(&id) = self.signal_name_to_id.get(name.as_ref()) else {
             return false;
         };
         let selected = self.eval_expr(index);
@@ -41772,7 +42573,7 @@ impl Simulator {
         let elem_width = self
             .module
             .packed_signal_elem_widths
-            .get(&name)
+            .get(&*name)
             .copied()
             .unwrap_or(1);
         let Some(low) = self.packed_elem_lsb(&name, label, elem_width) else {
@@ -42128,7 +42929,27 @@ impl Simulator {
         // §10.7: fit the queued value to the destination type (real / 2-state /
         // width / signedness). A bare `resize` here dropped real conversions
         // (integer bits reinterpreted as a double) and left X/Z in 2-state nets.
-        let mut val = self.fit_value_to_signal(id, &entry.value);
+        // A value already at the signal's width (the usual `q <= d`) is
+        // MOVED into place instead of cloned through the fitting path: for
+        // a wide value that clone was a fresh allocation per non-blocking
+        // assignment per edge. The move is exact — a resize to the same
+        // width copies the bits unchanged — and the shapes the fitting
+        // path converts (fills, reals, strings, two-state targets with x/z)
+        // are excluded.
+        let width = self.signal_widths[id];
+        let v = &entry.value;
+        let mut val = if width != 0
+            && v.width == width
+            && !v.is_fill
+            && !v.is_real
+            && !self.signal_real[id]
+            && !self.signal_is_string.get(id).copied().unwrap_or(false)
+            && !(self.signal_two_state.get(id).copied().unwrap_or(false) && v.has_xz())
+        {
+            entry.value
+        } else {
+            self.fit_value_to_signal(id, v)
+        };
         if val.is_signed != signed {
             val.is_signed = signed;
         }
@@ -42412,7 +43233,7 @@ impl Simulator {
                 }
             }
             let resolved = self.resolve_hier_name(hier);
-            if let Some(&id) = self.signal_name_to_id.get(resolved.as_str()) {
+            if let Some(&id) = self.signal_name_to_id.get(resolved.as_ref()) {
                 return Some(id);
             }
             // Fallback for legacy single-segment names.
@@ -42746,8 +43567,22 @@ impl Simulator {
                     self.edge_pos_seen[p] = false;
                 }
             }
+            // A process resumed INSIDE the scan (an edge continuation) may
+            // write an edge-sensitive signal; that position is pushed onto
+            // the fresh list during the scan. Overwriting the list with the
+            // emptied subset dropped it while its `edge_pos_seen` stayed
+            // set, so no later write to that signal could ever queue it
+            // again: an `always @(sig)` fired once and was dead for the
+            // rest of the run. Carry those positions into the next pass.
+            let pushed_during_scan = std::mem::take(&mut self.changed_edge_pos);
             let mut s = subset;
             s.clear();
+            s.extend_from_slice(&pushed_during_scan);
+            for &p in &pushed_during_scan {
+                if p < self.edge_pos_seen.len() {
+                    self.edge_pos_seen[p] = true;
+                }
+            }
             self.changed_edge_pos = s;
             return;
         }
@@ -43126,15 +43961,7 @@ impl Simulator {
                 let operand = args.first()?.clone();
                 let site = expr.span.start;
                 let widx = self.sampled_watch_for(site, &operand, ec, cid, n)?;
-                let cur = match self.sampled_watches[widx].hist.front() {
-                    Some(v) => v.clone(),
-                    None => {
-                        let op = operand.clone();
-                        self.eval_expr(&op)
-                    }
-                };
-                let past = self.sampled_watches[widx].hist.get(n).cloned();
-                return Some((cur, past));
+                return Some(self.sampled_cur_and_past(widx, &operand, n));
             }
             let (clk_str, _) = self.clocking_meta.get("__xz_default_clocking")?.clone();
             // clocking_meta stores the bare clock SIGNAL name (the parser
@@ -43148,16 +43975,37 @@ impl Simulator {
         let operand = args.first()?.clone();
         let site = expr.span.start;
         let widx = self.sampled_watch_for(site, &operand, edge_code.unwrap_or(0), clk_id, n)?;
-        let w = &self.sampled_watches[widx];
-        let cur = match w.hist.front() {
-            Some(v) => v.clone(),
-            None => {
+        Some(self.sampled_cur_and_past(widx, &operand, n))
+    }
+
+    /// (current sample, `n` edges back) for a sampled-value call. The per-slot
+    /// sampler runs after the Active processes and before the SVA sites, so
+    /// when the reader runs BEFORE this slot's sample the front of the
+    /// history is the PREVIOUS edge: the current value is read live and the
+    /// past index shifts by one. A procedural `$past(v)` at the second edge
+    /// used to index past that single sample and report "no history", and
+    /// from the third edge on returned the value from two edges back.
+    fn sampled_cur_and_past(
+        &mut self,
+        widx: usize,
+        operand: &Expression,
+        n: usize,
+    ) -> (Value, Option<Value>) {
+        let sampled_this_slot = self.sampled_watches[widx].last_sample_time == Some(self.time);
+        let cur = match self.sampled_watches[widx].hist.front() {
+            Some(v) if sampled_this_slot => v.clone(),
+            _ => {
                 let op = operand.clone();
                 self.eval_expr(&op)
             }
         };
-        let past = self.sampled_watches[widx].hist.get(n).cloned();
-        Some((cur, past))
+        let idx = if sampled_this_slot { n } else { n.saturating_sub(1) };
+        let past = if n == 0 {
+            Some(cur.clone())
+        } else {
+            self.sampled_watches[widx].hist.get(idx).cloned()
+        };
+        (cur, past)
     }
 
     /// Pre-register sampled-value watches for every `$rose/$fell/$stable/
@@ -43371,6 +44219,22 @@ impl Simulator {
 
     /// Reconstruct a signal's PREPONED (slot-entry) value from the edge
     /// snapshot arrays.
+    /// Copy a signal's current value into its preponed snapshot (the
+    /// per-slot pass does this for every edge signal after a slot that wrote
+    /// something; a signal registered mid-run needs it once, immediately).
+    fn seed_prev_from_current(&mut self, id: usize) {
+        if id >= self.signal_table.len() || id >= self.prev_val.len() || id >= self.prev_xz.len() {
+            return;
+        }
+        let (v, x) = self.signal_table[id].raw_bits();
+        self.prev_val[id] = v;
+        self.prev_xz[id] = x;
+        if self.signal_widths.get(id).copied().unwrap_or(0) > 64 {
+            let cur = self.signal_table[id].clone();
+            self.prev_wide.insert(id, cur);
+        }
+    }
+
     fn preponed_value_of(&self, id: usize) -> Value {
         if let Some(w) = self.prev_wide.get(&id) {
             return w.clone();
@@ -43402,12 +44266,19 @@ impl Simulator {
             _ => EdgeKind::AnyEdge,
         };
         let sig_id = self.get_lhs_signal_id(operand);
+        // A signal registered here at run time has no preponed snapshot yet,
+        // and the snapshot pass only runs for a slot that wrote something —
+        // a declaration-initialised operand (`logic [7:0] v = 8'hA5;`) is
+        // never written, so its first sample read a stale x. Seed the
+        // snapshot from the current value on registration.
         if !self.edge_signal_ids.contains(&clk_id) {
             self.edge_signal_ids.push(clk_id);
+            self.seed_prev_from_current(clk_id);
         }
         if let Some(sid) = sig_id {
             if !self.edge_signal_ids.contains(&sid) {
                 self.edge_signal_ids.push(sid);
+                self.seed_prev_from_current(sid);
             }
         }
         let i = self.sampled_watches.len();
@@ -43418,6 +44289,7 @@ impl Simulator {
             expr: operand.clone(),
             hist: std::collections::VecDeque::new(),
             depth: depth + 1,
+            last_sample_time: None,
         });
         self.sampled_watch_site.insert(site, i);
         Some(i)
@@ -43434,6 +44306,7 @@ impl Simulator {
             if !self.check_edge_id(clk_id, edge) {
                 continue;
             }
+            self.sampled_watches[i].last_sample_time = Some(self.time);
             let sample = match self.sampled_watches[i].sig_id {
                 Some(sid) => self.preponed_value_of(sid),
                 None => {
@@ -44400,7 +45273,7 @@ impl Simulator {
                 false
             } else if !qualifies {
                 false
-            } else if std::env::var("XEZIM_FORCE_PARALLEL").ok().as_deref() == Some("1") {
+            } else if env_is_one_cached!("XEZIM_FORCE_PARALLEL") {
                 true
             } else {
                 match self.par_cal_phase {
@@ -45061,7 +45934,10 @@ impl Simulator {
         // same edge updates). XEZIM_ACTIVE_REGION=0 restores the legacy
         // schedule-into-event_queue path (waiter runs in the NEXT event_loop
         // iter after apply_nba, reading post-NBA values).
-        let active_region = std::env::var("XEZIM_ACTIVE_REGION").ok().as_deref() != Some("0");
+        let active_region = {
+            static FLAG: OnceLock<bool> = OnceLock::new();
+            *FLAG.get_or_init(|| std::env::var("XEZIM_ACTIVE_REGION").ok().as_deref() != Some("0"))
+        };
         // Record continuation writes for the §9.2 rescan drain (see
         // `in_edge_cont`): these run AFTER this pass's edge detection, so
         // without recording, an AnyEdge block sensitive to a signal a
@@ -45121,7 +45997,7 @@ impl Simulator {
                 }
                 settle_guard += 1;
                 if self.finished || settle_guard > 10_000 {
-                    if std::env::var_os("XEZIM_TRACE_SPIN").is_some() && !self.finished {
+                    if env_set_cached!("XEZIM_TRACE_SPIN") && !self.finished {
                         eprintln!("[DRAINGUARD] t={} exhausted; {} waiters:", self.time, self.event_waiters.len());
                         for w in self.event_waiters.iter().take(6) {
                             let names: Vec<String> = w
@@ -45624,6 +46500,27 @@ impl Simulator {
         // §29: sequential UDPs mutate per-instance state during evaluation,
         // which the parallel/BSP isolated eval (`&self`, view-based) cannot do.
         // Force the serial fixpoint path whenever the design contains any UDP.
+        self.settle_dispatch();
+        // A `release` executed inside the pass (by a level-sensitive block
+        // evaluated as a comb entry) could not re-drive its net because the
+        // entry table was taken out: do it now and settle again until quiet.
+        let mut rounds = 0;
+        while !self.pending_release_ids.is_empty() && rounds < 8 {
+            rounds += 1;
+            let ids = std::mem::take(&mut self.pending_release_ids);
+            for id in ids {
+                self.mark_release_sources_dirty(id);
+            }
+            if self.dirty_any {
+                self.settle_dispatch();
+            }
+        }
+        if !self.active_force_exprs.is_empty() {
+            self.refresh_active_forces();
+        }
+    }
+
+    fn settle_dispatch(&mut self) {
         if self.has_udp || self.proc_settle_defer || !self.deferred_proc_entries.is_empty() {
             self.settle_combinatorial_inner();
         } else if self.perlp_settle.is_some() {
@@ -45648,8 +46545,34 @@ impl Simulator {
         // cannot re-trigger the very entries that fed it (no oscillation);
         // a target with comb readers marks them dirty and the caller's
         // next settle picks that up as usual.
-        if !self.active_force_exprs.is_empty() {
-            self.refresh_active_forces();
+    }
+
+    /// `release` of a net: its continuous drivers must re-evaluate. Outside a
+    /// settle the source signals of every entry writing the net are marked
+    /// dirty right away; inside one (entry table taken out, dirty marks
+    /// dropped with the pass) the id is queued for `settle_combinatorial`.
+    fn redrive_released_signal(&mut self, id: usize) {
+        if self.settling || self.comb_entries.is_empty() {
+            self.pending_release_ids.push(id);
+            self.dirty_any = true;
+            return;
+        }
+        self.mark_release_sources_dirty(id);
+    }
+
+    fn mark_release_sources_dirty(&mut self, id: usize) {
+        let mut sources: Vec<usize> = Vec::new();
+        for entry in self.comb_entries.iter() {
+            if entry.cold.write_signal_ids.contains(&id) {
+                sources.extend(entry.cold.read_signal_ids.iter().copied());
+            }
+        }
+        for src_id in sources {
+            if src_id < self.dirty_signals.len() && !self.dirty_signals[src_id] {
+                self.dirty_signals[src_id] = true;
+                self.dirty_list.push(src_id);
+                self.dirty_any = true;
+            }
         }
     }
 
@@ -45715,7 +46638,9 @@ impl Simulator {
                 self.settle_triggered_list.push(eidx);
             }
         }
-        if self.time == 0 && !self.comb_time0_fired {
+        // See `settle_combinatorial_inner`: the one-shot must not retire on a
+        // static-init settle that runs before the comb graph is built.
+        if self.time == 0 && !self.comb_time0_fired && !self.comb_entries.is_empty() {
             for ti in 0..self.comb_time0_idx.len() {
                 let eidx = self.comb_time0_idx[ti];
                 if eidx < num_entries && !self.settle_triggered[eidx] {
@@ -46307,6 +47232,7 @@ impl Simulator {
                 // ELEMENT type. The generic eval concatenates items at their
                 // own widths, which scrambles any item that is not exactly
                 // element-sized.
+                //
                 let val = if let ExprKind::AssignmentPattern(items) = &rhs.kind {
                     self.packed_pattern_for_lhs(lhs, items)
                         .or_else(|| self.eval_packed_struct_pattern(lhs, items))
@@ -46593,7 +47519,19 @@ impl Simulator {
         // at the same (or later) time rely on dirty propagation through the
         // worklist. The prior O(num_entries) scan per call was ~500μs on
         // c910 and dominated per-assign cost during memory-init loops.
-        if self.time == 0 && !self.comb_time0_fired {
+        //
+        // `num_entries > 0` keeps the one-shot from being CONSUMED before the
+        // comb graph exists. Class static initializers run during elaboration
+        // (the `registry spec static init` phase), long before
+        // `build combinational entries`; a blocking write in one of them
+        // reaches `settle_after_proc_write`, whose settle finds an empty
+        // entry list. Latching there seeded nothing yet retired the flag, so
+        // the real time-0 settle skipped `comb_time0_idx` entirely and every
+        // entry with an EMPTY READ SET — a constant-RHS continuous assign
+        // such as `assign a[i][v][j] = '0;` — never evaluated at all, leaving
+        // its net x for the whole run. UVM's parameterized-class registry
+        // makes that early static-init settle happen in any UVM testbench.
+        if self.time == 0 && !self.comb_time0_fired && num_entries > 0 {
             for &eidx in self.comb_time0_idx.iter() {
                 if eidx < num_entries && !triggered[eidx] {
                     triggered[eidx] = true;
@@ -46652,6 +47590,33 @@ impl Simulator {
         let warn_x_on = self.warn_x && self.time > 0;
         // Profiling counters accumulate in registers and fold back into `self`
         // once, instead of a read-modify-write per evaluation.
+        // Dependents injected into the running pass, as a bitset plus the
+        // index of the smallest pending one. A binary heap here cost a
+        // push/pop per dependency edge (~780M per CoreMark run); the bitset
+        // is one OR per injection and a forward word scan per take.
+        let mut inject_bits: Vec<u64> = std::mem::take(&mut self.settle_inject_bits);
+        let words = num_entries.div_ceil(64).max(1);
+        if inject_bits.len() < words {
+            inject_bits.resize(words, 0);
+        }
+        let mut next_inject: usize = usize::MAX;
+        fn next_set_bit(bits: &[u64], from: usize) -> usize {
+            let mut w = from >> 6;
+            if w >= bits.len() {
+                return usize::MAX;
+            }
+            let mut word = bits[w] & (u64::MAX << (from & 63));
+            loop {
+                if word != 0 {
+                    return (w << 6) + word.trailing_zeros() as usize;
+                }
+                w += 1;
+                if w >= bits.len() {
+                    return usize::MAX;
+                }
+                word = bits[w];
+            }
+        }
         let mut n_evals = 0u64;
         let mut n_dc = 0u64;
         let mut n_ab = 0u64;
@@ -46681,7 +47646,16 @@ impl Simulator {
                         if !triggered[__dep] {
                             triggered[__dep] = true;
                             if __dep > $eidx {
-                                cur_list.push(__dep);
+                                // Keep the pass in entry (topological)
+                                // order: an injected dependent runs BEFORE
+                                // the entries that read it, so they are not
+                                // re-triggered into a second pass. Appending
+                                // it to the pass list ran it last and cost
+                                // 15% more entry evaluations on c906.
+                                inject_bits[__dep >> 6] |= 1u64 << (__dep & 63);
+                                if __dep < next_inject {
+                                    next_inject = __dep;
+                                }
                             } else {
                                 next_list.push(__dep);
                             }
@@ -46726,9 +47700,18 @@ impl Simulator {
             // cache-state interaction we haven't traced yet. Don't
             // re-enable without a c910 t=1 k=0 + t=4 k=4 cmark sanity.
             let mut cur_pos = 0usize;
-            while cur_pos < cur_list.len() {
-                let eidx = cur_list[cur_pos];
-                cur_pos += 1;
+            while cur_pos < cur_list.len() || next_inject != usize::MAX {
+                let eidx = if next_inject != usize::MAX
+                    && (cur_pos >= cur_list.len() || next_inject < cur_list[cur_pos])
+                {
+                    let e = next_inject;
+                    inject_bits[e >> 6] &= !(1u64 << (e & 63));
+                    next_inject = next_set_bit(&inject_bits, e + 1);
+                    e
+                } else {
+                    cur_pos += 1;
+                    cur_list[cur_pos - 1]
+                };
                 // The entry header load is the loop's dominant stall (~19%
                 // of settle self-time: 35k 64-byte entries visited in
                 // data-dependent order). The worklist names the upcoming
@@ -47353,6 +48336,7 @@ impl Simulator {
         self.comb_entries = entries;
         self.comb_dep_offsets = dep_offsets;
         self.comb_dep_entries = dep_entries;
+        self.settle_inject_bits = inject_bits;
         self.settle_triggered = triggered;
         self.settle_triggered_list = next_list;
         self.settle_dirty_ids = cur_list;
@@ -47794,8 +48778,8 @@ impl Simulator {
         if let ExprKind::Ident(hier) = &lv.kind {
             if hier.path.iter().all(|s| s.selects.is_empty()) {
                 let name = self.resolve_hier_name(hier);
-                let id = self.signal_name_to_id.get(name.as_str()).copied();
-                return Some((name, id));
+                let id = self.signal_name_to_id.get(name.as_ref()).copied();
+                return Some((name.to_string(), id));
             }
         }
         // §10.6.2: a HIERARCHICAL target (`force u.internal = v`) parses as
@@ -47838,10 +48822,10 @@ impl Simulator {
             if let ExprKind::Ident(bh) = &base.kind {
                 if bh.path.iter().all(|s| s.selects.is_empty()) {
                     let bname = self.resolve_hier_name(bh);
-                    if self.module.arrays.contains_key(&bname)
-                        && !self.module.dynamic_arrays.contains(&bname)
-                        && !self.module.queue_vars.contains(&bname)
-                        && !self.module.associative_arrays.contains_key(&bname)
+                    if self.module.arrays.contains_key(&*bname)
+                        && !self.module.dynamic_arrays.contains(&*bname)
+                        && !self.module.queue_vars.contains(&*bname)
+                        && !self.module.associative_arrays.contains_key(&*bname)
                     {
                         let idx = self.eval_expr(index).to_i64()?;
                         if let Some(id) = self.get_array_elem_id(&bname, idx) {
@@ -47854,6 +48838,33 @@ impl Simulator {
                         }
                     }
                 }
+            }
+        }
+        None
+    }
+
+    /// The registered packed-struct base of a dotted member lvalue, as
+    /// `(base_name, bit_offset, width)` of the selected member within it.
+    ///
+    /// `packed_struct_fields[base]` is FLATTENED — a nested member is a key in
+    /// its own right (`"hdr.d.x"`), and no entry exists for an intermediate
+    /// member on its own (`packed_struct_fields["f.hdr"]` is None). So the
+    /// single split at the last dot only ever resolved a DEPTH-1 member, and
+    /// `f.hdr.d = v` inside a subroutine — where the lvalue parses as
+    /// MemberAccess rather than a dotted Ident — matched nothing and was
+    /// silently dropped. Walk the split points LONGEST BASE FIRST, exactly as
+    /// `resolve_packed_struct_target` does for assignment patterns (which is
+    /// why the same write with a `'{...}` RHS always worked): the base may
+    /// itself be instance-scoped (`u.r2`), so the first-dot split is wrong too.
+    fn packed_struct_member_slice(&mut self, lvalue: &Expression) -> Option<(String, u32, u32)> {
+        let flat = self.flat_member_name(lvalue)?;
+        for (i, _) in flat.match_indices('.').collect::<Vec<_>>().into_iter().rev() {
+            let (base, prefix) = (&flat[..i], &flat[i + 1..]);
+            let Some(layout) = self.module.packed_struct_fields.get(base) else {
+                continue;
+            };
+            if let Some((_, o, w)) = layout.iter().find(|(k, _, _)| k == prefix) {
+                return Some((base.to_string(), *o, *w));
             }
         }
         None
@@ -48097,7 +49108,7 @@ impl Simulator {
         let ExprKind::Ident(h) = &cur.kind else {
             return None;
         };
-        Some((self.resolve_hier_name(h), steps))
+        Some((self.resolve_hier_name(h).into_owned(), steps))
     }
 
     /// Resolve a walked path over a PACKED aggregate to the
@@ -48373,6 +49384,125 @@ impl Simulator {
         changed
     }
 
+    /// §13.5.2: an element, bit or part-select access on a `ref` formal
+    /// (`a[i]`, `a[i][j]`, `a[7:0]`, `a[i].f`) goes THROUGH to the caller's
+    /// actual — for a formal aliased to module-visible storage the storage
+    /// name replaces the formal; for an aggregate bound by identity (no local
+    /// copy exists) the actual's own hierarchical name is extended with the
+    /// formal's selects. Whole-name reads and writes keep their existing
+    /// routing (see `ref_alias_stack`); this covers the selected forms, which
+    /// previously wrote a dead local copy while the matching read went to
+    /// the storage — `a[1] = 9` inside the task read back x.
+    fn ref_formal_redirect_hier(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+        selected: bool,
+    ) -> Option<crate::ast::expr::HierarchicalIdentifier> {
+        if hier.root.is_some() || hier.path.is_empty() {
+            return None;
+        }
+        // A bare name is redirected only underneath an `Index`/`RangeSelect`
+        // wrapper (`selected`); the whole-name forms keep their own routing.
+        if !selected && hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+            return None;
+        }
+        let name = hier.path[0].name.name.as_str();
+        if let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(name)) {
+            // A formal bound to an actual of the SAME name (`run_checks(ref
+            // u7_t [..] cnt)` called as `run_checks(cnt)`) rewrote the
+            // identifier to itself, and the evaluator re-entered this
+            // redirect on the rewritten node until the stack overflowed.
+            // Plain resolution of the name already reaches that storage.
+            if storage == name {
+                return None;
+            }
+            let mut path = hier.path.clone();
+            path[0].name.name = storage.clone();
+            return Some(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path,
+                span: hier.span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            });
+        }
+        // Identity-bound aggregate: the formal has no storage of its own.
+        // Formals the copy-in machineries own (scalars with a local slot, 1-D
+        // arrays, associative arrays, queues — copied back on return) are not
+        // listed: a direct write to the actual would be undone by the stale
+        // copy-back.
+        if !self.ref_identity_stack.last().is_some_and(|v| v.iter().any(|n| n == name)) {
+            return None;
+        }
+        let actual = self.ref_binding_stack.last().and_then(|m| m.get(name))?;
+        let ExprKind::Ident(ah) = &actual.kind else { return None };
+        if ah.path.is_empty() {
+            return None;
+        }
+        // A self-mapped binding (`a` -> `a`) would rewrite forever.
+        if ah.path.len() == 1 && ah.path[0].selects.is_empty() && ah.path[0].name.name == name {
+            return None;
+        }
+        let mut path = ah.path.clone();
+        let mut rest = hier.path.clone();
+        let first = rest.remove(0);
+        path.last_mut().unwrap().selects.extend(first.selects);
+        path.extend(rest);
+        Some(crate::ast::expr::HierarchicalIdentifier {
+            root: ah.root.clone(),
+            path,
+            span: hier.span,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        })
+    }
+
+    /// `ref_formal_redirect_hier` applied through `Index`/`RangeSelect`
+    /// wrappers down to the root identifier of an lvalue or operand.
+    fn ref_formal_redirect_expr(&self, e: &Expression) -> Option<Expression> {
+        if !self.ref_redirect_possible() {
+            return None;
+        }
+        self.ref_formal_redirect_inner(e, false)
+    }
+
+    /// Cheap reject for the hot paths: only a call with an aliased or an
+    /// identity-bound `ref` formal can redirect anything.
+    #[inline(always)]
+    fn ref_redirect_possible(&self) -> bool {
+        self.ref_redirect_hot
+    }
+
+    fn refresh_ref_redirect_hot(&mut self) {
+        self.ref_redirect_hot = self.ref_alias_stack.last().is_some_and(|m| !m.is_empty())
+            || self.ref_identity_stack.last().is_some_and(|v| !v.is_empty());
+    }
+
+    fn ref_formal_redirect_inner(&self, e: &Expression, selected: bool) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Ident(h) => self
+                .ref_formal_redirect_hier(h, selected)
+                .map(|nh| Expression::new(ExprKind::Ident(nh), e.span)),
+            ExprKind::Index { expr, index } => self.ref_formal_redirect_inner(expr, true).map(|ne| {
+                Expression::new(ExprKind::Index { expr: Box::new(ne), index: index.clone() }, e.span)
+            }),
+            ExprKind::RangeSelect { expr, kind, left, right } => {
+                self.ref_formal_redirect_inner(expr, true).map(|ne| {
+                    Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(ne),
+                            kind: kind.clone(),
+                            left: left.clone(),
+                            right: right.clone(),
+                        },
+                        e.span,
+                    )
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn assign_value_inner(&mut self, lhs: &Expression, val: &Value) -> bool {
         // §25.9: a just-returned vif (recorded by the Return arm) binds to
         // the FIRST assignment target after the call — `value = r.read(c)`
@@ -48402,6 +49532,46 @@ impl Simulator {
             );
             let _ = self.try_bind_virtual_iface(lhs, &synth);
         }
+        // §13.5.2: a selected write through a `ref` formal lands on the
+        // caller's actual; an aliased formal's local copy is refreshed so
+        // any unredirected read path stays coherent.
+        if let Some(rewritten) = self.ref_formal_redirect_expr(lhs) {
+            let changed = self.assign_value(&rewritten, val);
+            let mut root = lhs;
+            loop {
+                match &root.kind {
+                    ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => root = expr,
+                    _ => break,
+                }
+            }
+            if let ExprKind::Ident(h) = &root.kind {
+                let fname = h.path[0].name.name.clone();
+                if let Some(storage) =
+                    self.ref_alias_stack.last().and_then(|m| m.get(&fname)).cloned()
+                {
+                    if let Some(full) = self.get_signal_value_by_name(&storage) {
+                        if let Some(frame) = self.local_stack.last_mut() {
+                            if let Some(slot) = frame.get_mut(&fname) {
+                                *slot = full;
+                            }
+                        }
+                    }
+                }
+            }
+            return changed;
+        }
+        if let ExprKind::Ident(h) = &lhs.kind {
+            if h.path.len() == 3 && h.path[1].name.name == "type_option" {
+                if let Some((cg, field)) = self.cg_type_option_path(h) {
+                    // Seed the table (defaults + body items) before the write.
+                    let _ = self.cg_type_option_get(&cg, &field);
+                    if let Some(t) = self.cg_type_options.get_mut(&cg) {
+                        t.insert(field, val.clone());
+                    }
+                    return true;
+                }
+            }
+        }
         if let Some(rewritten) = self.super_rewrite(lhs) {
             return self.assign_value(&rewritten, val);
         }
@@ -48425,7 +49595,7 @@ impl Simulator {
         } else {
             lhs
         };
-        
+
         // §7.4.6 / §11.5.1: an ELEMENT index containing x or z selects nothing,
         // so the write is discarded — `a['hx] = v` must leave every element
         // alone. The index folded to 0 through `to_u64`, so it silently
@@ -48444,12 +49614,12 @@ impl Simulator {
                 // discard-out-of-range semantics.
                 if let ExprKind::Ident(h) = &base.kind {
                     let qn = self.resolve_hier_name(h);
-                    if self.module.queue_vars.contains(&qn) {
+                    if self.module.queue_vars.contains(&*qn) {
                         let sz = self.get_queue_size(&qn);
                         let within_max = self
                             .module
                             .queue_max_sizes
-                            .get(&qn)
+                            .get(&*qn)
                             .is_none_or(|&m| sz < m as u64);
                         if within_max && iv.to_u64() == Some(sz) {
                             self.set_queue_size(&qn, sz + 1);
@@ -48668,6 +49838,11 @@ impl Simulator {
                 let fitted = match prev.as_ref() {
                     Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
                     Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    Some(p) if !p.is_real && val.is_real => {
+                        let mut f = Self::real_to_int(val.to_f64(), p.width.max(1));
+                        f.is_signed = p.is_signed;
+                        f
+                    }
                     _ => val.clone(),
                 };
                 let changed = prev.as_ref() != Some(&fitted);
@@ -48810,6 +49985,22 @@ impl Simulator {
                                 } else {
                                     val.clone()
                                 }
+                            } else if val.is_real
+                                && !is_str
+                                && self.local_stack[last_idx].get(name).is_some_and(|p| !p.is_real)
+                            {
+                                // §6.12.2: a real assigned to an INTEGRAL local
+                                // rounds to the local's type — the module-variable
+                                // path did, the frame local kept the real, so an
+                                // `int baudDivisor = freq / rate;` compared as
+                                // 32.55 forever (uart AVIP baud clock never toggled).
+                                let (w, signed) = self.local_stack[last_idx]
+                                    .get(name)
+                                    .map(|p| (self.widths.get(name).copied().unwrap_or(p.width).max(1), p.is_signed))
+                                    .unwrap_or((32, true));
+                                let mut f = Self::real_to_int(val.to_f64(), w);
+                                f.is_signed = signed;
+                                f
                             } else {
                                 val.clone()
                             };
@@ -48881,7 +50072,7 @@ impl Simulator {
                         if self.module.classes.contains_key(&cls)
                             && !self
                                 .signal_name_to_id
-                                .contains_key(self.resolve_hier_name(hier).as_str())
+                                .contains_key(self.resolve_hier_name(hier).as_ref())
                             && self.class_static_set(&cls, &prop, val.clone())
                         {
                             return true;
@@ -49111,7 +50302,7 @@ impl Simulator {
                     }
                 }
                 let name = self.resolve_hier_name(hier);
-                if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     hier.cached_signal_id.set(Some(id));
                     let resized = self.fit_value_to_signal(id, val);
                     let changed = self.signal_table[id] != resized;
@@ -49154,16 +50345,16 @@ impl Simulator {
                 // LRM §10.6/§10.6.1: a target under an active force or
                 // procedural continuous assign ignores ordinary procedural
                 // writes until the matching release/deassign.
-                if self.forced_names.contains(&name) {
+                if self.forced_names.contains(&*name) {
                     return false;
                 }
                 let width = self
                     .widths
-                    .get(&name)
+                    .get(&*name)
                     .copied()
                     .filter(|w| *w > 0)
                     .unwrap_or(val.width);
-                let is_real = self.real_signals.contains(&name);
+                let is_real = self.real_signals.contains(&*name);
                 // §6.16: a string has no declared length — for a `string`
                 // LOCAL the widths-map entry is the 1024-bit placeholder
                 // `resolve_type_width` hands the dynamic type, and resizing to
@@ -49173,7 +50364,7 @@ impl Simulator {
                 // map-backed store is where PROCEDURAL LOCALS land, so exempt
                 // them here too. Issue #64: a 129-char `$system` command came
                 // back as 128 chars shifted one byte left ("echo …" → "cho …").
-                let is_str = self.string_signals.contains(&name)
+                let is_str = self.string_signals.contains(&*name)
                     || hier
                         .path
                         .last()
@@ -49193,21 +50384,21 @@ impl Simulator {
                         val.resize(width)
                     }
                 };
-                resized.is_signed = self.signed_signals.contains(&name);
-                let changed = self.signals.get(&name).is_none_or(|p| *p != resized);
+                resized.is_signed = self.signed_signals.contains(&*name);
+                let changed = self.signals.get(&*name).is_none_or(|p| *p != resized);
                 if changed {
                     self.mark_dirty(&name);
                 }
-                self.signals.insert(name.clone(), resized.clone());
+                self.signals.insert(name.to_string(), resized.clone());
 
                 // If this is an array or queue, and we are assigning a packed value,
                 // we might want to split it into elements.
-                if std::env::var("XEZIM_A1_DBG").is_ok() && name.contains('m') {
+                if env_set_cached!("XEZIM_A1_DBG") && name.contains('m') {
                     eprintln!("[A1DBG] whole-name write name={:?} in_arrays={} hint={:?}",
-                        name, self.module.arrays.contains_key(&name),
+                        name, self.module.arrays.contains_key(&*name),
                         self.name_resolve_hint.borrow().clone());
                 }
-                if let Some((lo, hi, elem_width)) = self.module.arrays.get(&name).cloned() {
+                if let Some((lo, hi, elem_width)) = self.module.arrays.get(&*name).cloned() {
                     let num_elements = (resized.width / elem_width) as usize;
                     // For queues/dynamic arrays, we update the size
                     let is_dynamic = hi < lo || hi == 63 && lo == 0; // simplistic check for [lo:hi] vs []/[$]
@@ -49276,9 +50467,9 @@ impl Simulator {
                     if h.path.len() == 1 && h.path[0].selects.is_empty() {
                         let base = self.resolve_hier_name(h);
                         let bare = &h.path[0].name.name;
-                        let elem_key = if self.module.packed_signal_elem_widths.contains_key(&base)
+                        let elem_key = if self.module.packed_signal_elem_widths.contains_key(&*base)
                         {
-                            Some(base.clone())
+                            Some(base.to_string())
                         } else if self
                             .module
                             .packed_signal_elem_widths
@@ -49289,10 +50480,10 @@ impl Simulator {
                             None
                         };
                         // Collections keep their own semantics.
-                        let is_collection = self.module.arrays.contains_key(&base)
+                        let is_collection = self.module.arrays.contains_key(&*base)
                             || self.module.arrays.contains_key(bare.as_str())
-                            || self.module.dynamic_arrays.contains(&base)
-                            || self.module.associative_arrays.contains_key(&base);
+                            || self.module.dynamic_arrays.contains(&*base)
+                            || self.module.associative_arrays.contains_key(&*base);
                         if let Some(pkey) = elem_key.filter(|_| !is_collection) {
                             let elem_w =
                                 *self.module.packed_signal_elem_widths.get(&pkey).unwrap();
@@ -49305,7 +50496,7 @@ impl Simulator {
                             // the call frame, module vars in the signal maps —
                             // get/set_local_or_signal covers both.
                             let storage_key = if self.get_local_or_signal(&base).is_some() {
-                                Some(base.clone())
+                                Some(base.to_string())
                             } else if self.get_local_or_signal(bare).is_some() {
                                 Some(bare.clone())
                             } else {
@@ -49353,17 +50544,17 @@ impl Simulator {
                         if h.path.iter().all(|seg| seg.selects.is_empty()) {
                             let name = self.resolve_hier_name(h);
                             if let Some(&(first_id, lo, hi)) =
-                                self.array_first_id.get(name.as_str())
+                                self.array_first_id.get(name.as_ref())
                             {
-                                if !self.module.queue_vars.contains(&name)
-                                    && !self.module.dynamic_arrays.contains(&name)
-                                    && !self.module.associative_arrays.contains_key(&name)
+                                if !self.module.queue_vars.contains(&*name)
+                                    && !self.module.dynamic_arrays.contains(&*name)
+                                    && !self.module.associative_arrays.contains_key(&*name)
                                     // string elements are DYNAMIC-length; the
                                     // resize-to-declared-width below would
                                     // truncate them (a 200-char element came
                                     // back 16 chars) — the general path stores
                                     // strings unresized.
-                                    && !self.module.string_signals.contains(&name)
+                                    && !self.module.string_signals.contains(&*name)
                                 {
                                     let idx =
                                         self.eval_expr(index).to_i64().unwrap_or(i64::MIN);
@@ -49487,7 +50678,7 @@ impl Simulator {
                     // which own their own storage.
                     let (base, may_create) = match &expr.kind {
                         ExprKind::Ident(h) => (Some(self.resolve_hier_name(h)), true),
-                        ExprKind::MemberAccess { .. } => (self.flat_member_name(expr), false),
+                        ExprKind::MemberAccess { .. } => (self.flat_member_name(expr).map(std::borrow::Cow::Owned), false),
                         _ => (None, false),
                     };
                     // A member of a PACKED struct is a bit-slice of the
@@ -49511,8 +50702,8 @@ impl Simulator {
                         })
                     };
                     if let Some(base) = base.filter(|b| !base_is_packed_member(self, b)) {
-                    if !self.signal_name_to_id.contains_key(base.as_str())
-                        && !self.signals.contains_key(&base)
+                    if !self.signal_name_to_id.contains_key(base.as_ref())
+                        && !self.signals.contains_key(&*base)
                     {
                         let i = self.eval_expr(index).to_i64().unwrap_or(0);
                         let elem = format!("{}[{}]", base, i);
@@ -49586,8 +50777,8 @@ impl Simulator {
                 // label i targets internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
-                    if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
-                        if let Some(&id) = self.signal_name_to_id.get(nm.as_str()) {
+                    if let Some(w) = self.module.ascending_packed.get(&*nm).copied() {
+                        if let Some(&id) = self.signal_name_to_id.get(nm.as_ref()) {
                             let i = self.eval_expr(index).to_u64().unwrap_or(0) as u32;
                             if i < w {
                                 let pos = (w - 1 - i) as usize;
@@ -49610,7 +50801,7 @@ impl Simulator {
                 // Class associative-array member element write — base may be
                 // a bare member (`m[k]=v`) or another object's (`obj.m[k]=v`).
                 if let Some(an) = self.expr_assoc_name(expr) {
-                    if std::env::var_os("XEZIM_AW_DBG").is_some() {
+                    if env_set_cached!("XEZIM_AW_DBG") {
                         eprintln!("[AW] assoc write an={} width={:?} map={:?}",
                             an, self.assoc_elem_width(&an), self.module.assoc_elem_widths);
                     }
@@ -49660,20 +50851,20 @@ impl Simulator {
                         let mut base_name = self.resolve_hier_name(hier);
                         // Bare class-member N-D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_nd.contains_key(&base_name) {
+                        if !self.module.arrays_nd.contains_key(&*base_name) {
                             if let Some(s) = self.instance_assoc_member(&base_name) {
-                                base_name = s;
+                                base_name = std::borrow::Cow::Owned(s);
                             }
                         }
-                        if let Some((shape, _w)) = self.module.arrays_nd.get(&base_name).cloned() {
+                        if let Some((shape, _w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
                                 for i in (0..rev_idxs.len()).rev() {
                                     let v =
                                         self.eval_expr(rev_idxs[i]).to_u64().unwrap_or(0) as i64;
-                                    name = format!("{}[{}]", name, v);
+                                    name = std::borrow::Cow::Owned(format!("{}[{}]", name, v));
                                 }
-                                if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                                if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                                     let width = self.signal_widths[id];
                                     let resized = val.resize(width);
                                     let changed = self.signal_table[id] != resized;
@@ -49688,9 +50879,9 @@ impl Simulator {
                                     }
                                     return changed;
                                 }
-                                let changed = self.signals.get(&name).is_none_or(|p| *p != *val);
+                                let changed = self.signals.get(&*name).is_none_or(|p| *p != *val);
                                 if changed {
-                                    self.signals.insert(name.clone(), val.clone());
+                                    self.signals.insert(name.to_string(), val.clone());
                                     self.mark_dirty(&name);
                                 }
                                 return changed;
@@ -49712,16 +50903,16 @@ impl Simulator {
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
                         let mut name = self.resolve_hier_name(hier);
-                        if !self.module.arrays.contains_key(&name) {
+                        if !self.module.arrays.contains_key(&*name) {
                             if let Some(s) = self.instance_assoc_member(&name) {
-                                name = s;
+                                name = std::borrow::Cow::Owned(s);
                             }
                         }
                         // Only a plain unpacked array: an `arrays_2d` entry is a
                         // genuine two-dimensional index and is handled below.
-                        if self.module.arrays.contains_key(&name)
-                            && !self.module.arrays_2d.contains_key(&name)
-                            && !self.module.arrays_nd.contains_key(&name)
+                        if self.module.arrays.contains_key(&*name)
+                            && !self.module.arrays_2d.contains_key(&*name)
+                            && !self.module.arrays_nd.contains_key(&*name)
                         {
                             let i = self.eval_expr(inner_idx).to_i64().unwrap_or(0);
                             let elem = format!("{}[{}]", name, i);
@@ -49734,7 +50925,7 @@ impl Simulator {
                                 // through to the pre-existing normalizing
                                 // paths below, which already resolve it.
                                 // (Casting such a label to u32 overflowed.)
-                                let pos = match self.module.ascending_packed.get(&name).copied() {
+                                let pos = match self.module.ascending_packed.get(&*name).copied() {
                                     Some(aw) if raw >= 0 && (raw as u32) < aw => {
                                         Some(aw - 1 - raw as u32)
                                     }
@@ -49749,7 +50940,7 @@ impl Simulator {
                                 let ew = self
                                     .module
                                     .packed_signal_elem_widths
-                                    .get(&name)
+                                    .get(&*name)
                                     .copied()
                                     .unwrap_or(1)
                                     .max(1);
@@ -49847,9 +51038,9 @@ impl Simulator {
                         let mut name = self.resolve_hier_name(hier);
                         // Bare class-member 2D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_2d.contains_key(&name) {
+                        if !self.module.arrays_2d.contains_key(&*name) {
                             if let Some(s) = self.instance_assoc_member(&name) {
-                                name = s;
+                                name = std::borrow::Cow::Owned(s);
                             }
                         }
                         // A bare name written from inside a SUBMODULE — e.g. the
@@ -49858,7 +51049,7 @@ impl Simulator {
                         // per-node name cache may already hold the unscoped form.
                         // Try the hint, then a UNIQUE suffix match, so the write
                         // lands instead of being silently dropped.
-                        if !self.module.arrays_2d.contains_key(&name) && !name.contains('.') {
+                        if !self.module.arrays_2d.contains_key(&*name) && !name.contains('.') {
                             let hinted = self
                                 .name_resolve_hint
                                 .borrow()
@@ -49866,7 +51057,7 @@ impl Simulator {
                                 .map(|h| format!("{}.{}", h, name));
                             if let Some(h) = hinted.filter(|h| self.module.arrays_2d.contains_key(h))
                             {
-                                name = h;
+                                name = std::borrow::Cow::Owned(h);
                             } else {
                                 let suffix = format!(".{}", name);
                                 let mut hit: Option<String> = None;
@@ -49881,11 +51072,11 @@ impl Simulator {
                                     }
                                 }
                                 if let (Some(k), false) = (hit, many) {
-                                    name = k;
+                                    name = std::borrow::Cow::Owned(k);
                                 }
                             }
                         }
-                        if self.module.arrays_2d.contains_key(&name) {
+                        if self.module.arrays_2d.contains_key(&*name) {
                             let i = self.eval_expr(inner_idx).to_u64().unwrap_or(0) as i64;
                             let j = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
                             let elem_name = format!("{}[{}][{}]", name, i, j);
@@ -49973,8 +51164,8 @@ impl Simulator {
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
                         let base = self.resolve_hier_name(hier);
-                        if let Some(&elem_w) = self.module.packed_signal_elem_widths.get(&base) {
-                            if let Some(&id) = self.signal_name_to_id.get(base.as_str()) {
+                        if let Some(&elem_w) = self.module.packed_signal_elem_widths.get(&*base) {
+                            if let Some(&id) = self.signal_name_to_id.get(base.as_ref()) {
                                 let total_w = self.signal_widths[id] as usize;
                                 let i = self.eval_expr(outer_idx).to_u64().unwrap_or(0) as usize;
                                 let j = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
@@ -50064,32 +51255,61 @@ impl Simulator {
                 // matched here, so hierarchical element writes were silently
                 // dropped while reads (which go through flat_member_name)
                 // worked.
+                // Element write into a packed multi-dimensional CLASS property:
+                // read-modify-write the addressed slice of the whole value.
+                if let Some((h, prop, idx_exprs)) = self.prop_index_chain(lhs) {
+                    if let Some(dims) = self.class_prop_packed_dims(h, &prop) {
+                        if idx_exprs.len() <= dims.len() {
+                            let idx: Vec<Value> =
+                                idx_exprs.iter().map(|ie| self.eval_expr(ie)).collect();
+                            if let Some(cur) = self.read_member_value(h, &prop) {
+                                if let Some((lsb, w)) =
+                                    Self::packed_chain_slice(cur.width as u64, &dims, &idx)
+                                {
+                                    let piece = val.resize(w as u32);
+                                    let mut nv = cur.clone();
+                                    for i in 0..(w as usize) {
+                                        nv.set_bit(lsb as usize + i, piece.get_bit(i));
+                                    }
+                                    let changed = nv != cur;
+                                    if changed {
+                                        if let Some(Some(inst)) = self.heap.get_mut(h) {
+                                            inst.properties.insert(prop, nv);
+                                        }
+                                    }
+                                    return changed;
+                                }
+                                return false;
+                            }
+                        }
+                    }
+                }
                 let (base_name, hier_opt): (
-                    Option<String>,
+                    Option<std::borrow::Cow<str>>,
                     Option<&crate::ast::expr::HierarchicalIdentifier>,
                 ) = match &expr.kind {
                     ExprKind::Ident(hier) => (Some(self.resolve_hier_name(hier)), Some(hier)),
-                    ExprKind::MemberAccess { .. } => (self.flat_member_name(expr), None),
+                    ExprKind::MemberAccess { .. } => (self.flat_member_name(expr).map(std::borrow::Cow::Owned), None),
                     _ => (None, None),
                 };
                 if let Some(mut name) = base_name {
                     if let Some(scoped) = self.instance_assoc_member(&name) {
-                        name = scoped;
+                        name = std::borrow::Cow::Owned(scoped);
                     }
                     // §8.9: `Cls::S[i] = v` reaches here with the resolver's
                     // bare-leaf collapse of the 2-segment form; the original
                     // segments name the qualified store.
-                    if !self.module.arrays.contains_key(&name) {
+                    if !self.module.arrays.contains_key(&*name) {
                         if let Some(h) = hier_opt {
                             if let Some(k) = self.static_fixed_key_from_hier(h) {
-                                name = k;
+                                name = std::borrow::Cow::Owned(k);
                             }
                         }
                     }
                     // A bare name inside a SUBMODULE process resolves under
                     // the process's instance scope (name_resolve_hint), like
                     // scalar reads/writes already do.
-                    if !self.module.arrays.contains_key(&name) && !self.is_associative_array(&name)
+                    if !self.module.arrays.contains_key(&*name) && !self.is_associative_array(&name)
                     {
                         let hint = self.name_resolve_hint.borrow().clone();
                         if let Some(h) = hint {
@@ -50097,7 +51317,7 @@ impl Simulator {
                             if self.module.arrays.contains_key(&scoped)
                                 || self.is_associative_array(&scoped)
                             {
-                                name = scoped;
+                                name = std::borrow::Cow::Owned(scoped);
                             }
                         }
                     }
@@ -50115,13 +51335,13 @@ impl Simulator {
                         idx_val.to_u64().unwrap_or(0).to_string()
                     };
                     // Check if this is an array element assignment
-                    if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
+                    if self.module.arrays.contains_key(&*name) || self.is_associative_array(&name) {
                         // Compact-resolver fast path for 1D arrays: compute
                         // signal_id directly without `format!()` + HashMap
                         // lookup. Required for correctness now that 1D
                         // array elements are no longer materialised as
                         // per-element entries in signal_name_to_id.
-                        if let Some(&(first_id, lo, hi)) = self.array_first_id.get(name.as_str()) {
+                        if let Some(&(first_id, lo, hi)) = self.array_first_id.get(name.as_ref()) {
                             let idx = idx_val.to_u64().unwrap_or(0) as i64;
                             if idx >= lo && idx <= hi {
                                 let id = first_id + (idx - lo) as usize;
@@ -50206,7 +51426,7 @@ impl Simulator {
                             // collection's `.size` proxy, not the per-key
                             // entry — mark it or they never re-fire.
                             if self.is_associative_array(&name)
-                                || self.module.dynamic_arrays.contains(&name)
+                                || self.module.dynamic_arrays.contains(&*name)
                             {
                                 self.touch_queue(&name);
                             }
@@ -50216,7 +51436,7 @@ impl Simulator {
                     // String character assignment: `s[i] = "."` replaces the
                     // i-th character (byte). `s[0]` is the leftmost char, which
                     // sits in the most-significant byte of the packed value.
-                    if self.string_signals.contains(&name) {
+                    if self.string_signals.contains(&*name) {
                         // Replace the i-th character of the string CONTENT (not
                         // a byte of the fixed-width container, which would write
                         // the wrong position and grow the string). Mirrors putc.
@@ -50237,8 +51457,8 @@ impl Simulator {
                     // either `name` (resolved hier) or the dotted-Ident form
                     // (`pp.words`) is in packed_signal_elem_widths.
                     let pkt_key: Option<String> = {
-                        if self.module.packed_signal_elem_widths.contains_key(&name) {
-                            Some(name.clone())
+                        if self.module.packed_signal_elem_widths.contains_key(&*name) {
+                            Some(name.to_string())
                         } else if let ExprKind::Ident(h) = &expr.kind {
                             if h.path.len() >= 2 {
                                 let dotted: String = h
@@ -50265,7 +51485,7 @@ impl Simulator {
                         // Resolve underlying signal by either `name` or `pkey`.
                         let sig_id = self
                             .signal_name_to_id
-                            .get(name.as_str())
+                            .get(name.as_ref())
                             .copied()
                             .or_else(|| self.signal_name_to_id.get(pkey.as_str()).copied());
                         if let Some(id) = sig_id {
@@ -50301,7 +51521,7 @@ impl Simulator {
                         // bug: reference models and DUT shared the defect).
                         {
                             let key = if self.get_signal_value_by_name(&name).is_some() {
-                                Some(name.clone())
+                                Some(name.to_string())
                             } else if self.get_signal_value_by_name(&pkey).is_some() {
                                 Some(pkey.clone())
                             } else {
@@ -50421,7 +51641,7 @@ impl Simulator {
                         }
                     }
                     // Bit select needs signal_table
-                    if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                    if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                         if idx < self.signal_widths[id] as usize {
                             let nb = val.bits_first();
                             let old = self.signal_table[id].get_bit(idx);
@@ -50441,7 +51661,7 @@ impl Simulator {
                     // signal_id, e.g. `bit [7:0] x;` declared inside an
                     // initial begin/task). Without this branch the write
                     // would silently no-op.
-                    if let Some(cur) = self.signals.get(&name).cloned() {
+                    if let Some(cur) = self.signals.get(&*name).cloned() {
                         if idx < cur.width as usize {
                             let nb = val.bits_first();
                             let old = cur.get_bit(idx);
@@ -50449,7 +51669,7 @@ impl Simulator {
                             if c {
                                 let mut nv = cur;
                                 nv.set_bit(idx, nb);
-                                self.signals.insert(name.clone(), nv);
+                                self.signals.insert(name.to_string(), nv);
                                 self.mark_dirty(&name);
                             }
                             return c;
@@ -50502,15 +51722,15 @@ impl Simulator {
                     let is_multi_d = self
                         .module
                         .packed_signal_elem_widths
-                        .get(&nm)
+                        .get(&*nm)
                         .copied()
                         .unwrap_or(0)
                         > 1;
-                    let is_ascending = self.module.ascending_packed.contains_key(&nm);
-                    let is_unpacked = self.module.arrays.contains_key(&nm);
+                    let is_ascending = self.module.ascending_packed.contains_key(&*nm);
+                    let is_unpacked = self.module.arrays.contains_key(&*nm);
                     if !is_multi_d && !is_ascending && !is_unpacked {
                         if let Some(&(dl, dr)) =
-                            self.module.packed_full_dims.get(&nm).and_then(|d| d.first())
+                            self.module.packed_full_dims.get(&*nm).and_then(|d| d.first())
                         {
                             let lo_b = dl.min(dr);
                             if lo_b != 0 {
@@ -50565,7 +51785,7 @@ impl Simulator {
                     if let Some(&elem_w) = self
                         .module
                         .packed_signal_elem_widths
-                        .get(&nm)
+                        .get(&*nm)
                         .filter(|&&w| w > 1)
                     {
                         let (lab_a, lab_b): (i64, i64) = match kind {
@@ -50576,7 +51796,7 @@ impl Simulator {
                         let dim = self
                             .module
                             .packed_full_dims
-                            .get(&nm)
+                            .get(&*nm)
                             .and_then(|d| d.first())
                             .copied();
                         let lsb_of = |idx: i64| -> i64 {
@@ -50604,7 +51824,7 @@ impl Simulator {
                 if !elem_scaled {
                     if let ExprKind::Ident(h) = &expr.kind {
                         let nm = self.resolve_hier_name(h);
-                        if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
+                        if let Some(w) = self.module.ascending_packed.get(&*nm).copied() {
                             let top = w as usize - 1;
                             // The bounds reaching here are already resolved to a
                             // [msb:lsb] pair for every RangeKind, so one mapping
@@ -50633,9 +51853,9 @@ impl Simulator {
                 // Unpacked array slice assignment: copy element-by-element
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
-                    if let Some(&(arr_lo, arr_hi, elem_w)) = self.module.arrays.get(&name) {
+                    if let Some(&(arr_lo, arr_hi, elem_w)) = self.module.arrays.get(&*name) {
                         let count = msb + 1 - lsb;
-                        let descending = self.module.descending_arrays.contains(&name);
+                        let descending = self.module.descending_arrays.contains(&*name);
                         let mut changed = false;
                         let _ = (arr_lo, descending);
                         for i in 0..count {
@@ -50712,7 +51932,7 @@ impl Simulator {
                             Some(id)
                         } else {
                             let name = self.resolve_hier_name(hier);
-                            if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                            if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                                 hier.cached_signal_id.set(Some(id));
                                 Some(id)
                             } else {
@@ -50726,7 +51946,7 @@ impl Simulator {
                     } => {
                         if let ExprKind::Ident(hier) = &arr_expr.kind {
                             let name = self.resolve_hier_name(hier);
-                            if self.module.arrays.contains_key(&name) {
+                            if self.module.arrays.contains_key(&*name) {
                                 // §7.4.6: SIGNED index — a negative-lo array
                                 // (`m[-2:1]`) loses its negative elements when
                                 // the index goes through to_u64.
@@ -51009,7 +52229,7 @@ impl Simulator {
                     }
                     // signals slow-path
                     let name = self.resolve_hier_name(hier);
-                    if let Some(cur) = self.signals.get(&name).cloned() {
+                    if let Some(cur) = self.signals.get(&*name).cloned() {
                         let width = cur.width as usize;
                         let mut nv = cur.clone();
                         let mut changed = false;
@@ -51021,7 +52241,7 @@ impl Simulator {
                             }
                         }
                         if changed {
-                            self.signals.insert(name.clone(), nv);
+                            self.signals.insert(name.to_string(), nv);
                             self.mark_dirty(&name);
                         }
                         return changed;
@@ -51070,13 +52290,13 @@ impl Simulator {
                     if let ExprKind::Ident(bh) = &base.kind {
                         let base_name = self.resolve_hier_name(bh);
                         if let Some(fields) =
-                            self.module.packed_struct_fields.get(&base_name).cloned()
+                            self.module.packed_struct_fields.get(&*base_name).cloned()
                         {
                             if let Some((_, field_off, field_w)) =
                                 fields.iter().find(|(m, _, _)| m == &member.name).cloned()
                             {
                                 // signal_table path
-                                if let Some(&id) = self.signal_name_to_id.get(base_name.as_str()) {
+                                if let Some(&id) = self.signal_name_to_id.get(base_name.as_ref()) {
                                     let total_w = self.signal_widths[id] as usize;
                                     let lo = (field_off as usize) + lsb;
                                     let hi = (field_off as usize)
@@ -51102,7 +52322,7 @@ impl Simulator {
                                     }
                                 }
                                 // signals slow-path
-                                if let Some(cur_sig) = self.signals.get(&base_name).cloned() {
+                                if let Some(cur_sig) = self.signals.get(&*base_name).cloned() {
                                     let total_w = cur_sig.width as usize;
                                     let lo = (field_off as usize) + lsb;
                                     let hi = (field_off as usize)
@@ -51118,7 +52338,7 @@ impl Simulator {
                                             }
                                         }
                                         if changed {
-                                            self.signals.insert(base_name.clone(), nv);
+                                            self.signals.insert(base_name.to_string(), nv);
                                             self.mark_dirty(&base_name);
                                         }
                                         return changed;
@@ -51139,7 +52359,7 @@ impl Simulator {
                 {
                     if let ExprKind::Ident(ah) = &arr_expr.kind {
                         let arr_name = self.resolve_hier_name(ah);
-                        if let Some(&elem_w) = self.module.packed_signal_elem_widths.get(&arr_name)
+                        if let Some(&elem_w) = self.module.packed_signal_elem_widths.get(&*arr_name)
                         {
                             let idx = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                             let Some(base_off) =
@@ -51161,7 +52381,7 @@ impl Simulator {
                             };
                             let lo = base_off + b_lsb.min(b_msb);
                             let hi = base_off + b_lsb.max(b_msb);
-                            if let Some(&id) = self.signal_name_to_id.get(arr_name.as_str()) {
+                            if let Some(&id) = self.signal_name_to_id.get(arr_name.as_ref()) {
                                 let total_w = self.signal_widths[id] as usize;
                                 if hi < total_w {
                                     let mut changed = false;
@@ -51183,7 +52403,7 @@ impl Simulator {
                                     return changed;
                                 }
                             }
-                            if let Some(cur_sig) = self.signals.get(&arr_name).cloned() {
+                            if let Some(cur_sig) = self.signals.get(&*arr_name).cloned() {
                                 let total_w = cur_sig.width as usize;
                                 if hi < total_w {
                                     let mut nv = cur_sig.clone();
@@ -51196,7 +52416,7 @@ impl Simulator {
                                         }
                                     }
                                     if changed {
-                                        self.signals.insert(arr_name.clone(), nv);
+                                        self.signals.insert(arr_name.to_string(), nv);
                                         self.mark_dirty(&arr_name);
                                     }
                                     return changed;
@@ -51260,7 +52480,7 @@ impl Simulator {
                 {
                     if let ExprKind::Ident(ah) = &arr_expr.kind {
                         let arr_name = self.resolve_hier_name(ah);
-                        if !self.module.packed_signal_elem_widths.contains_key(&arr_name) {
+                        if !self.module.packed_signal_elem_widths.contains_key(&*arr_name) {
                             let idxv = self.eval_expr(index);
                             if let Some(idx) = idxv.to_i64().filter(|_| !idxv.has_xz()) {
                                 let ename = format!("{}[{}]", arr_name, idx);
@@ -51486,27 +52706,21 @@ impl Simulator {
                 }
                 // A nested PACKED struct member inside an unpacked aggregate
                 // (`arr[i].tag.vlan`): slice the parent's own signal.
-                if let Some(pflat) = self.flat_member_name(expr) {
-                    if let Some(fields) = self.module.packed_struct_fields.get(&pflat).cloned() {
-                        if let Some((_, off, w)) =
-                            fields.iter().find(|(m, _, _)| *m == member.name).cloned()
-                        {
-                            // The container may be a procedural LOCAL: a packed
-                            // struct declared inside a task lives in the call
-                            // frame, not the signal table, so a member write
-                            // reached nothing and the struct read back as X.
-                            if let Some(cur_sig) = self.get_local_or_signal(&pflat) {
-                                let total_w = cur_sig.width;
-                                let mut cur = cur_sig.resize(total_w);
-                                let piece = val.resize(w);
-                                for i in 0..w {
-                                    cur.set_bit((off + i) as usize, piece.get_bit(i as usize));
-                                }
-                                let changed = cur != cur_sig;
-                                self.set_local_or_signal(&pflat, cur);
-                                return changed;
-                            }
+                if let Some((base, off, w)) = self.packed_struct_member_slice(lhs) {
+                    // The container may be a procedural LOCAL: a packed
+                    // struct declared inside a task lives in the call
+                    // frame, not the signal table, so a member write
+                    // reached nothing and the struct read back as X.
+                    if let Some(cur_sig) = self.get_local_or_signal(&base) {
+                        let total_w = cur_sig.width;
+                        let mut cur = cur_sig.resize(total_w);
+                        let piece = val.resize(w);
+                        for i in 0..w {
+                            cur.set_bit((off + i) as usize, piece.get_bit(i as usize));
                         }
+                        let changed = cur != cur_sig;
+                        self.set_local_or_signal(&base, cur);
+                        return changed;
                     }
                 }
                 // LRM §25.10 — `vif_arr[i].member = ...` (indexed
@@ -51773,7 +52987,7 @@ impl Simulator {
                 // packed_struct_fields for signal-based structs
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
-                    if let Some(fields) = self.module.packed_struct_fields.get(&name).cloned() {
+                    if let Some(fields) = self.module.packed_struct_fields.get(&*name).cloned() {
                         if let Some((_, off, w)) =
                             fields.iter().find(|(m, _, _)| m == &member.name).cloned()
                         {
@@ -51833,7 +53047,7 @@ impl Simulator {
                             // in the top module (empty scope) worked.
                             ExprKind::Ident(h) => {
                                 let scoped = self.resolve_hier_name(h);
-                                if !self.module.packed_struct_fields.contains_key(&scoped)
+                                if !self.module.packed_struct_fields.contains_key(&*scoped)
                                     && h.path.len() == 1
                                     && h.path[0].selects.is_empty()
                                     && self
@@ -51843,7 +53057,7 @@ impl Simulator {
                                 {
                                     break Some(h.path[0].name.name.clone());
                                 }
-                                break Some(scoped);
+                                break Some(scoped.to_string());
                             }
                             // §7.4.2: root may itself be a struct-member path
                             // (`main.sub_list[0].f`) — build the dotted name so
@@ -51857,7 +53071,7 @@ impl Simulator {
                                     c = b.as_ref();
                                 }
                                 if let ExprKind::Ident(h) = &c.kind {
-                                    segs.push(self.resolve_hier_name(h));
+                                    segs.push(self.resolve_hier_name(h).into_owned());
                                     segs.reverse();
                                     break Some(segs.join("."));
                                 }
@@ -52000,6 +53214,160 @@ impl Simulator {
     /// and an ascending range: physical = label - right (descending) /
     /// right - label (ascending). None for a plain Ident base (layers = 0 —
     /// the existing plain-signal paths own that) or when nothing is recorded.
+    /// Packed dimensions of a CLASS PROPERTY (`rand u7_t [4:0][1:0] d;`),
+    /// declared dimensions first and then a typedef's own, resolved from the
+    /// property's declared type. Module-scope geometry tables are keyed by
+    /// signal name, which a property never has, so without this an element
+    /// select on a packed multi-dimensional property was a single-bit select
+    /// of the whole value (`d[0][0]` read bit 0; `d[2][1] = 77` was dropped).
+    fn class_prop_packed_dims(&self, handle: usize, prop: &str) -> Option<Vec<(i64, i64)>> {
+        let cn = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let mut cur = Some(cn);
+        while let Some(c) = cur {
+            let cd = self.module.classes.get(&c)?;
+            // A property with UNPACKED dimensions (`bit [1:0][7:0] tbl [4]`)
+            // is a collection: its index selects an element, not a slice.
+            if cd.array_properties.contains_key(prop) || cd.array_nd_properties.contains_key(prop) {
+                return None;
+            }
+            if let Some(dt) = cd.property_types.get(prop) {
+                let dims = super::elaborate::packed_full_dims_chained(
+                    dt,
+                    &self.module.parameters,
+                    &self.module.typedef_types,
+                )?;
+                return if dims.len() >= 2 { Some(dims) } else { None };
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// If `expr` is an index chain `root[i]...[k]` whose root names a class
+    /// property (a bare property of `this`, not shadowed by a local or a
+    /// signal, or `obj.prop` on a handle), return the handle, the property
+    /// name, and the index expressions outermost first.
+    fn prop_index_chain<'e>(
+        &mut self,
+        expr: &'e Expression,
+    ) -> Option<(usize, String, Vec<&'e Expression>)> {
+        self.prop_index_chain_inner(expr, None)
+    }
+
+    /// Same as `prop_index_chain` for an `Index` already split into its base
+    /// and outermost index (the eval arm destructures the node, shadowing
+    /// the whole expression).
+    fn prop_index_chain_parts<'e>(
+        &mut self,
+        base: &'e Expression,
+        outer: &'e Expression,
+    ) -> Option<(usize, String, Vec<&'e Expression>)> {
+        self.prop_index_chain_inner(base, Some(outer))
+    }
+
+    fn prop_index_chain_inner<'e>(
+        &mut self,
+        expr: &'e Expression,
+        outer: Option<&'e Expression>,
+    ) -> Option<(usize, String, Vec<&'e Expression>)> {
+        let mut rev: Vec<&'e Expression> = Vec::new();
+        if let Some(o) = outer {
+            rev.push(o);
+        }
+        let mut cur = expr;
+        while let ExprKind::Index { expr: b, index } = &cur.kind {
+            rev.push(index);
+            cur = b;
+        }
+        if rev.is_empty() {
+            return None;
+        }
+        let (handle, prop) = match &cur.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let name = &h.path[0].name.name;
+                if self.local_stack.last().is_some_and(|f| f.contains_key(name))
+                    || self.signal_name_to_id.contains_key(name.as_str())
+                {
+                    return None;
+                }
+                let handle = self.this_stack.last().copied().flatten()?;
+                let has = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .is_some_and(|i| i.properties.contains_key(name));
+                if !has {
+                    return None;
+                }
+                (handle, name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) => {
+                let obj = self.eval_ident_handle(&h.path[0].name.name)?;
+                if obj == 0 || obj >= self.heap.len() {
+                    return None;
+                }
+                (obj, h.path[1].name.name.clone())
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                let obj = self.eval_handle_expr(base)?;
+                if obj == 0 || obj >= self.heap.len() {
+                    return None;
+                }
+                (obj, member.name.clone())
+            }
+            _ => return None,
+        };
+        rev.reverse();
+        Some((handle, prop, rev))
+    }
+
+    /// Bit slice (lsb, width) addressed by an index chain into a packed
+    /// value of `total` bits with dimensions `dims` (outermost first), using
+    /// the same slot arithmetic as the signal path: descending dimensions
+    /// place index `lo` at the bottom, ascending ones at the top. None when
+    /// an index is out of range or X.
+    fn packed_chain_slice(total: u64, dims: &[(i64, i64)], idx: &[Value]) -> Option<(u64, u64)> {
+        let mut w = total;
+        let mut lsb: i64 = 0;
+        for (k, iv) in idx.iter().enumerate() {
+            let (dl, dr) = *dims.get(k)?;
+            let count = (dl - dr).unsigned_abs() + 1;
+            if count == 0 || w % count != 0 {
+                return None;
+            }
+            w /= count;
+            if iv.has_xz() {
+                return None;
+            }
+            let i = iv.to_i64()?;
+            let lo_b = dl.min(dr);
+            let off = i - lo_b;
+            if off < 0 || off as u64 >= count {
+                return None;
+            }
+            let slot = if dl >= dr { off } else { (count as i64 - 1) - off };
+            lsb += slot * w as i64;
+        }
+        Some((lsb as u64, w))
+    }
+
+    /// Width of the sub-array addressed by `n` indices into `dims`.
+    fn packed_chain_width(total: u64, dims: &[(i64, i64)], n: usize) -> u64 {
+        let mut w = total;
+        for k in 0..n.min(dims.len()) {
+            let (dl, dr) = dims[k];
+            let c = (dl - dr).unsigned_abs() + 1;
+            if c > 0 && w % c == 0 {
+                w /= c;
+            }
+        }
+        w.max(1)
+    }
+
     fn select_base_elem_dim(&self, base: &Expression) -> Option<(i64, i64)> {
         let mut cur = base;
         let mut layers = 0usize;
@@ -52014,14 +53382,14 @@ impl Simulator {
             return None;
         };
         let nm = self.resolve_hier_name(h);
-        let dims = self.module.packed_full_dims.get(&nm)?;
-        let mut udepth = if let Some((sh, _)) = self.module.arrays_nd.get(&nm) {
+        let dims = self.module.packed_full_dims.get(&*nm)?;
+        let mut udepth = if let Some((sh, _)) = self.module.arrays_nd.get(&*nm) {
             sh.len()
-        } else if self.module.arrays_2d.contains_key(&nm) {
+        } else if self.module.arrays_2d.contains_key(&*nm) {
             2
-        } else if self.module.arrays.contains_key(&nm)
-            || self.module.dynamic_arrays.contains(&nm)
-            || self.module.associative_arrays.contains_key(&nm)
+        } else if self.module.arrays.contains_key(&*nm)
+            || self.module.dynamic_arrays.contains(&*nm)
+            || self.module.associative_arrays.contains_key(&*nm)
         {
             1
         } else {
@@ -52220,6 +53588,15 @@ impl Simulator {
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
+        // §13.5.2: an indexed / part-selected read through a `ref` formal
+        // reads the caller's actual (see `ref_formal_redirect_hier`).
+        if matches!(expr.kind, ExprKind::Index { .. } | ExprKind::RangeSelect { .. })
+            && self.ref_redirect_possible()
+        {
+            if let Some(rewritten) = self.ref_formal_redirect_inner(expr, false) {
+                return self.eval_expr_ctx(&rewritten, ctx_width);
+            }
+        }
         // §7.2/§13.4.2: a leaf of an unpacked struct the innermost call frame
         // OWNS — `s.a`, `s.inner.x`, `s.arr[2]`. Read it from the frame, as the
         // write path does; otherwise the lookups below reach module scope and
@@ -52387,6 +53764,21 @@ impl Simulator {
                 Value::from_string(s)
             }
             ExprKind::Ident(hier) => {
+                // §13.5.2: a selected read through a `ref` formal reads the
+                // caller's actual (see `ref_formal_redirect_hier`).
+                if self.ref_redirect_possible() {
+                    if let Some(nh) = self.ref_formal_redirect_hier(hier, false) {
+                        let rewritten = Expression::new(ExprKind::Ident(nh), expr.span);
+                        return self.eval_expr_ctx(&rewritten, ctx_width);
+                    }
+                }
+                if hier.path.len() == 3 && hier.path[1].name.name == "type_option" {
+                    if let Some((cg, field)) = self.cg_type_option_path(hier) {
+                        if let Some(v) = self.cg_type_option_get(&cg, &field) {
+                            return v;
+                        }
+                    }
+                }
                 // §26.3: a PACKAGE-scoped reference (`P::s.x` = [P, s, x])
                 // reads exactly like the bare `s.x` — the prefix carries no
                 // hierarchy at runtime, but every shape-keyed branch below
@@ -52534,6 +53926,28 @@ impl Simulator {
                     }
                 }
                 if hier.path.len() == 2 {
+                    // A variable holding a live object shadows any signal or
+                    // instance of the same name: `core.n` with a local `core`
+                    // read x when a sibling instance was also called `core`,
+                    // because the dotted signal lookup ran first and answered
+                    // for the instance.
+                    if hier.path[0].selects.is_empty()
+                        && hier.path[1].selects.is_empty()
+                        && !self.no_class_objects()
+                    {
+                        if let Some(hval) = self.eval_ident_handle(&hier.path[0].name.name) {
+                            if hval != 0 {
+                                if let Some(v) = self
+                                    .heap
+                                    .get(hval)
+                                    .and_then(|o| o.as_ref())
+                                    .and_then(|inst| inst.properties.get(&hier.path[1].name.name))
+                                {
+                                    return v.clone();
+                                }
+                            }
+                        }
+                    }
                     let dotted = format!("{}.{}", hier.path[0].name.name, hier.path[1].name.name);
                     if let Some(v) = self.get_signal_value_by_name(&dotted) {
                         return v;
@@ -52562,6 +53976,56 @@ impl Simulator {
                 }
                 // LRM §14.3 clocking-block input read — `cb.<sig>` returns
                 // the snapshot taken at the block's most recent clock edge.
+                // `w.r.c` with three or more segments: a handle chain. The
+                // two-segment case above reads the property off the head
+                // handle; longer chains had no such path and fell through to
+                // hierarchical-name resolution, which inside a sub-instance
+                // applied the instance scope hint and read x (the same chain
+                // parenthesised, `(w.r).c`, or split in two steps was fine).
+                // Walk the handles property by property; any miss falls
+                // through to the existing resolution unchanged.
+                if hier.path.len() >= 3
+                    && hier.path.iter().all(|s| s.selects.is_empty())
+                    && !self.no_class_objects()
+                {
+                    let head = hier.path[0].name.name.as_str();
+                    let head_handle = if head == "this" {
+                        self.this_stack.last().copied().flatten()
+                    } else {
+                        self.eval_ident_handle(head)
+                    };
+                    if let Some(mut h) = head_handle {
+                        let mut ok = h != 0;
+                        let last = hier.path.len() - 1;
+                        for seg in &hier.path[1..last] {
+                            if !ok {
+                                break;
+                            }
+                            match self
+                                .heap
+                                .get(h)
+                                .and_then(|o| o.as_ref())
+                                .and_then(|inst| inst.properties.get(&seg.name.name))
+                                .and_then(|v| v.to_u64())
+                            {
+                                Some(next) if next != 0 && self.heap.get(next as usize).is_some_and(|o| o.is_some()) => {
+                                    h = next as usize;
+                                }
+                                _ => ok = false,
+                            }
+                        }
+                        if ok {
+                            if let Some(v) = self
+                                .heap
+                                .get(h)
+                                .and_then(|o| o.as_ref())
+                                .and_then(|inst| inst.properties.get(&hier.path[last].name.name))
+                            {
+                                return v.clone();
+                            }
+                        }
+                    }
+                }
                 if hier.path.len() >= 2 {
                     let segs: Vec<&str> =
                         hier.path.iter().map(|s| s.name.name.as_str()).collect();
@@ -52877,7 +54341,7 @@ impl Simulator {
                         if self.module.classes.contains_key(cls)
                             && !self
                                 .signal_name_to_id
-                                .contains_key(self.resolve_hier_name(hier).as_str())
+                                .contains_key(self.resolve_hier_name(hier).as_ref())
                         {
                             // `Class::method` with NO parens invokes a
                             // parameterless STATIC function (LRM §13.4.1: a
@@ -53471,6 +54935,31 @@ impl Simulator {
                 // arrays — module-level OR class-property, accessed as bare
                 // `a`, `this.a`, or `obj.a`. `rhs_.sa == lhs.sa` in a class
                 // method (`compare`/`do_compare`) is the common case.
+                // Multi-dimensional unpacked arrays (or a row of one) compare
+                // element-wise by suffix; the 1-D arm below sees no shape.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
+                    && !(self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
+                {
+                    if let (Some((lb, ls, l_nd)), Some((rb, rs, r_nd))) =
+                        (self.nd_array_operand(left), self.nd_array_operand(right))
+                    {
+                        if l_nd || r_nd {
+                            let mut equal = ls.len() == rs.len();
+                            if equal {
+                                for (a, b) in ls.iter().zip(rs.iter()) {
+                                    let lv = self.get_signal_value_by_name(&format!("{}{}", lb, a));
+                                    let rv = self.get_signal_value_by_name(&format!("{}{}", rb, b));
+                                    if lv.is_none() || rv.is_none() || lv != rv {
+                                        equal = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            let bit = if matches!(op, BinaryOp::Eq) { equal } else { !equal };
+                            return Value::from_u64(bit as u64, 1);
+                        }
+                    }
+                }
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
                     if let (Some((ln, llo, lhi)), Some((rn, rlo, rhi))) =
                         (self.fixed_array_operand(left), self.fixed_array_operand(right))
@@ -53573,10 +55062,31 @@ impl Simulator {
                         | BinaryOp::Gt
                         | BinaryOp::Geq
                 );
+                // Operands the width probe had to evaluate are kept and
+                // reused below instead of being evaluated again.
+                let mut pre_l: Option<Value> = None;
+                let mut pre_r: Option<Value> = None;
                 let self_det_w = if is_arith_or_bitwise {
-                    let lw = self.infer_width(left);
-                    let rw = self.infer_width(right);
-                    lw.max(rw).max(ctx_width)
+                    let (lw, lv) = self.width_probe(left);
+                    let (rw, rv) = self.width_probe(right);
+                    pre_l = lv;
+                    pre_r = rv;
+                    let w = lw.max(rw).max(ctx_width);
+                    // A narrow x/z value (a missing associative key reads as
+                    // x) fills the whole context when evaluated there; keep
+                    // that by letting such an operand evaluate again. A fill
+                    // literal replicates on resize and needs no re-run.
+                    let keep = |v: &Option<Value>| {
+                        !v.as_ref()
+                            .is_some_and(|v| v.width < w && v.has_xz() && !v.is_fill)
+                    };
+                    if !keep(&pre_l) {
+                        pre_l = None;
+                    }
+                    if !keep(&pre_r) {
+                        pre_r = None;
+                    }
+                    w
                 } else if widens_left {
                     // The LRM self width, NOT the carry-aware infer_width:
                     // `(a<<4)>>2` in an 8-bit context otherwise evaluates the
@@ -53623,8 +55133,9 @@ impl Simulator {
                 // the call we are trying to avoid. Evaluating the mask first is
                 // unobservable precisely because the call is pure — it has no
                 // effects to reorder against.
-                let mut pre_r: Option<Value> = None;
                 if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr)
+                    && pre_l.is_none()
+                    && pre_r.is_none()
                     && self.pure_call_name(left).is_some()
                 {
                     let want_ones = matches!(op, BinaryOp::BitOr);
@@ -53639,7 +55150,10 @@ impl Simulator {
                     }
                     pre_r = Some(r0);
                 }
-                let mut l = self.eval_expr_ctx(left, self_det_w);
+                let mut l = match pre_l.take() {
+                    Some(v) => v,
+                    None => self.eval_expr_ctx(left, self_det_w),
+                };
                 // §11.4.8 zero-mask elision. `0 & anything` is 0 for EVERY
                 // value the other side can take — `0 & x` and `0 & z` are both
                 // 0 — so the result cannot depend on the call. Gating a
@@ -53985,11 +55499,11 @@ impl Simulator {
                     // Special case: dynamic array/queue ident → concat all elements, idx0 at MSB.
                     let piece = if let ExprKind::Ident(h) = &p.kind {
                         let n = self.resolve_hier_name(h);
-                        if self.module.arrays.contains_key(&n) {
+                        if self.module.arrays.contains_key(&*n) {
                             let ew = self
                                 .lookup_signal_width(&format!("{}[0]", n))
                                 .unwrap_or_else(|| {
-                                    self.module.arrays.get(&n).map(|t| t.2).unwrap_or(8)
+                                    self.module.arrays.get(&*n).map(|t| t.2).unwrap_or(8)
                                 })
                                 .max(1);
                             let sz = self.get_queue_size(&n) as usize;
@@ -54110,6 +55624,25 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // Element select on a packed multi-dimensional CLASS property.
+                if let Some((h, prop, idx_exprs)) = self.prop_index_chain_parts(expr, index) {
+                    if let Some(dims) = self.class_prop_packed_dims(h, &prop) {
+                        if idx_exprs.len() <= dims.len() {
+                            let idx: Vec<Value> =
+                                idx_exprs.iter().map(|ie| self.eval_expr(ie)).collect();
+                            if let Some(base_v) = self.read_member_value(h, &prop) {
+                                return match Self::packed_chain_slice(base_v.width as u64, &dims, &idx) {
+                                    Some((lsb, w)) => {
+                                        base_v.range_select((lsb + w - 1) as usize, lsb as usize)
+                                    }
+                                    None => Value::new(
+                                        Self::packed_chain_width(base_v.width as u64, &dims, idx.len()) as u32,
+                                    ),
+                                };
+                            }
+                        }
+                    }
+                }
                 // Every shape probe below used to re-resolve this same base
                 // identifier from scratch — up to ten resolutions, each with
                 // its own allocation, per indexed read. On an axi4Lite UVM run
@@ -54117,7 +55650,7 @@ impl Simulator {
                 // Sound: for one AST node the result is idempotent — the
                 // memoized path deliberately skips the scope-hint ratchet, so
                 // the repeats were pure overhead, not a second decision.
-                let base_nm: Option<String> = match &expr.kind {
+                let base_nm: Option<std::borrow::Cow<str>> = match &expr.kind {
                     ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
                     _ => None,
                 };
@@ -54163,12 +55696,12 @@ impl Simulator {
                         let elemish = self
                             .module
                             .packed_signal_elem_widths
-                            .get(&nm)
+                            .get(&*nm)
                             .is_some_and(|&ew| ew > 1)
                             || self
                                 .module
                                 .packed_full_dims
-                                .get(&nm)
+                                .get(&*nm)
                                 .is_some_and(|d| d.len() > 1);
                         if elemish {
                             let norm = Expression::new(
@@ -54236,7 +55769,7 @@ impl Simulator {
                         }
                     }
                 }
-                if std::env::var("XEZIM_EV_DBG").is_ok() {
+                if env_set_cached!("XEZIM_EV_DBG") {
                     eprintln!(
                         "[EVDBG] idx-eval base_fmn={:?} qb={:?} ean={:?} nin={:?}",
                         self.flat_member_name(expr),
@@ -54452,27 +55985,27 @@ impl Simulator {
                         let mut base_name = self.resolve_hier_name(hier);
                         // Bare class-member N-D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_nd.contains_key(&base_name) {
+                        if !self.module.arrays_nd.contains_key(&*base_name) {
                             if let Some(s) = self.instance_assoc_member(&base_name) {
-                                base_name = s;
+                                base_name = std::borrow::Cow::Owned(s);
                             }
                         }
-                        if let Some((shape, w)) = self.module.arrays_nd.get(&base_name).cloned() {
+                        if let Some((shape, w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
                                 for i in (0..rev_idxs.len()).rev() {
                                     let v =
                                         self.eval_expr(rev_idxs[i]).to_u64().unwrap_or(0) as i64;
-                                    name = format!("{}[{}]", name, v);
+                                    name = std::borrow::Cow::Owned(format!("{}[{}]", name, v));
                                 }
-                                if let Some(&eid) = self.signal_name_to_id.get(name.as_str()) {
+                                if let Some(&eid) = self.signal_name_to_id.get(name.as_ref()) {
                                     let mut v = self.signal_table[eid].clone();
                                     if self.signal_signed[eid] {
                                         v.is_signed = true;
                                     }
                                     return v;
                                 }
-                                if let Some(sv) = self.signals.get(&name) {
+                                if let Some(sv) = self.signals.get(&*name) {
                                     return sv.clone();
                                 }
                                 return Value::new(w);
@@ -54490,12 +56023,12 @@ impl Simulator {
                         let mut name = self.resolve_hier_name(hier);
                         // Bare class-member 2D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_2d.contains_key(&name) {
+                        if !self.module.arrays_2d.contains_key(&*name) {
                             if let Some(s) = self.instance_assoc_member(&name) {
-                                name = s;
+                                name = std::borrow::Cow::Owned(s);
                             }
                         }
-                        if self.module.arrays_2d.contains_key(&name) {
+                        if self.module.arrays_2d.contains_key(&*name) {
                             let i = self.eval_expr(inner_idx).to_u64().unwrap_or(0) as i64;
                             let j = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
                             let elem_name = format!("{}[{}][{}]", name, i, j);
@@ -54509,7 +56042,7 @@ impl Simulator {
                             if let Some(sv) = self.signals.get(&elem_name) {
                                 return sv.clone();
                             }
-                            let w = self.module.arrays_2d.get(&name).map(|t| t.2).unwrap_or(1);
+                            let w = self.module.arrays_2d.get(&*name).map(|t| t.2).unwrap_or(1);
                             return Value::new(w);
                         }
                     }
@@ -54518,9 +56051,9 @@ impl Simulator {
                 // The base may be a flat/hier Ident OR a MemberAccess chain
                 // (`u_h.mem[q]` from a parent scope) — mirror of the same
                 // shape in assign_value.
-                let idx_base_name: Option<String> = match &expr.kind {
+                let idx_base_name: Option<std::borrow::Cow<str>> = match &expr.kind {
                     ExprKind::Ident(hier) => Some(self.resolve_hier_name(hier)),
-                    ExprKind::MemberAccess { .. } => self.flat_member_name(expr),
+                    ExprKind::MemberAccess { .. } => self.flat_member_name(expr).map(std::borrow::Cow::Owned),
                     _ => None,
                 };
                 if let Some(mut name) = idx_base_name {
@@ -54561,8 +56094,10 @@ impl Simulator {
                             // collection keeps the BARE name its accessors and
                             // store use. Match `spec_static_coll_key`.
                             name = if self.static_coll_name_collides(coll) {
-                                self.static_prop_key(&real_cls, coll)
-                                    .unwrap_or_else(|| coll.to_string())
+                                std::borrow::Cow::Owned(
+                                    self.static_prop_key(&real_cls, coll)
+                                        .unwrap_or_else(|| coll.to_string()),
+                                )
                             } else if self.class_is_parameterized(&real_cls) {
                                 // PARAMETERIZED class: elements live
                                 // per-specialization via the qualified form
@@ -54573,27 +56108,27 @@ impl Simulator {
                                 // the MemberAccess pre-rewrite only fires for a
                                 // plain class receiver.
                                 if let Some((b, sig)) = self.resolve_typedef_spec(cls) {
-                                    format!(
+                                    std::borrow::Cow::Owned(format!(
                                         "{}#{}::{}",
                                         b,
                                         self.canonicalize_spec_sig(&b, &sig),
                                         coll
-                                    )
+                                    ))
                                 } else {
                                     name
                                 }
                             } else {
-                                coll.to_string()
+                                std::borrow::Cow::Owned(coll.to_string())
                             };
                         }
                     }
                     if let Some(scoped) = self.instance_assoc_member(&name) {
-                        name = scoped;
+                        name = std::borrow::Cow::Owned(scoped);
                     }
                     // A bare name inside a SUBMODULE process resolves under
                     // the process's instance scope (name_resolve_hint), like
                     // scalar reads/writes already do.
-                    if !self.module.arrays.contains_key(&name) && !self.is_associative_array(&name)
+                    if !self.module.arrays.contains_key(&*name) && !self.is_associative_array(&name)
                     {
                         let hint = self.name_resolve_hint.borrow().clone();
                         if let Some(h) = hint {
@@ -54601,12 +56136,12 @@ impl Simulator {
                             if self.module.arrays.contains_key(&scoped)
                                 || self.is_associative_array(&scoped)
                             {
-                                name = scoped;
+                                name = std::borrow::Cow::Owned(scoped);
                             }
                         }
                     }
-                    if self.module.arrays.contains_key(&name)
-                        || self.module.dynamic_arrays.contains(&name)
+                    if self.module.arrays.contains_key(&*name)
+                        || self.module.dynamic_arrays.contains(&*name)
                         || self.is_associative_array(&name)
                         || self.is_per_spec_dynamic_static(&name)
                     {
@@ -54619,7 +56154,7 @@ impl Simulator {
                         // element read like `info.addr[0]` returns X because
                         // the enum arm exits before reaching the dynamic-array
                         // signal lookup below.
-                        if self.module.dynamic_arrays.contains(&name) {
+                        if self.module.dynamic_arrays.contains(&*name) {
                             // fall through to the element lookup below
                         }
                         // Per-spec storage key for STATIC collection properties
@@ -54630,12 +56165,12 @@ impl Simulator {
                         // `eval_builtin_method`'s push_back/size).
                         let store_name = self.spec_static_coll_key(&name);
                         // Array element access: look up signal "name[idx]"
-                        if self.module.dynamic_arrays.contains(&name) {
+                        if self.module.dynamic_arrays.contains(&*name) {
                             self.dollar_bound
                                 .push((self.get_queue_size(&store_name) as i64) - 1);
                         }
                         let idx_val = self.eval_expr(index);
-                        if self.module.dynamic_arrays.contains(&name) {
+                        if self.module.dynamic_arrays.contains(&*name) {
                             self.dollar_bound.pop();
                         }
                         // Fast path for 1-D arrays: compute signal_id directly
@@ -54646,7 +56181,7 @@ impl Simulator {
                         // every element, silently corrupting reads.
                         if !self.is_associative_array(&name) {
                             if let Some(&(first_id, lo, hi)) =
-                                self.array_first_id.get(name.as_str())
+                                self.array_first_id.get(name.as_ref())
                             {
                                 // §7.4.6: SIGNED index — negative-lo arrays.
                                 let idx = idx_val.to_i64().unwrap_or(0);
@@ -54691,7 +56226,7 @@ impl Simulator {
                         let mut v = if let Some(sv) = self.signals.get(&elem_name) {
                             sv.clone()
                         } else if let Some(def_expr) =
-                            self.module.assoc_defaults.get(&name).cloned()
+                            self.module.assoc_defaults.get(&*name).cloned()
                         {
                             self.eval_expr(&def_expr)
                         } else {
@@ -54706,7 +56241,7 @@ impl Simulator {
                             // `num()` is unchanged, which is why this is a
                             // value-only fallback.)
                             let ew = self.assoc_elem_width(&name).unwrap_or(1).max(1);
-                            if self.module.two_state_signals.contains(&name)
+                            if self.module.two_state_signals.contains(&*name)
                                 || name
                                     .rsplit('.')
                                     .next()
@@ -54766,7 +56301,7 @@ impl Simulator {
                     if rev_idx_exprs.len() >= 2 {
                         if let ExprKind::Ident(h) = &cur.kind {
                             let nm = self.resolve_hier_name(h);
-                            if let Some(dims) = self.module.packed_full_dims.get(&nm).cloned() {
+                            if let Some(dims) = self.module.packed_full_dims.get(&*nm).cloned() {
                                 if dims.len() >= rev_idx_exprs.len() {
                                     let base_v = self.eval_expr(cur);
                                     let total = base_v.width as u64;
@@ -54826,7 +56361,7 @@ impl Simulator {
                     let mut candidates: Vec<String> = Vec::new();
                     match &expr.kind {
                         ExprKind::Ident(h) => {
-                            candidates.push(self.resolve_hier_name(h));
+                            candidates.push(self.resolve_hier_name(h).into_owned());
                             if h.path.len() >= 2 {
                                 let dotted: String = h
                                     .path
@@ -54954,12 +56489,12 @@ impl Simulator {
                     // Index rather than a plain Ident.
                     let base = match &expr.kind {
                         ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
-                        ExprKind::MemberAccess { .. } => self.flat_member_name(expr),
+                        ExprKind::MemberAccess { .. } => self.flat_member_name(expr).map(std::borrow::Cow::Owned),
                         _ => None,
                     };
                     if let Some(base) = base {
-                        if !self.signal_name_to_id.contains_key(base.as_str())
-                            && !self.signals.contains_key(&base)
+                        if !self.signal_name_to_id.contains_key(base.as_ref())
+                            && !self.signals.contains_key(&*base)
                         {
                             let i = self.eval_expr(index).to_i64().unwrap_or(0);
                             let elem = format!("{}[{}]", base, i);
@@ -54972,7 +56507,7 @@ impl Simulator {
                 // Fall back to bit select
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
-                    if let Some(dims) = self.module.packed_full_dims.get(&nm) {
+                    if let Some(dims) = self.module.packed_full_dims.get(&*nm) {
                         if let Some(&(dl, dr)) = dims.first() {
                             let lo_b = dl.min(dr);
                             if lo_b != 0 {
@@ -54995,8 +56530,8 @@ impl Simulator {
                 // Unpacked array slice: concatenate elements
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
-                    if let Some(&(arr_lo, arr_hi, elem_w)) = self.module.arrays.get(&name) {
-                        let is_dyn = self.module.dynamic_arrays.contains(&name);
+                    if let Some(&(arr_lo, arr_hi, elem_w)) = self.module.arrays.get(&*name) {
+                        let is_dyn = self.module.dynamic_arrays.contains(&*name);
                         let upper_bound: i64 = if is_dyn {
                             (self.get_queue_size(&name) as i64) - 1
                         } else {
@@ -55048,7 +56583,7 @@ impl Simulator {
                     if let ExprKind::Ident(h) = &expr.kind {
                         let nm = self.resolve_hier_name(h);
                         if let Some(&elem_w) =
-                            self.module.packed_signal_elem_widths.get(&nm).filter(|&&w| w > 1)
+                            self.module.packed_signal_elem_widths.get(&*nm).filter(|&&w| w > 1)
                         {
                             let li = self.eval_expr(left).to_i64().unwrap_or(0);
                             let ri = self.eval_expr(right).to_i64().unwrap_or(0);
@@ -55066,7 +56601,7 @@ impl Simulator {
                             let dim = self
                                 .module
                                 .packed_full_dims
-                                .get(&nm)
+                                .get(&*nm)
                                 .and_then(|d| d.first())
                                 .copied();
                             let lsb_of = |idx: i64| -> i64 {
@@ -55096,7 +56631,7 @@ impl Simulator {
                 // [(W-1)-a : (W-1)-b] (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
-                    if let Some(w) = self.module.ascending_packed.get(&nm).copied() {
+                    if let Some(w) = self.module.ascending_packed.get(&*nm).copied() {
                         if matches!(kind, RangeKind::Constant) {
                             let a = self.eval_expr(left).to_u64().unwrap_or(0) as u32;
                             let b = self.eval_expr(right).to_u64().unwrap_or(0) as u32;
@@ -55153,7 +56688,7 @@ impl Simulator {
                         let nm = self.resolve_hier_name(h);
                         self.module
                             .packed_full_dims
-                            .get(&nm)
+                            .get(&*nm)
                             .and_then(|d| d.first())
                             .copied()
                     }
@@ -55313,7 +56848,8 @@ impl Simulator {
                 self.assign_value(lvalue, &v);
                 v
             }
-            ExprKind::SystemCall { name, args } => match name.as_str() {
+            ExprKind::SystemCall { name, args } => {
+                let mut sys_result = match name.as_str() {
                 // §9.4.5: retrieve a pre-evaluated intra-assignment RHS
                 // (stashed by the suspend path; see make_intra_saved_expr).
                 INTRA_SAVED_MARKER => {
@@ -55350,13 +56886,15 @@ impl Simulator {
                                 return p;
                             }
                             // Not enough history yet: LRM default-value = the
-                            // operand type's default (x for 4-state).
-                            return Value::new(1);
+                            // operand type's default (x for 4-state), at the
+                            // OPERAND's width.
+                            let w = args.first().map(|a| self.infer_width(a)).unwrap_or(1);
+                            return Value::new(w.max(1));
                         }
                     }
                     let sig_name = match args.first().map(|a| &a.kind) {
                         Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
-                        _ => String::new(),
+                        _ => std::borrow::Cow::Owned(String::new()),
                     };
                     let n_cycles = args
                         .get(1)
@@ -55371,7 +56909,7 @@ impl Simulator {
                         if let Some(ring) = self
                             .sva_sites
                             .get(site_idx)
-                            .and_then(|s| s.past_snapshots.get(&sig_name))
+                            .and_then(|s| s.past_snapshots.get(&*sig_name))
                         {
                             if let Some(v) = ring.get(idx) {
                                 return v.clone();
@@ -55411,7 +56949,7 @@ impl Simulator {
                     }
                     let sig_name = match args.first().map(|a| &a.kind) {
                         Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
-                        _ => String::new(),
+                        _ => std::borrow::Cow::Owned(String::new()),
                     };
                     let cur = self
                         .get_signal_value_by_name(&sig_name)
@@ -55419,7 +56957,7 @@ impl Simulator {
                     let prev_opt = self.active_sva_site.and_then(|si| {
                         self.sva_sites
                             .get(si)
-                            .and_then(|s| s.past_snapshots.get(&sig_name))
+                            .and_then(|s| s.past_snapshots.get(&*sig_name))
                             .and_then(|r| r.get(1).cloned())
                     });
                     let cur_bit = (cur.to_u64().unwrap_or(0) & 1) as u8;
@@ -55607,7 +57145,7 @@ impl Simulator {
                                     let mut found_member = false;
                                     while let Some(cn) = &cur {
                                         if let Some(cd) = self.module.classes.get(cn) {
-                                            if cd.properties.contains_key(&name) {
+                                            if cd.properties.contains_key(&*name) {
                                                 found_member = true;
                                                 break;
                                             }
@@ -55628,18 +57166,18 @@ impl Simulator {
                             // dimension sizes (IEEE 1800-2017 §20.6.2). The
                             // signal's own Value holds only one element, so the
                             // array shape must be consulted explicitly.
-                            if let Some(&(lo, hi, ew)) = self.module.arrays.get(&name) {
+                            if let Some(&(lo, hi, ew)) = self.module.arrays.get(&*name) {
                                 let n = (hi - lo).unsigned_abs() + 1;
                                 return Value::from_u64(n * ew as u64, 32);
                             }
                             if let Some(&((a0, a1), (b0, b1), ew)) =
-                                self.module.arrays_2d.get(&name)
+                                self.module.arrays_2d.get(&*name)
                             {
                                 let n =
                                     ((a1 - a0).unsigned_abs() + 1) * ((b1 - b0).unsigned_abs() + 1);
                                 return Value::from_u64(n * ew as u64, 32);
                             }
-                            if let Some((shape, ew)) = self.module.arrays_nd.get(&name) {
+                            if let Some((shape, ew)) = self.module.arrays_nd.get(&*name) {
                                 let n: u64 = shape
                                     .iter()
                                     .map(|(l, h)| (h - l).unsigned_abs() + 1)
@@ -55653,7 +57191,7 @@ impl Simulator {
                             // parameterized instances don't collide. Resolve
                             // through the process's scope hint, outermost
                             // scope walked inward (ivtest sv_enum1).
-                            let typedef_w = self.module.typedefs.get(&name).copied().or_else(|| {
+                            let typedef_w = self.module.typedefs.get(&*name).copied().or_else(|| {
                                 let mut h = self.name_resolve_hint.borrow().clone()?;
                                 loop {
                                     if let Some(&w) =
@@ -55964,7 +57502,7 @@ impl Simulator {
                         Some(_) => self.eval_expr(&args[0]).to_sv_string(),
                         None => String::new(),
                     };
-                    Value::from_u64(self.test_plusarg(&pat) as u64, 1)
+                    Value::from_u64(self.test_plusarg(&pat) as u64, 32)
                 }
                 "$value$plusargs" => self.eval_value_plusargs(args),
                 "$fopen" => self.open_file_handle(args),
@@ -56224,6 +57762,18 @@ impl Simulator {
                 //  - a `seed` argument selects a DETERMINISTIC per-seed stream and
                 //    advances the seed in place (IEEE 1800 §20.15.2) — same seed,
                 //    same sequence.
+                // §19.8: overall coverage — the mean of every covergroup
+                // TYPE's coverage.
+                "$get_coverage" => {
+                    let names: std::collections::BTreeSet<String> =
+                        self.cg_heap.iter().flatten().map(|i| i.cg_name.clone()).collect();
+                    if names.is_empty() {
+                        Value::from_f64(0.0)
+                    } else {
+                        let sum: f64 = names.iter().map(|n| self.calculate_type_coverage(n)).sum();
+                        Value::from_f64(sum / names.len() as f64)
+                    }
+                }
                 "$urandom" => {
                     if let Some(seed_arg) = args.first() {
                         let s = self.eval_expr(seed_arg).to_u64().unwrap_or(0) as u32;
@@ -56791,20 +58341,20 @@ impl Simulator {
                             let elem_w = self
                                 .module
                                 .arrays
-                                .get(&aname)
+                                .get(&*aname)
                                 .map(|&(_, _, w)| w)
-                                .or_else(|| self.module.arrays_2d.get(&aname).map(|&(_, _, w)| w))
-                                .or_else(|| self.module.arrays_nd.get(&aname).map(|(_, w)| *w))
+                                .or_else(|| self.module.arrays_2d.get(&*aname).map(|&(_, _, w)| w))
+                                .or_else(|| self.module.arrays_nd.get(&*aname).map(|(_, w)| *w))
                                 .or_else(|| {
                                     self.signal_name_to_id
-                                        .get(aname.as_str())
+                                        .get(aname.as_ref())
                                         .map(|&id| self.signal_widths[id])
                                 })
                                 .unwrap_or(0);
                             let packed_dim: u64 = self
                                 .module
                                 .packed_full_dims
-                                .get(&aname)
+                                .get(&*aname)
                                 .map(|d| d.len() as u64)
                                 .unwrap_or(if elem_w > 1 { 1 } else { 0 });
                             let total = packed_dim + unpacked_dim;
@@ -56894,23 +58444,51 @@ impl Simulator {
                         }
                     }
                     if let Some(arg) = args.first() {
+                        // Resolve the operand to the name its declared bounds
+                        // are registered under. A plain / hierarchical Ident
+                        // resolves as it always did; a HANDLE-QUALIFIED member
+                        // resolves to the instance-scoped store below.
+                        let mut aname: Option<std::borrow::Cow<str>> = None;
                         if let ExprKind::Ident(hier) = &arg.kind {
-                            let mut aname = self.resolve_hier_name(hier);
+                            let mut n = self.resolve_hier_name(hier);
                             // A fixed-size ARRAY class member lives at
                             // `<handle>#<member>`; the bare name has no dims.
-                            if let Some(scoped) = self.instance_assoc_member(&aname) {
+                            if let Some(scoped) = self.instance_assoc_member(&n) {
                                 if self.module.arrays.contains_key(&scoped) {
-                                    aname = scoped;
+                                    n = std::borrow::Cow::Owned(scoped);
                                 }
                             }
                             // §8.9: `$size(Cls::S)` — the resolver collapses
                             // the 2-segment form to the bare leaf; map from
                             // the original segments to the qualified store.
-                            if !self.module.arrays.contains_key(&aname) {
+                            if !self.module.arrays.contains_key(&*n) {
                                 if let Some(k) = self.static_fixed_key_from_hier(hier) {
-                                    aname = k;
+                                    n = std::borrow::Cow::Owned(k);
                                 }
                             }
+                            aname = Some(n);
+                        }
+                        // §20.7: `$size(a.M)` on a class member array. The
+                        // handle-qualified spelling parses either as a
+                        // `MemberAccess`, which never entered the Ident arm at
+                        // all, or as a two-segment Ident that resolves to a
+                        // name carrying no registered shape. Either way no
+                        // bounds were found and the query fell through to the
+                        // operand's evaluated BIT WIDTH below, so every
+                        // `$size(a.M)` reported 32 while the in-method
+                        // `$size(M)` on the same member reported 3.
+                        // `foreach (a.M[i])` already iterates the member, so
+                        // the shape was known all along — only this path
+                        // missed it.
+                        if aname
+                            .as_deref()
+                            .is_none_or(|n| self.foreach_dims(n).is_none())
+                        {
+                            if let Some(scoped) = self.handle_member_array_name(arg) {
+                                aname = Some(std::borrow::Cow::Owned(scoped));
+                            }
+                        }
+                        if let Some(aname) = aname {
                             // Every unpacked dimension, outermost first. Only the
                             // 1-D table was consulted, so `$size(m, 2)` — and even
                             // `$size(m)` on a 2-D/N-D array — returned 0.
@@ -56918,13 +58496,13 @@ impl Simulator {
                             let elem_w = self
                                 .module
                                 .arrays
-                                .get(&aname)
+                                .get(&*aname)
                                 .map(|&(_, _, w)| w)
-                                .or_else(|| self.module.arrays_2d.get(&aname).map(|&(_, _, w)| w))
-                                .or_else(|| self.module.arrays_nd.get(&aname).map(|(_, w)| *w));
+                                .or_else(|| self.module.arrays_2d.get(&*aname).map(|&(_, _, w)| w))
+                                .or_else(|| self.module.arrays_nd.get(&*aname).map(|(_, w)| *w));
                             let packed_w = if let Some(w) = elem_w {
                                 w
-                            } else if let Some(&id) = self.signal_name_to_id.get(aname.as_str()) {
+                            } else if let Some(&id) = self.signal_name_to_id.get(aname.as_ref()) {
                                 self.signal_widths[id]
                             } else {
                                 // Block-local vector: width lives in the
@@ -56950,17 +58528,17 @@ impl Simulator {
                             let decl_sel = self
                                 .module
                                 .unpacked_decl_dims
-                                .get(&aname)
+                                .get(&*aname)
                                 .and_then(|d| d.get(dim.saturating_sub(1)))
                                 .copied();
                             let (lo, hi, descending) = if let Some((l, r)) = decl_sel {
                                 (l.min(r), l.max(r), l > r)
                             } else if let Some(&(l, h)) = sel {
                                 let desc =
-                                    dim == 1 && self.module.descending_arrays.contains(&aname);
+                                    dim == 1 && self.module.descending_arrays.contains(&*aname);
                                 (l, h, desc)
                             } else if let Some(&(l, r)) =
-                                self.module.packed_full_dims.get(&aname).and_then(|pd| {
+                                self.module.packed_full_dims.get(&*aname).and_then(|pd| {
                                     pd.get(dim.saturating_sub(1).saturating_sub(n_unpacked))
                                 })
                             {
@@ -57130,7 +58708,7 @@ impl Simulator {
                                 }
                             }
                             let name = self.resolve_hier_name(hier);
-                            if self.signal_name_to_id.contains_key(name.as_str()) {
+                            if self.signal_name_to_id.contains_key(name.as_ref()) {
                                 return Value::from_string("logic");
                             }
                         }
@@ -57276,11 +58854,28 @@ impl Simulator {
                     let self_ptr = self as *mut Simulator;
                     vpi_call_systf(self_ptr, name, args).unwrap_or_else(|| Value::zero(32))
                 }
+                // §16.9.3 `$sampled(e)` outside a property: the value in the
+                // current time step, which is the operand's current value.
+                "$sampled" => args
+                    .first()
+                    .map(|a| self.eval_expr(a))
+                    .unwrap_or(Value::zero(32)),
                 _ => {
                     self.warn_unknown_system_task(name, args);
                     Value::zero(32)
                 }
-            },
+                };
+                // §20/§21: an `int`/`integer`-valued function returns a SIGNED
+                // value (`$countones(x) - 8 < 0`, `$fgetc(fd) < 0` on EOF).
+                // The arms above build unsigned words; stamp the sign here,
+                // once, from the shared result-type table.
+                if let Some((32, true)) = super::bytecode::system_function_result(name) {
+                    if sys_result.width == 32 && !sys_result.is_real {
+                        sys_result.is_signed = true;
+                    }
+                }
+                sys_result
+            }
             ExprKind::This => {
                 if let Some(Some(handle)) = self.this_stack.last() {
                     Value::from_u64(*handle as u64, 32)
@@ -57330,12 +58925,12 @@ impl Simulator {
                             let elemish = self
                                 .module
                                 .packed_signal_elem_widths
-                                .get(&nm)
+                                .get(&*nm)
                                 .is_some_and(|&ew| ew > 1)
                                 || self
                                     .module
                                     .packed_full_dims
-                                    .get(&nm)
+                                    .get(&*nm)
                                     .is_some_and(|d| d.len() > 1);
                             if elemish {
                                 let norm = Expression::new(
@@ -57562,6 +59157,34 @@ impl Simulator {
                         None => base_flat,
                     };
                     let flat = format!("{}.{}", base_flat, member.name);
+                    // A dotted read from a hinted scope (`core.seq` inside a
+                    // class method of an object built in `u_w`, issue #155):
+                    // `a.b` parses as a MemberAccess, so the identifier
+                    // resolver's hint walk never saw it and the flat name
+                    // missed. Try it under the hint and each parent scope.
+                    let flat = if self.get_signal_value_by_name(&flat).is_some() {
+                        flat
+                    } else {
+                        let hint = self.name_resolve_hint.borrow().clone();
+                        let mut found: Option<String> = None;
+                        if let Some(hint) = hint.as_deref() {
+                            let mut scope = hint;
+                            loop {
+                                let scoped = format!("{}.{}", scope, flat);
+                                if self.signal_name_to_id.contains_key(scoped.as_str())
+                                    || self.signals.contains_key(&scoped)
+                                {
+                                    found = Some(scoped);
+                                    break;
+                                }
+                                match scope.rsplit_once('.') {
+                                    Some((p, _)) => scope = p,
+                                    None => break,
+                                }
+                            }
+                        }
+                        found.unwrap_or(flat)
+                    };
                     // A leaf may live in the compact table OR the runtime map (a
                     // LOCAL unpacked-struct array element is only in the latter),
                     // so consult both — `sa[1].a` read 0 while `%p` showed 2.
@@ -57692,7 +59315,7 @@ impl Simulator {
                     // For `Ident.field`: look up packed_struct_fields[Ident]
                     // For `Index.field`: look up packed_struct_fields[base_arr_name]
                     // For `Call.field`: try the function's return type layout
-                    let struct_base_name: Option<String> = match &expr.kind {
+                    let struct_base_name: Option<std::borrow::Cow<str>> = match &expr.kind {
                         ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
                         ExprKind::Index { expr: base, .. } => {
                             if let ExprKind::Ident(h) = &base.kind {
@@ -57708,7 +59331,7 @@ impl Simulator {
                                 // (we register it there for nettype resolver functions)
                                 let fn_name =
                                     h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                                Some(fn_name.to_string())
+                                Some(std::borrow::Cow::Owned(fn_name.to_string()))
                             } else {
                                 None
                             }
@@ -57726,10 +59349,10 @@ impl Simulator {
                             let dt_opt =
                                 self.module
                                     .typedef_types
-                                    .get(&base_name)
+                                    .get(&*base_name)
                                     .cloned()
                                 .or_else(|| {
-                                        self.var_typedef_types.get(&base_name).cloned().and_then(
+                                        self.var_typedef_types.get(&*base_name).cloned().and_then(
                                             |tn| {
                                                 self.module.typedef_types.get(tn.as_str()).cloned()
                                             },
@@ -57737,7 +59360,7 @@ impl Simulator {
                                 })
                                 .or_else(|| {
                                         self.signal_name_to_id
-                                            .get(base_name.as_str())
+                                            .get(base_name.as_ref())
                                         .and_then(|id| self.signal_type_names.get(id).cloned())
                                             .and_then(|tn| {
                                                 self.module.typedef_types.get(tn.as_str()).cloned()
@@ -57758,7 +59381,7 @@ impl Simulator {
                         let from_packed = self
                             .module
                             .packed_struct_fields
-                            .get(&base_name)
+                            .get(&*base_name)
                             .cloned()
                             .map(|fs| {
                                 fs.into_iter()
@@ -57784,7 +59407,7 @@ impl Simulator {
                                         None
                                     }
                                 } else if let Some(type_name) =
-                                    self.var_typedef_types.get(&base_name)
+                                    self.var_typedef_types.get(&*base_name)
                                 {
                                     // Local variable/parameter with typedef type
                                     let dt = self.module.typedef_types.get(type_name.as_str())?;
@@ -57797,7 +59420,7 @@ impl Simulator {
                                     // signal_type_names → typedef_types.
                                     let sig_tn = self
                                         .signal_name_to_id
-                                        .get(base_name.as_str())
+                                        .get(base_name.as_ref())
                                         .and_then(|id| self.signal_type_names.get(id).cloned());
                                     if let Some(tn) = sig_tn {
                                         let dt = self.module.typedef_types.get(tn.as_str())?;
@@ -57806,7 +59429,7 @@ impl Simulator {
                                         Self::struct_field_layout(&resolved)
                                     } else {
                                         // Try resolving base_name as a typedef
-                                        let dt = self.module.typedef_types.get(&base_name)?;
+                                        let dt = self.module.typedef_types.get(&*base_name)?;
                                         let resolved =
                                             Self::resolve_type_ref(dt, &self.module.typedef_types);
                                         Self::struct_field_layout(&resolved)
@@ -57986,13 +59609,13 @@ impl Simulator {
                     if let ExprKind::Ident(hier) = &idx_base.kind {
                         let mut an = self.resolve_hier_name(hier);
                         if let Some(scoped) = self.instance_assoc_member(&an) {
-                            an = scoped;
+                            an = std::borrow::Cow::Owned(scoped);
                         } else if !self.is_associative_array(&an)
-                            && !self.module.dynamic_arrays.contains(&an)
-                            && !self.module.arrays.contains_key(&an)
+                            && !self.module.dynamic_arrays.contains(&*an)
+                            && !self.module.arrays.contains_key(&*an)
                         {
                             // Through an object handle (`c.slices[0].path`).
-                            an = self.resolve_locator_storage(&an);
+                            an = std::borrow::Cow::Owned(self.resolve_locator_storage(&an));
                         }
                         if self.is_associative_array(&an) {
                             let idx_val = self.eval_expr(index);
@@ -58001,8 +59624,8 @@ impl Simulator {
                             if let Some(v) = self.get_signal_value_by_name(&target) {
                                 return v;
                             }
-                        } else if (self.module.dynamic_arrays.contains(&an)
-                            || self.module.arrays.contains_key(&an))
+                        } else if (self.module.dynamic_arrays.contains(&*an)
+                            || self.module.arrays.contains_key(&*an))
                             && self.queue_elem_struct(&an).is_some()
                         {
                             // Same leaf read for a DYNAMIC/fixed collection of
@@ -58050,7 +59673,7 @@ impl Simulator {
                             // `a[0].p` into an unknown `u.a`.
                             ExprKind::Ident(h) => {
                                 let scoped = self.resolve_hier_name(h);
-                                if !self.module.packed_struct_fields.contains_key(&scoped)
+                                if !self.module.packed_struct_fields.contains_key(&*scoped)
                                     && h.path.len() == 1
                                     && h.path[0].selects.is_empty()
                                     && self
@@ -58060,7 +59683,7 @@ impl Simulator {
                                 {
                                     break Some(h.path[0].name.name.clone());
                                 }
-                                break Some(scoped);
+                                break Some(scoped.to_string());
                             }
                             // §7.4.2: root may itself be a struct-member path
                             // (`main.sub_list[0].f`) — mirror of assign_value.
@@ -58072,7 +59695,7 @@ impl Simulator {
                                     c = b.as_ref();
                                 }
                                 if let ExprKind::Ident(h) = &c.kind {
-                                    segs.push(self.resolve_hier_name(h));
+                                    segs.push(self.resolve_hier_name(h).into_owned());
                                     segs.reverse();
                                     break Some(segs.join("."));
                                 }
@@ -58139,7 +59762,7 @@ impl Simulator {
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
-                    if let Some(fields) = self.module.packed_struct_fields.get(&name).cloned() {
+                    if let Some(fields) = self.module.packed_struct_fields.get(&*name).cloned() {
                         if let Some((_, off, w)) =
                             fields.iter().find(|(m, _, _)| m == &member.name).cloned()
                         {
@@ -58209,8 +59832,8 @@ impl Simulator {
                             // the CURRENT scope (§8.10): then the user
                             // method must dispatch, not a same-named global.
                             if !self.bare_receiver_is_class_handle(&name)
-                                && (self.module.arrays.contains_key(&name)
-                                    || self.module.dynamic_arrays.contains(&name)
+                                && (self.module.arrays.contains_key(&*name)
+                                    || self.module.dynamic_arrays.contains(&*name)
                                     || self.signals.contains_key(&format!("{}.size", name)))
                             {
                                 return Value::from_u64(self.get_queue_size(&name), 32);
@@ -58402,7 +60025,7 @@ impl Simulator {
                                 member,
                             } => {
                             if let ExprKind::Ident(h) = &arr_e.kind {
-                                Some((self.resolve_hier_name(h), member.name.clone()))
+                                Some((self.resolve_hier_name(h).into_owned(), member.name.clone()))
                             } else {
                                 None
                             }
@@ -58410,7 +60033,7 @@ impl Simulator {
                         ExprKind::Ident(h) if h.path.len() >= 2 => {
                             let mut head = h.clone();
                             let last = head.path.pop().unwrap().name.name;
-                            Some((self.resolve_hier_name(&head), last))
+                            Some((self.resolve_hier_name(&head).into_owned(), last))
                         }
                         _ => None,
                     }
@@ -58418,7 +60041,7 @@ impl Simulator {
                     if h.path.len() >= 2 {
                         let mut head = h.clone();
                         let last = head.path.pop().unwrap().name.name;
-                        Some((self.resolve_hier_name(&head), last))
+                        Some((self.resolve_hier_name(&head).into_owned(), last))
                     } else {
                         None
                     }
@@ -58428,7 +60051,7 @@ impl Simulator {
                     } = &expr.kind
                     {
                     if let ExprKind::Ident(h) = &arr_e.kind {
-                        Some((self.resolve_hier_name(h), member.name.clone()))
+                        Some((self.resolve_hier_name(h).into_owned(), member.name.clone()))
                     } else {
                         None
                     }
@@ -58492,9 +60115,16 @@ impl Simulator {
                 // §5.7.1: an UNSIZED literal is at least 32 bits, but must not
                 // drop digits the source wrote — `'h123456789ABCDEF0` is 64 bits
                 // of value and a flat 32 kept only the low half, silently.
+                // The cached triple already carries the width the literal
+                // was parsed at; an UNSIZED literal used to recompute it from
+                // its text on every evaluation.
+                let cached = cached_val.get();
                 let w = match size {
                     Some(sz) => *sz,
-                    None => Value::unsized_literal_width(value, r_for_w),
+                    None => match cached {
+                        Some((_, _, cw)) => cw,
+                        None => Value::unsized_literal_width(value, r_for_w),
+                    },
                 };
                 // §5.7.1: an unsized all-x/all-z literal ('bx, 'hz, 'b?) is a
                 // FILL — it must replicate to the consuming context, not stop
@@ -58502,7 +60132,7 @@ impl Simulator {
                 let xz_fill =
                     size.is_none() && Value::unsized_xz_fill_char(value).is_some();
                 // Fast path: return cached value (avoids re-parsing string)
-                if let Some((vb, xz, cw)) = cached_val.get() {
+                if let Some((vb, xz, cw)) = cached {
                     if cw == w {
                         let mut v = Value::from_inline(vb, xz, w);
                         v.is_signed = *signed;
@@ -58558,7 +60188,7 @@ impl Simulator {
     fn subject_union_tag(&self, subject: &Expression) -> Option<String> {
         if let ExprKind::Ident(h) = &subject.kind {
             let n = self.resolve_hier_name(h);
-            return self.active_union_tag.get(&n).cloned();
+            return self.active_union_tag.get(&*n).cloned();
         }
         None
     }
@@ -58875,18 +60505,18 @@ impl Simulator {
                 return false;
             };
             let root_name = self.resolve_hier_name(root);
-            if self.module.arrays.contains_key(&root_name)
-                || self.module.arrays_2d.contains_key(&root_name)
-                || self.module.arrays_nd.contains_key(&root_name)
-                || self.module.dynamic_arrays.contains(&root_name)
-                || self.module.associative_arrays.contains_key(&root_name)
+            if self.module.arrays.contains_key(&*root_name)
+                || self.module.arrays_2d.contains_key(&*root_name)
+                || self.module.arrays_nd.contains_key(&*root_name)
+                || self.module.dynamic_arrays.contains(&*root_name)
+                || self.module.associative_arrays.contains_key(&*root_name)
             {
                 return false;
             }
             let Some(&(decl_l, decl_r)) = self
                 .module
                 .packed_full_dims
-                .get(&root_name)
+                .get(&*root_name)
                 .and_then(|dims| dims.get(depth))
             else {
                 return false;
@@ -59072,6 +60702,34 @@ impl Simulator {
                 // spread, not collapsed into one packed value. This is also
                 // what makes a DECLARATION initializer work — elaboration
                 // lowers `T v[int] = '{...}` to `v = '{...}` in an initial block.
+                // §10.9.2: a whole-ARRAY pattern on a CLASS PROPERTY whose
+                // elements are unpacked structs — expand per element so each
+                // lands in the cells the READ path uses, by the same store rule
+                // as the whole-element write above. Must precede the spread
+                // below: `assign_class_fixed_array_pattern` writes the
+                // instance-scoped SIGNAL names (`<h>#arr[i].<m>`) that nothing
+                // reads back, which is what left every element 0.
+                if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+                    if let Some((_, _, su)) = self
+                        .lvalue_root_is_unpacked_struct_prop(lvalue, true)
+                        .then(|| self.class_unpacked_array_prop_of(lvalue))
+                        .flatten()
+                    {
+                        let probe0 = Self::index_expr(lvalue, 0);
+                        if self.class_unpacked_elem_is_heap_owned(&probe0) {
+                            let ord: Vec<Expression> =
+                                self.pattern_ordered(items).into_iter().cloned().collect();
+                            if !ord.is_empty() {
+                                for (i, item) in ord.iter().enumerate() {
+                                    let elem = Self::index_expr(lvalue, i as i64);
+                                    self.assign_class_unpacked_elem(&elem, item, &su);
+                                }
+                                self.settle_after_proc_write();
+                                return;
+                            }
+                        }
+                    }
+                }
                 if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
                     let spread = self.assign_class_fixed_array_pattern(lvalue, items)
                         || self.assign_class_collection_pattern(lvalue, items)
@@ -59156,7 +60814,7 @@ impl Simulator {
                     if let Some((n_expr, src_expr)) = sized_new {
                         let target = match &lvalue.kind {
                             ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
-                            _ => self.flat_member_name(lvalue),
+                            _ => self.flat_member_name(lvalue).map(std::borrow::Cow::Owned),
                         };
                         // A class-property dynamic array (`c.p = new[n]`)
                         // lives under the instance-scoped `<handle>#p`, which
@@ -59166,10 +60824,10 @@ impl Simulator {
                         // non-associative collections (dynamic arrays /
                         // queues); `new[n]` is invalid for assoc arrays.
                         let name = target
-                            .filter(|n| self.module.dynamic_arrays.contains(n))
+                            .filter(|n| self.module.dynamic_arrays.contains(n.as_ref()))
                             .or_else(|| {
                                 self.expr_assoc_name(lvalue)
-                                    .filter(|an| !self.is_associative_array(an))
+                                    .filter(|an| !self.is_associative_array(an)).map(std::borrow::Cow::Owned)
                             });
                         if let Some(name) = name {
                             let n = self.eval_expr(n_expr).to_u64().unwrap_or(0);
@@ -59202,12 +60860,12 @@ impl Simulator {
                             let inner: Option<(Vec<(i64, i64)>, u32)> = self
                                 .module
                                 .arrays_2d
-                                .get(&name)
+                                .get(&*name)
                                 .map(|&(_, d2, w)| (vec![d2], w))
                                 .or_else(|| {
                                     self.module
                                         .arrays_nd
-                                        .get(&name)
+                                        .get(&*name)
                                         .map(|(sh, w)| (sh[1..].to_vec(), *w))
                                 });
                             if let Some((shape, w)) = inner {
@@ -59237,15 +60895,15 @@ impl Simulator {
                                 let w = self
                                     .module
                                     .arrays
-                                    .get(&name)
+                                    .get(&*name)
                                     .map(|&(_, _, w)| w)
                                     .unwrap_or(32);
-                                let four_state = self.p_elem_type(&name).is_some_and(|dt| {
+                                let four_state = self.p_elem_type_ref(&name).is_some_and(|dt| {
                                     use crate::ast::types::{
                                         DataType as DT, IntegerAtomType as IAT,
                                         IntegerVectorType as IVT,
                                     };
-                                    match self.resolve_dt(&dt) {
+                                    match self.resolve_dt_ref(&dt) {
                                         DT::IntegerVector {
                                             kind: IVT::Logic | IVT::Reg,
                                             ..
@@ -59416,6 +61074,28 @@ impl Simulator {
                 // generic arm below can't resolve the container (`p_elem_type`
                 // only knows module-scope names), so the copy fell to a packed
                 // store and every member of the element stayed blank.
+                // §7.2/§18.4: ...unless the READ path owns this element's
+                // leaves. A CLASS PROPERTY that is a fixed array of unpacked
+                // structs is resolved on the read side by `class_unpacked_leaf`
+                // into the instance property map (`arr[i].<m>`) — which is also
+                // where a per-leaf write (`arr[i].m = v`) and a scalar-struct
+                // property write land. Only the whole-element path below routed
+                // to the instance-scoped SIGNAL name `<h>#arr[i].<m>`, so the
+                // value was written and then unreachable and every such element
+                // read back 0. Ask the read resolver where the leaves live and
+                // decompose into the same cells. A genuine queue/dynamic/assoc
+                // element is NOT claimed by it and keeps the signal-name copy
+                // below (UVM uvm_hdl_path_concat::add_slice).
+                if self.lvalue_root_is_unpacked_struct_prop(lvalue, false)
+                    && self.queue_pop_call(rvalue).is_none()
+                    && self.class_unpacked_elem_is_heap_owned(lvalue)
+                {
+                    if let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) {
+                        self.assign_class_unpacked_elem(lvalue, rvalue, &su);
+                        self.settle_after_proc_write();
+                        return;
+                    }
+                }
                 if self.queue_pop_call(rvalue).is_none() {
                     if let Some(dst) = self.flat_member_name(lvalue) {
                         // Only a BARE element lvalue (`slices[i] = ...`) — a
@@ -59460,11 +61140,11 @@ impl Simulator {
                     // this type lookup bypassed it, so the whole-struct copy
                     // silently declined and every member stayed x — while the
                     // identical code at top level worked.
-                    let dst = if self.p_elem_type(&dst).is_none() {
+                    let dst = if self.p_elem_type_ref(&dst).is_none() {
                         match self.name_resolve_hint.borrow().clone() {
                             Some(h) => {
                                 let scoped = format!("{}.{}", h, dst);
-                                if self.p_elem_type(&scoped).is_some() {
+                                if self.p_elem_type_ref(&scoped).is_some() {
                                     scoped
                                 } else {
                                     dst
@@ -59475,9 +61155,17 @@ impl Simulator {
                     } else {
                         dst
                     };
-                    if let Some(dt) = self.p_elem_type(&dst) {
-                        if let DataType::Struct(su) = self.resolve_dt(&dt) {
-                            if Self::spreads_member_wise(&su) {
+                    // Only a member-wise struct target needs its type owned;
+                    // every other assignment answers the predicate by borrow.
+                    let spread_su = self.p_elem_type_ref(&dst).and_then(|dt| {
+                        match self.resolve_dt_ref(&dt) {
+                            DataType::Struct(su) if Self::spreads_member_wise(su) => {
+                                Some(su.clone())
+                            }
+                            _ => None,
+                        }
+                    });
+                    if let Some(su) = spread_su {
                                 if let Some(src) = self.flat_member_name(rvalue) {
                                     if src != dst && self.struct_storage_exists(&src, &su) {
                                         self.copy_unpacked_struct(&dst, &src, &su.clone());
@@ -59516,8 +61204,6 @@ impl Simulator {
                                         return;
                                     }
                                 }
-                            }
-                        }
                     }
                 }
                 // `collection[key] = new(...)`: a bare `new` assigned to an
@@ -59547,7 +61233,7 @@ impl Simulator {
                             let handle = self.heap.len();
                             self.heap.push(Some(ClassInstance {
                                 class_name: kind.to_string(),
-                                properties: HashMap::default(),
+                                properties: PropMap::default(),
                                 type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
@@ -60061,8 +61747,8 @@ impl Simulator {
                     if is_new && args.len() == 1 {
                         if let ExprKind::Ident(lh) = &lvalue.kind {
                             let mut lname = self.resolve_hier_name(lh);
-                            if !(self.module.dynamic_arrays.contains(&lname)
-                                || self.module.arrays.contains_key(&lname))
+                            if !(self.module.dynamic_arrays.contains(&*lname)
+                                || self.module.arrays.contains_key(&*lname))
                             {
                                 // A class-member dynamic array reached either
                                 // via the CURRENT instance (`base` → this
@@ -60100,25 +61786,25 @@ impl Simulator {
                                     })
                                     .or_else(|| self.expr_assoc_name(lvalue));
                                 if let Some(s) = scoped {
-                                    lname = s;
+                                    lname = std::borrow::Cow::Owned(s);
                                 }
                             }
-                            if self.module.dynamic_arrays.contains(&lname)
-                                || self.module.arrays.contains_key(&lname)
+                            if self.module.dynamic_arrays.contains(&*lname)
+                                || self.module.arrays.contains_key(&*lname)
                                 || lname.contains('#')
                             {
                             let size = self.eval_expr(&args[0]).to_u64().unwrap_or(0);
-                            let w = self.module.arrays.get(&lname).map(|t| t.2).unwrap_or(32);
+                            let w = self.module.arrays.get(&*lname).map(|t| t.2).unwrap_or(32);
                             // Drop any stale elements, then size + zero-fill.
                             let prefix = format!("{}[", lname);
                             let stale: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
                             for k in stale {
                                 self.signals.remove(&k);
                             }
-                            self.module.dynamic_arrays.insert(lname.clone());
+                            self.module.dynamic_arrays.insert(lname.to_string());
                                 self.module
                                     .arrays
-                                    .entry(lname.clone())
+                                    .entry(lname.to_string())
                                     .or_insert((0, 63, w));
                             // A STRUCT-element array keeps each member in its
                             // own leaf signal (`arr[i].path`); registering a
@@ -60177,7 +61863,7 @@ impl Simulator {
                         } else {
                             tag.name.clone()
                         };
-                        self.active_union_tag.insert(lname.clone(), tag_name);
+                        self.active_union_tag.insert(lname.to_string(), tag_name);
                         if let Some(inner_expr) = inner {
                             let v = self.eval_expr(inner_expr);
                             self.set_signal_value_by_name(&lname, v);
@@ -60208,10 +61894,10 @@ impl Simulator {
                     // A string QUEUE is in `string_signals` too (so its
                     // elements render as strings), but `q = {...}` on it is a
                     // QUEUE assignment — `q = {}` clears it — not a byte concat.
-                    let lhs_is_queue = self.module.dynamic_arrays.contains(&lname)
-                        || self.module.arrays.contains_key(&lname);
+                    let lhs_is_queue = self.module.dynamic_arrays.contains(&*lname)
+                        || self.module.arrays.contains_key(&*lname);
                     if !lhs_is_queue
-                        && (self.string_signals.contains(&lname)
+                        && (self.string_signals.contains(&*lname)
                             || self.string_signals.contains(
                                 &lh.path
                                     .last()
@@ -60238,12 +61924,12 @@ impl Simulator {
                         if self
                             .local_stack
                             .last()
-                            .is_some_and(|f| f.contains_key(&lname))
+                            .is_some_and(|f| f.contains_key(&*lname))
                         {
                             self.local_stack
                                 .last_mut()
                                 .unwrap()
-                                .insert(lname.clone(), sval);
+                                .insert(lname.to_string(), sval);
                         } else {
                             self.assign_value(lvalue, &sval);
                         }
@@ -60360,8 +62046,8 @@ impl Simulator {
                     if let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lbase.kind, &rbase.kind) {
                         let lname = self.resolve_hier_name(lh);
                         let rname = self.resolve_hier_name(rh);
-                        let lshape = self.module.arrays_nd.get(&lname).cloned();
-                        let rshape = self.module.arrays_nd.get(&rname).cloned();
+                        let lshape = self.module.arrays_nd.get(&*lname).cloned();
+                        let rshape = self.module.arrays_nd.get(&*rname).cloned();
                         if let (Some((ls, _)), Some((rs, _))) = (lshape, rshape) {
                             if ls.len() == rs.len()
                                 && lrev.len() < ls.len()
@@ -60373,8 +62059,8 @@ impl Simulator {
                                 for i in (0..given).rev() {
                                     let lv = self.eval_expr(lrev[i]).to_u64().unwrap_or(0) as i64;
                                     let rv = self.eval_expr(rrev[i]).to_u64().unwrap_or(0) as i64;
-                                    l_prefix = format!("{}[{}]", l_prefix, lv);
-                                    r_prefix = format!("{}[{}]", r_prefix, rv);
+                                    l_prefix = std::borrow::Cow::Owned(format!("{}[{}]", l_prefix, lv));
+                                    r_prefix = std::borrow::Cow::Owned(format!("{}[{}]", r_prefix, rv));
                                 }
                                 let remaining: Vec<(i64, i64)> =
                                     ls[given..].to_vec();
@@ -60401,7 +62087,7 @@ impl Simulator {
                                         }
                                     }
                                     let mut pairs = Vec::new();
-                                    enum_idx(&remaining, l_prefix, r_prefix, &mut pairs);
+                                    enum_idx(&remaining, l_prefix.into_owned(), r_prefix.into_owned(), &mut pairs);
                                     for (lp, rp) in pairs {
                                         let v = self
                                             .get_signal_value_by_name(&rp)
@@ -60422,11 +62108,11 @@ impl Simulator {
                 if let ExprKind::StreamOp { .. } = &rvalue.kind {
                     if let ExprKind::Ident(lh) = &lvalue.kind {
                         let lname = self.resolve_hier_name(lh);
-                        if self.module.arrays.contains_key(&lname) {
+                        if self.module.arrays.contains_key(&*lname) {
                             let elem_w = self
                                 .lookup_signal_width(&format!("{}[0]", lname))
                                 .unwrap_or_else(|| {
-                                    self.module.arrays.get(&lname).map(|t| t.2).unwrap_or(8)
+                                    self.module.arrays.get(&*lname).map(|t| t.2).unwrap_or(8)
                                 })
                                 .max(1);
                             // Evaluate stream raw (no pad) by using ctx 0.
@@ -60468,14 +62154,14 @@ impl Simulator {
                     // element type, concatenate elements with index 0 at the MSB.
                     let rhs_val = if let ExprKind::Ident(rhier) = &rvalue.kind {
                         let rname = self.resolve_hier_name(rhier);
-                        if self.module.arrays.contains_key(&rname)
-                            || self.module.dynamic_arrays.contains(&rname)
+                        if self.module.arrays.contains_key(&*rname)
+                            || self.module.dynamic_arrays.contains(&*rname)
                         {
                             let n = self.get_queue_size(&rname) as usize;
                             let elem_w = self
                                 .lookup_signal_width(&format!("{}[0]", rname))
                                 .unwrap_or_else(|| {
-                                    self.module.arrays.get(&rname).map(|t| t.2).unwrap_or(8)
+                                    self.module.arrays.get(&*rname).map(|t| t.2).unwrap_or(8)
                                 });
                             let total_w = (n as u32) * elem_w;
                             let mut packed = Value::zero(total_w);
@@ -60539,15 +62225,15 @@ impl Simulator {
                         if is_last {
                             if let ExprKind::Ident(h) = &e.kind {
                                 let n = self.resolve_hier_name(h);
-                                if self.module.dynamic_arrays.contains(&n)
-                                    || self.module.arrays.contains_key(&n)
+                                if self.module.dynamic_arrays.contains(&*n)
+                                    || self.module.arrays.contains_key(&*n)
                                 {
                                     let ew = self
                                         .lookup_signal_width(&format!("{}[0]", n))
                                         .unwrap_or_else(|| {
-                                            self.module.arrays.get(&n).map(|t| t.2).unwrap_or(8)
+                                            self.module.arrays.get(&*n).map(|t| t.2).unwrap_or(8)
                                         });
-                                    dyn_last = Some(n);
+                                    dyn_last = Some(n.to_string());
                                     dyn_last_elem_w = ew;
                                     continue;
                                 }
@@ -60927,7 +62613,7 @@ impl Simulator {
                         // same handle-as-u32 form as classes, just routed
                         // through the covergroup heap so sample_covergroup /
                         // instantiate_covergroup wire up.
-                        if let Some(cg_def) = self.module.covergroups.get(&tname).cloned() {
+                        if let Some(cg_def) = self.covergroup_def_for(&tname) {
                             let handle = self.instantiate_covergroup(&cg_def, ctor_args);
                             self.assign_value(lvalue, &handle.resize(w));
                             self.settle_after_proc_write();
@@ -60982,7 +62668,7 @@ impl Simulator {
                                 let is_frame_local = self
                                     .local_stack
                                     .last()
-                                    .is_some_and(|f| f.contains_key(&lhs_name));
+                                    .is_some_and(|f| f.contains_key(&*lhs_name));
                                 let has_field_sigs = decl_order.iter().all(|(fn_, _, _, _)| {
                                     let dotted = format!("{}.{}", lhs_name, fn_);
                                     self.signals.contains_key(&dotted)
@@ -60996,7 +62682,7 @@ impl Simulator {
                                             self.local_stack
                                                 .last()
                                                 .unwrap()
-                                                .get(&lhs_name)
+                                                .get(&*lhs_name)
                                                 .cloned()
                                                 .unwrap_or_else(|| Value::zero(65))
                                         } else {
@@ -61035,7 +62721,7 @@ impl Simulator {
                                             self.local_stack
                                                 .last_mut()
                                                 .unwrap()
-                                                .insert(lhs_name.clone(), cur);
+                                                .insert(lhs_name.to_string(), cur);
                                         } else {
                                             self.set_signal_value_by_name(&lhs_name, cur);
                                         }
@@ -61081,7 +62767,7 @@ impl Simulator {
                                 let handle = self.heap.len();
                                 self.heap.push(Some(ClassInstance {
                                     class_name: kind.to_string(),
-                                    properties: HashMap::default(),
+                                    properties: PropMap::default(),
                                     type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
@@ -61150,7 +62836,7 @@ impl Simulator {
                                     let handle = self.heap.len();
                                     self.heap.push(Some(ClassInstance {
                                         class_name: tname.clone(),
-                                        properties: HashMap::default(),
+                                        properties: PropMap::default(),
                                         type_bindings: HashMap::default(),
                                     spec: None,
                                     creation_scope: self.active_instance_scope(),
@@ -61165,7 +62851,7 @@ impl Simulator {
                                     let handle = self.heap.len();
                                     self.heap.push(Some(ClassInstance {
                                         class_name: tname.clone(),
-                                        properties: HashMap::default(),
+                                        properties: PropMap::default(),
                                         type_bindings: HashMap::default(),
                                     spec: None,
                                     creation_scope: self.active_instance_scope(),
@@ -61190,7 +62876,7 @@ impl Simulator {
                                         ta_cloned.as_deref(),
                                     )
                                 } else if let Some(cg_def) =
-                                    self.module.covergroups.get(&tname).cloned()
+                                    self.covergroup_def_for(&tname)
                                 {
                                     self.instantiate_covergroup(&cg_def, args)
                                 } else {
@@ -61206,7 +62892,7 @@ impl Simulator {
                                             }
                                             _ => {
                                                 let f = self.flat_member_name(lvalue);
-                                                f.filter(|n| self.module.dynamic_arrays.contains(n))
+                                                f.filter(|n| self.module.dynamic_arrays.contains(n)).map(std::borrow::Cow::Owned)
                                             }
                                         };
                                         if let Some(name) = target {
@@ -61235,7 +62921,7 @@ impl Simulator {
                                         let h = self.heap.len();
                                         self.heap.push(Some(ClassInstance {
                                             class_name: tname.clone(),
-                                            properties: HashMap::default(),
+                                            properties: PropMap::default(),
                                             type_bindings: HashMap::default(),
                                         spec: None,
                                         creation_scope: self.active_instance_scope(),
@@ -61262,7 +62948,7 @@ impl Simulator {
                                     let h = self.heap.len();
                                     self.heap.push(Some(ClassInstance {
                                         class_name: String::new(),
-                                        properties: HashMap::default(),
+                                        properties: PropMap::default(),
                                         type_bindings: HashMap::default(),
                                     spec: None,
                                     creation_scope: self.active_instance_scope(),
@@ -61283,7 +62969,7 @@ impl Simulator {
                 // its `return` statement): copy it into a collection lvalue.
                 if matches!(&rvalue.kind, ExprKind::Call { .. }) {
                     if let Some(src) = self.pending_ret_collection.take() {
-                        let dst: Option<String> = {
+                        let dst: Option<std::borrow::Cow<str>> = {
                             let byname = if let ExprKind::Ident(h) = &lvalue.kind {
                                 // The LHS may itself be a renamed local dyn
                                 // (`byte_array b;` inside an initial/method).
@@ -61291,15 +62977,15 @@ impl Simulator {
                                     h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                                 let n = self
                                     .dyn_name_lookup(bare)
-                                    .map(str::to_string)
+                                    .map(|s| std::borrow::Cow::Owned(s.to_string()))
                                     .unwrap_or_else(|| self.resolve_hier_name(h));
-                                self.module.dynamic_arrays.contains(&n).then_some(n)
+                                self.module.dynamic_arrays.contains(&*n).then_some(n)
                             } else {
                                 None
                             };
                             byname.or_else(|| {
                                 self.expr_assoc_name(lvalue)
-                                    .filter(|an| !self.is_associative_array(an))
+                                    .filter(|an| !self.is_associative_array(an)).map(std::borrow::Cow::Owned)
                             })
                         };
                         if let Some(dst) = dst {
@@ -61410,6 +63096,13 @@ impl Simulator {
                     return;
                 }
                 // LHS fixed array  ←  RHS dynamic array/prop
+                // Multi-dimensional unpacked arrays: whole copy (`w = v`) and
+                // row copy (`r = v[1]`, `v[1] = r`) go element-wise by suffix;
+                // the arms below only know one dimension.
+                if self.copy_multi_dim_array(lvalue, rvalue) {
+                    self.settle_after_proc_write();
+                    return;
+                }
                 if let (Some((dst, lo, hi)), Some(src)) = (l_fix, r_dyn.clone()) {
                     let desc = self.module.descending_arrays.contains(&dst);
                     let cap = (hi - lo + 1) as u64;
@@ -61454,21 +63147,21 @@ impl Simulator {
                         self.settle_after_proc_write();
                         return;
                     }
-                    if self.module.arrays.contains_key(&lname)
-                        && self.module.arrays.contains_key(&rname)
+                    if self.module.arrays.contains_key(&*lname)
+                        && self.module.arrays.contains_key(&*rname)
                     {
-                        let (llo, lhi, _) = self.module.arrays[&lname];
-                        let (rlo, rhi, _) = self.module.arrays[&rname];
+                        let (llo, lhi, _) = self.module.arrays[&*lname];
+                        let (rlo, rhi, _) = self.module.arrays[&*rname];
                         let lsize = (lhi - llo + 1) as usize;
                         let rsize = (rhi - rlo + 1) as usize;
                         // §7.6: assigning a FIXED array to a DYNAMIC array
                         // resizes the destination to the source's size —
                         // the placeholder (0,63) registration made this look
                         // like fixed-to-fixed and left the old size in place.
-                        if self.module.dynamic_arrays.contains(&lname)
-                            && !self.module.dynamic_arrays.contains(&rname)
+                        if self.module.dynamic_arrays.contains(&*lname)
+                            && !self.module.dynamic_arrays.contains(&*rname)
                         {
-                            let r_desc = self.module.descending_arrays.contains(&rname);
+                            let r_desc = self.module.descending_arrays.contains(&*rname);
                             for i in 0..rsize {
                                 let ridx = if r_desc {
                                     rhi - i as i64
@@ -61488,8 +63181,8 @@ impl Simulator {
                             return;
                         }
                         let count = lsize.min(rsize);
-                        let l_desc = self.module.descending_arrays.contains(&lname);
-                        let r_desc = self.module.descending_arrays.contains(&rname);
+                        let l_desc = self.module.descending_arrays.contains(&*lname);
+                        let r_desc = self.module.descending_arrays.contains(&*rname);
                         for i in 0..count {
                             let ridx = if r_desc {
                                 rhi - i as i64
@@ -61515,9 +63208,9 @@ impl Simulator {
                     // An instance-scoped queue/array member (`q` inside a method,
                     // or `obj.q`) lives under `<handle>#q`, not the bare name.
                     if let Some(s) = self.instance_assoc_member(&lname) {
-                        lname = s;
+                        lname = std::borrow::Cow::Owned(s);
                     }
-                    if self.module.arrays.contains_key(&lname) {
+                    if self.module.arrays.contains_key(&*lname) {
                         // Queue/array slice assignment: lq = rq[a:b]
                         if let ExprKind::RangeSelect {
                             expr: rbase,
@@ -61531,11 +63224,11 @@ impl Simulator {
                                 // Same instance scoping as the LHS: a member queue
                                 // slice (`instr_list[a:b]`) reads `<handle>#name`.
                                 if let Some(s) = self.instance_assoc_member(&rname) {
-                                    rname = s;
+                                    rname = std::borrow::Cow::Owned(s);
                                 }
-                                if self.module.arrays.contains_key(&rname) {
-                                    let (r_lo_a, r_hi_a, _) = self.module.arrays[&rname];
-                                    let r_is_dyn = self.module.dynamic_arrays.contains(&rname);
+                                if self.module.arrays.contains_key(&*rname) {
+                                    let (r_lo_a, r_hi_a, _) = self.module.arrays[&*rname];
+                                    let r_is_dyn = self.module.dynamic_arrays.contains(&*rname);
                                     let r_upper: i64 = if r_is_dyn {
                                         (self.get_queue_size(&rname) as i64) - 1
                                     } else {
@@ -61565,8 +63258,8 @@ impl Simulator {
                                                 .collect()
                                         }
                                     };
-                                    let (l_lo, l_hi, _) = self.module.arrays[&lname];
-                                    let is_dyn = self.module.dynamic_arrays.contains(&lname);
+                                    let (l_lo, l_hi, _) = self.module.arrays[&*lname];
+                                    let is_dyn = self.module.dynamic_arrays.contains(&*lname);
                                     for (i, v) in results.iter().enumerate() {
                                         let idx = l_lo + i as i64;
                                         // Dynamic arrays / queues start
@@ -61590,14 +63283,14 @@ impl Simulator {
                             }
                         }
                         if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
-                            let is_dyn = self.module.dynamic_arrays.contains(&lname);
+                            let is_dyn = self.module.dynamic_arrays.contains(&*lname);
                             let (lo, hi, _w) = self
                                 .module
                                 .arrays
-                                .get(&lname)
+                                .get(&*lname)
                                 .copied()
                                 .unwrap_or((0, -1, 32));
-                            let descending = self.module.descending_arrays.contains(&lname);
+                            let descending = self.module.descending_arrays.contains(&*lname);
                             for (i, item) in items.iter().enumerate() {
                                 let idx = if descending {
                                     hi - i as i64
@@ -61685,12 +63378,12 @@ impl Simulator {
                                         // Instance-scope a member-queue slice
                                         // operand inside a concat (`{q[0:i], …}`).
                                         if let Some(s) = self.instance_assoc_member(&rname) {
-                                            rname = s;
+                                            rname = std::borrow::Cow::Owned(s);
                                         }
-                                        if self.module.arrays.contains_key(&rname) {
-                                            let (r_lo_a, r_hi_a, _) = self.module.arrays[&rname];
+                                        if self.module.arrays.contains_key(&*rname) {
+                                            let (r_lo_a, r_hi_a, _) = self.module.arrays[&*rname];
                                             let r_is_dyn =
-                                                self.module.dynamic_arrays.contains(&rname);
+                                                self.module.dynamic_arrays.contains(&*rname);
                                             let r_upper: i64 = if r_is_dyn {
                                                 (self.get_queue_size(&rname) as i64) - 1
                                             } else {
@@ -61722,11 +63415,11 @@ impl Simulator {
                                 }
                                 all_vals.push(self.eval_expr(expr));
                             }
-                            let is_dyn = self.module.dynamic_arrays.contains(&lname);
+                            let is_dyn = self.module.dynamic_arrays.contains(&*lname);
                             let (lo, hi, _w) = self
                                 .module
                                 .arrays
-                                .get(&lname)
+                                .get(&*lname)
                                 .copied()
                                 .unwrap_or((0, -1, 32));
                             for (i, v) in all_vals.iter().enumerate() {
@@ -61752,8 +63445,8 @@ impl Simulator {
                 // When assigning a locator/reduction method result to a queue, store as single-element queue
                 if let ExprKind::Ident(lhier) = &lvalue.kind {
                     let lname = self.resolve_hier_name(lhier);
-                    if self.module.dynamic_arrays.contains(&lname)
-                        && self.module.arrays.contains_key(&lname)
+                    if self.module.dynamic_arrays.contains(&*lname)
+                        && self.module.arrays.contains_key(&*lname)
                     {
                         if let ExprKind::MemberAccess { member, .. } = &rvalue.kind {
                             let mname = member.name.as_str();
@@ -62307,11 +64000,18 @@ impl Simulator {
                     })
                     .collect();
                 let fv_saved = self.snapshot_loop_vars(&fv_names);
+                // A loop variable that shadows a module-scope variable needs
+                // its own frame. The module variable of an INLINED instance
+                // is keyed under the process scope (`u.i`), so test the
+                // scope-hinted names too: without this the first run wrote a
+                // bare `i` signal while the reads resolved through the hint
+                // to the x-valued `u.i`, and the loop never entered.
                 let shadow_frame = self.local_stack.last().is_none()
                     && init.iter().any(|fi| match fi {
                         ForInit::VarDecl { name, .. } => {
                             self.signal_name_to_id.contains_key(name.name.as_str())
                                 || self.signals.contains_key(&name.name)
+                                || self.scoped_signal_exists(&name.name)
                         }
                         _ => false,
                     });
@@ -62398,9 +64098,9 @@ impl Simulator {
                         _ => None,
                     })
                     .collect();
-                let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                static LOOP_LIMIT_ENV: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+                let loop_limit: u64 = (*LOOP_LIMIT_ENV
+                    .get_or_init(|| std::env::var("XEZIM_LOOP_LIMIT").ok().and_then(|s| s.parse().ok())))
                     .unwrap_or(10_000_000);
                 let mut iters: u64 = 0;
                 loop {
@@ -62448,6 +64148,25 @@ impl Simulator {
                     self.pop_local_frame();
                 }
                 self.restore_loop_vars(&fv_saved);
+            }
+            // A foreach variable that shadows a module-scope variable (bare or
+            // under the process's instance scope, `u.i`) gets its own frame,
+            // like a for-init variable: without one the loop variable was
+            // written by name, resolved through the scope hint to the module
+            // variable, and the block re-triggered itself on that write.
+            // The re-dispatch below sees a local frame and takes the normal
+            // path, so every exit of that path pops nothing extra.
+            StatementKind::Foreach { vars, .. }
+                if self.local_stack.last().is_none()
+                    && vars.iter().flatten().any(|v| {
+                        self.signal_name_to_id.contains_key(v.name.as_str())
+                            || self.signals.contains_key(&v.name)
+                            || self.scoped_signal_exists(&v.name)
+                    }) =>
+            {
+                self.push_local_frame(HashMap::default());
+                self.exec_statement(stmt);
+                self.pop_local_frame();
             }
             StatementKind::Foreach { array, vars, body } => {
                 // foreach index variables are loop-scoped (SV): save the outer
@@ -62756,6 +64475,10 @@ impl Simulator {
                 }
                 if let ExprKind::Ident(hier) = &array.kind {
                     let mut name = self.resolve_hier_name(hier);
+                    // Packed multi-dimensional CLASS property (`foreach (c.d[i, j])`
+                    // over `bit [6:0] [4:0][1:0] d`): the geometry lives on the
+                    // class type, not in the module-level packed tables.
+                    let mut prop_packed_dims: Option<Vec<(i64, i64)>> = None;
                     // A subroutine-LOCAL queue/dyn array lives under its
                     // per-process rename — and shadows any same-named class
                     // member (§8.10). Without this, `foreach (pp[j])` over a
@@ -62763,16 +64486,16 @@ impl Simulator {
                     // (UVM's get_full_hdl_path parent_paths loop, so every
                     // backdoor access lost its hdl path).
                     if let Some(rn) = self.dyn_name_lookup(&name) {
-                        name = rn.to_string();
+                        name = std::borrow::Cow::Owned(rn.to_string());
                     } else {
                         let spec_key = self.spec_static_coll_key(&name);
-                        // §8.25: the per-spec key for a static collection
-                        // (`Class#spec::member`) is authoritative — do not
-                        // re-scope it into the instance/collision namespace.
-                        if spec_key != name {
-                            name = spec_key;
+                        // §8.25: adopt the per-spec key when `spec_static_coll_key`
+                        // specialized this collection (`Class#spec::member`); a
+                        // bare (unparameterized) collection keeps its name.
+                        if let std::borrow::Cow::Owned(k) = spec_key {
+                            name = std::borrow::Cow::Owned(k);
                         } else if let Some(scoped) = self.instance_assoc_member(&name) {
-                            name = scoped;
+                            name = std::borrow::Cow::Owned(scoped);
                         }
                     }
                     // `foreach (obj.member[i, j])` over a FIXED array
@@ -62784,10 +64507,10 @@ impl Simulator {
                     // only via a later element-key scan).
                     if hier.path.len() >= 2
                         && hier.path.iter().all(|s| s.selects.is_empty())
-                        && !self.module.arrays.contains_key(&name)
-                        && !self.module.arrays_2d.contains_key(&name)
-                        && !self.module.arrays_nd.contains_key(&name)
-                        && !self.module.dynamic_arrays.contains(&name)
+                        && !self.module.arrays.contains_key(&*name)
+                        && !self.module.arrays_2d.contains_key(&*name)
+                        && !self.module.arrays_nd.contains_key(&*name)
+                        && !self.module.dynamic_arrays.contains(&*name)
                         && !self.is_associative_array(&name)
                     {
                         let obj = hier.path[0].name.name.clone();
@@ -62818,7 +64541,30 @@ impl Simulator {
                                 || self.module.arrays_2d.contains_key(&scoped)
                                 || self.module.arrays_nd.contains_key(&scoped)
                             {
-                                name = scoped;
+                                name = std::borrow::Cow::Owned(scoped);
+                            } else if let Some(pd) = self.class_prop_packed_dims(
+                                h,
+                                hier.path.last().map(|s| s.name.name.as_str()).unwrap_or(""),
+                            ) {
+                                if pd.len() >= vars.len() {
+                                    prop_packed_dims = Some(pd);
+                                }
+                            }
+                        }
+                    }
+                    // Same geometry for a bare property name inside a method
+                    // (`foreach (d[i, j])` with `this` implied).
+                    if prop_packed_dims.is_none()
+                        && hier.path.len() == 1
+                        && hier.path[0].selects.is_empty()
+                        && self.foreach_dims(&name).is_none()
+                        && !self.module.packed_full_dims.contains_key(&*name)
+                    {
+                        if let Some(h) = self.this_stack.last().copied().flatten().filter(|&h| h != 0) {
+                            if let Some(pd) = self.class_prop_packed_dims(h, &hier.path[0].name.name) {
+                                if pd.len() >= vars.len() {
+                                    prop_packed_dims = Some(pd);
+                                }
                             }
                         }
                     }
@@ -62826,10 +64572,10 @@ impl Simulator {
                     // under the process's instance scope ("u_s.mem"), like
                     // reads/writes already do — otherwise the collection
                     // lookups all miss and the foreach body never runs.
-                    if !self.module.arrays.contains_key(&name)
-                        && !self.module.arrays_2d.contains_key(&name)
-                        && !self.module.arrays_nd.contains_key(&name)
-                        && !self.module.dynamic_arrays.contains(&name)
+                    if !self.module.arrays.contains_key(&*name)
+                        && !self.module.arrays_2d.contains_key(&*name)
+                        && !self.module.arrays_nd.contains_key(&*name)
+                        && !self.module.dynamic_arrays.contains(&*name)
                         && !self.is_associative_array(&name)
                     {
                         let hint = self.name_resolve_hint.borrow().clone();
@@ -62841,7 +64587,7 @@ impl Simulator {
                                 || self.module.dynamic_arrays.contains(&scoped)
                                 || self.is_associative_array(&scoped)
                             {
-                                name = scoped;
+                                name = std::borrow::Cow::Owned(scoped);
                             }
                         }
                     }
@@ -62853,10 +64599,10 @@ impl Simulator {
                     // UNIQUE suffix match: accept `<scope>.m` only when exactly
                     // one registered array ends that way, so this can never pick
                     // between same-named arrays in sibling instances.
-                    if !self.module.arrays.contains_key(&name)
-                        && !self.module.arrays_2d.contains_key(&name)
-                        && !self.module.arrays_nd.contains_key(&name)
-                        && !self.module.dynamic_arrays.contains(&name)
+                    if !self.module.arrays.contains_key(&*name)
+                        && !self.module.arrays_2d.contains_key(&*name)
+                        && !self.module.arrays_nd.contains_key(&*name)
+                        && !self.module.dynamic_arrays.contains(&*name)
                         && !self.is_associative_array(&name)
                         && !name.contains('.')
                     {
@@ -62879,7 +64625,7 @@ impl Simulator {
                             }
                         }
                         if let (Some(k), false) = (hit, many) {
-                            name = k;
+                            name = std::borrow::Cow::Owned(k);
                         }
                     }
                     // The array's instance prefix ("u_s" from "u_s.mem") —
@@ -62896,7 +64642,7 @@ impl Simulator {
                     // fallbacks below sized a 2-D fixed array wrong (one
                     // iteration).
                     if vars.len() == 1
-                        && !self.module.dynamic_arrays.contains(&name)
+                        && !self.module.dynamic_arrays.contains(&*name)
                         && !self.is_associative_array(&name)
                     {
                         if let Some(dims) = self.foreach_dims(&name) {
@@ -62912,11 +64658,34 @@ impl Simulator {
                         }
                     }
                     if vars.len() >= 2 {
-                        if let Some(mut dims) = self.foreach_dims(&name) {
+                        // §12.7.3: the loop variables map onto the array's
+                        // dimensions left to right, unpacked first, then
+                        // packed. A PURELY packed array (`u7_t [4:0][1:0] a`,
+                        // `bit [6:0][4:0][1:0] b`) has no unpacked shape, so
+                        // `foreach_dims` is None; that used to fall through to
+                        // the single-dimension path and iterate one packed
+                        // dimension with every other variable x. Start from an
+                        // empty shape and let the packed dimensions supply
+                        // every variable.
+                        let purely_packed = prop_packed_dims.is_some()
+                            || (self.foreach_dims(&name).is_none()
+                                && !self.module.dynamic_arrays.contains(&*name)
+                                && !self.is_associative_array(&name)
+                                && self
+                                    .module
+                                    .packed_full_dims
+                                    .get(&*name)
+                                    .is_some_and(|d| d.len() >= vars.len()));
+                        let start_dims = if purely_packed {
+                            Some(Vec::new())
+                        } else {
+                            self.foreach_dims(&name)
+                        };
+                        if let Some(mut dims) = start_dims {
                             // A dynamic outer dimension (`T a[][16]`) is backed
                             // by a fixed 64-slot buffer; iterate only the
                             // CURRENT size, like the 1-var dynamic path below.
-                            if self.module.dynamic_arrays.contains(&name) {
+                            if self.module.dynamic_arrays.contains(&*name) {
                                 let sz = self.get_queue_size(&name) as i64;
                                 dims[0] = (0, sz - 1);
                             }
@@ -62934,7 +64703,10 @@ impl Simulator {
                             // record (e.g. a bare `reg [W-1:0]` element).
                             let mut descs: Vec<bool> = vec![false; dims.len()];
                             if dims.len() < vars.len() {
-                                if let Some(pdims) = self.module.packed_full_dims.get(&name) {
+                                if let Some(pdims) = prop_packed_dims
+                                    .as_ref()
+                                    .or_else(|| self.module.packed_full_dims.get(&*name))
+                                {
                                     for &(l, r) in pdims.iter() {
                                         if dims.len() >= vars.len() {
                                             break;
@@ -62948,13 +64720,13 @@ impl Simulator {
                                     let ew = self
                                         .module
                                         .arrays
-                                        .get(&name)
+                                        .get(&*name)
                                         .map(|&(_, _, w)| w)
                                         .or_else(|| {
-                                            self.module.arrays_2d.get(&name).map(|&(_, _, w)| w)
+                                            self.module.arrays_2d.get(&*name).map(|&(_, _, w)| w)
                                         })
                                         .or_else(|| {
-                                            self.module.arrays_nd.get(&name).map(|(_, w)| *w)
+                                            self.module.arrays_nd.get(&*name).map(|(_, w)| *w)
                                         });
                                     if let Some(w) = ew.filter(|&w| w > 1) {
                                         dims.push((0, w as i64 - 1));
@@ -62962,7 +64734,7 @@ impl Simulator {
                                         // lone packed dim is `[w-1:0]` unless
                                         // the ascending map says otherwise.
                                         descs.push(
-                                            !self.module.ascending_packed.contains_key(&name),
+                                            !self.module.ascending_packed.contains_key(&*name),
                                         );
                                     }
                                 }
@@ -63009,7 +64781,7 @@ impl Simulator {
                                 let is_str = self
                                     .module
                                     .associative_arrays
-                                    .get(&name)
+                                    .get(&*name)
                                     .copied()
                                     .unwrap_or(false);
                                 'akeys: for key in &akeys {
@@ -63056,7 +64828,7 @@ impl Simulator {
                     }
                     if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                         self.widths.insert(var.name.clone(), 32);
-                        if self.string_signals.contains(&name)
+                        if self.string_signals.contains(&*name)
                             // A QUEUE/dyn array OF STRINGS is in
                             // `string_signals` too (so its elements render as
                             // strings) — but foreach over it walks ELEMENTS,
@@ -63064,11 +64836,11 @@ impl Simulator {
                             // `string pp[$]` in a class method iterated zero
                             // times (UVM get_full_hdl_path's parent_paths
                             // loop — every backdoor access lost its path).
-                            && !self.module.dynamic_arrays.contains(&name)
+                            && !self.module.dynamic_arrays.contains(&*name)
                             && !self.is_associative_array(&name)
-                            && !self.module.arrays.contains_key(&name)
-                            && !self.module.arrays_2d.contains_key(&name)
-                            && !self.module.arrays_nd.contains_key(&name)
+                            && !self.module.arrays.contains_key(&*name)
+                            && !self.module.arrays_2d.contains_key(&*name)
+                            && !self.module.arrays_nd.contains_key(&*name)
                         {
                             // foreach over a STRING iterates its characters
                             // [0..len) by CONTENT length, and must be checked
@@ -63134,7 +64906,7 @@ impl Simulator {
                             let is_str = self
                                 .module
                                 .associative_arrays
-                                .get(&name)
+                                .get(&*name)
                                 .copied()
                                 .unwrap_or(false)
                                 || self.is_string_keyed_array(&name);
@@ -63173,7 +64945,7 @@ impl Simulator {
                                 }
                                 self.continue_flag = false;
                             }
-                        } else if self.module.dynamic_arrays.contains(&name)
+                        } else if self.module.dynamic_arrays.contains(&*name)
                             || self.is_per_spec_dynamic_static(&name)
                         {
                             // Queue / dynamic array: iterate 0..current size.
@@ -63197,9 +64969,9 @@ impl Simulator {
                                 }
                                 self.continue_flag = false;
                             }
-                        } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
+                        } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&*name) {
                             // Fixed unpacked array: iterate its declared index range.
-                            let descending = self.module.descending_arrays.contains(&name);
+                            let descending = self.module.descending_arrays.contains(&*name);
                             let mut idx = lo;
                             while idx <= hi {
                                 if self.finished {
@@ -63222,7 +64994,7 @@ impl Simulator {
                                 self.continue_flag = false;
                                 idx += 1;
                             }
-                        } else if self.string_signals.contains(&name) {
+                        } else if self.string_signals.contains(&*name) {
                             // foreach over a string iterates its characters
                             // [0..len). Use the CONTENT length: a string is held
                             // in a fixed-width container (e.g. 1024 bits), so
@@ -63248,7 +65020,7 @@ impl Simulator {
                         } else if let Some(&(l, r)) = self
                             .module
                             .packed_full_dims
-                            .get(&name)
+                            .get(&*name)
                             .filter(|d| d.len() >= 2)
                             .and_then(|d| d.first())
                         {
@@ -63306,9 +65078,9 @@ impl Simulator {
                 if !self.return_flag { self.break_flag = false; }
             }
             StatementKind::While { condition, body } => {
-                let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                static LOOP_LIMIT_ENV: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+                let loop_limit: u64 = (*LOOP_LIMIT_ENV
+                    .get_or_init(|| std::env::var("XEZIM_LOOP_LIMIT").ok().and_then(|s| s.parse().ok())))
                     .unwrap_or(10_000_000);
                 let mut i: u64 = 0;
                 loop {
@@ -63346,9 +65118,9 @@ impl Simulator {
                 }
             }
             StatementKind::DoWhile { body, condition } => {
-                let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
+                static LOOP_LIMIT_ENV: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+                let loop_limit: u64 = (*LOOP_LIMIT_ENV
+                    .get_or_init(|| std::env::var("XEZIM_LOOP_LIMIT").ok().and_then(|s| s.parse().ok())))
                     .unwrap_or(10_000_000);
                 let mut i: u64 = 0;
                 loop {
@@ -63717,10 +65489,10 @@ impl Simulator {
                         // `dynamic_arrays` (ivtest sv_darray_function).
                         let n = self
                             .dyn_name_lookup(bare)
-                            .map(str::to_string)
-                            .or_else(|| self.instance_assoc_member(bare))
+                            .map(|s| std::borrow::Cow::Owned(s.to_string()))
+                            .or_else(|| self.instance_assoc_member(bare).map(std::borrow::Cow::Owned))
                             .unwrap_or_else(|| self.resolve_hier_name(h));
-                        if self.module.dynamic_arrays.contains(&n) {
+                        if self.module.dynamic_arrays.contains(&*n) {
                             // Frame teardown wipes a subroutine-LOCAL
                             // collection before the caller's assignment
                             // consumes it (the recorded name read back size
@@ -63734,7 +65506,7 @@ impl Simulator {
                                 self.copy_whole_queue(RET_SNAP, &n);
                                 self.pending_ret_collection = Some(RET_SNAP.to_string());
                             } else {
-                                self.pending_ret_collection = Some(n);
+                                self.pending_ret_collection = Some(n.to_string());
                             }
                         }
                     }
@@ -64034,21 +65806,30 @@ impl Simulator {
                         let span_key = a.span.start;
                         if !self.sva_sites.iter().any(|s| s.span_key == span_key) {
                             let clock_signal = match &clock.kind {
-                                ExprKind::Ident(h) => self.resolve_hier_name(h),
+                                ExprKind::Ident(h) => self.resolve_hier_name(h).into_owned(),
                                 _ => String::new(),
                             };
                             // LRM §16.5.1: collect the ids of every signal
                             // referenced in the property body so their
                             // Preponed (slot-entry) values can be sampled
                             // when the assertion fires (see eval_sva_sampled).
+                            let kind: u8 = match a.kind {
+                                AssertionKind::Assert => 0,
+                                AssertionKind::Assume => 1,
+                                AssertionKind::Cover => 2,
+                            };
+                            // Named sequence / property instances INSIDE the
+                            // body (`a |=> s`) expand here, once.
+                            let body_expanded = self.sva_expand_named(body, 0);
                             let mut sampled_ids = Vec::new();
-                            self.collect_sva_signal_ids(body, &mut sampled_ids);
+                            self.collect_sva_signal_ids(&body_expanded, &mut sampled_ids);
                             sampled_ids.sort_unstable();
                             sampled_ids.dedup();
                             self.sva_sites.push(SvaClockedSite {
                                 span_key,
+                                kind,
                                 clock_signal,
-                                body: (**body).clone(),
+                                body: body_expanded,
                                 prev_clock: 2, // sentinel
                                 pending: std::collections::VecDeque::new(),
                                 s_eventually: Vec::new(),
@@ -64154,21 +65935,9 @@ impl Simulator {
                         if let Some(id) = id {
                             self.forced_signals.remove(&id);
                             // Re-evaluate continuous drivers (nets). For a
-                            // variable no comb entry writes it, so this loop
+                            // variable no comb entry writes it, so the scan
                             // finds nothing and the value is retained.
-                            let mut sources: Vec<usize> = Vec::new();
-                            for entry in self.comb_entries.iter() {
-                                if entry.cold.write_signal_ids.contains(&id) {
-                                    sources.extend(entry.cold.read_signal_ids.iter().copied());
-                                }
-                            }
-                            for src_id in sources {
-                                if src_id < self.dirty_signals.len() && !self.dirty_signals[src_id]
-                                {
-                                    self.dirty_signals[src_id] = true;
-                                    self.dirty_list.push(src_id);
-                                }
-                            }
+                            self.redrive_released_signal(id);
                         }
                     }
                     // A released signal that is a gateable flop's output (`q` in
@@ -64504,7 +66273,7 @@ impl Simulator {
                             &self.module.typedef_types,
                         ) {
                             if !fields.is_empty() {
-                                if std::env::var("XEZIM_PSDBG").is_ok() {
+                                if env_set_cached!("XEZIM_PSDBG") {
                                     eprintln!("[PSDBG] register packed local {}", d.name.name);
                                 }
                                 self.module
@@ -65857,7 +67626,7 @@ impl Simulator {
                     keys.push(seg.name.name.clone());
                 }
             }
-            keys.push(self.resolve_hier_name(h));
+            keys.push(self.resolve_hier_name(h).into_owned());
         }
         // Container element (`q[0].triggered`): the element VALUE is the key.
         if let ExprKind::Ident(h) = &e.kind {
@@ -66560,7 +68329,7 @@ impl Simulator {
                 let td = self
                     .module
                     .tasks
-                    .get(&name)
+                    .get(&*name)
                     .or_else(|| raw.as_deref().and_then(|r| self.module.tasks.get(r)))
                     .cloned();
                 if let Some(td) = td {
@@ -66621,7 +68390,7 @@ impl Simulator {
                                         ta_cloned.as_deref(),
                                     )
                                 } else if let Some(cg_def) =
-                                    self.module.covergroups.get(&tname).cloned()
+                                    self.covergroup_def_for(&tname)
                                 {
                                     self.instantiate_covergroup(&cg_def, args)
                                 } else {
@@ -66883,7 +68652,7 @@ impl Simulator {
             "$printtimescale" => {
                 // §20.11: an instance argument selects THAT instance's
                 // module timescale; no argument means the calling scope.
-                let arg_inst: Option<String> = args.first().and_then(|a| {
+                let arg_inst: Option<std::borrow::Cow<str>> = args.first().and_then(|a| {
                     if let ExprKind::Ident(h) = &a.kind {
                         Some(self.resolve_hier_name(h))
                     } else {
@@ -67406,7 +69175,7 @@ impl Simulator {
                     if let ExprKind::Ident(hier) = &a.kind {
                         let s = self.resolve_hier_name(hier);
                         if !s.is_empty() {
-                            scopes.push(s);
+                            scopes.push(s.to_string());
                         }
                     }
                 }
@@ -67997,7 +69766,7 @@ impl Simulator {
             // A bare or member reference whose declared type is `string`, or an
             // element of a string-typed queue/array.
             ExprKind::Ident(h) => {
-                self.string_signals.contains(&self.resolve_hier_name(h))
+                self.string_signals.contains(&*self.resolve_hier_name(h))
                     || self.class_member_is_string(expr)
                     || self
                         .get_expr_type_name(expr)
@@ -68006,7 +69775,7 @@ impl Simulator {
             }
             ExprKind::Index { expr: base, .. } => {
                 (if let ExprKind::Ident(h) = &base.kind {
-                    self.string_signals.contains(&self.resolve_hier_name(h))
+                    self.string_signals.contains(&*self.resolve_hier_name(h))
                 } else {
                     false
                 }) || self
@@ -68303,8 +70072,7 @@ impl Simulator {
                 let cn = self
                     .runtime_recv_class(&Expression {
                         kind: ExprKind::Ident(h.clone()),
-                        span: h.span,
-                    })
+                        span: h.span, cached_width: std::cell::Cell::new(None) })
                     .or_else(|| self.var_class_types.get(first).cloned())
                     .or_else(|| Some(first.clone()));
                     let mn = h.path.last().unwrap().name.name.clone();
@@ -68559,7 +70327,7 @@ impl Simulator {
                                 }
                                 if let ExprKind::Ident(h) = &arg.kind {
                                     let name = self.resolve_hier_name(h);
-                                    if let Some(tag) = self.active_union_tag.get(&name).cloned() {
+                                    if let Some(tag) = self.active_union_tag.get(&*name).cloned() {
                                         let v = self.eval_expr(arg);
                                         result.push_str(&format!(
                                             "'{{{}:{}}}",
@@ -68686,7 +70454,7 @@ impl Simulator {
                                         let is_str = match &fexpr.kind {
                                             ExprKind::Ident(fh) => {
                                                 let n = self.resolve_hier_name(fh);
-                                                self.string_signals.contains(&n)
+                                                self.string_signals.contains(&*n)
                                             }
                                             _ => false,
                                         };
@@ -68719,15 +70487,15 @@ impl Simulator {
                                     if matches!(kind, RangeKind::Constant) {
                                         if let ExprKind::Ident(h) = &expr.kind {
                                             let nm = self.resolve_hier_name(h);
-                                            let is_coll = self.module.arrays.contains_key(&nm)
-                                                || self.module.dynamic_arrays.contains(&nm);
+                                            let is_coll = self.module.arrays.contains_key(&*nm)
+                                                || self.module.dynamic_arrays.contains(&*nm);
                                             if is_coll {
                                                 let is_dyn =
-                                                    self.module.dynamic_arrays.contains(&nm);
+                                                    self.module.dynamic_arrays.contains(&*nm);
                                                 let (arr_lo, arr_hi) = self
                                                     .module
                                                     .arrays
-                                                    .get(&nm)
+                                                    .get(&*nm)
                                                     .map(|&(lo, hi, _)| (lo, hi))
                                                     .unwrap_or((0, 0));
                                                 // `$` in the slice resolves to the
@@ -68751,7 +70519,7 @@ impl Simulator {
                                                 // element range.
                                                 l = l.max(arr_lo);
                                                 r = r.min(upper);
-                                                let is_str = self.string_signals.contains(&nm);
+                                                let is_str = self.string_signals.contains(&*nm);
                                                 let mut parts: Vec<String> = Vec::new();
                                                 for i in l..=r {
                                                     let en = format!("{}[{}]", nm, i);
@@ -69353,6 +71121,162 @@ impl Simulator {
     /// clock fire (`assert property (...) <pass> else <fail>;`). Cloned out of
     /// the site first so the exec holds no borrow on `sva_sites`. A vacuous pass
     /// must NOT run the pass action, so callers pass `passed=false`/skip there.
+    /// §16.8: expand named sequence / property instances (no formals)
+    /// nested anywhere in an SVA body, so `a |=> s` sees `s`'s body.
+    fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
+        if depth > 16 {
+            return e.clone();
+        }
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let name = h.path[0].name.name.as_str();
+                if self.module.sequences.contains(name)
+                    && self.module.property_params.get(name).map_or(true, |p| p.is_empty())
+                {
+                    if let Some(body) = self.module.property_decls.get(name) {
+                        return self.sva_expand_named(body, depth + 1);
+                    }
+                }
+                e.clone()
+            }
+            ExprKind::Binary { op, left, right } => Expression::new(
+                ExprKind::Binary {
+                    op: op.clone(),
+                    left: Box::new(self.sva_expand_named(left, depth)),
+                    right: Box::new(self.sva_expand_named(right, depth)),
+                },
+                e.span,
+            ),
+            ExprKind::Unary { op, operand } => Expression::new(
+                ExprKind::Unary { op: op.clone(), operand: Box::new(self.sva_expand_named(operand, depth)) },
+                e.span,
+            ),
+            ExprKind::Paren(inner) => Expression::new(
+                ExprKind::Paren(Box::new(self.sva_expand_named(inner, depth))),
+                e.span,
+            ),
+            _ => e.clone(),
+        }
+    }
+
+    /// A sequence expression as cycle steps `(delay, boolean)`: `a ##1 b ##2 c`
+    /// (parsed `SeqAnd(SeqAnd(a, ##1 b), ##2 c)`) becomes
+    /// `[(0,a),(1,b),(2,c)]`; a plain boolean is one delay-0 step.
+    fn sva_flatten_steps(e: &Expression, out: &mut Vec<(u32, Expression)>) {
+        match &e.kind {
+            ExprKind::Binary { op, left, right } if matches!(op, crate::ast::expr::BinaryOp::SeqAnd) => {
+                Self::sva_flatten_steps(left, out);
+                Self::sva_flatten_steps(right, out);
+            }
+            ExprKind::Binary { op, left, right } if matches!(op, crate::ast::expr::BinaryOp::HashHash) => {
+                let n: u32 = match &left.kind {
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { value, .. }) => {
+                        value.replace('_', "").parse().unwrap_or(1)
+                    }
+                    _ => 1,
+                };
+                let start = out.len();
+                Self::sva_flatten_steps(right, out);
+                if let Some(first) = out.get_mut(start) {
+                    first.0 += n;
+                }
+            }
+            ExprKind::Paren(inner) => Self::sva_flatten_steps(inner, out),
+            _ => out.push((0, e.clone())),
+        }
+    }
+
+    /// Rebuild `steps` (first delay already stripped) as one expression the
+    /// pending queue can carry, shaped so `sva_flatten_steps` recovers
+    /// exactly these steps when it comes due.
+    fn sva_rebuild_steps(steps: &[(u32, Expression)]) -> Expression {
+        let mk_num = |d: u32, span: crate::ast::Span| {
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: d.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                span,
+            )
+        };
+        let mut acc: Option<Expression> = None;
+        for (i, (d, t)) in steps.iter().enumerate() {
+            let span = t.span;
+            let term = if i == 0 || *d == 0 {
+                t.clone()
+            } else {
+                Expression::new(
+                    ExprKind::Binary {
+                        op: crate::ast::expr::BinaryOp::HashHash,
+                        left: Box::new(mk_num(*d, span)),
+                        right: Box::new(t.clone()),
+                    },
+                    span,
+                )
+            };
+            acc = Some(match acc {
+                None => term,
+                Some(prev) => Expression::new(
+                    ExprKind::Binary {
+                        op: crate::ast::expr::BinaryOp::SeqAnd,
+                        left: Box::new(prev),
+                        right: Box::new(term),
+                    },
+                    span,
+                ),
+            });
+        }
+        acc.unwrap_or_else(|| mk_num(1, crate::ast::Span::dummy()))
+    }
+
+    /// Run a sequence from its first step at the CURRENT clock tick: every
+    /// leading delay-0 step is sampled now; the first failure ends the
+    /// attempt (`Some(false)`); an exhausted list is a match (`Some(true)`);
+    /// a remaining delayed step is queued for that many ticks (`None`).
+    fn sva_run_steps(
+        &mut self,
+        site_idx: usize,
+        sampled_ids: &[usize],
+        mut steps: Vec<(u32, Expression)>,
+    ) -> Option<bool> {
+        let mut idx = 0;
+        while idx < steps.len() && steps[idx].0 == 0 {
+            if !self.eval_sva_sampled(sampled_ids, &steps[idx].1) {
+                return Some(false);
+            }
+            idx += 1;
+        }
+        if idx >= steps.len() {
+            return Some(true);
+        }
+        let mut rest: Vec<(u32, Expression)> = steps.drain(idx..).collect();
+        let delay = rest[0].0;
+        rest[0].0 = 0;
+        let expr = Self::sva_rebuild_steps(&rest);
+        self.sva_sites[site_idx].pending.push_back((delay, expr));
+        None
+    }
+
+    /// Tally one finished attempt on a site: cover sites count matches only.
+    fn sva_tally(&mut self, site_idx: usize, span_key: usize, outcome: bool) {
+        let kind = self.sva_sites[site_idx].kind;
+        let stat = self
+            .assertion_stats
+            .entry(span_key)
+            .or_insert_with(|| AssertionStat { kind, pass_count: 0, fail_count: 0 });
+        stat.kind = kind;
+        if outcome {
+            stat.pass_count += 1;
+            self.fire_sva_action(site_idx, true);
+        } else if kind != 2 {
+            stat.fail_count += 1;
+            self.fire_sva_action(site_idx, false);
+        }
+    }
+
     fn fire_sva_action(&mut self, site_idx: usize, passed: bool) {
         let act = self.sva_sites.get(site_idx).and_then(|s| {
             if passed {
@@ -69590,6 +71514,8 @@ impl Simulator {
             // Otherwise the watcher persists. At end-of-sim, any
             // remaining watcher counts as FAIL (handled later).
             let span_key_for_evt = self.sva_sites[i].span_key;
+            // §16.5: tally under the kind the source wrote (assert/assume/cover).
+            let site_kind = self.sva_sites[i].kind;
             let watchers: Vec<Expression> = std::mem::take(&mut self.sva_sites[i].s_eventually);
             for w in watchers {
                 let outcome = self.eval_sva_sampled(&sampled_ids, &w);
@@ -69598,7 +71524,7 @@ impl Simulator {
                         .assertion_stats
                         .entry(span_key_for_evt)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
@@ -69622,31 +71548,24 @@ impl Simulator {
                         .assertion_stats
                         .entry(span_key_for_evt)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
-                    stat.fail_count += 1;
+                    if site_kind != 2 {
+                        // §16.12: a cover has hits, not verdicts.
+                        stat.fail_count += 1;
+                    }
                     self.fire_sva_action(i, false);
                 }
             }
             let span_key = self.sva_sites[i].span_key;
             for e in due {
-                let v = self.eval_sva_sampled(&sampled_ids, &e);
-                let stat = self
-                    .assertion_stats
-                    .entry(span_key)
-                    .or_insert_with(|| AssertionStat {
-                        kind: 0, /* assert */
-                        pass_count: 0,
-                        fail_count: 0,
-                    });
-                if v {
-                    stat.pass_count += 1;
-                } else {
-                    stat.fail_count += 1;
+                let mut steps = Vec::new();
+                Self::sva_flatten_steps(&e, &mut steps);
+                if let Some(v) = self.sva_run_steps(i, &sampled_ids, steps) {
+                    self.sva_tally(i, span_key, v);
                 }
-                self.fire_sva_action(i, v);
             }
             // 2) Process the property body for this clock fire.
             let body = self.sva_sites[i].body.clone();
@@ -69697,7 +71616,7 @@ impl Simulator {
             {
                 if let Some(arg) = args.first() {
                     if let ExprKind::Ident(h) = &arg.kind {
-                        out.push(self.resolve_hier_name(h));
+                        out.push(self.resolve_hier_name(h).into_owned());
                     }
                 }
                 for a in args {
@@ -69751,6 +71670,9 @@ impl Simulator {
         body: &Expression,
         sampled_ids: &[usize],
     ) {
+        // §16.5: tally under the kind the source wrote; a cover has hits,
+        // not verdicts, so it is never filed as an assert here either.
+        let site_kind = self.sva_sites[site_idx].kind;
         // LRM §16.6 `disable iff (g)` wrapper. The parser encodes the
         // clause as `Binary{LogAnd, !g, inner_body}`. When `g` is true
         // (so `!g` is false), the property is suppressed for this
@@ -69801,23 +71723,15 @@ impl Simulator {
                     // `lhs |=> ##N inner` — defer the inner check by
                     // 1+N cycles (the |=> 1-cycle defer plus the
                     // ##N delay).
-                    if let ExprKind::Binary {
-                        op: rop,
-                        left: rl,
-                        right: rr,
-                    } = &right.kind
-                    {
-                        if matches!(rop, crate::ast::expr::BinaryOp::HashHash) {
-                            let n = self.eval_expr(rl).to_u64().unwrap_or(0) as u32;
-                            self.sva_sites[site_idx]
-                                .pending
-                                .push_back((1 + n, (**rr).clone()));
-                            return;
-                        }
+                    // `|=>`: the consequent sequence starts NEXT tick.
+                    let mut steps = Vec::new();
+                    Self::sva_flatten_steps(right, &mut steps);
+                    if let Some(first) = steps.first_mut() {
+                        first.0 += 1;
                     }
-                    self.sva_sites[site_idx]
-                        .pending
-                        .push_back((1, (**right).clone()));
+                    if let Some(v) = self.sva_run_steps(site_idx, sampled_ids, steps) {
+                        self.sva_tally(site_idx, span_key, v);
+                    }
                 }
             }
             // `lhs |-> rhs` — overlapping implication. If `lhs` true,
@@ -69834,63 +71748,29 @@ impl Simulator {
                         self.assertion_stats
                         .entry(span_key)
                         .or_insert_with(|| AssertionStat {
-                            kind: 0,
+                            kind: site_kind,
                             pass_count: 0,
                             fail_count: 0,
                         });
                     stat.pass_count += 1; // vacuous
                     return;
                 }
-                // `lhs |-> ##N body` → defer body N cycles.
-                if let ExprKind::Binary {
-                    op: rop,
-                    left: rl,
-                    right: rr,
-                } = &right.kind
-                {
-                    if matches!(rop, crate::ast::expr::BinaryOp::HashHash) {
-                        let n = self.eval_expr(rl).to_u64().unwrap_or(0) as u32;
-                        let cycles = n.max(1);
-                        self.sva_sites[site_idx]
-                            .pending
-                            .push_back((cycles, (**rr).clone()));
-                        return;
-                    }
+                // `lhs |-> seq` (overlap): the consequent sequence starts
+                // THIS tick — leading delay-0 terms sample now, the rest is
+                // queued as cycle steps.
+                let mut steps = Vec::new();
+                Self::sva_flatten_steps(right, &mut steps);
+                if let Some(v) = self.sva_run_steps(site_idx, sampled_ids, steps) {
+                    self.sva_tally(site_idx, span_key, v);
                 }
-                // `lhs |-> rhs` (overlap): check rhs now.
-                let outcome = self.eval_sva_sampled(sampled_ids, right);
-                let stat = self
-                    .assertion_stats
-                    .entry(span_key)
-                    .or_insert_with(|| AssertionStat {
-                        kind: 0,
-                        pass_count: 0,
-                        fail_count: 0,
-                    });
-                if outcome {
-                    stat.pass_count += 1;
-                } else {
-                    stat.fail_count += 1;
-                }
-                self.fire_sva_action(site_idx, outcome);
             }
-            // Plain boolean body: tally directly each clock.
+            // Plain boolean / sequence body: evaluate each clock.
             _ => {
-                let outcome = self.eval_sva_sampled(sampled_ids, body);
-                let stat = self
-                    .assertion_stats
-                    .entry(span_key)
-                    .or_insert_with(|| AssertionStat {
-                        kind: 0,
-                        pass_count: 0,
-                        fail_count: 0,
-                    });
-                if outcome {
-                    stat.pass_count += 1;
-                } else {
-                    stat.fail_count += 1;
+                let mut steps = Vec::new();
+                Self::sva_flatten_steps(body, &mut steps);
+                if let Some(v) = self.sva_run_steps(site_idx, sampled_ids, steps) {
+                    self.sva_tally(site_idx, span_key, v);
                 }
-                self.fire_sva_action(site_idx, outcome);
             }
         }
     }
@@ -69906,24 +71786,47 @@ impl Simulator {
         if self.clocking_meta.is_empty() {
             return;
         }
-        let cb_names: Vec<String> = self.clocking_meta.keys().cloned().collect();
-        for cb in cb_names {
-            let (clk, sigs) = self.clocking_meta.get(&cb).cloned().unwrap();
-            let cur = self
-                .get_signal_value_by_name(&clk)
-                .and_then(|v| v.to_u64())
-                .map(|u| (u & 1) as u8)
-                .unwrap_or(2);
-            let prev = *self.clocking_prev_clock.get(&cb).unwrap_or(&2);
-            self.clocking_prev_clock.insert(cb.clone(), cur);
+        // This runs after EVERY tick. The poll table resolves each block's
+        // clock to a signal-table id once and keeps the previous level, so a
+        // quiet tick costs one indexed read per block instead of cloning the
+        // block's signal list and resolving its clock by name. Rebuilt when a
+        // block is registered (the map only ever grows); iteration order is
+        // the map's, exactly as before.
+        if self.clocking_tick_cache.len() != self.clocking_meta.len() {
+            let names: Vec<String> = self.clocking_meta.keys().cloned().collect();
+            self.clocking_tick_cache = names
+                .into_iter()
+                .map(|cb| {
+                    let clk = self.clocking_meta[&cb].0.clone();
+                    let id = self.signal_name_to_id.get(clk.as_str()).copied();
+                    let edge = self
+                        .clocking_edge
+                        .get(&cb)
+                        .copied()
+                        .unwrap_or(EdgeKind::Posedge);
+                    let prev = self.clocking_prev_clock.get(&cb).copied().unwrap_or(2);
+                    ClockingTick { cb, clk, id, edge, prev }
+                })
+                .collect();
+        }
+        let mut cache = std::mem::take(&mut self.clocking_tick_cache);
+        for ent in cache.iter_mut() {
+            let cur = match ent.id {
+                Some(id) => self.signal_table[id]
+                    .to_u64()
+                    .map(|u| (u & 1) as u8)
+                    .unwrap_or(2),
+                None => self
+                    .get_signal_value_by_name(&ent.clk)
+                    .and_then(|v| v.to_u64())
+                    .map(|u| (u & 1) as u8)
+                    .unwrap_or(2),
+            };
+            let prev = ent.prev;
+            ent.prev = cur;
             // §14.3: advance on the block's declared clock edge (posedge by
             // default; negedge / any-edge when so declared).
-            let edge = self
-                .clocking_edge
-                .get(&cb)
-                .copied()
-                .unwrap_or(EdgeKind::Posedge);
-            let fired = match edge {
+            let fired = match ent.edge {
                 EdgeKind::Negedge => prev == 1 && cur == 0,
                 EdgeKind::Posedge => prev == 0 && cur == 1,
                 // `edge` / any: any resolved 0↔1 transition.
@@ -69932,6 +71835,12 @@ impl Simulator {
             if !fired {
                 continue;
             }
+            let cb = ent.cb.clone();
+            let sigs: Vec<(String, bool)> = self
+                .clocking_meta
+                .get(&cb)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
             // §14.16.1: record the edge time — a drive executed AT this time
             // matures at edge + output skew instead of waiting a full cycle.
             self.clocking_last_edge.insert(cb.clone(), self.time);
@@ -70071,6 +71980,7 @@ impl Simulator {
             }
             self.clocking_snapshots.insert(cb.clone(), snap);
         }
+        self.clocking_tick_cache = cache;
     }
 
     /// Resume the clocking-event waiters (`@(cb)` / `##N`) that fired this slot,
@@ -70080,12 +71990,14 @@ impl Simulator {
     /// samples (§14.13). Mirrors the Active-region waiter run loop.
     fn drain_deferred_clocking_conts(&mut self) {
         let mut guard = 0u32;
+        let mut ran_any = false;
         while !self.deferred_clocking_conts.is_empty() {
             let conts = std::mem::take(&mut self.deferred_clocking_conts);
             for (pid, stmts) in conts {
                 if self.finished {
                     break;
                 }
+                ran_any = true;
                 self.run_scheduled_process(pid, &stmts);
                 if !self.is_pid_suspended(pid) {
                     self.child_finished(pid);
@@ -70098,6 +72010,21 @@ impl Simulator {
             if self.finished || guard > 10_000 {
                 break;
             }
+        }
+        // These continuations run after the tick's edge pass. A named event
+        // or signal they write (`##2; -> ev;`) had no pass left to wake its
+        // `@(ev)` / `@(sig)` waiters, which then resumed one tick late
+        // (a clocking-synchronised trigger was seen a clock toggle after
+        // it fired). Give their writes the same edge pass the clocking
+        // mirror gets above.
+        if ran_any && !self.finished {
+            self.settle_combinatorial();
+            let saved = self.edge_dispatch_phase;
+            self.edge_dispatch_phase = "clocking-conts";
+            self.check_edges();
+            self.edge_dispatch_phase = saved;
+            let limit = self.cascade_limit;
+            let _ = self.drain_edge_cascade(limit);
         }
     }
 
@@ -70152,6 +72079,44 @@ impl Simulator {
     /// The instance scope currently executing — the same precedence `%m` uses:
     /// a sensitivity-driven block records `m_block_scope`, a procedural process
     /// records `current_scope`.
+    /// Strip the top module's name from a `%m`-form scope (`tb.u_w` ->
+    /// `u_w`; `tb` -> ``), giving the instance path signal keys use.
+    fn instance_relative_scope(&self, scope: &str) -> String {
+        let top = self.module.name.as_str();
+        if scope == top {
+            return String::new();
+        }
+        match scope.strip_prefix(top) {
+            Some(rest) if rest.starts_with('.') => rest[1..].to_string(),
+            _ => scope.to_string(),
+        }
+    }
+
+    /// The module a class (or an ancestor of it) is declared inside, if any.
+    fn class_enclosing_module(&self, handle: usize) -> Option<String> {
+        let mut cur: Option<String> = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        let mut hops = 0;
+        while let Some(cn) = cur {
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(m) = &cd.declaring_module {
+                return Some(m.clone());
+            }
+            if let Some(enc) = &cd.enclosing {
+                return Some(enc.clone());
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
     fn active_instance_scope(&self) -> String {
         if !self.m_block_scope.is_empty() {
             self.m_block_scope.clone()
@@ -70225,10 +72190,155 @@ impl Simulator {
         }
     }
 
-    fn resolve_hier_name(&self, hier: &HierarchicalIdentifier) -> String {
+    /// The receiver of `a.b.method(...)` as an expression, built ONCE per
+    /// call site (keyed by the identifier's span) and reused: rebuilding it
+    /// per call cloned every path segment string and, worse, discarded the
+    /// identifier's resolved-name cache, so each call re-resolved from
+    /// scratch. Same context-insensitive caching the AST node itself uses.
+    fn method_receiver_expr(&mut self, hier: &HierarchicalIdentifier, keep: usize) -> std::rc::Rc<Expression> {
+        // The cached receiver node carries its own resolution cells, which
+        // the first evaluation fills under ITS scope hint. Keyed by span
+        // alone, every instance of a module executing the same source line
+        // then read the first instance's resolution: `q.push_back(..)` in
+        // ten sibling instances pushed into one instance's queue. The
+        // scope hint is part of the key (interned, so the hot path pays one
+        // string hash and no clone).
+        let hint_id = match self.name_resolve_hint.borrow().as_deref() {
+            None => 0,
+            Some(h) => match self.method_receiver_hint_ids.get(h) {
+                Some(&id) => id,
+                None => {
+                    let id = self.method_receiver_hint_ids.len() as u32 + 1;
+                    self.method_receiver_hint_ids.insert(h.to_string(), id);
+                    id
+                }
+            },
+        };
+        // The hint alone is not enough: a loop body or a display runs with
+        // NO hint, and every instance's inlined copy of the same source line
+        // shares one span. The inliner already prefixed the head identifier
+        // per instance (`u0.q` / `u1.q`), so interning it too keeps the
+        // entry per instance — `q.size()` inside a `for` in ten siblings
+        // otherwise read the first sibling's queue.
+        let head = hier.path[0].name.name.as_str();
+        let head_id = match self.method_receiver_hint_ids.get(head) {
+            Some(&id) => id,
+            None => {
+                let id = self.method_receiver_hint_ids.len() as u32 + 1;
+                self.method_receiver_hint_ids.insert(head.to_string(), id);
+                id
+            }
+        };
+        let key = (hier.span.start as usize, hier.span.end as usize, keep, hint_id, head_id);
+        if let Some(e) = self.method_receiver_cache.get(&key) {
+            return e.clone();
+        }
+        let base = HierarchicalIdentifier {
+            root: hier.root.clone(),
+            path: hier.path[..keep].to_vec(),
+            span: hier.span,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        };
+        let e = std::rc::Rc::new(Expression::new(ExprKind::Ident(base), hier.span));
+        self.method_receiver_cache.insert(key, e.clone());
+        e
+    }
+
+    /// Resolved flat name of a hierarchical identifier, BORROWED from the
+    /// node's own cache whenever it has one (`Cow::Borrowed`), so the hot
+    /// read paths stop allocating a String per resolution. The lifetime is
+    /// the node's, not `self`'s, so callers can keep the name across `&mut
+    /// self` calls. Owned only on the frame-dependent paths (per-process
+    /// local-dyn rename, package-ambiguous free names) and the first
+    /// computation of an uncacheable shape.
+    /// `cg::type_option.<field>` — the covergroup TYPE's option table,
+    /// seeded from the body's `type_option.f = v;` items and the §19.7.1
+    /// defaults (weight 1, goal 90, strobe 0, merge_instances 0).
+    fn cg_type_option_get(&mut self, cg: &str, field: &str) -> Option<Value> {
+        if !self.module.covergroups.contains_key(cg) {
+            return None;
+        }
+        if !self.cg_type_options.contains_key(cg) {
+            let mut t: HashMap<String, Value> = HashMap::default();
+            t.insert("weight".into(), Value::from_u64(1, 32));
+            t.insert("goal".into(), Value::from_u64(90, 32));
+            t.insert("strobe".into(), Value::from_u64(0, 1));
+            t.insert("merge_instances".into(), Value::from_u64(0, 1));
+            t.insert("comment".into(), Value::from_string(""));
+            let seeds: Vec<(String, Expression)> = self
+                .module
+                .covergroups
+                .get(cg)
+                .map(|d| {
+                    d.items
+                        .iter()
+                        .filter_map(|it| match it {
+                            CovergroupItem::TypeOption { name, val } => Some((name.clone(), val.clone())),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (n, e) in seeds {
+                let v = self.eval_expr(&e);
+                t.insert(n, v);
+            }
+            self.cg_type_options.insert(cg.to_string(), t);
+        }
+        self.cg_type_options.get(cg).and_then(|t| t.get(field)).cloned()
+    }
+
+    /// The `[cg, type_option, field]` shape of a scoped type-option access.
+    fn cg_type_option_path(&self, hier: &HierarchicalIdentifier) -> Option<(String, String)> {
+        if hier.path.len() == 3
+            && hier.path.iter().all(|s| s.selects.is_empty())
+            && hier.path[1].name.name == "type_option"
+            && self.module.covergroups.contains_key(&hier.path[0].name.name)
+        {
+            Some((hier.path[0].name.name.clone(), hier.path[2].name.name.clone()))
+        } else {
+            None
+        }
+    }
+
+    fn resolve_hier_name<'h>(&self, hier: &'h HierarchicalIdentifier) -> std::borrow::Cow<'h, str> {
         if self.name_stats_on {
             self.name_stats[1].set(self.name_stats[1].get() + 1);
         }
+        if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+            if let Some(uq) = self.dyn_name_lookup(&hier.path[0].name.name) {
+                return std::borrow::Cow::Owned(uq.to_string());
+            }
+        }
+        if !self.pkg_ambiguous_names.is_empty() && hier.path.len() == 1 {
+            let leaf = hier.path[0].name.name.as_str();
+            if self.pkg_ambiguous_names.contains(leaf)
+                && !self
+                    .local_stack
+                    .last()
+                    .is_some_and(|l| l.contains_key(leaf))
+            {
+                if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
+                    let qual = format!("{}::{}", pkg, leaf);
+                    if self.signal_name_to_id.contains_key(qual.as_str()) {
+                        return std::borrow::Cow::Owned(qual);
+                    }
+                }
+            }
+        }
+        if let Some(cached) = hier.cached_resolved_name.get() {
+            return std::borrow::Cow::Borrowed(cached.as_str());
+        }
+        let owned = self.resolve_hier_name_slow(hier);
+        // The slow path memoizes every cacheable shape: borrow that copy.
+        if let Some(cached) = hier.cached_resolved_name.get() {
+            return std::borrow::Cow::Borrowed(cached.as_str());
+        }
+        std::borrow::Cow::Owned(owned)
+    }
+
+    fn resolve_hier_name_slow(&self, hier: &HierarchicalIdentifier) -> String {
         // Per-process local dynamic arrays: resolve the bare name through the
         // current process's per-frame rename map and BYPASS the AST-node cache.
         // The cache is shared across concurrent processes (they share AST
@@ -70553,6 +72663,29 @@ impl Simulator {
                 let scoped = format!("{}.{}", hint, raw);
                 if self.signal_name_to_id.contains_key(scoped.as_str()) {
                     return scoped;
+                }
+            }
+        } else if !self.signal_name_to_id.contains_key(raw.as_str()) {
+            // A DOTTED reference from a hinted scope (`core.seq` inside a
+            // class method of an object built in `u_w`, or inside a
+            // nested block of `u_w`) names a sibling instance's member:
+            // try it under the hint and each parent scope (§23.6 upward
+            // resolution). Only when the raw name is not itself a signal,
+            // so an absolute path keeps winning.
+            let hint = self.name_resolve_hint.borrow().clone();
+            if let Some(hint) = hint.as_deref() {
+                let mut scope = hint;
+                loop {
+                    let scoped = format!("{}.{}", scope, raw);
+                    if self.signal_name_to_id.contains_key(scoped.as_str()) {
+                        let parent = parent_of(&scoped).to_string();
+                        *self.name_resolve_hint.borrow_mut() = Some(parent);
+                        return scoped;
+                    }
+                    match scope.rsplit_once('.') {
+                        Some((p, _)) => scope = p,
+                        None => break,
+                    }
                 }
             }
         }
@@ -70920,7 +73053,7 @@ impl Simulator {
         }
         // First access: resolve name and cache ID
         let name = self.resolve_hier_name(hier);
-        if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+        if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
             hier.cached_signal_id.set(Some(id));
             let mut v = self.signal_table[id].clone();
             if self.signal_signed[id] {
@@ -70934,10 +73067,10 @@ impl Simulator {
         // Fallback
         let mut v = self
             .signals
-            .get(&name)
+            .get(&*name)
             .cloned()
             .unwrap_or_else(|| Value::new(1));
-        if self.signed_signals.contains(&name) {
+        if self.signed_signals.contains(&*name) {
             v.is_signed = true;
         }
         v
@@ -73560,10 +75693,10 @@ impl Simulator {
                 {
                     let mut head = hier.clone();
                     head.path.pop();
-                    names.push(self.resolve_hier_name(&head));
+                    names.push(self.resolve_hier_name(&head).into_owned());
                     return;
                 }
-                names.push(self.resolve_hier_name(hier));
+                names.push(self.resolve_hier_name(hier).into_owned());
             }
             // Virtual-interface member access (`vif.signal`) and other dotted
             // refs to interface signals. Flatten the chain into a dotted name
@@ -73576,13 +75709,13 @@ impl Simulator {
                 if member.name == "triggered" {
                     if let ExprKind::Ident(h) = &base.kind {
                         let ev = self.resolve_hier_name(h);
-                        if self.module.events.contains(&ev)
+                        if self.module.events.contains(&*ev)
                             || self
                                 .module
                                 .events
                                 .contains(ev.rsplit('.').next().unwrap_or(&ev))
                         {
-                            names.push(ev);
+                            names.push(ev.to_string());
                             return;
                         }
                     }
@@ -73652,6 +75785,16 @@ impl Simulator {
     fn lrm_self_width(&mut self, expr: &Expression) -> Option<u32> {
         match &expr.kind {
             ExprKind::Paren(i) => self.lrm_self_width(i),
+            ExprKind::SystemCall { name, args }
+                if super::bytecode::system_function_carries_arg(name) && !args.is_empty() =>
+            {
+                self.lrm_self_width(&args[0])
+            }
+            ExprKind::SystemCall { name, .. }
+                if super::bytecode::system_function_result(name).is_some() =>
+            {
+                super::bytecode::system_function_result(name).map(|(w, _)| w)
+            }
             ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
             ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
@@ -73723,12 +75866,81 @@ impl Simulator {
         }
     }
 
+    /// Self-determined width of `expr`. Cached on the node when the answer
+    /// is a static property of it (signal and packed-layout widths, literals,
+    /// declared system-function results, and compositions of those); a width
+    /// that depends on runtime state — a local's current value, a user
+    /// function's return type, or the evaluate-and-measure fallback — is
+    /// recomputed every time. The binary arm of the evaluator asks for both
+    /// operand widths on every arithmetic evaluation, each a full tree walk
+    /// (7 % of an axi4 run before the cache).
     fn infer_width(&mut self, expr: &Expression) -> u32 {
+        if let Some(w) = expr.cached_width.get() {
+            return w;
+        }
+        let (w, is_static) = self.infer_width_walk(expr);
+        if is_static {
+            expr.cached_width.set(Some(w));
+        }
+        w
+    }
+
+    /// `infer_width` for an operand that is about to be EVALUATED anyway.
+    /// Shapes the walk can only size by evaluating (a property read, an
+    /// element select, a method whose return type it cannot resolve) are
+    /// evaluated here ONCE and the value handed back, so the caller does not
+    /// evaluate them a second time. The binary arm probed both operands of
+    /// every `+`/`&`/... and then evaluated them again: every `obj.prop + 1`
+    /// read the property twice, and a method in an arithmetic expression ran
+    /// twice (6 % of an axi4 run). Static shapes go through the cached walk
+    /// and return no value.
+    fn width_probe(&mut self, expr: &Expression) -> (u32, Option<Value>) {
+        if let Some(w) = expr.cached_width.get() {
+            return (w, None);
+        }
+        let evaluates = match &expr.kind {
+            ExprKind::Ident(_)
+            | ExprKind::Number(NumberLiteral::Integer { .. })
+            | ExprKind::Concatenation(_)
+            | ExprKind::Paren(_)
+            | ExprKind::AssignExpr { .. }
+            | ExprKind::Binary { .. }
+            | ExprKind::Unary { .. }
+            | ExprKind::Conditional { .. } => false,
+            ExprKind::SystemCall { name, args } => {
+                !(vpi_systf_is_func(name)
+                    || (super::bytecode::system_function_carries_arg(name) && !args.is_empty())
+                    || super::bytecode::system_function_result(name).is_some())
+            }
+            ExprKind::Call { func, .. } => {
+                if let Some(w) = self.call_return_width(func) {
+                    return (w, None);
+                }
+                true
+            }
+            // A streaming concatenation pads to the CONTEXT width on the
+            // right; a value taken here would be extended on the left.
+            ExprKind::StreamOp { .. } => false,
+            _ => true,
+        };
+        if evaluates {
+            let v = self.eval_expr(expr);
+            return (v.width, Some(v));
+        }
+        (self.infer_width(expr), None)
+    }
+
+    /// `infer_width` body; the flag says whether every branch taken was
+    /// static, i.e. safe to pin on the node.
+    fn infer_width_walk(&mut self, expr: &Expression) -> (u32, bool) {
         match &expr.kind {
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);
+                // The resolution is node-stable only once the resolver has
+                // pinned the name on the node.
+                let stable = h.cached_resolved_name.get().is_some();
                 if let Some(w) = self.lookup_signal_width(&n) {
-                    return w;
+                    return (w, stable);
                 }
                 // A method formal or local variable has no signal entry —
                 // infer from the local's current Value width. Without this,
@@ -73744,7 +75956,7 @@ impl Simulator {
                         .map(|v| v.width)
                         .filter(|w| *w > 1)
                     {
-                        return w;
+                        return (w, false);
                     }
                 }
                 // A packed struct/union member (`word3.high`) has no leaf
@@ -73755,36 +75967,67 @@ impl Simulator {
                     let (parent, field) = (&n[..dot], &n[dot + 1..]);
                     if let Some(fields) = self.module.packed_struct_fields.get(parent) {
                         if let Some((_, _, w)) = fields.iter().find(|(m, _, _)| m == field) {
-                            return *w;
+                            return (*w, stable);
                         }
                     }
                 }
-                1
+                (1, false)
             }
-            ExprKind::Number(NumberLiteral::Integer { size, .. }) => size.unwrap_or(32),
+            ExprKind::Number(NumberLiteral::Integer { size, .. }) => (size.unwrap_or(32), true),
             ExprKind::Concatenation(p) => {
                 let mut total = 0;
+                let mut st = true;
                 for x in p {
                     total += self.infer_width(x);
+                    st &= x.cached_width.get().is_some();
                 }
-                total
+                (total, st)
             }
-            ExprKind::Paren(inner) => self.infer_width(inner),
-            ExprKind::AssignExpr { lvalue, .. } => self.infer_width(lvalue),
+            ExprKind::Paren(inner) => (self.infer_width(inner), inner.cached_width.get().is_some()),
+            ExprKind::AssignExpr { lvalue, .. } => {
+                (self.infer_width(lvalue), lvalue.cached_width.get().is_some())
+            }
             ExprKind::Binary { left, right, .. } => {
-                self.infer_width(left).max(self.infer_width(right))
+                let w = self.infer_width(left).max(self.infer_width(right));
+                (w, left.cached_width.get().is_some() && right.cached_width.get().is_some())
             }
-            ExprKind::Unary { operand, .. } => self.infer_width(operand),
+            ExprKind::Unary { operand, .. } => {
+                (self.infer_width(operand), operand.cached_width.get().is_some())
+            }
             ExprKind::Conditional {
                 then_expr,
                 else_expr,
                 ..
-            } => self.infer_width(then_expr).max(self.infer_width(else_expr)),
+            } => {
+                let w = self.infer_width(then_expr).max(self.infer_width(else_expr));
+                (
+                    w,
+                    then_expr.cached_width.get().is_some()
+                        && else_expr.cached_width.get().is_some(),
+                )
+            }
             // A VPI system function has a declared return width. The fallback
             // below infers a width by EVALUATING, which for a `$systf` means
             // running its calltf — twice, once here and once for the value.
             ExprKind::SystemCall { name, .. } if vpi_systf_is_func(name) => {
-                vpi_sysfunc_ret_width(name)
+                (vpi_sysfunc_ret_width(name), true)
+            }
+            // A built-in system function's width comes from its LRM result
+            // type. Sizing it by EVALUATING (the fallback below) ran the
+            // call twice — `$urandom % n` advanced the generator twice and
+            // `$fgetc(fd) & mask` consumed two bytes.
+            ExprKind::SystemCall { name, args }
+                if super::bytecode::system_function_carries_arg(name) && !args.is_empty() =>
+            {
+                (self.infer_width(&args[0]), args[0].cached_width.get().is_some())
+            }
+            ExprKind::SystemCall { name, .. }
+                if super::bytecode::system_function_result(name).is_some() =>
+            {
+                (
+                    super::bytecode::system_function_result(name).map(|(w, _)| w).unwrap_or(32),
+                    true,
+                )
             }
             // Same for a user function: its width comes from its declared
             // return type, never from calling it. `f() + 1` used to call `f`
@@ -73792,12 +76035,12 @@ impl Simulator {
             // a side effect ran twice.
             ExprKind::Call { func, .. } => {
                 if let Some(w) = self.call_return_width(func) {
-                    w
+                    (w, false)
                 } else {
-                    self.eval_expr(expr).width
+                    (self.eval_expr(expr).width, false)
                 }
             }
-            _ => self.eval_expr(expr).width,
+            _ => (self.eval_expr(expr).width, false),
         }
     }
     /// Cheaply test whether the method name of a call callee (`recv.m(...)`
@@ -74082,14 +76325,14 @@ impl Simulator {
                     }
                 }
                 let name = self.resolve_hier_name(h);
-                if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+                if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     h.cached_signal_id.set(Some(id));
                     return self.signal_widths[id];
                 }
                 // A width of 0 is never valid for an lvalue — it usually
                 // means the flat `widths` map was polluted by a same-named
                 // class-handle elsewhere. Ignore it and fall through.
-                if let Some(w) = self.widths.get(&name).copied() {
+                if let Some(w) = self.widths.get(&*name).copied() {
                     if w > 0 {
                         return w;
                     }
@@ -74150,7 +76393,7 @@ impl Simulator {
                     if let Some(&ew) = self
                         .module
                         .packed_signal_elem_widths
-                        .get(&nm)
+                        .get(&*nm)
                         .filter(|&&w| w > 1)
                     {
                         return count * ew;
@@ -74170,19 +76413,31 @@ impl Simulator {
                     depth += 1;
                     cur = inner.as_ref();
                 }
-                if let ExprKind::Ident(h) = &cur.kind {
-                    let n = self.resolve_hier_name(h);
+                // §25.8: for `vif.member[i]` the root is a MemberAccess, not an
+                // Ident, so the whole block below was skipped and the lvalue
+                // fell through to width 1 — an NBA then resized its RHS to ONE
+                // BIT before queueing it, and `vif.data[p] <= flit` wrote the
+                // flit's LSB. Resolve the binding to the interface signal's
+                // flat name and ask the same width questions about it.
+                let root_name: Option<std::borrow::Cow<'_, str>> = match &cur.kind {
+                    ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                    ExprKind::MemberAccess { .. } => {
+                        self.vif_member_flat_name(cur).map(std::borrow::Cow::Owned)
+                    }
+                    _ => None,
+                };
+                if let Some(n) = root_name {
                     if depth == 1 {
-                        if let Some((_, _, w)) = self.module.arrays.get(&n) {
+                        if let Some((_, _, w)) = self.module.arrays.get(&*n) {
                             return *w;
                         }
                     }
                     if depth == 2 {
-                        if let Some((_, _, w)) = self.module.arrays_2d.get(&n) {
+                        if let Some((_, _, w)) = self.module.arrays_2d.get(&*n) {
                             return *w;
                         }
                     }
-                    if let Some((shape, w)) = self.module.arrays_nd.get(&n) {
+                    if let Some((shape, w)) = self.module.arrays_nd.get(&*n) {
                         if depth == shape.len() {
                             return *w;
                         }
@@ -74198,16 +76453,16 @@ impl Simulator {
                     // dim list and the lvalue fell through to width 1 — a
                     // continuous assign then resized its RHS to one bit and
                     // wrote the LSB (0x12 -> 0).
-                    let num_unpacked = if let Some((d, _)) = self.module.arrays_nd.get(&n) {
+                    let num_unpacked = if let Some((d, _)) = self.module.arrays_nd.get(&*n) {
                         d.len()
-                    } else if self.module.arrays_2d.contains_key(&n) {
+                    } else if self.module.arrays_2d.contains_key(&*n) {
                         2
-                    } else if self.module.arrays.contains_key(&n) {
+                    } else if self.module.arrays.contains_key(&*n) {
                         1
                     } else {
                         0
                     };
-                    if let Some(dims) = self.module.packed_full_dims.get(&n) {
+                    if let Some(dims) = self.module.packed_full_dims.get(&*n) {
                         let pdepth = depth.saturating_sub(num_unpacked);
                         if pdepth < dims.len() {
                             let w: u64 = dims[pdepth..]
@@ -74219,7 +76474,7 @@ impl Simulator {
                             }
                         }
                     } else if depth == 1 {
-                        if let Some(&ew) = self.module.packed_signal_elem_widths.get(&n) {
+                        if let Some(&ew) = self.module.packed_signal_elem_widths.get(&*n) {
                             if ew > 1 {
                                 return ew;
                             }
@@ -75463,7 +77718,7 @@ impl Simulator {
                 // A consumed slot may admit a parked bounded-put producer.
                 self.admit_mailbox_put_waiter(handle);
             }
-            if std::env::var("XEZIM_MBX_DBG").is_ok() {
+            if env_set_cached!("XEZIM_MBX_DBG") {
                 eprintln!(
                     "[MBX] t={} DRAIN deliver to pid={} is_peek={} handle={}",
                     self.time, pid, is_peek, handle
@@ -75480,13 +77735,13 @@ impl Simulator {
         v: Value,
         cont: ProcCont,
     ) {
-        if let Some(ctx) = self.process_contexts.get(&pid).cloned() {
-            let saved = self.snapshot_process_context();
+        if let Some(ctx) = self.process_contexts.remove(&pid) {
+            let saved = self.take_process_context();
             self.restore_process_context(ctx);
             let width = self.infer_lhs_width(lvalue);
             self.assign_value(lvalue, &v.resize(width));
-            self.process_contexts
-                .insert(pid, self.snapshot_process_context());
+            let ctx = self.take_process_context();
+            self.process_contexts.insert(pid, ctx);
             self.restore_process_context(saved);
         } else {
             let width = self.infer_lhs_width(lvalue);
@@ -77089,9 +79344,36 @@ impl Simulator {
         false
     }
 
+    /// Does `name` resolve to a signal under the active process scope
+    /// (`<hint>.<name>`, walking up parent scopes)?
+    fn scoped_signal_exists(&self, name: &str) -> bool {
+        let hint = self.name_resolve_hint.borrow();
+        let Some(mut scope) = hint.as_deref() else {
+            return false;
+        };
+        loop {
+            let scoped = format!("{}.{}", scope, name);
+            if self.signal_name_to_id.contains_key(scoped.as_str())
+                || self.signals.contains_key(&scoped)
+            {
+                return true;
+            }
+            match scope.rsplit_once('.') {
+                Some((parent, _)) => scope = parent,
+                None => return false,
+            }
+        }
+    }
+
     fn is_associative_array(&self, name: &str) -> bool {
         if self.module.associative_arrays.contains_key(name) {
             return true;
+        }
+        // Every remaining branch needs a `#` (scoped member) or a trailing
+        // `]` (nested element): one byte scan replaces up to three char
+        // searches, a second map probe and a `format!` on the hot path.
+        if !name.ends_with(']') && !name.as_bytes().contains(&b'#') {
+            return false;
         }
         // A per-specialization static-collection storage key
         // (`Class#spec::member`, e.g. `wrapper#e_t::map`) rewritten by
@@ -77116,13 +79398,14 @@ impl Simulator {
             if let Ok(handle) = name[..pos].parse::<usize>() {
                 let member = &name[pos + 1..];
                 if let Some(Some(inst)) = self.heap.get(handle) {
-                    let mut cur = Some(inst.class_name.clone());
+                    // Borrowed chain walk: no String clone per ancestor.
+                    let mut cur: Option<&str> = Some(inst.class_name.as_str());
                     while let Some(cn) = cur {
-                        if let Some(cd) = self.module.classes.get(&cn) {
+                        if let Some(cd) = self.module.classes.get(cn) {
                             if cd.assoc_properties.contains_key(member) {
                                 return true;
                             }
-                            cur = cd.extends.clone();
+                            cur = cd.extends.as_deref();
                         } else {
                             break;
                         }
@@ -77189,7 +79472,7 @@ impl Simulator {
     /// the `name->id` index), so a nested assoc element (stored as
     /// `base[k1][k2]...`) is visible.
     fn signal_name_prefix_present(&self, prefix: &str) -> bool {
-        self.signals.keys().any(|k| k.starts_with(prefix))
+        self.signals.any_key_with_prefix(prefix)
             || !self.assoc_static_keys(prefix).is_empty()
     }
 
@@ -77201,6 +79484,37 @@ impl Simulator {
     /// `typedef_targets`. Used both to default a typedef'd handle to `null` and
     /// to let `rsrc_q_t rq = new()` construct the right class (`queue`).
     fn resolve_typeref_class_name(&self, tref: &crate::ast::types::TypeName) -> Option<String> {
+        // Memoized on (name, scope, class context): the miss path below
+        // scans every class's typedef table, and the same type name is
+        // resolved on every property access / call that carries it. The
+        // class table only grows (lazy specializations), so an entry is
+        // keyed to the table size it was computed against.
+        let ctx_key: &str = match self.class_context_stack.last() {
+            Some(Some(c)) => c.as_str(),
+            _ => "",
+        };
+        let scope_key: &str = tref.scope.as_ref().map(|s| s.name.as_str()).unwrap_or("");
+        let ncls = self.module.classes.len();
+        {
+            let memo = self.typeref_class_memo.borrow();
+            if let Some(by_scope) = memo.get(tref.name.name.as_str()) {
+                if let Some((n, hit)) = by_scope.get(&(scope_key.to_string(), ctx_key.to_string())) {
+                    if *n == ncls {
+                        return hit.clone();
+                    }
+                }
+            }
+        }
+        let out = self.resolve_typeref_class_name_uncached(tref);
+        self.typeref_class_memo
+            .borrow_mut()
+            .entry(tref.name.name.clone())
+            .or_default()
+            .insert((scope_key.to_string(), ctx_key.to_string()), (ncls, out.clone()));
+        out
+    }
+
+    fn resolve_typeref_class_name_uncached(&self, tref: &crate::ast::types::TypeName) -> Option<String> {
         use crate::ast::types::DataType;
         let base_class = |s: &str| -> Option<String> {
             if self.module.classes.contains_key(s) {
@@ -77268,7 +79582,7 @@ impl Simulator {
                 if name.name.name == *nm {
                     return None; // self-reference guard
                 }
-                self.resolve_typeref_class_name(&name)
+                self.resolve_typeref_class_name_uncached(&name)
             }
             _ => None,
         }
@@ -78249,15 +80563,13 @@ impl Simulator {
         // `special-:{ chars{}[0123456789] _` are legal assoc string keys,
         // §7.11) — take up to the LAST `]` so such brackets are not mistaken
         // for an index end.
-        let idx_keys = self.signals.keys_with_elem_prefix(&prefix);
         // The `signal_name_to_id` half of this enumeration is fixed for the
         // run (see `assoc_static_keys_cache`), so scan it once per prefix
         // instead of on every call.
         let static_keys = self.assoc_static_keys(&prefix);
-        let mut keys: Vec<String> = idx_keys
-            .iter()
-            .map(|k| k.as_str())
-            .filter(|k| k.starts_with(&prefix))
+        let mut keys: Vec<String> = self
+            .signals
+            .elem_keys_with_prefix(&prefix)
             .chain(static_keys.iter().map(|k| &**k))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
@@ -78452,7 +80764,7 @@ impl Simulator {
         let base_name = match &cur.kind {
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);
-                if !self.module.packed_full_dims.contains_key(&n) && h.path.len() >= 2 {
+                if !self.module.packed_full_dims.contains_key(&*n) && h.path.len() >= 2 {
                     let dotted: String = h
                         .path
                         .iter()
@@ -78462,10 +80774,10 @@ impl Simulator {
                     if self.module.packed_full_dims.contains_key(&dotted) {
                         dotted
                     } else {
-                        n
+                        n.to_string()
                     }
                 } else {
-                    n
+                    n.into_owned()
                 }
             }
             ExprKind::MemberAccess { expr: e, member } => {
@@ -78600,23 +80912,41 @@ impl Simulator {
             // genuine composed name always wins). `tb.counter` read from a
             // class method silently returned x without this.
             if !self.signal_name_to_id.contains_key(name) && !self.signals.contains_key(name) {
-                if let Some(rest) = name.strip_prefix(&format!("{}.", self.module.name)) {
-                    if let Some(v) = self.get_signal_value_by_name(rest) {
+                // `<top>.` prefix test without building the prefix string.
+                let top = self.module.name.as_str();
+                if name.len() > top.len()
+                    && name.as_bytes()[top.len()] == b'.'
+                    && name.starts_with(top)
+                {
+                    if let Some(v) = self.get_signal_value_by_name(&name[top.len() + 1..]) {
                         return Some(v);
                     }
                 }
             }
         }
         if !name.contains('.') {
-            if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
-                let scoped = format!("{}.{}", hint, name);
-                if let Some(&id) = self.signal_name_to_id.get(scoped.as_str()) {
-                    let mut v = self.signal_table[id].clone();
-                    if self.signal_signed[id] {
-                        v.is_signed = true;
+            // Every undotted read under a scope hint probed `<hint>.<name>`
+            // through a fresh String; reuse one buffer instead.
+            let hinted: Option<usize> = {
+                let hint = self.name_resolve_hint.borrow();
+                match hint.as_deref() {
+                    Some(h) => {
+                        let mut k = self.hint_key_scratch.borrow_mut();
+                        k.clear();
+                        k.push_str(h);
+                        k.push('.');
+                        k.push_str(name);
+                        self.signal_name_to_id.get(k.as_str()).copied()
                     }
-                    return Some(v);
+                    None => None,
                 }
+            };
+            if let Some(id) = hinted {
+                let mut v = self.signal_table[id].clone();
+                if self.signal_signed[id] {
+                    v.is_signed = true;
+                }
+                return Some(v);
             }
         }
         if let Some(&id) = self.signal_name_to_id.get(name) {
@@ -78959,9 +81289,9 @@ impl Simulator {
         // guard falsely reported them equal (skipping the update).
         if let ExprKind::Ident(h) = &expr.kind {
             let name = self.resolve_hier_name(h);
-            if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
-                if !self.module.dynamic_arrays.contains(&name) && !(hi < lo) {
-                    return Some((name, lo, hi));
+            if let Some(&(lo, hi, _)) = self.module.arrays.get(&*name) {
+                if !self.module.dynamic_arrays.contains(&*name) && !(hi < lo) {
+                    return Some((name.to_string(), lo, hi));
                 }
             }
         }
@@ -79380,14 +81710,14 @@ impl Simulator {
         if let ExprKind::Ident(hier) = &array.kind {
             let mut name = self.resolve_hier_name(hier);
             if let Some(scoped) = self.instance_assoc_member(&name) {
-                name = scoped;
+                name = std::borrow::Cow::Owned(scoped);
             }
             // A bare array name inside a SUBMODULE process resolves under the
             // process's instance scope, like the synchronous foreach path.
-            if !self.module.arrays.contains_key(&name)
-                && !self.module.arrays_2d.contains_key(&name)
-                && !self.module.arrays_nd.contains_key(&name)
-                && !self.module.dynamic_arrays.contains(&name)
+            if !self.module.arrays.contains_key(&*name)
+                && !self.module.arrays_2d.contains_key(&*name)
+                && !self.module.arrays_nd.contains_key(&*name)
+                && !self.module.dynamic_arrays.contains(&*name)
                 && !self.is_associative_array(&name)
             {
                 let hint = self.name_resolve_hint.borrow().clone();
@@ -79399,7 +81729,7 @@ impl Simulator {
                         || self.module.dynamic_arrays.contains(&scoped)
                         || self.is_associative_array(&scoped)
                     {
-                        name = scoped;
+                        name = std::borrow::Cow::Owned(scoped);
                     }
                 }
             }
@@ -79412,13 +81742,13 @@ impl Simulator {
                 let kw = self.assoc_index_width_for(&name).unwrap_or((32, false));
                 return Some((keys, is_str, var_scope, None, kw));
             }
-            if self.module.dynamic_arrays.contains(&name) {
+            if self.module.dynamic_arrays.contains(&*name) {
                 let size = self.get_queue_size(&name);
                 let keys: Vec<String> = (0..size).map(|i| i.to_string()).collect();
-                return Some((keys, false, var_scope, Some(name), (32, false)));
+                return Some((keys, false, var_scope, Some(name.to_string()), (32, false)));
             }
-            if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
-                let descending = self.module.descending_arrays.contains(&name);
+            if let Some(&(lo, hi, _)) = self.module.arrays.get(&*name) {
+                let descending = self.module.descending_arrays.contains(&*name);
                 let mut keys: Vec<String> = Vec::new();
                 let mut idx = lo;
                 while idx <= hi {
@@ -79433,7 +81763,7 @@ impl Simulator {
             if keys.is_empty() {
                 return None;
             }
-            return Some((keys, is_str, var_scope, Some(name), (32, false)));
+            return Some((keys, is_str, var_scope, Some(name.to_string()), (32, false)));
         }
         None
     }
@@ -79483,7 +81813,8 @@ impl Simulator {
     /// modelled by a flat per-frame map; it is rare in practice.)
     fn declare_local_dyn(&mut self, bare: &str) -> String {
         // Kill-switch for debugging the per-process local-dyn-array rename.
-        if std::env::var("XEZIM_NO_DYN_RENAME").is_ok() {
+        static NO_DYN_RENAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NO_DYN_RENAME.get_or_init(|| std::env::var_os("XEZIM_NO_DYN_RENAME").is_some()) {
             return bare.to_string();
         }
         if self.local_dyn.is_empty() {
@@ -79767,13 +82098,13 @@ impl Simulator {
                                 // field-level constraints keep working.
                                 if self.is_packed_struct_var(a) {
                                     if let ExprKind::Ident(hh) = &a.kind {
-                                        targets.push((self.resolve_hier_name(hh), a.clone()));
+                                        targets.push((self.resolve_hier_name(hh).into_owned(), a.clone()));
                                     }
                                 }
                                 if let Some(fields) = self.expand_struct_target(a) {
                                     targets.extend(fields);
                                 } else if let ExprKind::Ident(hh) = &a.kind {
-                                    targets.push((self.resolve_hier_name(hh), a.clone()));
+                                    targets.push((self.resolve_hier_name(hh).into_owned(), a.clone()));
                                 }
                             }
                             let mut satisfied = false;
@@ -80286,10 +82617,10 @@ impl Simulator {
         if let ExprKind::Ident(h) = &expr.kind {
             let mut nm = self.resolve_hier_name(h);
             if let Some(s) = self.instance_assoc_member(&nm) {
-                nm = s;
+                nm = std::borrow::Cow::Owned(s);
             }
-            if self.module.arrays.contains_key(&nm) || self.module.dynamic_arrays.contains(&nm) {
-                return Some(nm);
+            if self.module.arrays.contains_key(&*nm) || self.module.dynamic_arrays.contains(&*nm) {
+                return Some(nm.to_string());
             }
         }
         // `obj.q` / `arr[i].q` — an instance-scoped queue/array member.
@@ -80307,6 +82638,60 @@ impl Simulator {
     /// `assoc[<keyval>]`. The nested collection then lives under that name and
     /// reuses the ordinary queue/array machinery (`<base>.size`, `<base>[i]`).
     /// Declared index bounds of `name`, outermost dimension first.
+    /// Dimensions a constraint `foreach (a[v1, v2, ...])` iterates for its
+    /// `nvars` loop variables: the unpacked shape first, then the packed
+    /// dimensions, each normalised to (low, high); a dynamic/queue outer
+    /// dimension takes its current size. Fewer dimensions than variables
+    /// leaves the trailing variables unbound, as before.
+    /// Name of a constraint-foreach operand that `foreach_check_dims` can
+    /// iterate: unpacked arrays of any rank, queues/dynamic arrays,
+    /// associative arrays, and packed multi-dimensional variables.
+    fn foreach_check_operand_name(&mut self, expr: &Expression) -> Option<String> {
+        if let Some(n) = self.array_operand_name(expr) {
+            return Some(n);
+        }
+        let ExprKind::Ident(h) = &expr.kind else {
+            return None;
+        };
+        let mut nm = self.resolve_hier_name(h).into_owned();
+        if let Some(s) = self.instance_assoc_member(&nm) {
+            nm = s;
+        }
+        if self.module.arrays_2d.contains_key(&nm)
+            || self.module.arrays_nd.contains_key(&nm)
+            || self.is_associative_array(&nm)
+            || self.module.packed_full_dims.get(&nm).is_some_and(|d| !d.is_empty())
+        {
+            return Some(nm);
+        }
+        None
+    }
+
+    fn foreach_check_dims(&self, name: &str, nvars: usize) -> Vec<(i64, i64)> {
+        let mut dims: Vec<(i64, i64)> = match self.foreach_dims(name) {
+            Some(d) => d.into_iter().map(|(l, r)| (l.min(r), l.max(r))).collect(),
+            None if self.module.dynamic_arrays.contains(name) || self.is_associative_array(name) => {
+                vec![(0, self.get_queue_size(name) as i64 - 1)]
+            }
+            None => Vec::new(),
+        };
+        if self.module.dynamic_arrays.contains(name) && !dims.is_empty() {
+            dims[0] = (0, self.get_queue_size(name) as i64 - 1);
+        }
+        if dims.len() < nvars {
+            if let Some(pdims) = self.module.packed_full_dims.get(name) {
+                for &(l, r) in pdims.iter() {
+                    if dims.len() >= nvars {
+                        break;
+                    }
+                    dims.push((l.min(r), l.max(r)));
+                }
+            }
+        }
+        dims.truncate(nvars);
+        dims
+    }
+
     fn foreach_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
         if let Some((shape, _)) = self.module.arrays_nd.get(name) {
             return Some(shape.clone());
@@ -80343,12 +82728,12 @@ impl Simulator {
             return None;
         }
         let resolved = self.resolve_hier_name(hier);
-        if self.signal_name_to_id.contains_key(resolved.as_str())
-            || self.module.arrays.contains_key(&resolved)
-            || self.module.arrays_2d.contains_key(&resolved)
-            || self.module.arrays_nd.contains_key(&resolved)
-            || self.module.dynamic_arrays.contains(&resolved)
-            || self.module.associative_arrays.contains_key(&resolved)
+        if self.signal_name_to_id.contains_key(resolved.as_ref())
+            || self.module.arrays.contains_key(&*resolved)
+            || self.module.arrays_2d.contains_key(&*resolved)
+            || self.module.arrays_nd.contains_key(&*resolved)
+            || self.module.dynamic_arrays.contains(&*resolved)
+            || self.module.associative_arrays.contains_key(&*resolved)
             || self.lookup_signal_width(&resolved).is_some()
             || self.get_signal_value_by_name(&seg.name.name).is_some()
         {
@@ -80551,7 +82936,7 @@ impl Simulator {
         };
         let mut bn = self.resolve_hier_name(bh);
         if let Some(s) = self.instance_assoc_member(&bn) {
-            bn = s;
+            bn = std::borrow::Cow::Owned(s);
         } else if bh.path.len() >= 2 {
             // `obj.member` accessed from module/lower scope where the first
             // path segment is an OBJECT handle and the member is an
@@ -80565,7 +82950,7 @@ impl Simulator {
                 if h != 0 {
                     let cand = format!("{h}#{member}");
                     if self.is_associative_array(&cand) {
-                        bn = cand;
+                        bn = std::borrow::Cow::Owned(cand);
                     }
                 }
             }
@@ -80578,9 +82963,9 @@ impl Simulator {
         for idx in rev.iter().rev() {
             let kv = self.eval_expr(idx);
             let ks = self.assoc_key_str(&bn, &kv);
-            name = format!("{}[{}]", name, ks);
+            name = std::borrow::Cow::Owned(format!("{}[{}]", name, ks));
         }
-        Some(name)
+        Some(name.to_string())
     }
 
     /// Resolve a base expression to its associative-array STORAGE name if it
@@ -80592,7 +82977,7 @@ impl Simulator {
             if h.path.len() == 1 && h.path[0].selects.is_empty() {
                 let nm = self.resolve_hier_name(h);
                 if self.is_associative_array(&nm) {
-                    return Some(nm);
+                    return Some(nm.to_string());
                 }
                 if let Some(scoped) = self.instance_assoc_member(&nm) {
                     if self.is_associative_array(&scoped) {
@@ -80850,6 +83235,19 @@ impl Simulator {
                     ExprKind::Index { expr: b, .. } => b.as_ref(),
                     _ => array,
                 };
+                // A multi-dimensional operand (2-D/N-D unpacked array, packed
+                // multi-dimensional variable) is repaired element by element
+                // with every loop variable bound; the 1-D path below keeps
+                // its own solver.
+                if vars.len() >= 2 || self.array_operand_name(base).is_none() {
+                    if let Some(arr_name) = self.foreach_check_operand_name(base) {
+                        let dims = self.foreach_check_dims(&arr_name, vars.len());
+                        if dims.len() == vars.len() && !dims.is_empty() {
+                            self.solve_inline_foreach_multidim(item, base, vars, &dims);
+                            return;
+                        }
+                    }
+                }
                 if let Some(arr_name) = self.array_operand_name(base) {
                     // Index range: declared bounds for fixed arrays,
                     // 0..size-1 for queues / dynamic arrays.
@@ -80939,8 +83337,8 @@ impl Simulator {
             return None;
         };
         let nm = self.resolve_hier_name(h);
-        if self.module.dynamic_arrays.contains(&nm) || self.module.arrays.contains_key(&nm) {
-            Some(nm)
+        if self.module.dynamic_arrays.contains(&*nm) || self.module.arrays.contains_key(&*nm) {
+            Some(nm.to_string())
         } else {
             None
         }
@@ -81308,6 +83706,186 @@ impl Simulator {
     /// the interval only when the current value violates it, so
     /// cross-element relations (`arr[i] > arr[i-1]`) converge across the
     /// outer apply sweeps.
+    /// Per-element repair for a constraint `foreach (a[v1, v2, ...]) body`
+    /// over a multi-dimensional operand. For every index tuple the loop
+    /// variables are bound in a frame and each `Expr` item in the body is
+    /// applied to the element `a[v1][v2]...` (read and written through the
+    /// ordinary expression paths, so packed slices and unpacked elements
+    /// behave alike): relational operators narrow the element's range and
+    /// re-draw it inside; `elem == e` pins it; `$countones(x[...]) == elem`
+    /// (either way round) draws `x[...]` with exactly that many ones.
+    fn solve_inline_foreach_multidim(
+        &mut self,
+        body: &crate::ast::decl::ConstraintItem,
+        base: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+        dims: &[(i64, i64)],
+    ) {
+        use crate::ast::decl::ConstraintItem as CI;
+        use rand::Rng;
+        let names: Vec<Option<String>> =
+            vars.iter().map(|v| v.as_ref().map(|i| i.name.clone())).collect();
+        let items: Vec<&CI> = match body {
+            CI::Block(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        let mut elem = base.clone();
+        for v in vars {
+            let Some(v) = v else { return };
+            let idx = Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: None,
+                    path: vec![crate::ast::expr::HierPathSegment {
+                        name: v.clone(),
+                        selects: Vec::new(),
+                    }],
+                    span: crate::ast::Span::dummy(),
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
+                crate::ast::Span::dummy(),
+            );
+            elem = Expression::new(
+                ExprKind::Index { expr: Box::new(elem), index: Box::new(idx) },
+                crate::ast::Span::dummy(),
+            );
+        }
+        let mut idx: Vec<i64> = dims.iter().map(|&(lo, _)| lo).collect();
+        if dims.iter().any(|&(lo, hi)| hi < lo) {
+            return;
+        }
+        loop {
+            let mut frame: HashMap<String, Value> = HashMap::default();
+            for (k, n) in names.iter().enumerate() {
+                if let Some(n) = n {
+                    frame.insert(n.clone(), Self::signed_loop_val(idx[k]));
+                }
+            }
+            self.push_local_frame(frame);
+            let cur = self.eval_expr(&elem);
+            let w = cur.width.max(1);
+            let (mut lo, mut hi): (i64, i64) =
+                (0, if w >= 63 { i64::MAX } else { (1i64 << w) - 1 });
+            let mut any_rel = false;
+            let mut pinned = false;
+            let mut popcount_targets: Vec<Expression> = Vec::new();
+            for it in &items {
+                let CI::Expr(e) = it else { continue };
+                let ExprKind::Binary { op, left, right } = &e.kind else { continue };
+                let on_l = Self::expr_same_ignoring_span(left, &elem);
+                let on_r = Self::expr_same_ignoring_span(right, &elem);
+                if on_l == on_r {
+                    continue;
+                }
+                let (other, eff) = if on_l {
+                    (right.as_ref(), *op)
+                } else {
+                    let m = match op {
+                        BinaryOp::Lt => BinaryOp::Gt,
+                        BinaryOp::Gt => BinaryOp::Lt,
+                        BinaryOp::Leq => BinaryOp::Geq,
+                        BinaryOp::Geq => BinaryOp::Leq,
+                        o => *o,
+                    };
+                    (left.as_ref(), m)
+                };
+                if let ExprKind::SystemCall { name, args } = &other.kind {
+                    if name == "$countones" && matches!(eff, BinaryOp::Eq) {
+                        if let Some(t) = args.first() {
+                            popcount_targets.push(t.clone());
+                        }
+                        continue;
+                    }
+                }
+                let b = self.eval_expr(other).to_i64().unwrap_or(0);
+                match eff {
+                    BinaryOp::Lt => {
+                        hi = hi.min(b.saturating_sub(1));
+                        any_rel = true;
+                    }
+                    BinaryOp::Leq => {
+                        hi = hi.min(b);
+                        any_rel = true;
+                    }
+                    BinaryOp::Gt => {
+                        lo = lo.max(b.saturating_add(1));
+                        any_rel = true;
+                    }
+                    BinaryOp::Geq => {
+                        lo = lo.max(b);
+                        any_rel = true;
+                    }
+                    BinaryOp::Eq => {
+                        let v = self.eval_expr(other).resize(w);
+                        let e2 = elem.clone();
+                        self.assign_value(&e2, &v);
+                        pinned = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !pinned && any_rel && lo <= hi {
+                let curv = cur.to_i64().unwrap_or(0);
+                if curv < lo || curv > hi {
+                    let p = if lo == hi { lo } else { self.cur_rng().gen_range(lo..=hi) };
+                    let e2 = elem.clone();
+                    self.assign_value(&e2, &Value::from_u64(p as u64, w));
+                }
+            }
+            if !popcount_targets.is_empty() {
+                let want = self.eval_expr(&elem).to_i64().unwrap_or(0).max(0) as usize;
+                for t in popcount_targets {
+                    let tw = self.eval_expr(&t).width.max(1) as usize;
+                    let ones = want.min(tw);
+                    let mut bits: Vec<usize> = (0..tw).collect();
+                    for i in (1..bits.len()).rev() {
+                        let j = self.cur_rng().gen_range(0..=i);
+                        bits.swap(i, j);
+                    }
+                    let mut v = Value::zero(tw as u32);
+                    for &b in &bits[..ones] {
+                        v.set_bit(b, LogicBit::One);
+                    }
+                    self.assign_value(&t, &v);
+                }
+            }
+            self.pop_local_frame();
+            let mut k = idx.len();
+            loop {
+                if k == 0 {
+                    return;
+                }
+                k -= 1;
+                if idx[k] < dims[k].1 {
+                    idx[k] += 1;
+                    break;
+                }
+                idx[k] = dims[k].0;
+            }
+        }
+    }
+
+    /// Structural equality of `Ident` / `Index` / `Paren` expression shapes,
+    /// ignoring source spans (a synthesized element expression never shares
+    /// the constraint's spans).
+    fn expr_same_ignoring_span(a: &Expression, b: &Expression) -> bool {
+        match (&a.kind, &b.kind) {
+            (ExprKind::Paren(x), _) => Self::expr_same_ignoring_span(x, b),
+            (_, ExprKind::Paren(y)) => Self::expr_same_ignoring_span(a, y),
+            (ExprKind::Ident(x), ExprKind::Ident(y)) => {
+                x.path.len() == y.path.len()
+                    && x.path.iter().zip(y.path.iter()).all(|(p, q)| {
+                        p.name.name == q.name.name && p.selects.is_empty() && q.selects.is_empty()
+                    })
+            }
+            (
+                ExprKind::Index { expr: xb, index: xi },
+                ExprKind::Index { expr: yb, index: yi },
+            ) => Self::expr_same_ignoring_span(xb, yb) && Self::expr_same_ignoring_span(xi, yi),
+            _ => false,
+        }
+    }
+
     fn solve_inline_foreach_elem(
         &mut self,
         item: &crate::ast::decl::ConstraintItem,
@@ -81630,20 +84208,34 @@ impl Simulator {
                     ExprKind::Index { expr: b, .. } => b.as_ref(),
                     _ => array,
                 };
-                let Some(arr_name) = self.array_operand_name(base) else {
+                // Any iterable shape, not only the 1-D unpacked arrays
+                // `array_operand_name` knows: a 2-D/N-D unpacked array and a
+                // packed multi-dimensional VARIABLE used to fall out here as
+                // "not an array" and the whole foreach passed vacuously.
+                let Some(arr_name) = self.foreach_check_operand_name(base) else {
                     return true;
                 };
-                let (lo, hi) = self
-                    .foreach_dims(&arr_name)
-                    .and_then(|d| d.first().copied())
-                    .unwrap_or_else(|| (0, self.get_queue_size(&arr_name) as i64 - 1));
-                let idx_var: Option<String> = vars
-                    .first()
-                    .and_then(|v| v.as_ref().map(|id| id.name.clone()));
-                for i in lo..=hi {
+                // Bind EVERY loop variable, over unpacked dimensions first
+                // and then the packed ones (§12.7.3). Binding only the first
+                // used to leave `j` in `d[i][j]` unbound (x) for a 2-D
+                // target, so the body compared against x and the constraint
+                // passed vacuously: `std::randomize(d) with { foreach
+                // (d[i, j]) d[i][j] < 100; }` returned 1 with every element 0.
+                let dims = self.foreach_check_dims(&arr_name, vars.len());
+                let idx_vars: Vec<Option<String>> = vars
+                    .iter()
+                    .map(|v| v.as_ref().map(|id| id.name.clone()))
+                    .collect();
+                let mut idx: Vec<i64> = dims.iter().map(|&(lo, _)| lo).collect();
+                if dims.iter().any(|&(lo, hi)| hi < lo) {
+                    return true;
+                }
+                loop {
                     let mut frame: HashMap<String, Value> = HashMap::default();
-                    if let Some(iv) = &idx_var {
-                        frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
+                    for (k, iv) in idx_vars.iter().enumerate() {
+                        if let (Some(iv), Some(&i)) = (iv, idx.get(k)) {
+                            frame.insert(iv.clone(), Self::signed_loop_val(i));
+                        }
                     }
                     self.push_local_frame(frame);
                     let ok = self.check_constraint_item_impl(body);
@@ -81651,8 +84243,20 @@ impl Simulator {
                     if !ok {
                         return false;
                     }
+                    // odometer advance over the bound dimensions
+                    let mut k = idx.len();
+                    loop {
+                        if k == 0 {
+                            return true;
+                        }
+                        k -= 1;
+                        if idx[k] < dims[k].1 {
+                            idx[k] += 1;
+                            break;
+                        }
+                        idx[k] = dims[k].0;
+                    }
                 }
-                true
             }
             // Recurse so nested foreach items get the per-element check.
             CI::Block(items) => {
@@ -82276,7 +84880,7 @@ impl Simulator {
     /// Returns `None` for anything else.
     fn constraint_operand_name(&self, e: &Expression) -> Option<String> {
         match &e.kind {
-            ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+            ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
             ExprKind::MemberAccess { expr, member } => {
                 if let ExprKind::Ident(bh) = &expr.kind {
                     if bh.path.len() == 1 {
@@ -82290,7 +84894,7 @@ impl Simulator {
                         });
                         fh.cached_signal_id = std::cell::Cell::new(None);
                         fh.cached_resolved_name = std::cell::OnceCell::new();
-                        return Some(self.resolve_hier_name(&fh));
+                        return Some(self.resolve_hier_name(&fh).into_owned());
                     }
                 }
                 None
@@ -82572,10 +85176,10 @@ impl Simulator {
                 ExprKind::Ident(h) => {
                     let mut name = self.resolve_hier_name(h);
                     if let Some(s) = self.instance_assoc_member(&name) {
-                        name = s;
+                        name = std::borrow::Cow::Owned(s);
                     }
-                    if self.module.arrays.contains_key(&name)
-                        || self.module.dynamic_arrays.contains(&name)
+                    if self.module.arrays.contains_key(&*name)
+                        || self.module.dynamic_arrays.contains(&*name)
                     {
                         let sz = self.get_queue_size(&name);
                         for i in 0..sz {
@@ -82688,7 +85292,7 @@ impl Simulator {
     fn vpi_arg_handle(&mut self, e: &Expression) -> VpiHandle {
         if let ExprKind::Ident(h) = &e.kind {
             let name = self.resolve_hier_name(h);
-            if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
+            if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                 let ty = vpi_type_of(self, &name, id);
                 let leaf = name.rsplit('.').next().unwrap_or(&name).to_string();
                 let full = vpi_full_name(self, &name);
@@ -82763,24 +85367,24 @@ impl Simulator {
 
     /// §3.14.2 / §20.4 — the timescale a module REPORTS via `$printtimescale`.
     /// A module with no `timescale directive (and none preceding it in
-    /// compilation order, so it is absent from `module_timescale_exp`) reports
-    /// the IEEE default `1s / 1s` — NOT the global/top-module unit that drives
-    /// `$time` scaling. This keeps xezim's pragmatic 1 ns simulation default for
-    /// delays while matching a reference simulator's printed timescale (a
-    /// directive-less module must not display another module's timescale).
+    /// compilation order) runs on the tool default `1ns / 1ns` for both delays
+    /// and `$time`/`$realtime`; elaboration records that default in
+    /// `module_timescale_exp`, so the fallback here only covers definitions the
+    /// map never saw. A directive-less module must not display another
+    /// module's timescale.
     fn reported_timescale_exp(&self, def: &str) -> (i32, i32) {
         self.module
             .module_timescale_exp
             .get(def)
             .copied()
-            .unwrap_or((0, 0))
+            .unwrap_or((-9, -9))
     }
 
     /// `--dump-timescales`: print every module definition's timescale before the
     /// run. Shows the REPORTED unit/precision (`$printtimescale` semantics: an
-    /// explicit/inherited `timescale, or the 1s/1s default when a module has
-    /// none — flagged, since such a module's effective delay unit collapses to
-    /// the global tick). No source `$printtimescale` calls are needed.
+    /// explicit/inherited `timescale, or the 1ns/1ns tool default when a
+    /// module has none — flagged, so a mixed design shows which modules count
+    /// nanoseconds by default). No source `$printtimescale` calls are needed.
     fn dump_module_timescales(&self) {
         // Every module definition reachable in the design: the top plus every
         // instantiated def_name (deduplicated, sorted for stable output).
@@ -82796,11 +85400,11 @@ impl Simulator {
         println!("=== module timescales ({} modules) ===", defs.len());
         for d in &defs {
             let (u, p) = self.reported_timescale_exp(d);
-            let has_ts = self.module.module_timescale_exp.contains_key(d);
-            let note = if has_ts {
-                ""
+            let defaulted = self.module.modules_without_timescale.iter().any(|m| m == d);
+            let note = if defaulted {
+                "   (no `timescale — 1ns/1ns default)"
             } else {
-                "   (no `timescale — 1s/1s default)"
+                ""
             };
             println!(
                 "  {:<28} {} / {}{}",
@@ -83365,7 +85969,7 @@ impl Simulator {
             let name = self.resolve_hier_name(h);
             self.module
                 .net_strengths
-                .get(&name)
+                .get(&*name)
                 .or_else(|| {
                     h.path
                         .last()
@@ -83951,11 +86555,18 @@ impl Simulator {
 
     /// Follow a typedef chain to the underlying type.
     fn resolve_dt(&self, dt: &DataType) -> DataType {
-        let mut cur = dt.clone();
+        self.resolve_dt_ref(dt).clone()
+    }
+
+    /// `resolve_dt` as a borrow: the result is either `dt` itself or an entry
+    /// of the typedef table, so read-only callers (type predicates, `matches!`)
+    /// need no clone.
+    fn resolve_dt_ref<'a>(&'a self, dt: &'a DataType) -> &'a DataType {
+        let mut cur = dt;
         for _ in 0..16 {
-            if let DataType::TypeReference { name, .. } = &cur {
+            if let DataType::TypeReference { name, .. } = cur {
                 if let Some(next) = self.module.typedef_types.get(&name.name.name) {
-                    cur = next.clone();
+                    cur = next;
                     continue;
                 }
             }
@@ -84169,8 +86780,7 @@ impl Simulator {
                 Some((
                     Expression {
                         kind: ExprKind::Ident(base),
-                        span: e.span,
-                    },
+                        span: e.span, cached_width: std::cell::Cell::new(None) },
                     last.name.name,
                 ))
             }
@@ -84181,6 +86791,26 @@ impl Simulator {
     /// Resolve a receiver expression to the `(handle, property)` pair it names:
     /// a bare `prop` inside a class method/constraint (implicit `this`), or an
     /// `<obj>.prop` access from outside.
+    /// A packed integer vector whose every dimension is a literal range
+    /// (`[15:0]`, not `[W-1:0]`): its width is known without any parameter
+    /// or class type-argument lookup.
+    fn packed_dims_are_literal(dt: &DataType) -> bool {
+        use crate::ast::types::PackedDimension;
+        match dt {
+            DataType::IntegerVector { dimensions, .. } => {
+                !dimensions.is_empty()
+                    && dimensions.iter().all(|d| match d {
+                        PackedDimension::Range { left, right, .. } => {
+                            matches!(left.kind, ExprKind::Number(_))
+                                && matches!(right.kind, ExprKind::Number(_))
+                        }
+                        PackedDimension::Unsized(_) => false,
+                    })
+            }
+            _ => false,
+        }
+    }
+
     fn class_prop_receiver(&mut self, base: &Expression) -> Option<(usize, String)> {
         if let Some((obj, prop)) = Self::split_trailing_member(base) {
             let h = self.eval_expr(&obj).to_u64()? as usize;
@@ -84221,14 +86851,34 @@ impl Simulator {
         // typedef name to look up, but its declared type is retained verbatim
         // in `property_types` — use it directly; whole-value access worked
         // while `s.f` read x without this.
-        if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
-            let mut cur = Some(inst.class_name.clone());
-            let mut seen: HashSet<String> = HashSet::default();
+        let class_name: &str = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.as_str())
+            .unwrap_or("");
+        // The common answer for a scalar property is "not a struct"; it
+        // depends only on the class chain and the name, so it is cached
+        // per class. The walk below used to clone the class name per level
+        // and allocate a cycle-guard set on every property access.
+        if !class_name.is_empty()
+            && self
+                .class_prop_struct_neg
+                .borrow()
+                .get(class_name)
+                .is_some_and(|set| set.contains(prop))
+        {
+            return None;
+        }
+        if !class_name.is_empty() {
+            let mut cur: Option<&str> = Some(class_name);
+            let mut hops = 0usize;
             while let Some(cn) = cur {
-                if !seen.insert(cn.clone()) {
+                hops += 1;
+                if hops > 64 {
                     break;
                 }
-                let cd = self.module.classes.get(&cn)?;
+                let cd = self.module.classes.get(cn)?;
                 // A COLLECTION property (assoc/queue/array — incl. a STATIC
                 // one, which elaboration gates out of the per-instance maps)
                 // is NOT a scalar struct: its unpacked dimension indexes
@@ -84259,18 +86909,25 @@ impl Simulator {
                 if cd.properties.contains_key(prop) {
                     break;
                 }
-                cur = cd.extends.clone();
+                cur = cd.extends.as_deref();
             }
         }
-        let tn = self.class_prop_type_name(handle, prop)?;
-        let dt = self
-            .module
-            .typedef_types
-            .get(tn.as_str())?;
-        match Self::resolve_type_ref(dt, &self.module.typedef_types) {
-            DataType::Struct(su) => Some(su),
-            _ => None,
+        let verdict = (|| {
+            let tn = self.class_prop_type_name(handle, prop)?;
+            let dt = self.module.typedef_types.get(tn.as_str())?;
+            match Self::resolve_type_ref(dt, &self.module.typedef_types) {
+                DataType::Struct(su) => Some(su),
+                _ => None,
+            }
+        })();
+        if verdict.is_none() && !class_name.is_empty() {
+            self.class_prop_struct_neg
+                .borrow_mut()
+                .entry(class_name.to_string())
+                .or_default()
+                .insert(prop.to_string());
         }
+        verdict
     }
 
     /// The CONCRETE type name a property's declared type denotes on this
@@ -84394,8 +87051,7 @@ impl Simulator {
                 (
                     Some(Expression {
                         kind: ExprKind::Ident(base),
-                        span: func.span,
-                    }),
+                        span: func.span, cached_width: std::cell::Cell::new(None) }),
                     last.name.name,
                 )
             }
@@ -85160,6 +87816,158 @@ impl Simulator {
             cur = cd.extends.clone();
         }
         params
+    }
+
+    /// `(handle, prop, elem_struct)` when `lvalue` — with any trailing element
+    /// select stripped — names a CLASS PROPERTY whose element type is an
+    /// unpacked struct. Drives a member-wise decomposition of a whole-element
+    /// write into the same cells `class_unpacked_leaf` reads back.
+    /// Cheap syntactic pre-check for the class unpacked-struct array
+    /// write paths: the lvalue's root identifier must name a class
+    /// property declared as an unpacked struct (of any class). Computed
+    /// once from `property_types`; a UVM run otherwise paid a receiver
+    /// resolution on every blocking assignment (+1.3% instructions on the
+    /// axi4 benchmark) for a write shape it never has.
+    fn lvalue_root_is_unpacked_struct_prop(&self, lvalue: &Expression, allow_bare: bool) -> bool {
+        if self.no_class_objects() {
+            return false;
+        }
+        // The common `x = ..` write: one bare identifier, no select. Only
+        // the whole-array pattern site (`A = '{..}`) may pass one through.
+        if !allow_bare {
+            if let ExprKind::Ident(h) = &lvalue.kind {
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    return false;
+                }
+            }
+        }
+        let set = self.unpacked_struct_prop_names.get_or_init(|| {
+            let mut set: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                for (name, dt) in &cd.property_types {
+                    let dt = Self::resolve_type_ref(dt, &self.module.typedef_types);
+                    if let DataType::Struct(su) = &dt {
+                        if Self::spreads_member_wise(su) {
+                            set.insert(name.clone());
+                        }
+                    }
+                }
+            }
+            set
+        });
+        if set.is_empty() {
+            return false;
+        }
+        let mut cur = lvalue;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, .. } => cur = expr.as_ref(),
+                ExprKind::Ident(h) => {
+                    return h.path.len() <= 2
+                        && h.path.iter().any(|seg| set.contains(&seg.name.name));
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    if set.contains(&member.name) {
+                        return true;
+                    }
+                    cur = expr.as_ref();
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn class_unpacked_array_prop_of(
+        &mut self,
+        lvalue: &Expression,
+    ) -> Option<(usize, String, crate::ast::types::StructUnionType)> {
+        if self.no_class_objects() {
+            return None;
+        }
+        let recv = match self.class_prop_receiver(lvalue) {
+            Some(r) => Some(r),
+            None => match &lvalue.kind {
+                ExprKind::Index { expr, .. } => self.class_prop_receiver(expr),
+                ExprKind::Ident(h) if h.path.len() == 1 && !h.path[0].selects.is_empty() => {
+                    let bare = crate::ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: vec![crate::ast::expr::HierPathSegment {
+                            name: h.path[0].name.clone(),
+                            selects: Vec::new(),
+                        }],
+                        span: h.span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    };
+                    let e = Expression::new(ExprKind::Ident(bare), lvalue.span);
+                    self.class_prop_receiver(&e)
+                }
+                _ => None,
+            },
+        };
+        let (handle, prop) = recv?;
+        let su = self.class_prop_struct(handle, &prop)?;
+        Self::spreads_member_wise(&su).then_some((handle, prop, su))
+    }
+
+    /// True when the READ path (`class_unpacked_leaf`) owns this element's
+    /// leaves — i.e. they live in the instance property map as
+    /// `<prop>[i].<member>`, not under an instance-scoped SIGNAL name. Used to
+    /// keep whole-element / whole-array writes in the same store the reads use.
+    fn class_unpacked_elem_is_heap_owned(&mut self, lvalue: &Expression) -> bool {
+        let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) else {
+            return false;
+        };
+        let Some(m0) = su
+            .members
+            .first()
+            .and_then(|m| m.declarators.first())
+            .map(|d| d.name.name.clone())
+        else {
+            return false;
+        };
+        let probe = Self::append_member_expr(lvalue, &m0);
+        self.class_unpacked_leaf(&probe).is_some()
+    }
+
+    /// Write one unpacked-struct value into a class-property element's leaf
+    /// cells, member by member, so each lands via the (working) per-leaf path.
+    fn assign_class_unpacked_elem(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+        su: &crate::ast::types::StructUnionType,
+    ) {
+        let items: Option<Vec<&Expression>> = match &rvalue.kind {
+            ExprKind::AssignmentPattern(its) => {
+                let ord = self.pattern_ordered(its);
+                (!ord.is_empty()).then_some(ord)
+            }
+            _ => None,
+        };
+        let mut k = 0usize;
+        for m in &su.members {
+            for md in &m.declarators {
+                let mn = md.name.name.as_str();
+                let lhs_f = Self::append_member_expr(lvalue, mn);
+                let v = match &items {
+                    // Ordered pattern: item k belongs to the k-th declared member.
+                    Some(its) => match its.get(k) {
+                        Some(e) => {
+                            let e = (*e).clone();
+                            self.eval_expr(&e)
+                        }
+                        None => continue,
+                    },
+                    None => {
+                        let rhs_f = Self::append_member_expr(rvalue, mn);
+                        self.eval_expr(&rhs_f)
+                    }
+                };
+                self.assign_value(&lhs_f, &v);
+                k += 1;
+            }
+        }
     }
 
     /// `class_agg_member` for an already-split `<base>.<field>`.
@@ -86569,11 +89377,11 @@ impl Simulator {
             }
             _ => return None,
         };
-        let packed_elem_w = self.module.packed_signal_elem_widths.get(&name).copied();
+        let packed_elem_w = self.module.packed_signal_elem_widths.get(&*name).copied();
         let total_w = if is_elem {
-            self.module.arrays.get(&name).map(|t| t.2)?
+            self.module.arrays.get(&*name).map(|t| t.2)?
         } else {
-            if self.module.arrays.contains_key(&name) {
+            if self.module.arrays.contains_key(&*name) {
                 return None; // whole-array target: the unpacked path owns it
             }
             self.lookup_signal_width(&name)?
@@ -86582,7 +89390,7 @@ impl Simulator {
             Some(ew) => self
                 .module
                 .packed_full_dims
-                .get(&name)
+                .get(&*name)
                 .cloned()
                 .unwrap_or_else(|| vec![((total_w as i64 / ew as i64) - 1, 0)]),
             None => {
@@ -86594,13 +89402,13 @@ impl Simulator {
                 // zero-extended it to 16'h0001 (a reset that armed only bank 0).
                 // Aggregates with their own pattern path must not be diverted
                 // here.
-                if self.module.packed_struct_fields.contains_key(&name)
-                    || self.module.associative_arrays.contains_key(&name)
-                    || self.module.dynamic_arrays.contains(&name)
-                    || self.module.arrays_2d.contains_key(&name)
-                    || self.module.arrays_nd.contains_key(&name)
-                    || self.module.string_signals.contains(&name)
-                    || self.real_signals.contains(&name)
+                if self.module.packed_struct_fields.contains_key(&*name)
+                    || self.module.associative_arrays.contains_key(&*name)
+                    || self.module.dynamic_arrays.contains(&*name)
+                    || self.module.arrays_2d.contains_key(&*name)
+                    || self.module.arrays_nd.contains_key(&*name)
+                    || self.module.string_signals.contains(&*name)
+                    || self.real_signals.contains(&*name)
                     || total_w <= 1
                 {
                     return None;
@@ -86618,7 +89426,7 @@ impl Simulator {
     fn pattern_aggregate_names(&mut self, lvalue: &Expression) -> Vec<String> {
         let mut out = Vec::new();
         if let ExprKind::Ident(h) = &lvalue.kind {
-            out.push(self.resolve_hier_name(h));
+            out.push(self.resolve_hier_name(h).into_owned());
             if h.path.len() > 1 {
                 let joined = h
                     .path
@@ -86697,7 +89505,14 @@ impl Simulator {
             DataType::Struct(su) => Self::spreads_member_wise(&su),
             _ => false,
         };
-        if !dt_is_unpacked_struct && !self.module.dynamic_arrays.contains(base) {
+        // A dotted name that is a REGISTERED fixed array (an inlined
+        // instance's `u.v[2][2]`, a generate block's `g.w`) keeps its shape:
+        // the dynamic-array fallback below reclassified it and handed each
+        // row a bare pattern.
+        let registered_fixed = self.module.arrays.contains_key(base)
+            || self.module.arrays_2d.contains_key(base)
+            || self.module.arrays_nd.contains_key(base);
+        if !dt_is_unpacked_struct && !self.module.dynamic_arrays.contains(base) && !registered_fixed {
             // Only register SUB-PATHS (dotted, like `info.addr`) in
             // `dynamic_arrays` — a bare variable like `src` is NOT a queue
             // even if `p_elem_type` finds an element type for it.
@@ -86781,7 +89596,7 @@ impl Simulator {
             return false;
         };
         let bname = self.resolve_hier_name(bh);
-        let Some(dt) = self.module.var_decl_types.get(&bname).cloned() else {
+        let Some(dt) = self.module.var_decl_types.get(&*bname).cloned() else {
             return false;
         };
         let DataType::Struct(su) = self.resolve_dt(&dt) else {
@@ -86791,7 +89606,7 @@ impl Simulator {
             return false;
         }
         let iv = self.eval_expr(index);
-        let key = if self.module.associative_arrays.contains_key(&bname) {
+        let key = if self.module.associative_arrays.contains_key(&*bname) {
             self.assoc_key_str(&bname, &iv)
         } else {
             iv.to_i64().unwrap_or(0).to_string()
@@ -86928,11 +89743,21 @@ impl Simulator {
     /// Element type recorded for `name`, or derived from its base when `name`
     /// is a flattened sub-path (`q[i]`, which has no declaration of its own).
     fn p_elem_type(&self, name: &str) -> Option<DataType> {
+        self.p_elem_type_ref(name).map(std::borrow::Cow::into_owned)
+    }
+
+    /// `p_elem_type` without the clone: the declared type is borrowed from the
+    /// design's type tables whenever it lives there (the common case), and
+    /// only the flat-path fallback materialises an owned value. The blocking
+    /// assignment path consults this on every write purely as a predicate,
+    /// which used to clone a `DataType` (and drop it) per assignment.
+    fn p_elem_type_ref(&self, name: &str) -> Option<std::borrow::Cow<'_, DataType>> {
+        use std::borrow::Cow;
         self.module
             .var_decl_types
             .get(name)
-            .cloned()
-            .or_else(|| self.flat_path_type(name).map(|(d, _)| d))
+            .map(Cow::Borrowed)
+            .or_else(|| self.flat_path_type(name).map(|(d, _)| Cow::Owned(d)))
             .or_else(|| {
                 // An ELEMENT (`arr[2]`) carries no type of its own, but
                 // `var_decl_types` holds the container's ELEMENT type — so the
@@ -86945,7 +89770,7 @@ impl Simulator {
                 if base.is_empty() {
                     return None;
                 }
-                self.module.var_decl_types.get(base).cloned()
+                self.module.var_decl_types.get(base).map(Cow::Borrowed)
             })
     }
 
@@ -87546,8 +90371,7 @@ impl Simulator {
                 fname.clone(),
                 Expression {
                     kind: ExprKind::Ident(fh),
-                    span: a.span,
-                },
+                    span: a.span, cached_width: std::cell::Cell::new(None) },
             ));
         }
         Some(out)
@@ -87653,11 +90477,10 @@ impl Simulator {
             });
             fh.cached_signal_id = std::cell::Cell::new(None);
             fh.cached_resolved_name = std::cell::OnceCell::new();
-            let name = self.resolve_hier_name(&fh);
+            let name = self.resolve_hier_name(&fh).into_owned();
             let fexpr = Expression {
                 kind: ExprKind::Ident(fh),
-                span: a.span,
-            };
+                span: a.span, cached_width: std::cell::Cell::new(None) };
             out.push((name, fexpr));
         }
         Some(out)
@@ -87766,17 +90589,50 @@ impl Simulator {
                     }
                 }
             }
+            // A multi-dimensional unpacked array (`u7_t e[5][2]`) is not in
+            // `arrays` (1-D) and was never drawn at all; draw every element
+            // by its flat name.
+            if let ExprKind::Ident(h) = &a.kind {
+                if h.path.iter().all(|s| s.selects.is_empty()) {
+                    let nm = self.resolve_hier_name(h).into_owned();
+                    let shape: Option<(Vec<(i64, i64)>, u32)> =
+                        if let Some((sh, w)) = self.module.arrays_nd.get(&nm) {
+                            Some((sh.clone(), *w))
+                        } else if let Some(&(d1, d2, w)) = self.module.arrays_2d.get(&nm) {
+                            Some((vec![d1, d2], w))
+                        } else {
+                            None
+                        };
+                    if let Some((shape, w)) = shape {
+                        let w = w.max(1);
+                        let mut suffixes: Vec<String> = vec![String::new()];
+                        for &(lo, hi) in &shape {
+                            let (lo, hi) = (lo.min(hi), lo.max(hi));
+                            let mut next = Vec::new();
+                            for sfx in &suffixes {
+                                for k in lo..=hi {
+                                    next.push(format!("{}[{}]", sfx, k));
+                                }
+                            }
+                            suffixes = next;
+                        }
+                        for sfx in suffixes {
+                            let rv = self.random_value_of_width(w);
+                            self.set_signal_value_by_name(&format!("{}{}", nm, sfx), rv);
+                        }
+                        continue;
+                    }
+                }
+            }
             let w = self.infer_lhs_width(a).max(1);
-            let rv = if w <= 64 {
-                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                Value::from_u64(self.cur_rng().r#gen::<u64>() & mask, w)
-            } else {
-                Value::zero(w)
-            };
+            // A packed target wider than 64 bits (`u7_t [4:0][1:0] d` is 70
+            // bits) used to be "drawn" as all zeros; draw every bit.
+            let rv = self.random_value_of_width(w);
             self.assign_value(a, &rv);
         }
         Value::from_u64(1, 32)
     }
+
 
     /// Evaluate an array reduction (`sum`/`product`/`min`/`max`/`and`/`or`/`xor`)
     /// with a `with (item...)` expression, binding `item` to each element.
@@ -88116,7 +90972,7 @@ impl Simulator {
         fn flatten_dotted(sim: &Simulator, e: &Expression) -> Option<String> {
             match &e.kind {
                 ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
-                    Some(sim.resolve_hier_name(h))
+                    Some(sim.resolve_hier_name(h).into_owned())
                 }
                 ExprKind::MemberAccess { expr, member } => {
                     Some(format!("{}.{}", flatten_dotted(sim, expr)?, member.name))
@@ -88616,9 +91472,9 @@ impl Simulator {
                 // `get_full_hdl_path(paths)` returned an empty path list —
                 // every backdoor access read 0).
                 if let Some(r) = self.dyn_name_lookup(&n) {
-                    n = r.to_string();
+                    n = std::borrow::Cow::Owned(r.to_string());
                 } else if let Some(s) = self.instance_assoc_member(&n) {
-                    n = s;
+                    n = std::borrow::Cow::Owned(s);
                 }
                 n
             }
@@ -88656,20 +91512,20 @@ impl Simulator {
                 for seg in h.path.iter().take(h.path.len() - 1).skip(1) {
                     handle = self.member_handle(handle, &seg.name.name)?;
                 }
-                self.handle_collection_name(handle, &leaf)?
+                std::borrow::Cow::Owned(self.handle_collection_name(handle, &leaf)?)
             }
             ExprKind::MemberAccess { expr, member } => {
                 let handle = self.eval_handle_expr(expr)?;
-                self.handle_collection_name(handle, &member.name)?
+                std::borrow::Cow::Owned(self.handle_collection_name(handle, &member.name)?)
             }
             _ => return None,
         };
-        if !self.module.arrays.contains_key(&cname) && !self.module.dynamic_arrays.contains(&cname)
+        if !self.module.arrays.contains_key(&*cname) && !self.module.dynamic_arrays.contains(&*cname)
         {
             return None;
         }
         let size = self.get_queue_size(&cname);
-        let w = self.module.arrays.get(&cname).map(|t| t.2).unwrap_or(32);
+        let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
         let vals: Vec<Value> = (0..size)
             .map(|j| {
                 self.get_signal_value_by_name(&format!("{}[{}]", cname, j))
@@ -88712,7 +91568,7 @@ impl Simulator {
                 frame.push((pname.to_string(), pname.to_string()));
             }
         }
-        Some(cname)
+        Some(cname.into_owned())
     }
 
     /// §13.5.2: stage a queue FORMAL's contents under a fresh temporary
@@ -88920,13 +91776,29 @@ impl Simulator {
         mname: &str,
         args: &[Expression],
     ) -> Option<Value> {
+        // One string match classifies the method up front; every check below
+        // is then an integer compare, and a name this function does not
+        // implement returns before the receiver-key allocation and the scans
+        // (the sequential `mname == ".."` chain cost a memcmp per arm).
+        let bm = BuiltinM::classify(mname);
+        if bm == BuiltinM::Other {
+            return None;
+        }
         // Per-specialization keying for STATIC collection properties of
         // parameterized classes (e.g. `static T m_q[$]` in `uvmq#(T)`):
         // rewrite the bare member name to the spec-aware storage key so each
         // specialization gets its own element/size cells. No-op for instance
         // methods and non-static/non-collection names.
+        if env_set_cached!("XEZIM_BM_CENSUS") {
+            eprintln!(
+                "[bm] {} {} this={}",
+                obj_name,
+                mname,
+                self.this_stack.last().copied().flatten().is_some()
+            );
+        }
         let _resolved = self.spec_static_coll_key(obj_name);
-        let obj_name = _resolved.as_str();
+        let obj_name: &str = &_resolved;
         // §8.10: inside a class method, a MEMBER collection shadows any
         // same-named module/package-scope collection. Several callers gate
         // on the bare name being registered globally before trying the
@@ -88936,9 +91808,10 @@ impl Simulator {
         // elements (backdoor hdl paths came back empty). Rewrite centrally:
         // bare name + declared by the current class + not a true local.
         let _inst_scoped;
-        let obj_name = if !obj_name.contains('#')
-            && !obj_name.contains('.')
-            && !obj_name.contains('[')
+        let obj_name = if !obj_name
+            .as_bytes()
+            .iter()
+            .any(|&b| matches!(b, b'#' | b'.' | b'['))
         {
             // §8.10 precedence for a BARE receiver — see
             // `bare_receiver_is_class_handle`.
@@ -88982,10 +91855,10 @@ impl Simulator {
         // signal_id), since `self.module.signals` may not be the storage.
         // §6.19.6: first/last/num take no argument; next/prev take an OPTIONAL
         // count N (default 1) — `c.next(2)` steps two forward with wrapping.
-        if (matches!(mname, "first" | "last" | "num") && args.is_empty())
-            || (matches!(mname, "next" | "prev") && args.len() <= 1)
+        if (matches!(bm, BuiltinM::First | BuiltinM::Last | BuiltinM::Num) && args.is_empty())
+            || (matches!(bm, BuiltinM::Next | BuiltinM::Prev) && args.len() <= 1)
         {
-            let step_n: u64 = if matches!(mname, "next" | "prev") {
+            let step_n: u64 = if matches!(bm, BuiltinM::Next | BuiltinM::Prev) {
                 args.first()
                     .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                     .unwrap_or(1)
@@ -89040,11 +91913,11 @@ impl Simulator {
                         v.is_signed = esigned;
                         v
                     };
-                    return Some(match mname {
-                        "num"   => Value::from_u64(members.len() as u64, 32),
-                        "first" => mk(members[0].1),
-                        "last"  => mk(members[members.len()-1].1),
-                        "next" | "prev" => {
+                    return Some(match bm {
+                        BuiltinM::Num => Value::from_u64(members.len() as u64, 32),
+                        BuiltinM::First => mk(members[0].1),
+                        BuiltinM::Last => mk(members[members.len()-1].1),
+                        BuiltinM::Next | BuiltinM::Prev => {
                             // Read the receiver like an ordinary identifier —
                             // LOCAL FRAME first. `get_signal_value_by_name`
                             // consults only the flat table, so a method-local
@@ -89073,7 +91946,7 @@ impl Simulator {
                                 // -> last). N defaults to 1; N==0 returns current.
                                 let len = members.len() as u64;
                                 let step = (step_n % len) as usize;
-                                let new_p = if mname == "next" {
+                                let new_p = if bm == BuiltinM::Next {
                                     (p + step) % members.len()
                                 } else {
                                     (p + members.len() - step) % members.len()
@@ -89110,7 +91983,7 @@ impl Simulator {
                 }
             }
         }
-        if mname == "size" || mname == "len" {
+        if bm == BuiltinM::Size || bm == BuiltinM::Len {
             // An associative array's size() == num(): count populated keys.
             // (Without this it falls through to the queue/.size-shadow/string
             // paths and reads 0 for a true assoc array — sv_22.)
@@ -89154,7 +92027,7 @@ impl Simulator {
         // Was unimplemented (returned 0), which made string glob matchers compare
         // every char as 0==0 — exact matches passed by accident but `*`/`?`
         // wildcards were never detected.
-        if mname == "getc" {
+        if bm == BuiltinM::Getc {
             if let Some(idx_arg) = args.first() {
                 let idx = self.eval_expr(idx_arg).to_u64().unwrap_or(0) as usize;
                 // Byte indexing, not UTF-8: a char above 0x7F is one SV byte.
@@ -89169,7 +92042,7 @@ impl Simulator {
             }
             return Some(Value::zero(8));
         }
-        if mname == "substr" {
+        if bm == BuiltinM::Substr {
             if let Some(first) = args.first() {
                 if let Some(second) = args.get(1) {
                     let start = self.eval_expr(first).to_u64().unwrap_or(0) as usize;
@@ -89238,7 +92111,7 @@ impl Simulator {
                 }
             }
         }
-        if mname == "push_back" {
+        if bm == BuiltinM::PushBack {
             if let Some(arg) = args.first() {
                 // LRM §8.4: if the queue's element type is a class and
                 // the arg is a bare `new(...)` call, construct the
@@ -89257,7 +92130,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "push_front" {
+        if bm == BuiltinM::PushFront {
             if let Some(arg) = args.first() {
                 let cur_size = self.get_queue_size(obj_name);
                 if let Some(&max) = self.module.queue_max_sizes.get(obj_name) {
@@ -89274,7 +92147,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "pop_front" {
+        if bm == BuiltinM::PopFront {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
                 let val = self
@@ -89288,7 +92161,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "pop_back" {
+        if bm == BuiltinM::PopBack {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
                 let val = self
@@ -89299,7 +92172,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "sort" {
+        if bm == BuiltinM::Sort {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
                 // §7.12.2 + §11.4.8: a STRING element collection sorts
@@ -89324,7 +92197,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "rsort" {
+        if bm == BuiltinM::Rsort {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
                 let is_str = self.is_string_collection(obj_name);
@@ -89346,7 +92219,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "reverse" {
+        if bm == BuiltinM::Reverse {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
                 let order: Vec<usize> = (0..cur_size).rev().collect();
@@ -89356,7 +92229,7 @@ impl Simulator {
         }
         // LRM §7.12.1 array `shuffle()` — Fisher-Yates in place using
         // the simulator's PRNG so seeded runs are reproducible.
-        if mname == "shuffle" {
+        if bm == BuiltinM::Shuffle {
             use rand::Rng;
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 1 {
@@ -89370,7 +92243,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "insert" {
+        if bm == BuiltinM::Insert {
             if args.len() >= 2 {
                 let idx = self.eval_expr(&args[0]).to_u64().unwrap_or(0);
                 let cur_size = self.get_queue_size(obj_name);
@@ -89385,7 +92258,7 @@ impl Simulator {
             }
             return Some(Value::zero(32));
         }
-        if mname == "num" {
+        if bm == BuiltinM::Num {
             // §15.4.2: a mailbox's `num()` counts queued messages, which live in
             // `self.mailboxes` (keyed by handle), not in `obj[i]` signal slots.
             // This expression path (e.g. `m.num()` inside `$display(...)`) must
@@ -89405,10 +92278,10 @@ impl Simulator {
             // assoc-of-queue, queues, and dynamic arrays.
             return Some(Value::from_u64(self.assoc_top_level_keys(obj_name).len() as u64, 32));
         }
-        if matches!(mname, "sum" | "product") {
+        if matches!(bm, BuiltinM::Sum | BuiltinM::Product) {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let (w, signed) = self.array_elem_sign_width(obj_name);
-            let mut total: u64 = if mname == "sum" { 0 } else { 1 };
+            let mut total: u64 = if bm == BuiltinM::Sum { 0 } else { 1 };
             for i in 0..cur_size {
                 if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
                     let x = if signed {
@@ -89416,7 +92289,7 @@ impl Simulator {
                     } else {
                         v.to_u64().unwrap_or(0)
                     };
-                    total = if mname == "sum" {
+                    total = if bm == BuiltinM::Sum {
                         total.wrapping_add(x)
                     } else {
                         total.wrapping_mul(x)
@@ -89431,7 +92304,7 @@ impl Simulator {
             out.is_signed = signed;
             return Some(out);
         }
-        if matches!(mname, "and" | "or" | "xor") {
+        if matches!(bm, BuiltinM::And | BuiltinM::Or | BuiltinM::Xor) {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let mut acc: Option<u64> = None;
             for i in 0..cur_size {
@@ -89448,7 +92321,7 @@ impl Simulator {
             }
             return Some(Value::from_u64(acc.unwrap_or(0), 32));
         }
-        if mname == "min" {
+        if bm == BuiltinM::Min {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let mut min_val: Option<Value> = None;
             for i in 0..cur_size {
@@ -89468,7 +92341,7 @@ impl Simulator {
             }
             return Some(min_val.unwrap_or(Value::zero(32)));
         }
-        if mname == "max" {
+        if bm == BuiltinM::Max {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let mut max_val: Option<Value> = None;
             for i in 0..cur_size {
@@ -89488,13 +92361,13 @@ impl Simulator {
             }
             return Some(max_val.unwrap_or(Value::zero(32)));
         }
-        if mname == "unique" {
+        if bm == BuiltinM::Unique {
             // §7.12.1: a locator method RETURNS a queue; it must not modify the
             // source. `r = q.unique()` is handled by the locator path in
             // BlockingAssign; a bare `q.unique();` is simply a no-op.
             return Some(Value::zero(32));
         }
-        if mname == "unique_index" {
+        if bm == BuiltinM::UniqueIndex {
             let cur_size = self.get_queue_size(obj_name) as usize;
             let mut seen = std::collections::HashSet::new();
             let mut indices = Vec::new();
@@ -89515,12 +92388,12 @@ impl Simulator {
             self.set_queue_size(obj_name, indices.len() as u64);
             return Some(Value::zero(32));
         }
-        if (mname == "find"
-            || mname == "find_first"
-            || mname == "find_last"
-            || mname == "find_index"
-            || mname == "find_first_index"
-            || mname == "find_last_index")
+        if (bm == BuiltinM::Find
+            || bm == BuiltinM::FindFirst
+            || bm == BuiltinM::FindLast
+            || bm == BuiltinM::FindIndex
+            || bm == BuiltinM::FindFirstIndex
+            || bm == BuiltinM::FindLastIndex)
             && (self.module.arrays.contains_key(obj_name)
                 || self.is_associative_array(obj_name)
                 || self.module.dynamic_arrays.contains(obj_name))
@@ -89566,7 +92439,7 @@ impl Simulator {
                 results[0].clone()
             });
         }
-        if mname == "exists" {
+        if bm == BuiltinM::Exists {
             if let Some(arg) = args.first() {
                 let kv = self.eval_expr(arg);
                 let key = self.assoc_key_str(obj_name, &kv);
@@ -89585,14 +92458,12 @@ impl Simulator {
                     // under `<assoc>[<key>].size` / `<assoc>[<key>][i]`.
                     || self.signals.contains_key(&format!("{}.size", elem_name))
                     || self.module.dynamic_arrays.contains(&elem_name)
-                    || self
-                        .signals
-                        .keys()
-                        .any(|k| k.starts_with(&nested_prefix) || k.starts_with(&member_prefix));
+                    || self.signals.any_key_with_prefix(&nested_prefix)
+                    || self.signals.any_key_with_prefix(&member_prefix);
                 return Some(Value::from_u64(found as u64, 1));
             }
         }
-        if mname == "delete" {
+        if bm == BuiltinM::Delete {
             if self.is_associative_array(obj_name) {
                 if let Some(arg) = args.first() {
                     let key = self.eval_expr(arg);
@@ -89625,7 +92496,7 @@ impl Simulator {
                 return Some(Value::zero(32));
             }
         }
-        if (mname == "first" || mname == "last" || mname == "next" || mname == "prev")
+        if (bm == BuiltinM::First || bm == BuiltinM::Last || bm == BuiltinM::Next || bm == BuiltinM::Prev)
             && self.is_associative_array(obj_name) {
                 let keys = self.assoc_top_level_keys(obj_name);
                 // i128, not i64: a full-range unsigned 64-bit key
@@ -89635,9 +92506,9 @@ impl Simulator {
                 if keys.is_empty() {
                     return Some(Value::zero(32));
                 }
-                let result_key = if mname == "first" {
+                let result_key = if bm == BuiltinM::First {
                     Some(keys[0].clone())
-                } else if mname == "last" {
+                } else if bm == BuiltinM::Last {
                     Some(keys[keys.len() - 1].clone())
                 } else {
                     if let Some(arg) = args.first() {
@@ -89652,7 +92523,7 @@ impl Simulator {
                             cur_val.to_sv_string()
                         };
                         if let Some(pos) = keys.iter().position(|k| *k == cur) {
-                            if mname == "next" {
+                            if bm == BuiltinM::Next {
                                 if pos + 1 < keys.len() {
                                     Some(keys[pos + 1].clone())
                                 } else {
@@ -89930,7 +92801,7 @@ impl Simulator {
                 let ch = self.heap.len();
                 self.heap.push(Some(ClassInstance {
                     class_name: kind.to_string(),
-                    properties: HashMap::default(),
+                    properties: PropMap::default(),
                     type_bindings: HashMap::default(),
                     spec: None,
                     creation_scope: self.active_instance_scope(),
@@ -90290,18 +93161,51 @@ impl Simulator {
     /// non-collection / non-static names are returned unchanged. Applied
     /// centrally in `eval_builtin_method` so every builtin
     /// (push_back/size/pop_front/...) keys off the same spec-aware name.
-    fn spec_static_coll_key(&self, name: &str) -> String {
+    fn spec_static_coll_key<'n>(&self, name: &'n str) -> std::borrow::Cow<'n, str> {
         let this_h = self
             .this_stack
             .last()
             .copied()
             .flatten()
             .filter(|&h| h != 0);
+        // Instance method: collection storage is instance-scoped
+        // (`<handle>#name`), not static. A static method carries a ZERO
+        // `this` handle, so filter that out.
+        if this_h.is_some() {
+            return std::borrow::Cow::Borrowed(name);
+        }
         let Some(Some(ctx)) = self.class_context_stack.last().cloned() else {
-            let r = name.to_string();
-            return r;
+            return std::borrow::Cow::Borrowed(name);
         };
-        self.spec_static_coll_key_in_class(name, &ctx)
+        // Walk ctx's inheritance chain for a STATIC collection property.
+        // Static collections are registered in `static_collections`
+        // (name, is_assoc, width) — NOT queue_properties/assoc_properties,
+        // which are gated to non-static members during elaboration.
+        let mut cur = Some(ctx.clone());
+        while let Some(cn) = cur {
+            if let Some(cd) = self.module.classes.get(&cn) {
+                if cd.static_properties.contains(name)
+                    && cd.static_collections.iter().any(|(n, _, _)| n == name)
+                {
+                    if let Some(key) = self.static_prop_key(&ctx, name) {
+                        // Rewrite storage to the per-DECLARING-class key ONLY
+                        // when the bare name collides across classes (§8.9) or
+                        // the class is parameterized (`#spec`). A statically
+                        // unique collection name keeps the bare store the rest
+                        // of the runtime uses; rewriting it would split
+                        // storage and break the many bare-name accessors
+                        // (including the UVM phase machinery).
+                        if key.contains('#') || self.static_coll_name_collides(name) {
+                            return std::borrow::Cow::Owned(key);
+                        }
+                    }
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        std::borrow::Cow::Borrowed(name)
     }
 
     /// Resolve a bare static-collection member `name` to its storage key,
@@ -90746,7 +93650,7 @@ impl Simulator {
                 ) {
                     return false;
                 }
-                let lname = h.path[0].name.name.clone();
+                let lname: &str = h.path[0].name.name.as_str();
                 // A bare name that is a PROPERTY of `this` stores per-instance
                 // (each uvm_resource's `val` must keep its own interface);
                 // otherwise the flat local/static key.
@@ -90763,43 +93667,47 @@ impl Simulator {
                     .flatten()
                     .filter(|&th| th != 0)
                 {
-                    let mut cur = self
+                    let mut cur: Option<&str> = self
                         .heap
                         .get(th)
                         .and_then(|o| o.as_ref())
-                        .map(|i| i.class_name.clone());
+                        .map(|i| i.class_name.as_str());
                     while let Some(cn) = cur {
-                        let Some(cd) = self.module.classes.get(&cn) else { break };
-                        if cd.virtual_iface_properties.contains_key(&lname) {
+                        let Some(cd) = self.module.classes.get(cn) else { break };
+                        if cd.virtual_iface_properties.contains_key(lname) {
                             is_vif_prop_of = Some(th);
                             break;
                         }
-                        if cd.properties.contains_key(&lname) {
+                        if cd.properties.contains_key(lname) {
                             is_prop_of = Some(th);
                             break;
                         }
-                        cur = cd.extends.clone();
+                        cur = cd.extends.as_deref();
                     }
                 }
                 if let Some(th) = is_vif_prop_of {
                     if matches!(&rvalue.kind, ExprKind::Null) {
-                        self.virtual_iface_bindings.remove(&(th, lname.clone()));
+                        self.virtual_iface_bindings.remove(&(th, lname.to_string()));
                         return true;
                     }
                     if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
                         self.virtual_iface_bindings
-                            .insert((th, lname.clone()), (nm, None));
+                            .insert((th, lname.to_string()), (nm, None));
                         return true;
                     }
                     return false;
                 }
-                let key = match is_prop_of {
-                    Some(th) => format!("__vif_local__{}#{}", th, lname),
-                    None => format!("__vif_local__{}", lname),
+                let make_key = |is_prop_of: Option<usize>| -> String {
+                    match is_prop_of {
+                        Some(th) => format!("__vif_local__{}#{}", th, lname),
+                        None => format!("__vif_local__{}", lname),
+                    }
                 };
                 if matches!(&rvalue.kind, ExprKind::Null) {
+                    let key = make_key(is_prop_of);
                     self.signals.remove(&key);
                 } else if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
+                    let key = make_key(is_prop_of);
                     self.signals.insert(key, Value::from_string(&nm));
                 }
             }
@@ -90821,19 +93729,30 @@ impl Simulator {
                     {
                         return Some(Some(b.clone()));
                     }
-                    if self
-                        .signals
-                        .contains_key(&format!("__vif_local__{}#{}", th, raw))
-                    {
-                        return Some(
-                            self.signals
-                                .get(&format!("__vif_local__{}#{}", th, raw))
-                                .map(|v| v.to_sv_string()),
-                        );
+                    let hit = {
+                        let mut k = self.vif_key_scratch.borrow_mut();
+                        k.clear();
+                        {
+                            use std::fmt::Write as _;
+                            let _ = write!(k, "__vif_local__{}#{}", th, raw);
+                        }
+                        self.signals.get(k.as_str()).map(|v| v.to_sv_string())
+                    };
+                    if let Some(v) = hit {
+                        return Some(Some(v));
                     }
                 }
-                if let Some(v) = self.signals.get(&format!("__vif_local__{}", raw)) {
-                    return Some(Some(v.to_sv_string()));
+                let hit = {
+                    let mut k = self.vif_key_scratch.borrow_mut();
+                    k.clear();
+                    {
+                        use std::fmt::Write as _;
+                        let _ = write!(k, "__vif_local__{}", raw);
+                    }
+                    self.signals.get(k.as_str()).map(|v| v.to_sv_string())
+                };
+                if let Some(v) = hit {
+                    return Some(Some(v));
                 }
                 if let Some(b) = self.iface_alias_for(raw) {
                     return Some(Some(b));
@@ -90914,6 +93833,20 @@ impl Simulator {
     /// live interface instance — bound names always bottom out at one, so
     /// anything else (an ordinary variable, an indexed storage name) is
     /// rejected. Keeps the propagation hooks from polluting bindings.
+    /// Can a formal of this declared type be bound to a virtual interface?
+    /// `virtual x_if` / bare interface types and typedef references (which
+    /// may resolve to one) can; integral, real, string, struct, enum and
+    /// class-less simple types cannot.
+    #[inline]
+    fn formal_may_carry_vif(dt: &crate::ast::types::DataType) -> bool {
+        matches!(
+            dt,
+            crate::ast::types::DataType::Interface { .. }
+                | crate::ast::types::DataType::TypeReference { .. }
+                | crate::ast::types::DataType::Implicit { .. }
+        )
+    }
+
     fn resolve_vif_rhs_name_strict(&self, rvalue: &Expression) -> Option<String> {
         // `iface.member` where the dotted name is a real SIGNAL is a value
         // read, not a modport view — `dd1 = u.d` must not classify dd1 as a
@@ -90998,11 +93931,29 @@ impl Simulator {
                             }
                         }
                     }
+                    // A subroutine LOCAL `virtual ifc lv;` (the top frame owns
+                    // the name) binds in the frame's alias map, which travels
+                    // with the process context across a park. The global map
+                    // is keyed by the bare name only: two class tasks each
+                    // holding a local `lv` bound to different interfaces and
+                    // interleaved on delays saw each other's binding (a1's
+                    // `lv.id` read a2's interface after a2's task had run).
+                    let frame_local = self
+                        .local_stack
+                        .last()
+                        .is_some_and(|f| f.contains_key(name))
+                        && !self.local_iface_aliases.is_empty();
                     if matches!(&rvalue.kind, ExprKind::Null) {
                         // Clear the alias, then FALL THROUGH so the normal
                         // value path stores the null handle — keeping a
                         // later `vif == null` true.
-                        self.viface_var_aliases.remove(name);
+                        if frame_local {
+                            if let Some(f) = self.local_iface_aliases.last_mut() {
+                                f.remove(name);
+                            }
+                        } else {
+                            self.viface_var_aliases.remove(name);
+                        }
                     } else if matches!(&rvalue.kind, ExprKind::Call { .. }) {
                         // `vd = mgr.get_vif();` — run the call; the callee's
                         // return recorded the bound instance (see the Return
@@ -91011,7 +93962,13 @@ impl Simulator {
                         self.last_vif_return = None;
                         let v = self.eval_expr(rvalue);
                         if let Some(bound) = self.last_vif_return.take() {
-                            self.viface_var_aliases.insert(name.to_string(), bound);
+                            if frame_local {
+                                if let Some(f) = self.local_iface_aliases.last_mut() {
+                                    f.insert(name.to_string(), bound);
+                                }
+                            } else {
+                                self.viface_var_aliases.insert(name.to_string(), bound);
+                            }
                         }
                         self.assign_value(lvalue, &v);
                         return true;
@@ -91028,7 +93985,13 @@ impl Simulator {
                                 hsh ^= b as u64;
                                 hsh = hsh.wrapping_mul(0x100000001b3);
                             }
-                            self.viface_var_aliases.insert(name, bound);
+                            if frame_local {
+                                if let Some(f) = self.local_iface_aliases.last_mut() {
+                                    f.insert(name.clone(), bound);
+                                }
+                            } else {
+                                self.viface_var_aliases.insert(name, bound);
+                            }
                             self.assign_value(
                                 lvalue,
                                 &Value::from_u64((hsh & 0x7FFF_FFFF) | 1, 32),
@@ -91259,17 +94222,31 @@ impl Simulator {
                 // record the interface name in signals["__vif_local__<var>"] so a
                 // later `obj.vif_prop = local_var` can propagate the binding.
                 if let Some(th) = self.this_stack.last().copied().flatten() {
-                    let ikey = format!("__vif_local__{}#{}", th, raw);
-                    if let Some(iface_val) = self.signals.get(&ikey) {
-                        let s = iface_val.to_sv_string();
+                    let hit = {
+                        let mut k = self.vif_key_scratch.borrow_mut();
+                        k.clear();
+                        {
+                            use std::fmt::Write as _;
+                            let _ = write!(k, "__vif_local__{}#{}", th, raw);
+                        }
+                        self.signals.get(k.as_str()).map(|v| v.to_sv_string())
+                    };
+                    if let Some(s) = hit {
                         if !s.is_empty() {
                             return Some(s);
                         }
                     }
                 }
-                let local_key = format!("__vif_local__{}", raw);
-                if let Some(iface_val) = self.signals.get(&local_key) {
-                    let s = iface_val.to_sv_string();
+                let hit = {
+                    let mut k = self.vif_key_scratch.borrow_mut();
+                    k.clear();
+                    {
+                        use std::fmt::Write as _;
+                        let _ = write!(k, "__vif_local__{}", raw);
+                    }
+                    self.signals.get(k.as_str()).map(|v| v.to_sv_string())
+                };
+                if let Some(s) = hit {
                     if !s.is_empty() {
                         return Some(s);
                     }
@@ -92394,6 +95371,64 @@ impl Simulator {
         })
     }
 
+    /// §20.7: the instance-scoped store (`<handle>#<member>`) behind a
+    /// HANDLE-QUALIFIED array member operand — `a.M`, `this.M`. `new`
+    /// registers every fixed-size array property under that name in the
+    /// `arrays`/`arrays_2d`/`arrays_nd` tables, so once the operand resolves
+    /// to it the ordinary declared-bounds path answers the query.
+    ///
+    /// Both spellings the parser produces are accepted: an explicit
+    /// `MemberAccess`, and the flattened two-segment `Ident` — the same pair
+    /// `assign_class_collection_pattern` already resolves for whole-array
+    /// writes. Returns None unless the object's class, or an ancestor, really
+    /// declares `member` as a fixed-size array, which leaves a module
+    /// hierarchical path and a packed (non-array) member on their existing
+    /// paths.
+    fn handle_member_array_name(&self, expr: &Expression) -> Option<String> {
+        let (handle, member) = match &expr.kind {
+            ExprKind::MemberAccess { expr: base, member } => {
+                let h = match &base.kind {
+                    ExprKind::This => self.this_stack.last().copied().flatten()?,
+                    ExprKind::Ident(b) if b.path.len() == 1 && b.path[0].selects.is_empty() => {
+                        self.eval_ident_handle(&b.path[0].name.name)?
+                    }
+                    _ => return None,
+                };
+                (h, member.name.as_str())
+            }
+            ExprKind::Ident(hi)
+                if hi.path.len() == 2 && hi.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let base = &hi.path[0].name.name;
+                let h = if base == "this" || base == "super" {
+                    self.this_stack.last().copied().flatten()?
+                } else {
+                    self.eval_ident_handle(base)?
+                };
+                (h, hi.path[1].name.name.as_str())
+            }
+            _ => return None,
+        };
+        if handle == 0 {
+            return None;
+        }
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(c) = cur {
+            let Some(cd) = self.module.classes.get(&c) else { break };
+            if cd.array_properties.contains_key(member)
+                || cd.array_nd_properties.contains_key(member)
+            {
+                return Some(format!("{}#{}", handle, member));
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
         // §8.9: `Cls::member` / flattened `Cls.member` spellings of a static
         // fixed array resolve to the declaring class's store BEFORE the
@@ -92439,7 +95474,7 @@ impl Simulator {
             // the per-spec key builtins use ─ so `m[k]=v` stored its value
             // where the later `m[k]`/`exists` never looked (and vice-versa).
             if self.collection_is_static_in(&ctx, name) {
-                return Some(self.spec_static_coll_key(name));
+                return Some(self.spec_static_coll_key(name).into_owned());
             }
             return self.static_fixed_key_in(&ctx, name);
         };
@@ -92483,13 +95518,33 @@ impl Simulator {
             return Some(self.spec_static_coll_key_in_class(name, ctx));
         }
         // Miss: only the per-instance type-binding case can still match.
+        if self
+            .class_non_member_cache
+            .borrow()
+            .get(ctx)
+            .is_some_and(|set| set.contains(name))
+        {
+            return None;
+        }
         let mut cur: Option<&str> = Some(ctx);
+        let mut declared = false;
         while let Some(cn) = cur {
             let cd = self.module.classes.get(cn)?;
+            declared |= cd.properties.contains_key(name);
             if self.prop_bound_collection(handle, cn, name) {
                 return Some(format!("{}#{}", handle, name));
             }
             cur = cd.extends.as_deref();
+        }
+        if !declared {
+            // Not a property anywhere in the chain: the verdict cannot
+            // depend on this instance's type bindings, so it holds for
+            // every object of the class.
+            self.class_non_member_cache
+                .borrow_mut()
+                .entry(ctx.to_string())
+                .or_default()
+                .insert(name.to_string());
         }
         None
     }
@@ -92546,6 +95601,25 @@ impl Simulator {
     /// a property declared with a type parameter that this instance binds to
     /// a typedef carrying a dynamic/queue unpacked dimension (§6.20.3)?
     fn prop_bound_collection(&self, handle: usize, class_name: &str, member: &str) -> bool {
+        // Hit path without allocations: the cached raw type and the
+        // instance's binding are borrowed, and the dimension verdict is
+        // read by `&str`.
+        {
+            let cache = self.prop_raw_ty_cache.borrow();
+            if let Some(hit) = cache.get(class_name).and_then(|m| m.get(member)) {
+                let Some(raw) = hit.as_deref() else { return false };
+                let concrete: &str = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.type_bindings.get(raw))
+                    .map(String::as_str)
+                    .unwrap_or(raw);
+                if let Some(&v) = self.collection_dim_cache.borrow().get(concrete) {
+                    return v;
+                }
+            }
+        }
         let raw_ty: Option<String> = {
             let hit = self
                 .prop_raw_ty_cache
@@ -93082,9 +96156,37 @@ impl Simulator {
         }
     }
 
+    /// True when `e` is built only from literals, plain names, and
+    /// arithmetic — the shapes the elaboration-time constant folder can
+    /// settle without any per-call setup. A call, system call, `$bits(type)`,
+    /// or member access is left to the runtime paths: for those the folder
+    /// clones the whole function table (or typedef table) into a throwaway
+    /// elaboration shell on every attempt, and at runtime the attempt almost
+    /// always fails anyway (the function needs `this` or a live argument).
+    /// On the axi4 UVM base test that throwaway was 6.5 % of all samples.
+    fn const_fold_shape(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) => true,
+            ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
+            ExprKind::Unary { operand, .. } => Self::const_fold_shape(operand),
+            ExprKind::Paren(inner) => Self::const_fold_shape(inner),
+            ExprKind::Binary { left, right, .. } => {
+                Self::const_fold_shape(left) && Self::const_fold_shape(right)
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                Self::const_fold_shape(condition)
+                    && Self::const_fold_shape(then_expr)
+                    && Self::const_fold_shape(else_expr)
+            }
+            _ => false,
+        }
+    }
+
     fn eval_scalar_self(&self, e: &Expression) -> Option<i64> {
-        if let Some(v) = super::elaborate::const_eval_i64_with_params(e, None) {
-            return Some(v);
+        if Self::const_fold_shape(e) {
+            if let Some(v) = super::elaborate::const_eval_i64_with_params(e, None) {
+                return Some(v);
+            }
         }
         if let ExprKind::Ident(h) = &e.kind {
             if h.path.len() == 1 {
@@ -94194,6 +97296,30 @@ impl Simulator {
                     self.exec_task_call(&td, args);
                     return Value::zero(32);
                 }
+                // The same key under the resolution hint and its parents:
+                // `core.get_seq()` from a class method of an object built in
+                // `u_w` is `u_w.core.get_seq` (issue #155). Class bodies are
+                // not instance-rewritten, so the bare join misses.
+                {
+                    let hint = self.name_resolve_hint.borrow().clone();
+                    if let Some(hint) = hint.as_deref() {
+                        let mut scope = hint;
+                        loop {
+                            let scoped = format!("{}.{}", scope, joined);
+                            if let Some(fd) = self.fn_decl_rc(&scoped) {
+                                return self.exec_function_call(&fd, args);
+                            }
+                            if let Some(td) = self.module.tasks.get(&scoped).cloned() {
+                                self.exec_task_call(&td, args);
+                                return Value::zero(32);
+                            }
+                            match scope.rsplit_once('.') {
+                                Some((p, _)) => scope = p,
+                                None => break,
+                            }
+                        }
+                    }
+                }
                 // Collection builtin on the flattened receiver name.
                 if segs.len() >= 2 {
                     let mut recv_name = segs[..segs.len() - 1].join(".");
@@ -95101,14 +98227,14 @@ impl Simulator {
             if let ExprKind::Ident(hier) = &expr.kind {
                 let mut name = self.resolve_hier_name(hier);
                 if let Some(scoped) = self.instance_assoc_member(&name) {
-                    name = scoped;
+                    name = std::borrow::Cow::Owned(scoped);
                 }
                 if let Some(res) = self.eval_builtin_method(&name, mname, args) {
                     return res;
                 }
                 // Package scope resolution: `pkg::func(args)`. Only when LHS is an
                 // explicitly known package name — not a class, signal, or handle.
-                if hier.path.len() == 1 && self.module.packages.contains(&name) {
+                if hier.path.len() == 1 && self.module.packages.contains(&*name) {
                     // §26.3: `pkg::f(...)` calls THAT package's subroutine.
                     // Package subroutines are hoisted under their BARE name, so
                     // two packages declaring the same one collided and whichever
@@ -95124,7 +98250,7 @@ impl Simulator {
                         .or_else(|| self.module.functions.get(mname))
                         .cloned();
                     if let Some(fd) = fd {
-                        self.pending_pkg_scope = Some(name.clone());
+                        self.pending_pkg_scope = Some(name.to_string());
                         return self.exec_function_call(&fd, args);
                     }
                     let td = self
@@ -95134,7 +98260,7 @@ impl Simulator {
                         .or_else(|| self.module.tasks.get(mname))
                         .cloned();
                     if let Some(td) = td {
-                        self.pending_pkg_scope = Some(name.clone());
+                        self.pending_pkg_scope = Some(name.to_string());
                         self.exec_task_call(&td, args);
                         return Value::zero(32);
                     }
@@ -95158,9 +98284,9 @@ impl Simulator {
                     && !self
                         .local_stack
                         .last()
-                        .is_some_and(|m| m.contains_key(&name))
-                    && !self.signal_name_to_id.contains_key(name.as_str())
-                    && !self.signals.contains_key(&name)
+                        .is_some_and(|m| m.contains_key(&*name))
+                    && !self.signal_name_to_id.contains_key(name.as_ref())
+                    && !self.signals.contains_key(&*name)
                 {
                     // Type-parameter used as a class name: `Tregistry::get()`.
 
@@ -95205,13 +98331,13 @@ impl Simulator {
                         if let Some(v) = res {
                             return v;
                         }
-                    } else if self.module.classes.contains_key(&name) {
+                    } else if self.module.classes.contains_key(&*name) {
                         if let Some(res) = self.exec_static_method(&name, mname, args) {
                             return res;
                         }
                         // `ClassName::new(...)` — explicit constructor call.
                         if mname == "new" {
-                            if let Some(cd) = self.module.classes.get(&name).cloned() {
+                            if let Some(cd) = self.module.classes.get(&*name).cloned() {
                                 return self.instantiate_class(&cd, args);
                             }
                         }
@@ -95688,8 +98814,8 @@ impl Simulator {
                 }
             }
             if handle != 0 {
-                if let Some(Some(_)) = self.cg_heap.get(handle) {
-                    return self.exec_cg_method_call(handle, &member.name, args);
+                if let Some(idx) = self.cg_index(handle) {
+                    return self.exec_cg_method_call(idx, &member.name, args);
                 }
                 // §8.20: a NON-virtual method binds to the receiver's DECLARED
                 // type, not the object's runtime type. Dispatch always started
@@ -95814,14 +98940,7 @@ impl Simulator {
                     ))
             {
                 let m = path[len - 1].name.name.clone();
-                let base = HierarchicalIdentifier {
-                    root: hier.root.clone(),
-                    path: path[..len - 1].to_vec(),
-                    span: hier.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
-                };
-                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                let base_expr = self.method_receiver_expr(hier, len - 1);
                 if let Some(an) = self.expr_assoc_name(&base_expr) {
                     if let Some(res) = self.eval_builtin_method(&an, &m, args) {
                         return res;
@@ -95835,8 +98954,8 @@ impl Simulator {
                 if let ExprKind::Ident(bh) = &base_expr.kind {
                     let bn = self.resolve_hier_name(bh);
                     if self.is_associative_array(&bn)
-                        || self.module.arrays.contains_key(&bn)
-                        || self.module.dynamic_arrays.contains(&bn)
+                        || self.module.arrays.contains_key(&*bn)
+                        || self.module.dynamic_arrays.contains(&*bn)
                     {
                         if let Some(res) = self.eval_builtin_method(&bn, &m, args) {
                             return res;
@@ -95877,14 +98996,7 @@ impl Simulator {
                 )
             {
                 let m = path[len - 1].name.name.clone();
-                let base = HierarchicalIdentifier {
-                    root: hier.root.clone(),
-                    path: path[..len - 1].to_vec(),
-                    span: hier.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
-                };
-                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                let base_expr = self.method_receiver_expr(hier, len - 1);
                 let recv = self.eval_expr(&base_expr);
                 let recv_h = recv.to_u64().unwrap_or(0) as usize;
                 let is_user_method = recv_h != 0
@@ -95942,14 +99054,7 @@ impl Simulator {
                 )
             {
                 let m = path[len - 1].name.name.clone();
-                let base = HierarchicalIdentifier {
-                    root: hier.root.clone(),
-                    path: path[..len - 1].to_vec(),
-                    span: hier.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
-                };
-                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                let base_expr = self.method_receiver_expr(hier, len - 1);
                 // Guarded: a user class method (e.g. UVM's inherited
                 // `uvm_object::compare`) must NOT be shadowed by the string
                 // builtins dispatched by `string_method`.
@@ -95978,14 +99083,7 @@ impl Simulator {
                 )
             {
                 let m = path[len - 1].name.name.clone();
-                let base = HierarchicalIdentifier {
-                    root: hier.root.clone(),
-                    path: path[..len - 1].to_vec(),
-                    span: hier.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
-                };
-                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                let base_expr = self.method_receiver_expr(hier, len - 1);
                 // LRM §6.19.6: enum reflection on a hier-Ident receiver.
                 // Same logic as the MemberAccess branch above — but the
                 // parser flattens `c.next()` into `Call{Ident([c,next])}`
@@ -96144,7 +99242,7 @@ impl Simulator {
                                 Some(_) => self.eval_expr(&args[0]).to_sv_string(),
                                 None => String::new(),
                             };
-                            Value::from_u64(self.test_plusarg(&pat) as u64, 1)
+                            Value::from_u64(self.test_plusarg(&pat) as u64, 32)
                         }
                         "$value$plusargs" => self.eval_value_plusargs(args),
                         "$fopen" => self.open_file_handle(args),
@@ -96699,6 +99797,11 @@ impl Simulator {
                             .and_then(|v| v.to_u64())
                             .unwrap_or(0) as usize;
                     }
+                    // The walked-to property may be a covergroup instance
+                    // (`e.cg.sample()`, `e.cg.get_inst_coverage()`).
+                    if let Some(idx) = self.cg_index(handle) {
+                        return self.exec_cg_method_call(idx, method_name, args);
+                    }
                     if handle != 0 && handle < self.heap.len() && self.heap[handle].is_some() {
                         return self.exec_method_call(handle, method_name, args);
                     }
@@ -96814,8 +99917,8 @@ impl Simulator {
                                 }
                             }
                         }
-                        if handle < self.cg_heap.len() && self.cg_heap[handle].is_some() {
-                            return self.exec_cg_method_call(handle, method_name, args);
+                        if let Some(idx) = self.cg_index(handle) {
+                            return self.exec_cg_method_call(idx, method_name, args);
                         }
                         if handle < self.heap.len() && self.heap[handle].is_some() {
                             // §8.20: non-virtual methods bind to the DECLARED
@@ -96915,7 +100018,9 @@ impl Simulator {
                     full
                 };
                 let scope = full.rsplit_once('.').map(|(s, _)| s.to_string());
-                if let Some(fd) = self.module.functions.get(&full).cloned() {
+                // Refcounted declaration (see `fn_decl_rc`): this arm cloned the
+                // whole FunctionDeclaration AST on every scoped call.
+                if let Some(fd) = self.fn_decl_rc(&full) {
                     let saved = self.name_resolve_hint.borrow().clone();
                     *self.name_resolve_hint.borrow_mut() = scope.clone();
                     // §20.3: `$time`/`$realtime`/`%m` inside a subroutine reference
@@ -96939,13 +100044,31 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = saved;
                     return Value::zero(32);
                 }
+                // A METHOD on an object reached by a hierarchical path
+                // (`u_w.p.peek()`, the UVM-MS proxy pattern of issue #155):
+                // the callee parses as one identifier path, no subroutine
+                // has that flat name, and the call used to fall through the
+                // remaining fallbacks to a silent 0. Evaluate the prefix path
+                // as a variable; a live class handle takes the call.
+                {
+                    let mut recv = hier.clone();
+                    recv.path.pop();
+                    recv.cached_signal_id = std::cell::Cell::new(None);
+                    recv.cached_resolved_name = std::cell::OnceCell::new();
+                    let recv_expr = Expression::new(ExprKind::Ident(recv), func.span);
+                    let h = self.eval_expr(&recv_expr).to_u64().unwrap_or(0) as usize;
+                    if h != 0 && self.heap.get(h).and_then(|o| o.as_ref()).is_some() {
+                        let mname = hier.path.last().unwrap().name.name.clone();
+                        return self.exec_method_call(h, &mname, args);
+                    }
+                }
             }
             // Handle static/constructor call: class_name::f() or new()
             let name = &hier.path.last().unwrap().name.name;
             if let Some(class_def) = self.module.classes.get(name).cloned() {
                 return self.instantiate_class(&class_def, args);
             }
-            if let Some(cg_def) = self.module.covergroups.get(name).cloned() {
+            if let Some(cg_def) = self.covergroup_def_for(name) {
                 return self.instantiate_covergroup(&cg_def, args);
             }
             // DPI import call
@@ -97678,12 +100801,17 @@ impl Simulator {
         // `<base>.` marker for each unpacked-struct variable it owns, so an
         // expression rooted anywhere else costs one hash lookup.
         let root = Self::expr_root_ident(e)?;
-        let marker = format!("{}.", root);
-        if !self
+        // `"<root>."` marker probe without allocating: reuse one buffer.
+        let mut marker = std::mem::take(&mut self.marker_key_scratch);
+        marker.clear();
+        marker.push_str(root);
+        marker.push('.');
+        let has = self
             .local_stack
             .last()
-            .is_some_and(|l| l.contains_key(&marker))
-        {
+            .is_some_and(|l| l.contains_key(marker.as_str()));
+        self.marker_key_scratch = marker;
+        if !has {
             return None;
         }
         let flat = self.flat_member_name(e)?;
@@ -97830,6 +100958,26 @@ impl Simulator {
 
     /// Build a member-access lvalue for the write-back of a struct formal.
     /// See `bind_unpacked_struct_arg` for why the `Ident` form is preferred.
+    /// `<base>[i]` as an expression, for driving per-element decomposition.
+    fn index_expr(base: &Expression, i: i64) -> Expression {
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(base.clone()),
+                index: Box::new(Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: None,
+                        signed: true,
+                        base: NumberBase::Decimal,
+                        value: i.to_string(),
+                        cached_val: std::cell::Cell::new(None),
+                    }),
+                    base.span,
+                )),
+            },
+            base.span,
+        )
+    }
+
     fn struct_member_lvalue(base: &Expression, member: &str) -> Expression {
         if let ExprKind::Ident(hier) = &base.kind {
             let mut path = hier.path.clone();
@@ -97905,7 +101053,7 @@ impl Simulator {
                 frame.push((param.clone(), param.clone()));
             }
         }
-        Some((param, caller, prior))
+        Some((param, caller.to_string(), prior))
     }
 
     /// Drop a formal associative array's entries and registration. Restores
@@ -98013,12 +101161,39 @@ impl Simulator {
         // §18.5.12 / §13.5.2: the actual may be a fixed-array CLASS member
         // (`calculate_array_parity(payload_bytes)` inside a constraint), whose
         // storage lives at `<handle>#<member>`, not under the bare name.
-        if !self.module.arrays.contains_key(&caller) {
+        if !self.module.arrays.contains_key(&*caller) {
             if let Some(scoped) = self.instance_assoc_member(&caller) {
-                caller = scoped;
+                caller = std::borrow::Cow::Owned(scoped);
             }
         }
-        if !self.module.arrays.contains_key(&caller) {
+        // §13.5.2 multi-dimensional formal (`int a[R][C]`, `a[X][Y][Z]`): copy
+        // every element of the caller's array in under the formal's name and
+        // register the same shape, so element, `foreach`, `%p`, `$size` and
+        // whole-array uses inside the body see a real array; out/inout/ref
+        // copy back through `writeback_array_args`. Only the first dimension
+        // was handled before: a 2-D formal read x and never wrote back.
+        if dims.len() >= 2 {
+            let param = port.name.name.clone();
+            let suffixes = if let Some(&((a0, a1), (b0, b1), w)) = self.module.arrays_2d.get(&*caller) {
+                self.module.arrays_2d.insert(param.clone(), ((a0, a1), (b0, b1), w));
+                Self::nd_elem_suffixes(&[(a0, a1), (b0, b1)])
+            } else if let Some((shape, w)) = self.module.arrays_nd.get(&*caller).cloned() {
+                self.module.arrays_nd.insert(param.clone(), (shape.clone(), w));
+                Self::nd_elem_suffixes(&shape)
+            } else {
+                return None;
+            };
+            self.multi_dim_array_names.insert(param.clone());
+            if param != caller {
+                for sfx in &suffixes {
+                    if let Some(v) = self.get_signal_value_by_name(&format!("{}{}", caller, sfx)) {
+                        self.signals.insert(format!("{}{}", param, sfx), v);
+                    }
+                }
+            }
+            return Some((param, caller.to_string(), lo, hi));
+        }
+        if !self.module.arrays.contains_key(&*caller) {
             return None;
         }
         let param = port.name.name.clone();
@@ -98039,15 +101214,126 @@ impl Simulator {
                 self.signals.insert(format!("{}[{}]", param, idx), v);
             }
         }
-        let w = self.module.arrays.get(&caller).map(|t| t.2).unwrap_or(32);
+        let w = self.module.arrays.get(&*caller).map(|t| t.2).unwrap_or(32);
         self.module.arrays.insert(param.clone(), (lo, hi, w));
-        Some((param, caller, lo, hi))
+        Some((param, caller.to_string(), lo, hi))
     }
 
     /// Copy an array formal's elements back onto the caller's array, then drop
     /// the formal's element signals.
+    /// `[i][j]…` element suffixes of an N-dimensional shape, row-major.
+    fn nd_elem_suffixes(dims: &[(i64, i64)]) -> Vec<String> {
+        let mut out: Vec<String> = vec![String::new()];
+        for &(d0, d1) in dims {
+            let (lo, hi) = (d0.min(d1), d0.max(d1));
+            let mut next = Vec::with_capacity(out.len() * ((hi - lo + 1).max(0) as usize));
+            for prefix in &out {
+                for i in lo..=hi {
+                    next.push(format!("{}[{}]", prefix, i));
+                }
+            }
+            out = next;
+        }
+        out
+    }
+
+    /// Element suffixes of a name registered as a multi-dimensional array.
+    fn nd_formal_suffixes(&self, name: &str) -> Option<Vec<String>> {
+        if let Some(&(a, b, _)) = self.module.arrays_2d.get(name) {
+            return Some(Self::nd_elem_suffixes(&[a, b]));
+        }
+        if let Some((shape, _)) = self.module.arrays_nd.get(name) {
+            return Some(Self::nd_elem_suffixes(shape));
+        }
+        None
+    }
+
+    /// Drop the array registrations a formal received in `bind_array_arg`.
+    fn purge_array_formal(&mut self, param: &str) {
+        self.module.arrays.remove(param);
+        if self.module.arrays_2d.remove(param).is_some() | self.module.arrays_nd.remove(param).is_some() {
+            self.multi_dim_array_names.remove(param);
+        }
+    }
+
+    /// An unpacked-array operand as `(base, element suffixes)`: a whole
+    /// N-D array (`v`), a row of one (`v[1]` -> base `v[1]`, suffixes over
+    /// the remaining dimensions), or a plain fixed 1-D array. `None` for
+    /// anything else (dynamic / associative / queue / scalar).
+    fn nd_array_operand(&mut self, e: &Expression) -> Option<(String, Vec<String>, bool)> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                let name = self.resolve_hier_name(h);
+                if let Some(sfx) = self.nd_formal_suffixes(&name) {
+                    return Some((name.to_string(), sfx, true));
+                }
+                if let Some(&(lo, hi, _)) = self.module.arrays.get(&*name) {
+                    if !self.module.dynamic_arrays.contains(&*name) {
+                        let desc = self.module.descending_arrays.contains(&*name);
+                        let mut sfx: Vec<String> = (lo..=hi).map(|i| format!("[{}]", i)).collect();
+                        if desc {
+                            sfx.reverse();
+                        }
+                        return Some((name.to_string(), sfx, false));
+                    }
+                }
+                None
+            }
+            ExprKind::Index { expr, index } => {
+                let ExprKind::Ident(h) = &expr.kind else { return None };
+                if !h.path.iter().all(|s| s.selects.is_empty()) {
+                    return None;
+                }
+                let name = self.resolve_hier_name(h);
+                let rest: Vec<(i64, i64)> = if let Some(&(_, b, _)) = self.module.arrays_2d.get(&*name) {
+                    vec![b]
+                } else if let Some((shape, _)) = self.module.arrays_nd.get(&*name) {
+                    if shape.len() < 2 {
+                        return None;
+                    }
+                    shape[1..].to_vec()
+                } else {
+                    return None;
+                };
+                let i = self.eval_expr(index).to_i64()?;
+                Some((format!("{}[{}]", name, i), Self::nd_elem_suffixes(&rest), true))
+            }
+            _ => None,
+        }
+    }
+
+    /// `w = v` / `r = v[1]` / `v[1] = r` over multi-dimensional unpacked
+    /// arrays. Returns true when it performed the copy.
+    fn copy_multi_dim_array(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        if self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty() {
+            return false;
+        }
+        let Some((lbase, lsfx, l_nd)) = self.nd_array_operand(lvalue) else { return false };
+        let Some((rbase, rsfx, r_nd)) = self.nd_array_operand(rvalue) else { return false };
+        if !(l_nd || r_nd) || (lbase == rbase && lsfx == rsfx) {
+            return false;
+        }
+        for (ls, rs) in lsfx.iter().zip(rsfx.iter()) {
+            let v = self
+                .get_signal_value_by_name(&format!("{}{}", rbase, rs))
+                .unwrap_or_else(|| Value::zero(32));
+            self.set_signal_value_by_name(&format!("{}{}", lbase, ls), v);
+        }
+        true
+    }
+
     fn writeback_array_args(&mut self, wb: &[(String, String, i64, i64)]) {
         for (param, caller, lo, hi) in wb {
+            if let Some(sfxs) = self.nd_formal_suffixes(param) {
+                if param != caller {
+                    for sfx in sfxs {
+                        if let Some(v) = self.get_signal_value_by_name(&format!("{}{}", param, sfx)) {
+                            self.set_signal_value_by_name(&format!("{}{}", caller, sfx), v);
+                        }
+                    }
+                }
+                continue;
+            }
             // §7.2: elements of an UNPACKED-struct array are member leaves, so
             // copying `a[i]` alone wrote nothing back — an `output pkt_t a[3]`
             // formal left every member of the caller's array untouched.
@@ -98565,11 +101851,21 @@ impl Simulator {
         // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
         // records its interface under the formal's name (cleared otherwise so
         // a stale same-named formal from an earlier call can't leak).
+        // Only a formal whose declared type can name an interface (`virtual
+        // x_if v`, or a typedef that may resolve to one) can carry a vif;
+        // an `int`/`bit`/`string` formal never had a key to set or clear, so
+        // the per-port format + resolve + hash was pure overhead on every
+        // call of every function.
+        let mut vif_keyed: Vec<&str> = Vec::new();
         for (i, port) in fd.ports.iter().enumerate() {
+            if !Self::formal_may_carry_vif(&port.data_type) {
+                continue;
+            }
             let key = format!("__vif_local__{}", port.name.name);
             match args.get(i).and_then(|a| self.resolve_vif_rhs_name_strict(a)) {
                 Some(nm) => {
                     self.signals.insert(key, Value::from_string(&nm));
+                    vif_keyed.push(port.name.name.as_str());
                 }
                 None => {
                     self.signals.remove(&key);
@@ -99081,7 +102377,7 @@ impl Simulator {
             for k in keys {
                 self.signals.remove(&k);
             }
-            self.module.arrays.remove(param);
+            self.purge_array_formal(param);
         }
         // Copy `output`/`inout`/`ref` formals back to the caller's actuals
         // before popping this frame's locals.
@@ -99111,7 +102407,7 @@ impl Simulator {
             // A vif binding recorded on the formal (out/inout) propagates to
             // the caller's actual — instance prop or another plain name.
             let key = format!("__vif_local__{}", pn);
-            if self.signals.contains_key(&key) {
+            if vif_keyed.iter().any(|k| *k == pn) && self.signals.contains_key(&key) {
                 let synth = Expression::new(
                     ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
                         root: None,
@@ -99206,6 +102502,8 @@ impl Simulator {
         }
         self.ref_binding_stack.pop();
         self.ref_alias_stack.pop();
+        self.ref_identity_stack.pop();
+        self.refresh_ref_redirect_hot();
         self.local_iface_aliases.pop();
         self.continue_flag = c.saved_continue;
         self.sync_static_locals();
@@ -99259,7 +102557,7 @@ impl Simulator {
             for k in keys {
                 self.signals.remove(&k);
             }
-            self.module.arrays.remove(param_name);
+            self.purge_array_formal(param_name);
         }
         self.break_flag = c.saved_break;
         self.return_flag = c.saved_return;
@@ -99541,6 +102839,9 @@ impl Simulator {
         // records its interface under the formal's name (cleared otherwise so
         // a stale same-named formal from an earlier call can't leak).
         for (i, port) in td.ports.iter().enumerate() {
+            if !Self::formal_may_carry_vif(&port.data_type) {
+                continue;
+            }
             let key = format!("__vif_local__{}", port.name.name);
             match args.get(i).and_then(|a| self.resolve_vif_rhs_name_strict(a)) {
                 Some(nm) => {
@@ -99553,6 +102854,7 @@ impl Simulator {
         }
         let mut assoc_params: Vec<(String, String, bool)> = Vec::new(); // (param_name, caller_array_name, is_out)
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
+        let mut identity_formals: Vec<String> = Vec::new(); // ref aggregates bound by identity
         self.push_queue_frame();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
@@ -99668,7 +102970,7 @@ impl Simulator {
                     self.module
                         .associative_arrays
                         .insert(param_name.clone(), is_string_key);
-                    assoc_params.push((param_name, caller_name, assoc_is_out));
+                    assoc_params.push((param_name, caller_name.to_string(), assoc_is_out));
                 }
                 continue;
             }
@@ -99701,7 +103003,8 @@ impl Simulator {
                     ) {
                         continue;
                     }
-                    if std::env::var("XEZIM_REF_DBG").is_ok() {
+                    static REF_DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *REF_DBG.get_or_init(|| std::env::var_os("XEZIM_REF_DBG").is_some()) {
                         eprintln!("[REFDBG] task-ref formal={} dims={}", port.name.name, port.dimensions.len());
                     }
                     // §13.5.2: a ref formal with UNPACKED dimensions
@@ -99711,6 +103014,7 @@ impl Simulator {
                     // array with the placeholder x (audit46 a10: the
                     // reference keeps '{11,12,13}).
                     if !port.dimensions.is_empty() {
+                        identity_formals.push(port.name.name.clone());
                         continue;
                     }
                     let val = if i < args.len() {
@@ -99806,7 +103110,23 @@ impl Simulator {
                 if let Some(frozen) = self.ref_alias_target(&args[i]) {
                     alias_map.insert(port.name.name.clone(), frozen);
                 }
-                ref_map.insert(port.name.name.clone(), args[i].clone());
+                // Chained identity binding: an actual that is itself the
+                // caller's identity-bound formal resolves to the caller's
+                // actual (the callee's frames are not pushed yet, so the top
+                // of the stacks is the caller's). Without this a formal named
+                // like its actual rewrote `a` to `a` forever.
+                let mut actual = args[i].clone();
+                if let ExprKind::Ident(h) = &actual.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        let n = h.path[0].name.name.clone();
+                        if self.ref_identity_stack.last().is_some_and(|v| v.iter().any(|x| *x == n)) {
+                            if let Some(up) = self.ref_binding_stack.last().and_then(|m| m.get(&n)).cloned() {
+                                actual = up;
+                            }
+                        }
+                    }
+                }
+                ref_map.insert(port.name.name.clone(), actual);
             }
         }
         // An aliased ref writes through during the call — a return copy-out
@@ -99815,7 +103135,21 @@ impl Simulator {
         // the callee's stale copy).
         output_bindings.retain(|(n, _)| !alias_map.contains_key(n));
         self.ref_binding_stack.push(ref_map);
+        // A `ref` formal whose actual has the SAME name (`sum(ref int cnt)`
+        // called as `sum(cnt)`) cannot be steered by the alias map: the
+        // redirect would rewrite the name to itself (see
+        // `ref_formal_redirect_hier`). Drop its frame copy instead, so plain
+        // resolution reaches the actual's storage for reads and writes.
+        if let Some(frame) = self.local_stack.last_mut() {
+            for (formal, storage) in &alias_map {
+                if formal == storage {
+                    frame.remove(formal);
+                }
+            }
+        }
         self.ref_alias_stack.push(alias_map);
+        self.ref_identity_stack.push(identity_formals);
+        self.refresh_ref_redirect_hot();
         self.return_value = None;
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
@@ -99918,6 +103252,35 @@ impl Simulator {
         }
     }
 
+    /// The covergroup definition `new` instantiates for a type name: inside
+    /// a class, the class's OWN `Class::cg` (walking `extends`) wins over
+    /// the bare name, so a derived class that redeclares `cg` gets its own
+    /// coverpoints (§19.3); elsewhere the bare name.
+    fn covergroup_def_for(&self, tname: &str) -> Option<CovergroupDeclaration> {
+        let ctx: Option<String> = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .filter(|&h| h != 0)
+            .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()).map(|i| i.class_name.clone()))
+            .or_else(|| self.class_context_stack.last().cloned().flatten());
+        let mut cur = ctx;
+        while let Some(cn) = cur {
+            let base = cn.split('#').next().unwrap_or(&cn).to_string();
+            let key = format!("{}::{}", base, tname);
+            if let Some(d) = self.module.covergroups.get(&key) {
+                // The instance remembers the QUALIFIED key (sampling and
+                // coverage look the definition up by the instance's name).
+                let mut d = d.clone();
+                d.name.name = key;
+                return Some(d);
+            }
+            cur = self.module.classes.get(&base).and_then(|cd| cd.extends.clone());
+        }
+        self.module.covergroups.get(tname).cloned()
+    }
+
     fn instantiate_covergroup(
         &mut self,
         cg_def: &CovergroupDeclaration,
@@ -99926,6 +103289,21 @@ impl Simulator {
         let handle = self.cg_heap.len();
         let instance = CovergroupInstance {
             cg_name: cg_def.name.name.clone(),
+            owner: self.this_stack.last().copied().flatten().filter(|&h| h != 0),
+            ctor_args: {
+                let mut bound = Vec::new();
+                for (i, port) in cg_def.ports.iter().enumerate() {
+                    let v = if let Some(a) = _args.get(i) {
+                        self.eval_expr(a)
+                    } else if let Some(d) = &port.default {
+                        self.eval_expr(d)
+                    } else {
+                        Value::zero(32)
+                    };
+                    bound.push((port.name.name.clone(), v));
+                }
+                bound
+            },
             point_hits: HashMap::default(),
             bin_hits: HashMap::default(),
             point_history: HashMap::default(),
@@ -99954,7 +103332,24 @@ impl Simulator {
             self.cg_event_waiters.push((handle, resolved));
         }
 
-        Value::from_u64(handle as u64, 32)
+        // Tagged so a covergroup handle can never be mistaken for a class
+        // handle: both are small heap indices, and the receiver dispatch
+        // probed `cg_heap` first — class object 1 was dispatched as
+        // covergroup 1 and its method body never ran.
+        Value::from_u64((CG_HANDLE_TAG + handle) as u64, 32)
+    }
+
+    /// Decode a tagged covergroup handle to its `cg_heap` index.
+    fn cg_index(&self, handle: usize) -> Option<usize> {
+        if handle < CG_HANDLE_TAG {
+            return None;
+        }
+        let i = handle - CG_HANDLE_TAG;
+        if i < self.cg_heap.len() && self.cg_heap[i].is_some() {
+            Some(i)
+        } else {
+            None
+        }
     }
 
     fn exec_cg_method_call(
@@ -99988,7 +103383,41 @@ impl Simulator {
                 }
             }
             "sample" => {
-                self.sample_covergroup(handle);
+                // §19.8.1 `with function sample(formals)`: bind the call's
+                // arguments to the formals (fitted to their declared width)
+                // for the duration of this sample. They were dropped before,
+                // so every coverpoint over a sample argument read x.
+                let formals: Vec<crate::ast::decl::FunctionPort> = self
+                    .cg_heap
+                    .get(handle)
+                    .and_then(|x| x.as_ref())
+                    .and_then(|i| self.module.covergroups.get(&i.cg_name))
+                    .map(|d| d.sample_ports.clone())
+                    .unwrap_or_default();
+                if formals.is_empty() {
+                    self.sample_covergroup(handle);
+                } else {
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    for (i, port) in formals.iter().enumerate() {
+                        let mut v = match _args.get(i) {
+                            Some(a) => self.eval_expr(a),
+                            None => match &port.default {
+                                Some(d) => self.eval_expr(d),
+                                None => Value::zero(32),
+                            },
+                        };
+                        if let Some((w, signed)) = self.scalar_formal_integral(&port.data_type) {
+                            if w > 0 && w != v.width {
+                                v = v.resize(w);
+                            }
+                            v.is_signed = signed;
+                        }
+                        frame.insert(port.name.name.clone(), v);
+                    }
+                    self.push_local_frame(frame);
+                    self.sample_covergroup(handle);
+                    self.pop_local_frame();
+                }
                 Value::zero(32)
             }
             _ => Value::zero(32),
@@ -100051,21 +103480,31 @@ impl Simulator {
         // this many times (per-coverpoint override falls back to the covergroup
         // option, then the LRM default of 1). §19.7 option.weight: each item's
         // weight in the covergroup's (weighted) mean.
-        fn opt_u64(e: &crate::ast::expr::Expression) -> Option<u64> {
-            match &e.kind {
-                ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
-                    let radix = match base {
-                        crate::ast::expr::NumberBase::Decimal => 10,
-                        crate::ast::expr::NumberBase::Hex => 16,
-                        crate::ast::expr::NumberBase::Octal => 8,
-                        crate::ast::expr::NumberBase::Binary => 2,
-                    };
-                    u64::from_str_radix(&value.replace('_', ""), radix).ok()
+        // Bin bounds are literals or (§19.3) the instance's constructor
+        // formals: `bins r = {[lo:hi]}` with `new(2, 5)`.
+        let ctor: &[(String, Value)] = insts.first().map(|i| i.ctor_args.as_slice()).unwrap_or(&[]);
+        let opt_u64 = |e: &crate::ast::expr::Expression| -> Option<u64> {
+            fn lit(e: &crate::ast::expr::Expression, ctor: &[(String, Value)]) -> Option<u64> {
+                match &e.kind {
+                    ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
+                        let radix = match base {
+                            crate::ast::expr::NumberBase::Decimal => 10,
+                            crate::ast::expr::NumberBase::Hex => 16,
+                            crate::ast::expr::NumberBase::Octal => 8,
+                            crate::ast::expr::NumberBase::Binary => 2,
+                        };
+                        u64::from_str_radix(&value.replace('_', ""), radix).ok()
+                    }
+                    ExprKind::Paren(i) => lit(i, ctor),
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => ctor
+                        .iter()
+                        .find(|(n, _)| *n == h.path[0].name.name)
+                        .and_then(|(_, v)| v.to_u64()),
+                    _ => None,
                 }
-                ExprKind::Paren(i) => opt_u64(i),
-                _ => None,
             }
-        }
+            lit(e, ctor)
+        };
         let cg_at_least = def
             .items
             .iter()
@@ -100114,8 +103553,22 @@ impl Simulator {
                         // up to `auto_bin_max` (default 64) bins; coverage is the
                         // fraction of those bins hit — NOT 100% the moment
                         // anything is sampled. Width comes from a sampled value
-                        // (all share the coverpoint's width).
-                        const AUTO_BIN_MAX: u64 = 64;
+                        // (all share the coverpoint's width). §19.7.1
+                        // `option.auto_bin_max`: the coverpoint's own option,
+                        // else the covergroup's, else 64.
+                        #[allow(non_snake_case)]
+                        let AUTO_BIN_MAX: u64 = cp
+                            .options
+                            .iter()
+                            .find_map(|(n, v)| (n == "auto_bin_max").then(|| opt_u64(v)).flatten())
+                            .or_else(|| {
+                                def.items.iter().find_map(|it| match it {
+                                    CovergroupItem::Option { name, val } if name == "auto_bin_max" => opt_u64(val),
+                                    _ => None,
+                                })
+                            })
+                            .filter(|&n| n > 0)
+                            .unwrap_or(64);
                         let width = insts
                             .iter()
                             .filter_map(|i| i.point_hits.get(&cp_name))
@@ -100308,6 +103761,31 @@ impl Simulator {
     }
 
     fn sample_covergroup(&mut self, handle: usize) {
+        let (owner, ctor_args) = match self.cg_heap.get(handle).and_then(|x| x.as_ref()) {
+            Some(i) => (i.owner, i.ctor_args.clone()),
+            None => return,
+        };
+        let has_args = !ctor_args.is_empty();
+        if has_args {
+            let mut frame: HashMap<String, Value> = HashMap::default();
+            for (n, v) in ctor_args {
+                frame.insert(n, v);
+            }
+            self.push_local_frame(frame);
+        }
+        if let Some(h) = owner {
+            self.this_stack.push(Some(h));
+            self.sample_covergroup_inner(handle);
+            self.this_stack.pop();
+        } else {
+            self.sample_covergroup_inner(handle);
+        }
+        if has_args {
+            self.pop_local_frame();
+        }
+    }
+
+    fn sample_covergroup_inner(&mut self, handle: usize) {
         let cg_name = if let Some(Some(inst)) = self.cg_heap.get(handle) {
             inst.cg_name.clone()
         } else {
@@ -101714,7 +105192,7 @@ impl Simulator {
         let handle = self.heap.len();
         let mut instance = ClassInstance {
             class_name: class_def.name.clone(),
-            properties: HashMap::default(),
+            properties: PropMap::default(),
             type_bindings: HashMap::default(),
             spec: None,
             creation_scope: self.active_instance_scope(),
@@ -102263,7 +105741,7 @@ impl Simulator {
                     let ch = self.heap.len();
                     self.heap.push(Some(ClassInstance {
                         class_name: kind.to_string(),
-                        properties: HashMap::default(),
+                        properties: PropMap::default(),
                         type_bindings: HashMap::default(),
                     spec: None,
                     creation_scope: self.active_instance_scope(),
@@ -102359,6 +105837,49 @@ impl Simulator {
                     let scoped = format!("{}#{}", handle, pname);
                     if let ExprKind::AssignmentPattern(items) = &init.kind {
                         let indices: Vec<i64> = (lo..=hi).collect();
+                        // §7.2/§18.4: an UNPACKED-STRUCT element has no single
+                        // cell — its members live as `<prop>[i].<m>` in the
+                        // instance property map, which is where the read path
+                        // (`class_unpacked_leaf`) looks. Storing the element as
+                        // one packed value under the signal name `<h>#<prop>[i]`
+                        // wrote something nothing reads, so every element of a
+                        // `localparam`/`const` array of unpacked structs came
+                        // back 0 — the shape a directed-stimulus table uses.
+                        // Decompose into the same cells the runtime element
+                        // write now uses.
+                        if let Some(su) = self.class_prop_struct(handle, &pname) {
+                            if Self::spreads_member_wise(&su) {
+                                let base = Expression::new(
+                                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![crate::ast::expr::HierPathSegment {
+                                            name: crate::ast::Identifier {
+                                                name: pname.clone(),
+                                                span: crate::ast::Span::dummy(),
+                                            },
+                                            selects: Vec::new(),
+                                        }],
+                                        span: crate::ast::Span::dummy(),
+                                        cached_signal_id: std::cell::Cell::new(None),
+                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                    }),
+                                    crate::ast::Span::dummy(),
+                                );
+                                let elems = self.pattern_elems(items, &indices);
+                                let owned: Vec<(usize, Option<Expression>)> = elems
+                                    .into_iter()
+                                    .map(|e| e.cloned())
+                                    .enumerate()
+                                    .collect();
+                                for (k, e) in owned {
+                                    if let Some(e) = e {
+                                        let elem = Self::index_expr(&base, indices[k]);
+                                        self.assign_class_unpacked_elem(&elem, &e, &su);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                         let elems = self.pattern_elems(items, &indices);
                         for (k, e) in elems.into_iter().enumerate() {
                             if let Some(e) = e {
@@ -102763,6 +106284,7 @@ impl Simulator {
                                 local_iface_aliases: Vec::new(),
                                 ref_binding_stack: Vec::new(),
             ref_alias_stack: Vec::new(),
+            ref_identity_stack: Vec::new(),
                                 queue_frame_saves: Vec::new(),
                                 task_cleanup: Vec::new(),
                                 local_dyn: Vec::new(),
@@ -104906,6 +108428,439 @@ impl Simulator {
         r
     }
 
+
+    /// Every `cond -> consequent` item of the class constraints, with
+    /// `Block`/`Soft` nesting flattened (top level and inside blocks).
+    fn class_implications<'a>(constraints: &'a [ClassConstraint]) -> Vec<(&'a Expression, ImpCons<'a>)> {
+        fn walk<'a>(item: &'a ConstraintItem, out: &mut Vec<(&'a Expression, ImpCons<'a>)>) {
+            match item {
+                ConstraintItem::Implication { condition, constraint, .. } => {
+                    out.push((condition, ImpCons::Item(constraint.as_ref())));
+                }
+                // `a -> b` inside a constraint block parses as ONE expression
+                // (LogImplies), never as ConstraintItem::Implication.
+                ConstraintItem::Expr(e) => {
+                    if let ExprKind::Binary { op: BinaryOp::LogImplies, left, right } =
+                        &Simulator::unparen(e).kind
+                    {
+                        out.push((left.as_ref(), ImpCons::Expr(right.as_ref())));
+                    }
+                }
+                ConstraintItem::Block(items) => items.iter().for_each(|i| walk(i, out)),
+                ConstraintItem::Soft(inner) => walk(inner, out),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for con in constraints {
+            for it in &con.items {
+                walk(it, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Rand properties named by an implication's consequent, each with the
+    /// value ranges the consequent allows for it (`None` = no countable
+    /// restriction). Handles `p inside {..}`, `!(p inside {..})`, `p == c`,
+    /// `p != c` and the relational forms; anything else contributes no
+    /// restriction. Ranges are within the property's unsigned domain.
+    fn consequent_domains_of(
+        &mut self,
+        cons: &ImpCons<'_>,
+        rand_props: &[(String, u32)],
+        out: &mut Vec<(String, Option<Vec<(i128, i128)>>)>,
+    ) {
+        match cons {
+            ImpCons::Item(item) => self.consequent_domains(item, rand_props, out),
+            ImpCons::Expr(e) => self.consequent_domains_expr(e, rand_props, out),
+        }
+    }
+
+    fn unparen(e: &Expression) -> &Expression {
+        let mut cur = e;
+        while let ExprKind::Paren(inner) = &cur.kind {
+            cur = inner.as_ref();
+        }
+        cur
+    }
+
+    fn consequent_domains_expr(
+        &mut self,
+        e: &Expression,
+        rand_props: &[(String, u32)],
+        out: &mut Vec<(String, Option<Vec<(i128, i128)>>)>,
+    ) {
+        let prop_of = |e: &Expression| -> Option<(String, u32)> {
+            if let ExprKind::Ident(h) = &Self::unparen(e).kind {
+                let n = &h.path.last()?.name.name;
+                return rand_props.iter().find(|(p, _)| p == n).cloned();
+            }
+            None
+        };
+        let full = |w: u32| -> i128 { if w >= 127 { i128::MAX } else { (1i128 << w) - 1 } };
+        let inside_ranges = |me: &mut Self, ranges: &[Expression]| -> Vec<(i128, i128)> {
+            let cr: Vec<ConstraintRange> = ranges
+                .iter()
+                .map(|r| match &r.kind {
+                    ExprKind::Range(lo, hi) => ConstraintRange::Range { lo: (**lo).clone(), hi: (**hi).clone() },
+                    _ => ConstraintRange::Value(r.clone()),
+                })
+                .collect();
+            me.cons_ranges_i128(&cr)
+        };
+        let e = Self::unparen(e);
+        // a consequent that is itself a block of `a && b` restrictions
+        if let ExprKind::Binary { op: BinaryOp::LogAnd, left, right } = &e.kind {
+            self.consequent_domains_expr(left, rand_props, out);
+            self.consequent_domains_expr(right, rand_props, out);
+            return;
+        }
+        match &e.kind {
+                ExprKind::Inside { expr, ranges } => {
+                    if let Some((n, _)) = prop_of(expr) {
+                        let rs = inside_ranges(self, ranges);
+                        out.push((n, Some(rs)));
+                    }
+                }
+                ExprKind::Unary { op: UnaryOp::LogNot, operand } => {
+                    if let ExprKind::Inside { expr, ranges } = &Self::unparen(operand).kind {
+                        if let Some((n, w)) = prop_of(expr) {
+                            let mut rs = inside_ranges(self, ranges);
+                            rs.sort();
+                            // complement within [0, 2^w)
+                            let mut comp: Vec<(i128, i128)> = Vec::new();
+                            let mut cur: i128 = 0;
+                            let top = full(w);
+                            for (lo, hi) in rs {
+                                let lo = lo.max(0);
+                                if lo > cur {
+                                    comp.push((cur, lo - 1));
+                                }
+                                cur = cur.max(hi + 1);
+                            }
+                            if cur <= top {
+                                comp.push((cur, top));
+                            }
+                            out.push((n, Some(comp)));
+                        }
+                    }
+                }
+                ExprKind::Binary { op, left, right } => {
+                    let (prop, other, flipped) = match (prop_of(left), prop_of(right)) {
+                        (Some(p), None) => (p, right, false),
+                        (None, Some(p)) => (p, left, true),
+                        _ => return,
+                    };
+                    let mut ids = HashSet::default();
+                    self.collect_expr_idents(other, &mut ids);
+                    if rand_props.iter().any(|(n, _)| ids.contains(n)) {
+                        return;
+                    }
+                    let c = self.eval_expr(other).to_u128() as i128;
+                    let top = full(prop.1);
+                    let eff = if flipped {
+                        match op {
+                            BinaryOp::Lt => BinaryOp::Gt,
+                            BinaryOp::Gt => BinaryOp::Lt,
+                            BinaryOp::Leq => BinaryOp::Geq,
+                            BinaryOp::Geq => BinaryOp::Leq,
+                            o => *o,
+                        }
+                    } else {
+                        *op
+                    };
+                    let rs: Option<Vec<(i128, i128)>> = match eff {
+                        BinaryOp::Eq => Some(vec![(c, c)]),
+                        BinaryOp::Neq => Some(vec![(0, c - 1), (c + 1, top)]),
+                        BinaryOp::Lt => Some(vec![(0, c - 1)]),
+                        BinaryOp::Leq => Some(vec![(0, c)]),
+                        BinaryOp::Gt => Some(vec![(c + 1, top)]),
+                        BinaryOp::Geq => Some(vec![(c, top)]),
+                        _ => None,
+                    };
+                    out.push((prop.0, rs));
+                }
+                _ => {}
+            }
+    }
+
+    fn consequent_domains(
+        &mut self,
+        item: &ConstraintItem,
+        rand_props: &[(String, u32)],
+        out: &mut Vec<(String, Option<Vec<(i128, i128)>>)>,
+    ) {
+        if let ConstraintItem::Expr(e) = item {
+            return self.consequent_domains_expr(e, rand_props, out);
+        }
+        let prop_of = |e: &Expression| -> Option<(String, u32)> {
+            if let ExprKind::Ident(h) = &Self::unparen(e).kind {
+                let n = &h.path.last()?.name.name;
+                return rand_props.iter().find(|(p, _)| p == n).cloned();
+            }
+            None
+        };
+        let full = |w: u32| -> i128 { if w >= 127 { i128::MAX } else { (1i128 << w) - 1 } };
+        let inside_ranges = |me: &mut Self, ranges: &[Expression]| -> Vec<(i128, i128)> {
+            let cr: Vec<ConstraintRange> = ranges
+                .iter()
+                .map(|r| match &r.kind {
+                    ExprKind::Range(lo, hi) => ConstraintRange::Range { lo: (**lo).clone(), hi: (**hi).clone() },
+                    _ => ConstraintRange::Value(r.clone()),
+                })
+                .collect();
+            me.cons_ranges_i128(&cr)
+        };
+        match item {
+            ConstraintItem::Block(items) => {
+                for i in items {
+                    self.consequent_domains(i, rand_props, out);
+                }
+            }
+            ConstraintItem::Soft(inner) => self.consequent_domains(inner, rand_props, out),
+            ConstraintItem::Inside { expr, range, is_dist, .. } if !*is_dist => {
+                if let Some((n, _)) = prop_of(expr) {
+                    let rs = self.cons_ranges_i128(range);
+                    out.push((n, Some(rs)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// §18.5.10 without `solve … before`: every solution is equally likely,
+    /// so an antecedent whose value selects the size of the consequent
+    /// space must be drawn in proportion to that size. `sel inside {0,1,2}`
+    /// with `(sel==0) -> (addr inside {[512:1023]})`, `(sel==2) ->
+    /// !(addr inside {[512:1535]})` gives sel=2 almost always. Picking sel
+    /// uniformly and repairing addr afterwards gave one third each.
+    /// Returns None when the weights carry no information (uniform pick).
+    fn weighted_antecedent_pick(
+        &mut self,
+        handle: usize,
+        name: &str,
+        width: u32,
+        ranges: &[(i128, i128)],
+        constraints: &[ClassConstraint],
+        rand_props: &[(String, u32)],
+        solved: &HashMap<String, Value>,
+    ) -> Option<Value> {
+        let total: i128 = ranges.iter().map(|(lo, hi)| (hi - lo + 1).max(0)).sum();
+        if total <= 1 || total > 64 || width == 0 || width > 64 {
+            return None;
+        }
+        let imps = Self::class_implications(constraints);
+        if imps.is_empty() {
+            return None;
+        }
+        // Only implications whose condition reads this property and no
+        // other unsolved rand property.
+        let mine: Vec<(&Expression, ImpCons<'_>)> = imps
+            .into_iter()
+            .filter(|(cond, _)| {
+                let mut ids = HashSet::default();
+                self.collect_expr_idents(cond, &mut ids);
+                ids.contains(name)
+                    && !rand_props
+                        .iter()
+                        .any(|(n, _)| n != name && ids.contains(n) && !solved.contains_key(n))
+            })
+            .collect();
+        if mine.is_empty() {
+            return None;
+        }
+        let cands: Vec<i128> = ranges
+            .iter()
+            .flat_map(|(lo, hi)| (*lo..=*hi))
+            .filter(|c| *c >= 0)
+            .collect();
+        let saved = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| i.properties.get(name).cloned());
+        let full = |w: u32| -> f64 { 2f64.powi(w.min(127) as i32) };
+        let mut weights: Vec<f64> = Vec::with_capacity(cands.len());
+        self.this_stack.push(Some(handle));
+        for &c in &cands {
+            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                inst.properties.insert(name.to_string(), Value::from_u64(c as u64, width));
+            }
+            // per consequent property: the allowed count under the fired
+            // consequents, or the full domain when none fires for it
+            let mut per: HashMap<String, f64> = HashMap::default();
+            let mut feasible = true;
+            for (cond, cons) in &mine {
+                if !self.eval_expr(cond).is_true() {
+                    continue;
+                }
+                let mut doms = Vec::new();
+                self.consequent_domains_of(cons, rand_props, &mut doms);
+                for (pn, rs) in doms {
+                    if pn == name || solved.contains_key(&pn) {
+                        continue;
+                    }
+                    let Some(rs) = rs else { continue };
+                    let cnt: f64 = rs.iter().map(|(lo, hi)| ((hi - lo + 1).max(0)) as f64).sum();
+                    let e = per.entry(pn).or_insert(f64::INFINITY);
+                    *e = e.min(cnt);
+                    if cnt <= 0.0 {
+                        feasible = false;
+                    }
+                }
+            }
+            let _ = full;
+            weights.push(if feasible { per.values().product::<f64>().max(f64::MIN_POSITIVE) } else { 0.0 });
+        }
+        self.this_stack.pop();
+        // Properties restricted for SOME candidates but not others: the
+        // unrestricted candidates get the full domain for them.
+        let mut restricted: HashSet<String> = HashSet::default();
+        {
+            self.this_stack.push(Some(handle));
+            for &c in &cands {
+                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                    inst.properties.insert(name.to_string(), Value::from_u64(c as u64, width));
+                }
+                for (cond, cons) in &mine {
+                    if self.eval_expr(cond).is_true() {
+                        let mut doms = Vec::new();
+                        self.consequent_domains_of(cons, rand_props, &mut doms);
+                        for (pn, rs) in doms {
+                            if rs.is_some() && pn != name && !solved.contains_key(&pn) {
+                                restricted.insert(pn);
+                            }
+                        }
+                    }
+                }
+            }
+            self.this_stack.pop();
+        }
+        if !restricted.is_empty() {
+            // recompute with the full-domain default for unrestricted props
+            self.this_stack.push(Some(handle));
+            for (k, &c) in cands.iter().enumerate() {
+                if weights[k] == 0.0 {
+                    continue;
+                }
+                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                    inst.properties.insert(name.to_string(), Value::from_u64(c as u64, width));
+                }
+                let mut per: HashMap<String, f64> = restricted
+                    .iter()
+                    .map(|pn| {
+                        let w = rand_props.iter().find(|(n, _)| n == pn).map(|(_, w)| *w).unwrap_or(32);
+                        (pn.clone(), full(w))
+                    })
+                    .collect();
+                for (cond, cons) in &mine {
+                    if !self.eval_expr(cond).is_true() {
+                        continue;
+                    }
+                    let mut doms = Vec::new();
+                    self.consequent_domains_of(cons, rand_props, &mut doms);
+                    for (pn, rs) in doms {
+                        let Some(rs) = rs else { continue };
+                        if let Some(e) = per.get_mut(&pn) {
+                            let cnt: f64 = rs.iter().map(|(lo, hi)| ((hi - lo + 1).max(0)) as f64).sum();
+                            *e = e.min(cnt);
+                        }
+                    }
+                }
+                weights[k] = per.values().product::<f64>();
+            }
+            self.this_stack.pop();
+        }
+        // restore the property
+        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+            match saved {
+                Some(v) => {
+                    inst.properties.insert(name.to_string(), v);
+                }
+                None => {
+                    inst.properties.remove(name);
+                }
+            }
+        }
+        let sum: f64 = weights.iter().sum();
+        if !(sum > 0.0) || weights.iter().all(|w| (*w - weights[0]).abs() <= f64::EPSILON * weights[0].abs()) {
+            return None;
+        }
+        use rand::Rng;
+        let mut r: f64 = self.cur_rng().gen_range(0.0..sum);
+        let mut chosen = cands[cands.len() - 1];
+        for (k, &c) in cands.iter().enumerate() {
+            if r < weights[k] {
+                chosen = c;
+                break;
+            }
+            r -= weights[k];
+        }
+        Some(Value::from_u64(chosen as u64, width))
+    }
+
+    /// After a property is solved, implications whose condition now holds
+    /// narrow the allowed ranges of the still-unsolved properties their
+    /// consequents name, so those are drawn inside the consequent instead
+    /// of being repaired by retries.
+    fn narrow_from_fired_implications(
+        &mut self,
+        handle: usize,
+        constraints: &[ClassConstraint],
+        rand_props: &[(String, u32)],
+        solved: &HashMap<String, Value>,
+        allowed: &mut HashMap<String, Vec<(i128, i128)>>,
+    ) {
+        let imps = Self::class_implications(constraints);
+        if imps.is_empty() {
+            return;
+        }
+        self.this_stack.push(Some(handle));
+        for (cond, cons) in imps {
+            let mut ids = HashSet::default();
+            self.collect_expr_idents(cond, &mut ids);
+            // every rand property the condition reads must be solved
+            if rand_props.iter().any(|(n, _)| ids.contains(n) && !solved.contains_key(n)) {
+                continue;
+            }
+            if !ids.iter().any(|i| rand_props.iter().any(|(n, _)| n == i)) {
+                continue;
+            }
+            if !self.eval_expr(cond).is_true() {
+                continue;
+            }
+            let mut doms = Vec::new();
+            self.consequent_domains_of(&cons, rand_props, &mut doms);
+            for (pn, rs) in doms {
+                let Some(rs) = rs else { continue };
+                if solved.contains_key(&pn) || rs.is_empty() {
+                    continue;
+                }
+                let entry = allowed.entry(pn).or_default();
+                if entry.is_empty() {
+                    *entry = rs;
+                } else {
+                    // intersect
+                    let mut inter = Vec::new();
+                    for (alo, ahi) in entry.iter() {
+                        for (blo, bhi) in &rs {
+                            let lo = (*alo).max(*blo);
+                            let hi = (*ahi).min(*bhi);
+                            if lo <= hi {
+                                inter.push((lo, hi));
+                            }
+                        }
+                    }
+                    if !inter.is_empty() {
+                        *entry = inter;
+                    }
+                }
+            }
+        }
+        self.this_stack.pop();
+    }
+
     fn exec_randomize_inner(&mut self, handle: usize, inline: &[ConstraintItem]) -> Value {
         // Reset the dist-pick-once tracker so each randomize call gets a
         // fresh weighted draw per `(handle, prop)`.
@@ -105038,7 +108993,8 @@ impl Simulator {
                             if sig.is_signed {
                                 signed_rand_props.insert(prop.clone());
                             }
-                            if std::env::var_os("XEZIM_RAND_DBG").is_some() {
+                            static RAND_DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                            if *RAND_DBG.get_or_init(|| std::env::var_os("XEZIM_RAND_DBG").is_some()) {
                                 eprintln!("RPROP {} w={} signed={}", prop, sig.width, sig.is_signed);
                             }
                             if let Some(tn) = enum_t {
@@ -105314,7 +109270,23 @@ impl Simulator {
                     } else if *width <= 64 {
                         Value::from_u64(self.rng.r#gen(), *width)
                     } else {
-                        Value::zero(*width)
+                        // A `rand` property wider than 64 bits (a packed
+                        // multi-dimensional array such as `u7_t [4:0][1:0]`)
+                        // was "drawn" as all zeros; draw every bit, from the
+                        // same stream this loop already uses.
+                        let mut acc = Value::zero(*width);
+                        let mut bit = 0u32;
+                        while bit < *width {
+                            let chunk: u64 = self.rng.r#gen();
+                            let n = (*width - bit).min(64);
+                            for k in 0..n {
+                                if (chunk >> k) & 1 == 1 {
+                                    acc.set_bit((bit + k) as usize, LogicBit::One);
+                                }
+                            }
+                            bit += n;
+                        }
+                        acc
                     };
                     if let Some(Some(inst)) = self.heap.get_mut(handle) {
                         inst.properties.insert(name.clone(), v);
@@ -105755,7 +109727,23 @@ impl Simulator {
                     }
                 }
                 pids_to_solve = topo;
+            } else {
+                // Antecedents of implications first (see weighted_antecedent_pick).
+                let mut ante: HashSet<String> = HashSet::default();
+                for (cond, _) in Self::class_implications(&constraints) {
+                    let mut ids = HashSet::default();
+                    self.collect_expr_idents(cond, &mut ids);
+                    ante.extend(ids.into_iter().filter(|i| rand_props.iter().any(|(n, _)| n == i)));
+                }
+                if !ante.is_empty() {
+                    let (first, rest): (Vec<usize>, Vec<usize>) = pids_to_solve
+                        .iter()
+                        .copied()
+                        .partition(|&i| ante.contains(&rand_props[i].0));
+                    pids_to_solve = first.into_iter().chain(rest).collect();
+                }
             }
+            let has_solve_before = !solve_pairs.is_empty();
             let mut progress = true;
             while !pids_to_solve.is_empty() && progress {
                 progress = false;
@@ -105901,7 +109889,16 @@ impl Simulator {
                         // (signed) interval and keeps the property's signedness.
                         let sgn = signed_rand_props.contains(name);
                         if let Some(ranges) = prop_allowed_ranges.get(name).cloned() {
-                            if let Some(p) = self.pick_i128_range(&ranges, *width, sgn) {
+                            let weighted = if has_solve_before || sgn {
+                                None
+                            } else {
+                                self.weighted_antecedent_pick(
+                                    handle, name, *width, &ranges, &constraints, &rand_props, &solved_props,
+                                )
+                            };
+                            if let Some(p) = weighted {
+                                val = p;
+                            } else if let Some(p) = self.pick_i128_range(&ranges, *width, sgn) {
                                 val = p;
                             }
                         } else if let Some(et) = enum_prop_types.get(name) {
@@ -105920,6 +109917,9 @@ impl Simulator {
                         if let Some(Some(inst)) = self.heap.get_mut(handle) {
                             inst.properties.insert(name.clone(), val);
                         }
+                        self.narrow_from_fired_implications(
+                            handle, &constraints, &rand_props, &solved_props, &mut prop_allowed_ranges,
+                        );
                         pids_to_solve.remove(i);
                         progress = true;
                         continue;
@@ -106161,30 +110161,6 @@ impl Simulator {
             // constrained value; sizing it earlier yields the scalar's raw,
             // unconstrained draw and the `.size() == m.length` acceptance then
             // fails. `unique {}` runs last over the settled elements.
-            let mut pinned_elems: HashSet<String> = HashSet::default();
-            if !rand_colls.is_empty() {
-                self.solve_array_sizes(&rand_colls, &constraints);
-                // Fresh random baseline for every element of a dynamic /
-                // associative member (fixed arrays keep the legacy pool pass).
-                // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
-                // object handles that are randomized RECURSIVELY — never drawn
-                // as scalars, or the handle is overwritten with junk.
-                for c in &rand_colls {
-                    if c.kind == CollKind::Fixed || c.is_object_elem {
-                        continue;
-                    }
-                    for key in self.coll_elem_keys(c) {
-                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
-                        let v = self.draw_elem(c.width, prev);
-                        self.write_coll_elem(&key, v);
-                    }
-                }
-                self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
-                self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
-                for c in &unique_colls {
-                    self.enforce_unique_coll(c, &constraints, &pinned_elems);
-                }
-            }
 
             // Push rand SCALAR enum fields off any reserved value implied by
             // `!(field inside {…})` / `field != X` exclusions. Iterated so
@@ -106243,102 +110219,11 @@ impl Simulator {
             }
 
             // Randomize rand fixed-array elements now that the scalar fields
-            // their exclusions reference (sp/tp/scratch_reg) are solved. For
-            // Collect array names that have a *positive* foreach constraint
-            // (`foreach (arr[i]) arr[i] inside {…}`); the rand_array loop
-            // would otherwise overwrite the per-index slices solve_forced
-            // wrote. Those arrays are still seeded by the later second
-            // solve_forced pass.
-            let foreach_constrained_arrays: HashSet<String> = {
-                let mut set = HashSet::default();
-                // Only a POSITIVE `arr[i] inside {…}` body is something
-                // solve_forced_array_elem can solve — only those arrays must
-                // be left to it. A negated-only body (`!(arr[i] inside {…})`,
-                // riscv-dv's gpr_c) is exclusion-shaped: the rand_array pool
-                // pass below handles it via collect_array_exclusions (and
-                // picks distinct elements), so such arrays must NOT be
-                // skipped here — skipping left gpr[0] free to keep ZERO and
-                // emit an illegal `la x0, _start`.
-                fn has_positive_inside(item: &ConstraintItem) -> bool {
-                    match item {
-                        ConstraintItem::Expr(e) => match &e.kind {
-                            ExprKind::Inside { .. } => true,
-                            // §18.5.7: equality / relational element bodies
-                            // (`arr[i] == i + 5`, `arr[i] < K`) are also
-                            // solved per-index by solve_forced_array_elem,
-                            // so the pool pass must not re-seed them either.
-                            // Exactly ONE side must be an element ref —
-                            // cross-element relations (`arr[i] < arr[i+1]`)
-                            // are not solved there and keep pool seeding.
-                            ExprKind::Binary { op, left, right } => {
-                                let li = matches!(&left.kind, ExprKind::Index { .. });
-                                let ri = matches!(&right.kind, ExprKind::Index { .. });
-                                matches!(
-                                    op,
-                                    BinaryOp::Eq
-                                        | BinaryOp::Lt
-                                        | BinaryOp::Leq
-                                        | BinaryOp::Gt
-                                        | BinaryOp::Geq
-                                ) && (li != ri)
-                            }
-                            _ => false,
-                        },
-                        ConstraintItem::Inside { .. } => true,
-                        ConstraintItem::Block(items) => items.iter().any(has_positive_inside),
-                        ConstraintItem::Soft(inner) => has_positive_inside(inner),
-                        _ => false,
-                    }
-                }
-                fn walk(item: &ConstraintItem, out: &mut HashSet<String>) {
-                    if let ConstraintItem::Foreach {
-                        array, item: body, ..
-                    } = item
-                    {
-                        // Only skip the pool pass for arrays whose foreach body
-                        // has a POSITIVE `inside` (what solve_forced_array_elem
-                        // can solve); negated-only bodies are exclusion-shaped
-                        // and belong to the pool pass.
-                        if !has_positive_inside(body.as_ref()) {
-                            return;
-                        }
-                        let inner_h = match &array.kind {
-                            ExprKind::Index { expr: b, .. } => match &b.kind {
-                                ExprKind::Ident(h) => Some(h),
-                                _ => None,
-                            },
-                            ExprKind::Ident(h) => Some(h),
-                            _ => None,
-                        };
-                        if let Some(h) = inner_h {
-                            if !h.path.is_empty() {
-                                out.insert(h.path[0].name.name.clone());
-                            }
-                        }
-                    }
-                    if let ConstraintItem::Block(items) = item {
-                        for it in items {
-                            walk(it, out);
-                        }
-                    }
-                    if let ConstraintItem::Soft(inner) = item {
-                        walk(inner, out);
-                    }
-                }
-                for con in &constraints {
-                    for item in &con.items {
-                        walk(item, &mut set);
-                    }
-                }
-                set
-            };
+            // their exclusions reference (sp/tp/scratch_reg) are solved.
             // each element pick a valid enum member outside the array's
             // `foreach !(elem inside {…})` exclusion, distinct across the array
             // (best-effort `unique{}`).
             for (prop, scoped, lo, hi, width, enum_t) in &rand_arrays {
-                if foreach_constrained_arrays.contains(prop) {
-                    continue; // solve_forced will handle this in the next pass
-                }
                 let excluded = self.collect_array_exclusions(prop, &constraints);
                 let pool: Vec<u64> = if let Some(et) = enum_t {
                     self.module
@@ -106374,8 +110259,12 @@ impl Simulator {
                     } else {
                         0
                     };
-                    self.signals
-                        .insert(format!("{}[{}]", scoped, i), Value::from_u64(v, *width));
+                    let val = if !pool.is_empty() || *width <= 64 {
+                        Value::from_u64(v, *width)
+                    } else {
+                        self.random_value_of_width(*width)
+                    };
+                    self.signals.insert(format!("{}[{}]", scoped, i), val);
                 }
             }
 
@@ -106383,9 +110272,6 @@ impl Simulator {
             // shape, unless a positive foreach body owns the array (same
             // skip-set as the 1-D pool pass above).
             for (prop, scoped, shape, width) in &rand_nd_arrays {
-                if foreach_constrained_arrays.contains(prop) {
-                    continue; // solve_forced will handle this in the next pass
-                }
                 if shape.iter().any(|&(lo, hi)| hi < lo) {
                     continue;
                 }
@@ -106403,8 +110289,13 @@ impl Simulator {
                     } else {
                         0
                     };
-                    self.signals
-                        .insert(format!("{}{}", scoped, suffix), Value::from_u64(v, *width));
+                    // Elements wider than 64 bits were left at zero.
+                    let val = if *width <= 64 {
+                        Value::from_u64(v, *width)
+                    } else {
+                        self.random_value_of_width(*width)
+                    };
+                    self.signals.insert(format!("{}{}", scoped, suffix), val);
                     let mut k = shape.len();
                     loop {
                         if k == 0 {
@@ -106431,6 +110322,63 @@ impl Simulator {
             // multi-expression `unique {a, b, arr[0:2]}` desugars to (each `!=`
             // re-pick respects its target's declared range, so this cannot
             // knock a scalar out of its `inside` set).
+            // The array draws above run AFTER the first repair pass and
+            // overwrite whatever it wrote into array elements (`a[0] == 5`,
+            // foreach bodies). Arrays under a foreach used to be skipped
+            // instead, which left them undrawn: a zero that already satisfied
+            // `e[i] < 100` was kept, and repeated randomize() calls returned
+            // the same values. Draw everything, then repair the hard items and
+            // the foreach items once more against the fresh draws.
+            {
+                fn has_foreach(item: &ConstraintItem) -> bool {
+                    match item {
+                        ConstraintItem::Foreach { .. } => true,
+                        ConstraintItem::Block(items) => items.iter().any(has_foreach),
+                        ConstraintItem::Soft(inner) => has_foreach(inner),
+                        _ => false,
+                    }
+                }
+                for _pass in 0..4 {
+                    let mut changed = false;
+                    for item in constraints
+                        .iter()
+                        .flat_map(|c| c.items.iter())
+                        .chain(inline.iter())
+                        .filter(|it| !matches!(it, ConstraintItem::Soft(_)) || has_foreach(it))
+                    {
+                        if self.solve_forced(handle, item, &rand_set) {
+                            changed = true;
+                        }
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+            }
+            let mut pinned_elems: HashSet<String> = HashSet::default();
+            if !rand_colls.is_empty() {
+                self.solve_array_sizes(&rand_colls, &constraints);
+                // Fresh random baseline for every element of a dynamic /
+                // associative member (fixed arrays keep the legacy pool pass).
+                // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
+                // object handles that are randomized RECURSIVELY — never drawn
+                // as scalars, or the handle is overwritten with junk.
+                for c in &rand_colls {
+                    if c.kind == CollKind::Fixed || c.is_object_elem {
+                        continue;
+                    }
+                    for key in self.coll_elem_keys(c) {
+                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
+                        let v = self.draw_elem(c.width, prev);
+                        self.write_coll_elem(&key, v);
+                    }
+                }
+                self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
+                self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
+                for c in &unique_colls {
+                    self.enforce_unique_coll(c, &constraints, &pinned_elems);
+                }
+            }
             {
                 fn collect_unique_items<'a>(
                     item: &'a ConstraintItem,
@@ -108299,7 +112247,10 @@ impl Simulator {
                 // `foreach (m[i,j])` constraint found no range and was dropped
                 // silently — randomize() still returned 1 and every element
                 // came out unconstrained.
-                let Some((dims, elem_w)) = self.fixed_foreach_dims(handle, &arr_name) else {
+                let Some((dims, elem_w)) = self
+                    .fixed_foreach_dims(handle, &arr_name)
+                    .or_else(|| self.packed_prop_foreach_dims(handle, &arr_name))
+                else {
                     return false;
                 };
                 // One loop variable per leading dimension (§12.7.3).
@@ -108548,9 +112499,8 @@ impl Simulator {
                 let elem_name = format!("{}{}", arr_name, idx);
                 // A CLASS array element lives under the instance-scoped key;
                 // the bare name only exists for a module-level array.
-                let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
                 let cur = self
-                    .get_signal_value_by_name(&scoped_key)
+                    .class_elem_load(handle, arr_name, idx)
                     .or_else(|| self.get_signal_value_by_name(&elem_name))
                     .unwrap_or_else(|| Value::zero(32));
                 if self.value_in_ranges(&cur, range) {
@@ -108558,7 +112508,7 @@ impl Simulator {
                 }
                 let width = cur.width.max(32);
                 if let Some(picked) = self.pick_from_ranges(range, width, cur.is_signed) {
-                    self.signals.insert(scoped_key, picked.clone());
+                    self.class_elem_store(handle, arr_name, idx, picked.clone());
                     self.set_signal_value_by_name(&elem_name, picked.clone());
                     return true;
                 }
@@ -108597,8 +112547,7 @@ impl Simulator {
                     if let Some(picked) = self.pick_from_ranges(&cr, width, cur.is_signed) {
                         // Write to the scoped per-element key (`<handle>#arr[i]`)
                         // — the place exec_randomize wrote the random baseline.
-                        let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
-                        self.signals.insert(scoped_key, picked.clone());
+                        self.class_elem_store(handle, arr_name, idx, picked.clone());
                         // Also try the unscoped form for module-level arrays.
                         self.set_signal_value_by_name(&elem_name, picked);
                         return true;
@@ -108651,13 +112600,12 @@ impl Simulator {
                         (left, m)
                     };
                     let elem_name = format!("{}{}", arr_name, idx);
-                    let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
                     let cur = self
                         .get_signal_value_by_name(&elem_name)
-                        .or_else(|| self.signals.get(&scoped_key).cloned());
+                        .or_else(|| self.class_elem_load(handle, arr_name, idx));
                     let w = cur.as_ref().map(|v| v.width).unwrap_or(32).max(1);
                     let write_elem = |s: &mut Self, v: Value| {
-                        s.signals.insert(scoped_key.clone(), v.clone());
+                        s.class_elem_store(handle, arr_name, idx, v.clone());
                         s.set_signal_value_by_name(&elem_name, v);
                     };
                     match eff {
@@ -108785,6 +112733,66 @@ impl Simulator {
     /// The FIXED shape of a class rand array member, walking the inheritance
     /// chain: 1-D from `array_properties`, N-D from `array_nd_properties`.
     /// Returns (per-dimension bounds, element width).
+    /// foreach geometry of a packed multi-dimensional class property
+    /// (`bit [6:0] [4:0][1:0] d`): the packed dims normalised to (lo, hi)
+    /// and the width of one addressed element.
+    fn packed_prop_foreach_dims(
+        &self,
+        handle: usize,
+        arr_name: &str,
+    ) -> Option<(Vec<(i64, i64)>, u32)> {
+        let pd = self.class_prop_packed_dims(handle, arr_name)?;
+        let total = self.read_member_value(handle, arr_name)?.width as u64;
+        let ew = Self::packed_chain_width(total, &pd, pd.len()) as u32;
+        Some((pd.iter().map(|&(l, r)| (l.min(r), l.max(r))).collect(), ew))
+    }
+
+    fn parse_idx_suffix(idx: &str) -> Option<Vec<Value>> {
+        let mut out = Vec::new();
+        for part in idx.split('[').skip(1) {
+            let n: i64 = part.strip_suffix(']')?.trim().parse().ok()?;
+            out.push(Value::from_u64(n as u64, 32));
+        }
+        Some(out)
+    }
+
+    /// Read one element of a class array property addressed by an index
+    /// suffix (`[1][0]`): the per-element `<handle>#arr[1][0]` signal for
+    /// unpacked arrays, a bit slice of the property for packed ones.
+    fn class_elem_load(&self, handle: usize, arr_name: &str, idx: &str) -> Option<Value> {
+        if let Some(dims) = self.class_prop_packed_dims(handle, arr_name) {
+            let base = self.read_member_value(handle, arr_name)?;
+            let iv = Self::parse_idx_suffix(idx)?;
+            let (lsb, w) = Self::packed_chain_slice(base.width as u64, &dims, &iv)?;
+            return Some(base.range_select((lsb + w - 1) as usize, lsb as usize));
+        }
+        self.get_signal_value_by_name(&format!("{}#{}{}", handle, arr_name, idx))
+    }
+
+    fn class_elem_store(&mut self, handle: usize, arr_name: &str, idx: &str, v: Value) {
+        if let Some(dims) = self.class_prop_packed_dims(handle, arr_name) {
+            let (Some(cur), Some(iv)) = (
+                self.read_member_value(handle, arr_name),
+                Self::parse_idx_suffix(idx),
+            ) else {
+                return;
+            };
+            let Some((lsb, w)) = Self::packed_chain_slice(cur.width as u64, &dims, &iv) else {
+                return;
+            };
+            let piece = v.resize(w as u32);
+            let mut nv = cur;
+            for i in 0..(w as usize) {
+                nv.set_bit(lsb as usize + i, piece.get_bit(i));
+            }
+            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                inst.properties.insert(arr_name.to_string(), nv);
+            }
+            return;
+        }
+        self.signals.insert(format!("{}#{}{}", handle, arr_name, idx), v);
+    }
+
     fn fixed_foreach_dims(
         &self,
         handle: usize,
@@ -109867,7 +113875,7 @@ impl Simulator {
                 // clobbered by unrelated scopes (UVM config_db's `imp`).
                 let mut frame_class_formals: Vec<(String, String)> = Vec::new();
                 for (i, port) in ports.iter().enumerate() {
-                    if matches!(self.resolve_dt(&port.data_type), DataType::Struct(_)) {
+                    if matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_)) {
                         self.register_formal_type_metadata(
                             &port.name.name,
                             &port.data_type,
@@ -110106,6 +114114,28 @@ impl Simulator {
                             // `T=int` formal renders signed like the reference.
                             val.is_signed = true;
                         }
+                    } else if matches!(&port.data_type, DataType::IntegerAtom { .. })
+                        || Self::packed_dims_are_literal(&port.data_type)
+                    {
+                        // A built-in integer formal (`int`, `byte`, ...) or a
+                        // packed vector with LITERAL bounds (`logic signed
+                        // [15:0]`) has a fixed width that no class
+                        // type-parameter can alter, so widen the actual FIRST
+                        // and stamp the signedness after: marking a 2-bit
+                        // unsigned actual signed and letting the frame widen it
+                        // later sign-extended `2'b10` into -2 for every such
+                        // method formal.
+                        let pw = super::elaborate::resolve_type_width(
+                            &port.data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        );
+                        if val.is_real {
+                            val = Self::real_to_int(val.to_f64(), pw.max(1));
+                        } else if pw > 0 && pw != val.width {
+                            val = val.resize_for_assign(pw);
+                        }
+                        val.is_signed = super::elaborate::is_type_signed(&port.data_type);
                     } else if super::elaborate::is_type_signed(&port.data_type) {
                         val.is_signed = true;
                     }
@@ -110428,6 +114458,32 @@ impl Simulator {
                         .and_then(|o| o.as_ref())
                         .map(|i| i.creation_scope.clone())
                         .unwrap_or_default();
+                    // `creation_scope` is kept in `%m` form (`tb.u_w`, top
+                    // module first) for the method's own `%m`; the
+                    // resolution hint must be instance-relative (`u_w`,
+                    // the key form of every signal). Installing the `%m`
+                    // form made every hinted lookup miss, so a method of an
+                    // object built inside `u_w` could not read `u_w`'s own
+                    // variables or reach its sibling instances (issue #155).
+                    let mut birth = self.instance_relative_scope(&birth);
+                    if birth.is_empty() {
+                        // No usable birth scope (the object was built at the
+                        // top or in a package): a class declared INSIDE a
+                        // module resolves bare and sibling names in that
+                        // module; when the module has exactly one instance
+                        // its path is the scope.
+                        if let Some(enc) = self.class_enclosing_module(handle) {
+                            let mut paths = self
+                                .module
+                                .instances
+                                .iter()
+                                .filter(|i| i.def_name == enc)
+                                .map(|i| i.path.as_str());
+                            if let (Some(only), None) = (paths.next(), paths.next()) {
+                                birth = only.to_string();
+                            }
+                        }
+                    }
                     if birth.is_empty() {
                         None
                     } else {
@@ -110717,7 +114773,7 @@ impl Simulator {
 
     fn resolve_expr_name(&self, expr: &Expression) -> String {
         match &expr.kind {
-            ExprKind::Ident(hier) => self.resolve_hier_name(hier),
+            ExprKind::Ident(hier) => self.resolve_hier_name(hier).into_owned(),
             _ => "expr".to_string(),
         }
     }
@@ -110846,7 +114902,7 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &expr.kind {
                     let full = self.resolve_hier_name(h);
                     let leaf = h.path.last().map(|s| s.name.name.clone()).unwrap_or_default();
-                    for key in [full.as_str(), leaf.as_str()] {
+                    for key in [full.as_ref(), leaf.as_str()] {
                         if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
                             self.module.var_decl_types.get(key)
                             && let Some(k) = Self::container_base(&name.name.name)
@@ -110985,6 +115041,9 @@ impl Simulator {
                     if let Some(t) = &sig.type_name {
                         if self.module.classes.contains_key(t)
                             || self.module.enum_members.contains_key(t)
+                            // A covergroup-typed property (the implicit
+                            // variable a class-body covergroup declares).
+                            || self.module.covergroups.contains_key(t)
                             // §6.20.3: a TYPE-parameter name passes through —
                             // the caller resolves it to the bound concrete
                             // type via the instance's type_bindings.
@@ -111108,7 +115167,7 @@ impl Simulator {
             let name = self.resolve_hier_name(hier);
             if self
                 .var_container_types
-                .get(&name)
+                .get(&*name)
                 .is_some_and(|k| says_mailbox(k))
             {
                 return true;
@@ -111187,7 +115246,7 @@ impl Simulator {
     fn enum_receiver_keys(&self, expr: &Expression) -> Vec<String> {
         let mut keys = Vec::new();
         if let ExprKind::Ident(h) = &expr.kind {
-            keys.push(self.resolve_hier_name(h));
+            keys.push(self.resolve_hier_name(h).into_owned());
             if let Some(leaf) = h.path.last() {
                 if h.path.len() > 1 || keys[0] != leaf.name.name {
                     keys.push(leaf.name.name.clone());
@@ -111206,8 +115265,8 @@ impl Simulator {
                 // including a same-named class property, which otherwise won
                 // below and gave UVM's severity summary the type of an
                 // unrelated ancestor property.
-                if hier.path.len() == 1 && self.fe_trusted_types.contains(&name) {
-                    if let Some(t) = self.var_typedef_types.get(&name) {
+                if hier.path.len() == 1 && self.fe_trusted_types.contains(&*name) {
+                    if let Some(t) = self.var_typedef_types.get(&*name) {
                         return Some(t.clone());
                     }
                 }
@@ -111259,7 +115318,7 @@ impl Simulator {
                                 .unwrap_or(&[])
                                 .iter()
                                 .rev()
-                                .any(|m| m.contains_key(&name))
+                                .any(|m| m.contains_key(&*name))
                         })
                         // Outside any class method (initial/always blocks):
                         // locals live as signals/flat-map entries with no
@@ -111269,22 +115328,22 @@ impl Simulator {
                             self.local_stack
                                 .iter()
                                 .rev()
-                                .any(|m| m.contains_key(&name))
+                                .any(|m| m.contains_key(&*name))
                         });
                 if in_any_frame {
                     // A class-typed procedural local declared in this scope.
-                    if let Some(t) = self.var_class_types.get(&name) {
+                    if let Some(t) = self.var_class_types.get(&*name) {
                         return Some(t.clone());
                     }
                     // LRM §6.19.6: typedef-typed local — used by
                     // `local.next/.first/.last/.num/.prev` resolution.
-                    if let Some(t) = self.var_typedef_types.get(&name) {
+                    if let Some(t) = self.var_typedef_types.get(&*name) {
                         return Some(t.clone());
                     }
                 }
                 if let Some(t) = self
                     .signal_name_to_id
-                    .get(name.as_str())
+                    .get(name.as_ref())
                     .and_then(|id| self.signal_type_names.get(id).cloned())
                 {
                     return Some(t);
@@ -111333,12 +115392,12 @@ impl Simulator {
                 let trust_flat_maps = in_any_frame || !in_class_method;
                 if trust_flat_maps {
                     // A class-typed procedural local declared in this scope.
-                    if let Some(t) = self.var_class_types.get(&name) {
+                    if let Some(t) = self.var_class_types.get(&*name) {
                         return Some(t.clone());
                     }
                     // LRM §6.19.6: typedef-typed local — used by
                     // `local.next/.first/.last/.num/.prev` resolution.
-                    if let Some(t) = self.var_typedef_types.get(&name) {
+                    if let Some(t) = self.var_typedef_types.get(&*name) {
                         return Some(t.clone());
                     }
                 }
@@ -111424,7 +115483,7 @@ impl Simulator {
                 }
                 if let ExprKind::Ident(bh) = &cur.kind {
                     let bname = self.resolve_hier_name(bh);
-                    if let Some(cn) = self.module.array_elem_class.get(&bname).cloned() {
+                    if let Some(cn) = self.module.array_elem_class.get(&*bname).cloned() {
                         return Some(cn);
                     }
                     // §8.20 + §6.20.3: a class-MEMBER array whose element
@@ -111554,8 +115613,8 @@ impl Simulator {
     ) -> Option<(String, Vec<Expression>)> {
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
-            if let Some(base) = self.var_class_types.get(&name) {
-                let ta = self.var_type_args.get(&name).cloned().unwrap_or_default();
+            if let Some(base) = self.var_class_types.get(&*name) {
+                let ta = self.var_type_args.get(&*name).cloned().unwrap_or_default();
                 return Some((base.clone(), ta));
             }
             let bname = &hier.path[0].name.name;
@@ -112313,6 +116372,12 @@ mod vpi {
     pub const SCALAR: c_int = 17;
     pub const VECTOR: c_int = 18;
     pub const SIGNED: c_int = 65;
+    pub const DIRECTION: c_int = 20;
+    pub const INPUT: c_int = 1;
+    pub const OUTPUT: c_int = 2;
+    pub const INOUT: c_int = 3;
+    pub const MIXED_IO: c_int = 4;
+    pub const NO_DIRECTION: c_int = 5;
 
     // vpi_control operations.
     pub const STOP: c_int = 66;
@@ -112354,6 +116419,8 @@ mod vpi {
     pub const VARIABLES: c_int = 100;
     pub const INTEGER_VAR: c_int = 25;
     pub const NET: c_int = 36;
+    pub const PORT: c_int = 44;
+    pub const PORT_BIT: c_int = 45;
     pub const REAL_VAR: c_int = 47;
     /// Also `vpiLogicVar` — the standard aliases them.
     pub const REG: c_int = 48;
@@ -112647,6 +116714,10 @@ static GLOBAL_ACTIVE_SIMULATOR: std::sync::atomic::AtomicPtr<Simulator> =
 /// fields that only some kinds populate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum VpiKind {
+    /// A module port (§37.16): its own object, with `vpiDirection`; the
+    /// connected signal keeps its `vpiNet`/`vpiReg` type. `signal_id` is the
+    /// port's signal so value reads work through the port handle.
+    Port,
     /// A whole signal in the flat signal table.
     Signal,
     /// A bit range of a signal — a packed-struct member or part-select.
@@ -112677,6 +116748,7 @@ struct VpiHandle {
     /// handle is created. It must not be derived from the current value:
     /// a `logic` signal is a `vpiReg` whether or not it happens to hold X.
     type_code: libc::c_int,
+    direction: libc::c_int,
     /// Slice only: bit range within `signal_id`.
     lsb: u32,
     width: u32,
@@ -112703,6 +116775,7 @@ impl VpiHandle {
             kind: VpiKind::Signal,
             signal_id: id,
             type_code,
+            direction: vpi::NO_DIRECTION,
             lsb: 0,
             width: 0,
             inst_idx: -1,
@@ -112716,6 +116789,14 @@ impl VpiHandle {
         }
     }
 
+    fn port(id: usize, name: &str, full: &str, direction: libc::c_int, width: u32) -> Self {
+        let mut h = VpiHandle::signal(id, vpi::PORT, name, full);
+        h.kind = VpiKind::Port;
+        h.direction = direction;
+        h.width = width;
+        h
+    }
+
     fn into_raw(self) -> *mut libc::c_void {
         Box::into_raw(Box::new(self)) as *mut libc::c_void
     }
@@ -112726,6 +116807,7 @@ impl VpiHandle {
             kind: VpiKind::Constant,
             signal_id: 0,
             type_code: vpi::CONSTANT,
+            direction: vpi::NO_DIRECTION,
             lsb: 0,
             width: v.width,
             inst_idx: -1,
@@ -112749,6 +116831,7 @@ impl VpiHandle {
             } else {
                 vpi::SYS_TASK_CALL
             },
+            direction: vpi::NO_DIRECTION,
             lsb: 0,
             width: ret_width,
             inst_idx: -1,
@@ -113015,10 +117098,31 @@ fn vpi_type_of(sim: &Simulator, name: &str, id: usize) -> libc::c_int {
     }
 }
 
+fn vpi_direction_code(dir: PortDirection) -> libc::c_int {
+    match dir {
+        PortDirection::Input => vpi::INPUT,
+        PortDirection::Output => vpi::OUTPUT,
+        PortDirection::Inout => vpi::INOUT,
+        PortDirection::Ref => vpi::NO_DIRECTION,
+    }
+}
+
+/// Direction of the port a signal belongs to, `vpiNoDirection` for a plain
+/// signal. The standard defines `vpiDirection` on port objects; answering
+/// it on the port's signal too is a convenience that costs nothing.
+fn vpi_direction_of(sim: &Simulator, name: &str) -> libc::c_int {
+    sim.vpi_port_directions
+        .get(name)
+        .map(|d| vpi_direction_code(*d))
+        .unwrap_or(vpi::NO_DIRECTION)
+}
+
 fn new_vpi_handle(sim: &Simulator, name: &str, id: usize) -> *mut libc::c_void {
     let type_code = vpi_type_of(sim, name, id);
     let leaf = name.rsplit('.').next().unwrap_or(name);
-    VpiHandle::signal(id, type_code, leaf, &vpi_full_name(sim, name)).into_raw()
+    let mut handle = VpiHandle::signal(id, type_code, leaf, &vpi_full_name(sim, name));
+    handle.direction = vpi_direction_of(sim, name);
+    handle.into_raw()
 }
 
 /// Prefix a design-relative name with the top module, the way
@@ -113069,6 +117173,7 @@ fn vpi_module_handle(sim: &Simulator, inst_idx: isize) -> *mut libc::c_void {
         kind: VpiKind::Module,
         signal_id: 0,
         type_code: vpi::MODULE,
+        direction: vpi::NO_DIRECTION,
         lsb: 0,
         width: 0,
         inst_idx,
@@ -113109,6 +117214,7 @@ fn vpi_slice_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
         kind: VpiKind::Slice,
         signal_id: id,
         type_code: vpi::PART_SELECT,
+        direction: vpi::NO_DIRECTION,
         lsb,
         width,
         inst_idx: -1,
@@ -113227,6 +117333,7 @@ fn vpi_memory_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
         kind: VpiKind::Memory,
         signal_id: id,
         type_code: vpi::MEMORY,
+        direction: vpi::NO_DIRECTION,
         lsb: lo.min(hi) as u32,
         width: count,
         inst_idx: -1,
@@ -113438,6 +117545,28 @@ pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *m
         }
 
         // Declared objects, filtered by what the caller asked for.
+        if type_ == vpi::PORT {
+            // §37.16: ports are their own objects, one per direction-bearing
+            // member of the scope, in name order.
+            let items: Vec<VpiHandle> = vpi_scope_members(sim, &scope_path)
+                .into_iter()
+                .filter(|(_, id)| *id != usize::MAX)
+                .filter_map(|(name, id)| {
+                    let dir = sim.vpi_port_directions.get(&name)?;
+                    let leaf = name.rsplit('.').next().unwrap_or(&name).to_string();
+                    let width = sim.signal_widths.get(id).copied().unwrap_or(1) as u32;
+                    Some(VpiHandle::port(
+                        id,
+                        &leaf,
+                        &vpi_full_name(sim, &name),
+                        vpi_direction_code(*dir),
+                        width,
+                    ))
+                })
+                .collect();
+            return vpi_make_iterator(items);
+        }
+
         let want = |ty: libc::c_int| -> bool {
             match type_ {
                 vpi::NET => ty == vpi::NET,
@@ -113462,7 +117591,9 @@ pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *m
             let ty = vpi_type_of(sim, &name, id);
             if want(ty) {
                 let leaf = name.rsplit('.').next().unwrap_or(&name);
-                items.push(VpiHandle::signal(id, ty, leaf, &vpi_full_name(sim, &name)));
+                let mut handle = VpiHandle::signal(id, ty, leaf, &vpi_full_name(sim, &name));
+                handle.direction = vpi_direction_of(sim, &name);
+                items.push(handle);
             }
         }
         vpi_make_iterator(items)
@@ -113478,6 +117609,7 @@ fn vpi_make_iterator(items: Vec<VpiHandle>) -> *mut libc::c_void {
         kind: VpiKind::Iterator,
         signal_id: 0,
         type_code: vpi::ITERATOR,
+        direction: vpi::NO_DIRECTION,
         lsb: 0,
         width: 0,
         inst_idx: -1,
@@ -113525,6 +117657,8 @@ fn vpi_type_name(code: libc::c_int) -> Option<&'static str> {
         vpi::MEMORY => "vpiMemory",
         vpi::MODULE => "vpiModule",
         vpi::NET => "vpiNet",
+        vpi::PORT => "vpiPort",
+        vpi::PORT_BIT => "vpiPortBit",
         vpi::PARAMETER => "vpiParameter",
         vpi::PART_SELECT => "vpiPartSelect",
         vpi::REAL_VAR => "vpiRealVar",
@@ -113906,6 +118040,9 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
     if property == vpi::TYPE {
         return h.type_code;
     }
+    if property == vpi::DIRECTION {
+        return h.direction;
+    }
     // vpiFuncType of a system function call is its `sysfunctype`.
     if h.kind == VpiKind::SysTfCall {
         return match property {
@@ -113927,6 +118064,12 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
         };
     }
     // A module or an iterator has no width, sign or scalar-ness.
+    if property == vpi::DIRECTION {
+        return match h.kind {
+            VpiKind::Port | VpiKind::Signal => h.direction,
+            _ => vpi::UNDEFINED,
+        };
+    }
     match h.kind {
         VpiKind::Module | VpiKind::Iterator => return vpi::UNDEFINED,
         // vpiSize of a memory is its number of words; of a slice, its bits.
@@ -114292,19 +118435,8 @@ pub extern "C" fn vpi_put_value(
         if flags == vpi::RELEASE_FLAG {
             // Release: remove from forced_signals and trigger settle
             sim.forced_signals.remove(&sig_id);
-            // Find comb entries that write to this signal and add their source
-            // signals to dirty_list. This ensures settle sees the source as dirty
-            // and triggers the comb entry through the dep_entries mechanism.
-            for entry in sim.comb_entries.iter() {
-                if entry.cold.write_signal_ids.contains(&sig_id) {
-                    for &src_id in &entry.cold.read_signal_ids {
-                        if src_id < sim.dirty_signals.len() && !sim.dirty_signals[src_id] {
-                            sim.dirty_signals[src_id] = true;
-                            sim.dirty_list.push(src_id);
-                        }
-                    }
-                }
-            }
+            // Re-evaluate the continuous drivers of the released net.
+            sim.redrive_released_signal(sig_id);
             // Release invalidates the event-edge assumption that a flop's
             // output still reflects its last sampled inputs.
             sim.edge_block_snap_valid

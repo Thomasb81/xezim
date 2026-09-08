@@ -13,6 +13,8 @@
 
 #[path = "classes/collection_of_handles_new.rs"]
 mod collection_of_handles_new;
+#[path = "classes/class_unpacked_struct_array_store.rs"]
+mod class_unpacked_struct_array_store;
 #[path = "classes/static_fixed_array_storage.rs"]
 mod static_fixed_array_storage;
 #[path = "classes/array_equality_class.rs"]
@@ -267,3 +269,21 @@ mod package_class_nested_class;
 mod sqr_zero_time_loop;
 #[path = "classes/member_visibility_local_protected.rs"]
 mod member_visibility_local_protected;
+#[path = "classes/method_local_base_per_process.rs"]
+mod method_local_base_per_process;
+#[path = "classes/class_covergroups.rs"]
+mod class_covergroups;
+#[path = "classes/array_query_handle_qualified_member.rs"]
+mod array_query_handle_qualified_member;
+#[path = "classes/parked_task_local_vif_alias.rs"]
+mod parked_task_local_vif_alias;
+#[path = "classes/class_randomize_multidim.rs"]
+mod class_randomize_multidim;
+#[path = "classes/class_method_sibling_instance_oomr.rs"]
+mod class_method_sibling_instance_oomr;
+#[path = "classes/method_int_formal_zero_extends.rs"]
+mod method_int_formal_zero_extends;
+#[path = "classes/handle_chain_read_in_instance_task.rs"]
+mod handle_chain_read_in_instance_task;
+#[path = "classes/implication_joint_distribution.rs"]
+mod implication_joint_distribution;

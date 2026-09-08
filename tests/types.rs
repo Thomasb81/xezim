@@ -27,6 +27,8 @@ mod ansi_port_name_with_unpacked_dim;
 mod array_element_declared_signedness;
 #[path = "types/array_parameter.rs"]
 mod array_parameter;
+#[path = "types/nested_packed_member_lvalue.rs"]
+mod nested_packed_member_lvalue;
 #[path = "types/array_query_multidim_packed.rs"]
 mod array_query_multidim_packed;
 #[path = "types/assoc_of_queue_enumeration.rs"]
@@ -360,3 +362,17 @@ mod class_handle_nonclass_assign_compile_err;
 mod vector_type_arg_spec;
 #[path = "types/self_named_typedef_alias.rs"]
 mod self_named_typedef_alias;
+#[path = "types/tf_port_typedef_packed_dims.rs"]
+mod tf_port_typedef_packed_dims;
+#[path = "types/ref_formal_element_write.rs"]
+mod ref_formal_element_write;
+#[path = "types/multi_dim_unpacked_arrays.rs"]
+mod multi_dim_unpacked_arrays;
+#[path = "types/real_to_integral_local.rs"]
+mod real_to_integral_local;
+#[path = "types/system_function_result_width.rs"]
+mod system_function_result_width;
+#[path = "types/packed_member_select_name_collision.rs"]
+mod packed_member_select_name_collision;
+#[path = "types/bit_write_unknown_index_discarded.rs"]
+mod bit_write_unknown_index_discarded;

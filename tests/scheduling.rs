@@ -209,3 +209,13 @@ mod delayed_write_pending_semantics;
 mod labeled_block_local_hier_ref;
 #[path = "scheduling/nba_wait_for_region_yield.rs"]
 mod nba_wait_for_region_yield;
+#[path = "scheduling/release_from_level_sensitive_block.rs"]
+mod release_from_level_sensitive_block;
+#[path = "scheduling/sva_instances_and_sequences.rs"]
+mod sva_instances_and_sequences;
+#[path = "scheduling/always_value_change_after_edge_continuation.rs"]
+mod always_value_change_after_edge_continuation;
+#[path = "scheduling/package_and_unit_delays_scale_by_timescale.rs"]
+mod package_and_unit_delays_scale_by_timescale;
+#[path = "scheduling/clocking_cont_trigger_same_step.rs"]
+mod clocking_cont_trigger_same_step;

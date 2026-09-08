@@ -149,3 +149,19 @@ mod library_dir_on_demand;
 mod modport_expression_ports;
 #[path = "hierarchy/unit_scope_library_subroutine.rs"]
 mod unit_scope_library_subroutine;
+#[path = "hierarchy/bind_grid_module_name_refs.rs"]
+mod bind_grid_module_name_refs;
+#[path = "hierarchy/instance_loop_local_shadows_module_var.rs"]
+mod instance_loop_local_shadows_module_var;
+#[path = "hierarchy/multi_top_typedef_packed_dims.rs"]
+mod multi_top_typedef_packed_dims;
+#[path = "hierarchy/bind_with_parameters.rs"]
+mod bind_with_parameters;
+#[path = "hierarchy/ref_formal_same_name.rs"]
+mod ref_formal_same_name;
+#[path = "hierarchy/instance_block_locals_shadow_module_names.rs"]
+mod instance_block_locals_shadow_module_names;
+#[path = "hierarchy/instance_collections_resolve_by_scope.rs"]
+mod instance_collections_resolve_by_scope;
+#[path = "hierarchy/vif_packed_array_elem_nba.rs"]
+mod vif_packed_array_elem_nba;

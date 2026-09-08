@@ -47,3 +47,7 @@ mod dump_formats_agree;
 mod fst_time_table_breakeven;
 #[path = "gates/interrupt_finalizes_dumps.rs"]
 mod interrupt_finalizes_dumps;
+#[path = "gates/cont_assign_packed2d_unit_inner.rs"]
+mod cont_assign_packed2d_unit_inner;
+#[path = "gates/const_cont_assign_time0_seed.rs"]
+mod const_cont_assign_time0_seed;
