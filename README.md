@@ -165,7 +165,9 @@ and testbench flows. Portable code should not rely on them.
   it directly: 5.6 % fewer instructions on the C906 CoreMark run.
 * Reads and writes from class methods no longer build a scoped name string
   for every lookup, and virtual-interface bindings are probed without
-  allocating: 2.6 % fewer instructions on the axi4 AVIP.
+  allocating, an assignment no longer probes for a pending interface
+  return on every write, and the width of a plain variable target is
+  remembered per statement: 3.6 % fewer instructions on the axi4 AVIP.
 * Clocked monitor blocks that contain a rare `#delay` run compiled instead
   of interpreted, with the same process semantics: 0.3 % fewer instructions
   on C906 CoreMark.
